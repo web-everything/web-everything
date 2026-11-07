@@ -13,8 +13,26 @@ it('retains a send-back during a tick and wakes the following sleep', async () =
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 import { createResourceFixThrottle } from '../resource-gate.mjs';
+// R559: admission now refuses on a stale/unreadable memory reading, so these cap tests inject a healthy host
+// (fresh snapshot, 8 GB available under the standard 2 GB floor, normal pressure) instead of an unreadable one.
+const HOST_NOW = Date.parse('2026-11-04T12:00:00Z');
+const healthyHost = {
+  nowMs: () => HOST_NOW,
+  readSnap: () => ({ sampledAt: new Date(HOST_NOW - 5000).toISOString(), freshUntil: new Date(HOST_NOW + 15000).toISOString(),
+    cpu: { idlePct: 40, loadAvg: [1] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192 } }),
+  resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }),
+};
+it('the healthy host fixture is fresh within the 20s maximum and reaches the host gate', () => {
+  const snap = healthyHost.readSnap();
+  expect(Date.parse(snap.freshUntil) - Date.parse(snap.sampledAt)).toBeLessThanOrEqual(20000);
+  let gateCalls = 0;
+  const throttle = createResourceFixThrottle({ listClaims: () => [], ...healthyHost, readHeavyWait: () => 0,
+    settings: { cutover: 'enforce', fixCap: { floor: 2, ceiling: 2 } }, gate: () => { gateCalls += 1; return { admit: false, kind: 'host-load' }; }, log: () => {} });
+  expect(throttle.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'host-load' });
+  expect(gateCalls).toBe(1);
+});
 it('keeps a send-back slot inside a reduced cap without bypassing host admission', () => {
-  const throttle = createResourceFixThrottle({ listClaims: () => [], readSnap: () => null, readHeavyWait: () => 100,
+  const throttle = createResourceFixThrottle({ listClaims: () => [], ...healthyHost, readHeavyWait: () => 100,
     settings: { cutover: 'enforce', fixCap: { floor: 8, lowerBy: 4, lowerMinimum: 1, ceiling: 8 } },
     sendBackReservedSlots: 1, gate: () => ({ admit: true }), log: () => {} });
   for (let n = 0; n < 3; n++) expect(throttle.tryAdmit('ci-heal').admit).toBe(true);
@@ -64,7 +82,7 @@ it('falls back to the stat poll when the directory event never fires', async () 
   } finally { clearTimeout(timer); rmSync(dir, { recursive: true, force: true }); }
 });
 it('a send-back reservation never waives the host gate', () => {
-  const throttle = createResourceFixThrottle({ sendBackReservedSlots: 1, listClaims: () => [], readSnap: () => null,
+  const throttle = createResourceFixThrottle({ sendBackReservedSlots: 1, listClaims: () => [], ...healthyHost,
     settings: { cutover: 'enforce', fixCap: { floor: 1, ceiling: 1 } },
     gate: () => ({ admit: false, kind: 'host-load' }), log: () => {} });
   expect(throttle.tryAdmit('fix', { sendBack: true })).toMatchObject({ admit: false, kind: 'host-load' });
@@ -78,7 +96,7 @@ it('also checks local hand-offs when webhook waking is enabled', async () => {
   expect(polled).toBe(false);
 });
 it('reserves exactly one send-back slot when no setting is supplied (the standard default)', () => {
-  const throttleWith = live => createResourceFixThrottle({ env: {}, alive: () => true, readSnap: () => null, readHeavyWait: () => 0,
+  const throttleWith = live => createResourceFixThrottle({ env: {}, alive: () => true, ...healthyHost, readHeavyWait: () => 0,
     listClaims: () => Array.from({ length: live }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } })),
     settings: { cutover: 'enforce', fixCap: { floor: 3, ceiling: 3 } }, gate: () => ({ admit: true }), log: () => {} });
   expect(throttleWith(1).tryAdmit('fix').admit).toBe(true); // a default of 2+ would refuse here
@@ -90,7 +108,7 @@ it.each([[1, 1], [1, 3], [2, 1], [2, 5], [3, 0], [4, 2]])(
   'cap %i with %i reserved slot(s) still admits an ordinary repair — the reserve never takes the last slot', (cap, reserve) => {
     const ordinary = cap - Math.min(reserve, cap - 1);
     expect(ordinary).toBeGreaterThanOrEqual(1);
-    const throttleWith = live => createResourceFixThrottle({ env: {}, alive: () => true, readSnap: () => null, readHeavyWait: () => 0, sendBackReservedSlots: reserve,
+    const throttleWith = live => createResourceFixThrottle({ env: {}, alive: () => true, ...healthyHost, readHeavyWait: () => 0, sendBackReservedSlots: reserve,
       listClaims: () => Array.from({ length: live }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } })),
       settings: { cutover: 'enforce', fixCap: { floor: cap, ceiling: cap } }, gate: () => ({ admit: true }), log: () => {} });
     expect(throttleWith(ordinary - 1).tryAdmit('ci-heal').admit).toBe(true);
@@ -130,7 +148,7 @@ it('the live dispatch pass asks the throttle for the send-back slot only for a r
 const passWith = (entries, extra = {}) => {
   const dispatch = vi.fn(entry => ({ pr: entry.pr, lane: entry.lane }));
   const borrowGate = { consider: vi.fn(() => ({ borrow: false, why: 'borrow-off' })), clear: vi.fn() };
-  const dispatchThrottle = createResourceFixThrottle({ env: {}, alive: () => true, readSnap: () => null, readHeavyWait: () => 0,
+  const dispatchThrottle = createResourceFixThrottle({ env: {}, alive: () => true, ...healthyHost, readHeavyWait: () => 0,
     listClaims: () => [{ meta: { kind: 'fix', repo: 'we', pr: 1 } }],
     settings: { cutover: 'enforce', fixCap: { floor: 2, ceiling: 2 } }, gate: () => ({ admit: true }), log: () => {} });
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});

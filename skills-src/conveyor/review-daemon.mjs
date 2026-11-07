@@ -107,6 +107,7 @@ import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
 // PRs — landing it in `runner.mjs` alone would leave #2549/#2578's stray labels uncleaned indefinitely, the
 // exact gap this wiring closes.
 import { sweepReviewHoldLabels } from '../../scripts/conveyor/review-hold-reconcile.mjs';
+import { sweepAuthorStamps } from '../../scripts/lib/author-stamp-restore.mjs';
 import { sweepHumanSurfaceRepark } from '../../scripts/conveyor/human-surface-repark.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
 // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session executor for a
@@ -450,7 +451,8 @@ export function runReviewTick({
   let holdReconcileError = null;
   try {
     // Both hold sweeps nominate candidates from number/labels; all mutations still use fresh live reads.
-    holdReconcileResults = holdReconcile({ repo, ...(sharedReads && !rawPrsFailed ? { listPrs: () => rawPrs } : {}) }) ?? [];
+    holdReconcileResults = holdReconcile({ repo, restoreStamps: sweepAuthorStamps,
+      ...(sharedReads && !rawPrsFailed ? { listPrs: () => rawPrs } : {}) }) ?? [];
   } catch (e) {
     holdReconcileError = String((e && e.message) || e).split('\n')[0];
   }
@@ -484,6 +486,9 @@ export function runReviewTick({
     } else {
       plan = reconcile({ repo, defaultBranch });
     }
+    // A deferred PR read (gh low budget / slot throttle / author-lookup budget) planned NOTHING: that is "owed unknown",
+    // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
+    if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
@@ -1763,6 +1768,7 @@ export function buildCliDaemonEffects({
       // `h.remove`/`h.healed`/`h.flagged` are INDEPENDENT optional fields on one entry (see
       // `sweepReviewHoldLabels`'s own return doc) — never assume any one of them is present.
       for (const h of (result.holdReconcile ?? [])) {
+        if (h.stampRestore) log.error(`review-daemon: ${h.repo}#${h.num} author-stamp ${h.stampRestore} - ${h.detail?.reason ?? ''}`.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' '));
         if (h.repark) log.error(`review-daemon: ${h.repo}#${h.num} human-surface re-park ${h.repark} at ${String(h.head||'').slice(0,9)} (${(h.files||[]).join(',')})${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.remove?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile removed ${h.remove.join(',')}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.healed?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile HEALED — removed ${h.healed.join(',')}${h.commentPosted ? ', comment posted' : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`);

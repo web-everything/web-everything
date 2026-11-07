@@ -220,3 +220,23 @@ describe('postNoteComment — the IO shell', () => {
     expect(postNoteComment({ pr: 10, body: 'hello', exec })).toEqual({ ok: false, error: 'gh: rate limited' });
   });
 });
+
+describe('informational note kinds (conveyor.notes.informationalKinds)', async () => {
+  const { latestUnresolvedPersonNote } = await import('../../operations/operator-queue-needs-person.mjs');
+  const { loadInformationalNoteKinds } = await import('../../lib/pr-comment-policy.mjs');
+  const asComment = (note) => ({ body: buildNoteComment(note), createdAt: '2026-11-03T10:00:00Z', viewerDidAuthor: true, author: { login: 'x' } });
+  it('settings list the fallback-heal kind', () => {
+    expect(loadInformationalNoteKinds()).toContain('timeout-retry-fallback-heal');
+  });
+  it('an info kind posts as an info note and creates no needs-decision item', () => {
+    const c = asComment({ kind: 'timeout-retry-fallback-heal', prNumber: 7, text: 'falling back' });
+    expect(c.body.startsWith('ℹ️ conveyor — note')).toBe(true);
+    expect(c.body).not.toMatch(/needs your decision/i);
+    expect(latestUnresolvedPersonNote([c])).toBeNull();
+  });
+  it('a real decision kind still posts needs-decision and raises an item', () => {
+    const c = asComment({ kind: 'ci-heal-exhausted', prNumber: 7, attempts: 3, cap: 3, text: 'x' });
+    expect(c.body.startsWith(NOTE_COMMENT_MARKER)).toBe(true);
+    expect(latestUnresolvedPersonNote([c])?.kind).toBe('ci-heal-exhausted');
+  });
+});

@@ -974,6 +974,36 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
   const ACCEPTED = ['review:accepted', 'ready-to-merge'];
   const enqueuedAny = h => h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')));
   const clean = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+  // Wiring: both call sites hand the live formal reviews to the settle step. A review-unfinished result older than the
+  // unfinished run settles on a trusted same-head accept, unless a formal review came after that accept.
+  describe('review-unfinished settle by a same-head accept reads the live formal reviews', () => {
+    const T = Date.parse('2026-11-06T14:42:13Z');
+    const iso = ms => new Date(ms).toISOString();
+    const result = { user: { login: 'web-everything[bot]' }, createdAt: iso(T),
+      body: renderRedTeamComment({ pr: 5283, rev: HEAD, findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) };
+    const accept = { user: { login: 'web-everything[bot]' }, createdAt: iso(T + 14 * 60e3),
+      body: `Cleared by operator.\n<!-- reviewed-sha: ${HEAD} -->\n<!-- cleared-human: chalbert -->` };
+    const unfinished = () => Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { enumerable: false, value: {
+      unfinishedUndecided: true, unfinishedStartedAt: T + 6 * 60e3, unfinishedActiveAt: T + 16 * 60e3, evaluatedAt: T + 2 * 3600e3,
+      completeHeadRead: () => ({ complete: true, blocked: false }) } });
+    const commented = { state: 'COMMENTED', submittedAt: iso(T + 20 * 60e3), author: { login: 'chalbert' } };
+    const make = reviews => harness({ strategy: 'github-merge-queue', labels: ACCEPTED, liveComments: [result, accept], evidence: unfinished(),
+      env: { ...process.env, WE_UNDER_TEST: '1', WE_RED_TEAM_STATUS_LABELS: 'false' },
+      onView: { readLive: () => ({ headRefOid: HEAD, labels: ACCEPTED, reviews }) } });
+
+    it('prestage: settles with no later review, holds with a later COMMENTED review', () => {
+      expect(make([]).s.prestage({ num: 5283 }, HEAD).allowed).toBe(true);
+      expect(make([commented]).s.prestage({ num: 5283 }, HEAD).allowed).toBe(false);
+    });
+    it('admission (enqueue): settles with no later review, holds with a later COMMENTED review', () => {
+      const ok = make([]);
+      expect(ok.s.enqueue({ num: 5283 }, HEAD, { comments: [result, accept] })).toMatchObject({ enqueued: true });
+      const held = make([commented]);
+      expect(held.s.enqueue({ num: 5283 }, HEAD, { comments: [result, accept] })).toMatchObject({ enqueued: false });
+      expect(enqueuedAny(held)).toBe(false);
+    });
+  });
+
   const pastDeadline = (opts = {}) => {
     const clock = { t: 1000 };
     const notes = [];
@@ -1219,6 +1249,38 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
     clock.t += 10 * 60 * 60_000;
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
+  it.each(['scan-capped', 'review-unfinished', 'run-start-missing'])('%s run evidence past the deadline never re-requests or takes the operator override', reason => {
+    const requests = [];
+    const { h, clock, notes } = pastDeadline({ labels: [...ACCEPTED, 'red-team:pending'], env: OVERRIDE_ENV,
+      evidence: { ok: false, reason }, requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true,
+      reason: expect.stringContaining(`run evidence unknown (${reason})`) });
+    clock.t += 10 * 60 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(requests).toHaveLength(0);
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
+  it('capped run evidence with a confirmed break keeps send-back routing ahead of the deadline path', async () => {
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) }];
+    const requests = [];
+    const { h, firstAttempt } = pastDeadline({ labels: [...ACCEPTED, 'red-team:pending'],
+      env: { ...OVERRIDE_ENV, WE_UNDER_TEST: '1', WE_RED_TEAM_STATUS_LABELS: 'false' }, liveComments: thread,
+      evidence: { ok: false, reason: 'scan-capped' }, requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(firstAttempt).toMatchObject({ enqueued: false, reason: expect.stringContaining('requiring send-back') });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false,
+      reason: expect.stringContaining('requiring send-back') });
+    expect(requests).toHaveLength(0);
     expect(enqueuedAny(h)).toBe(false);
     expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
   });

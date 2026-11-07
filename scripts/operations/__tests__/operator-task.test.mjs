@@ -18,6 +18,8 @@ import { createFileItemReader } from '../file-item-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import * as operatorTaskModule from '../../backlog/operator-task.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 
 const brief = 'A bounded task.\n\n' + ['Design', 'MVP', 'Done when', 'Edge cases', 'Test plan', 'Proof plan']
   .map(h => `## ${h}\nConcrete handling in we:scripts/example.mjs.\n`).join('\n');

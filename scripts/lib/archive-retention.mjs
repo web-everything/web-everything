@@ -1,18 +1,20 @@
 /** R217: archives are retained forever; source removal requires verified Drive evidence. */
-import { lstat, opendir, mkdir, writeFile, rename, unlink, rmdir, mkdtemp, rm, link } from 'node:fs/promises';
-import { join, dirname, relative, resolve } from 'node:path';
+import { lstat, opendir, mkdir, writeFile, rename, unlink, rmdir, mkdtemp, rm, link, access } from 'node:fs/promises';
+import { join, dirname, basename, relative, resolve, isAbsolute } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { sharedRunsDir } from '../operations/run-store.mjs';
 import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { boundedText } from './host-overload-settings.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
+import { createRunsWriterExclusion, runRecordEligible, loadRunCompletion } from './runs-writer-exclusion.mjs';
+import { readFile } from 'node:fs/promises';
 const exec = promisify(execFile);
 const DAY = 86400000;
-const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
+const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, runsBatchCap: 5000, runsMinAgeDays: 7, driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
 export function archiveSettings({ env = process.env, tool, log = console.error } = {}) {
   const p = readPlatformPreferences({ env, readFile: path => boundedText(path) });
   if (p.errors.length) throw Error(p.errors.join('; '));
@@ -25,24 +27,31 @@ export function archiveSettings({ env = process.env, tool, log = console.error }
     const v = env[`WE_ARCHIVE_${kind.toUpperCase()}_KEEP_DAYS`];
     if (v !== undefined) envValues[kind] = { keepDays: Number(v) };
   }
+  if (env.WE_ARCHIVE_RUNS_MIN_AGE_DAYS !== undefined) envValues.runsMinAgeDays = Number(env.WE_ARCHIVE_RUNS_MIN_AGE_DAYS);
+  if (env.WE_ARCHIVE_RUNS_BATCH_CAP !== undefined) envValues.runsBatchCap = Number(env.WE_ARCHIVE_RUNS_BATCH_CAP);
   if (env.WE_ARCHIVE_DRIVE_ROOT !== undefined) envValues.driveRoot = env.WE_ARCHIVE_DRIVE_ROOT;
   const valid = { runs: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
     sessions: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
+    runsBatchCap: v => Number.isSafeInteger(v) && v > 0,
+    runsMinAgeDays: v => Number.isSafeInteger(v) && v >= 0,
     driveRoot: v => typeof v === 'string' && v.trim().length > 0 };
   // Validate complete blocks too: empty objects must not silently disappear in the cascade.
   for (const layer of [p.prefs.archive, tool, envValues]) if (layer !== undefined) {
     if (!layer || typeof layer !== 'object' || Array.isArray(layer)) throw Error('invalid archive policy');
-    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (k !== 'driveRoot' && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
+    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (!['driveRoot', 'runsBatchCap', 'runsMinAgeDays'].includes(k) && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
   }
   const r = resolveCascade({ standard, platform: p.prefs.archive, tool, envValues, valid });
   if (r.invalid.length) throw Error(`invalid archive policy: ${r.invalid.join('; ')}`);
   log(formatCascadeSourcesLine('archive', r));
   return r;
 }
+/** Default provider per kind: runs get the live-writer exclusion; sessions keep the retain-only behaviour. */
+export const defaultWriterExclusion = kind => (kind === 'runs' ? createRunsWriterExclusion() : undefined);
 const dayOf = ms => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
 const same = (a, b) => a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 // Include identity/ctime so a replacement or a same-size write with restored mtime is new.
 const version = s => [s.size, s.mtimeMs, s.ctimeMs, s.dev, s.ino];
+const MAX_REMOVAL_RETRIES = 3;
 const MAX_MANIFEST_BYTES = 128 * 1024 * 1024;
 async function readArchiveManifest(path, source, drive, maxFiles) {
   try {
@@ -74,6 +83,11 @@ async function writeArchiveManifest(path, source, drive, files, maxFiles) {
 async function directory(path) { const s = await lstat(path); if (!s.isDirectory() || s.isSymbolicLink()) throw Error('not a real directory'); return s; }
 async function tar(args) { return exec('tar', args, { timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024 }); }
 /**
+ * WRITER-EXCLUSION CONTRACT (R559, runs): no writer lock exists or is built. A run record may leave only when it is
+ * FINISHED (parses against the canonical schema, terminal effects, verdict present, cursor > 0) AND its mtime is older
+ * than max(keepDays, runsMinAgeDays=7) days; the live-pid check in runs-writer-exclusion.mjs is defence in depth.
+ * Removal is quarantine-rename, identity+content re-verify, then unlink; a failed restore alerts loudly and every
+ * later runs scan retries `.retiring-<name>.<uuid>` files.
  * Source removal requires `withSourceWriterExclusion(path, criticalSection)`.
  * The provider must exclude ALL writers (including existing open descriptors and atomic
  * replacements) until the awaited critical section returns. An archiver-only lock, quiet
@@ -110,7 +124,8 @@ export async function archiveRetention(o = {}) {
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
     }
     if (o.keepDays !== undefined && (!Number.isSafeInteger(o.keepDays) || o.keepDays < 0)) throw Error('invalid keepDays');
-    const cutoff = Math.min(now - (o.keepDays ?? settings.value[kind].keepDays) * DAY, now - 600000);
+    const keepDays = Math.max(o.keepDays ?? settings.value[kind].keepDays, kind === 'runs' ? (o.minAgeDays ?? settings.value.runsMinAgeDays) : 0);
+    const cutoff = Math.min(now - keepDays * DAY, now - 600000);
     const groups = new Map(); let scanned = 0;
     const maxFiles = o.maxFiles ?? 500000;
     let archived = await readArchiveManifest(archiveManifest, source, drive, maxFiles);
@@ -139,8 +154,82 @@ export async function archiveRetention(o = {}) {
       if (!groups.has(key)) groups.set(key, { files: [], dirs: [] });
       groups.get(key).files.push(...files); groups.get(key).dirs.push(...dirs);
     }
+    // A failed restore is loud (error + event), never silent; the parked file stays discoverable for the next scan.
+    async function restore(parked, canonical) {
+      try { await link(parked, canonical); await unlink(parked); return true; }
+      catch (e) {
+        out.errors.push(`ALERT: restore of ${basename(parked)} failed (${e.code ?? e.message}); operator must inspect`);
+        // The emitter may be sync or async and may throw: an alert failure must never abort the scan.
+        try { await (o.emit ?? (ev => appendDaemonEvent(ev, { env })))({ kind: 'archive-retention-alert', daemon: 'archive-retention', detail: { parked, canonical, error: e.message } }); } catch { /* alert is best-effort */ }
+        return false;
+      }
+    }
+    // A runs record archived but not removed is forgotten by the manifest so the next run re-verifies and retries removal,
+    // at most MAX_REMOVAL_RETRIES times per path (each retry writes one more verified bundle); then it stays excluded
+    // and an operator-visible error says so. The counter lives in its own state file (keyed by relative path; run ids are unique, so it is never reused).
+    const retriesFile = join(state, 'runs.removal-retries.json');
+    async function retryRemoval(pending, manifest) {
+      // Null-prototype map: a `__proto__` / `constructor` key in the file is plain data, never a prototype write.
+      let counts = Object.create(null);
+      try {
+        const parsed = JSON.parse(boundedText(retriesFile, 1024 * 1024));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error('invalid retry state');
+        Object.assign(counts, parsed);
+      } catch (e) {
+        // Throw (do not swallow): the caller keeps the removal-intent file, so fixing the state file later still recovers the records.
+        if (e.code !== 'ENOENT') throw Error(`removal-retry state unreadable (${e.message}); records stay excluded, operator must inspect`);
+      }
+      const forget = new Map(manifest); let changed = false;
+      for (const key of pending) {
+        // A missing count is a first retry; a present but invalid one (negative, fractional, non-number) fails closed as exhausted.
+        const n = counts[key] === undefined ? 0 : (Number.isSafeInteger(counts[key]) && counts[key] >= 0 ? counts[key] : MAX_REMOVAL_RETRIES);
+        if (n >= MAX_REMOVAL_RETRIES) { out.errors.push(`ALERT: ${key} archived but not removed after ${n} retries; operator must inspect`); continue; }
+        counts[key] = n + 1; forget.delete(key); changed = true;
+      }
+      if (!changed) return manifest;
+      const temp = `${retriesFile}.${randomUUID()}.partial`;
+      try { await writeFile(temp, JSON.stringify(counts), { flag: 'wx', mode: 0o600 }); await rename(temp, retriesFile); } finally { await unlink(temp).catch(() => {}); }
+      await writeArchiveManifest(archiveManifest, source, drive, forget, maxFiles);
+      return forget;
+    }
+    const intentFile = join(state, 'runs.removal-intent.json');
     if (kind === 'runs') {
-      for (const f of (await scan(source, true)).files) if (f.path.endsWith('.json') && f.stat.mtimeMs < cutoff) add(`runs-${dayOf(f.stat.mtimeMs)}`, [f]);
+      // Oldest first, bounded by the batch cap; unreadable or unfinished records are skipped (never eligible).
+      const cap = o.batchCap ?? settings.value.runsBatchCap;
+      const scanned1 = (await scan(source, true)).files;
+      for (const f of scanned1) {
+        const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(basename(f.path));
+        if (!m) continue;
+        if (o.dryRun) { out.errors.push(`ALERT: parked ${basename(f.path)} awaits restore`); continue; }
+        await restore(f.path, join(dirname(f.path), m[1]));
+      }
+      // Crash recovery: a run killed between the manifest commit and the removal loop's bookkeeping leaves an intent file
+      // naming the records it archived but had not yet removed. Treat them like skipped records (bounded retry) so the
+      // manifest does not exclude them forever.
+      if (!o.dryRun) {
+        let keys = null;
+        try { keys = JSON.parse(boundedText(intentFile, 1024 * 1024)); if (!Array.isArray(keys)) throw Error('invalid intent state'); }
+        catch (e) { if (e.code !== 'ENOENT') out.errors.push(`removal-intent state unreadable (${e.message}); records may stay excluded, operator must inspect`); }
+        if (keys) {
+          const stillThere = new Set();
+          for (const k of keys) if (typeof k === 'string' && !isAbsolute(k) && !k.split('/').includes('..') && await access(join(source, k)).then(() => true, () => false)) stillThere.add(k);
+          let recovered = true;
+          if (stillThere.size) { try { archived = await retryRemoval(stillThere, archived); } catch (e) { recovered = false; out.errors.push(e.message); } }
+          // Keep the intent when the bookkeeping failed, so a repaired state file lets the next run recover these records.
+          if (recovered) await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; });
+        }
+      }
+      const old = scanned1.filter(f => f.path.endsWith('.json') && f.stat.mtimeMs < cutoff && !(archived.get(relative(source, f.path)) && version(f.stat).every((v, i) => v === archived.get(relative(source, f.path))[i])))
+        .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
+      let taken = 0;
+      const isComplete = o.runEligible ? undefined : (o.isComplete ?? await loadRunCompletion());
+      for (const f of old) {
+        if (taken >= cap) break;
+        let ok = false;
+        try { const bytes = await readFile(f.path); ok = (o.runEligible ?? (t => runRecordEligible(t, isComplete)))(bytes.toString('utf8')); if (ok) f.hash = createHash('sha256').update(bytes).digest('hex'); } catch { ok = false; }
+        if (!ok) { out.filesRetained++; continue; }
+        add(`runs-${dayOf(f.stat.mtimeMs)}`, [f]); taken++;
+      }
     } else {
       for await (const project of await opendir(source)) {
         if (++scanned > maxFiles) throw Error('scan bound exceeded; operator must split the source or raise maxFiles after inspection');
@@ -187,6 +276,17 @@ export async function archiveRetention(o = {}) {
         await unlink(temp).catch(e => { if (e.code !== 'ENOENT') throw e; });
         await o.afterBundle?.(final);
         const listing = o.listBundle ? await o.listBundle(final) : (await tar(['-tzf', final])).stdout.trimEnd().split('\n');
+        // Content check (runs): extract the Drive copy and compare each member's sha256 with the bytes judged eligible.
+        if (group.files.every(f => f.hash)) {
+          const check = await mkdtemp(join(tmpdir(), 'archive-retention-verify-'));
+          try {
+            await tar(['-xzf', final, '-C', check]);
+            for (const f of group.files) {
+              const got = createHash('sha256').update(await readFile(join(check, relative(source, f.path)))).digest('hex');
+              if (got !== f.hash) throw Error('archive content mismatch; originals retained');
+            }
+          } finally { await rm(check, { recursive: true, force: true }); }
+        }
         const verified = await lstat(final);
         if (!verified.isFile() || verified.size <= 0 || verified.size !== written.size || listing.length !== names.length || listing.some((n, i) => n !== names[i])) throw Error('archive verification failed; originals retained');
         const driveNow = await directory(drive);
@@ -196,33 +296,70 @@ export async function archiveRetention(o = {}) {
         // differ on the next scan and must get their own verified archive.
         const next = new Map(archived);
         for (const f of group.files) next.set(relative(source, f.path), version(f.stat));
+        // Runs with a removal path (a provider): every group file starts "pending" and leaves the set only when removed.
+        const pending = new Set(kind === 'runs' && o.withSourceWriterExclusion ? group.files.map(f => relative(source, f.path)) : []);
+        const groupKeys = new Set(pending);
+        // Keys an earlier group of this run left in the intent (its bookkeeping failed): carried, never overwritten or dropped.
+        let carried = [];
+        async function writeIntent(keys) {
+          if (!keys.length) { await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; }); return; }
+          const t = `${intentFile}.${randomUUID()}.partial`;
+          try { await writeFile(t, JSON.stringify(keys), { flag: 'wx', mode: 0o600 }); await rename(t, intentFile); } finally { await unlink(t).catch(() => {}); }
+        }
+        if (pending.size) { // intent BEFORE the manifest commit, so a crash right after it is recovered on the next run
+          try { const prior = JSON.parse(boundedText(intentFile, 1024 * 1024)); if (Array.isArray(prior)) carried = prior.filter(k => typeof k === 'string' && !groupKeys.has(k)); else throw Error('invalid intent state'); }
+          catch (e) { if (e.code !== 'ENOENT') throw Error(`removal-intent state unreadable (${e.message}); operator must inspect`); }
+          await writeIntent([...carried, ...groupKeys]);
+        }
         await writeArchiveManifest(archiveManifest, source, drive, next, maxFiles);
         archived = next;
         out.bundles.push(final); out.filesArchived += names.length;
+        await o.afterManifestCommit?.(); // test seam: a hard crash between the manifest commit and the removal loop
         let uncoordinated = 0;
-        for (const f of group.files) {
-          let removed = false, entered = false;
-          const remove = async (writerExcluded) => {
-            if (entered) throw Error('source writer exclusion invoked removal more than once');
-            entered = true;
-            if (!same(f.stat, await lstat(f.path))) return;
-            // Test seam exercises precisely the former final-stat → unlink interval.
-            await o.afterSourceStat?.(f.path);
-            if (!writerExcluded) return;
-            await unlink(f.path);
-            removed = true;
-            out.bytesFreed += f.stat.size;
-          };
+        try {
+          for (const f of group.files) {
+            let removed = false, entered = false;
+            const remove = async (writerExcluded) => {
+              if (entered) throw Error('source writer exclusion invoked removal more than once');
+              entered = true;
+              if (!same(f.stat, await lstat(f.path))) return;
+              // Test seam exercises precisely the former final-stat → unlink interval.
+              await o.afterSourceStat?.(f.path);
+              if (!writerExcluded) return;
+              // Quarantine by atomic rename, re-verify the bytes' identity, only then unlink: a writer that replaced
+              // the record between the stat and here is detected and its new file is restored, never deleted.
+              const parked = join(dirname(f.path), `.retiring-${basename(f.path)}.${randomUUID()}`);
+              await rename(f.path, parked);
+              const q = await lstat(parked);
+              if (!(q.isFile() && (!f.hash || createHash('sha256').update(await readFile(parked)).digest('hex') === f.hash) && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await restore(parked, f.path); return; }
+              // A writer holding a descriptor opened earlier can still append to the parked inode after the hash above:
+              // re-stat right before unlink and restore the record if it changed. (Only the instants between this stat
+              // and unlink remain open; a kernel-level lock would be needed to close them, see the operator error.)
+              await o.afterQuarantineVerify?.(parked);
+              if (!same(q, await lstat(parked))) { await restore(parked, f.path); return; }
+              await unlink(parked);
+              removed = true;
+              out.bytesFreed += f.stat.size;
+            };
+            try {
+              if (o.withSourceWriterExclusion) {
+                await o.withSourceWriterExclusion(f.path, () => remove(true));
+                if (!entered) uncoordinated++;
+              } else {
+                uncoordinated++;
+                await remove(false);
+              }
+            } catch (e) { if (e.code !== 'ENOENT') throw e; }
+            if (removed) pending.delete(relative(source, f.path)); else out.filesRetained++;
+          }
+        } finally {
+          // Applied on EVERY exit (skip, restored quarantine, or a thrown error mid-loop), so no unremoved record is left
+          // excluded forever by the manifest committed above. Bounded: see retryRemoval.
+          // The intent file is dropped only once the bookkeeping succeeded; on failure it stays and the next run recovers.
           try {
-            if (o.withSourceWriterExclusion) {
-              await o.withSourceWriterExclusion(f.path, () => remove(true));
-              if (!entered) uncoordinated++;
-            } else {
-              uncoordinated++;
-              await remove(false);
-            }
-          } catch (e) { if (e.code !== 'ENOENT') throw e; }
-          if (!removed) out.filesRetained++;
+            if (pending.size) archived = await retryRemoval(pending, archived);
+            await writeIntent(carried); // this group is settled; an earlier group's unsettled keys stay recorded
+          } catch (e) { out.errors.push(`retry bookkeeping failed; operator must inspect: ${e.message}`); }
         }
         if (uncoordinated) out.errors.push(`Source removal skipped for ${uncoordinated} files: writer exclusion unavailable; originals retained. Operator must arrange exclusion of all source writers, including open descriptors, before reclamation.`);
         for (const dir of [...new Set(group.dirs)].sort((a, b) => b.length - a.length)) {
@@ -238,6 +375,7 @@ export async function archiveRetention(o = {}) {
   }
   if (out.errors.length && out.status === 'archived') out.status = out.filesArchived ? 'partial' : 'skipped';
   const event = { kind: 'archive-retention', daemon: 'archive-retention', detail: out, filesArchived: out.filesArchived, bytesFreed: out.bytesFreed };
-  if (!o.dryRun) await (o.emit ?? (e => appendDaemonEvent(e, { env })))(event);
+  // Best-effort like the restore alert: all work is done, a sync/throwing/rejecting emitter must not turn it into a crash.
+  if (!o.dryRun) { try { await (o.emit ?? (e => appendDaemonEvent(e, { env })))(event); } catch (e) { out.errors.push(`event emit failed: ${e.message}`); } }
   return out;
 }

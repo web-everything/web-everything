@@ -1040,6 +1040,25 @@ export function defaultLoadItems(root) {
   return typeof load === 'function' ? load() : [];
 }
 
+// Mirrors pr-work-unit.mjs; importing it here would cycle through lease-reaper.mjs.
+/** Split authored scope entries, inheriting prefixes only within each entry. */
+function splitScopeEntries(raw) {
+  if (!Array.isArray(raw)) return [];
+  const entries = [];
+  for (const entry of raw) {
+    let inherited = '';
+    const pieces = String(entry ?? '').trim().split(/\s+/).filter(Boolean);
+    // Several globs in one entry stay joined: normalizeBriefScope refuses them (they may overlap); splitting would bypass that.
+    if (pieces.filter((p) => p.includes('*')).length > 1) { entries.push(String(entry).trim()); continue; }
+    for (const piece of pieces) {
+      const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+      if (own) inherited = own;
+      entries.push(own ? piece : inherited + piece);
+    }
+  }
+  return [...new Set(entries)];
+}
+
 /** One item's spec path + repo-qualified scope, or null when the loader cannot see it. Exported (#3438) for the
  *  same reason as {@link defaultLoadItems} just above.
  *
@@ -1071,7 +1090,7 @@ export function findItem(key, loadItems, pocRegistry = null) {
     slug: String(it.slug),
     specPath: `backlog/${it.num}-${it.slug}.md`,
     // Already repo-qualified by the loader (`we:scripts/...`), which is the form the brief's `--scope` wants.
-    scope: Array.isArray(it.scope) ? it.scope.map(String) : [],
+    scope: splitScopeEntries(it.scope),
     // The still-open `blockedBy` targets (#3462), or `[]` when every edge resolved or the item names none.
     openBlockers: Array.isArray(it.openBlockers) ? it.openBlockers.map(String) : [],
     // #3717 — the card's own `size:` frontmatter, narrowed through for the SAME reason `openBlockers` is: the
@@ -1701,6 +1720,8 @@ export function createDispatchSinks({
           ...(wrappedPid ? { wrapped: true, runnerPid: wrappedPid } : {}),
           launchKind: payload?.launchKind ?? 'build',
           route,
+          // R549: false when the launch output could not be read and `handle` is only the minted session id.
+          handleVerified: handle != null && String(handle) !== sessionId,
           executor,
           effort: reportedEffort ?? payload?.routing?.effort ?? table?.effort ?? null,
           supervisorModel: reportedModel ?? modelDecision?.model ?? extractModelFlag(extraArgs.map(String)).value,

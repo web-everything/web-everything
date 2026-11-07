@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readPrsFromFile } from '../open-pr-fetch.mjs';
 
+const CLI_TEST_TIMEOUT_MS = 60_000;
+
 const fixture = [901, 902].map((number) => ({
   number, headRefName: `lane/3478-delivery-${number}`, headRefOid: `sha-${number}`,
   title: 'WE #3478: implement delivery', body: 'Closes #3478', labels: [{ name: 'review:pending' }],
@@ -110,6 +112,9 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
         expect(standalone.throttled).toEqual([['gh',
           ['pr', 'list', '--state', 'open', '--limit', '200', '--json', fields, '--repo', 'web-everything/web-everything'], expect.any(Object)]]);
       });
-    });
+      // Each cli() call resets the module graph and re-imports the whole watch script, twice per test. That is ~2s on an
+      // idle host but exceeded the 5s default on a loaded coverage shard (main red @ 996a30514, shard 6/9), so the budget
+      // is explicit; every assertion above is unchanged.
+    }, CLI_TEST_TIMEOUT_MS);
   });
 }

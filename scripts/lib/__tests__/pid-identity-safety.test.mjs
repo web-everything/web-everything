@@ -177,7 +177,7 @@ describe('session-bound fixing claim identity safety', () => {
           reason: 'session-identity-dead (zombie)' }]);
         expect(result.refreshed).toEqual([]);
         expect(readFixDispatchClaim(claim)).toBeNull();
-        expect(identity).toHaveBeenCalledWith(PID);
+        expect(identity).toHaveBeenCalledWith(PID, { startedBy: rows[0].startedAt });
       } else {
         expect(result.released ?? []).toEqual([]);
         expect(result.refreshed).toHaveLength(1);
@@ -252,7 +252,7 @@ describe('session-bound fixing claim identity safety', () => {
         hungInfoFor: () => null, awaitingVerifyFor: null,
         nowMs: NOW + 1000, nowIso: () => new Date(NOW + 1000).toISOString(),
       });
-      expect(identity).toHaveBeenCalledWith(PID);
+      expect(identity).toHaveBeenCalledWith(PID, { startedBy: null });
       expect(result.refreshed).toEqual([]);
       expect(result.released ?? []).toEqual([]);
       expect(readFixDispatchClaim(claim).meta).toMatchObject({

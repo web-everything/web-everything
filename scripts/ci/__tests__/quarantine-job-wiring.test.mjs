@@ -32,9 +32,11 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
     expect(skip(resolved, file).line).toBe(`--exclude=${file}`);
   });
 
-  it('soak checkout includes ancestry so quarantine can prove changed files', () => {
-    const checkout = jobs['soak-shard'].steps.find((s) => s.uses?.startsWith('actions/checkout@'));
-    expect(checkout.with?.['fetch-depth']).toBe(0);
+  it('soak checkout is depth 50 plus blobless main so quarantine can prove changed files (else it fails closed)', () => {
+    const steps = jobs['soak-shard'].steps;
+    const i = steps.findIndex((s) => s.uses?.startsWith('actions/checkout@'));
+    expect(steps[i].with?.['fetch-depth']).toBe(50);
+    expect(steps[i + 1].run).toMatch(/--filter=blob:none --depth=1000000 origin \+refs\/heads\/main:refs\/remotes\/origin\/main/);
   });
 
   it.each([['integration', integrationFile], ['soak-shard (1)', soakFile]])('%s retains fail-closed guards', (job, file) => {

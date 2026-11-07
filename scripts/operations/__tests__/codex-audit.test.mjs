@@ -3,10 +3,19 @@ import { createHash } from 'node:crypto';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit } from '../codex-audit.mjs';
+import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
+
+// Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
+const settingsOverride = vi.hoisted(() => ({ text: null }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  const readFileSync = (path, ...rest) => settingsOverride.text !== null && String(path).endsWith('settings/codex-audit.json') ? settingsOverride.text : actual.readFileSync(path, ...rest);
+  return { ...actual, readFileSync, default: { ...actual.default, readFileSync } };
+});
 
 const BASE = 'a'.repeat(40);
 const HEAD = 'b'.repeat(40);
@@ -368,5 +377,151 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     f.fs.readFileSync.mockReturnValue(settings);
     expect(() => f.deps.appendRecord({ head: HEAD })).toThrow();
     expect(f.fs.appendFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe('prior question hashes (AU1 PR-B)', () => {
+  const PRIOR = 'c'.repeat(64);
+  const NOW = Date.parse('2026-11-04T12:00:00.000Z');
+  const window = acceptUntil => [{ hash: PRIOR, acceptUntil }];
+  const open = window('2026-11-10T00:00:00.000Z');
+  const rec = (verdict, over = {}) => ({ head: HEAD, base: BASE, questionHash: PRIOR, at: AT, verdict, findings: [], ...over });
+  const find = (records, priorQuestionHashes) => findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, priorQuestionHashes, now: NOW });
+
+  it('accepts the current hash and a prior hash only inside its window', () => {
+    expect(isAcceptedQuestionHash(QUESTION_HASH, { priorQuestionHashes: [], now: NOW })).toBe(true);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: open, now: NOW })).toBe(true);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: window('2026-11-04T11:59:59.000Z'), now: NOW })).toBe(false);
+    expect(isAcceptedQuestionHash('d'.repeat(64), { priorQuestionHashes: open, now: NOW })).toBe(false);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: [], now: NOW })).toBe(false);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: 'nope' }], now: NOW })).toBe(false);
+  });
+  it('a prior NOT WEAKENED passes inside its window', () => {
+    const r = rec('NOT WEAKENED');
+    expect(find([r], open)).toBe(r);
+  });
+  it('a prior WEAKENED still blocks (is returned as WEAKENED)', () => {
+    expect(find([rec('WEAKENED', { findings: ['x.mjs:1 gap'] })], open)?.verdict).toBe('WEAKENED');
+  });
+  it('a later prior WEAKENED beats an earlier prior NOT WEAKENED', () => {
+    const later = rec('WEAKENED', { at: '2026-11-02T12:00:00.000Z', findings: ['x.mjs:1 gap'] });
+    expect(find([rec('NOT WEAKENED'), later], open)).toBe(later);
+  });
+  it('unknown, expired or unlisted prior hashes are ignored', () => {
+    expect(find([rec('NOT WEAKENED')], [])).toBeNull();
+    expect(find([rec('NOT WEAKENED')], window('2026-11-04T11:00:00.000Z'))).toBeNull();
+    expect(find([rec('NOT WEAKENED', { questionHash: 'd'.repeat(64) })], open)).toBeNull();
+  });
+  it('a prior NOT WEAKENED never overrides a current-question WEAKENED, in either order', () => {
+    const cur = rec('WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-01T12:00:00.000Z', findings: ['x.mjs:1 gap'] });
+    const prior = rec('NOT WEAKENED', { at: '2026-11-03T12:00:00.000Z' });
+    expect(find([cur, prior], open)).toBe(cur);
+    expect(find([prior, cur], open)).toBe(cur);
+  });
+  it('a contradictory current-question record blocks the prior fallback', () => {
+    const bad = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-02T12:00:00.000Z', findings: ['WEAKENED'] });
+    expect(find([rec('NOT WEAKENED'), bad], open)).toBeNull();
+  });
+  it('prior records older than 30 days before acceptUntil, or dated after it, are ignored', () => {
+    expect(find([rec('NOT WEAKENED', { at: '2020-01-01T00:00:00.000Z' })], open)).toBeNull();
+    expect(find([rec('NOT WEAKENED', { at: '2026-11-11T00:00:00.000Z' })], open)).toBeNull();
+  });
+  it('contradictory prior records are still rejected', () => {
+    expect(find([rec('NOT WEAKENED', { findings: ['WEAKENED'] })], open)).toBeNull();
+  });
+  it('the setting lands empty and invalid values resolve to empty', () => {
+    expect(resolvePriorQuestionHashes()).toEqual([]);
+    expect(resolvePriorQuestionHashes({ readFile: () => '{"audit":{"priorQuestionHashes":[{"hash":"zz","acceptUntil":"2026-12-01"}]}}' })).toEqual([]);
+    expect(resolvePriorQuestionHashes({ readFile: () => { throw new Error('unreadable'); } })).toEqual([]);
+  });
+  const settingsWith = list => () => JSON.stringify({ audit: { priorQuestionHashes: list } });
+  it('resolves a valid nonempty prior-question-hash setting', () => {
+    const list = [{ hash: PRIOR, acceptUntil: '2026-12-01T00:00:00.000Z' }, { hash: 'd'.repeat(64), acceptUntil: '2026-12-02T00:00:00.000Z' }];
+    expect(resolvePriorQuestionHashes({ readFile: settingsWith(list), env: {} })).toEqual(list);
+    // one invalid entry voids the whole list (strictest reading)
+    expect(resolvePriorQuestionHashes({ readFile: settingsWith([...list, { hash: 'zz', acceptUntil: '2026-12-01' }]), env: {} })).toEqual([]);
+  });
+  it('excludes platform prior-question hashes', () => {
+    const dir = realFs.mkdtempSync(join(tmpdir(), 'codex-audit-platform-'));
+    try {
+      const file = join(dir, 'platform.json');
+      const platform = { hash: 'e'.repeat(64), acceptUntil: '2026-12-05T00:00:00.000Z' };
+      realFs.writeFileSync(file, JSON.stringify({ audit: { priorQuestionHashes: [platform] } }));
+      const env = { WE_PLATFORM_PREFERENCES_FILE: file };
+      // tool layer unset (empty file, then unreadable): a platform-only value must not surface
+      expect(resolvePriorQuestionHashes({ env, readFile: () => '{}' })).toEqual([]);
+      expect(resolvePriorQuestionHashes({ env, readFile: () => { throw new Error('unreadable'); } })).toEqual([]);
+      // a tool value is kept without the platform entry merged in
+      const tool = { hash: PRIOR, acceptUntil: '2026-12-01T00:00:00.000Z' };
+      expect(resolvePriorQuestionHashes({ env, readFile: settingsWith([tool]) })).toEqual([tool]);
+    } finally { realFs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('window boundaries: acceptUntil and the 30-day lower bound are inclusive, one ms past is rejected', () => {
+    const until = '2026-11-10T00:00:00.000Z', U = Date.parse(until), list = window(until);
+    const ok = (now, at) => isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: list, now, at });
+    expect(MAX_PRIOR_WINDOW_MS).toBe(30 * 24 * 3600 * 1000);
+    expect(ok(U, undefined)).toBe(true);
+    expect(ok(U + 1, undefined)).toBe(false);
+    expect(ok(U, until)).toBe(true);
+    expect(ok(U, new Date(U + 1).toISOString())).toBe(false);
+    expect(ok(U, new Date(U - MAX_PRIOR_WINDOW_MS).toISOString())).toBe(true);
+    expect(ok(U, new Date(U - MAX_PRIOR_WINDOW_MS - 1).toISOString())).toBe(false);
+  });
+  it('a current-question record for another head or base does not block the prior fallback', () => {
+    const prior = rec('NOT WEAKENED');
+    expect(find([prior, rec('WEAKENED', { questionHash: QUESTION_HASH, head: BASE, findings: ['x.mjs:1 gap'] })], open)).toBe(prior);
+    expect(find([prior, rec('WEAKENED', { questionHash: QUESTION_HASH, base: HEAD, findings: ['x.mjs:1 gap'] })], open)).toBe(prior);
+  });
+  it.each([
+    ['an invalid timestamp', { at: 'not-a-date' }],
+    ['an unrecognized verdict', { verdict: 'MAYBE' }],
+    ['a missing verdict', { verdict: undefined }],
+  ])('a current-question record with %s blocks the prior fallback', (_name, over) => {
+    const bad = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, ...over });
+    expect(find([rec('NOT WEAKENED'), bad], open)).toBeNull();
+    expect(find([bad, rec('NOT WEAKENED')], open)).toBeNull();
+  });
+  it('findAudit accepts configured prior hashes when options omit priorQuestionHashes', () => {
+    // The default parameter resolves the tool-layer setting; feed it a nonempty value through the mocked read.
+    const list = [{ hash: PRIOR, acceptUntil: '2099-01-01T00:00:00.000Z' }];
+    const prior = rec('NOT WEAKENED', { at: '2098-12-20T00:00:00.000Z' });
+    const omit = records => findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, now: Date.parse('2098-12-25T00:00:00.000Z') });
+    try {
+      settingsOverride.text = JSON.stringify({ audit: { priorQuestionHashes: list } });
+      expect(omit([prior])).toBe(prior);
+      // the same configured window still honours a prior WEAKENED and the current-question block
+      const weak = rec('WEAKENED', { at: '2098-12-21T00:00:00.000Z', findings: ['x.mjs:1 gap'] });
+      expect(omit([prior, weak])).toBe(weak);
+      expect(omit([prior, rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: 'not-a-date' })])).toBeNull();
+    } finally { settingsOverride.text = null; }
+    // the shipped (empty) setting accepts nothing extra
+    expect(omit([prior])).toBeNull();
+  });
+  it('replay over a frozen copy of audits.jsonl is identical with priorQuestionHashes empty', () => {
+    const dir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+    const records = realFs.readFileSync(join(dir, 'audits-frozen.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    const expected = JSON.parse(realFs.readFileSync(join(dir, 'audits-frozen.expected.json'), 'utf8'));
+    const pairs = [...new Set(records.map(r => `${r.head}/${r.base}`))];
+    expect(pairs.length).toBeGreaterThan(10);
+    for (const key of pairs) {
+      const [head, base] = key.split('/');
+      const got = findAudit(records, { head, base, questionHash: QUESTION_HASH, priorQuestionHashes: [] });
+      expect(got ? { at: got.at, verdict: got.verdict } : null).toEqual(expected[key]);
+    }
+  });
+});
+
+describe('audit record fingerprint (R503)', () => {
+  it('stores the head net-diff fingerprint when readable and omits it when not', async () => {
+    const fp = 'c'.repeat(64);
+    const f = fixture(); f.deps.fingerprint = vi.fn(async () => fp);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fingerprint).toHaveBeenCalledWith(BASE, HEAD);
+    expect(f.records[0]).toMatchObject({ head: HEAD, fingerprint: fp });
+    for (const bad of [async () => null, async () => { throw new Error('git'); }]) {
+      const g = fixture(); g.deps.fingerprint = bad;
+      expect(await main(ARGS, g.deps)).toBe(0);
+      expect(g.records[0]).not.toHaveProperty('fingerprint');
+    }
   });
 });

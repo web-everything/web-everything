@@ -1,6 +1,7 @@
 {
   "name": "web-everything",
   "version": "1.0.0",
+  "packageManager": "pnpm@12.18.0",
   "description": "Web Everything - Grouping standards for better web library standardization",
   "customElements": "custom-elements.json",
   "scripts": {
@@ -37,8 +38,8 @@
     "test:smoke": "node scripts/readiness/heavy-admission.mjs run -- playwright test --project=chromium tests/smoke",
     "test:a11y": "node scripts/readiness/heavy-admission.mjs run -- playwright test --project=chromium tests/a11y",
     "regression": "node scripts/dev/regression.mjs",
-    "check:visual": "playwright test --project=chromium tests/visual",
-    "check:visual:update": "playwright test --project=chromium tests/visual --update-snapshots",
+    "check:visual": "node scripts/readiness/heavy-admission.mjs run -- playwright test --project=chromium tests/visual",
+    "check:visual:update": "node scripts/readiness/heavy-admission.mjs run -- playwright test --project=chromium tests/visual --update-snapshots",
     "check:render": "node scripts/dev/render-check.mjs",
     "test:interaction": "node scripts/readiness/heavy-admission.mjs run -- playwright test --project=interaction",
     "test:coverage": "node scripts/readiness/heavy-admission.mjs run -- vitest run --coverage",
@@ -61,6 +62,7 @@
     "converge:daemon": "node scripts/converge-daemon-install.mjs",
     "pr-status": "node scripts/pr-status.mjs",
     "check:standards": "node scripts/readiness/heavy-admission.mjs run -- node scripts/check-standards.mjs",
+    "check:lockfile-parity": "node scripts/check-lockfile-parity.mjs",
     "check:statute": "node scripts/check-statute.mjs",
     "check:backlog-workflow": "node scripts/check-backlog-workflow.mjs",
     "check:memory": "node scripts/check-memory.mjs",
