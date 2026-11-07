@@ -144,9 +144,15 @@ function conflictsWithPolicyClear(label, { settlesPending = false, settlesReview
 }
 
 /** The daemon's own referral pause notice (`decideReferralHold`'s need-a-ruling shape, automation author only). Only a
- * caller that has just proven every referral ruled may treat it as settled: the persist-exhausted and ledger variants,
- * and any look-alike from another author, are different holds and stay. PURE. */
-function isSettledReferralPauseNotice(comment) {
+ * caller that has just proven every referral ruled may treat it as settled. A persistence-failure notice (detail
+ * paragraph, or the retries-spent lead) is settled only when the caller also proves persistence recovered
+ * (`persistRecovered`: the newest run is no longer persistenceFailed); the ledger variant and any look-alike from
+ * another author are different holds and stay. PURE. */
+const RULING_PAUSE_LEAD = /^review paused: \d+ referrals need a ruling; it resumes on a new push, a ruling, or a send-back(?:\n|$)/;
+const PERSIST_EXHAUSTED_LEAD = /^review paused: \d+ referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply(?:\n|$)/;
+const PERSIST_DETAIL = /\n\nReferral persistence (?:failed; the next bounded retry is at [0-9TZ:.-]+\.|retries are exhausted; waiting for a new event\.)\n\n<!-- review-referral-hold: [0-9a-f]+ -->$/;
+
+function isSettledReferralPauseNotice(comment, { persistRecovered = false } = {}) {
   // Same trust set the producer's own dedupe uses (notifyReferralHoldNotice): the daemon sometimes posts under the operator's credential.
   if (!isTrustedMarkerAuthor(comment) || typeof comment?.body !== 'string') return false;
   const body = comment.body.trim();
@@ -155,9 +161,11 @@ function isSettledReferralPauseNotice(comment) {
   // detail means a persist hold, not a pause for rulings, so it never counts as settled. That detail is the standalone
   // paragraph between the findings block and the marker, so it is matched only there, anchored to the marker:
   // a finding summary (interpolated into the findings block) that merely quotes the phrase is not that detail.
-  return /^review paused: \d+ referrals need a ruling; it resumes on a new push, a ruling, or a send-back(?:\n|$)/.test(body)
-    && /\n<!-- review-referral-hold: [0-9a-f]+ -->$/.test(body)
-    && !/\n\nReferral persistence (?:failed; the next bounded retry is at [0-9TZ:.-]+\.|retries are exhausted; waiting for a new event\.)\n\n<!-- review-referral-hold: [0-9a-f]+ -->$/.test(body);
+  if (!/\n<!-- review-referral-hold: [0-9a-f]+ -->$/.test(body)) return false;
+  // The caller proves persistence is no longer failing (the newest run has none), so a persistence notice is a stale
+  // episode from before the retry succeeded: the producer never removes it, and a ruling cannot clear it.
+  if (RULING_PAUSE_LEAD.test(body)) return persistRecovered || !PERSIST_DETAIL.test(body);
+  return persistRecovered && PERSIST_EXHAUSTED_LEAD.test(body);
 }
 
 /** A reviewed-sha marker alone never proves acceptance or supersedes a newer hold. */
@@ -451,7 +459,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         // Once every refused referral is ruled, the daemon's own "referrals need a ruling" pause notice (trusted author
         // only) is settled, and the parked run's retained review:pending is the resume's own label. Every other hold stands.
         const guardComments = referralsRuled && Array.isArray(rawPr.comments)
-          ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment)) : rawPr.comments;
+          ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment, { persistRecovered: true })) : rawPr.comments;
         const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
         const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
           settlesPending: true, settlesReviewPending: referralsRuled };
@@ -470,7 +478,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           // Only the newest attempt on this head counts: an older ruled run must not mask a newer one that still owes a human.
           const newest = readReviewRuns().filter(run => run?.repo === repo && Number(run.pr) === pr && run.head === head)
             .reduce((best, run) => !best || Number(run.startedAt) > Number(best.startedAt) ? run : best, null);
-          ruled = newest != null && refusedReferralsAreRuled({ ...rawPr, number: pr }, newest, { repo });
+          // A run still failing to persist is the persistence retry path's, not a ruling resume (and its notices stay holds).
+          ruled = newest != null && newest.persistenceFailed === false
+            && refusedReferralsAreRuled({ ...rawPr, number: pr }, newest, { repo });
         } catch { /* Unknown run evidence preserves the existing not-owed decision. */ }
         if (ruled) return fullReviewDecision('stored review needs-human only on referrals now ruled; resume the parked run',
           { referralsRuled: true });

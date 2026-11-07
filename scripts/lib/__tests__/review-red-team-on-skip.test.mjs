@@ -89,17 +89,20 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     // The daemon sometimes posts under the operator's own credential; the producer's dedupe trusts that author too.
     if (kind === 'notice posted under the operator credential') comments.push({ body: notice, author: { login: OPERATOR_LOGINS[0] }, createdAt: '2026-11-06T13:26:00Z' });
     if (kind === 'bare notice without episode marker') comments.push({ body: why, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
-    if (kind === 'notice with persistence detail') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+    if (/notice with persistence detail/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
       body: `${why}\n\nReferral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z.${marker}` });
     // Finding summaries are interpolated into the notice, so one may quote the persistence phrases without being that detail.
     if (kind === 'a finding summary quoting "Referral persistence failed"') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
       body: `${why}\n\nWaiting on your ruling (block, card or not-real):\n- \`scripts/x.mjs:1\` — Referral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z is quoted\n- \`no file\` — second defect${marker}` });
     if (kind === 'a finding summary quoting "Referral persistence retries are exhausted"') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
       body: `${why}\n\nWaiting on your ruling (block, card or not-real):\n- \`scripts/x.mjs:1\` — Referral persistence retries are exhausted; waiting for a new event.\n- \`no file\` — second defect${marker}` });
-    if (kind === 'findings block then real exhausted detail') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+    if (/findings block then real exhausted detail/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
       body: `${why}${findings}\n\nReferral persistence retries are exhausted; waiting for a new event.${marker}` });
-    if (kind === 'findings block then real failed detail') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+    if (/findings block then real failed detail/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
       body: `${why}${findings}\n\nReferral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z.${marker}` });
+    // The retries-spent notice as the producer posts it: its own lead, the findings block, the exhausted detail, the marker.
+    if (/exhausted-lead notice/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `review paused: 2 referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply${findings}\n\nReferral persistence retries are exhausted; waiting for a new event.${marker}` });
     if (kind === 'persist-exhausted notice') comments.push({ body: 'review paused: 2 referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply',
       author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
     if (kind === 'notice from another author') comments.push({ body: notice, author: { login: 'stranger' }, createdAt: '2026-11-06T13:26:00Z' });
@@ -116,6 +119,8 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     let runs = [projected];
     const loopPayload = { verdict: run.verdict, findings: { read: run.findings.read } };
     if (kind === 'no parked run') runs = [];
+    // A run that still fails to persist: its persistence notices describe a live hold, so nothing resumes.
+    if (/persistence still failing/.test(kind)) runs = [{ ...projected, persistenceFailed: true }];
     if (kind === 'run for other head') runs = [{ ...projected, head: 'b'.repeat(40) }];
     if (kind === 'run for other repo') runs = [{ ...projected, repo: 'other/repo' }];
     if (kind === 'run for other PR') runs = [{ ...projected, pr: pr + 1 }];
@@ -151,6 +156,11 @@ describe('#6345 — resume a stored needs-human review after its refused referra
   it.each([
     'pause notice', 'review:pending label', 'pause notice and review:pending label', 'notice posted under the operator credential',
     'a finding summary quoting "Referral persistence failed"', 'a finding summary quoting "Referral persistence retries are exhausted"',
+    // Persistence recovered (the newest run no longer fails to persist) and every referral is ruled: the old notices are stale.
+    'recovered persistence, stale notice with persistence detail',
+    'recovered persistence, stale findings block then real failed detail',
+    'recovered persistence, stale findings block then real exhausted detail',
+    'recovered persistence, stale exhausted-lead notice',
   ])('resumes when the parked run carries its own settled marks: %s', kind => {
     const o = parkedFixture(kind);
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
@@ -182,9 +192,12 @@ describe('#6345 — resume a stored needs-human review after its refused referra
   });
 
   it.each([
-    'persist-exhausted notice', 'notice from another author', 'bare notice without episode marker', 'notice with persistence detail', 'other hold comment', 'review:human label',
+    'persist-exhausted notice', 'notice from another author', 'bare notice without episode marker', 'other hold comment', 'review:human label',
     'pause notice and review:human label',
-    'findings block then real exhausted detail', 'findings block then real failed detail',
+    'persistence still failing, findings block then real failed detail',
+    'persistence still failing, findings block then real exhausted detail',
+    'persistence still failing, exhausted-lead notice',
+    'persistence still failing, pause notice',
   ])('fails closed: a hold that is not the settled referral pause still skips: %s', kind => {
     const o = parkedFixture(kind);
     expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
