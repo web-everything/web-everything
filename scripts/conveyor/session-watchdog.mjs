@@ -67,7 +67,7 @@
  *   node scripts/conveyor/session-watchdog.mjs --apply [--json]  # one pass that also takes its actions
  */
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -82,7 +82,7 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listLiveFixClaims, releaseFixClaim, FIXING_KIND } from './fix-procedure.mjs';
 import { fixDispatchClaimRoot, fixDispatchSessionName, listFixDispatchClaims } from './fix-claim-store.mjs';
 import { parseLockEntry } from '../readiness/file-locks.mjs';
-import { makeAwaitingVerifyResolver } from './await-verify.mjs';
+import { awaitVerifyStoreDir, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyPath, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
 import { makeCompletionResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
@@ -245,7 +245,7 @@ const PUSH_RE = /\bgit\b[^;&|]*\bpush\b|\bpr-land\.mjs\b|\bfix-procedure\.mjs\s+
  * still-pending call runs to `nowMs`). Time matters: a quick `git log -1` in every call is habit, not a wait.
  * PURE.
  */
-export function summarizeTail(entries, { windowCalls = DEFAULT_SESSION_WATCHDOG.waitLoopWindowCalls, nowMs = null } = {}) {
+export function summarizeTail(entries, { windowCalls = DEFAULT_SESSION_WATCHDOG.waitLoopWindowCalls, nowMs = null, hadUnparseableLine = false } = {}) {
   const list = Array.isArray(entries) ? entries : [];
   const resultAt = new Map();
   for (const e of list) for (const b of e?.blocks || []) if (b.kind === 'tool_result') resultAt.set(b.toolUseId, Date.parse(e.ts ?? ''));
@@ -292,6 +292,8 @@ export function summarizeTail(entries, { windowCalls = DEFAULT_SESSION_WATCHDOG.
     if (Number.isFinite(t) && (lastActivityMs == null || t > lastActivityMs)) lastActivityMs = t;
   }
   return {
+    // The shared reader flags thrown parse failures; summarizeEntry also returns unparseable sentinels.
+    hadUnparseableLine: hadUnparseableLine || list.some((entry) => entry?.kind === 'unparseable'),
     totalCalls: calls.length,
     recentCalls: recent.length,
     distinct: new Set(recent.map((c) => c.segs.join(' ; '))).size,
@@ -316,6 +318,7 @@ export function classifyWatchdogSession({ row, tail, nowMs, standard, cfg = DEFA
   const runtimeMs = Number.isFinite(startedMs) ? nowMs - startedMs : null;
   const ghostMs = cfg.ghostHours * 60 * MINUTE;
   const ev = { runtimeMinutes: runtimeMs == null ? null : Math.round(runtimeMs / MINUTE), standardMinutes: Math.round(standard.ms / MINUTE) };
+  if (tail?.hadUnparseableLine) ev.unparseableTail = true;
   if (runtimeMs != null && runtimeMs < standard.ms) return { class: CLASSES.WITHIN, reason: 'runtime-within-standard', evidence: ev };
   if (!tail || !Number.isFinite(tail.lastActivityMs)) {
     if (pidAlive === false && runtimeMs != null && runtimeMs >= ghostMs) {
@@ -431,6 +434,7 @@ export function planWatchdog({ rows, claims, stopClaims = claims, prHeadFor = ()
   }
   const reapKinds = new Set(['fix', 'ci-heal', 'prepare']);
   const eligible = (r) => r.listingKind === 'background' && reapKinds.has(r.kind) && r.state === 'idle'
+    && !r.evidence?.unparseableTail
     && !!r.id && !!r.sessionId && !claimHolders.has(r) && !r.evidence?.pendingTool
     && Number.isFinite(r.evidence?.idleMinutes) && r.evidence.idleMinutes >= cfg.reapFinishedGraceMinutes;
   const stopRows = new Set();
@@ -505,10 +509,10 @@ export function writeRmIneffective(ledger, dir = watchdogEventDir()) {
 }
 
 /** Bounded tail read of one listed session's own transcript, through `hung-session.mjs`'s shared primitive. */
-export function readWatchdogTail(row, cfg = DEFAULT_SESSION_WATCHDOG, nowMs = Date.now()) {
-  const t = readTranscriptTailActivity(row, { tailLines: cfg.tailLines, maxBytes: cfg.tailMaxBytes, fieldMax: 200, tailLinesFn: tailLines, summarizeEntryFn: summarizeEntry });
+export function readWatchdogTail(row, cfg = DEFAULT_SESSION_WATCHDOG, nowMs = Date.now(), io = {}) {
+  const t = readTranscriptTailActivity(row, { tailLines: cfg.tailLines, maxBytes: cfg.tailMaxBytes, fieldMax: 200, tailLinesFn: tailLines, summarizeEntryFn: summarizeEntry, ...io });
   if (!t) return null;
-  const s = summarizeTail(t.entries, { windowCalls: cfg.waitLoopWindowCalls, nowMs });
+  const s = summarizeTail(t.entries, { windowCalls: cfg.waitLoopWindowCalls, nowMs, hadUnparseableLine: t.hadUnparseableLine });
   return { ...s, lastActivityMs: t.lastActivityMs, file: t.file };
 }
 
@@ -555,13 +559,58 @@ export function defaultClaimStoreReadable(readDirectory = readdirSync, readEntry
     let parsed = null;
     try { parsed = parseLockEntry(readEntry(join(root, entry, 'lock.json'), 'utf8')); }
     catch { /* An entry disappearing mid-scan is incomplete evidence, too. */ }
-    if (!parsed) {
+    if (!parsed || !parsed.meta?.repo || !parsed.meta?.pr || !parsed.meta?.kind) {
       // Quote the entry name to keep control characters inert; never log lock contents or read errors.
       log(`session-watchdog: claim store unreadable (${JSON.stringify(`${entry}/lock.json`)}); stops refused until a successful read`);
       return false;
     }
   }
   return true;
+}
+
+/** Stop-only resolver: missing records are safe, unreadable or malformed evidence is unknown. */
+export function makeStopAwaitingVerifyResolver({
+  readFileSyncFn = readFileSync, statFn = statSync, dir = awaitVerifyStoreDir(),
+  now = Date.now, ttlMs = resolveAwaitVerifyTtlMs(),
+} = {}) {
+  return (session) => {
+    try {
+      if (typeof session?.cwd !== 'string' || !session.cwd) return null;
+      let gitMissing = false;
+      let pathError = false;
+      const lanePath = resolveAwaitVerifyPath(session.cwd, {
+        statFn: (path) => {
+          try { return statFn(path); }
+          catch (err) {
+            if (err?.code === 'ENOENT') gitMissing = true;
+            else pathError = true;
+            throw err;
+          }
+        },
+        readFileSyncFn: (path, encoding) => {
+          try { return readFileSyncFn(path, encoding); }
+          catch (err) { pathError = true; throw err; }
+        },
+      });
+      // The shared path resolver catches errors; retain them rather than mistaking them for absence.
+      if (pathError || (!lanePath && !gitMissing)) return null;
+      const keys = [session.sessionId, session.name].map((key) => awaitVerifyStoreKey({ sessionId: key }));
+      if (keys.some((key, i) => !key && [session.sessionId, session.name][i])) return null;
+      if (!keys.some(Boolean)) return null;
+      const paths = new Set([lanePath, ...keys.filter(Boolean).map((key) => join(dir, `${key}.json`))].filter(Boolean));
+      for (const path of paths) {
+        let text;
+        try { text = readFileSyncFn(path, 'utf8'); }
+        catch (err) { if (err?.code === 'ENOENT') continue; throw err; }
+        const record = JSON.parse(text);
+        if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+        const verdict = classifyAwaitVerify({ record, session, nowMs: now(), ttlMs });
+        if (verdict.awaiting === true) return verdict;
+        if (!['expired', 'foreign-session', 'other-pr'].includes(verdict.reason)) return null;
+      }
+      return { awaiting: false };
+    } catch { return null; }
+  };
 }
 
 export function runSessionWatchdogPass({
@@ -583,7 +632,7 @@ export function runSessionWatchdogPass({
   },
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
   completionFor = makeCompletionResolver(),
-  awaitingVerifyFor = makeAwaitingVerifyResolver(),
+  awaitingVerifyFor = makeStopAwaitingVerifyResolver({ now: () => nowMs }),
   rm = rmSessionRecord,
   stop = stopSessionWithRetry,
   ownSessionId = process.env.CLAUDE_CODE_SESSION_ID,
@@ -695,9 +744,10 @@ export function runSessionWatchdogPass({
           log(`session-watchdog: awaiting verification unreadable; stop refused for ${a.handle}`);
           continue;
         }
-        // A null verdict matches the reaper's not-awaiting convention; a thrown resolver refuses above.
-        if (awaiting?.awaiting === true) {
-          done.push({ ...a, ok: false, detail: 'refused: awaiting verification' });
+        if (awaiting?.awaiting !== false) {
+          const detail = awaiting?.awaiting === true ? 'refused: awaiting verification' : 'refused: awaiting verification unreadable';
+          done.push({ ...a, ok: false, detail });
+          if (awaiting?.awaiting !== true) log(`session-watchdog: awaiting verification unreadable; stop refused for ${a.handle}`);
           continue;
         }
         if (stopCount >= Math.floor(config.reapMaxStopsPerTick)) {

@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_SESSION_WATCHDOG, CLASSES, ESCALATION_EVENT_TYPE, resolveSessionWatchdogConfig, watchdogKindOf, standardDuration,
   commandSegments, summarizeTail, classifyWatchdogSession, planWatchdog, runSessionWatchdogPass, escalationKey,
-  readEscalationLedger, appendEscalationEvent, renderWatchdogPass, defaultClaimStoreReadable,
+  readEscalationLedger, appendEscalationEvent, renderWatchdogPass, defaultClaimStoreReadable, readWatchdogTail, makeStopAwaitingVerifyResolver,
 } from '../session-watchdog.mjs';
 import { tailLines, summarizeEntry } from '../../../skills-src/inspect-agent-health/agent-health.mjs';
 import fixerStuck from '../health-smells/fixer-stuck.mjs';
@@ -273,7 +273,7 @@ describe('runSessionWatchdogPass — the IO shell with fakes', () => {
     const opts = {
       nowMs: NOW, agents: listing, processes: [{ pid: 2009, command: 'claude' }, { pid: 3, command: 'claude' }],
       readTail: (r) => { calls.tailReads.push(r.name); return tails[r.sessionId] ?? null; },
-      listDispatchClaims: () => [], awaitingVerifyFor: () => null, readHeavy: () => null, listClaims: () => claims, prHeadFor: () => 'abc', completionFor: () => null,
+      listDispatchClaims: () => [], awaitingVerifyFor: () => ({ awaiting: false }), readHeavy: () => null, listClaims: () => claims, prHeadFor: () => 'abc', completionFor: () => null,
       rm: ({ handle }) => { calls.rm.push(handle); return { removed: true, alreadyGone: false }; },
       releaseFixing: () => ({ released: false, reason: 'absent' }), releaseDispatch: () => ({ released: [], skipped: [] }),
       readLedger: () => ({ emitted: new Set(), acked: new Set() }), appendEvent: (e) => calls.events.push(e),
@@ -671,7 +671,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     const result = runSessionWatchdogPass({
       nowMs: T0, act: true, agents: [listing()], processes: [{ pid: 2009, command: 'claude' }],
       readTail: (r) => { calls.tailReads.push(r.sessionId); return finishedTail(); },
-      listDispatchClaims: () => [], awaitingVerifyFor: () => null, readHeavy: () => null, listClaims: () => [], prHeadFor: () => null, completionFor: () => null,
+      listDispatchClaims: () => [], awaitingVerifyFor: () => ({ awaiting: false }), readHeavy: () => null, listClaims: () => [], prHeadFor: () => null, completionFor: () => null,
       stop: ({ handle }) => { calls.stop.push(handle); return { stopped: true }; },
       appendReapEvent: (e) => calls.reapEvents.push(e), log: (line) => calls.logs.push(line),
       ownSessionId: 'orchestrator-not-listed',
@@ -743,7 +743,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
 
   it('reads every entry, including entries after a valid lock', () => {
     const read = vi.fn(path => path.includes('good-entry')
-      ? JSON.stringify({ owner: 'holder', heartbeatAt: new Date(T0).toISOString() }) : '{}');
+      ? JSON.stringify({ owner: 'holder', heartbeatAt: new Date(T0).toISOString(), meta: { repo: 'we', pr: 3771, kind: 'fix' } }) : '{}');
     expect(defaultClaimStoreReadable(() => ['good-entry', 'bad-entry'], read)).toBe(false);
     expect(read).toHaveBeenCalledTimes(2);
   });
@@ -799,7 +799,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(['finished', 'duplicate'])('awaiting verification and resolver throws refuse %s stops; false/null allow them', (mode) => {
+  it.each(['finished', 'duplicate'])('awaiting verification, resolver throws and null refuse %s stops; definite false allows them', (mode) => {
     const old = listing({ cwd: 'scratch/session', extraListingEvidence: true });
     const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
     const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
@@ -811,8 +811,140 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
       });
       const { calls } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, awaitingVerifyFor });
       expect(awaitingVerifyFor).toHaveBeenCalledWith(old);
-      expect(calls.stop).toEqual(['false', 'null'].includes(outcome) ? [old.id] : []);
+      expect(calls.stop).toEqual(outcome === 'false' ? [old.id] : []);
     }
+  });
+
+  it.each([
+    ['finished', 'sentinel'], ['completion', 'sentinel'], ['duplicate', 'sentinel'],
+    ['finished', 'throw'], ['completion', 'throw'], ['duplicate', 'throw'],
+  ])('unparseable transcript tool-call lines refuse %s stops (parser %s)', (mode, parseFailure) => {
+    const old = listing({ cwd: 'scratch/session' });
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const timestamp = new Date(T0 - 40 * MIN).toISOString();
+    const lines = mode === 'finished' ? [JSON.stringify({ type: 'assistant', timestamp,
+      message: { content: [{ type: 'text', text: 'Done.' }] } })] : [
+      JSON.stringify({ type: 'assistant', timestamp, message: { content: [
+        { type: 'tool_use', id: 'probe-call', name: 'Bash', input: { command: 'git status --short' } },
+      ] } }),
+      JSON.stringify({ type: 'user', timestamp, message: { content: [
+        { type: 'tool_result', tool_use_id: 'probe-call', content: 'clean' },
+      ] } }),
+    ];
+    for (const malformed of [false, true]) {
+      const tail = readWatchdogTail(old, CFG, T0, {
+        resolveTranscript: () => 'fixture.jsonl',
+        summarizeEntryFn: (raw, fieldMax) => {
+          const entry = summarizeEntry(raw, fieldMax);
+          if (parseFailure === 'throw' && entry.kind === 'unparseable') throw new Error('parse failed');
+          return entry;
+        },
+        tailLinesFn: () => ({ lines: malformed ? [...lines, '{"type":"assistant","tool_call":'] : lines }),
+      });
+      expect(tail.hadUnparseableLine).toBe(malformed);
+      const { result, calls, actions } = base({
+        agents: mode === 'duplicate' ? [old, keeper] : [old], readTail: () => tail,
+        completionFor: () => mode === 'completion' ? { done: true } : null,
+      });
+      if (malformed) {
+        expect(result.rows[0].evidence.unparseableTail).toBe(true);
+        expect(actions).toEqual([]);
+        expect(calls.reapEvents).toEqual([]);
+      } else {
+        expect(actions).toEqual([expect.objectContaining({ mode: mode === 'duplicate' ? 'duplicate' : 'finished', ok: true })]);
+      }
+      expect(calls.stop).toEqual(malformed ? [] : [old.id]);
+    }
+  });
+
+  it.each(['meta', 'repo', 'pr', 'kind'])('incomplete lock %s refuses stops and logs only the entry name', (missing) => {
+    const logs = [];
+    const meta = { repo: 'we', pr: 3771, kind: 'fix', who: 'fix-3771', sessionId: 'sid-1' };
+    delete meta[missing];
+    const entry = { owner: 'secret-owner', heartbeatAt: new Date(T0).toISOString(), ...(missing === 'meta' ? {} : { meta }) };
+    const { calls, actions } = base({ claimStoreReadable: () => defaultClaimStoreReadable(
+      () => ['incomplete-entry'], () => JSON.stringify(entry), line => logs.push(line)),
+    });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+    expect(logs).toEqual([expect.stringContaining('incomplete-entry/lock.json')]);
+    expect(logs.join(' ')).not.toContain('secret-owner');
+    expect(logs.join(' ')).not.toContain('sid-1');
+  });
+
+  it.each(['finished', 'duplicate'])('unreadable lane or shared await records (EACCES) refuse %s stops', (mode) => {
+    const old = listing({ cwd: 'scratch/session' });
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    for (const unreadable of ['.fix-await-verify', 'sid-1.json', 'fix-3771.json']) {
+      const read = vi.fn(path => {
+        throw Object.assign(new Error('secret-record'), { code: path.endsWith(unreadable) ? 'EACCES' : 'ENOENT' });
+      });
+      const awaitingVerifyFor = makeStopAwaitingVerifyResolver({
+        statFn: () => ({ isDirectory: () => true }), readFileSyncFn: read, dir: 'await-store', now: () => T0,
+      });
+      const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, awaitingVerifyFor });
+      expect(read.mock.calls.some(([path]) => path.endsWith(unreadable))).toBe(true);
+      expect(calls.stop).toEqual([]);
+      expect(calls.reapEvents).toEqual([]);
+      expect(actions).toEqual([expect.objectContaining({ detail: 'refused: awaiting verification unreadable' })]);
+    }
+  });
+
+  it.each(['finished', 'duplicate'])('missing await records (ENOENT) allow %s stops after probing lane and shared paths', (mode) => {
+    const old = listing({ cwd: 'scratch/session' });
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const read = vi.fn(() => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); });
+    const awaitingVerifyFor = makeStopAwaitingVerifyResolver({
+      statFn: () => ({ isDirectory: () => true }), readFileSyncFn: read, dir: 'await-store', now: () => T0,
+    });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    const { calls } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, awaitingVerifyFor });
+    expect(read.mock.calls.map(([path]) => path)).toEqual([
+      expect.stringContaining('.git/.fix-await-verify'), join('await-store', 'sid-1.json'), join('await-store', 'fix-3771.json'),
+    ]);
+    expect(calls.stop).toEqual([old.id]);
+  });
+
+  it('a missing session gitdir still probes shared await records before allowing a stop', () => {
+    const read = vi.fn(() => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); });
+    const awaitingVerifyFor = makeStopAwaitingVerifyResolver({
+      statFn: () => { throw Object.assign(new Error('no gitdir'), { code: 'ENOENT' }); },
+      readFileSyncFn: read, dir: 'await-store', now: () => T0,
+    });
+    const { calls } = base({ agents: [listing({ cwd: 'scratch/session' })], awaitingVerifyFor });
+    expect(read.mock.calls.map(([path]) => path)).toEqual([join('await-store', 'sid-1.json'), join('await-store', 'fix-3771.json')]);
+    expect(calls.stop).toEqual(['f29aeb29']);
+  });
+
+  it.each(['awaiting', 'expired'])('the strict resolver classifies a readable %s await record', (state) => {
+    const awaitingVerifyFor = makeStopAwaitingVerifyResolver({
+      statFn: () => ({ isDirectory: () => true }),
+      readFileSyncFn: path => {
+        if (!path.endsWith('sid-1.json')) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        return JSON.stringify({ v: 1, pr: 3771, sessionId: 'sid-1', requestedAt: new Date(T0 - (state === 'expired' ? 2 : 0) * MIN).toISOString() });
+      },
+      dir: 'await-store', now: () => T0, ttlMs: MIN,
+    });
+    const { calls } = base({ agents: [listing({ cwd: 'scratch/session' })], awaitingVerifyFor });
+    expect(calls.stop).toEqual(state === 'awaiting' ? [] : ['f29aeb29']);
+  });
+
+  it.each(['EACCES', 'malformed', 'null', 'unbound'])('unknown await evidence (%s) refuses stops', (failure) => {
+    const awaitingVerifyFor = makeStopAwaitingVerifyResolver({
+      statFn: () => {
+        if (failure === 'EACCES') throw Object.assign(new Error('unreadable gitdir'), { code: 'EACCES' });
+        return { isDirectory: () => true };
+      },
+      readFileSyncFn: () => failure === 'malformed' ? '{bad' : failure === 'null' ? 'null' : JSON.stringify({
+        v: 1, pr: 3771, requestedAt: new Date(T0).toISOString(),
+      }),
+      dir: 'await-store', now: () => T0,
+    });
+    const { calls, actions } = base({ agents: [listing({ cwd: 'scratch/session' })], awaitingVerifyFor });
+    expect(calls.stop).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: awaiting verification unreadable' })]);
   });
 
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
