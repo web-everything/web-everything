@@ -1,15 +1,16 @@
 ---
+bornAs: xv6a4qs
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/conveyor/orphan-fix-round.mjs"]
+scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# orphan guard re-dispatch cap not enforced when the marker comment fails to post
+# Queue-merged PR follow-up gives up after 5 attempts with only a log line; attempts are spent at collection ti…
 
-Flow-sim gap E-G6, class K14 (progress counter counts only successes). Failing input: PR review:changes, fix rounds ending unowned after the 15 min grace, no re-arm' 'redispatch succeeds, postComment (gh pr comment) fails Cited: we:scripts/conveyor/orphan-fix-round.mjs:276-282, we:scripts/conveyor/orphan-fix-round.mjs:142-146. Soak-break sketch: guard re-dispatches again after the next ended round; cap of 2 never reached; no escalation to a person. Needs gh comment failing while gh list/read works, so low frequency.
+Flow-sim gap D-C6, class K14 (progress counter counts only successes). Failing input: we:drain-merge-queue-followups.json pending[{num, headSha, followUpAttempts:4}]; PR already MERGED by GitHub; drainFollowupJob handed off=false (job launch failed -> inline path, we:drain-followup-job.mjs:380-395); cwd tracked-dirty or detached so local pull and resync fail (MAP:7466-7488) => localSynced=false' 'another pass (f… Cited: we:scripts/lib/drain-merge-strategy.mjs:705-708, we:scripts/merge-ai-prs.mjs:7679, we:scripts/lib/drain-merge-strategy.mjs:717, we:scripts/lib/drain-merge-strategy.mjs:694-697. Soak-break sketch: none
 
 ## Acceptance
 

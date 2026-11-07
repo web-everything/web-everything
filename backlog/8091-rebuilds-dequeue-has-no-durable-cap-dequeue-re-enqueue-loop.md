@@ -1,15 +1,16 @@
 ---
+bornAs: xca8ax2
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/lib/merge-queue-stuck-dequeue.mjs", "we:scripts/lib/drain-queue-safety.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Queue-merged PR follow-up gives up after 5 attempts with only a log line; attempts are spent at collection ti…
+# 'rebuilds' dequeue has no durable cap: dequeue -> re-enqueue loop
 
-Flow-sim gap D-C6, class K14 (progress counter counts only successes). Failing input: we:drain-merge-queue-followups.json pending[{num, headSha, followUpAttempts:4}]; PR already MERGED by GitHub; drainFollowupJob handed off=false (job launch failed -> inline path, we:drain-followup-job.mjs:380-395); cwd tracked-dirty or detached so local pull and resync fail (MAP:7466-7488) => localSynced=false' 'another pass (f… Cited: we:scripts/lib/drain-merge-strategy.mjs:705-708, we:scripts/merge-ai-prs.mjs:7679, we:scripts/lib/drain-merge-strategy.mjs:717, we:scripts/lib/drain-merge-strategy.mjs:694-697. Soak-break sketch: none
+Flow-sim gap D-C9, class K14 (progress counter counts only successes). Failing input: PR in GitHub queue state AWAITING_CHECKS whose group commit changed >= queueRebuildMax(3) times (a flaky or red batch partner); labels [ready-to-merge, review:accepted]; we:drain-merge-queue-stuck.json tracker count>=3' 'stuck sweep runs Cited: we:scripts/lib/merge-queue-stuck-dequeue.mjs:68, we:scripts/lib/merge-queue-stuck-dequeue.mjs:111, we:scripts/lib/drain-queue-safety.mjs:63. Soak-break sketch: none
 
 ## Acceptance
 

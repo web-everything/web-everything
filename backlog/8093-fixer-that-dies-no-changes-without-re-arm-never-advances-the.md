@@ -1,15 +1,16 @@
 ---
+bornAs: xzeoyze
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/lib/merge-queue-stuck-dequeue.mjs", "we:scripts/lib/drain-queue-safety.mjs"]
+scope: ["we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/operations/fix-run.mjs", "we:scripts/conveyor/orphan-fix-round.mjs", "we:scripts/conveyor/fix-loop-ledger.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# 'rebuilds' dequeue has no durable cap: dequeue -> re-enqueue loop
+# fixer that dies/no-changes without re-arm never advances the round counter or the loop ledger
 
-Flow-sim gap D-C9, class K14 (progress counter counts only successes). Failing input: PR in GitHub queue state AWAITING_CHECKS whose group commit changed >= queueRebuildMax(3) times (a flaky or red batch partner); labels [ready-to-merge, review:accepted]; we:drain-merge-queue-stuck.json tracker count>=3' 'stuck sweep runs Cited: we:scripts/lib/merge-queue-stuck-dequeue.mjs:68, we:scripts/lib/merge-queue-stuck-dequeue.mjs:111, we:scripts/lib/drain-queue-safety.mjs:63. Soak-break sketch: none
+Flow-sim gap E-G2, class K14 (progress counter counts only successes). Failing input: PR review:changes, attempts < cap, no stand-down; Claude fixer session dies before step 0b fix-begin (auth/crash/context) or ends with outcome no-change/no-change-unproven and no stand-down' 'claim lapses/released, next tick re-plans Cited: we:scripts/conveyor/reconcile-pass.mjs:647-652, we:scripts/conveyor/reconcile-core.mjs:1868-1876, we:scripts/operations/fix-run.mjs:1175-1188, we:scripts/conveyor/orphan-fix-round.mjs:127-128, we:scripts/conveyor/fix-loop-ledger.mjs. Soak-break sketch: a fresh fixer session per tick on the same head with the counter stuck, until an external stop. Codex-routed runs are bounded (ROUTED_CODEX_MAX_UNPRODUCTIVE=2, we:fix-run.mjs:679); Claude-routed runs are not by anything I read.
 
 ## Acceptance
 

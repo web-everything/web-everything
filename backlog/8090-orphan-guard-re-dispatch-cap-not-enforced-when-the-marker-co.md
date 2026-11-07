@@ -1,15 +1,16 @@
 ---
+bornAs: x4b1dhk
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/operations/fix-run.mjs", "we:scripts/conveyor/orphan-fix-round.mjs", "we:scripts/conveyor/fix-loop-ledger.mjs"]
+scope: ["we:scripts/conveyor/orphan-fix-round.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# fixer that dies/no-changes without re-arm never advances the round counter or the loop ledger
+# orphan guard re-dispatch cap not enforced when the marker comment fails to post
 
-Flow-sim gap E-G2, class K14 (progress counter counts only successes). Failing input: PR review:changes, attempts < cap, no stand-down; Claude fixer session dies before step 0b fix-begin (auth/crash/context) or ends with outcome no-change/no-change-unproven and no stand-down' 'claim lapses/released, next tick re-plans Cited: we:scripts/conveyor/reconcile-pass.mjs:647-652, we:scripts/conveyor/reconcile-core.mjs:1868-1876, we:scripts/operations/fix-run.mjs:1175-1188, we:scripts/conveyor/orphan-fix-round.mjs:127-128, we:scripts/conveyor/fix-loop-ledger.mjs. Soak-break sketch: a fresh fixer session per tick on the same head with the counter stuck, until an external stop. Codex-routed runs are bounded (ROUTED_CODEX_MAX_UNPRODUCTIVE=2, we:fix-run.mjs:679); Claude-routed runs are not by anything I read.
+Flow-sim gap E-G6, class K14 (progress counter counts only successes). Failing input: PR review:changes, fix rounds ending unowned after the 15 min grace, no re-arm' 'redispatch succeeds, postComment (gh pr comment) fails Cited: we:scripts/conveyor/orphan-fix-round.mjs:276-282, we:scripts/conveyor/orphan-fix-round.mjs:142-146. Soak-break sketch: guard re-dispatches again after the next ended round; cap of 2 never reached; no escalation to a person. Needs gh comment failing while gh list/read works, so low frequency.
 
 ## Acceptance
 
