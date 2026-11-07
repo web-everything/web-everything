@@ -331,7 +331,7 @@ describe('planRetirements redundant merge siblings (fake git/gh)', () => {
   const unique = 'd'.repeat(40);
   const mainTree = 'a'.repeat(40);
   const fixture = ({ registered = true, contained = 0, state = 'OPEN', conflict = 1,
-    unreadableBase = false, unknownPr = false, mergeEdits = false, unreadableMerge = false, baseHead = baseRef, baseCross = false, ownPr = null, row = {} } = {}) => {
+    unreadableBase = false, unknownPr = false, mergeEdits = false, unreadableMerge = false, baseHead = baseRef, baseCross = false, ownPr = null, row = {}, ownView = null, baseAsProof = false } = {}) => {
     const calls = [];
     const git = (args) => {
       calls.push(args);
@@ -350,9 +350,16 @@ describe('planRetirements redundant merge siblings (fake git/gh)', () => {
     };
     // `ownPr`: a PR headed by the sibling's own branch, discovered by head lookup although the row records `pr: null`.
     const stub = ghStub({ heads: { [baseRef]: { number: 7, state: 'OPEN' }, ...(ownPr ? { [ref]: { number: 9, ...ownPr } } : {}) },
-      views: unknownPr ? {} : { 8: { number: 8, state, headRefName: baseHead, isCrossRepository: baseCross } } });
-    const rows = [{ ref, pr: null, ...row }, ...(registered ? [{ ref: baseRef, pr: 8 }] : [])];
-    return { decision: planRetirements({ rows, git, gh: stub.gh, repo: 'web-everything/web-everything' })[0], calls };
+      views: { ...(unknownPr ? {} : { 8: { number: 8, state, headRefName: baseHead, isCrossRepository: baseCross } }),
+        // `ownView`: the sibling's own recorded PR (`row.pr`), whatever state it is in.
+        ...(ownView ? { [ownView.number]: { headRefName: ref, isCrossRepository: false, ...ownView } } : {}) } });
+    // `baseAsProof`: the loader excludes the candidate being loaded from the planned rows, so the base reaches the
+    // planner only as proof context (`proofRows`), never as a retirement candidate.
+    const baseRows = registered ? [{ ref: baseRef, pr: 8 }] : [];
+    const rows = [{ ref, pr: null, ...row }, ...(baseAsProof ? [] : baseRows)];
+    const proofRows = baseAsProof ? baseRows : undefined;
+    const decisions = planRetirements({ rows, proofRows, git, gh: stub.gh, repo: 'web-everything/web-everything' });
+    return { decision: decisions[0], decisions, calls };
   };
 
   it.each([
@@ -379,6 +386,33 @@ describe('planRetirements redundant merge siblings (fake git/gh)', () => {
   it('still retires a redundant sibling whose own PR is no longer open', () => {
     expect(fixture({ ownPr: { state: 'MERGED' } }).decision).toMatchObject({ action: 'retire', reason: 'redundant-merge-sibling' });
     expect(fixture({ ownPr: { state: 'CLOSED' } }).decision).toMatchObject({ action: 'retire', reason: 'redundant-merge-sibling' });
+  });
+
+  // R10 send-back: the loader plans without the candidate being loaded (here the base), so the base is proof context only.
+  it('retires a redundant sibling whose base is only proof context, and never plans the base itself', () => {
+    const { decisions } = fixture({ baseAsProof: true });
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ ref, action: 'retire', reason: 'redundant-merge-sibling', evidence: { basePr: 8, baseRef, baseTip } });
+  });
+
+  it.each([
+    ['without proof context the base is unknown', { baseAsProof: true, registered: false }],
+    ['a closed base PR', { baseAsProof: true, state: 'CLOSED' }],
+    ['a base PR heading another branch', { baseAsProof: true, baseHead: 'lane/unrelated' }],
+    ['a unique sibling commit absent from the base', { baseAsProof: true, contained: 1 }],
+  ])('keeps the sibling when %s', (_label, options) => {
+    expect(fixture(options).decision.action).toBe('keep');
+  });
+
+  // Deferred review finding: the `row.pr == null` guard is only discriminated by a non-OPEN recorded PR, because an
+  // OPEN one is already kept by `ownOpenPr`.
+  it.each(['CLOSED', 'MERGED'])('keeps a redundant sibling with its own recorded %s PR', (state) => {
+    for (const baseAsProof of [false, true]) {
+      const { decision } = fixture({ baseAsProof, row: { pr: 9 }, ownView: { number: 9, state } });
+      expect(decision.action).toBe('keep');
+      expect(decision.reason).not.toBe('redundant-merge-sibling');
+      expect(decision.pr).toBe(9);
+    }
   });
 
   it('keeps a sibling with unique merge-resolution edits despite identical non-merge ancestry in the base', () => {

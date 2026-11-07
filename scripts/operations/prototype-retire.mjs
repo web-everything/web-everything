@@ -152,10 +152,12 @@ function prCommits({ gh, pr, repo }) {
 
 /**
  * Decide, per registration, whether it retires. Never mutates anything.
- * @param {{rows:Array<{ref:string, pr?:number|null}>, git:Function, gh:Function, repo:string, mainRef?:string}} o
+ * `proofRows` are registrations that may be CITED as evidence (a redundant sibling's base) but are never decided
+ * here: a caller that withholds a registration from `rows` (the loader's own candidate) still passes it as proof.
+ * @param {{rows:Array<{ref:string, pr?:number|null}>, proofRows?:Array<{ref:string, pr?:number|null}>, git:Function, gh:Function, repo:string, mainRef?:string}} o
  * @returns {Array<{ref:string, action:'retire'|'keep', reason:string, tip?:string, pr?:number|null, evidence?:object}>}
  */
-export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }) {
+export function planRetirements({ rows, proofRows = [], git, gh, repo, mainRef = 'origin/main' }) {
   return rows.map((row) => {
     const keep = (reason, extra = {}) => ({ ref: row.ref, action: 'keep', reason, ...extra });
     const carried = carriedBeyondMain({ git, ref: row.ref, mainRef });
@@ -171,7 +173,7 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     const prNumber = pr ? pr.number : null;
     const baseRef = mergeRefBase(row.ref);
     const baseRow = baseRef && row.pr == null && !row.pinned && !row.edgeResolution
-      ? rows.find((entry) => entry.ref === baseRef) : null;
+      ? [...rows, ...proofRows].find((entry) => entry.ref === baseRef) : null;
     // Ancestry alone cannot preserve edits introduced by merge commits. Unverifiable or edited merge
     // trees must stay registered; only reproducible clean merges can be ignored for containment.
     // A sibling with its OWN open PR keeps its registration however that PR was found (recorded or by head lookup):

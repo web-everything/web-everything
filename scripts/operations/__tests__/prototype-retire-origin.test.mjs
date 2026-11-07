@@ -65,6 +65,63 @@ const paths = [
 const RETIRE = { action: 'retire', reason: 'pr-squash-merged', tip: TIP, pr: 7 };
 const KEEP = { action: 'keep', reason: 'fetch-failed' };
 
+// R10 send-back: loading `lane/live` excludes it from the planned rows, so the real planner must still see its
+// registration as proof context. Wiring test through the production planner, not an injected one.
+describe('loader planner keeps the loaded base as proof context for a redundant merge sibling', () => {
+  const base = REF;
+  const sibling = `${REF}-m2`;
+  const baseTip = 'd'.repeat(40);
+  const siblingTip = 'e'.repeat(40);
+  const unique = '1'.repeat(40);
+  const mainTree = '2'.repeat(40);
+  const view = { number: 42, state: 'OPEN', headRefName: base, isCrossRepository: false };
+  const planWith = ({ baseOnOrigin = true, proofRows }) => {
+    const fetched = [];
+    const git = vi.fn((args) => {
+      const key = args.join(' ');
+      if (args[0] === 'remote') return { code: 0, stdout: `https://github.com/${REPO}.git` };
+      if (args[0] === 'fetch') {
+        fetched.push(args[2]);
+        return { code: args[2].includes(`refs/heads/${base}:`) && !baseOnOrigin ? 1 : 0, stdout: '' };
+      }
+      if (key === `rev-parse --verify --quiet refs/remotes/origin/${sibling}^{commit}`) return { code: 0, stdout: siblingTip };
+      if (key === `rev-parse --verify --quiet refs/remotes/origin/${base}^{commit}`) return { code: 0, stdout: baseTip };
+      if (key === 'rev-parse --verify origin/main^{tree}') return { code: 0, stdout: mainTree };
+      if (args[0] === 'rev-list' && args[1] === '--no-merges') return { code: 0, stdout: unique };
+      if (args[0] === 'rev-list' && args[1] === '--merges') return { code: 0, stdout: args[2].endsWith(siblingTip) ? siblingTip : '' };
+      if (key === `rev-list --parents -n 1 ${siblingTip}`) return { code: 0, stdout: `${siblingTip} ${mainTree} ${unique}` };
+      if (key === `merge-tree --write-tree --no-messages ${mainTree} ${unique}`) return { code: 0, stdout: 'f'.repeat(40) };
+      if (key === `rev-parse --verify ${siblingTip}^{tree}`) return { code: 0, stdout: 'f'.repeat(40) };
+      if (key === `merge-base --is-ancestor ${unique} ${baseTip}`) return { code: 0, stdout: '' };
+      if (args[0] === 'merge-tree' && args.at(-2) === 'origin/main') return { code: 1, stdout: 'f'.repeat(40) };
+      return { code: 1, stdout: '' };
+    });
+    const gh = vi.fn((args) => {
+      if (args[0] === 'repo') return { code: 0, stdout: repository(REPO) };
+      if (args[1] === 'view') return { code: 0, stdout: JSON.stringify(view) };
+      return { code: 0, stdout: JSON.stringify(args[args.indexOf('--head') + 1] === base ? [view] : []) };
+    });
+    const plan = defaultDeps().retirePlanner({ rows: [{ ref: sibling }], proofRows, git, gh });
+    return { plan, fetched };
+  };
+
+  it('retires the sibling and plans only the sibling, refreshing the base tracking ref first', () => {
+    const { plan, fetched } = planWith({ proofRows: [{ ref: base, pr: 42 }, { ref: sibling }] });
+    expect(plan).toHaveLength(1);
+    expect(plan[0]).toMatchObject({ ref: sibling, action: 'retire', reason: 'redundant-merge-sibling', evidence: { basePr: 42, baseTip } });
+    expect(fetched).toContain(`+refs/heads/${base}:refs/remotes/origin/${base}`);
+  });
+
+  it('keeps the sibling when no proof context is passed (the pre-fix loader behaviour)', () => {
+    expect(planWith({ proofRows: undefined }).plan[0]).toMatchObject({ ref: sibling, action: 'keep', reason: 'pr-open' });
+  });
+
+  it('keeps the sibling when the base cannot be refreshed from origin (a stale tracking ref is no proof)', () => {
+    expect(planWith({ baseOnOrigin: false, proofRows: [{ ref: base, pr: 42 }] }).plan[0])
+      .toMatchObject({ ref: sibling, action: 'keep', reason: 'pr-open' });
+  });
+});
+
 it('CLI re-proof fetches and passes the registered base for a redundant merge sibling, keeping it without that registration', () => {
   const root = mkdtempSync(join(tmpdir(), 'retire-base-proof-'));
   const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: root };
