@@ -350,6 +350,17 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
     expect(selectPlan).not.toHaveBeenCalled();
     expect(readFileSync(markerPath + '.pnpm-failed', 'utf8')).toBe(lockHash(dir, 'npm'));
   });
+  it('an unusable pnpm store falling back to npm also suppresses migration (no npm reinstall loop)', () => {
+    const { dir, markerPath } = lane({ nodeModules: false });
+    const badStore = join(dir, 'package.json', 'store'); // a path below a regular file: mkdir fails
+    const selectPlan = vi.fn(() => select({ storeDir: badStore }));
+    const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules')));
+    expect(ensureLaneDeps({ dir, markerPath, storeDir: badStore, selectPlan, exec })).toBe('installed');
+    expect(exec.mock.calls).toEqual([['npm', ['ci']]]);
+    exec.mockClear();
+    expect(ensureLaneDeps({ dir, markerPath, storeDir: badStore, selectPlan, exec })).toBe('ok');
+    expect(exec).not.toHaveBeenCalled();
+  });
   it('a stale lane installs and stamps <backend>:<that backend hash>', () => {
     const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
     const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules'), { recursive: true }));

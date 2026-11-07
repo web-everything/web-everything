@@ -201,6 +201,7 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
   });
   if (state === 'n/a' || state === 'ok') return state;
   plan = getPlan();
+  const wantedPnpm = plan.backend === 'pnpm'; // also true when the store is unusable and we fall back below
   let generation = null; // the store generation this pnpm install links into
   if (plan.backend === 'pnpm') {
     try {
@@ -224,7 +225,7 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
     return 'stale';
   }
   if (result.state === 'installed') {
-    if (plan.backend === 'pnpm' && result.backend === 'npm') {
+    if (wantedPnpm && result.backend === 'npm') {
       writeFileSync(failedPath, lockHash(dir, 'npm'));
     }
     writeFileSync(markerPath, result.marker);
