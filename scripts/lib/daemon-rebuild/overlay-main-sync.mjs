@@ -535,6 +535,9 @@ function assertionIdentity(file, assertion) {
 // Vitest 1.x has no list CLI: let its own config loader and project globbing define the inventory.
 // createVitest does not set the flags the real CLI (startVitest) sets before it loads the config, and configs
 // branch on them, so establish the same prelude first: TEST and VITEST forced, NODE_ENV only defaulted.
+// A config or plugin may log to stdout before, after or around the inventory, so the inventory is a single
+// marked line on its own (a leading newline ends any unterminated write) and only that line is parsed.
+export const VITEST_INVENTORY_MARK = '@@overlay-main-sync-inventory@@ ';
 const VITEST_LIST_SCRIPT = `
 process.env.TEST = 'true';
 process.env.VITEST = 'true';
@@ -543,7 +546,7 @@ const { createVitest } = await import('vitest/node');
 const ctx = await createVitest('test', { watch: false, run: false });
 try {
   const files = await ctx.globTestFiles();
-  console.log(JSON.stringify(files.map(entry => Array.isArray(entry) ? entry[1] : entry)));
+  process.stdout.write('\\n${VITEST_INVENTORY_MARK}' + JSON.stringify(files.map(entry => Array.isArray(entry) ? entry[1] : entry)) + '\\n');
 } finally { await ctx.close(); }
 `;
 const TEST_LIST_MAX_BUFFER = 8 * 1024 * 1024;
@@ -555,7 +558,10 @@ async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
     });
     const stdout = output({ ...result, step: 'test-select' });
     if (Buffer.byteLength(stdout, 'utf8') > TEST_LIST_MAX_BUFFER) throw new Error('Vitest inventory exceeds 8 MiB');
-    const files = JSON.parse(stdout);
+    // Fail closed: no marked line means the listing did not complete; the last one wins over earlier noise.
+    const marked = stdout.split(/\r?\n/).filter(line => line.startsWith(VITEST_INVENTORY_MARK));
+    if (!marked.length) throw new Error('Vitest inventory line missing from stdout');
+    const files = JSON.parse(marked.at(-1).slice(VITEST_INVENTORY_MARK.length));
     if (!Array.isArray(files) || files.some(file => typeof file !== 'string' || !isAbsolute(file) || file.includes('\0'))) {
       throw new Error('invalid Vitest inventory paths');
     }

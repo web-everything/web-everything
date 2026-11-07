@@ -4,7 +4,9 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { addOverlay } from '../../../lib/daemon-overlays.mjs';
-import { runOverlayMainSync } from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
+import * as sync from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
+// Absent on trees from before the marked-inventory protocol, which the replay must still be able to load.
+const { runOverlayMainSync, VITEST_INVENTORY_MARK = '' } = sync;
 
 const SOURCE = 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs';
 const FILE = 'worker.test.mjs', OUTSIDE = 'outside/ignored.test.mjs', EXCLUDED = 'excluded.test.mjs';
@@ -65,7 +67,7 @@ export default {
           appendDaemonEvent: event => { events.push(event); },
           appendOverlayEvent: (_root, event) => { events.push(event); },
           testListRunner: (_command, _args, { cwd }) => ({ status: 0,
-            stdout: JSON.stringify([join(realpathSync(cwd), FILE)]), stderr: '' }),
+            stdout: `\n${VITEST_INVENTORY_MARK}${JSON.stringify([join(realpathSync(cwd), FILE)])}\n`, stderr: '' }),
           testRunner: async ({ root: scratch, args, testReport }) => {
             testCalls++;
             const selected = args.filter(arg => arg.endsWith('.test.mjs'));

@@ -88,8 +88,8 @@ function fixture({ reruns } = {}) {
     appendDaemonEvent: event => { outcomes.push(event); },
     // Vitest inventory: every committed test file is runnable in these fixtures.
     testListRunner: vi.fn((_command, _args, { cwd }) => ({ status: 0, stderr: '',
-      stdout: JSON.stringify(ok(cwd, ['ls-files']).split('\n').filter(f => /\.test\.mjs$/.test(f))
-        .map(f => join(fs.realpathSync(cwd), f))) })),
+      stdout: `\n${sync.VITEST_INVENTORY_MARK}` + JSON.stringify(ok(cwd, ['ls-files']).split('\n').filter(f => /\.test\.mjs$/.test(f))
+        .map(f => join(fs.realpathSync(cwd), f))) + '\n' })),
     now: () => new Date().toISOString(),
   };
   return { base, root, env, mainSha, events, outcomes, pushes, scratched, deps };

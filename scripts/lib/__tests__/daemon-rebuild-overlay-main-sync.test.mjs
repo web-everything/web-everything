@@ -5,7 +5,7 @@ import ts from 'typescript';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode } from '../daemon-rebuild/overlay-main-sync.mjs';
+import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
@@ -35,7 +35,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false } = {}) {
+function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false, noisy = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -51,6 +51,13 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   // A config that, like many real ones, only discovers tests under the Vitest CLI's own environment.
   if (envGated) write(root, 'vitest.config.ts',
     "export default { test: { include: process.env.VITEST === 'true' && process.env.TEST === 'true' && process.env.NODE_ENV === 'test' ? ['*.test.mjs'] : [] } };\n");
+  // A config or plugin that logs to stdout: a banner, a JSON-looking line, an unterminated write, and late output at exit.
+  if (noisy) write(root, 'vitest.config.ts', [
+    "console.log('plugin banner');",
+    'console.log(\'{"not":"the inventory"}\');',
+    "process.stdout.write('[]');",
+    "process.on('exit', () => { console.log('[]'); process.stdout.write('late'); });",
+    "export default { test: { include: ['*.test.mjs'] } };", ''].join('\n'));
   if (mainUnion) write(root, 'docs/agent/testing.md', '# Testing\n');
   for (let i = 0; i < count; i++) write(root, `worker${i}.test.mjs`, "import './worker.mjs';\n");
   if (deleteFinalTest) write(root, 'scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs',
@@ -93,8 +100,8 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     git: vi.fn((args, opts) => { if (args[0] === 'push') pushes.push([...args]); return run(args, opts); }),
     appendOverlayEvent: (root, event, opts) => { events.push(event); return appendOverlayEvent(root, event, opts); },
     testListRunner: vi.fn((_command, _args, { cwd }) => ({ status: 0,
-      stdout: JSON.stringify(ok(cwd, ['ls-files']).split('\n').filter(f => /\.test\.mjs$/.test(f)
-        && !['outside/ignored.test.mjs', 'excluded.test.mjs'].includes(f)).map(f => join(fs.realpathSync(cwd), f))), stderr: '' })),
+      stdout: `\n${VITEST_INVENTORY_MARK}` + JSON.stringify(ok(cwd, ['ls-files']).split('\n').filter(f => /\.test\.mjs$/.test(f)
+        && !['outside/ignored.test.mjs', 'excluded.test.mjs'].includes(f)).map(f => join(fs.realpathSync(cwd), f))) + '\n', stderr: '' })),
     testRunner: vi.fn(async ({ root: scratch, args, testReport }) => {
       expect(allowedCommand(args.slice(args.indexOf('--') + 1))).toBe(true);
       fs.writeFileSync(testReport, JSON.stringify({
@@ -152,8 +159,10 @@ describe('overlay main sync', () => {
   it.each([
     ['failure', { status: 1, stdout: '', stderr: 'listing failed' }],
     ['timeout', { status: null, stdout: '', error: Object.assign(new Error('listing timed out'), { code: 'ETIMEDOUT' }) }],
-    ['unparseable', { status: 0, stdout: 'not JSON', stderr: '' }],
-    ['invalid paths', { status: 0, stdout: '[123]', stderr: '' }],
+    ['unparseable', { status: 0, stdout: `${VITEST_INVENTORY_MARK}not JSON\n`, stderr: '' }],
+    ['unmarked JSON only', { status: 0, stdout: '[]\n', stderr: '' }],
+    ['noise without an inventory line', { status: 0, stdout: 'plugin banner\n[]\n', stderr: '' }],
+    ['invalid paths', { status: 0, stdout: `${VITEST_INVENTORY_MARK}[123]\n`, stderr: '' }],
     ['oversized', { status: 0, stdout: ' '.repeat(8 * 1024 * 1024 + 1), stderr: '' }],
   ])('listing %s fails closed at test-select with operator diagnostics', async (_mode, result) => {
     const f = fixture();
@@ -168,7 +177,7 @@ describe('overlay main sync', () => {
 
   it('skips when no selected files are runnable', async () => {
     const f = fixture();
-    f.deps.testListRunner = vi.fn(() => ({ status: 0, stdout: '[]', stderr: '' }));
+    f.deps.testListRunner = vi.fn(() => ({ status: 0, stdout: `noise\n${VITEST_INVENTORY_MARK}[]\n`, stderr: '' }));
     expect(await job(f)).toEqual({ skipped: true, reason: 'no-relevant-tests' });
     expect(f.deps.testRunner).not.toHaveBeenCalled();
   });
@@ -187,6 +196,14 @@ describe('overlay main sync', () => {
     fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
     // The daemon is started outside Vitest: none of the CLI's flags are present.
     for (const key of ['TEST', 'VITEST', 'NODE_ENV']) delete f.env[key];
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('Vitest listing ignores config or plugin stdout around the inventory (banner, JSON-like lines, unterminated and late writes)', async () => {
+    const f = fixture({ noisy: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
     delete f.deps.testListRunner;
     expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
   }, 90_000);
