@@ -228,7 +228,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     return completeReads.get(settleAt);
   };
   const runScan = () => {
-    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, exactDecided: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true }]));
+    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, exactDecided: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true, verdictless: true }]));
     const startless = []; // ids and mtimes only, never payloads
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
@@ -252,6 +252,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
               const since = unfinishedSince(run);
               slot.since = Number.isNaN(slot.since) || Number.isNaN(since) ? NaN : Math.max(slot.since, since);
               if (!undecidedUnfinished(run)) slot.undecided = false;
+              if (hasVerdict(run) || run.resumeOf != null || run.resumedAt != null) slot.verdictless = false;
               // R622 liveness: when any unfinished run was last written. A review still running keeps writing, so a
               // settle waits until every unfinished run has been quiet for the abandon horizon (NaN mtime never does).
               slot.active = Number.isNaN(slot.active) || !Number.isFinite(at) ? NaN : Math.max(slot.active, at);
@@ -268,7 +269,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
-    const { newest, exact, exactDecided, unfinished, since, undecided, active } = scan.slots[order];
+    const { newest, exact, exactDecided, unfinished, since, undecided, active, verdictless } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
     // A start-less run last written before the selected run started is older; any other cannot be ordered.
@@ -278,7 +279,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { exactDecided, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        { exactDecided, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedVerdictless: verdictless, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -289,7 +290,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
       && scan.boundary + RUN_MTIME_SLACK_MS <= writtenAfter
       && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
-    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead });
+    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedVerdictless: verdictless, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead });
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
@@ -305,7 +306,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
-  readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
+  readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records,
+  probe = { host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime } } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
   if (bytes !== null && (!parsed || parsed.repo !== repo || Number(parsed.pr) !== Number(pr) || parsed.head !== head)) throw Error('recovery writer identity mismatch');
@@ -321,11 +323,26 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   let latest = lookup();
   if (latest.ok === false && latest.reason === 'review-unfinished' && ['queued', 'running'].includes(parsed?.status)) {
     const bounds = latest.settleBounds;
-    // Only recovery may look behind a quiet unfinished review. The recovery planner still
-    // proves the writer is dead and owns the single redispatch marker before admitting work.
-    if (Number.isFinite(bounds?.unfinishedActiveAt) && Number.isFinite(bounds?.evaluatedAt)
+    // Only a complete scan of quiet, verdictless, never-resumed attempts permits this fallback.
+    // Prove local owner death here: the planner's age fallback cannot authorize unknown owners.
+    if (bounds?.unfinishedVerdictless === true && !Object.hasOwn(bounds, 'unreadBoundaryAt')
+      && Number.isFinite(bounds.unfinishedActiveAt) && Number.isFinite(bounds.evaluatedAt)
       && bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS
-      && bounds.exactDecided?.run && redTeamOwedFor(bounds.exactDecided.run)) latest = bounds.exactDecided;
+      && bounds.exactDecided?.run && redTeamOwedFor(bounds.exactDecided.run)) {
+      let dead = false;
+      try {
+        if (parsed.host === probe.host && parsed.pidNamespace === probe.namespace
+          && Number.isInteger(parsed.pid) && parsed.pid > 0) {
+          const alive = probe.isAlive(parsed.pid);
+          if (alive === false) dead = true;
+          else if (alive === true && typeof parsed.pidStart === 'string' && parsed.pidStart.trim()) {
+            const start = probe.readPidStart(parsed.pid);
+            dead = typeof start === 'string' && start.trim() !== '' && start !== parsed.pidStart;
+          }
+        }
+      } catch { /* Unreadable liveness evidence retains the original unfinished-review hold. */ }
+      if (dead) latest = bounds.exactDecided;
+    }
   }
   let carryEvidence;
   if (latest.ok === false) {

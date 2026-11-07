@@ -610,7 +610,7 @@ describe('dead running red-team owner behind an unfinished review', () => {
       isAlive: vi.fn(() => { if (unreadableProbe) throw Error('pid table unreadable'); return alive; }),
       readPidStart: vi.fn(() => writer.pidStart) };
     const seats = failedSeat ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }] : [];
-    const witnessOptions = { ...key, runsDir: env.WE_SHARED_RUNS_DIR, now, stat: fs.statSync, readScorecards: () => seats };
+    const witnessOptions = { ...key, runsDir: env.WE_SHARED_RUNS_DIR, now, stat: fs.statSync, readScorecards: () => seats, probe };
     const readWitness = () => evidence.readRecoveryWitness(witnessOptions);
     const recoveryOptions = { now, probe, deadlineMs: 2 * hour };
     const plan = () => recovery.planRedTeamRecovery(readWitness(), recoveryOptions);
@@ -641,6 +641,9 @@ describe('dead running red-team owner behind an unfinished review', () => {
 
   it('holds a slow live owner with matching pidStart instead of recovering it twice', () => {
     const f = fixture({ alive: true });
+    // The reader's death probe and the planner's recheck can disagree after PID reuse.
+    // Keep exercising the planner's live-owner guard with a raw witness admitted by the reader.
+    f.witnessOptions.probe = { ...f.probe, isAlive: () => false };
     expect(f.plan()).toMatchObject({ mode: 'skip', why: 'owner live' });
     expect(f.probe.readPidStart).toHaveBeenCalledWith(99999999);
     expect(f.abandon()).toEqual({ ok: false });
@@ -653,6 +656,71 @@ describe('dead running red-team owner behind an unfinished review', () => {
     expect(recovery.planRedTeamOnSkip(f.planningOptions)[0].action).toBe('skip');
     expect(f.abandon()).toEqual({ ok: false });
     expect(existsSync(`${f.writerPath}.stale-redispatch-1`)).toBe(false);
+  });
+
+  it.each(['changes', 'needs-human', false, 0, '', {}])('holds an unfinished run with a present verdict %j and an open effect', verdict => {
+    const f = fixture();
+    f.put({ ...f.unfinished, verdict }, 70 * 60_000);
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(f.plan().mode).toBe('skip');
+  });
+
+  it.each(['resumeOf', 'resumedAt'])('holds a resumed unfinished run marked by %s', field => {
+    const f = fixture();
+    f.put({ ...f.unfinished, [field]: field === 'resumeOf' ? 'earlier-run' : f.now - 2 * evidence.ABANDONED_REVIEW_AFTER_MS }, 70 * 60_000);
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it('holds when an older unfinished run on another head has a verdict', () => {
+    const f = fixture();
+    f.put({ ...f.unfinished, id: 'review-pr-older-rejection', verdict: 'changes',
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(f.now - 4 * evidence.ABANDONED_REVIEW_AFTER_MS).toISOString() }],
+      findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }, 80 * 60_000);
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it('holds a capped scan with an unread boundary even after finding the decided review', () => {
+    const f = fixture();
+    f.put({ ...f.unfinished, id: 'review-pr-unread' }, 100 * 60_000);
+    f.witnessOptions.scanSettings = { file: { runs: { scan: { maxParses: 2 } } }, platform: {}, env: f.env };
+    f.witnessOptions.warn = vi.fn();
+    const witness = f.readWitness();
+    expect(witness).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(witness.settleBounds).toHaveProperty('unreadBoundaryAt');
+    expect(f.witnessOptions.warn).toHaveBeenCalled();
+  });
+
+  it.each(['foreign host', 'foreign namespace', 'missing pid', 'invalid pid', 'throwing probe', 'unknown probe', 'live matching start', 'live unreadable start', 'live throwing start', 'live missing stored start'])
+  ('holds an old owner with %s without dispatch or abandonment', kind => {
+    const f = fixture();
+    const writer = JSON.parse(fs.readFileSync(f.writerPath, 'utf8'));
+    writer.pidStart = new Date(f.now - 4 * evidence.ABANDONED_REVIEW_AFTER_MS).toISOString();
+    if (kind === 'foreign host') writer.host = 'another-host';
+    if (kind === 'foreign namespace') writer.pidNamespace = 'another-namespace';
+    if (kind === 'missing pid') delete writer.pid;
+    if (kind === 'invalid pid') writer.pid = 0;
+    if (kind === 'live missing stored start') delete writer.pidStart;
+    writeFileSync(f.writerPath, JSON.stringify(writer));
+    f.probe.isAlive.mockImplementation(() => {
+      if (kind === 'throwing probe') throw Error('unreadable');
+      return kind === 'unknown probe' ? null : kind.startsWith('live');
+    });
+    f.probe.readPidStart.mockImplementation(() => {
+      if (kind === 'live throwing start') throw Error('unreadable');
+      return kind === 'live unreadable start' ? null : writer.pidStart;
+    });
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(f.plan()).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
+    expect(recovery.planRedTeamOnSkip(f.planningOptions)[0].action).toBe('skip');
+    expect(f.abandon()).toEqual({ ok: false });
+    expect(existsSync(`${f.writerPath}.stale-redispatch-1`)).toBe(false);
+  });
+
+  it('recovers a reused local pid with a readable different birth time', () => {
+    const f = fixture({ alive: true });
+    f.probe.readPidStart.mockReturnValue('another-process-start');
+    expect(f.readWitness().newest).toEqual(f.decided);
+    expect(f.plan()).toMatchObject({ mode: 'fresh', abandon: true });
   });
 
   it('keeps review-unfinished when the unfinished run was touched less than an hour ago', () => {
