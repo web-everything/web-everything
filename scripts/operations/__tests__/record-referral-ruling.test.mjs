@@ -860,12 +860,22 @@ describe('fileCard refuses when the dedupe lookup itself throws', () => {
 });
 
 describe('fileCard strict dedupe readers', () => {
-  it('real default dedupe refuses when gh and the local backlog are unusable (never files)', async () => {
-    const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
-    const landPreventionCard = vi.fn();
-    const r = await landRulingCard({ title: 't', digest: '1. `we:scripts/a.mjs:1` — claim', scope: 'we:scripts/a.mjs' },
-      { landPreventionCard, dedupe: (input, o) => { throw new Error('forced'); } });
-    expect(r.ok).toBe(false);
-    expect(landPreventionCard).not.toHaveBeenCalled();
+  const ok = (out) => () => out;
+  it.each([['{}'], ['not json'], [JSON.stringify(Array.from({ length: 200 }, (_, n) => ({ number: n, headRefName: 'x', files: [] })))]])(
+    'strictPrCards refuses PR list %#', async (out) => {
+      const { strictPrCards } = await import('../record-referral-ruling-io.mjs');
+      expect(() => strictPrCards('/nonexistent', { run: ok(out) })).toThrow(/open-PR/);
+    });
+  it('strictPrCards refuses when gh fails', async () => {
+    const { strictPrCards } = await import('../record-referral-ruling-io.mjs');
+    expect(() => strictPrCards('/nonexistent', { run: () => { throw new Error('gh down'); } })).toThrow(/open-PR card lookup failed/);
+  });
+  it('strictPrCards accepts a short valid list', async () => {
+    const { strictPrCards } = await import('../record-referral-ruling-io.mjs');
+    expect(strictPrCards('/nonexistent', { run: ok('[]') })).toEqual([]);
+  });
+  it('strictOpenCards refuses an unreadable backlog directory', async () => {
+    const { strictOpenCards } = await import('../record-referral-ruling-io.mjs');
+    expect(() => strictOpenCards(join(tmpdir(), 'no-such-dir-crfm'))).toThrow(/local backlog card lookup failed/);
   });
 });

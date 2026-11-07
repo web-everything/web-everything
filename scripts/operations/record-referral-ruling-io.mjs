@@ -184,13 +184,18 @@ export function readCardRulingFileMode({ env = process.env, tool, log = line => 
 /** Read-only dedupe first; new cards always use the existing isolated single-card landing path. */
 // Dedupe is forced ON for ruling cards whatever the repo-wide default says: this path must never file a duplicate.
 // A failed PR lookup (readPrHostedCards swallows it as []) must also refuse, never read as "no card exists".
+const PR_LIST_LIMIT = 200; // readPrHostedCards asks for --limit 200: a full page may be cut off
 const PR_HOSTED_CARD_CAP = 60; // mirrors card-dedupe's PR_CARD_CAP: reaching it means the list was cut off
-const strictPrCards = (dir) => {
+export const strictPrCards = (dir, { run = execFileSyncThrottled } = {}) => {
   let failure = null;
   const cards = readPrHostedCards({ cwd: dir, exec: (cmd, args, opts) => {
     try {
-      const out = String(execFileSyncThrottled(cmd, args, opts));
-      if (args[0] === 'pr' && args[1] === 'list') JSON.parse(out); // an unparseable list is a failed lookup too
+      const out = String(run(cmd, args, opts));
+      if (args[0] === 'pr' && args[1] === 'list') {
+        const list = JSON.parse(out); // an unparseable or non-array list is a failed lookup too
+        if (!Array.isArray(list)) throw new Error('open-PR list is not an array');
+        if (list.length >= PR_LIST_LIMIT) throw new Error('open-PR list hit its limit and may be incomplete');
+      }
       return out;
     } catch (error) { failure = error; throw error; }
   } });
@@ -199,7 +204,7 @@ const strictPrCards = (dir) => {
   return cards;
 };
 // Same for the local backlog: an unreadable directory or card is a failed lookup, not "no card".
-const strictOpenCards = (dir) => {
+export const strictOpenCards = (dir) => {
   let failure = null;
   const cards = readOpenCards(dir, {
     list: (path) => { try { return readdirSync(path); } catch (error) { failure = error; throw error; } },
