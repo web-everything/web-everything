@@ -1,15 +1,16 @@
 ---
+bornAs: xj4znuh
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/operations/red-team-gate-apply.mjs"]
+scope: ["we:scripts/conveyor/reconcile-note-comment.mjs", "we:scripts/operations/operator-queue-needs-person.mjs", "we:scripts/operations/operator-queue.mjs", "we:scripts/operations/needs-you-feed.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# red-team send-back writes review:changes after only a head re-read
+# needs-person ask is not bound to a head: a round-cap / ci-heal note about an old head stays on the operator's…
 
-Flow-sim gap R4-G6, class K6 (check-then-act race with no pin). Failing input: red-team result for head H with confirmed breaks, PR lacks review:changes. author pushes head H2 between `io.readHead` and the label write. Cited: we:scripts/operations/red-team-gate-apply.mjs:195-197. Soak-break sketch: wrong-bounce. review:changes lands on H2 carrying findings of H; one wasted fix round (the fixer sees an already-fixed head). Not a wrong-merge: changes only holds.
+Flow-sim gap R8b-G3, class K6 (check-then-act race with no pin). Failing input: Trusted note 'conveyor - needs your decision' (e.g. ci-heal-exhausted, 3/3) posted at head A; a fixer or the operator then pushes head B; operator has not commented.' 'operator-queue run after the push. Cited: we:scripts/conveyor/reconcile-note-comment.mjs:96-104, we:scripts/operations/operator-queue-needs-person.mjs:5-13, we:scripts/operations/operator-queue.mjs:791-799, we:scripts/operations/needs-you-feed.mjs:80. Soak-break sketch: Fixture: PR comments = [note(ci-heal-exhausted) at t1], commits: head moved at t2>t1, no operator comment. Action: needsPersonRow(repo, {headRefOid:B, comments}). Assert null (note predates the head); fails today (row returned). Contrast: standDownRow lapses …
 
 ## Acceptance
 

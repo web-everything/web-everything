@@ -1,15 +1,16 @@
 ---
+bornAs: xb5nlnk
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/readiness/file-locks.mjs"]
+scope: ["we:scripts/operations/red-team-gate-apply.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Lease heartbeat rewrites we:lock.json in place (truncate+write), so a concurrent reader sees an entry-less di…
+# red-team send-back writes review:changes after only a head re-read
 
-Flow-sim gap R8c-G4, class K6 (check-then-act race with no pin). Failing input: Any lease using file-locks heartbeat(): drain lease (we:drain-lock.mjs:349-356), runner lease (we:runner-lock.mjs heartbeatRunnerLease), review/fix daemon leases. Owner alive, heartbeat age normal. A second acquirer runs reserve() in the millisecond window while the owner's heartbeat() has truncated we:lock.json but not finishe… Cited: we:scripts/readiness/file-locks.mjs. Soak-break sketch: Fixture: temp lock root, owner A reserves; inject a writeFileSync seam that pauses after truncation; meanwhile B calls reserve() with the dir mtime backdated 20 s. Assertion that fails today: B.ok === false (reason 'held'); today B.ok === true.
+Flow-sim gap R4-G6, class K6 (check-then-act race with no pin). Failing input: red-team result for head H with confirmed breaks, PR lacks review:changes. author pushes head H2 between `io.readHead` and the label write. Cited: we:scripts/operations/red-team-gate-apply.mjs:195-197. Soak-break sketch: wrong-bounce. review:changes lands on H2 carrying findings of H; one wasted fix round (the fixer sees an already-fixed head). Not a wrong-merge: changes only holds.
 
 ## Acceptance
 

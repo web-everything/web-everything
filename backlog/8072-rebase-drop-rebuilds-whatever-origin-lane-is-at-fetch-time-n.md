@@ -1,15 +1,16 @@
 ---
+bornAs: x06uhwz
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/conveyor/reconcile-note-comment.mjs", "we:scripts/operations/operator-queue-needs-person.mjs", "we:scripts/operations/operator-queue.mjs", "we:scripts/operations/needs-you-feed.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/rebase-drop-manifest.mjs", "we:scripts/review-set-label.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# needs-person ask is not bound to a head: a round-cap / ci-heal note about an old head stays on the operator's…
+# Rebase-drop rebuilds whatever origin/<lane> is at fetch time, not the judged head, then restamps the acceptan…
 
-Flow-sim gap R8b-G3, class K6 (check-then-act race with no pin). Failing input: Trusted note 'conveyor - needs your decision' (e.g. ci-heal-exhausted, 3/3) posted at head A; a fixer or the operator then pushes head B; operator has not commented.' 'operator-queue run after the push. Cited: we:scripts/conveyor/reconcile-note-comment.mjs:96-104, we:scripts/operations/operator-queue-needs-person.mjs:5-13, we:scripts/operations/operator-queue.mjs:791-799, we:scripts/operations/needs-you-feed.mjs:80. Soak-break sketch: Fixture: PR comments = [note(ci-heal-exhausted) at t1], commits: head moved at t2>t1, no operator comment. Action: needsPersonRow(repo, {headRefOid:B, comments}). Assert null (note predates the head); fails today (row returned). Contrast: standDownRow lapses …
+Flow-sim gap R9c-G4, class K6 (check-then-act race with no pin). Failing input: PR accepted (review:accepted) and judged at head X at pass start (v.headSha/listedHeadSha). It is BEHIND or still carries the manifest (isRebaseDropCandidate / needsManifestStripBeforeMerge). Author pushes Y on top of X after the listing and before the rebuild; the review daemon has not yet re-armed the labels. Drain reaches th… Cited: we:scripts/merge-ai-prs.mjs:5915, we:scripts/lib/rebase-drop-manifest.mjs:160-164, we:scripts/lib/rebase-drop-manifest.mjs:265, we:scripts/merge-ai-prs.mjs:5944-5947, we:scripts/review-set-label.mjs:1380-1382. Soak-break sketch: Fixture: lane ref at X with review:accepted; stub gitRunner so fetch returns X+Y (one extra non-manifest commit) while the verdict carries headSha X. Action: run the rebase-drop loop for the verdict with a spawn stub capturing restampAcceptance argv. Assert (…
 
 ## Acceptance
 

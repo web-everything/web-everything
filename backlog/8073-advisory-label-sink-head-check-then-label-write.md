@@ -1,15 +1,16 @@
 ---
+bornAs: x3g7x2k
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/operations/review-pr-io.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Direct merge: a hold/bounce landing after the fresh re-read is not seen (labels not re-read before mergePr)
+# ADVISORY_LABEL sink head check then label write
 
-Flow-sim gap D-C2, class K6 (check-then-act race with no pin). Failing input: non-local repo; labels [ready-to-merge, review:accepted]; head H; reviewer bounces: review-set-label --to=changes atomically strips accepted + ready-to-merge and adds review:changes (we:review-set-label.mjs:728-740).' 'bounce lands after MAP:7168 revalidateForMerge read but before MAP:7287 gh pr merge. Window contains mergeQueu… Cited: we:scripts/merge-ai-prs.mjs:7168-7204, we:scripts/merge-ai-prs.mjs:7279-7287, we:scripts/merge-ai-prs.mjs:5110. Soak-break sketch: none
+Flow-sim gap R4-G7, class K6 (check-then-act race with no pin). Failing input: review:human PR, advisory outcome for head H. push of H2 after readPrState and before setLabels. Cited: we:scripts/operations/review-pr-io.mjs:1818-1834. Soak-break sketch: stale advisory:accepted on H2 until advisory-label-sweep drops it (sweep exists, ~one tick; delegated-clear-human treats advisory:accepted as label-only, seg C), narrow window.
 
 ## Acceptance
 

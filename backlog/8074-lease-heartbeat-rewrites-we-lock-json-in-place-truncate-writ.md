@@ -1,15 +1,16 @@
 ---
+bornAs: x9a4zap
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/review-set-label.mjs"]
+scope: ["we:scripts/readiness/file-locks.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# stale in-flight review verdict `changes` lands on a human-cleared PR
+# Lease heartbeat rewrites we:lock.json in place (truncate+write), so a concurrent reader sees an entry-less di…
 
-Flow-sim gap R4-G1, class K6 (check-then-act race with no pin). Failing input: PR at head H carries review:pending (or review:human re-parked while a review job for H is already running). Job R started on H. operator runs clear-human (labels -> review:accepted, human/pending/changes removed, marker `cleared-human` for H). Then R finishes with verdict changes. Cited: we:scripts/operations/review-pr-io.mjs:991-1030, we:scripts/operations/review-pr-io.mjs:1587-1600, we:scripts/review-set-label.mjs, we:scripts/review-set-label.mjs:719-745. Soak-break sketch: wrong-clear (inverse). The operator's clearance is silently undone, the PR is sent to a fixer for a review the operator had superseded: one wasted fix round, possible round-cap spend. Same-head accept is a no-op, so only `changes` hits it.
+Flow-sim gap R8c-G4, class K6 (check-then-act race with no pin). Failing input: Any lease using file-locks heartbeat(): drain lease (we:drain-lock.mjs:349-356), runner lease (we:runner-lock.mjs heartbeatRunnerLease), review/fix daemon leases. Owner alive, heartbeat age normal. A second acquirer runs reserve() in the millisecond window while the owner's heartbeat() has truncated we:lock.json but not finishe… Cited: we:scripts/readiness/file-locks.mjs. Soak-break sketch: Fixture: temp lock root, owner A reserves; inject a writeFileSync seam that pauses after truncation; meanwhile B calls reserve() with the dir mtime backdated 20 s. Assertion that fails today: B.ok === false (reason 'held'); today B.ok === true.
 
 ## Acceptance
 
