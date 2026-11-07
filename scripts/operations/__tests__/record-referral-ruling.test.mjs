@@ -1082,6 +1082,56 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     return { run, result, operation, view, written, judgeConfirm, landRulingCard, noIO, snapshot, rtIO };
   }
 
+  it('R671 red-team writer persists judge attribution in ledger and PR record without rewriting history', async () => {
+    const h = await fixture('red-team', { inputOver: { actor: 'judge:r10' },
+      readOver: { identity: { login: 'web-everything', type: 'Bot' }, files: ['scripts/x.mjs'] } });
+    const plan = await h.run();
+    const historical = gh('Historical operator ruling: preserve verbatim', 'chalbert');
+    const comments = [...h.snapshot.comments, historical];
+    const before = JSON.stringify(comments);
+    const rows = [], posted = [];
+    const sinks = h.rtIO.createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: head, labels: ['review:human'], comments: [...comments] }),
+      readScope: () => h.snapshot.scope, readStandingRulingScope: () => null,
+      resolveIdentity: () => ({ login: 'web-everything', type: 'Bot' }), syncLabels: () => null,
+      readEvents: async () => ({ status: 'ok', rows: [...rows] }),
+      appendEvents: async events => rows.push(...events),
+      post: (_repo, _pr, body) => { posted.push(body); comments.push(gh(body, 'web-everything', { createdAt: '2026-10-04T16:00:00Z' })); },
+    });
+    await sinks[plan.effect](plan);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].actor.declared).toBe('judge:r10');
+    expect(JSON.stringify(rows[0])).toContain('Ruled by acting judge (R10), not the operator');
+    expect(posted).toHaveLength(2);
+    for (const body of posted) {
+      expect(body).toContain('Ruled by acting judge (R10), not the operator');
+      expect(body).toContain('judge:r10');
+    }
+    expect(JSON.stringify(comments.slice(0, h.snapshot.comments.length + 1))).toBe(before);
+  });
+
+  // R671: use the existing evidence operation, with the distinct actor and automation poster.
+  for (const kind of ['referral', 'red-team']) {
+    it(`R671 ${kind}: judge:r10 not-real traverses --asJudge with live evidence`, async () => {
+      const h = await fixture(kind, { inputOver: { actor: 'judge:r10' },
+        readOver: { identity: { login: 'web-everything', type: 'Bot' }, files: ['scripts/x.mjs'] } });
+      const plan = await h.run();
+      expect(h.result(plan)).toBe('not-real');
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+      expect(storedEvidence(plan)).toMatchObject(evidence());
+      expect(kind === 'referral' ? plan.record.actor : plan.actor).toBe('judge:r10');
+      expect(h.written).toHaveLength(1);
+    });
+    it(`R671 ${kind}: judge:r10 cannot bypass --asJudge or omit its evidence`, async () => {
+      for (const inputOver of [{ asJudge: false }, { evidence: undefined }]) {
+        const h = await fixture(kind, { inputOver: { actor: 'judge:r10', ...inputOver },
+          readOver: { identity: { login: 'web-everything', type: 'Bot' }, files: ['scripts/x.mjs'] } });
+        await expect(h.run()).rejects.toThrow(/asJudge|evidence|judge.*not-real/i);
+        expect(h.written).toEqual([]);
+      }
+    });
+  }
+
   for (const history of ['ok', 'unreadable', 'throws', 'async']) {
     it(`red-team: real engine with synchronous judge reader and ${history} history`, async () => {
       const [, rt, rtIO, , , engine] = await modules;
@@ -1460,5 +1510,60 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     expect(storedEvidence(v.record).output).toBe(p.evidence.output);
     expect(v.body).toContain(p.evidence.output);
     expect(v.body).not.toContain('OVERSIZED-TAIL');
+  });
+});
+
+
+describe('R671 distinct acting judge referral actor (red-first)', () => {
+  const attribution = 'Ruled by acting judge (R10), not the operator';
+  const rec = referral();
+  const base = openReferralFindings({ comments: [gh(renderReferralRecord(rec))], ...ctx() });
+  const snapshot = (ruling, over = {}) => ({ ...base, head, now: '2026-11-07T12:00:00Z', clearerId: 'judge-session',
+    files: ['scripts/x.mjs'], identity: { login: 'web-everything', type: 'Bot' },
+    judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } },
+    card: ruling === 'card' ? { requested: CARD, ref: CARD, readable: true } : null, ...over });
+  const request = (ruling, over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling,
+    actor: 'judge:r10', channel: 'chat', reason: 'Observed the failure', ...over });
+
+  it.each(['block', 'card'])('allows judge %s and attributes both record and comment', result => {
+    const plan = planOperatorRuling(snapshot(result), request(result));
+    expect(plan.record.actor).toBe('judge:r10');
+    expect(JSON.stringify(plan.record)).toContain(attribution);
+    expect(plan.body).toContain(attribution);
+    expect(parseOperatorRulingComment(gh(plan.body)).record.actor).toBe('judge:r10');
+    const state = mandatoryReferralState([gh(renderReferralRecord(rec)), gh(plan.body)], ctx());
+    expect(result === 'block' ? state.blocked : state.pending).toEqual(result === 'block' ? [rec.referrals[0].key] : []);
+  });
+  it.each(['approval', 'clear-human', 'accept'])('refuses judge %s', result => {
+    expect(() => planOperatorRuling(snapshot(result), request(result))).toThrow(/ruling|approval|clear-human|accept/i);
+  });
+  it.each(['block', 'card', 'not-real'].flatMap(result => [
+    { securityReachableToday: true }, { category: 'security' }, { findingClass: 'security' },
+  ].map(fields => [result, fields])))('refuses security-class %s with %j', (result, fields) => {
+    const read = snapshot(result);
+    read.open = read.open.map(f => ({ ...f, ...fields }));
+    expect(() => planOperatorRuling(read, request(result, result === 'not-real' ? { asJudge: true, cause: 'other' } : {})))
+      .toThrow(/security|operator.only/i);
+  });
+  const protectedFiles = ['scripts/guard-git-push.mjs', 'scripts/security/check.mjs', 'scripts/launchd/agent.plist',
+    'scripts/drain-queue.mjs', 'scripts/merge-queue.mjs', 'scripts/firewall.mjs', 'scripts/codex-shim.mjs'];
+  it.each(protectedFiles)('refuses card/not-real for PR touching %s even when selected finding is elsewhere; allows block', file => {
+    expect(() => planOperatorRuling(snapshot('card', { files: ['scripts/x.mjs', file] }), request('card')))
+      .toThrow(/protected|operator.only/i);
+    expect(() => planOperatorRuling(snapshot('not-real', { files: ['scripts/x.mjs', file] }), request('not-real', { asJudge: true, cause: 'other' })))
+      .toThrow(/protected|operator.only/i);
+    expect(planOperatorRuling(snapshot('block', { files: [file] }), request('block')).record.rulings[0].result).toBe('block');
+  });
+  it.each([{ enabled: false, actor: 'judge:r10' }, { enabled: 'yes', actor: 'judge:r10' },
+    { enabled: true, actor: '' }])('refuses disabled/malformed policy %j', value => {
+    expect(() => planOperatorRuling(snapshot('block', { judgeActorPolicy: { value } }), request('block')))
+      .toThrow(/disabled|invalid|malformed|judge.*policy/i);
+  });
+  it('unknown actor stays refused and the existing operator record stays operator-worded', () => {
+    expect(() => planOperatorRuling(snapshot('block'), request('block', { actor: 'judge:unknown' }))).toThrow(/actor|operator/i);
+    const plan = planOperatorRuling(snapshot('block'), request('block', { actor: 'chalbert' }));
+    expect(plan.record.actor).toBe('chalbert');
+    expect(plan.body).toMatch(/operator ruling/i);
+    expect(plan.body).not.toContain(attribution);
   });
 });

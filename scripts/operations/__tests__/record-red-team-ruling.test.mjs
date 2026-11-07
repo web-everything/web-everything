@@ -2302,3 +2302,72 @@ describe('block and not-real rulings', () => {
   });
 
 });
+
+
+describe('R671 acting judge red-team authority (red-first)', () => {
+  const attribution = 'Ruled by acting judge (R10), not the operator';
+  const identity = { login: 'web-everything', type: 'Bot' };
+  const judgeRead = (over = {}) => read({ identity, files: ['backlog/x.md'],
+    judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } }, ...over });
+  const judgeInput = (ruling, over = {}) => input({ actor: 'judge:r10', ruling,
+    card: ruling === 'card' ? CARD : undefined, ...(ruling === 'not-real' ? { cause: 'other' } : {}), ...over });
+
+  it.each(['block', 'card'])('allows judge %s posted as automation', ruling => {
+    const plan = planRedTeamRuling(judgeRead(), judgeInput(ruling));
+    expect(plan).toMatchObject({ actor: 'judge:r10', ruling, indices: [1] });
+    expect(buildRuleReasonComment(plan)).toContain(attribution);
+  });
+  it.each(['approval', 'clear-human', 'accept'])('refuses judge %s', ruling => {
+    expect(() => planRedTeamRuling(judgeRead(), judgeInput(ruling))).toThrow(/ruling|approval|clear-human|accept/i);
+  });
+  it.each(['block', 'card', 'not-real'].flatMap(ruling => [
+    { securityReachableToday: true }, { category: 'security' }, { findingClass: 'security' },
+  ].map(fields => [ruling, fields])))('refuses security-class %s with %j', (ruling, fields) => {
+    const comments = [redTeam(HEAD, [{ summary: 'live break', file: 'backlog/x.md', line: 24,
+      category: 'edge-case', findingClass: 'coverage-or-style', impactIfUnfixed: 'broken', confirmedByRecheck: true, ...fields }]), capped()];
+    expect(() => planRedTeamRuling(judgeRead({ comments }), judgeInput(ruling, ruling === 'not-real' ? { asJudge: true } : {})))
+      .toThrow(/security|operator.only/i);
+  });
+  it.each(['scripts/guard-git-push.mjs', 'scripts/security/check.mjs', 'scripts/launchd/agent.plist',
+    'scripts/drain-queue.mjs', 'scripts/merge-queue.mjs', 'scripts/firewall.mjs', 'scripts/codex-shim.mjs'])(
+    'PR-wide protected path %s refuses card and not-real, permits block', file => {
+      for (const ruling of ['card', 'not-real']) {
+        expect(() => planRedTeamRuling(judgeRead({ files: ['backlog/x.md', file] }),
+          judgeInput(ruling, ruling === 'not-real' ? { asJudge: true } : {}))).toThrow(/protected|operator.only/i);
+      }
+      expect(planRedTeamRuling(judgeRead({ files: [file] }), judgeInput('block')).ruling).toBe('block');
+    });
+  it.each([{ enabled: false, actor: 'judge:r10' }, { enabled: 'yes', actor: 'judge:r10' },
+    { enabled: true, actor: '' }])('refuses disabled/malformed actor policy %j', value => {
+    expect(() => planRedTeamRuling(judgeRead({ judgeActorPolicy: { value } }), judgeInput('block')))
+      .toThrow(/disabled|invalid|malformed|judge.*policy/i);
+  });
+  it.each([OP, { login: 'mallory', type: 'User' }, undefined])('judge refuses a non-automation poster %j', identity => {
+    expect(() => planRedTeamRuling(judgeRead({ identity }), judgeInput('block'))).toThrow(/automation|posting identity/i);
+  });
+  it('unknown actors remain refused; operator still requires matching human identity', () => {
+    expect(() => planRedTeamRuling(judgeRead(), judgeInput('block', { actor: 'judge:unknown' }))).toThrow(/actor|operator/i);
+    expect(planRedTeamRuling(read(), input())).toMatchObject({ actor: OP.login, ruling: 'card' });
+    expect(() => planRedTeamRuling(judgeRead(), input())).toThrow(/human|operator/i);
+    expect(buildRuleReasonComment(planRedTeamRuling(read(), input()))).not.toContain(attribution);
+  });
+  it('card writer posts judge attribution and actor in reason and gate record as automation', async () => {
+    const comments = thread();
+    const plan = planRedTeamRuling(judgeRead({ comments }), judgeInput('card'));
+    const posted = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: ['review:human'], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: false } }), readStandingRulingScope: () => null,
+      resolveIdentity: () => identity, resolveCard: () => card, syncLabels: () => null,
+      post: (_repo, _pr, body) => { posted.push(body); comments.push(bot(body, '2026-10-21T01:00:00Z')); },
+      ...ledgerIO(),
+    });
+    await sinks[plan.effect](plan);
+    expect(posted).toHaveLength(2);
+    for (const body of posted) {
+      expect(body).toContain(attribution);
+      expect(body).toContain('judge:r10');
+    }
+    expect(operatorRulingsOnLiveResult(comments, PR, HEAD).ruled.get(1)).toEqual(['card']);
+  });
+});
