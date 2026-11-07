@@ -77,14 +77,13 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { readLockfileParity } from './check-lockfile-parity.mjs';
-import { selectInstaller, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
+import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { join, basename, resolve, dirname, sep, delimiter } from 'node:path';
+import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
 import { readGit, execRead } from './lib/proc-read.mjs';
 import { createBuildOutputCleaner } from './lib/lane-build-output.mjs';
@@ -827,25 +826,11 @@ const depsReady = (dir) => laneDepsReady(dir, DEPS_MARKER(dir));
 // nothing here at all). This function stays ungated.
 function ensureDeps(dir) {
   const storeDir = resolvePnpmStoreDir();
+  // The runtime routes installer stdout to OUR stderr: acquire --json must remain pure JSON (tested in the lib).
   return ensureLaneDeps({
     dir, markerPath: DEPS_MARKER(dir), storeDir,
-    selectPlan: () => selectInstaller({
-      which: name => (process.env.PATH || '').split(delimiter).map(dir => resolve(dir, name)).find(file => {
-        try { accessSync(file, constants.X_OK); return statSync(file).isFile(); } catch { return false; }
-      }),
-      exec: (command, args, { cwd }) => execFileSync(command, args, {
-        cwd, encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-      }),
-      hasPnpmLock: existsSync(join(dir, 'pnpm-lock.yaml')),
-      hasNpmLock: existsSync(join(dir, 'package-lock.json')),
-      parity: () => readLockfileParity(dir).ok,
-      storeDir,
-    }),
     log: message => log(`  ${message} in ${dir} …`),
-    // Installer stdout goes to OUR stderr: acquire --json must remain pure JSON.
-    exec: (command, args) => execFileSync(command, args, {
-      cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL',
-    }),
+    ...createLaneDepsRuntime({ dir, storeDir, installTimeoutMs: NPM_TIMEOUT_MS }),
   });
 }
 

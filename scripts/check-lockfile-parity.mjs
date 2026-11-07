@@ -16,24 +16,39 @@ function add(map, name, version) {
   map.get(name).add(version);
 }
 
-/** Require pnpm versions to be npm-pinned and retain every npm name, ignoring placement and peer contexts. No IO. */
+/**
+ * Require pnpm versions to be npm-pinned and retain every npm name, ignoring placement and peer contexts, AND
+ * require every pnpm package to carry registry integrity that npm's lock vouches for (one of npm's
+ * space-separated hashes for that name@version). A pnpm entry with no integrity, or any other resolution
+ * (tarball, git, directory), is `unverified`; both kinds fail parity, which only ever routes a lane to npm ci.
+ * No IO.
+ */
 export function compareLockfiles(npmLock, pnpmLock) {
   const npm = new Map();
   const pnpm = new Map();
+  const npmIntegrity = new Map(); // name@version → Set of hashes
   for (const [path, entry] of Object.entries(packageMap(npmLock, 'npm'))) {
     if (path === '') continue;
     if (!entry || typeof entry !== 'object') throw new Error('Invalid npm package: ' + path);
     if (entry.link === true) continue;
     const name = entry.name || path.split('node_modules/').at(-1);
     add(npm, name, entry.version);
+    const id = name + '@' + entry.version;
+    if (!npmIntegrity.has(id)) npmIntegrity.set(id, new Set());
+    for (const token of String(entry.integrity ?? '').split(/\s+/)) if (token) npmIntegrity.get(id).add(token);
   }
-  for (const key of Object.keys(packageMap(pnpmLock, 'pnpm'))) {
+  const integrityMismatches = new Set();
+  const unverified = new Set();
+  for (const [key, value] of Object.entries(packageMap(pnpmLock, 'pnpm'))) {
     const base = key.split('(')[0];
     const separator = base.lastIndexOf('@');
     if (separator <= 0 || separator === base.length - 1) {
       throw new Error('Invalid pnpm package key: ' + key);
     }
     add(pnpm, base.slice(0, separator), base.slice(separator + 1));
+    const integrity = value && typeof value === 'object' && !value.unverified ? value.integrity : undefined;
+    if (typeof integrity !== 'string' || !integrity) unverified.add(base);
+    else if (npmIntegrity.has(base) && !npmIntegrity.get(base).has(integrity)) integrityMismatches.add(base);
   }
   const onlyInNpm = [];
   const onlyInPnpm = [];
@@ -50,8 +65,9 @@ export function compareLockfiles(npmLock, pnpmLock) {
       versionDisagreements.push({ name, npm: a, pnpm: b });
     }
   }
-  return { ok: !onlyInNpm.length && !onlyInPnpm.length,
-    onlyInNpm, onlyInPnpm, versionDisagreements, npmOnlyExtraVersions };
+  return { ok: !onlyInNpm.length && !onlyInPnpm.length && !integrityMismatches.size && !unverified.size,
+    onlyInNpm, onlyInPnpm, versionDisagreements, npmOnlyExtraVersions,
+    integrityMismatches: [...integrityMismatches].sort(), unverified: [...unverified].sort() };
 }
 
 // Read only pnpm's block-map layout, not general YAML. This runs BEFORE deps install.
@@ -59,9 +75,11 @@ function readPnpmProject(source) {
   const documents = source.split(/^---\s*(?:#.*)?$/m).map(text => {
     const doc = { project: false, environment: false, snapshots: false };
     let section;
+    let current; // the package entry whose metadata lines follow
     for (const line of text.split(/\r?\n/)) {
       if (/^\s*(?:#.*)?$/.test(line) || /^\.\.\.\s*$/.test(line)) continue;
       if (/^\S/.test(line)) {
+        current = undefined;
         const header = /^([\w-]+):(?:\s|$)/.exec(line);
         section = header?.[1];
         if (section === 'snapshots') doc.snapshots = true;
@@ -82,12 +100,20 @@ function readPnpmProject(source) {
         }
       }
       if (section !== 'packages') continue;
-      if (/^ {4}/.test(line)) continue; // package metadata
+      if (/^ {4}/.test(line)) { // package metadata: only `resolution` matters
+        if (!current || !/^ {4}resolution:/.test(line)) continue;
+        // Only the one-line registry form is verified; any other shape (tarball, git, directory, multi-line,
+        // a second resolution line) marks the package unverified.
+        const resolution = /^ {4}resolution:\s*\{\s*integrity:\s*([^\s,{}]+)\s*\}\s*(?:#.*)?$/.exec(line);
+        if (resolution && current.integrity === undefined && !current.unverified) current.integrity = resolution[1];
+        else current.unverified = true;
+        continue;
+      }
       const entry = /^ {2}(?:'((?:[^']|'')+)'|([^\s'"].*?)):\s*(?:\{\})?\s*(?:#.*)?$/.exec(line);
       if (!entry) throw new Error('pnpm: invalid package entry: ' + line.trim());
       const key = entry[1] === undefined ? entry[2] : entry[1].replace(/''/g, "'");
       if (Object.hasOwn(doc.packages, key)) throw new Error('pnpm: duplicate package: ' + key);
-      doc.packages[key] = {};
+      current = doc.packages[key] = {};
     }
     return doc;
   });
@@ -117,6 +143,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         ['only-in-npm', result.onlyInNpm], ['only-in-pnpm', result.onlyInPnpm],
         ['version disagreements', result.versionDisagreements.map(
           row => row.name + ': npm=' + row.npm.join(',') + ' pnpm=' + row.pnpm.join(','))],
+        ['integrity mismatches (pnpm hash not in npm lock)', result.integrityMismatches],
+        ['unverified (no registry integrity in pnpm lock)', result.unverified],
       ]) {
         if (entries.length) console.error(label + ':\n  ' + entries.join('\n  '));
       }

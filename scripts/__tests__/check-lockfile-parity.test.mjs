@@ -5,9 +5,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { compareLockfiles, readLockfileParity } from '../check-lockfile-parity.mjs';
 
+// Fixture integrity defaults to a value derived from name@version, so matching fixtures agree.
+const sri = id => 'sha512-' + id;
 const npm = (entries) => ({ packages: { '': { name: 'root', version: '1' },
-  ...Object.fromEntries(entries.map(([name, version]) => ['node_modules/' + name, { version }])) } });
-const pnpm = (...keys) => ({ packages: Object.fromEntries(keys.map(key => [key, {}])) });
+  ...Object.fromEntries(entries.map(([name, version, integrity = sri(name + '@' + version)]) =>
+    ['node_modules/' + name, { version, integrity }])) } });
+const pnpm = (...keys) => ({ packages: Object.fromEntries(keys.map(key => Array.isArray(key)
+  ? [key[0], key[1]] : [key, { integrity: sri(key.split('(')[0]) }])) });
+/** A pnpm-lock.yaml package entry with registry integrity. */
+const entry = id => `  ${id}:\n    resolution: {integrity: ${sri(id)}}\n`;
 
 describe('lockfile parity', () => {
   it('checks parity and selects pnpm in a fresh lane with no node_modules', () => {
@@ -18,7 +24,7 @@ describe('lockfile parity', () => {
         copyFileSync(resolve('scripts', file), join(dir, 'scripts', file));
       }
       writeFileSync(join(dir, 'package-lock.json'), JSON.stringify(npm([['a', '1']])));
-      writeFileSync(join(dir, 'pnpm-lock.yaml'), 'packages:\n  a@1: {}\n');
+      writeFileSync(join(dir, 'pnpm-lock.yaml'), 'packages:\n' + entry('a@1'));
       expect(existsSync(join(dir, 'node_modules'))).toBe(false);
       const options = { cwd: dir, env: { ...process.env, NODE_PATH: '', NODE_OPTIONS: '' },
         encoding: 'utf8', maxBuffer: 64 * 1024 };
@@ -56,7 +62,7 @@ describe('lockfile parity', () => {
     lock.packages['node_modules/acorn-walk/node_modules/acorn'] = { version: '8.15.0' };
     expect(compareLockfiles(lock, pnpm('acorn@8.17.0'))).toEqual({
       ok: true, onlyInNpm: [], onlyInPnpm: [], versionDisagreements: [],
-      npmOnlyExtraVersions: ['acorn@8.15.0'],
+      npmOnlyExtraVersions: ['acorn@8.15.0'], integrityMismatches: [], unverified: [],
     });
   });
   it('rejects a package name missing from pnpm even with multiple npm versions', () => {
@@ -72,7 +78,7 @@ describe('lockfile parity', () => {
       const lock = npm([['a', '2']]);
       lock.packages['node_modules/parent/node_modules/a'] = { version: '1' };
       writeFileSync(join(dir, 'package-lock.json'), JSON.stringify(lock));
-      writeFileSync(join(dir, 'pnpm-lock.yaml'), 'packages:\n  a@2: {}\n');
+      writeFileSync(join(dir, 'pnpm-lock.yaml'), 'packages:\n' + entry('a@2'));
       const output = execFileSync(process.execPath,
         [resolve('scripts/check-lockfile-parity.mjs')],
         { cwd: dir, encoding: 'utf8', maxBuffer: 64 * 1024 });
@@ -101,6 +107,48 @@ describe('lockfile parity', () => {
   it('splits a package key at its last non-leading @', () => {
     expect(compareLockfiles(npm([['name@alias', '1']]), pnpm('name@alias@1(peer@2)')).ok).toBe(true);
   });
+  it('rejects a pnpm integrity that differs from npm for the same name@version', () => {
+    expect(compareLockfiles(npm([['a', '1', 'sha512-npm']]), pnpm(['a@1', { integrity: 'sha512-other' }])))
+      .toMatchObject({ ok: false, integrityMismatches: ['a@1'] });
+  });
+  it('accepts a pnpm integrity that is one of npm\'s space-separated hashes', () => {
+    expect(compareLockfiles(npm([['a', '1', 'sha1-old sha512-new']]), pnpm(['a@1', { integrity: 'sha512-new' }])))
+      .toMatchObject({ ok: true, integrityMismatches: [], unverified: [] });
+  });
+  it('rejects a pnpm entry with no registry integrity', () => {
+    expect(compareLockfiles(npm([['a', '1']]), pnpm(['a@1', {}])))
+      .toMatchObject({ ok: false, unverified: ['a@1'] });
+  });
+  it('rejects an npm entry with no integrity for a name@version pnpm installs', () => {
+    expect(compareLockfiles(npm([['a', '1', '']]), pnpm('a@1')))
+      .toMatchObject({ ok: false, integrityMismatches: ['a@1'] });
+  });
+  it.each([
+    ['tarball', '{tarball: https://example.invalid/a-1.tgz}'],
+    ['git', '{type: git, repo: https://example.invalid/a.git, commit: abc}'],
+    ['directory', '{directory: ../a, type: directory}'],
+    ['integrity plus tarball', '{integrity: ' + sri('a@1') + ', tarball: https://example.invalid/a-1.tgz}'],
+    ['empty', '{}'],
+  ])('reads a pnpm %s resolution as unverified', (_label, resolution) => {
+    const dir = mkdtempSync(join(tmpdir(), 'lockfile-parity-'));
+    try {
+      writeFileSync(join(dir, 'package-lock.json'), JSON.stringify(npm([['a', '1']])));
+      writeFileSync(join(dir, 'pnpm-lock.yaml'), `packages:\n  a@1:\n    resolution: ${resolution}\n`);
+      expect(readLockfileParity(dir)).toMatchObject({ ok: false, unverified: ['a@1'] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('reads a pnpm entry without a resolution line as unverified', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lockfile-parity-'));
+    try {
+      writeFileSync(join(dir, 'package-lock.json'), JSON.stringify(npm([['a', '1']])));
+      writeFileSync(join(dir, 'pnpm-lock.yaml'), 'packages:\n  a@1: {}\n');
+      expect(readLockfileParity(dir)).toMatchObject({ ok: false, unverified: ['a@1'] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('refuses incomplete evidence', () => {
     expect(() => compareLockfiles({}, pnpm())).toThrow();
     expect(() => compareLockfiles(npm([]), {})).toThrow();
@@ -124,17 +172,15 @@ snapshots:
         specifier: '1'
         version: '1'
 packages:
-  a@1:
-    resolution: {integrity: example}
-snapshots:
+${entry('a@1')}snapshots:
   a@1: {}
 `;
   it.each([
     ['single document', [project]],
     ['env followed by project', [env, project]],
     ['project followed by env', [project, env]],
-    ['last document without importer metadata', [env, 'packages:\n  a@1: {}\n']],
-    ['snapshots without importer metadata before env', ['packages:\n  a@1: {}\nsnapshots: {}\n', env]],
+    ['last document without importer metadata', [env, 'packages:\n' + entry('a@1')]],
+    ['snapshots without importer metadata before env', ['packages:\n' + entry('a@1') + 'snapshots: {}\n', env]],
     ['project importer before unrelated packages', [project, 'packages:\n  unrelated@2: {}\n']],
   ])('reads and compares %s', (_label, documents) => {
     const dir = mkdtempSync(join(tmpdir(), 'lockfile-parity-'));
@@ -169,10 +215,8 @@ settings:
     ignored@4: {}
 packages:
   '@scope/a@1(peer@2)(@scope/peer@3)':
-    resolution: {integrity: example}
-  @scope/b@2: {}
-  plain@3: {}
-snapshots:
+    resolution: {integrity: ${sri('@scope/a@1')}}
+${entry('@scope/b@2')}${entry('plain@3')}snapshots:
   unrelated@4: {}
 `);
       expect(readLockfileParity(dir).ok).toBe(true);
