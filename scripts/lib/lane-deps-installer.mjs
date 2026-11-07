@@ -5,7 +5,6 @@ import { accessSync, constants, existsSync, linkSync, mkdirSync, readdirSync, re
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { readLockfileParity } from '../check-lockfile-parity.mjs';
-import { LEASE_FILENAME, isLeaseStale } from './lane-lease.mjs';
 
 /**
  * Lane dependency installation. This runs BEFORE a lane has node_modules, so it imports only `node:` builtins
@@ -189,11 +188,20 @@ export function runDepsInstaller({ plan, hashFor, marker, hasNodeModules, exec, 
  * An unreadable lease file reads as foreign-held (fail closed).
  */
 export function hasForeignLiveLease(dir, nowMs = Date.now()) {
-  const file = join(dir, '.git', LEASE_FILENAME);
+  const file = join(dir, '.git', '.lane-lease');
   if (!existsSync(file)) return false;
   try {
+    // Mirrors lane-lease.mjs#isLeaseStale (not imported: this file runs before node_modules and the parity
+    // bootstrap fixture copies only this file's declared imports). TTL runs from the later of acquire/renew.
     const lease = JSON.parse(readFileSync(file, 'utf8'));
-    return !isLeaseStale(lease, nowMs) && lease.pid !== process.pid;
+    if (!lease || typeof lease !== 'object') return true;
+    if (lease.pid === process.pid) return false;
+    if (lease.reserved) return true;
+    const acquired = Date.parse(lease.acquiredAt);
+    if (Number.isNaN(acquired)) return false; // unparseable timestamp reads stale in lane-lease.mjs
+    const renewed = Date.parse(lease.renewedAt);
+    const ttl = Number.isFinite(lease.ttlMinutes) ? lease.ttlMinutes * 60_000 : 240 * 60_000;
+    return nowMs - (Number.isNaN(renewed) ? acquired : Math.max(acquired, renewed)) < ttl;
   } catch {
     return true;
   }
@@ -219,6 +227,9 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
   });
   if (state === 'n/a' || state === 'ok') return state;
   plan = getPlan();
+  // The probe above can take seconds: re-check, so a lane claimed meanwhile is never wiped by a migration.
+  // (A residual window between this check and the removal remains; migration only touches lanes that read ok.)
+  if (depsReady(dir, markerPath, storeDir) === 'ok' && hasForeignLiveLease(dir)) return 'ok';
   const wantedPnpm = plan.backend === 'pnpm'; // also true when the store is unusable and we fall back below
   let generation = null; // the store generation this pnpm install links into
   if (plan.backend === 'pnpm') {

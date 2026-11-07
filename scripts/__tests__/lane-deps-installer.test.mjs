@@ -381,6 +381,14 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
       expect(migrate(dir, markerPath, storeDir, exec)).toBe('ok');
       expect(exec).not.toHaveBeenCalled();
     });
+    it('a lane claimed by another process DURING the pnpm probe is not wiped', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      const exec = vi.fn();
+      const selectPlan = () => { writeLease(dir, { ...fresh, pid: process.pid + 1 }); return select({ storeDir }); };
+      expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('ok');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    });
     it('our own lease (acquire) and a stale lease both migrate', () => {
       for (const lease of [{ ...fresh, pid: process.pid }, { acquiredAt: '2020-01-01T00:00:00Z', ttlMinutes: 1, pid: process.pid + 1 }]) {
         const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
