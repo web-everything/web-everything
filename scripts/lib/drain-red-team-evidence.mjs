@@ -588,6 +588,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
             || !(at > bounds.unfinishedStartedAt) || typeof bounds.completeHeadRead !== 'function') return exactHit;
           const complete = bounds.completeHeadRead({ pr, head, at });
           if (complete?.complete !== true || complete.blocked !== false) return exactHit;
+          // The carried-from head's own runs may hide beyond the cap too: it needs the same complete clean read.
+          const source = completeSameHeadRead({ repo, pr, head: oldHead, runsDir, list, read, stat, now, settleAt: at });
+          if (source?.complete !== true || source.blocked !== false) return exactHit;
           const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat,
             lookup: () => ({ ok: true, run: null, at: 0 }), allowCappedStatusFallback: false, scanSettings, warn, now,
             isAlive, host, namespace, readPidStart, readScorecards });
