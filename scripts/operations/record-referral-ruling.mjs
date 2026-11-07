@@ -413,7 +413,7 @@ export function assertCardFiling(read, input) {
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
   const digest = `Operator card follow-up for ${input.repo}#${input.pr} (head ${read.head}):\n\n`
-    + selected.map(f => `- ${IN_REPO_LOCUS}${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — ${f.summary}`).join('\n');
+    + selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${String(f.summary ?? '').replace(/\s+/g, ' ').trim()}`).join('\n');
   const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
   for (const [field, value] of Object.entries({ digest, scope })) {
     const bounded = boundCardText(value, Number.MAX_SAFE_INTEGER, { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });

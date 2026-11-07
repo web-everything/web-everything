@@ -767,3 +767,15 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
     expect(result.open[0]).toMatchObject(coverage);
   });
 });
+
+describe('fileCard digest is parseable by the real card dedupe', () => {
+  it('parseFilingItems reads every finding line of buildRulingCardInput', async () => {
+    const { buildRulingCardInput } = await import('../record-referral-ruling.mjs');
+    const { parseFilingItems } = await import('../../lib/card-dedupe.mjs');
+    const sel = [{ file: 'scripts/x.mjs', line: 7, summary: 'a\nmulti line claim' }, { file: '', line: null, summary: 'no file claim' }];
+    const input = buildRulingCardInput({ head: 'a'.repeat(40) }, { repo: 'o/r', pr: 5 }, sel);
+    const items = parseFilingItems(input.digest);
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({ file: 'scripts/x.mjs', line: 7 });
+  });
+});
