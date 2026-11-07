@@ -379,6 +379,37 @@ describe('findStaleCodeServices reports older running code without restarting', 
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
+  it.each([
+    ['launchctl print exits non-zero', { launchctl: vi.fn(() => ({ status: 1, stdout: '' })) }],
+    ['launchctl print has no readable stdout', { launchctl: vi.fn(() => ({ status: 0 })) }],
+    ['ps start time is unparseable', {
+      launchctl: vi.fn(() => ({ status: 0, stdout: 'pid = 4242\n' })), ps: vi.fn(() => 'not a date'),
+    }],
+    ['launchctl prints an unknown process state', { launchctl: vi.fn(() => ({ status: 0, stdout: 'state = weird\n' })) }],
+  ])('flags process-unreadable, never fresh, when %s (default host reader)', async (_name, hosts) => {
+    const o = staleFixture({ readProcessStartMs: undefined, ...hosts });
+    // The shared inspect() helper forbids launchctl calls; these cases exercise the real host reader.
+    expect(await restartModule.findStaleCodeServices(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'process-unreadable' })]);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it.each([[Number.NaN], [-1], [Infinity]])('invalid graceMs %s fails closed as process-unreadable', async (graceMs) => {
+    const o = staleFixture({ graceMs });
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'process-unreadable' })]);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it('a service owned by another clone is positively fresh for this clone, never flagged stale', async () => {
+    const o = staleFixture({ readProcessStartMs: vi.fn(() => ({ start: adoptedAt - 1, cloneRoot: 'fixtures/other-clone' })) });
+    expect(await inspect(o)).toEqual([]);
+    expect(o.onFreshService).toHaveBeenCalledWith({ label: sampler });
+  });
+
+  it('a service owned by this clone with an older start is flagged stale', async () => {
+    const o = staleFixture({ readProcessStartMs: vi.fn(() => ({ start: adoptedAt - 1, cloneRoot })) });
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'stale-code' })]);
+  });
+
   it('makes no stale or fresh claim when the clone has adopted nothing', async () => {
     const o = staleFixture({ readAdoptedAtMs: vi.fn(() => null) });
     expect(await inspect(o)).toEqual([]);
