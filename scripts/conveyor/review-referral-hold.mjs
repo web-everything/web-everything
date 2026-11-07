@@ -27,7 +27,15 @@ import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
-export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
+/** The one set of run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name
+ * no finding: `attempted`/`count` skip them, and a refused run's cached list never matches them to a record key — the
+ * live re-read (empty `pending`) is what answers them. Failure tokens are deliberately absent and stay fail-closed:
+ * `referral-persistence-failed` (nothing live re-derives a lost persist; it has its own retry path),
+ * `malformed-referral-record` and `unreadable-referral-result` (the run's own findings are unknown, so its cached keys
+ * cannot be trusted as complete), and `referral-overflow` (added after the live read for a withheld ruling; nothing
+ * live re-derives it). */
+export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing',
+  'malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject']));
 export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -103,6 +111,9 @@ export function reviewRunEvidence(run) {
   } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
+    // A throwing stage has no pending confirm left. Keep this durable shape wakeable without caching live rulings.
+    ...(pending.length && !run.pending && run.stepTimings?.some(t => t?.step === 'stageVerdict'
+      && t.startedAt && !t.finishedAt) ? { referralStageRefused: true } : {}),
     ...(ciHeld ? { ciHeld: true } : {}),
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
@@ -192,7 +203,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
  */
 function wakeEvents(pr, run) {
   const knownRulings = new Set(run.rulings);
-  return (pr.comments ?? []).flatMap(c => {
+  return (Array.isArray(pr.comments) ? pr.comments : []).flatMap(c => {
     if (!isTrustedMarkerAuthor(c)) return [];
     const at = Date.parse(c.updatedAt ?? c.createdAt);
     if (!Number.isFinite(at)) return [];
@@ -231,6 +242,29 @@ export function persistRetryBudgetSpent(run) {
   return Boolean(run?.persistenceFailed) && 1 + (Number(run.persistRetries) || 0) > REFERRAL_RETRY_MS.length;
 }
 
+/** Re-read standing rulings, never a timestamp heuristic or an empty/missing thread. Every cached pending finding key
+ * must occur in a valid live record on this repo/PR/head; otherwise a cleared thread could erase a lost referral.
+ * The record may belong to an EARLIER run: a run's pending list legitimately inherits that run's open referrals, and
+ * the record that raised a key is where its ruling lands (PR #6465 round 3). Every referral of the record counts,
+ * not only the active ones: a key the sink durably retired (`dropped`, `superseded`, `carried`) stays in the record's
+ * append-only `referrals`, so it is still provably the saved finding, and the empty live pending list says it is settled.
+ * Reason tokens (`author-stamp-missing`, …) are answered by the empty live pending list, never by a record key.
+ * This only authorizes a rewind: mandatoryReferrals still derives and persists the actual verdict. */
+export function refusedReferralsAreRuled(pr, run, { repo,
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+  try {
+    if (!run?.referralStageRefused || !run.parked || run.head !== pr.headRefOid
+      || run.repo !== repo || run.pr !== Number(pr.number) || !Array.isArray(pr.comments)
+      || !Array.isArray(run.pending) || !run.pending.length) return false;
+    const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
+    if (live.pending.length) return false;
+    const keys = new Set(live.records.filter(r => r.repo === repo && r.pr === run.pr
+      && r.head === run.head).flatMap(r => r.referrals.map(f => f.key)));
+    const findingKeys = run.pending.filter(key => !PENDING_REASON_TOKENS.has(key));
+    return findingKeys.length > 0 && findingKeys.every(key => keys.has(key));
+  } catch { return false; }
+}
+
 /** A later attempt consumes a parked run's release even if it dies before advise. Keep completed
  * panel ordering, but never let an older park hide a newer incomplete attempt on that history. */
 function latestReviewAttempt(history) {
@@ -251,7 +285,7 @@ function latestReviewAttempt(history) {
  * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
-export function findResumableParkedRun(pr, runs, { repo } = {}) {
+export function findResumableParkedRun(pr, runs, { repo, cardReadable } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   if ((!last?.parked && !last?.resumeAdvise) || last.head !== pr.headRefOid) return null;
@@ -264,6 +298,8 @@ export function findResumableParkedRun(pr, runs, { repo } = {}) {
   if (last.persistenceFailed || last.resumeAdvise) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
   if (events.some(e => e.kind === 'fresh')) return null;
+  if (last.referralStageRefused) return refusedReferralsAreRuled(pr, last, { repo, cardReadable })
+    ? { id: last.id, head: last.head } : null;
   if (!last.attempted) return null;
   return events.length ? { id: last.id, head: last.head } : null;
 }
@@ -284,10 +320,14 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
   // replacing the obsolete persistence hold while the existing run retries its advisory step.
   if (last?.resumeAdvise && last.head === pr.headRefOid) return { hold: null, released: 'advisory-retry' };
   if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return { hold: null, released: null };
+  const refusedRuled = last.referralStageRefused && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0'
+    && refusedReferralsAreRuled(pr, last, { repo, cardReadable });
+  if (refusedRuled) return { hold: null, released: 'live-release' };
   // A failed persist checks its retry budget BEFORE any wake (card 5752): a ruling or an automated re-arm cannot fix a
   // persist, so it neither skips the backoff nor revives a spent budget. Only the operator in person (the needs-you
   // answer) or a new push releases it then. Any other parked run wakes on any event, as before.
-  const wake = last.persistenceFailed ? operatorWakeTime(pr, last) : wakeTime(pr, last);
+  const wake = last.referralStageRefused ? Math.max(0, ...wakeEvents(pr, last).filter(e => e.kind === 'fresh').map(e => e.at))
+    : last.persistenceFailed ? operatorWakeTime(pr, last) : wakeTime(pr, last);
   if (wake > last.startedAt) return { hold: null, released: 'wake' };
   let streak = 0;
   for (const run of history) {
@@ -298,7 +338,7 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
   const retryAt = last.persistenceFailed && streak <= REFERRAL_RETRY_MS.length
     ? last.completedAt + REFERRAL_RETRY_MS[streak - 1] : null;
   if (retryAt !== null && now >= retryAt) return { hold: null, released: 'retry' };
-  if (!last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
+  if (!last.referralStageRefused && !last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
     // Read exactly as the gate reads it (readable-card rule, author stamp, PR body/createdAt): a release the
     // gate would immediately re-park loops the review on every tick, which this hold exists to prevent.
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
