@@ -410,7 +410,10 @@ export function planOperatorRuling(read, input) {
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
   const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head, actor: String(actor).toLowerCase(),
     enabled: input.sendBack !== false && read.followUpEnabled !== false });
-  return { record, body: buildOperatorRulingComment(record), selected, skipped,
+  const body = buildOperatorRulingComment(record);
+  // The rendered body (finding text, channel) must be token-free too: refuse at plan time, not after approval.
+  assertJudgeReason(actor, body);
+  return { record, body, selected, skipped,
     ...(byPolicy ? { protectionSnapshot: policyProtectionSnapshot(read) } : {}), open: read.open, disputed: read.disputed ?? [],
     supersedes: record.rulings.flatMap((r) => r.supersedes ?? []), followUp };
 }

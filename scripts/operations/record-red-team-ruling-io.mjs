@@ -1,4 +1,4 @@
-import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeWriterPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
+import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
 import { assertJudgeReason, judgeEvidenceComment } from './record-referral-ruling.mjs';
 import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
@@ -18,7 +18,7 @@ import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
-import { assertRulingIdentity, isRulingComment, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
+import { assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createActionStore } from './action-store.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
@@ -210,6 +210,8 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   };
   /** Right before any write: the poster, the head, the SAME result, and every selected break still rulable the same way
    *  the plan found it (the same `rulableBreaks` rule, so the cap and held-break checks apply here too). */
+  // One judge-policy read per proof pass, under THIS sink's env — the env its recheck holds (#6494 F2/F7).
+  const passPolicy = () => judgePolicyOnce(() => readJudgeActorPolicy({ env, log: warn }));
   const recheck = (p, noWrite = 'nothing written') => {
     assertJudgeReason(p.actor, p.reason);
     assertJudgeReason(p.actor, p.sendBackBody);
@@ -220,7 +222,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     if (!Array.isArray(thread.labels) || !Array.isArray(thread.comments)) throw new Error('unreadable thread or labels; retry after a complete read');
     const head = String(thread.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`PR #${p.pr}'s head moved to ${head} since the plan (${p.head}); ${noWrite} — re-run against the new head`);
-    const comments = operatorBoundComments(thread.comments);
+    const comments = operatorBoundComments(thread.comments, { policy: passPolicy() });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...thread, number: p.pr, headRefOid: head } });
     let now;
     try { now = rulableBreaks({ comments, repo: p.repo, labels: thread.labels, pr: p.pr, head, setting: p.setting, scope: effectiveScope(p), ruling: p.ruling, citesCard: Boolean(p.cardRef), standingRuling }); }
@@ -237,10 +239,11 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     const after = readThread({ repo: p.repo, pr: p.pr });
     const head = String(after.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`${what} was posted but PR #${p.pr}'s head moved to ${head}; the ruling binds to ${p.head} only — inspect and re-run on the new head`);
-    const comments = operatorBoundComments(after.comments);
+    const policy = passPolicy();
+    const comments = operatorBoundComments(after.comments, { policy });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...after, number: p.pr, headRefOid: head } });
     if (liveResultGateState(comments, p.pr, head, p.repo, standingRuling).resultId !== p.resultId) throw new Error(`${what} was posted but the live red-team result changed; inspect the thread before retrying`);
-    if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c))) {
+    if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c, policy))) {
       throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
     }
     const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: effectiveScope(p), standingRuling });
@@ -255,10 +258,11 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     const after = readThread({ repo: p.repo, pr: p.pr });
     const head = String(after.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`the operator-block record was posted but PR #${p.pr}'s head moved to ${head}; inspect the thread`);
-    const comments = operatorBoundComments(after.comments);
+    const policy = passPolicy();
+    const comments = operatorBoundComments(after.comments, { policy });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...after, number: p.pr, headRefOid: head } });
     if (liveResultGateState(comments, p.pr, head, p.repo, standingRuling).resultId !== p.resultId) throw new Error('the operator-block record was posted but the live red-team result changed; inspect the thread');
-    if (!comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c))) {
+    if (!comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c, policy))) {
       throw new Error("the operator-block record is not in the read-back as a human operator's comment; inspect the thread before retrying");
     }
     const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: p.scope, standingRuling });
@@ -451,7 +455,8 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       const hasReason = comments => comments.filter(isTrustedMarkerAuthor).some(c => (p.actor === JUDGE_ACTOR ? isJudgeAuthored(c) : isHumanOperatorComment(c))
         && String(c.body ?? '').startsWith(`${marker}\n**Operator ruling on the post-accept red team: block**`));
       // Adding a hold is safe: restore it before any ledger or reason failure can strand a released finding.
-      if (!fresh.comments.filter(isTrustedMarkerAuthor).some(c => isRulingComment(c) && String(c.body ?? '').trim() === record)) {
+      const policy = passPolicy();
+      if (!fresh.comments.filter(isTrustedMarkerAuthor).some(c => isRulingComment(c, policy) && String(c.body ?? '').trim() === record)) {
         await post(p.repo, p.pr, record, p.actor);
       }
       const intents = p.indices.map(index => ({ ...buildLedgerEvent({ type: EVENT_TYPES.RULING,

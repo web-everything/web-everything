@@ -7,6 +7,13 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 
 // Ledger fixtures must not depend on which historical commits exist in the host checkout (as ruling-ledger.test.mjs).
 vi.mock('../restack-equivalence.mjs', () => ({ isRestackOf: () => false }));
+// A pass-through spy on the preferences read, so a test can count how often the judge policy hits the disk (#6494 F2).
+const { readPrefs } = vi.hoisted(() => ({ readPrefs: vi.fn() }));
+vi.mock('../policy-cascade.mjs', async (original) => {
+  const real = await original();
+  readPrefs.mockImplementation(real.readPlatformPreferences);
+  return { ...real, readPlatformPreferences: (...args) => readPrefs(...args) };
+});
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState, operatorRulingsOnLiveResult,
   readRedTeamDisposition, CONFIRMED_BREAKS_DEFAULTS } from '../red-team-gate.mjs';
@@ -111,9 +118,13 @@ describe('R671 v1 only adds holds', () => {
     expect(() => authorship.assertJudgeAuthority({}, { actor, ruling, asJudge: true }))
       .toThrow(`judge ${ruling ?? 'grant'} is refused in v1; operator-only`);
   });
-  it('block needs no classification or protected-path eligibility', () => {
-    expect(() => authorship.assertJudgeAuthority({}, { actor, ruling: 'block' },
-      [{ category: 'security/injection' }, { findingClass: 'unknown' }])).not.toThrow();
+  // The authority boundary takes no findings at all, so classification can never gate a judge block here; the
+  // plan-level tests ('judge block permits security or unreadable classification', both writers) pin the rest.
+  it('the authority boundary admits an enabled judge block without reading any classification', () => {
+    const read = { judgeActorPolicy: { value: { enabled: true, actor } } };
+    expect(authorship.assertJudgeAuthority.length).toBe(2);
+    expect(() => authorship.assertJudgeAuthority(read, { actor, ruling: 'block',
+      findings: [{ category: 'security/injection' }, { findingClass: 'unknown' }] })).not.toThrow();
   });
   it('disabled policy refuses persisted judge blocks', () => {
     vi.stubEnv('WE_JUDGE_ACTOR_ENABLED', 'false');
@@ -193,15 +204,21 @@ describe('#6494 judge policy is read once per reader pass, and logged once per l
       'policy-cascade judgeActor enabled=true (standard) actor=judge:r10 (standard)',
       'policy-cascade judgeActor enabled=false (env) actor=judge:r10 (standard)']);
   });
-  it('the red-team gate readers keep honouring an enabled judge block across a multi-block thread', () => {
+  it('the red-team gate readers read the preferences a fixed number of times, however many judge blocks the thread has', () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      const comments = [result, cap, block(), block(), block()];
-      expect(operatorRulingsOnLiveResult(comments, pr, head).blocked).toEqual(new Set([1]));
-      expect(liveResultGateState(comments, pr, head, 'we', null).outcomes.has('operator-block')).toBe(true);
-      const d = disposition(comments);
-      expect([...d.held, ...d.sendBack].map(f => f.index)).toEqual([1]);
-      expect(errors.mock.calls.filter(([l]) => /^policy-cascade judgeActor /.test(String(l))).length).toBeLessThanOrEqual(1);
+      const reads = comments => {
+        readPrefs.mockClear();
+        expect(operatorRulingsOnLiveResult(comments, pr, head).blocked).toEqual(new Set([1]));
+        expect(liveResultGateState(comments, pr, head, 'we', null).outcomes.has('operator-block')).toBe(true);
+        const d = disposition(comments);
+        expect([...d.held, ...d.sendBack].map(f => f.index)).toEqual([1]);
+        expect(operatorBoundComments(comments)).toHaveLength(comments.length);
+        return readPrefs.mock.calls.length;
+      };
+      const one = reads([result, cap, block()]);
+      expect(one).toBeGreaterThan(0);
+      expect(reads([result, cap, block(), block(), block(), block(), block()])).toBe(one);
     } finally { errors.mockRestore(); }
   });
 });

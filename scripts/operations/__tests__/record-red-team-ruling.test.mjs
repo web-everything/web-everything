@@ -2368,6 +2368,20 @@ describe('R671 v1 acting judge red-team blocks', () => {
     expect(buildRuleReasonComment(planRedTeamRuling(read(), input()))).not.toContain(attribution);
   });
 
+  // #6494 — the effects re-check the authority boundary on their own: a judge card / not-real plan handed straight to
+  // its effect (planning would refuse it) is refused before any read or write.
+  it.each([['card', RED_TEAM_RULING_CARD_EFFECT], ['not-real', RED_TEAM_RULING_NOT_REAL_EFFECT]])(
+    'judge %s handed straight to its red-team effect is refused before any write', async (ruling, effect) => {
+      const plan = { ...planRedTeamRuling(read(), input(ruling === 'card' ? {} : { ruling, card: undefined, cause: 'other' })), actor: 'judge:r10' };
+      const post = vi.fn(), readThread = vi.fn(), runSetLabel = vi.fn();
+      const sinks = createRecordRedTeamRulingSinks({ post, readThread, runSetLabel, warn: () => {}, resolveIdentity: () => identity });
+      // the card effect is synchronous: lift a synchronous throw into the same rejection
+      await expect(Promise.resolve().then(() => sinks[effect](plan))).rejects.toThrow(`judge ${ruling} is refused in v1; operator-only`);
+      expect(post).not.toHaveBeenCalled();
+      expect(readThread).not.toHaveBeenCalled();
+      expect(runSetLabel).not.toHaveBeenCalled();
+    });
+
   // #6494 F7 — planning and the effect hold ONE policy: a tool block may narrow the gate-visible policy, never widen it.
   const scratch = [];
   afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });

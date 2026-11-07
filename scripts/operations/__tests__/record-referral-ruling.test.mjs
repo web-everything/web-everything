@@ -1680,6 +1680,19 @@ describe('R671 v1 acting judge referral blocks', () => {
       // control: the same canonical record without the token is a counted judge block
       expect(readOperatorRulings([canonicalJudge()]).rulings).toHaveLength(1);
     });
+  it('a hand-edited judge referral block stays malformed (holds), whether or not the edit adds a clearance token', () => {
+    for (const edit of ['Edited prose.', 'Edited prose with reviewed-sha in it.']) {
+      const c = canonicalJudge();
+      c.body = c.body.replace(attribution, `${attribution}\n${edit}`);
+      expect(parseOperatorRulingComment(c)).toMatchObject({ malformed: true });
+      expect(readOperatorRulings([c]).malformed).toBe(true);
+    }
+  });
+  it('judge referral planning refuses a clearance token in the rendered body, not only in the reason', () => {
+    // the channel is rendered into the body; the reason is clean
+    expect(planOperatorRuling(snapshot(), request('block', { actor: 'chalbert', channel: 'chat reviewed-sha' })).body).toMatch(/reviewed-sha/);
+    expect(() => planOperatorRuling(snapshot(), request('block', { channel: 'chat reviewed-sha' }))).toThrow(/judge.*reserved.*review.*token/i);
+  });
   it('persisted judge referral block carrying supersedes is ignored', () => {
     const plan = planOperatorRuling(snapshot(), request());
     const c = canonicalJudge({ rulings: plan.record.rulings.map((r) => ({ ...r, supersedes: ['operator:aaaaaaaaa:0123456789ab'] })) });

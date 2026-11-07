@@ -3902,15 +3902,16 @@ export function parseOperatorRulingComment(comment) {
   let record = null;
   try { record = match ? JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')) : null; } catch { record = null; }
   const head = typeof record?.head === 'string' && /^[a-f0-9]{40}$/.test(record.head) ? record.head : undefined;
-  // A judge record only adds holds (#6494): automation-authored, block rows only, no supersession (a judge block can
-  // never retire a standing ruling), and no review-clearance token anywhere in the comment — the same refusal the
-  // red-team reader applies, so a crafted canonical record cannot carry one past the writer's check.
   if (record?.actor === JUDGE_ACTOR && (!AUTOMATION_LOGINS.includes(login)
-    || !Array.isArray(record.rulings) || record.rulings.some(x => x?.result !== 'block' || (Array.isArray(x?.supersedes) && x.supersedes.length))
-    || JUDGE_RESERVED_TOKEN_RE.test(body))) return null;
+    || !Array.isArray(record.rulings) || record.rulings.some(x => x?.result !== 'block'))) return null;
   if (!trusted || !record || !validateOperatorRuling(record)) return { malformed: true, head };
   try { if (buildOperatorRulingComment(record) !== normalized) return { malformed: true, head }; }
   catch { return { malformed: true, head }; }
+  // A judge record only adds holds (#6494): no supersession (a judge block never retires a standing ruling) and no
+  // review-clearance token anywhere — the red-team reader's refusal. Checked only AFTER the integrity check above, so a
+  // hand-edited judge comment stays malformed (and holds) instead of being silently dropped.
+  if (record.actor === JUDGE_ACTOR && (record.rulings.some(x => Array.isArray(x?.supersedes) && x.supersedes.length)
+    || JUDGE_RESERVED_TOKEN_RE.test(normalized))) return null;
   return { record };
 }
 
