@@ -619,6 +619,26 @@ export function makeStopAwaitingVerifyResolver({
   };
 }
 
+/** Keep the reaper's chat policy, but refuse stops when its tolerant readers swallowed an IO failure. */
+export function makeStopChatSpawnGuardResolver({ readFileSyncFn = readFileSync, ...options } = {}) {
+  let unreadable = false;
+  const guardFor = makeChatSpawnGuardResolver({
+    ...options,
+    readFileSyncFn: (...args) => {
+      try { return readFileSyncFn(...args); }
+      catch (err) {
+        if (err?.code !== 'ENOENT') unreadable = true;
+        throw err;
+      }
+    },
+  });
+  return (session) => {
+    unreadable = false;
+    const guard = guardFor(session);
+    return unreadable ? null : guard;
+  };
+}
+
 export function runSessionWatchdogPass({
   nowMs = Date.now(),
   config = DEFAULT_SESSION_WATCHDOG,
@@ -639,7 +659,7 @@ export function runSessionWatchdogPass({
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
   completionFor = makeCompletionResolver(),
   awaitingVerifyFor = makeStopAwaitingVerifyResolver({ now: () => nowMs }),
-  chatSpawnGuardFor = makeChatSpawnGuardResolver({ now: () => nowMs }),
+  chatSpawnGuardFor = makeStopChatSpawnGuardResolver({ now: () => nowMs }),
   rm = rmSessionRecord,
   stop = stopSessionWithRetry,
   ownSessionId = process.env.CLAUDE_CODE_SESSION_ID,

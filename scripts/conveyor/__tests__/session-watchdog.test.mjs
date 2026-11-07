@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_SESSION_WATCHDOG, CLASSES, ESCALATION_EVENT_TYPE, resolveSessionWatchdogConfig, watchdogKindOf, standardDuration,
   commandSegments, summarizeTail, classifyWatchdogSession, planWatchdog, runSessionWatchdogPass, escalationKey,
-  readEscalationLedger, appendEscalationEvent, renderWatchdogPass, defaultClaimStoreReadable, readWatchdogTail, makeStopAwaitingVerifyResolver,
+  readEscalationLedger, appendEscalationEvent, renderWatchdogPass, defaultClaimStoreReadable, readWatchdogTail, makeStopAwaitingVerifyResolver, makeStopChatSpawnGuardResolver,
 } from '../session-watchdog.mjs';
 import { tailLines, summarizeEntry } from '../../../skills-src/inspect-agent-health/agent-health.mjs';
 import fixerStuck from '../health-smells/fixer-stuck.mjs';
@@ -1039,6 +1039,68 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
       owner: 'holder', heartbeatAt: new Date(T0 - 24 * 60 * MIN).toISOString(),
       meta: { repo: 'we', pr: 3771, kind: 'fix' },
     }))).toBe(true);
+  });
+
+  it.each(['finished', 'duplicate'])('default chat guard refuses %s stops on EACCES reading the spawn link', (mode) => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const read = vi.fn(() => { throw Object.assign(new Error('secret-link-contents'), { code: 'EACCES' }); });
+    const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+      spawnsDir: 'spawn-links', endedDir: 'chat-ended', readFileSyncFn: read, now: () => T0,
+    });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, chatSpawnGuardFor });
+    expect(read).toHaveBeenCalledWith(join('spawn-links', 'sid-1.json'), 'utf8');
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: chat-spawn guard unreadable' })]);
+    expect(JSON.stringify({ actions, logs: calls.logs })).not.toContain('secret-link-contents');
+  });
+
+  it.each(['finished', 'duplicate'])('default chat guard refuses %s stops on EACCES reading the ended marker even past its ceiling', (mode) => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const read = vi.fn(path => {
+      if (path === join('spawn-links', 'sid-1.json')) return JSON.stringify({
+        v: 1, spawnedSessionId: 'sid-1', spawnedByChatSessionId: 'parent-chat', recordedAt: new Date(T0 - 2 * MIN).toISOString(),
+      });
+      throw Object.assign(new Error('secret-marker-contents'), { code: 'EACCES' });
+    });
+    const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+      spawnsDir: 'spawn-links', endedDir: 'chat-ended', readFileSyncFn: read, now: () => T0, ceilingMs: MIN,
+    });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, chatSpawnGuardFor });
+    expect(read).toHaveBeenCalledWith(join('chat-ended', 'parent-chat.json'), 'utf8');
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: chat-spawn guard unreadable' })]);
+    expect(JSON.stringify({ actions, logs: calls.logs })).not.toContain('secret-marker-contents');
+  });
+
+  it.each(['finished', 'duplicate'])('default chat guard allows %s stops when the spawn link is missing (ENOENT)', (mode) => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const read = vi.fn(() => { throw Object.assign(new Error('missing link'), { code: 'ENOENT' }); });
+    const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+      spawnsDir: 'spawn-links', endedDir: 'chat-ended', readFileSyncFn: read, now: () => T0,
+    });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, chatSpawnGuardFor });
+    expect(read).toHaveBeenCalledWith(join('spawn-links', 'sid-1.json'), 'utf8');
+    expect(calls.stop).toEqual([old.id]);
+    expect(actions).toEqual([expect.objectContaining({ mode, ok: true })]);
+  });
+
+  it('default chat guard resets recorded read errors for each session', () => {
+    let code = 'EACCES';
+    const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+      spawnsDir: 'spawn-links', endedDir: 'chat-ended', now: () => T0,
+      readFileSyncFn: () => { throw Object.assign(new Error('read failed'), { code }); },
+    });
+    expect(chatSpawnGuardFor(listing())).toBeNull();
+    code = 'ENOENT';
+    expect(chatSpawnGuardFor(listing({ sessionId: 'sid-next' }))).toMatchObject({ blocked: false, reason: 'no-link' });
   });
 
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
