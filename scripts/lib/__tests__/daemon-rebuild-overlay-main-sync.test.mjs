@@ -35,7 +35,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false } = {}) {
+function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -48,6 +48,9 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     write(root, 'excluded.test.mjs', "import './worker.mjs';\n");
     write(root, 'vitest.config.ts', "export default { test: { include: ['*.test.mjs'], exclude: ['excluded.test.mjs'] } };\n");
   }
+  // A config that, like many real ones, only discovers tests under the Vitest CLI's own environment.
+  if (envGated) write(root, 'vitest.config.ts',
+    "export default { test: { include: process.env.VITEST === 'true' && process.env.TEST === 'true' && process.env.NODE_ENV === 'test' ? ['*.test.mjs'] : [] } };\n");
   if (mainUnion) write(root, 'docs/agent/testing.md', '# Testing\n');
   for (let i = 0; i < count; i++) write(root, `worker${i}.test.mjs`, "import './worker.mjs';\n");
   if (deleteFinalTest) write(root, 'scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs',
@@ -176,6 +179,26 @@ describe('overlay main sync', () => {
     fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
     delete f.deps.testListRunner;
     expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('Vitest listing establishes the CLI environment, so a config gated on VITEST/TEST/NODE_ENV still discovers tests', async () => {
+    const f = fixture({ envGated: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    // The daemon is started outside Vitest: none of the CLI's flags are present.
+    for (const key of ['TEST', 'VITEST', 'NODE_ENV']) delete f.env[key];
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('Vitest listing keeps an operator-chosen NODE_ENV, as the CLI only defaults it', async () => {
+    const f = fixture({ envGated: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    for (const key of ['TEST', 'VITEST']) delete f.env[key];
+    f.env.NODE_ENV = 'production'; // the gated config requires 'test', so nothing is discoverable: skip, never run
+    delete f.deps.testListRunner;
+    expect(await job(f)).toEqual({ skipped: true, reason: 'no-relevant-tests' });
   }, 90_000);
 
   it('gives the scratch tests a real, clean frontierui sibling (never a link the Forge manifest would refuse)', async () => {

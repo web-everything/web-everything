@@ -533,7 +533,12 @@ function assertionIdentity(file, assertion) {
   return null;
 }
 // Vitest 1.x has no list CLI: let its own config loader and project globbing define the inventory.
+// createVitest does not set the flags the real CLI (startVitest) sets before it loads the config, and configs
+// branch on them, so establish the same prelude first: TEST and VITEST forced, NODE_ENV only defaulted.
 const VITEST_LIST_SCRIPT = `
+process.env.TEST = 'true';
+process.env.VITEST = 'true';
+process.env.NODE_ENV ??= 'test';
 const { createVitest } = await import('vitest/node');
 const ctx = await createVitest('test', { watch: false, run: false });
 try {
