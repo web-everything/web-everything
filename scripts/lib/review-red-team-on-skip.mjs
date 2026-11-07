@@ -152,10 +152,12 @@ function isSettledReferralPauseNotice(comment) {
   const body = comment.body.trim();
   // The real notice is `${why}${findings}${detail}\n\n<!-- review-referral-hold: <episode> -->` (notifyReferralHoldNotice):
   // the leading line, an optional "Waiting on your ruling" findings block, then the episode marker. A persistence-failure
-  // detail means a persist hold, not a pause for rulings, so it never counts as settled.
+  // detail means a persist hold, not a pause for rulings, so it never counts as settled. That detail is the standalone
+  // paragraph between the findings block and the marker, so it is matched only there, anchored to the marker:
+  // a finding summary (interpolated into the findings block) that merely quotes the phrase is not that detail.
   return /^review paused: \d+ referrals need a ruling; it resumes on a new push, a ruling, or a send-back(?:\n|$)/.test(body)
     && /\n<!-- review-referral-hold: [0-9a-f]+ -->$/.test(body)
-    && !/Referral persistence (?:failed|retries are exhausted)/.test(body);
+    && !/\n\nReferral persistence (?:failed; the next bounded retry is at [0-9TZ:.-]+\.|retries are exhausted; waiting for a new event\.)\n\n<!-- review-referral-hold: [0-9a-f]+ -->$/.test(body);
 }
 
 /** A reviewed-sha marker alone never proves acceptance or supersedes a newer hold. */
