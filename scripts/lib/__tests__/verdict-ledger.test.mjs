@@ -1756,8 +1756,8 @@ describe('configured shared ledger readers (Part B)', () => {
       ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
       const event = buildLedgerEvent({ type: 'ruling', repo: REPO, pr: 1, at: AT, source: 'test', findingKey: 'f1', ruling: 'block' });
       appendLedgerRows({ repo: REPO, board: ctx.clone, records: [rec(), event], sleep: () => {} });
-      const opts = { board: ctx.clone, env: { WE_VERDICT_LEDGER_READ_STORE: 'git' } };
-      vi.stubEnv('WE_OPS_FETCH_TTL_MS', '0'); // broken-origin assertion below needs every read to fetch
+      const opts = { board: ctx.clone, env: { WE_VERDICT_LEDGER_READ_STORE: 'git', WE_OPS_FETCH_TTL_MS: '0' } };
+      // the caller's env now reaches the transport read: the broken-origin assertion below needs every read to fetch
       const shared = await readLedgerEventsFromStore(REPO, opts);
       expect(shared).toMatchObject({ status: 'ok', store: { name: 'git', shared: true } });
       expect(shared.rows.map((r) => r.id)).toEqual([ledgerEventId(rec()), ledgerEventId(event)]);
