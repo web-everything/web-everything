@@ -25,7 +25,7 @@ import {
   createJobStore, enqueueJob, JOB_ID_ENV, JOB_ATTEMPT_ENV,
 } from '../daemon-jobs-runtime.mjs';
 import { defineJobKind, markFailed, markLaunching } from '../daemon-jobs.mjs';
-import { lockfileKey } from '../daemon-job-snapshots.mjs';
+import { lockfileKey, ensureNodeModulesStore, storeStillValid } from '../daemon-job-snapshots.mjs';
 
 const tmp = [];
 const mk = (p) => { const d = mkdtempSync(join(tmpdir(), p)); tmp.push(d); return d; };
@@ -311,6 +311,72 @@ describe('settings — env beats file beats built-in, and the source is named', 
   });
   it('env forces it off (rollback to the inline npm ci)', () => {
     expect(resolveDepsAsJob({ env: { [DEPS_AS_JOB_ENV]: '0' } })).toMatchObject({ enabled: false, source: 'env' });
+  });
+});
+
+describe('the store marker and the store check read the SAME pnpm inputs (live clone vs pinned snapshot)', () => {
+  // The real call sites build a store for a pinned snapshot (sourceDir) with an installer whose sourceRoot is the live
+  // clone, whose checked-out pnpm files can differ from the snapshot's while package-lock.json is identical.
+  function sites({ snapshotYaml = true } = {}) {
+    const lock = '{"lockfileVersion":3}';
+    const write = (dir, yaml) => {
+      writeFileSync(join(dir, 'package.json'), '{"name":"x","version":"1.0.0"}');
+      writeFileSync(join(dir, 'package-lock.json'), lock);
+      if (yaml) {
+        writeFileSync(join(dir, 'pnpm-lock.yaml'), `lockfileVersion: "9.0"\n# ${yaml}\n`);
+        writeFileSync(join(dir, 'pnpm-workspace.yaml'), `packages: []\n# ${yaml}\n`);
+      }
+    };
+    const root = mk('deps-live-clone-'); write(root, 'live clone B');
+    const snapshot = mk('deps-pinned-snapshot-'); write(snapshot, snapshotYaml ? 'pinned snapshot A' : null);
+    const jobsDir = mk('deps-store-jobs-');
+    const storeDir = join(mk('deps-store-pnpm-'), 'store');
+    ensureStoreGeneration(storeDir);
+    vi.stubEnv('WE_PNPM_STORE_DIR', storeDir);
+    const exec = vi.fn((cmd, args) => {
+      if (args[0] === '--version') return '12.1.0';
+      return '';
+    });
+    const legacy = vi.fn((into) => mkdirSync(join(into, 'node_modules'), { recursive: true })); // npm leaves a tree
+    const installer = pnpmAwareInstaller({
+      sourceRoot: root, legacy, storeDir, env: {}, which: () => 'pnpm', parity: () => true, log: () => {},
+      exec: (cmd, args, opts) => { exec(cmd, args, opts); if (args[0] === 'install') mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true }); return args[0] === '--version' ? '12.1.0' : ''; },
+    });
+    const installs = () => exec.mock.calls.filter(([, args]) => args[0] === 'install').length;
+    return { root, snapshot, jobsDir, installer, installs, legacy };
+  }
+
+  it('a store built for the snapshot is reused, not rebuilt on every call, when the live clone has other pnpm files', () => {
+    const f = sites();
+    const first = ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    expect(f.installs()).toBe(1);
+    // The store carries the SNAPSHOT's pnpm inputs, not the live clone's.
+    expect(readFileSync(join(first.dir, 'pnpm-lock.yaml'), 'utf8')).toBe(readFileSync(join(f.snapshot, 'pnpm-lock.yaml'), 'utf8'));
+    expect(readFileSync(join(first.dir, 'pnpm-workspace.yaml'), 'utf8')).toContain('pinned snapshot A');
+    expect(storeStillValid(first.dir, f.snapshot)).toBe(true);
+    ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    expect(f.installs()).toBe(1); // no perpetual rebuild
+  });
+
+  it('and still rebuilds once when only the snapshot pnpm-lock.yaml changes', () => {
+    const f = sites();
+    ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    writeFileSync(join(f.snapshot, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\n# pinned snapshot A2\n');
+    ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    expect(f.installs()).toBe(2);
+    ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    expect(f.installs()).toBe(2);
+  });
+
+  it('a snapshot with no pnpm files never borrows the live clone\'s: npm path, stable, no rebuild loop', () => {
+    const f = sites({ snapshotYaml: false });
+    const first = ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    expect(f.installs()).toBe(0);
+    expect(f.legacy).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(first.dir, 'pnpm-lock.yaml'))).toBe(false);
+    ensureNodeModulesStore({ jobsDir: f.jobsDir, sourceDir: f.snapshot, install: f.installer });
+    expect(f.legacy).toHaveBeenCalledTimes(1);
   });
 });
 

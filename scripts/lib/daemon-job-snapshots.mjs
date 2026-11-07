@@ -138,7 +138,9 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
   buildOnce(dir, (into) => {
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
     copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
-    install(into);
+    // The installer is told which tree this store is FOR: its pnpm inputs (and so the marker it stamps) must come from
+    // the same `sourceDir` that `storeStillValid(dir, sourceDir)` later hashes, never from a different checkout.
+    install(into, { sourceDir });
   });
   return { key, dir };
 }

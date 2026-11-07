@@ -213,20 +213,24 @@ export function nativeBuilt(into, names) {
 export function pnpmAwareInstaller({
   sourceRoot = process.cwd(), legacy, env = process.env, exec = execFileSync,
   storeDir = resolvePnpmStoreDir(env), which = (name) => whichOnPath(name, env.PATH),
-  parity = () => readLockfileParity(sourceRoot).ok,
+  parity = (root = sourceRoot) => readLockfileParity(root).ok,
   log = (line) => process.stderr.write(`[deps-installer] ${line}\n`),
   timeoutMs = NPM_INSTALL_TIMEOUT_MS,
   nativeBuilt: checkNativeBuilt = nativeBuilt,
 } = {}) {
-  return (into) => {
+  // `sourceDir` is the tree the store being built is FOR (ensureNodeModulesStore passes the pinned snapshot). The pnpm
+  // inputs, their parity and the marker hash all come from it, so they agree with `storeStillValid(dir, sourceDir)`;
+  // `sourceRoot` (e.g. the live clone, whose checkout can differ from the snapshot's) only applies when none is given.
+  return (into, { sourceDir } = {}) => {
+    const inputsRoot = sourceDir ?? sourceRoot;
     let same = false;
     try {
-      same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8')
+      same = readFileSync(join(inputsRoot, 'package-lock.json'), 'utf8')
         === readFileSync(join(into, 'package-lock.json'), 'utf8');
     } catch { /* Missing or unreadable inputs must use the legacy path. */ }
     let plan = selectInstaller({
-      which, parity, storeDir,
-      hasPnpmLock: same && existsSync(join(sourceRoot, 'pnpm-lock.yaml')),
+      which, parity: () => parity(inputsRoot), storeDir,
+      hasPnpmLock: same && existsSync(join(inputsRoot, 'pnpm-lock.yaml')),
       hasNpmLock: existsSync(join(into, 'package-lock.json')),
       exec: (command, args, { cwd }) => exec(command, args, {
         cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
@@ -245,9 +249,9 @@ export function pnpmAwareInstaller({
         plan = npm;
       }
     } else plan = npm;
-    if (plan.backend === 'pnpm' && resolve(sourceRoot) !== resolve(into)) {
+    if (plan.backend === 'pnpm' && resolve(inputsRoot) !== resolve(into)) {
       for (const name of ['pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
-        const source = join(sourceRoot, name);
+        const source = join(inputsRoot, name);
         if (existsSync(source)) copyFileSync(source, join(into, name));
         else rmSync(join(into, name), { force: true });
       }
