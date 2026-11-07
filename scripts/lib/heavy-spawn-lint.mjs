@@ -1,12 +1,16 @@
 /** Static admission lint for literal heavy child_process commands. No code is executed. */
 import ts from 'typescript';
-import { canonicalCommand, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 
 /** Inspect executable positions only; arguments to ordinary programs are data. */
-function heavyCommand(command) {
+function heavyCommand(command, depth = 0) {
+  if (depth > 8) return true; // fail closed on implausibly deep nesting
+  // A shell expands `$( … )` / backticks before running the outer command, so their bodies are executed too.
+  // Array arguments arrive single-quoted (see quote()), where nothing expands.
+  if (commandSubstitutionBodies(command).some(body => heavyCommand(body, depth + 1))) return true;
   return parseSegments(command).segments.some(segment => {
     // The Bash guard's own classifier first: package test scripts (`npm test`, `npm --prefix . test`, `pnpm t`),
     // `node --test`, vitest and check-standards heads. The checks below add playwright and `sh -c` bodies.
@@ -15,7 +19,7 @@ function heavyCommand(command) {
     let [program, ...args] = words;
     if (/^(?:ba|da|z|k)?sh$/.test(program || '')) {
       const at = args.findIndex(arg => /^-[a-z]*c[a-z]*$/.test(arg));
-      return at >= 0 && !!args[at + 1] && heavyCommand(args[at + 1]);
+      return at >= 0 && !!args[at + 1] && heavyCommand(args[at + 1], depth + 1);
     }
     if (/^(?:npm|pnpm|yarn|bun)$/.test(program || '')) {
       if (['exec', 'x'].includes(args[0])) args.shift();
@@ -156,7 +160,13 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs') {
     const origin = admittedField(node.arguments[0], 'file');
     if ((origin && origin === admittedField(node.arguments[1], 'args')) || inAdmissionCallback(node)) continue;
     const method = ts.isIdentifier(callee) ? bindings.get(callee.text) : callee.name.text;
-    let command = literals(node.arguments[0]).trim();
+    // `process.execPath` (or `process.argv0`) is the running Node binary: spawnSync(process.execPath, ['--test', …]).
+    const nodeBinary = (() => {
+      const file = resolveValue(node.arguments[0]);
+      return file && ts.isPropertyAccessExpression(file) && ts.isIdentifier(file.expression)
+        && file.expression.text === 'process' && ['execPath', 'argv0'].includes(file.name.text);
+    })();
+    let command = nodeBinary ? 'node' : literals(node.arguments[0]).trim();
     const args = resolveValue(node.arguments[1]);
     if (!/^exec(?:Sync)?$/.test(method) && args && ts.isArrayLiteralExpression(args)) {
       command += ' ' + args.elements.map(arg => quote(literals(arg).trim())).join(' ');

@@ -41,6 +41,15 @@ describe('daemon heavy spawn admission lint', () => {
     "spawnSync('sh', ['-c', 'npm test -- a.test.mjs']);",
     "execSync('npm test -- a.test.mjs');",
     "execSync('node --test a.test.mjs');",
+    "spawnSync('node', ['--run', 'test']);",
+    "spawnSync('npm', ['it']);",
+    "spawnSync('npm', ['cit']);",
+    "spawnSync('corepack', ['pnpm', 'test']);",
+    "spawnSync('/usr/bin/env', ['npm', 'test']);",
+    "spawnSync('npx', ['--yes', 'bun@1.4.2', 'test']);",
+    "spawnSync(process.execPath, ['--test', 'a.test.mjs']);",
+    "execSync('echo $(npm test)');",
+    "execSync('echo `node --test a.test.mjs`');",
   ])('detects unqueued package test / node --test entry points: %s', call => {
     expect(findUngatedHeavySpawns(cp.replace('spawnSync }', 'spawnSync, execSync }') + call)).toHaveLength(1);
   });
@@ -50,6 +59,9 @@ describe('daemon heavy spawn admission lint', () => {
     "spawnSync('npm', ['install']);",
     "spawnSync('node', ['--check', 'a.mjs']);",
     "spawnSync('node', ['scripts/readiness/heavy-admission.mjs', 'run', '--', 'node', '--test', 'a.test.mjs']);",
+    "spawnSync('echo', ['$(npm test)']);",
+    "spawnSync(process.execPath, ['scripts/light.mjs', '--test']);",
+    "spawnSync('node', ['--run', 'build']);",
   ])('leaves queued scripts and non-test commands alone: %s', call => {
     expect(findUngatedHeavySpawns(cp + call)).toEqual([]);
   });

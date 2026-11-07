@@ -3460,7 +3460,47 @@ const SHELL_CONTROL_PREFIX = /^(?:(?:do|then|else|elif|if|while|until|!)\s+)+/;
  *  'test'), or null. Shared with the static spawn lint and the transcript audit so all three classify the same
  *  heads (`npm test`, `npm --prefix . test`, `node --test`, …) instead of drifting copies. Pure. */
 export function ungatedHeavyRunKind(segment) {
-  return ungatedHeavyHead(canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, '')))?.kind ?? null;
+  let head = canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, ''));
+  for (let hop = 0; hop < 4 && head; hop += 1) {
+    const kind = ungatedHeavyHead(head)?.kind;
+    if (kind) return kind;
+    head = heavyRunAlias(head);
+    if (head) head = canonicalCommand(head);
+  }
+  return null;
+}
+
+/** Spellings that run a package test script or a runner the head classifier does not resolve itself, reduced to
+ *  one it does: `/usr/bin/env npm test`, `corepack pnpm test`, `npm it|cit`, `node --run test`, `npx bun test`.
+ *  Used only for classification (lint/audit); null when the head is none of these. Pure. */
+function heavyRunAlias(head) {
+  const words = headWords(head);
+  const w = words.map((word) => word.text);
+  const rest = (k) => (words[k] ? ' ' + head.slice(words[k].start) : '');
+  // canonicalCommand peels one `env` per pass (`/usr/bin/env npm test` → `env npm test` → `npm test`).
+  if (/(?:^|\/)env$/.test(w[0] || '') && words[1]) return 'env' + rest(1);
+  if (/^bun@\S+$/.test(w[0] || '')) return 'bun' + rest(1); // `npx bun@1.4.2 test` canonicalizes to this
+  if (w[0] === 'corepack' && /^(?:npm|pnpm|yarn)(?:@\S*)?$/.test(w[1] || '')) return w[1].replace(/@.*$/, '') + rest(2);
+  if (w[0] === 'npm' && ['it', 'cit', 'install-test', 'install-ci-test'].includes(w[1])) return 'npm test' + rest(2);
+  if (w[0] === 'node') {
+    for (let i = 1; w[i]?.startsWith('-') && w[i] !== '--'; i += 1) {
+      if (w[i] === '--run' && w[i + 1]) return 'npm run ' + w[i + 1] + rest(i + 2);
+      if (w[i].startsWith('--run=') && w[i].length > 6) return 'npm run ' + w[i].slice(6) + rest(i + 1);
+    }
+    return null;
+  }
+  const npx = /^(?:npx|pnpx|bunx)$/.test(w[0] || '') ? 1 : w[0] === 'npm' && ['exec', 'x'].includes(w[1]) ? 2 : 0;
+  if (npx) {
+    let i = npx;
+    while (w[i]?.startsWith('-')) { i += 1; if (w[i - 1] === '--') break; }
+    if (/^bun(?:@\S*)?$/.test(w[i] || '')) return 'bun' + rest(i + 1);
+  }
+  return null;
+}
+
+/** Every `$( … )` / backtick command-substitution body in `text` (any depth; never inside single quotes). Pure. */
+export function commandSubstitutionBodies(text) {
+  return substitutionBodies(String(text || ''));
 }
 
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */

@@ -116,6 +116,40 @@ describe('agent command audit', () => {
     expect(out).not.toMatch(/glpat|1234567890|abcdefghij|ABCDEFGHIJ/);
     expect(out).toContain('[REDACTED]');
   });
+  // A value with no known token prefix: only the option/header/assignment rules can redact it.
+  const plain = 'hunter2zqPlainValue';
+  it.each([
+    `--token ${plain}`, `--token=${plain}`, `--token "${plain}"`, `--token '${plain}'`, `--token\n${plain}`,
+    `--pass ${plain}`, `--pw ${plain}`, `--api-key ${plain}`, `"--token" ${plain}`, `"--token ${plain}"`,
+    `--token "a"${plain}`, `--token=""${plain}`, `--token "" ${plain}`, `--token \\"${plain}\\"`,
+    `--token $(echo ${plain})`, `--token \`echo ${plain}\``, `--token $'${plain}'`,
+    `-H "x-api-key: ${plain}"`, `-H "PRIVATE-TOKEN: ${plain}"`, `-H "X-Auth-Token: ${plain}"`, `token: ${plain}`,
+    `--user u:${plain}`, `-u u:${plain}`, `-uu:${plain}`, `export PASS=${plain}`, `MY_PASS=${plain}`,
+    `https://x.test/a?pass=${plain}`,
+  ])('redacts a prefix-free credential value in %s', value => {
+    const out = redact(`npm ci ${value}`);
+    expect(out).not.toContain('hunter2zq');
+    expect(out).toContain('[REDACTED]');
+  });
+  it.each([
+    'npx vitest run a.test.mjs --passWithNoTests=false', 'git log --author=bob', 'git fetch origin main:main',
+    'curl https://x.test/a', 'env -u HOME npm ci',
+  ])('leaves ordinary command %s unchanged', command => expect(redact(command)).toBe(command));
+  it('stays linear-time and marks a cut on oversized input', () => {
+    for (const unit of ['a.', 'a-', 'a+', '-a', 'token', '"--token ', 'x:']) {
+      const started = Date.now();
+      redact(unit.repeat(20000));
+      expect(Date.now() - started).toBeLessThan(500);
+    }
+    expect(redact('x'.repeat(40000) + ' --token v')).toMatch(/…\[truncated\]$/);
+  });
+  it.each([
+    ['npm --prefix . test', 'npm test/check'], ['npm -s test', 'npm test/check'], ['node --run test', 'npm test/check'],
+    ['npm it', 'npm test/check'], ['corepack pnpm test', 'npm test/check'], ['/usr/bin/env npm test', 'npm test/check'],
+    ['npx --yes bun@1.4.2 test', 'npm test/check'], ['echo $(npm test)', 'npm test/check'], ['echo `node --test a`', 'node --test'],
+  ])('classifies unqueued heavy spelling %s', (command, category) => {
+    expect(classifyCommand(command)).toEqual([expect.objectContaining({ category, queued: false })]);
+  });
   it('redacts a space-separated credential option through auditLines', () => {
     const report = JSON.stringify(auditLines([claude(`npx vitest run a.test.mjs --token ${fakeGl}`)], { date: '2026-07-02' }));
     expect(report).not.toContain('12345678901234567890');

@@ -10,26 +10,42 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
 }).format(new Date(value));
 
-// Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, …).
-const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|credential|auth(?!or)|cookie|key$/i;
-const OPTION_VALUE = String.raw`(?:"[^"]*"|'[^']*'|[^\s"';,|&]+)`;
+// Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, `--pass`, …).
+const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|^pass$|^pw$|credential|auth(?!or)|cookie|key$/i;
+// One whole shell word: concatenated quoted runs, `$'…'`, `$( … )`, backticks, escapes and plain characters.
+const SHELL_WORD = String.raw`(?:"(?:\\.|[^"\\])*"|'[^']*'|\$'(?:\\.|[^'\\])*'|\$\([^)]*\)|` + '`[^`]*`'
+  + String.raw`|\\.|[^\s"'` + '`' + String.raw`;|&\\])+`;
+const EMPTY_WORD = /^(?:""|'')+$/;
+// Header names (`Authorization:`, `PRIVATE-TOKEN:`, `x-api-key:`, `token:`) and assignment names
+// (`API_KEY=`, `MY_PASS=`, `GITLAB_AUTH=`) whose value is a credential. Tested on one captured name.
+const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|(?:api|access|private|secret|auth)[-_]?key/i;
+const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|pass(?:[_-]|$)|credential|auth(?!or)|cookie/i;
+// Commands longer than this are cut before redaction so every rule stays linear-time; the cut is marked.
+export const REDACT_MAX_CHARS = 16384;
 
 /** Redact a credential option together with its value, attached (`--token=x`) or separate (`--token x`).
- *  Option names are compared with shell quotes removed (`--"token"`, `--to''ken`). */
+ *  Option names are compared with shell quotes removed (`--"token"`, `"--token"`, `--to''ken`); an empty
+ *  quoted value (`--token "" v`) takes the next word too. */
 function redactCredentialOptions(text) {
-  const name = /(?<!\S)-{1,2}([^\s=]+)(=?)/g;
+  const name = /(?<![^\s"'])["']?-{1,2}([^\s=]+)(=?)/g;
   let out = '', last = 0;
   for (let m; (m = name.exec(text));) {
     if (!CREDENTIAL_OPTION.test(m[1].replace(/["']/g, ''))) continue;
-    const value = new RegExp((m[2] ? '' : String.raw`\s+`) + OPTION_VALUE, 'y');
-    value.lastIndex = name.lastIndex;
-    const end = value.exec(text) ? value.lastIndex : name.lastIndex;
+    let end = name.lastIndex;
+    for (let words = 0; words < 2; words += 1) {
+      const value = new RegExp((m[2] && !words ? '' : String.raw`\s+`) + SHELL_WORD, 'y');
+      value.lastIndex = end;
+      const hit = value.exec(text);
+      if (!hit) break;
+      end = value.lastIndex;
+      if (!EMPTY_WORD.test(hit[0].trim())) break;
+    }
     out += text.slice(last, m.index) + '[REDACTED]';
     last = name.lastIndex = end;
   }
@@ -37,14 +53,20 @@ function redactCredentialOptions(text) {
 }
 
 export function redact(text) {
-  const clean = stripVTControlCharacters(String(text)).replace(/[\x00-\x1f\x7f]/g, ' ');
+  let clean = stripVTControlCharacters(String(text)).replace(/[\x00-\x1f\x7f]/g, ' ');
+  if (clean.length > REDACT_MAX_CHARS) clean = clean.slice(0, REDACT_MAX_CHARS) + ' …[truncated]';
   // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
+  // Every rule that starts with a repeated class is anchored to a word start, so none of them is quadratic.
   return redactCredentialOptions(clean
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@"']+@/gi, '$1[REDACTED]@')
-    .replace(/\b(?:Proxy-)?Authorization\s*:\s*(?:[A-Za-z]+\s+)?[^\s"';]+/gi, '[REDACTED]'))
+    .replace(/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@"']+@/gi, '$1[REDACTED]@')
+    // HTTP-style credential headers and `token: v`, with or without an auth scheme word.
+    .replace(/(?<![\w-])([\w-]+)\s*:\s*(?:(?:Bearer|Basic|Digest|Negotiate|token)\s+)?[^\s"';]+/gi,
+      (all, name) => (CREDENTIAL_HEADER.test(name) ? '[REDACTED]' : all))
+    // curl/git-style `user:password` pairs.
+    .replace(/(?<!\S)(?:--user(?:=|\s+)|-u\s*)[^\s:]*:\S+/g, '[REDACTED]'))
     .replace(/\b(?:gh[pousr]_|github_pat_|glpat-|sk-|xox[a-z]-)[A-Za-z0-9_-]+|\bnpm_[A-Za-z0-9]{20,}|\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED]')
     .replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[^\s"'`;,]+)/gi, '[REDACTED]')
-    .replace(/\b[\w-]*(?:KEY|TOKEN|SECRET|PASSW(?:OR)?D|CREDENTIAL|AUTH(?!OR)|COOKIE)[\w-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, '[REDACTED]')
+    .replace(/(?<![\w-])([\w-]+)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/g, (all, name) => (CREDENTIAL_ASSIGNMENT.test(name) ? '[REDACTED]' : all))
     .replace(/\b(?:token|secret|key|bearer)\S*/gi, '[REDACTED]')
     .replace(/\b[a-f0-9]{32,}\b/gi, '[REDACTED]')
     .replace(/(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}(?![A-Za-z0-9+/_-])/g, '[REDACTED]');
@@ -71,8 +93,11 @@ function repoWideSearch(words) {
 const HEAVY_KIND_CATEGORY = { vitest: 'vitest', 'node-test': 'node --test', standards: 'check:standards', test: 'npm test/check' };
 
 /** One entry per heavy category/status/segment; admission never leaks across a separator. */
-export function classifyCommand(cmd) {
+export function classifyCommand(cmd, depth = 0) {
   const out = [];
+  if (depth > 8) return [{ category: 'unparsed (nesting too deep)', queued: false, command: redact(String(cmd)) }];
+  // A shell runs `$( … )` / backtick bodies too; they are never admitted by the outer command's queue.
+  for (const body of commandSubstitutionBodies(cmd)) out.push(...classifyCommand(body, depth + 1));
   for (const segment of parseSegments(String(cmd)).segments) {
     let head = canonicalCommand(segment), queued = false;
     const admitted = /^node\s+\S*heavy-admission\.mjs\s+run\b[\s\S]*?\s--\s+([\s\S]+)$/.exec(head);
@@ -81,7 +106,7 @@ export function classifyCommand(cmd) {
     if (/^(?:ba|da|z|k)?sh$/.test(words[0] || '')) {
       const at = words.findIndex((word, index) => index > 0 && /^-[a-z]*c[a-z]*$/.test(word));
       if (at >= 0 && words[at + 1]) {
-        for (const hit of classifyCommand(words[at + 1])) out.push({ ...hit, queued: queued || hit.queued });
+        for (const hit of classifyCommand(words[at + 1], depth + 1)) out.push({ ...hit, queued: queued || hit.queued });
         continue;
       }
     }
