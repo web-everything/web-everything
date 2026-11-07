@@ -75,7 +75,9 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/conveyor/stand-down.mjs',
   // Added on main after the list above: the finding-class policy and the care-exempt path list decide which findings
   // defer or need a fix, and jury-core.mjs / review-escalation.mjs import them directly.
-  'scripts/lib/finding-class-policy.mjs', 'scripts/lib/review-care-exempt-paths.mjs']);
+  'scripts/lib/finding-class-policy.mjs', 'scripts/lib/review-care-exempt-paths.mjs',
+  // Also added on main since: direct imports of the family (the card dedupe and the citation check).
+  'scripts/lib/card-dedupe.mjs', 'scripts/lib/citation-check.mjs']);
 /**
  * JSON files the floor modules decide with (PR #6381 self-review: red-team.json was read by red-team-gate.mjs but
  * unprotected). A test reads every floor module and pins each tracked scripts/ JSON file whose NAME it quotes, in any
@@ -98,7 +100,9 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/pr-limit.json', 'scripts/settings/pr-stall-sweep.json', 'scripts/settings/review-concurrency.json',
   'scripts/settings/review-red-team-on-skip.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
-  'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json']);
+  'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
+  // Read by card-dedupe.mjs and citation-check.mjs.
+  'scripts/settings/card-dedupe.json', 'scripts/conveyor/flows/build-dispatch.flow.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
  * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
@@ -139,7 +143,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/readiness/forge-exec-limits.mjs', 'scripts/readiness/forge-warm-base.mjs', 'scripts/readiness/red-main-remediation.mjs',
   'scripts/readiness/remote-exec.mjs',
   // A no-clobber `link` create (fails with EEXIST) is an exclusive create too (PR #6381 self-review).
-  'scripts/conveyor/health-responder-state.mjs']);
+  'scripts/conveyor/health-responder-state.mjs',
+  // Landed on main since: the lane dependency installer (a no-clobber link create).
+  'scripts/lib/lane-deps-installer.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
