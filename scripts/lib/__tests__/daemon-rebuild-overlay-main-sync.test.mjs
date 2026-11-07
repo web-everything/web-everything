@@ -35,7 +35,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false } = {}) {
+function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -43,6 +43,11 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   const lines = Array.from({ length: 30 }, (_, i) => `export const value${i} = ${i};`);
   write(root, 'worker.mjs', `${lines.join('\n')}\n`);
   write(root, 'unrelated.mjs', 'export default 0;\n');
+  if (unrunnable) {
+    write(root, 'outside/ignored.test.mjs', "import '../worker.mjs';\n");
+    write(root, 'excluded.test.mjs', "import './worker.mjs';\n");
+    write(root, 'vitest.config.ts', "export default { test: { include: ['*.test.mjs'], exclude: ['excluded.test.mjs'] } };\n");
+  }
   if (mainUnion) write(root, 'docs/agent/testing.md', '# Testing\n');
   for (let i = 0; i < count; i++) write(root, `worker${i}.test.mjs`, "import './worker.mjs';\n");
   if (deleteFinalTest) write(root, 'scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs',
@@ -84,6 +89,9 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     io: { ...fs, mkdtempSync: prefix => { const p = fs.mkdtempSync(prefix); scratched.push(p); temps.push(p); return p; } },
     git: vi.fn((args, opts) => { if (args[0] === 'push') pushes.push([...args]); return run(args, opts); }),
     appendOverlayEvent: (root, event, opts) => { events.push(event); return appendOverlayEvent(root, event, opts); },
+    testListRunner: vi.fn((_command, _args, { cwd }) => ({ status: 0,
+      stdout: JSON.stringify(ok(cwd, ['ls-files']).split('\n').filter(f => /\.test\.mjs$/.test(f)
+        && !['outside/ignored.test.mjs', 'excluded.test.mjs'].includes(f)).map(f => join(fs.realpathSync(cwd), f))), stderr: '' })),
     testRunner: vi.fn(async ({ root: scratch, args, testReport }) => {
       expect(allowedCommand(args.slice(args.indexOf('--') + 1))).toBe(true);
       fs.writeFileSync(testReport, JSON.stringify({
@@ -115,6 +123,60 @@ const unchanged = f => {
 };
 
 describe('overlay main sync', () => {
+
+  it('filters include-outside and exclude-listed selections, logs the count, and syncs runnable files', async () => {
+    const f = fixture({ unrunnable: true });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await job(f);
+    expect(result).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+    expect(f.deps.testListRunner).toHaveBeenCalledOnce();
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-test-selection', filteredNotRunnable: 2 }));
+    expect(log.mock.calls.flat().join(' ')).toContain('filteredNotRunnable: 2');
+  });
+
+  it('a listed runnable file missing from runner evidence still fails testFailure', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = async options => {
+      const result = await passing(options), report = json(options.testReport);
+      report.testResults.pop();
+      fs.writeFileSync(options.testReport, JSON.stringify(report));
+      return result;
+    };
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', message: expect.stringContaining('selected tests did not pass or execute') });
+    expect(f.pushes).toEqual([]);
+  });
+
+  it.each([
+    ['failure', { status: 1, stdout: '', stderr: 'listing failed' }],
+    ['timeout', { status: null, stdout: '', error: Object.assign(new Error('listing timed out'), { code: 'ETIMEDOUT' }) }],
+    ['unparseable', { status: 0, stdout: 'not JSON', stderr: '' }],
+    ['invalid paths', { status: 0, stdout: '[123]', stderr: '' }],
+    ['oversized', { status: 0, stdout: ' '.repeat(8 * 1024 * 1024 + 1), stderr: '' }],
+  ])('listing %s fails closed at test-select with operator diagnostics', async (_mode, result) => {
+    const f = fixture();
+    f.deps.testListRunner = vi.fn(() => result);
+    await expect(job(f)).rejects.toMatchObject({ step: 'test-select',
+      message: expect.stringContaining('operator review required'), stderrTail: expect.stringMatching(/.+/) });
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(f.pushes).toEqual([]);
+    expect(f.deps.testListRunner).toHaveBeenCalledWith(process.execPath,
+      ['--input-type=module', '-e', expect.any(String)], expect.objectContaining({ timeout: 60_000, maxBuffer: 8 * 1024 * 1024 }));
+  });
+
+  it('skips when no selected files are runnable', async () => {
+    const f = fixture();
+    f.deps.testListRunner = vi.fn(() => ({ status: 0, stdout: '[]', stderr: '' }));
+    expect(await job(f)).toEqual({ skipped: true, reason: 'no-relevant-tests' });
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+  });
+
+  it('Vitest 1.x listing loads the scratch vitest.config.ts include and exclude without running tests', async () => {
+    const f = fixture({ unrunnable: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
 
   it('gives the scratch tests a real, clean frontierui sibling (never a link the Forge manifest would refuse)', async () => {
     const f = fixture(), sibling = join(f.base, 'frontierui');
@@ -422,13 +484,15 @@ describe('overlay main sync', () => {
     expect(fs.existsSync(`${sidecar(f)}.clone.lock`)).toBe(false);
   });
 
-  it.each(['synced', 'failed', 'busy'])('%s worker outcome emits exactly one line and one daemon event', async outcome => {
+  it.each(['synced', 'failed', 'busy'])('%s worker outcome emits one outcome line and daemon event plus selection output when reached', async outcome => {
     const f = fixture(), events = [], log = vi.spyOn(console, 'error').mockImplementation(() => {});
     f.deps.appendDaemonEvent = e => events.push(e);
     if (outcome === 'failed') f.deps.testRunner = async () => ({ status: 1, stdout: '', stderr: 'broken tests' });
     if (outcome === 'busy') { fs.mkdirSync(dirname(marker(f)), { recursive: true }); fs.writeFileSync(marker(f), 'owner'); }
     await job(f).catch(() => {});
-    expect(log).toHaveBeenCalledOnce(); expect(events).toHaveLength(1);
+    expect(log).toHaveBeenCalledTimes(outcome === 'busy' ? 1 : 2);
+    if (outcome !== 'busy') expect(log.mock.calls[0][0]).toContain('filteredNotRunnable: 0');
+    expect(events).toHaveLength(1);
     expect(events[0].kind).toBe(`overlay-main-sync-${outcome === 'busy' ? 'skipped' : outcome}`);
   });
 
@@ -953,7 +1017,8 @@ describe('overlay main sync', () => {
     expect(state.firstFailureAt[ref]).toBe(started);
     expect(state.lastSyncedMain[ref]).toBeUndefined();
     expect(events).toEqual([{ kind: 'overlay-main-sync-failed', detail: expect.objectContaining({ ref, step: 'push' }) }]);
-    expect(log).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(log.mock.calls[0][0]).toContain('filteredNotRunnable: 0');
     expect(alerts(f)).toEqual([]); expect(synced(f)).toEqual([]);
     expect(ok(f.origin, ['rev-parse', ref]) === f.oldSha).toBe(mode !== 'published');
     unchanged(f);
