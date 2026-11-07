@@ -3454,10 +3454,19 @@ function ungatedHeavyHead(head) {
   return { kind: 'test', tail: forwarded.replace(/^(?:run|watch|dev)(?:\s+|$)/, ''), scope };
 }
 
+const SHELL_CONTROL_PREFIX = /^(?:(?:do|then|else|elif|if|while|until|!)\s+)+/;
+
+/** The kind of unqueued heavy run a segment's executable head starts ('vitest' | 'node-test' | 'standards' |
+ *  'test'), or null. Shared with the static spawn lint and the transcript audit so all three classify the same
+ *  heads (`npm test`, `npm --prefix . test`, `node --test`, …) instead of drifting copies. Pure. */
+export function ungatedHeavyRunKind(segment) {
+  return ungatedHeavyHead(canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, '')))?.kind ?? null;
+}
+
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
 export function ungatedHeavyRunReason(segment) {
   // Shell control words are syntax, not part of the runnable replacement for this segment.
-  const s = String(segment || '').trim().replace(/^(?:(?:do|then|else|elif|if|while|until|!)\s+)+/, '');
+  const s = String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, '');
   const run = ungatedHeavyHead(canonicalCommand(s));
   if (!run) return null;
   // Keep assignment spelling/quoting intact, placing it before node so it remains shell syntax. A leading

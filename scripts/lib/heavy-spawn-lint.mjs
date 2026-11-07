@@ -1,6 +1,6 @@
 /** Static admission lint for literal heavy child_process commands. No code is executed. */
 import ts from 'typescript';
-import { canonicalCommand, parseSegments, shellTokens } from '../guard-bash.mjs';
+import { canonicalCommand, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -8,6 +8,9 @@ const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 /** Inspect executable positions only; arguments to ordinary programs are data. */
 function heavyCommand(command) {
   return parseSegments(command).segments.some(segment => {
+    // The Bash guard's own classifier first: package test scripts (`npm test`, `npm --prefix . test`, `pnpm t`),
+    // `node --test`, vitest and check-standards heads. The checks below add playwright and `sh -c` bodies.
+    if (ungatedHeavyRunKind(segment)) return true;
     const words = shellTokens(canonicalCommand(segment)).filter(word => !word.op).map(word => word.text);
     let [program, ...args] = words;
     if (/^(?:ba|da|z|k)?sh$/.test(program || '')) {

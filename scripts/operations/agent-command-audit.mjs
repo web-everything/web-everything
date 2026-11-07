@@ -10,18 +10,41 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, parseSegments, shellTokens } from '../guard-bash.mjs';
+import { canonicalCommand, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
 }).format(new Date(value));
 
+// Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, …).
+const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|credential|auth(?!or)|cookie|key$/i;
+const OPTION_VALUE = String.raw`(?:"[^"]*"|'[^']*'|[^\s"';,|&]+)`;
+
+/** Redact a credential option together with its value, attached (`--token=x`) or separate (`--token x`).
+ *  Option names are compared with shell quotes removed (`--"token"`, `--to''ken`). */
+function redactCredentialOptions(text) {
+  const name = /(?<!\S)-{1,2}([^\s=]+)(=?)/g;
+  let out = '', last = 0;
+  for (let m; (m = name.exec(text));) {
+    if (!CREDENTIAL_OPTION.test(m[1].replace(/["']/g, ''))) continue;
+    const value = new RegExp((m[2] ? '' : String.raw`\s+`) + OPTION_VALUE, 'y');
+    value.lastIndex = name.lastIndex;
+    const end = value.exec(text) ? value.lastIndex : name.lastIndex;
+    out += text.slice(last, m.index) + '[REDACTED]';
+    last = name.lastIndex = end;
+  }
+  return out + text.slice(last);
+}
+
 export function redact(text) {
-  return stripVTControlCharacters(String(text))
-    .replace(/[\x00-\x1f\x7f]/g, ' ')
-    .replace(/\b(?:ghp_|github_pat_|sk-|xox[a-z]-)[A-Za-z0-9_-]+/gi, '[REDACTED]')
+  const clean = stripVTControlCharacters(String(text)).replace(/[\x00-\x1f\x7f]/g, ' ');
+  // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
+  return redactCredentialOptions(clean
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@"']+@/gi, '$1[REDACTED]@')
+    .replace(/\b(?:Proxy-)?Authorization\s*:\s*(?:[A-Za-z]+\s+)?[^\s"';]+/gi, '[REDACTED]'))
+    .replace(/\b(?:gh[pousr]_|github_pat_|glpat-|sk-|xox[a-z]-)[A-Za-z0-9_-]+|\bnpm_[A-Za-z0-9]{20,}|\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED]')
     .replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[^\s"'`;,]+)/gi, '[REDACTED]')
-    .replace(/\b[\w-]*(?:KEY|TOKEN|SECRET)[\w-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, '[REDACTED]')
+    .replace(/\b[\w-]*(?:KEY|TOKEN|SECRET|PASSW(?:OR)?D|CREDENTIAL|AUTH(?!OR)|COOKIE)[\w-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, '[REDACTED]')
     .replace(/\b(?:token|secret|key|bearer)\S*/gi, '[REDACTED]')
     .replace(/\b[a-f0-9]{32,}\b/gi, '[REDACTED]')
     .replace(/(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}(?![A-Za-z0-9+/_-])/g, '[REDACTED]');
@@ -44,6 +67,8 @@ function repoWideSearch(words) {
   const paths = listing || patternGiven ? operands : operands.slice(1);
   return !paths.length || paths.some(path => /^(?:\.|\.\/|~|\/.*)$/.test(path));
 }
+
+const HEAVY_KIND_CATEGORY = { vitest: 'vitest', 'node-test': 'node --test', standards: 'check:standards', test: 'npm test/check' };
 
 /** One entry per heavy category/status/segment; admission never leaks across a separator. */
 export function classifyCommand(cmd) {
@@ -69,6 +94,8 @@ export function classifyCommand(cmd) {
       && !/^node\s+(?:(?:--\S+|-\w)\s+)*(?:--check|-c|--eval|-e|--print|-p|--version|-v|--help|-h)(?:\s|$)/.test(head)) category = 'node --test';
     else if (/^node\s+.*\bcheck-standards\.mjs\b/.test(head) || /^(?:npm|pnpm)\s+run\s+check:standards(?:\s|$)/.test(head)) category = 'check:standards';
     else if (/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test\b|t\b|tst\b|check:(?:visual|render)\b)/.test(head)) category = 'npm test/check';
+    // The Bash guard's classifier catches spellings the patterns above miss (`npm --prefix . test`, `npm -s test`).
+    else if (HEAVY_KIND_CATEGORY[ungatedHeavyRunKind(head)]) category = HEAVY_KIND_CATEGORY[ungatedHeavyRunKind(head)];
     else if (/^(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci)\b/.test(head)) category = 'install/ci';
     else if (/^git\s+(?:-C\s+\S+\s+)?(?:fetch|clone|worktree\s+add|gc|repack)\b/.test(head)) category = 'git fetch/clone/wt/gc';
     else if (repoWideSearch(words)) category = 'repo-wide find/grep';

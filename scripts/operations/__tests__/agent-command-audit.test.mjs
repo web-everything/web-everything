@@ -100,6 +100,30 @@ describe('agent command audit', () => {
     'API_KEY="short value"', 'TOKEN=short', "SECRET='short value'", 'tokenSensitive',
     '0123456789abcdef0123456789abcdef', 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/abcdEFGH==',
   ])('redacts credential form %s', value => expect(redact(value)).toBe('[REDACTED]'));
+  // Red-team #6461: a credential option's separate value must not survive when only the name is redacted.
+  const fakeGl = 'glpat-12345678901234567890';
+  it.each([
+    `--token ${fakeGl}`, `--token=${fakeGl}`, `--token "${fakeGl}"`, `--token '${fakeGl}'`, `--token\t${fakeGl}`,
+    `--auth-token ${fakeGl}`, `--access-token ${fakeGl}`, `--api-key ${fakeGl}`, `--apikey ${fakeGl}`,
+    `--password ${fakeGl}`, `--passwd ${fakeGl}`, `--secret ${fakeGl}`, `--client-secret ${fakeGl}`,
+    `--credentials ${fakeGl}`, `--private-key ${fakeGl}`, `--"token" ${fakeGl}`, `--to''ken ${fakeGl}`,
+    `PASSWORD=${fakeGl}`, `GITLAB_AUTH=${fakeGl}`, fakeGl, 'gho_abcdefghijklmnopqrstuvwxyz', 'ghs_abcdefghijklmnopqrstuvwxyz',
+    'npm_abcdefghijklmnopqrstuvwxyz0123', 'AKIAABCDEFGHIJKLMNOP',
+    `-H 'Authorization: token ${fakeGl}'`, `--header "Authorization: Basic ${fakeGl}"`,
+    `https://user:${fakeGl}@example.com/x.git`,
+  ])('redacts the value of credential form %s', value => {
+    const out = redact(`npx vitest run a.test.mjs ${value}`);
+    expect(out).not.toMatch(/glpat|1234567890|abcdefghij|ABCDEFGHIJ/);
+    expect(out).toContain('[REDACTED]');
+  });
+  it('redacts a space-separated credential option through auditLines', () => {
+    const report = JSON.stringify(auditLines([claude(`npx vitest run a.test.mjs --token ${fakeGl}`)], { date: '2026-07-02' }));
+    expect(report).not.toContain('12345678901234567890');
+    expect(report).toContain('vitest');
+  });
+  it('keeps ordinary flags readable', () => {
+    expect(redact('npx vitest run a.test.mjs --run --bail=1')).toBe('npx vitest run a.test.mjs --run --bail=1');
+  });
   it('uses ET boundaries in both winter and summer', () => {
     expect(auditLines([claude('npm ci', '2026-11-06T04:59:59Z')], { date: '2026-11-06' }).rows).toEqual([]);
     expect(auditLines([claude('npm ci', '2026-07-02T03:59:59Z')], { date: '2026-07-02' }).rows).toEqual([]);

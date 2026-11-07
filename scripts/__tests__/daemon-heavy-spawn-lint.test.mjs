@@ -24,6 +24,35 @@ describe('daemon heavy spawn admission lint', () => {
   ])('detects the executed heavy target: %s', call => {
     expect(findUngatedHeavySpawns(cp + call)).toHaveLength(1);
   });
+  // Red-team #6461: package test scripts and Node's own test runner are unqueued heavy entry points too.
+  it.each([
+    "spawnSync('npm', ['test', '--', 'a.test.mjs']);",
+    "spawnSync('npm', ['test']);",
+    "spawnSync('npm', ['t']);",
+    "spawnSync('npm', ['run', 'test']);",
+    "spawnSync('npm', ['--prefix', '.', 'test']);",
+    "spawnSync('pnpm', ['test']);",
+    "spawnSync('yarn', ['test']);",
+    "spawnSync('bun', ['run', 'test']);",
+    "spawnSync('node', ['--test', 'a.test.mjs']);",
+    "spawnSync('node', ['--test']);",
+    "spawnSync('node', ['--test-reporter=spec', '--test', 'a.test.mjs']);",
+    "spawnSync('env', ['CI=1', 'npm', 'test']);",
+    "spawnSync('sh', ['-c', 'npm test -- a.test.mjs']);",
+    "execSync('npm test -- a.test.mjs');",
+    "execSync('node --test a.test.mjs');",
+  ])('detects unqueued package test / node --test entry points: %s', call => {
+    expect(findUngatedHeavySpawns(cp.replace('spawnSync }', 'spawnSync, execSync }') + call)).toHaveLength(1);
+  });
+  it.each([
+    "spawnSync('npm', ['run', 'test:unit', '--', 'a.test.mjs']);",
+    "spawnSync('npm', ['run', 'check:standards']);",
+    "spawnSync('npm', ['install']);",
+    "spawnSync('node', ['--check', 'a.mjs']);",
+    "spawnSync('node', ['scripts/readiness/heavy-admission.mjs', 'run', '--', 'node', '--test', 'a.test.mjs']);",
+  ])('leaves queued scripts and non-test commands alone: %s', call => {
+    expect(findUngatedHeavySpawns(cp + call)).toEqual([]);
+  });
   it.each([
     "spawnSync('vitest'); // heavy-admission-allow: parent holds slot\nspawnSync('vitest');",
     "// heavy-admission-allow: parent holds slot\nspawnSync('vitest'); spawnSync('vitest');",
