@@ -1326,6 +1326,12 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       expect(h.landRulingCard).not.toHaveBeenCalled();
       expect(h.written).toEqual([]);
     });
+    it(`${kind}: asJudge with --supersedes => refused (superseding is operator-only)`, async () => {
+      const h = await fixture(kind, { inputOver: { supersedes: 'operator:abc:def' } });
+      await expect(h.run()).rejects.toThrow(/cannot supersede/);
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(0);
+      expect(h.written).toEqual([]);
+    });
     for (const verdict of [null, 'invalid']) it(`${kind}: missing/malformed confirm ${verdict} => card`, async () => {
       expect(await plan({ confirm: verdict === null ? null : { verdict } })).toMatchObject({ ruling: 'card' });
       const h = await fixture(kind, { verdict });

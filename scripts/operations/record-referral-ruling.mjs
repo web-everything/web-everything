@@ -556,6 +556,7 @@ export function planJudgeRuling(read, input, select) {
   if (input.asJudge !== undefined && typeof input.asJudge !== 'boolean') throw new Error('asJudge must be boolean');
   if (!input.asJudge) return null;
   if (input.ruling !== 'not-real') throw new Error('asJudge applies only to not-real');
+  if (String(input.supersedes ?? '').trim()) throw new Error('asJudge cannot supersede rulings; superseding is operator-only');
   if (!Number.isInteger(read.disagreements) || read.disagreements < 0
     || (input.disagreements !== undefined && (!Number.isInteger(input.disagreements) || input.disagreements < 0)))
     throw new Error('reader and supplied disagreements must be nonnegative integers; history unknown: ask the operator to rule');
