@@ -146,7 +146,7 @@ export function readLedgerFromGit({
       if (!loggedCaps.has(line)) { loggedCaps.add(line); log(line); }
       run = sizedLedgerRun({ maxBytes: cap.maxBytes, source: cap.sources.maxBytes, ...(exec ? { exec } : {}) });
     }
-    files = readFromTransportBranch({ board, branch, paths: [path], run, fresh });
+    files = readFromTransportBranch({ board, branch, paths: [path], run, env, fresh });
   } catch (e) {
     const reason = e?.code === READ_CAP_CODE ? 'ledger-exceeds-read-cap' : 'transport-read-failed';
     return { status: 'unreadable', reason, error: String(e?.message ?? e) };

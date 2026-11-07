@@ -95,14 +95,14 @@ const humanVerdict = (pr) => buildVerdictRecord({ repo: REPO, pr, verdict: 'huma
 const tl = (label, change, actor, createdAt = '2026-10-12T11:00:00Z', actorType = 'User') => ({ label, change, actor, actorType, createdAt });
 
 describe('apply-path ledger reads are decision reads (fresh: true)', () => {
-  it('every readEvents call in runMirrorApply passes fresh: true', async () => {
+  it('the per-PR idempotency and re-derive reads in runMirrorApply pass fresh: true', async () => {
     const w = world({ labels: [] });
     const seen = [];
     const read = w.opts.readEvents;
     w.opts.readEvents = async (repo, o) => { seen.push(o?.fresh); return read(repo, o); };
     await runMirrorApply(w.opts);
-    expect(seen.length).toBeGreaterThanOrEqual(2);
-    expect(seen.every((f) => f === true)).toBe(true);
+    expect(seen.length).toBeGreaterThanOrEqual(3); // first = the pass-start read, left cached
+    expect(seen.slice(1).every((f) => f === true)).toBe(true);
   });
 });
 
