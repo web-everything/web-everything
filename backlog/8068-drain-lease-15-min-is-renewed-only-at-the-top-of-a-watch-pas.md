@@ -1,15 +1,16 @@
 ---
+bornAs: xnhxa6p
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/lib/prevention-landing-job.mjs", "we:scripts/lib/red-team-gate.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/file-locks.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lane-drain.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Two gate runs for the same PR both act (duplicate follow-up card, duplicate send-back ledger event, duplicate…
+# Drain lease (15 min) is renewed only at the top of a watch pass; a one-shot sweep never renews it, and the he…
 
-Flow-sim gap B-C2, class K7 (unserialized duplicate actors). Failing input: Labels: review:accepted. Comments: trusted result on HEAD with a confirmed `degraded` finding (card action) or `broken` finding; no gate marker yet. No lock file; status file irrelevant. review-job's post-red-team gate (we:review-job.mjs:1011) and an extend-rounds re-gate (we:extend-rounds-io.mjs:18) or an operator CLI run (we:… Cited: we:scripts/operations/red-team-gate-apply.mjs:140-148, we:scripts/lib/prevention-landing-job.mjs:84, we:scripts/lib/red-team-gate.mjs:352-357. Soak-break sketch: double-act (two follow-up cards for one result; duplicate SEND_BACK ledger events; duplicate round-cap notifications)
+Flow-sim gap R8c-G1, class K7 (unserialized duplicate actors). Failing input: we:merge-ai-prs.mjs running a label sweep (resident --watch or one-shot) holding the per-repo drain lease (we:drain-lock.mjs:71,79: DRAIN_LEASE_MINUTES = DEFAULT_LEASE_MINUTES = 15). One sweepOnce() takes longer than 15 minutes (many ready-to-merge PRs, unknown-mergeability retry sleeps, gh throttle, rebase waits). Time passes … Cited: we:scripts/merge-ai-prs.mjs:7732, we:scripts/merge-ai-prs.mjs:2924-2955, we:scripts/merge-ai-prs.mjs:7734, we:scripts/readiness/file-locks.mjs, we:scripts/merge-ai-prs.mjs:7819. Soak-break sketch: Fixture: temp DRAIN_LOCK_ROOT, drain A acquires with injected nowMs=T0, runs a stub sweepOnce that advances the clock 16 min. Action: drain B calls the gate+acquire at T0+16m, then A finishes its sweep step. Assertion that fails today: A must detect lease los…
 
 ## Acceptance
 

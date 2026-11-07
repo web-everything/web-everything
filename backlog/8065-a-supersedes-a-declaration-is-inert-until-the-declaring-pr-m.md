@@ -1,15 +1,16 @@
 ---
+bornAs: xc13jut
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/file-locks.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lane-drain.mjs"]
+scope: ["we:scripts/conveyor/supersede-watch.mjs", "we:scripts/conveyor/supersede-rule.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Drain lease (15 min) is renewed only at the top of a watch pass; a one-shot sweep never renews it, and the he…
+# A 'Supersedes #A' declaration is inert until the declaring PR merges, so old and new PR are both live (double…
 
-Flow-sim gap R8c-G1, class K7 (unserialized duplicate actors). Failing input: we:merge-ai-prs.mjs running a label sweep (resident --watch or one-shot) holding the per-repo drain lease (we:drain-lock.mjs:71,79: DRAIN_LEASE_MINUTES = DEFAULT_LEASE_MINUTES = 15). One sweepOnce() takes longer than 15 minutes (many ready-to-merge PRs, unknown-mergeability retry sleeps, gh throttle, rebase waits). Time passes … Cited: we:scripts/merge-ai-prs.mjs:7732, we:scripts/merge-ai-prs.mjs:2924-2955, we:scripts/merge-ai-prs.mjs:7734, we:scripts/readiness/file-locks.mjs, we:scripts/merge-ai-prs.mjs:7819. Soak-break sketch: Fixture: temp DRAIN_LOCK_ROOT, drain A acquires with injected nowMs=T0, runs a stub sweepOnce that advances the clock 16 min. Action: drain B calls the gate+acquire at T0+16m, then A finishes its sweep step. Assertion that fails today: A must detect lease los…
+Flow-sim gap R9b-G2, class K7 (unserialized duplicate actors). Failing input: Open PR #B body 'Supersedes: #A' (as we:open-pr.mjs:40-47 tells authors), #A open with review:changes or in review. No hold, no relation recorded anywhere.' 'Review, fix and ci-heal daemons both work #A and #B in parallel; #A can also be accepted and merged first. Cited: we:scripts/conveyor/supersede-watch.mjs:36-41, we:scripts/conveyor/supersede-rule.mjs:303-304, we:scripts/conveyor/reconcile-core.mjs. Soak-break sketch: fixture: open #B body 'Supersedes: #A'; open #A review:changes, no stand-down. action: reconcile plan for #A while #B is open. assert #A is not dispatched a fixer (or carries a 'superseding PR in flight' note) - today it is dispatched.
 
 ## Acceptance
 

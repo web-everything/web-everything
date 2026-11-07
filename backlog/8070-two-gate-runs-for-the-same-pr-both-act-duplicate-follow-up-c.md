@@ -1,15 +1,16 @@
 ---
+bornAs: xvk9y0r
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/accept-carry-sweep.mjs"]
+scope: ["we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/lib/prevention-landing-job.mjs", "we:scripts/lib/red-team-gate.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# per-process one-per-head memories reset on daemon restart
+# Two gate runs for the same PR both act (duplicate follow-up card, duplicate send-back ledger event, duplicate…
 
-Flow-sim gap E-G7, class K7 (unserialized duplicate actors). Failing input: overlap-exempt stale-base rebase or idle restack already dispatched once for a PR head in this daemon process' 'daemon restart (self-sync restartOntoNewCode, crash, launchd) Cited: we:scripts/conveyor/reconcile-fix-dispatch.mjs:2558-2560, we:scripts/conveyor/accept-carry-sweep.mjs:33-36. Soak-break sketch: a second exempt rebase / restack on the same head after every restart (acts twice).
+Flow-sim gap B-C2, class K7 (unserialized duplicate actors). Failing input: Labels: review:accepted. Comments: trusted result on HEAD with a confirmed `degraded` finding (card action) or `broken` finding; no gate marker yet. No lock file; status file irrelevant. review-job's post-red-team gate (we:review-job.mjs:1011) and an extend-rounds re-gate (we:extend-rounds-io.mjs:18) or an operator CLI run (we:… Cited: we:scripts/operations/red-team-gate-apply.mjs:140-148, we:scripts/lib/prevention-landing-job.mjs:84, we:scripts/lib/red-team-gate.mjs:352-357. Soak-break sketch: double-act (two follow-up cards for one result; duplicate SEND_BACK ledger events; duplicate round-cap notifications)
 
 ## Acceptance
 

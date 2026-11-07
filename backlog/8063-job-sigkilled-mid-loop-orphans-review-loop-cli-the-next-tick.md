@@ -1,15 +1,16 @@
 ---
+bornAs: x0kvr2o
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/conveyor/supersede-watch.mjs", "we:scripts/conveyor/supersede-rule.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/review-job.mjs", "we:scripts/operations/review-job-store.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:skills-src/conveyor/review-daemon.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A 'Supersedes #A' declaration is inert until the declaring PR merges, so old and new PR are both live (double…
+# Job SIGKILLed mid-loop orphans review-loop-cli; the next tick starts a second full review of the same PR
 
-Flow-sim gap R9b-G2, class K7 (unserialized duplicate actors). Failing input: Open PR #B body 'Supersedes: #A' (as we:open-pr.mjs:40-47 tells authors), #A open with review:changes or in review. No hold, no relation recorded anywhere.' 'Review, fix and ci-heal daemons both work #A and #B in parallel; #A can also be accepted and merged first. Cited: we:scripts/conveyor/supersede-watch.mjs:36-41, we:scripts/conveyor/supersede-rule.mjs:303-304, we:scripts/conveyor/reconcile-core.mjs. Soak-break sketch: fixture: open #B body 'Supersedes: #A'; open #A review:changes, no stand-down. action: reconcile plan for #A while #B is open. assert #A is not dispatched a fixer (or carries a 'superseding PR in flight' note) - today it is dispatched.
+Flow-sim gap A-C2, class K7 (unserialized duplicate actors). Failing input: labels: [review:pending] files: 'we:review-jobs/review-N.json {pid:J}; completion review-N = started; run record review-pr-<uuid1>.json mid-judge (not parked); lane L1 leased under slug review-N; child `node we:scripts/operations/review-loop-cli.mjs --pr=N` still running' operator/OOM kills job pid J with SIGKILL (jetsam under … Cited: we:scripts/operations/review-loop-cli.mjs:657-658, we:scripts/operations/review-loop-cli.mjs:733-735, we:scripts/operations/review-job.mjs:326-332, we:scripts/operations/review-job.mjs:1526-1528, we:scripts/operations/review-job-store.mjs:115. Soak-break sketch: double-act: two panels and two verdict writes for one head. RD:1559-1571 counts the orphan loop against the live-round cap but does not stop a second round on the SAME PR.
 
 ## Acceptance
 

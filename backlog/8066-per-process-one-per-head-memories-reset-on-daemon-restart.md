@@ -1,15 +1,16 @@
 ---
+bornAs: xc565xe
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/accept-carry-sweep.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Concurrent fast drains each run the same queue-merged follow-up; attempts counter advances per drain
+# per-process one-per-head memories reset on daemon restart
 
-Flow-sim gap D-C8, class K7 (unserialized duplicate actors). Failing input: pending[{num:N, followUpAttempts:0}], PR N MERGED by GitHub; catchUp concurrency=3 (we:merge-queue.json) plus event-triggered fast drains' 'two --only fast drains (lease bypassed, MAP:2924-2927) run collectQueueMerged within the same minute Cited: we:scripts/lib/drain-merge-strategy.mjs:664-710, we:scripts/lib/drain-merge-strategy.mjs:705, we:scripts/merge-ai-prs.mjs:7435-7447, we:scripts/lib/drain-merge-strategy.mjs:725, we:scripts/merge-ai-prs.mjs:7297-7312. Soak-break sketch: none
+Flow-sim gap E-G7, class K7 (unserialized duplicate actors). Failing input: overlap-exempt stale-base rebase or idle restack already dispatched once for a PR head in this daemon process' 'daemon restart (self-sync restartOntoNewCode, crash, launchd) Cited: we:scripts/conveyor/reconcile-fix-dispatch.mjs:2558-2560, we:scripts/conveyor/accept-carry-sweep.mjs:33-36. Soak-break sketch: a second exempt rebase / restack on the same head after every restart (acts twice).
 
 ## Acceptance
 

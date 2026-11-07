@@ -1,15 +1,16 @@
 ---
+bornAs: xnnbhnn
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/review-job.mjs", "we:scripts/operations/review-job-store.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:skills-src/conveyor/review-daemon.mjs"]
+scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:skills-src/conveyor/runner-lock.mjs", "we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs", "we:skills-src/conveyor/pass-daemon.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Job SIGKILLed mid-loop orphans review-loop-cli; the next tick starts a second full review of the same PR
+# review-daemon and fix-dispatch daemon renew their lease only between ticks, with no timer and no tick budget …
 
-Flow-sim gap A-C2, class K7 (unserialized duplicate actors). Failing input: labels: [review:pending] files: 'we:review-jobs/review-N.json {pid:J}; completion review-N = started; run record review-pr-<uuid1>.json mid-judge (not parked); lane L1 leased under slug review-N; child `node we:scripts/operations/review-loop-cli.mjs --pr=N` still running' operator/OOM kills job pid J with SIGKILL (jetsam under … Cited: we:scripts/operations/review-loop-cli.mjs:657-658, we:scripts/operations/review-loop-cli.mjs:733-735, we:scripts/operations/review-job.mjs:326-332, we:scripts/operations/review-job.mjs:1526-1528, we:scripts/operations/review-job-store.mjs:115. Soak-break sketch: double-act: two panels and two verdict writes for one head. RD:1559-1571 counts the orphan loop against the live-round cap but does not stop a second round on the SAME PR.
+Flow-sim gap R8c-G2, class K7 (unserialized duplicate actors). Failing input: Resident review-daemon (lease key '<conveyor:review-daemon-lease>', 15 min via RUNNER_LEASE_MINUTES) or reconcile-fix-dispatch daemon (key '<conveyor:reconcile-fix-dispatch-daemon-lease>') in the middle of one tick. Tick interval is 120 s (we:review-daemon.mjs:148) but a tick has no wall-clock bound (grep for deadline/budget/se… Cited: we:skills-src/conveyor/review-daemon.mjs:174-190, we:skills-src/conveyor/review-daemon.mjs:1741, we:skills-src/conveyor/runner-lock.mjs, we:skills-src/conveyor/review-daemon.mjs:1813, we:skills-src/conveyor/review-daemon.mjs:186-187. Soak-break sketch: Fixture: runDaemonLoop with a tickOnce that advances an injected clock 16 min and, mid-tick, a second acquireRunnerLease on the same key. Assertion that fails today: the first loop must not dispatch after the lease is lost (a dispatch effect called after the …
 
 ## Acceptance
 
