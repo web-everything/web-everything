@@ -80,7 +80,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
 import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { readLockfileParity } from './check-lockfile-parity.mjs';
-import { selectInstaller, runDepsInstaller, markerMatches } from './lib/lane-deps-installer.mjs';
+import { selectInstaller, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname, tmpdir } from 'node:os';
@@ -812,28 +812,8 @@ function existingPools() {
 
 // ── deps (node_modules) — not shared by --reference, so installed per lane on fresh-clone / lockfile change ──
 const DEPS_MARKER = (dir) => join(dir, '.git', '.lane-pool-deps'); // inside .git ⇒ never tracked or git-cleaned
-function lockHash(dir, backend = 'npm') {
-  const lock = join(dir, 'package-lock.json');
-  const pkg = join(dir, 'package.json');
-  const file = existsSync(lock) ? lock : existsSync(pkg) ? pkg : null;
-  if (!file) return null;
-  const hash = createHash('sha256').update(readFileSync(file));
-  // pnpm installs also depend on its own lockfile and workspace config (allowBuilds etc.).
-  if (backend === 'pnpm') {
-    for (const extra of ['pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
-      const path = join(dir, extra);
-      if (existsSync(path)) hash.update('\0' + extra + '\0').update(readFileSync(path));
-    }
-  }
-  return hash.digest('hex');
-}
-function depsReady(dir) {
-  const want = lockHash(dir);
-  if (want === null) return 'n/a'; // no package.json → nothing to install
-  if (!existsSync(join(dir, 'node_modules'))) return 'missing';
-  const have = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  return ['npm', 'pnpm'].some(backend => markerMatches(have, lockHash(dir, backend), backend)) ? 'ok' : 'stale';
-}
+// Hashing, readiness and the install orchestration live in lib/lane-deps-installer.mjs (unit-tested there).
+const depsReady = (dir) => laneDepsReady(dir, DEPS_MARKER(dir));
 // #3461 — `npm ci`/`npm install` here is a DELIBERATE, NAMED EXCEPTION to the heavy-command admission queue
 // (`scripts/readiness/heavy-admission.mjs`), not an oversight. #3456's own ruling is explicit that the cap
 // applies at heavy-command-INVOCATION time, never at lane-ACQUIRE time — "a lane may always be acquired
@@ -846,34 +826,26 @@ function depsReady(dir) {
 // that is comparatively cheap and already deduped by `depsReady`'s lockfile-hash skip (most acquires do
 // nothing here at all). This function stays ungated.
 function ensureDeps(dir) {
-  const hash = lockHash(dir);
-  if (hash === null) return 'n/a';
-  const plan = selectInstaller({
-    which: name => (process.env.PATH || '').split(delimiter).map(dir => resolve(dir, name)).find(file => {
-      try { accessSync(file, constants.X_OK); return statSync(file).isFile(); } catch { return false; }
+  return ensureLaneDeps({
+    dir, markerPath: DEPS_MARKER(dir),
+    selectPlan: () => selectInstaller({
+      which: name => (process.env.PATH || '').split(delimiter).map(dir => resolve(dir, name)).find(file => {
+        try { accessSync(file, constants.X_OK); return statSync(file).isFile(); } catch { return false; }
+      }),
+      exec: (command, args, { cwd }) => execFileSync(command, args, {
+        cwd, encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+      }),
+      hasPnpmLock: existsSync(join(dir, 'pnpm-lock.yaml')),
+      hasNpmLock: existsSync(join(dir, 'package-lock.json')),
+      parity: () => readLockfileParity(dir).ok,
+      storeDir: resolvePnpmStoreDir(),
     }),
-    exec: (command, args, { cwd }) => execFileSync(command, args, {
-      cwd, encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-    }),
-    hasPnpmLock: existsSync(join(dir, 'pnpm-lock.yaml')),
-    hasNpmLock: existsSync(join(dir, 'package-lock.json')),
-    parity: () => readLockfileParity(dir).ok,
-    storeDir: resolve(process.env.WE_PNPM_STORE_DIR || join(homedir(), '.cache', 'we-pnpm-store')),
-  });
-  const marker = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  const result = runDepsInstaller({
-    plan, hash: lockHash(dir, plan.backend), marker, hasNodeModules: existsSync(join(dir, 'node_modules')),
-    invalidate: () => rmSync(DEPS_MARKER(dir), { force: true }),
-    remove: () => rmSync(join(dir, 'node_modules'), { recursive: true, force: true }),
     log: message => log(`  ${message} in ${dir} …`),
     // Installer stdout goes to OUR stderr: acquire --json must remain pure JSON.
     exec: (command, args) => execFileSync(command, args, {
       cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL',
     }),
   });
-  // npm install may create/update package-lock.json; stamp the resulting lock just as before.
-  if (result.state === 'installed') writeFileSync(DEPS_MARKER(dir), result.backend + ':' + lockHash(dir, result.backend));
-  return result.state;
 }
 
 // ── lease (#2275) — an exclusive hold so a lane is never recycled or double-acquired while in use ─────
