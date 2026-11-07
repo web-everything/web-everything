@@ -858,3 +858,14 @@ describe('fileCard refuses when the dedupe lookup itself throws', () => {
     expect(landPreventionCard).not.toHaveBeenCalled();
   });
 });
+
+describe('fileCard strict dedupe readers', () => {
+  it('real default dedupe refuses when gh and the local backlog are unusable (never files)', async () => {
+    const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
+    const landPreventionCard = vi.fn();
+    const r = await landRulingCard({ title: 't', digest: '1. `we:scripts/a.mjs:1` — claim', scope: 'we:scripts/a.mjs' },
+      { landPreventionCard, dedupe: (input, o) => { throw new Error('forced'); } });
+    expect(r.ok).toBe(false);
+    expect(landPreventionCard).not.toHaveBeenCalled();
+  });
+});

@@ -1,7 +1,7 @@
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
-import { loadCardDedupePolicy, readPrHostedCards } from '../lib/card-dedupe.mjs';
+import { loadCardDedupePolicy, readOpenCards, readPrHostedCards } from '../lib/card-dedupe.mjs';
 /**
  * @file scripts/operations/record-referral-ruling-io.mjs
  * @description The io binding of `record-referral-ruling` (#4979): reads the PR thread through `gh`, resolves the
@@ -184,15 +184,31 @@ export function readCardRulingFileMode({ env = process.env, tool, log = line => 
 /** Read-only dedupe first; new cards always use the existing isolated single-card landing path. */
 // Dedupe is forced ON for ruling cards whatever the repo-wide default says: this path must never file a duplicate.
 // A failed PR lookup (readPrHostedCards swallows it as []) must also refuse, never read as "no card exists".
+const PR_HOSTED_CARD_CAP = 60; // mirrors card-dedupe's PR_CARD_CAP: reaching it means the list was cut off
 const strictPrCards = (dir) => {
   let failure = null;
   const cards = readPrHostedCards({ cwd: dir, exec: (cmd, args, opts) => {
-    try { return String(execFileSyncThrottled(cmd, args, opts)); } catch (error) { failure = error; throw error; }
+    try {
+      const out = String(execFileSyncThrottled(cmd, args, opts));
+      if (args[0] === 'pr' && args[1] === 'list') JSON.parse(out); // an unparseable list is a failed lookup too
+      return out;
+    } catch (error) { failure = error; throw error; }
   } });
   if (failure) throw new Error('open-PR card lookup failed');
+  if (cards.length >= PR_HOSTED_CARD_CAP) throw new Error('open-PR card lookup hit its cap and may be incomplete');
   return cards;
 };
-const rulingDedupe = (input, options) => runCardDedupe(input, { ...options, readPrCards: strictPrCards,
+// Same for the local backlog: an unreadable directory or card is a failed lookup, not "no card".
+const strictOpenCards = (dir) => {
+  let failure = null;
+  const cards = readOpenCards(dir, {
+    list: (path) => { try { return readdirSync(path); } catch (error) { failure = error; throw error; } },
+    read: (path, enc) => { try { return readFileSync(path, enc); } catch (error) { failure = error; throw error; } },
+  });
+  if (failure) throw new Error('local backlog card lookup failed');
+  return cards;
+};
+const rulingDedupe = (input, options) => runCardDedupe(input, { ...options, readPrCards: strictPrCards, readCards: strictOpenCards,
   loadPolicy: () => ({ ...loadCardDedupePolicy({ root: REPO_ROOT, env: process.env }), dedupe: true }) });
 
 export async function landRulingCard(input, { repo, pr, dedupe = rulingDedupe,
