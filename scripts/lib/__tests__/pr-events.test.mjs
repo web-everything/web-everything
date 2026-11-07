@@ -189,10 +189,18 @@ describe('createEventWaker.sleep', () => {
 });
 
 describe('PR comment wake relevance', () => {
-  it.each(['advisory', 'ruling', 'other', undefined])('routes comment kind %s only to the fix role when relevant', (kind) => {
+  it.each(['advisory', 'ruling', 'redteam', 'other', undefined])('routes comment kind %s by role', (kind) => {
     const event = { type: 'issue_comment', action: 'created', repo: 'web-everything/web-everything', prs: [4624], ...(kind ? { kind } : {}) };
+    // fix role is unchanged: redteam does NOT wake it.
     expect(isRelevantEvent(event, 'fix')).toBe(kind === 'advisory' || kind === 'ruling');
-    expect(isRelevantEvent(event, 'review')).toBe(false);
+    expect(isRelevantEvent(event, 'review')).toBe(kind === 'advisory' || kind === 'ruling' || kind === 'redteam');
     expect(isRelevantEvent(event, 'drain')).toBe(false);
+  });
+
+  it('wakes review on a submitted pull_request_review, while fix stays changes_requested only', () => {
+    const e = (state) => ({ type: 'pull_request_review', action: 'submitted', repo: 'web-everything/web-everything', prs: [1], state });
+    expect(isRelevantEvent(e('approved'), 'review')).toBe(true);
+    expect(isRelevantEvent(e('approved'), 'fix')).toBe(false);
+    expect(isRelevantEvent(e('changes_requested'), 'fix')).toBe(true);
   });
 });

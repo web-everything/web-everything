@@ -328,6 +328,16 @@ describe('advisory and operator-ruling PR comments', () => {
       '**Verdict:** changes requested\nNet basis: `not-hex..def`']) expect(classifyPrComment(body)).toBeNull();
   });
 
+  it('keeps a red-team result comment as kind redteam, matching the gate marker exactly', async () => {
+    const { classifyPrComment, RED_TEAM_COMMENT_MARKER } = await import('../core.mjs');
+    const gate = await import('../../../lib/red-team-gate.mjs');
+    expect(RED_TEAM_COMMENT_MARKER).toBe(gate.RED_TEAM_COMMENT_MARKER);
+    expect(classifyPrComment(gate.redTeamMarker(4624, 'abcdef1') + '\nfindings')).toBe('redteam');
+    expect(classifyPrComment('\r\n  ' + gate.redTeamMarker(4624, 'abcdef1'))).toBe('redteam');
+    for (const body of ['thanks', 'see <!-- we:red-team-advisory pr=1 rev=abcdef1 --> quoted mid-body',
+      '<!-- we:red-team-advisory pr=x rev=abcdef1 -->']) expect(classifyPrComment(body)).toBeNull();
+  });
+
   it.each([
     ['advisory', advisory], ['ruling', '<!-- mandatory-referral-operator-ruling-v1 -->\nPRIVATE comment text'],
   ])('keeps %s metadata without body and folds only the row sequence', async (kind, body) => {
