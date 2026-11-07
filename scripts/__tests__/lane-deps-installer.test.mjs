@@ -454,6 +454,24 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
       expect(readFileSync(markerPath, 'utf8')).toBe(npmMarker(dir));
       expect(leasePid(dir)).toBe(process.pid + 1);
     });
+    it('a STALE lane held by another live process is not reinstalled or wiped (reports stale)', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
+      writeLease(dir, { ...fresh, pid: process.pid + 1 });
+      const exec = vi.fn();
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('stale');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+      expect(readFileSync(markerPath, 'utf8')).toBe('pnpm:old');
+      expect(leasePid(dir)).toBe(process.pid + 1);
+    });
+    it('a stale lane claimed by a foreign lease before its wipe is left alone', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
+      const exec = vi.fn();
+      const selectPlan = () => windowPlan(select({ storeDir }), () => writeLease(dir, { ...fresh, pid: process.pid + 1 }), 1);
+      expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('stale');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    });
     it('a failing install still releases the claim', () => {
       const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
       const exec = vi.fn(() => { throw Error('install failed'); });
