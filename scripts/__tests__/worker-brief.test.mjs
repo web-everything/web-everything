@@ -185,7 +185,9 @@ describe('renderWorkerBrief', () => {
     expect(audit).toBeGreaterThan(verify);
     expect(openPr).toBeGreaterThan(audit);
     const text = step.slice(audit, openPr);
-    expect(text).toContain('node scripts/operations/codex-audit.mjs --base=origin/main --head=<40-hex sha of your lane HEAD>');
+    expect(text).toMatch(/node \S*scripts\/operations\/codex-audit\.mjs\S* --base=origin\/main --head=<40-hex sha of your lane HEAD>/);
+    expect(text).not.toContain('node scripts/operations/codex-audit.mjs');
+    expect(text).toContain('lane as the working directory');
     expect(text).toContain('NOT WEAKENED');
     expect(text).toContain('at most 2 repair rounds');
     expect(text).toContain('do NOT open a PR; report the remaining findings');
