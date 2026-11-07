@@ -531,6 +531,27 @@ describe('swapNodeModules — pnpm links survive the change of depth (real cp, n
       '',
     ].join('\n'));
     chmodSync(shim, 0o755);
+    // The shape pnpm 11 really writes (basedir_abs/basedir_win, single-quoted relative path, absolute NODE_PATH).
+    const realShim = join(modules, '.bin', 'conc');
+    const toStore = rel(join(modules, '.bin'), join(global, 'esbuild'));
+    writeFileSync(realShim, [
+      '#!/bin/sh',
+      'basedir=$(dirname "$0")',
+      'basedir_abs=$(CDPATH= cd -P -- "$basedir" && pwd -P) || exit $?',
+      'basedir="$basedir_abs"',
+      'basedir_win="$basedir"',
+      `export NODE_PATH='${join(global, 'esbuild')}'`,
+      'if [ -n "$exe" ] && [ -x "$basedir/node.exe" ]; then',
+      `  exec "$basedir/node.exe"  "$basedir_win"/'${toStore}/marker.txt' "$@"`,
+      'elif [ -x "$basedir/node" ]; then',
+      `  exec "$basedir/node"  "$basedir_abs"/'${toStore}/marker.txt' "$@"`,
+      'else',
+      `  exec cat "$basedir_abs"/'${toStore}/marker.txt'`,
+      'fi',
+      `# cmd-shim-target=${join(global, 'esbuild', 'marker.txt')}`,
+      '',
+    ].join('\n'));
+    chmodSync(realShim, 0o755);
     const clone = join(base, 'clone');
     mkdirSync(join(clone, 'node_modules'), { recursive: true });
     writeFileSync(join(clone, 'node_modules', 'old.txt'), 'old');
@@ -553,11 +574,38 @@ describe('swapNodeModules — pnpm links survive the change of depth (real cp, n
     expect(readlinkSync(join(live, 'inner'))).toBe(join('.pnpm', 'inner'));
     expect(readlinkSync(join(live, 'absolute'))).toBe(join(f.global, 'esbuild'));
     expect(execFileSync('sh', [join(live, '.bin', 'esbuild')], { encoding: 'utf8' })).toBe('esbuild');
+    // Real pnpm 11 shim spelling: dangles when copied verbatim, runs after the rebase.
+    expect(() => execFileSync('sh', [join(naive, '.bin', 'conc')], { encoding: 'utf8', stdio: 'pipe' })).toThrow();
+    expect(execFileSync('sh', [join(live, '.bin', 'conc')], { encoding: 'utf8' })).toBe('esbuild');
+    expect(readFileSync(join(live, '.bin', 'conc'), 'utf8')).toContain(`export NODE_PATH='${join(f.global, 'esbuild')}'`);
     expect(statSync(join(live, '.bin', 'esbuild')).mode & 0o111).not.toBe(0);
     expect(readFileSync(join(live, '.bin', 'esbuild'), 'utf8')).toContain('$basedir/../.pnpm/inner');
     // The kept store is not modified by the rebase.
     expect(readFileSync(join(f.modules, '.bin', 'esbuild'), 'utf8')).toContain(relative(join(f.modules, '.bin'), join(f.global, 'esbuild')));
     expect(readdirSync(f.clone).sort()).toEqual(['node_modules']);
+  });
+
+  it.each([
+    ['unrecognised path spelling', 'exec cat "$basedir"/"../../x"'],
+    ['oversized shim', null],
+  ])('a bin shim the rebase cannot handle fails closed, live tree untouched: %s', (_, line) => {
+    const f = pnpmLayout();
+    const shim = join(f.modules, '.bin', 'odd');
+    writeFileSync(shim, line === null ? `#!/bin/sh\n# basedir\n${'x'.repeat(4 * 1024 * 1024 + 1)}\n` : `#!/bin/sh\n${line}\n`);
+    let err;
+    try { swapNodeModules({ root: f.clone, storeDir: f.store }); } catch (e) { err = e; }
+    expect(err?.message).toMatch(/bin shim/);
+    expect(readdirSync(join(f.clone, 'node_modules'))).toEqual(['old.txt']);
+    expect(readdirSync(f.clone)).toEqual(['node_modules']);
+  });
+
+  it('a symlinked clone root does not skew the rebased links (physical resolution)', () => {
+    const f = pnpmLayout();
+    const alias = join(f.base, 'alias');
+    symlinkSync(f.base, alias);
+    swapNodeModules({ root: join(alias, 'clone'), storeDir: join(alias, 'jobs', 'snapshots', 'node-modules', 'key') });
+    expect(readFileSync(join(f.clone, 'node_modules', 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+    expect(execFileSync('sh', [join(f.clone, 'node_modules', '.bin', 'conc')], { encoding: 'utf8' })).toBe('esbuild');
   });
 
   it('a link that cannot resolve after the copy fails the swap before the working deps are touched', () => {

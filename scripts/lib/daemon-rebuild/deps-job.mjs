@@ -329,7 +329,10 @@ export function depsStore(jobsDir, key) {
 }
 
 const MAX_REBASE_ENTRIES = 2_000_000;
-const MAX_SHIM_BYTES = 256 * 1024;
+const MAX_SHIM_BYTES = 4 * 1024 * 1024;
+// pnpm/cmd-shim spellings: $basedir/x, "$basedir_abs"/'x', "$basedir_win"/'x', ${basedir}/x.
+const SHIM_PATH = /(\$\{?basedir(?:_abs|_win)?\}?"?)\/(?:'([^']*)'|([^\s"':$;|&()]+))/g;
+const SHIM_VAR_SLASH = /\$\{?basedir\w*\}?"?\//g;
 const insideTree = (path, tree) => path === tree || path.startsWith(tree + sep);
 
 /**
@@ -342,7 +345,9 @@ const insideTree = (path, tree) => path === tree || path.startsWith(tree + sep);
  *   `final` where it will live.
  */
 export function rebaseNodeModulesLinks({ from, copy, final }) {
-  from = resolve(from); copy = resolve(copy); final = resolve(final);
+  // Real paths on both ends: `..` in a link is resolved physically, so a symlinked parent (/tmp, a moved clone
+  // root) must not skew the relative path.
+  from = realpathSync(from); copy = resolve(copy); final = join(realpathSync(dirname(resolve(final))), basename(final));
   if (from === final) return;
   const stack = [''];
   let seen = 0;
@@ -367,15 +372,26 @@ export function rebaseNodeModulesLinks({ from, copy, final }) {
         symlinkSync(relative(dirname(join(final, childRel)), absolute), path);
       } else if (entry.isDirectory()) {
         stack.push(childRel);
-      } else if (entry.isFile() && basename(rel) === '.bin' && statSync(path).size <= MAX_SHIM_BYTES) {
-        const text = readFileSync(path, 'utf8');
-        if (!text.includes('$basedir/')) continue;
+      } else if (entry.isFile() && basename(rel) === '.bin') {
+        if (statSync(path).size > MAX_SHIM_BYTES) throw new Error(`bin shim too large to rebase: ${childRel}`);
+        const bytes = readFileSync(path);
+        if (bytes.includes(0)) continue; // a native executable, not a shell/PowerShell shim
+        const text = bytes.toString('utf8');
+        if (!/basedir/.test(text)) continue;
         const binDir = dirname(join(from, childRel));
-        const next = text.replace(/\$basedir((?:\/[^\s"':$;|&()]+)+)/g, (whole, tail) => {
-          const absolute = resolve(binDir, `.${tail}`);
+        const finalBin = dirname(join(final, childRel));
+        const next = text.replace(SHIM_PATH, (whole, head, quoted, bare) => {
+          const absolute = resolve(binDir, quoted ?? bare);
           if (insideTree(absolute, from)) return whole;
-          return `$basedir/${relative(dirname(join(final, childRel)), absolute).split(sep).join('/') || '.'}`;
+          const path = relative(finalBin, absolute).split(sep).join('/') || '.';
+          if (quoted !== undefined) return `${head}/'${path.replaceAll("'", "'\\''")}'`;
+          if (!/^[\w@.+,=%~/-]+$/.test(path)) throw new Error(`bin shim path cannot be rebased unquoted: ${childRel}`);
+          return `${head}/${path}`;
         });
+        // Fail closed on any `$basedir…/` path spelling the rewrite did not recognise.
+        if ((text.match(SHIM_VAR_SLASH) ?? []).length !== (text.match(SHIM_PATH) ?? []).length) {
+          throw new Error(`bin shim has an unrecognised $basedir path: ${childRel}`);
+        }
         if (next !== text) writeFileSync(path, next);
       }
     }
