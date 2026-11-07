@@ -4,8 +4,8 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findUngatedHeavySpawns } from '../lib/heavy-spawn-lint.mjs';
-import { resolveAdmissionPolicy } from '../readiness/heavy-admission.mjs';
-import { INVENTORY_RUN_TIMEOUT_MS, inventoryRunnerOptions } from '../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
+import { ADMISSION_DEFERRED_EXIT, resolveAdmissionPolicy } from '../readiness/heavy-admission.mjs';
+import { INVENTORY_RUN_TIMEOUT_MS, inventoryRunnerOptions, inventoryRunOutcome } from '../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
 
 const cp = "import { spawnSync } from 'node:child_process';\n";
 describe('daemon heavy spawn admission lint', () => {
@@ -134,6 +134,23 @@ describe('daemon heavy spawn admission lint', () => {
   ])('detects launcher / joined / fork spellings: %s', call => {
     expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
   });
+  // Review #6461 round 4: every lint-only check (Playwright, `sh -c` bodies, package scripts) also applies behind
+  // each launcher the shared classifier unwraps.
+  // `env -S` takes the run as one string; the other launchers take it as argv.
+  const launchers = { nohup: run => ['nohup', run], setsid: run => ['setsid', run], 'setsid -f': run => ['setsid', ['-f', ...run]],
+    'env -S': run => ['env', ['-S', run.join(' ')]], 'nohup nohup': run => ['nohup', ['nohup', ...run]] };
+  const lintOnlyRuns = [['npx', 'playwright', 'test', 'a'], ['playwright', 'test'], ['sh', '-c', 'npx playwright test a']];
+  it.each(Object.keys(launchers).flatMap(l => lintOnlyRuns.map(r => [l, r])))('rejects `%s` + %j', (launcher, run) => {
+    const [file, args] = launchers[launcher](run);
+    expect(findUngatedHeavySpawns(withFork + `spawnSync(${JSON.stringify(file)}, ${JSON.stringify(args)});`)).toHaveLength(1);
+  });
+  it('rejects Playwright behind launchers', () => {
+    expect(findUngatedHeavySpawns(withFork + "spawnSync('nohup', ['npx', 'playwright', 'test', 'a']);")).toHaveLength(1);
+    expect(findUngatedHeavySpawns(withFork + "execSync('nohup npx playwright test a');")).toHaveLength(1);
+    expect(findUngatedHeavySpawns(withFork + "execSync(\"eval 'npx playwright test a'\");")).toHaveLength(1);
+    expect(findUngatedHeavySpawns(withFork + "spawnSync('nohup', ['npm', 'run', 'e2e']);", 's.mjs', { scripts: { e2e: 'playwright test' } })).toHaveLength(1);
+    expect(findUngatedHeavySpawns(withFork + "spawnSync('nohup', ['npx', 'playwright', '--version']);")).toEqual([]);
+  });
   it.each([
     "execSync('git commit -m \"" + 'x'.repeat(17000) + "\"');",
     "execSync('cat <<EOF\\nnpm test\\nEOF');",
@@ -219,8 +236,23 @@ describe('daemon heavy spawn admission lint', () => {
     expect(policy.settings.runWaitMs).toBe(0);
     expect(policy.sources.runWaitMs).toMatch(/WE_HEAVY_ADMISSION_RUN_WAIT_MS|env/);
   });
+  // Review #6461 round 4: a busy queue is an explicit deferral outcome, not a generic runner failure.
+  it('reports a wrapper deferral exit from the soak inventory runner as deferred', () => {
+    expect(inventoryRunOutcome({ status: ADMISSION_DEFERRED_EXIT, stderr: 'heavy-command admission-deferred: busy' }))
+      .toEqual({ outcome: 'deferred', reason: 'heavy-command admission-deferred: busy' });
+    expect(inventoryRunOutcome({ status: 0 })).toEqual({ outcome: 'ran' });
+    expect(inventoryRunOutcome({ status: 1, stderr: 'x' })).toEqual({ outcome: 'failed', reason: 'x' });
+    expect(inventoryRunOutcome({ status: null, signal: 'SIGTERM' })).toEqual({ outcome: 'failed', reason: 'SIGTERM' });
+    expect(inventoryRunOutcome(undefined)).toEqual({ outcome: 'failed', reason: 'no runner result' });
+  });
   it('accepts a file using the imported admission helper', () => {
     expect(findUngatedHeavySpawns(cp + "import { admittedArgv as admit } from './readiness/heavy-admission.mjs'; const a = admit('npx', ['vitest']); spawnSync(a.file, a.args);")).toEqual([]);
+  });
+  it('resolves a relative admission import against the linted file path', () => {
+    const source = cp + "import { admittedArgv } from './heavy-admission.mjs'; const a = admittedArgv('npx', ['vitest']); spawnSync(a.file, a.args);";
+    expect(findUngatedHeavySpawns(source, 'scripts/readiness/x.mjs')).toEqual([]);
+    expect(findUngatedHeavySpawns(source, 'scripts/lib/x.mjs')).toHaveLength(1);
+    expect(findUngatedHeavySpawns(source)).toHaveLength(1);
   });
   it('rejects an unrelated unadmitted spawn beside an admitted call', () => {
     const source = cp + "import { admittedArgv } from './readiness/heavy-admission.mjs';\n"
@@ -273,7 +305,10 @@ describe('daemon heavy spawn admission lint', () => {
         return e.name.endsWith('.mjs') && !/\.(?:test|spec)\.mjs$/.test(e.name) ? [path] : [];
       });
     }
-    const paths = [...files('scripts', false), ...files('scripts/conveyor', true), ...files('skills-src/conveyor', true)];
+    const paths = [...files('scripts', true), ...files('skills-src/conveyor', true)];
+    // Review #6461 round 4: every script subdirectory is walked, not only the top level and conveyor.
+    expect(paths).toEqual(expect.arrayContaining(['scripts/lib/heavy-spawn-lint.mjs', 'scripts/readiness/heavy-admission.mjs',
+      'scripts/operations/agent-command-audit.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs']));
     const hits = paths.flatMap(path => findUngatedHeavySpawns(readFileSync(resolve(root, path), 'utf8'), relative(root, resolve(root, path))));
     expect(hits).toEqual([]);
   });

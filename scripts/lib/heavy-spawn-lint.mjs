@@ -1,7 +1,8 @@
 /** Static admission lint for literal heavy child_process commands. No code is executed. */
 import { readFileSync } from 'node:fs';
+import { posix } from 'node:path';
 import ts from 'typescript';
-import { canonicalCommand, commandSubstitutionBodies, heredocScan, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, heavyRunHeads, heredocScan, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -64,8 +65,16 @@ function heavyCommand(command, { depth = 0, substitutions = true, scripts = pack
     && inner(doc.body, false))) return true;
   return parseSegments(text).segments.some(segment => {
     // The Bash guard's own classifier first: package test scripts (`npm test`, `npm --prefix . test`, `pnpm t`),
-    // `node --test`, vitest and check-standards heads. The checks below add playwright and `sh -c` bodies.
+    // `node --test`, vitest and check-standards heads. The checks below add playwright and `sh -c` bodies, and
+    // run on every command the classifier unwraps (`nohup npx playwright test`, review #6461 r4).
     if (ungatedHeavyRunKind(segment)) return true;
+    const heads = heavyRunHeads(segment);
+    if (!heads) return true; // past the unwrap bound: fail closed
+    return heads.some(({ raw }) => lintOnlyHeavy(raw));
+  });
+
+  /** The lint's own checks for one unwrapped head. */
+  function lintOnlyHeavy(segment) {
     // `sh -c "…"` as the inner shell receives it (escaped quotes resolved, any nesting depth).
     const shellC = shellCString(segment);
     if (shellC) return inner(shellC.text);
@@ -98,7 +107,7 @@ function heavyCommand(command, { depth = 0, substitutions = true, scripts = pack
     program = program?.replace(/^.*\//, '');
     return /^(?:vitest(?:@\S*)?|vitest\.mjs|playwright(?:@\S*)?|check-standards(?:\.mjs)?)$/.test(program || '')
       && !args.some(arg => /^(?:--version|-v|--help|-h)$/.test(arg));
-  });
+  }
 }
 
 /** `scripts` overrides the package script table (tests); by default this repository's package.json is read. */
@@ -139,7 +148,10 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
           if (['execPath', 'argv0'].includes((e.propertyName || e.name).text)) processBinaryNames.add(e.name.text);
         }
       }
-      if (/(?:^|\/)readiness\/heavy-admission\.mjs$/.test(mod) && named && ts.isNamedImports(named)) {
+      // A relative specifier is resolved against the linted file, so `./heavy-admission.mjs` inside readiness/
+      // counts (review #6461 r4); with no path to resolve against it does not (fail closed).
+      const resolved = mod.startsWith('.') ? posix.join(posix.dirname(filename), mod) : mod;
+      if ([mod, resolved].some(m => /(?:^|\/)readiness\/heavy-admission\.mjs$/.test(m)) && named && ts.isNamedImports(named)) {
         for (const e of named.elements) if (['runUnderAdmission', 'admittedArgv'].includes((e.propertyName || e.name).text)) admission.set(e.name.text, (e.propertyName || e.name).text);
       }
     }

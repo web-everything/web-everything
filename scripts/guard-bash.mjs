@@ -707,6 +707,26 @@ export function truncatedOperationJsonReason(command) {
 // hardened normalizer that already knew about the whole class. `wrapperPrefixLength` is now the single
 // source of truth for both.
 
+/** env options that take a value (review #6461 r4): GNU -u/-C/-a, BSD/macOS -u/-P/-L/-U, and the long forms
+ *  GNU accepts by any unambiguous prefix. One table for every env parser here (the wrapper peel, `env -S`
+ *  extraction and the replacement builder), so they cannot disagree on where the command starts. */
+const ENV_VALUE_SHORT = 'uCaPLU';
+const ENV_VALUE_LONG = ['--unset', '--chdir', '--argv0'];
+
+/** How many words the env option `opt` occupies: 2 when its value is the next word, else 1. `-S`/
+ *  `--split-string` count as 1 here; `envSplitString` reads their string. Pure. */
+function envOptionWidth(opt) {
+  if (opt.startsWith('--')) {
+    if (opt.includes('=')) return 1;
+    return opt.length >= 3 && ENV_VALUE_LONG.some((full) => full.startsWith(opt)) ? 2 : 1;
+  }
+  for (let k = 1; k < opt.length; k += 1) {
+    if (opt[k] === 'S') return 1;
+    if (ENV_VALUE_SHORT.includes(opt[k])) return k === opt.length - 1 ? 2 : 1; // `-uNAME` holds its value
+  }
+  return 1;
+}
+
 /** How many LEADING tokens of `words` are wrapper/assignment noise before the real program word? Pure.
  *  Peels `VAR=val`, `env [VAR=v…]`, `time`/`command`/`builtin`/`nice`, `sudo [-n] [-u <user>]`,
  *  `xargs [opts]` and `npx`/`bunx` `[opts]`. Bounded — every branch advances by ≥1 token. Callers pass
@@ -740,8 +760,8 @@ function wrapperPrefixLength(words) {
       while (i < words.length) {
         const opt = words[i];
         if (opt === '--') { i += 1; break; }
-        if (opt === '-u' || opt === '--unset' || opt === '-C' || opt === '--chdir') { i += 2; continue; }
-        if (opt.startsWith('-') || /^[A-Za-z_]\w*=/.test(opt)) { i += 1; continue; }
+        if (opt.startsWith('-')) { i += envOptionWidth(opt); continue; }
+        if (/^[A-Za-z_]\w*=/.test(opt)) { i += 1; continue; }
         break;
       }
       continue;
@@ -3562,11 +3582,9 @@ export function envSplitString(segment) {
     const [name, value] = opt.includes('=') ? [opt.slice(0, opt.indexOf('=')), opt.slice(opt.indexOf('=') + 1)] : [opt, null];
     const longOf = (full, min) => name.length >= min && full.startsWith(name);
     if (longOf('--split-string', 4)) return envSplitText(value ?? w[i + 1]);
-    if (value === null && (longOf('--unset', 3) || longOf('--chdir', 3) || longOf('--argv0', 3))) { i += 1; continue; }
-    if (opt.startsWith('--')) continue;
+    if (opt.startsWith('--')) { i += envOptionWidth(opt) - 1; continue; }
     for (let k = 1; k < opt.length; k += 1) {
-      // Options that take a value: GNU -u/-C/-a, BSD/macOS -u/-P/-L/-U.
-      if ('uCaPLU'.includes(opt[k])) { if (k === opt.length - 1) i += 1; break; }
+      if (ENV_VALUE_SHORT.includes(opt[k])) { if (k === opt.length - 1) i += 1; break; }
       if (opt[k] === 'S') return envSplitText(opt.slice(k + 1) || w[i + 1]);
     }
   }
@@ -3581,19 +3599,34 @@ function envSplitText(text) {
 /** The unqueued heavy run a segment starts, with the command text that classified (after env -S, launcher
  *  and alias unwrapping), or null. Deeper than the hop bound fails closed. Pure. */
 function heavyRunHead(segment) {
+  const heads = heavyRunHeads(segment);
+  if (!heads) return { kind: 'test', raw: null }; // 16+ nested launchers/env -S: implausible, so fail closed
+  const last = heads.at(-1);
+  return last?.kind ? { kind: last.kind, raw: last.raw } : null;
+}
+
+/** Every command text a segment runs through env -S, launcher (`nohup`, `setsid`, `eval`) and alias unwrapping,
+ *  outermost first, each with the heavy kind the classifier gives it (null for none); it stops at the first
+ *  classified head. Null past the hop bound: callers fail closed. The spawn lint applies its own extra checks
+ *  (Playwright, `sh -c` bodies, package scripts) to every head, so a launcher hides none of them (review #6461
+ *  r4). Pure. */
+export function heavyRunHeads(segment) {
+  const heads = [];
   let raw = String(segment || '');
   for (let hop = 0; hop < 16; hop += 1) {
     const split = envSplitString(raw);
     if (split !== null) { raw = split; continue; }
-    const head = canonicalCommand(stripShellControl(raw));
-    if (!head) return null;
-    const kind = ungatedHeavyHead(head)?.kind;
-    if (kind) return { kind, raw: stripShellControl(raw) };
+    const stripped = stripShellControl(raw);
+    const head = canonicalCommand(stripped);
+    if (!head) return heads;
+    const kind = ungatedHeavyHead(head)?.kind ?? null;
+    heads.push({ raw: stripped, kind });
+    if (kind) return heads;
     const alias = heavyRunAlias(head);
-    if (!alias) return null;
+    if (!alias) return heads;
     raw = alias;
   }
-  return { kind: 'test', raw: null }; // 16+ nested launchers/env -S: implausible, so fail closed
+  return null;
 }
 
 /** The kind of unqueued heavy run a segment's executable head starts ('vitest' | 'node-test' | 'standards' |
@@ -3721,7 +3754,7 @@ export function ungatedHeavyRunReason(segment, depth = 0) {
     if (/^[A-Za-z_]\w*=/.test(word)) { prefix.push(s.slice(words[i].start, words[i].end)); i += 1; continue; }
     if (prefix[0] === 'env' && word.startsWith('-')) {
       prefix.push(s.slice(words[i].start, words[i].end)); i += 1;
-      if (/^(?:-u|--unset|-C|--chdir)$/.test(word) && words[i]) {
+      if (envOptionWidth(word) === 2 && words[i]) {
         prefix.push(s.slice(words[i].start, words[i].end)); i += 1;
       }
       if (word === '--') {

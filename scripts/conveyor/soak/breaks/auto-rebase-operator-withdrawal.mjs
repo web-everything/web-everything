@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { admittedArgv } from '../../../readiness/heavy-admission.mjs';
+import { ADMISSION_DEFERRED_EXIT, admittedArgv } from '../../../readiness/heavy-admission.mjs';
 import { runAutoRebase, finishPendingSwaps, heavyTestReport, runHeavyTests } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
 import { scratchTestOutput } from './scratch-tests-forge-command.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, persistStackBases } from '../../../lib/daemon-overlays.mjs';
@@ -25,6 +25,15 @@ export const INVENTORY_RUN_TIMEOUT_MS = 30_000;
 export function inventoryRunnerOptions(cwd, env) {
   return { cwd, env: { ...env, WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0' }, encoding: 'utf8',
     timeout: INVENTORY_RUN_TIMEOUT_MS, maxBuffer: 1024 * 1024 };
+}
+
+/** What the real Vitest child did: `ran`, `deferred` (the admission wrapper's busy-queue exit: the tests did not
+ *  run, so this is not a test failure) or `failed`, with the reason from stderr or the signal (review #6461 r4). */
+export function inventoryRunOutcome(result) {
+  if (!result) return { outcome: 'failed', reason: 'no runner result' };
+  if (result.status === 0) return { outcome: 'ran' };
+  const reason = String(result.stderr || '').trim() || result.signal || `exit ${result.status}`;
+  return { outcome: result.status === ADMISSION_DEFERRED_EXIT ? 'deferred' : 'failed', reason };
 }
 
 // realRunner exercises Vitest's actual file-filter/exclude behavior with the reported paths.
@@ -110,6 +119,7 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
     try { await runAutoRebase({ root, ref: REF, env, deps }); } catch (error) { failure = error.message; }
     const pending = `${overlayFilePath(root, env)}.auto-rebase`;
     return { failure, pushed, registered, audited, events, runnerResult,
+      runnerOutcome: realRunner ? inventoryRunOutcome(runnerResult) : null,
       remaining: fs.existsSync(pending) ? fs.readdirSync(pending) : [],
       overlays: readOverlays(root, { env }).map(o => o.ref),
       cleaned: scratches.every(p => !fs.existsSync(p)),

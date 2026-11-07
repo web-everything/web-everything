@@ -141,6 +141,19 @@ describe('heavy-enforce — every direct test run requires admission', () => {
   it.each(execWrappers.filter(wrapper => !/^(?:nohup|setsid)$/.test(wrapper)))('allows the admitted run behind `%s`', wrapper => {
     expect(decide(`${wrapper} ${queue}npx vitest run a`, {})).toBeNull();
   });
+  // Review #6461 round 4: every env option that takes a separate value (GNU -u/-C/-a, BSD/macOS -u/-P/-L/-U, the
+  // long forms and their abbreviations, a cluster ending in one) in front of a heavy run without -S.
+  const envValueOptions = ['-u NAME', '-C /tmp', '-a x', '-P /usr/bin', '-L 0', '-U nobody', '-iu NAME', '-ia x',
+    '--unset NAME', '--chdir /tmp', '--argv0 x', '--uns NAME', '--arg x', '-i -a x X=1'];
+  it.each(envValueOptions)('denies a heavy run behind `env %s`', opt => {
+    for (const run of ['npx vitest run a', 'npx playwright test a', 'node --test a.test.mjs', 'node scripts/check-standards.mjs']) {
+      expect(decide(`env ${opt} ${run}`, {}), `env ${opt} ${run}`).toMatch(/heavy-enforce|heavy-command admission queue/);
+    }
+  });
+  it.each(envValueOptions)('allows the admitted run behind `env %s` and keeps its value in the replacement', opt => {
+    expect(decide(`env ${opt} ${queue}npx vitest run a`, {})).toBeNull();
+    expect(decide(`env ${opt} npx vitest run a`, {})).toContain('`env ' + opt + ' ' + queue + 'npx vitest run a`');
+  });
   it('names the command env -S and a launcher actually run in the replacement', () => {
     for (const cmd of ["env -S 'npx vitest run a'", 'nohup npx vitest run a', 'case x in x) npx vitest run a;; esac']) {
       expect(decide(cmd, {})).toContain('`' + queue + 'npx vitest run a`');
