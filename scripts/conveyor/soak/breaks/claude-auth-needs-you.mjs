@@ -52,6 +52,7 @@ const sessions = [
   { name: 'fix-6467', startedAt: Date.parse('2026-11-07T01:49:00Z') },
   { name: 'ci-heal-6469', startedAt: Date.parse('2026-11-07T01:51:00Z') },
 ];
+const { diffFeed, REPORT_KINDS, GATE_KINDS } = await import(pathToFileURL(join(root, 'scripts/operations/needs-you-feed.mjs')).href);
 const key = 'claude-auth-expired::claude-auth';
 async function replay(name, blip) {
   const dir = join(scratch, name);
@@ -80,7 +81,11 @@ async function replay(name, blip) {
     });
     transitions.push(...result.transitions);
   }
-  return { calls, opened: transitions.some(t => t.type === 'opened' && t.key === key) };
+  // The next normal operator-queue refresh (complete report, nothing for this item) must not clear the alert.
+  const open = calls.length ? diffFeed([], calls, start).openKeys : [];
+  const refresh = diffFeed(open, [], start + 60_000, { incomplete: false, clearKinds: REPORT_KINDS, alsoClear: GATE_KINDS });
+  const refreshCleared = refresh.lines.filter(l => l.startsWith('NEEDS-YOU-CLEARED')).length;
+  return { calls, refreshCleared, opened: transitions.some(t => t.type === 'opened' && t.key === key) };
 }
 const sustained = await replay('sustained', false);
 const blip = await replay('blip', true);
@@ -117,7 +122,8 @@ export default {
     if (report?.sustained?.opened !== true) problems.push('scenario setup: sustained outage never opened claude-auth-expired');
     if (report?.sustained?.calls?.length !== 1) problems.push('sustained outage must publish exactly one NEEDS-YOU re-login item across repeated ticks and a reminder');
     const item = report?.sustained?.calls?.[0];
-    if (item?.kind !== 'needs-you' || item?.reason !== 'Claude login expired — re-login') problems.push('missing NEEDS-YOU re-login item');
+    if (item?.kind !== 'claude-auth-expired' || item?.reason !== 'Claude login expired — re-login') problems.push('missing NEEDS-YOU re-login item');
+    if (report?.sustained?.refreshCleared !== 0) problems.push('a complete operator-queue feed refresh cleared the re-login alert while the outage was open');
     if (report?.blip?.calls?.length !== 0 || report?.blip?.opened !== false) problems.push('single-session blip produced an alert or its evidence is incomplete');
     return problems;
   },

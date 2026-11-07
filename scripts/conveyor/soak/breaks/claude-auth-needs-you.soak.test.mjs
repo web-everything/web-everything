@@ -6,7 +6,7 @@ defineBreakTest(b);
 
 describe('claude-auth-needs-you judge', () => {
   const good = () => ({
-    sustained: { opened: true, calls: [{ kind: 'needs-you', reason: 'Claude login expired — re-login' }] },
+    sustained: { opened: true, refreshCleared: 0, calls: [{ kind: 'claude-auth-expired', reason: 'Claude login expired — re-login' }] },
     blip: { opened: false, calls: [] },
   });
   it('rejects missing or incomplete replay evidence', () => {
@@ -21,6 +21,11 @@ describe('claude-auth-needs-you judge', () => {
   it('rejects duplicate sustained-outage publications', () => {
     const report = good();
     report.sustained.calls.push(report.sustained.calls[0]);
+    expect(b.judge(report)).not.toEqual([]);
+  });
+  it('rejects an alert cleared by a complete feed refresh', () => {
+    const report = good();
+    report.sustained.refreshCleared = 1;
     expect(b.judge(report)).not.toEqual([]);
   });
   it('rejects a single-session blip alert', () => {

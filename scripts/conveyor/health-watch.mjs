@@ -1544,7 +1544,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   for (const p of [...result.plan.filter((x) => x.kind === 'notify' && !x.suppressed), ...needsYouRetries]) {
     const ep = state.episodes[p.key];
     if (ep?.smell === 'claude-auth-expired' && !Number.isFinite(ep.needsYouAt) && !flags['no-notify']) {
-      const item = { key: p.key, repo: 'health-watch', kind: 'needs-you', pr: 0,
+      // Event-only kind (like 'disk-space'): NOT in the feed's REPORT_KINDS, so a complete operator-queue refresh can't
+      // clear it by absence while the episode is still open — health-watch owns the condition and publishes once.
+      const item = { key: p.key, repo: 'health-watch', kind: 'claude-auth-expired', pr: 0,
         head: `${p.key}:${ep.openedAt ?? ep.firstBreachAt}`,
         reason: 'Claude login expired — re-login', title: 'Claude login expired — re-login (run /login)',
         at: new Date(now).toISOString() };

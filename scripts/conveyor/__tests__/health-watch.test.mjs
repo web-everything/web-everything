@@ -18,7 +18,7 @@ import {
   resolveLaneScanTarget, resolveTickWatchdogLimit,
 } from '../health-watch.mjs';
 import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
-import { replay, unacknowledged } from '../../operations/needs-you-feed.mjs';
+import { replay, unacknowledged, publishAttention, diffFeed, sidecarsOf, REPORT_KINDS, GATE_KINDS } from '../../operations/needs-you-feed.mjs';
 import { sweepReviewTmp, probeDiskSpace } from '../review-tmp-health.mjs';
 import diskSpaceSmell from '../health-smells/disk-space.mjs';
 
@@ -88,7 +88,7 @@ describe('tick() — Claude auth expired NEEDS-YOU delivery', () => {
     expect(first.transitions).toContainEqual({ type: 'opened', key });
     expect(publishNeedsYou).toHaveBeenCalledTimes(1);
     expect(publishNeedsYou.mock.calls[0][0]).toEqual({
-      key, repo: 'health-watch', kind: 'needs-you', pr: 0, head: `${key}:${start}`,
+      key, repo: 'health-watch', kind: 'claude-auth-expired', pr: 0, head: `${key}:${start}`,
       reason: 'Claude login expired — re-login', title: 'Claude login expired — re-login (run /login)',
       at: new Date(start).toISOString(),
     });
@@ -156,6 +156,22 @@ describe('tick() — Claude auth expired NEEDS-YOU delivery', () => {
       await run();
       expect(publishNeedsYou).toHaveBeenCalledTimes(2);
     } finally { log.mockRestore(); }
+  });
+
+  it('keeps the published re-login alert open across a complete operator-queue feed refresh', async () => {
+    // Real feed publisher + the exact refresh arguments runOnce uses: an event-only alert must survive a
+    // refresh whose report does not mention it (the outage is owned by health-watch, not by the queue).
+    const feedPath = join(dir, 'feed', 'needs-you-events.jsonl');
+    const publish = item => publishAttention(item, { path: feedPath, now: start });
+    episodeReplay.probes = { authExpired: sessions };
+    await tick({ 'state-root': join(dir, 'state2'), 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+      'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true, now: new Date(start).toISOString() },
+    { publishNeedsYou: publish });
+    const openKeys = JSON.parse(readFileSync(sidecarsOf(feedPath).state, 'utf8')).openKeys;
+    expect(openKeys).toHaveLength(1);
+    const refreshed = diffFeed(openKeys, [], start + 60_000, { incomplete: false, clearKinds: REPORT_KINDS, alsoClear: GATE_KINDS });
+    expect(refreshed.lines.filter(l => l.startsWith('NEEDS-YOU-CLEARED'))).toEqual([]);
+    expect(refreshed.openKeys).toEqual(openKeys);
   });
 
   it('does not retry a rejected publication once an active silence tracks the episode', async () => {
