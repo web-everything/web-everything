@@ -379,6 +379,13 @@ export function readFromTransportBranch({
 /** Default TTL for a READ's origin fetch of a transport branch; override with WE_OPS_FETCH_TTL_MS (0 = always fetch). */
 export const OPS_READ_FETCH_TTL_MS = 30_000;
 
+/**
+ * Branches whose reads must never be served from the TTL cache: the merge gate's freeze RECHECK relies on a
+ * read after a verdict seeing a freeze published seconds earlier (merge-gate-check.mjs), so a 30s-stale clear
+ * document would defeat it. These always fetch.
+ */
+export const OPS_READ_NEVER_CACHED = Object.freeze(['ops/red-main-freeze']);
+
 function defaultFetchLog(msg) { process.stderr.write(`${msg}\n`); }
 
 /**
@@ -401,6 +408,7 @@ function coalescedReadFetch({ board, branch, run, now, env, log }) {
   };
   let stampFile;
   try {
+    if (OPS_READ_NEVER_CACHED.includes(branch)) return fetchOrigin('never-cached');
     if (!(ttl > 0)) return fetchOrigin('ttl-disabled');
     const common = String(run(['rev-parse', '--git-common-dir'], { cwd: board }) ?? '').trim();
     if (!common) throw new Error('no git dir');

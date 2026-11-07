@@ -479,6 +479,12 @@ describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', 
     expect(fetches(m.calls)).toBe(2);
     expect(readdirSync(stampDir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
   });
+  it('the red-main-freeze branch is never served from cache (freeze recheck freshness)', () => {
+    reset(); const m = mk();
+    m.read({ branch: 'ops/red-main-freeze' }); m.read({ branch: 'ops/red-main-freeze' });
+    expect(fetches(m.calls)).toBe(2);
+    expect(m.logs.join('\n')).toMatch(/never-cached/);
+  });
   it('an unreadable stamp fails closed: fetch', () => {
     reset(); const m = mk();
     mkdirSync(stampDir, { recursive: true });
