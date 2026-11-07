@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,7 +14,11 @@ import { join } from 'node:path';
 import {
   refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, runDepsJob,
   DEPS_JOB_KIND, DEPS_JOB_KINDS, DEPS_AS_JOB_ENV, DEPS_JOB_NPM_ARGS, depsJobInstaller,
+  pnpmAwareInstaller, DEPS_MARKER_FILE,
 } from '../daemon-rebuild/deps-job.mjs';
+import {
+  lockHash, markerMatches, ensureStoreGeneration, readStoreGeneration,
+} from '../lane-deps-installer.mjs';
 import {
   createJobStore, enqueueJob, JOB_ID_ENV, JOB_ATTEMPT_ENV,
 } from '../daemon-jobs-runtime.mjs';
@@ -39,6 +43,151 @@ function fixture({ lock = '{"lockfileVersion":3,"v":2}' } = {}) {
   return { root, jobs, store, installed, key: lockfileKey(lock), lock };
 }
 const noReattach = vi.fn(async () => ({ actions: [] }));
+
+describe('pnpmAwareInstaller — snapshot dependency backend', () => {
+  function setup() {
+    const sourceRoot = mk('deps-pnpm-source-');
+    const into = mk('deps-pnpm-snapshot-');
+    const storeDir = join(mk('deps-pnpm-store-'), 'store');
+    for (const dir of [sourceRoot, into]) {
+      writeFileSync(join(dir, 'package.json'), '{"name":"snapshot","version":"1.0.0"}');
+      writeFileSync(join(dir, 'package-lock.json'), '{"lockfileVersion":3}');
+    }
+    writeFileSync(join(sourceRoot, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\n');
+    writeFileSync(join(sourceRoot, 'pnpm-workspace.yaml'), 'packages: []\n');
+    const legacy = vi.fn();
+    const log = vi.fn();
+    const which = vi.fn(() => 'pnpm');
+    const parity = vi.fn(() => true);
+    const exec = vi.fn((cmd, args, opts) => {
+      if (args[0] === '--version') return '12.1.0';
+      expect(cmd).toBe('pnpm');
+      expect(opts.cwd).toBe(into);
+      expect(readStoreGeneration(storeDir)).not.toBeNull();
+      mkdirSync(join(into, 'node_modules'), { recursive: true });
+    });
+    return { sourceRoot, into, storeDir, env: {}, legacy, log, which, parity, exec };
+  }
+  const installs = (f) => f.exec.mock.calls.filter(([, args]) => args[0] === 'install');
+  const logged = (f, message) => f.log.mock.calls.some(([line]) => String(line).includes(message));
+  function expectMarker(f, backend) {
+    expect(DEPS_MARKER_FILE).toBe('.we-deps-marker');
+    const marker = readFileSync(join(f.into, '.we-deps-marker'), 'utf8').trim();
+    const hash = lockHash(f.into, backend, f.storeDir);
+    expect(hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(marker).toBe(`${backend}:${hash}`);
+    expect(markerMatches(marker, hash, backend)).toBe(true);
+  }
+
+  it('chooses usable pnpm, copies its inputs, and ensures the store generation before installing', () => {
+    const f = setup();
+    pnpmAwareInstaller(f)(f.into);
+    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.storeDir}`], expect.objectContaining({ cwd: f.into })]]);
+    expect(f.which).toHaveBeenCalledWith('pnpm');
+    expect(f.parity).toHaveBeenCalledTimes(1);
+    expect(f.legacy).not.toHaveBeenCalled();
+    for (const name of ['pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
+      expect(readFileSync(join(f.into, name), 'utf8')).toBe(readFileSync(join(f.sourceRoot, name), 'utf8'));
+    }
+    expect(logged(f, 'backend=pnpm')).toBe(true);
+    expectMarker(f, 'pnpm');
+  });
+
+  it.each(['no pnpm', 'parity false', 'version 11', 'no pnpm-lock', 'different npm lock'])('uses legacy once with backend=npm: %s', (reason) => {
+    const f = setup();
+    if (reason === 'no pnpm') f.which.mockReturnValue(null);
+    if (reason === 'parity false') f.parity.mockReturnValue(false);
+    if (reason === 'version 11') f.exec.mockReturnValue('11.9.0');
+    if (reason === 'no pnpm-lock') rmSync(join(f.sourceRoot, 'pnpm-lock.yaml'));
+    if (reason === 'different npm lock') writeFileSync(join(f.into, 'package-lock.json'), '{"lockfileVersion":3,"changed":true}');
+    pnpmAwareInstaller(f)(f.into);
+    expect(f.legacy).toHaveBeenCalledTimes(1);
+    expect(f.legacy).toHaveBeenCalledWith(f.into);
+    expect(installs(f)).toEqual([]);
+    expect(logged(f, 'backend=npm')).toBe(true);
+    expectMarker(f, 'npm');
+  });
+
+  it('accepts absent optional pnpm inputs without creating placeholder files', () => {
+    const f = setup();
+    rmSync(join(f.sourceRoot, 'pnpm-workspace.yaml'));
+    pnpmAwareInstaller(f)(f.into);
+    expect(installs(f)).toHaveLength(1);
+    expect(existsSync(join(f.into, 'pnpm-workspace.yaml'))).toBe(false);
+    expectMarker(f, 'pnpm');
+  });
+
+  it('uses legacy when the store generation cannot be ensured', () => {
+    const f = setup();
+    writeFileSync(f.storeDir, 'a file cannot be a store directory');
+    pnpmAwareInstaller(f)(f.into);
+    expect(installs(f)).toEqual([]);
+    expect(f.legacy).toHaveBeenCalledTimes(1);
+    expect(f.legacy).toHaveBeenCalledWith(f.into);
+    expect(logged(f, 'backend=npm')).toBe(true);
+    expectMarker(f, 'npm');
+  });
+
+  it.each([false, true])('removes partial pnpm output and falls back exactly once; legacy failure=%s', (legacyFails) => {
+    const f = setup();
+    const failure = new Error('legacy install failed');
+    f.exec.mockImplementation((cmd, args) => {
+      if (args[0] === '--version') return '12.1.0';
+      mkdirSync(join(f.into, 'node_modules'), { recursive: true });
+      writeFileSync(join(f.into, 'node_modules', 'partial'), 'partial');
+      throw new Error('pnpm failed');
+    });
+    f.legacy.mockImplementation((into) => {
+      expect(existsSync(join(into, 'node_modules'))).toBe(false);
+      if (legacyFails) throw failure;
+      // The marker must hash the successful legacy output, including a changed lockfile.
+      writeFileSync(join(into, 'package-lock.json'), '{"lockfileVersion":3,"legacy":true}');
+      mkdirSync(join(into, 'node_modules'));
+    });
+    const install = pnpmAwareInstaller(f);
+    if (legacyFails) {
+      expect(() => install(f.into)).toThrow(failure);
+      expect(existsSync(join(f.into, '.we-deps-marker'))).toBe(false);
+    } else {
+      install(f.into);
+      expectMarker(f, 'npm');
+      expect(logged(f, 'backend=npm')).toBe(true);
+    }
+    expect(f.legacy).toHaveBeenCalledTimes(1);
+    expect(f.legacy).toHaveBeenCalledWith(f.into);
+    expect(installs(f)).toHaveLength(1);
+    expect(logged(f, 'pnpm install failed; falling back')).toBe(true);
+  });
+
+  it('runs pnpm in the snapshot and leaves shared store files and metadata unchanged', () => {
+    const f = setup();
+    ensureStoreGeneration(f.storeDir);
+    mkdirSync(join(f.storeDir, 'content'));
+    writeFileSync(join(f.storeDir, 'content', 'sentinel'), 'shared content');
+    const snapshot = (dir) => {
+      const stat = statSync(dir);
+      return {
+        mtime: stat.mtimeMs, ctime: stat.ctimeMs,
+        contents: stat.isDirectory()
+          ? readdirSync(dir).sort().map((name) => [name, snapshot(join(dir, name))])
+          : readFileSync(dir, 'utf8'),
+      };
+    };
+    const before = snapshot(f.storeDir);
+    const exec = f.exec.getMockImplementation();
+    f.exec.mockImplementation((cmd, args, opts) => {
+      if (args[0] === 'install') {
+        expect(opts.cwd).toBe(f.into);
+        expect(snapshot(f.storeDir)).toEqual(before);
+      }
+      return exec(cmd, args, opts);
+    });
+    pnpmAwareInstaller(f)(f.into);
+    expect(installs(f)).toHaveLength(1);
+    expect(snapshot(f.storeDir)).toEqual(before);
+    expectMarker(f, 'pnpm');
+  });
+});
 
 describe('settings — env beats file beats built-in, and the source is named', () => {
   it('built-in default is on', () => {

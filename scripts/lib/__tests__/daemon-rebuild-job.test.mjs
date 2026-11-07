@@ -9,7 +9,7 @@ import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync,
+  mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -20,7 +20,9 @@ import {
 } from '../daemon-rebuild.mjs';
 import {
   resolveRebuildAsJob, rebuildCloneAsJob, rebuildChildArgs, parseRebuildChildOutput, REBUILD_JOB_KIND, RESULT_SUFFIX,
+  cloneNodeModulesInstaller,
 } from '../daemon-rebuild/rebuild-job.mjs';
+import { lockHash, markerMatches } from '../lane-deps-installer.mjs';
 import { readRebuildStarvation, writeRebuildStarvation } from '../daemon-rebuild/lease.mjs';
 import * as rebuildLease from '../daemon-rebuild/lease.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
@@ -88,6 +90,83 @@ beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
+});
+
+describe('cloneNodeModulesInstaller — pnpm snapshot routing', () => {
+  function setup() {
+    const sourceRoot = mktemp('we-rebuild-pnpm-source-');
+    const into = mktemp('we-rebuild-pnpm-snapshot-');
+    const storeDir = join(mktemp('we-rebuild-pnpm-store-'), 'store');
+    for (const dir of [sourceRoot, into]) {
+      writeFile(dir, 'package.json', '{"name":"snapshot","version":"1.0.0"}');
+      writeFile(dir, 'package-lock.json', '{"lockfileVersion":3}');
+    }
+    writeFile(sourceRoot, 'pnpm-lock.yaml', 'lockfileVersion: "9.0"\n');
+    writeFile(sourceRoot, 'pnpm-workspace.yaml', 'packages: []\n');
+    writeFile(sourceRoot, 'node_modules/old.txt', 'old');
+    const exec = vi.fn(); // legacy cp only; no subprocess is started
+    const fallback = vi.fn(); // legacy npm only
+    const pnpm = {
+      env: {}, storeDir, which: vi.fn(() => 'pnpm'), parity: vi.fn(() => true), log: vi.fn(),
+      exec: vi.fn((cmd, args) => args[0] === '--version' ? '12.1.0' : undefined),
+    };
+    return { sourceRoot, into, exec, fallback, pnpm };
+  }
+  const installs = (f) => f.pnpm.exec.mock.calls.filter(([, args]) => args[0] === 'install');
+  function expectMarker(f, backend) {
+    const marker = readFileSync(join(f.into, '.we-deps-marker'), 'utf8').trim();
+    const hash = lockHash(f.into, backend, f.pnpm.storeDir);
+    expect(hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(marker).toBe(`${backend}:${hash}`);
+    expect(markerMatches(marker, hash, backend)).toBe(true);
+    expect(f.pnpm.log.mock.calls.some(([line]) => String(line).includes(`backend=${backend}`))).toBe(true);
+  }
+
+  it('routes a matching snapshot with a pnpm lock through pnpm and writes its marker', () => {
+    const f = setup();
+    cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`], expect.objectContaining({ cwd: f.into })]]);
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(f.fallback).not.toHaveBeenCalled();
+    expectMarker(f, 'pnpm');
+  });
+
+  it('retains the cp -cR clone path when pnpm is unavailable and records backend=npm', () => {
+    const f = setup();
+    f.pnpm.which.mockReturnValue(null);
+    cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+    expect(f.exec).toHaveBeenCalledTimes(1);
+    expect(f.exec).toHaveBeenCalledWith('cp', ['-cR', join(f.sourceRoot, 'node_modules'), join(f.into, 'node_modules')], expect.any(Object));
+    expect(f.fallback).not.toHaveBeenCalled();
+    expect(installs(f)).toEqual([]);
+    expectMarker(f, 'npm');
+  });
+
+  it.each([false, true])('failed pnpm reaches the legacy clone/npm path once; source node_modules missing=%s', (missing) => {
+    const f = setup();
+    if (missing) rmSync(join(f.sourceRoot, 'node_modules'), { recursive: true });
+    f.pnpm.exec.mockImplementation((cmd, args) => {
+      if (args[0] === '--version') return '12.1.0';
+      writeFile(f.into, 'node_modules/partial', 'partial');
+      throw new Error('pnpm install failed');
+    });
+    const assertClean = () => expect(existsSync(join(f.into, 'node_modules'))).toBe(false);
+    f.exec.mockImplementation(assertClean);
+    f.fallback.mockImplementation(assertClean);
+    cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+    expect(installs(f)).toHaveLength(1);
+    if (missing) {
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.fallback).toHaveBeenCalledTimes(1);
+      expect(f.fallback).toHaveBeenCalledWith(f.into);
+    } else {
+      expect(f.exec).toHaveBeenCalledTimes(1);
+      expect(f.exec).toHaveBeenCalledWith('cp', ['-cR', join(f.sourceRoot, 'node_modules'), join(f.into, 'node_modules')], expect.any(Object));
+      expect(f.fallback).not.toHaveBeenCalled();
+    }
+    expect(f.pnpm.log.mock.calls.some(([line]) => String(line).includes('pnpm install failed; falling back'))).toBe(true);
+    expectMarker(f, 'npm');
+  });
 });
 
 describe('the opted-in daemon tick never runs the smoke inline (the live harm)', () => {
