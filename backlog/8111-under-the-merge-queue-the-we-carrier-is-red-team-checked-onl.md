@@ -1,15 +1,16 @@
 ---
+bornAs: xxvynpt
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/conveyor/stuck-pr-watch-core.mjs", "we:scripts/conveyor/health-smells/pr-stage-stall.mjs", "we:scripts/lib/drain-queue-safety.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/lib/enqueue-on-event.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Stuck-PR watch and pr-stage-stall count an approved PR held only by red-team:pending/blocked as stuck in stag…
+# Under the merge queue the WE carrier is red-team-checked only AFTER its impl half has merged, and a carrier t…
 
-Flow-sim gap R6c-G3, class K9 (divergent predicates for one state). Failing input: PR with review:accepted (or ready-to-merge), mergeable MERGEABLE, red-team:pending (or red-team:blocked) on the head, no labeled/commented/committed event for 30 minutes (red team run in progress or awaiting operator), no live review-/fix- session. stuck-pr-watch sweep or health-watch pr-stage-stall evaluation Cited: we:scripts/conveyor/stuck-pr-watch-core.mjs:125-131, we:scripts/conveyor/stuck-pr-watch-core.mjs:147-149, we:scripts/conveyor/stuck-pr-watch-core.mjs:79-84, we:scripts/conveyor/health-smells/pr-stage-stall.mjs:78-85, we:scripts/lib/drain-queue-safety.mjs:446-450. Soak-break sketch: Fixture: 3 open PRs, labels review:accepted + red-team:pending, MERGEABLE, updatedAt 40 min old, no agents. Action: evaluateStuckPr on each and pr-stage-stall.evaluate on the set. Assertion (fails today): stuck is false with a reason naming the gate hold, and…
+Flow-sim gap R7a-G1, class K9 (divergent predicates for one state). Failing input: Strategy github-merge-queue (we:drain-merge-strategy.mjs:300: enqueues(repo) is true only for the local WE repo). plateau-app#1 (impl, direct merge) and we#3 (carrier) both ready-to-merge + review:accepted, test green. waitForRedTeamBeforeEnqueue is true (we:drain-queue-safety.mjs:431 standard), so the post-accept red team has … Cited: we:scripts/merge-ai-prs.mjs:7065, we:scripts/merge-ai-prs.mjs:1133-1147, we:scripts/merge-ai-prs.mjs, we:scripts/merge-ai-prs.mjs:6866-6868, we:scripts/merge-ai-prs.mjs:7284-7290. Soak-break sketch: Fixture: couple-split-by-unrelated-merge seedCouple with policy mergeStrategy=github-merge-queue for we and a pending red-team (no result comment, scheduled) on the carrier head. Action: one drain pass. Assertion that fails today: plateau-app impl MERGED, we …
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xe3web9
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/parked-pr-conflict-watch.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/lib/pr-state-core.mjs", "we:scripts/conveyor/pr-sweep-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Watch idle conflict re-assert caps on RAW lifetime conflict-fix count; reconcile caps on per-target stale cou…
+# The /state reader says READY-TO-MERGE ('drain merges the PR') for a PR held by red-team:pending/blocked, revi…
 
-Flow-sim gap R9a-G1, class K9 (divergent predicates for one state). Failing input: Open PR, labels review:pending + merge-status:conflicting, no review:changes, mergeable CONFLICTING. Thread has 3 trusted CONFLICT_FIX_COMMENT_MARKER rounds, each with trailer `main@<older sha>` (every one succeeded against a main that has since moved). 'Next parked-pr-conflict-watch sweep (idleConflictBounce, or the review:hum… Cited: we:scripts/conveyor/parked-pr-conflict-watch.mjs:1463-1465, we:scripts/conveyor/parked-pr-conflict-watch.mjs:1475-1476, we:scripts/conveyor/parked-pr-conflict-watch.mjs:1485-1493, we:scripts/conveyor/reconcile-core.mjs:2294-2297. Soak-break sketch: Fixture: PR labels [review:pending, merge-status:conflicting], mergeable CONFLICTING, comments = 3 trusted conflict-fix markers with trailers main@aaaaaaa, main@bbbbbbb, main@ccccccc (all != current main sha ddddddd). Action: watchParkedPrConflicts with a rec…
+Flow-sim gap R8b-G5, class K9 (divergent predicates for one state). Failing input: PR labels: review:accepted (or ready-to-merge) + red-team:blocked (or red-team:pending / review:changes / status:sent-back-red-team / status:fixing); not draft; every required check green; no review:human.' '`node we:scripts/state.mjs <N>`. Cited: we:scripts/lib/pr-state-core.mjs:61-62, we:scripts/lib/pr-state-core.mjs:64, we:scripts/conveyor/pr-sweep-core.mjs:349-353. Soak-break sketch: Fixture: derivePrState facts {state:'OPEN', labels:['review:accepted','red-team:blocked'], head:{sha}, requiredChecks:[{name:'test',state:'green'}], sessions:[], isDraft:false}. Assert phase !== 'READY-TO-MERGE' (expect NEEDS-RULING/STUCK/hold with owner name…
 
 ## Acceptance
 

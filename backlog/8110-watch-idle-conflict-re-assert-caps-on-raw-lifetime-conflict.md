@@ -1,15 +1,16 @@
 ---
+bornAs: xtzgbyi
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/conveyor/parked-pr-conflict-watch.mjs", "we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/conflict-reassert-rule.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/conveyor/parked-pr-conflict-watch.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Conflict re-assert refuses on ANY stand-down in the thread, ignoring head scope, supersede and operator answer
+# Watch idle conflict re-assert caps on RAW lifetime conflict-fix count; reconcile caps on per-target stale cou…
 
-Flow-sim gap R9a-G2, class K9 (divergent predicates for one state). Failing input: review:human + merge-status:conflicting PR, no review:changes, no live watcher marker. Thread holds an old trusted stand-down (e.g. ci-heal fix-loop park from buildStandDownComment, or a fixer stand-down on an earlier head, since answered or lapsed by a new push). 'Sweep after a conflict-fix round was re-armed without clearing … Cited: we:scripts/conveyor/parked-pr-conflict-watch.mjs:1577-1581, we:scripts/conveyor/stand-down.mjs:535-549, we:scripts/conveyor/conflict-reassert-rule.mjs, we:scripts/conveyor/reconcile-core.mjs:2569-2594. Soak-break sketch: Fixture: review:human + merge-status:conflicting PR at head B, thread has a trusted stand-down comment bound to head A (reconcile's countUnresolvedStandDowns returns 0 for head B), reviewHuman reassert setting on. Action: watch sweep. Assert (fails today): po…
+Flow-sim gap R9a-G1, class K9 (divergent predicates for one state). Failing input: Open PR, labels review:pending + merge-status:conflicting, no review:changes, mergeable CONFLICTING. Thread has 3 trusted CONFLICT_FIX_COMMENT_MARKER rounds, each with trailer `main@<older sha>` (every one succeeded against a main that has since moved). 'Next parked-pr-conflict-watch sweep (idleConflictBounce, or the review:hum… Cited: we:scripts/conveyor/parked-pr-conflict-watch.mjs:1463-1465, we:scripts/conveyor/parked-pr-conflict-watch.mjs:1475-1476, we:scripts/conveyor/parked-pr-conflict-watch.mjs:1485-1493, we:scripts/conveyor/reconcile-core.mjs:2294-2297. Soak-break sketch: Fixture: PR labels [review:pending, merge-status:conflicting], mergeable CONFLICTING, comments = 3 trusted conflict-fix markers with trailers main@aaaaaaa, main@bbbbbbb, main@ccccccc (all != current main sha ddddddd). Action: watchParkedPrConflicts with a rec…
 
 ## Acceptance
 

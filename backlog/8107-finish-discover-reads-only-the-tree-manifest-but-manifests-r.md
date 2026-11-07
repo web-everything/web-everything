@@ -1,15 +1,16 @@
 ---
+bornAs: x84zdce
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/lib/enqueue-on-event.mjs"]
+scope: ["we:scripts/lane-resume.mjs", "we:scripts/lib/remote-manifest.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Under the merge queue the WE carrier is red-team-checked only AFTER its impl half has merged, and a carrier t…
+# /finish discover reads only the tree manifest, but manifests ride the PR body since xnsk54v, so item, blocked…
 
-Flow-sim gap R7a-G1, class K9 (divergent predicates for one state). Failing input: Strategy github-merge-queue (we:drain-merge-strategy.mjs:300: enqueues(repo) is true only for the local WE repo). plateau-app#1 (impl, direct merge) and we#3 (carrier) both ready-to-merge + review:accepted, test green. waitForRedTeamBeforeEnqueue is true (we:drain-queue-safety.mjs:431 standard), so the post-accept red team has … Cited: we:scripts/merge-ai-prs.mjs:7065, we:scripts/merge-ai-prs.mjs:1133-1147, we:scripts/merge-ai-prs.mjs, we:scripts/merge-ai-prs.mjs:6866-6868, we:scripts/merge-ai-prs.mjs:7284-7290. Soak-break sketch: Fixture: couple-split-by-unrelated-merge seedCouple with policy mergeStrategy=github-merge-queue for we and a pending red-team (no result comment, scheduled) on the carrier head. Action: one drain pass. Assertion that fails today: plateau-app impl MERGED, we …
+Flow-sim gap R9c-G2, class K9 (divergent predicates for one state). Failing input: Ready-labelled lane PR created by current producer (we:lane-manifest-write.mjs:122 writes scratch, pr-land embeds it in the PR body; nothing is committed). Its blockedBy names an item not yet landed, its item is closed. 'lane-resume discover (we:scripts/lane-resume.mjs:899) calls readManifest(headRefName). Cited: we:scripts/lane-resume.mjs:557-570, we:scripts/lane-resume.mjs:899, we:scripts/lane-resume.mjs:900, we:scripts/lane-resume.mjs:140, we:scripts/lane-resume.mjs:184-196. Soak-break sketch: Fixture: gh/git stubs where PR 11 has body with manifestBodyBlock({item:50,blockedBy:[49],repos:[we]}) and no tree manifest; item 49 unresolved on main. Action: run lane-resume discover over the stubs. Assert (fails today): PR 11 disposition is 'blocked' (blo…
 
 ## Acceptance
 

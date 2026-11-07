@@ -1,15 +1,16 @@
 ---
+bornAs: x4fn2iw
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/pr-state-core.mjs", "we:scripts/conveyor/pr-sweep-core.mjs"]
+scope: ["we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/review-set-label.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# The /state reader says READY-TO-MERGE ('drain merges the PR') for a PR held by red-team:pending/blocked, revi…
+# editing an old trusted comment wakes a parked review as a fresh operator request
 
-Flow-sim gap R8b-G5, class K9 (divergent predicates for one state). Failing input: PR labels: review:accepted (or ready-to-merge) + red-team:blocked (or red-team:pending / review:changes / status:sent-back-red-team / status:fixing); not draft; every required check green; no review:human.' '`node we:scripts/state.mjs <N>`. Cited: we:scripts/lib/pr-state-core.mjs:61-62, we:scripts/lib/pr-state-core.mjs:64, we:scripts/conveyor/pr-sweep-core.mjs:349-353. Soak-break sketch: Fixture: derivePrState facts {state:'OPEN', labels:['review:accepted','red-team:blocked'], head:{sha}, requiredChecks:[{name:'test',state:'green'}], sessions:[], isDraft:false}. Assert phase !== 'READY-TO-MERGE' (expect NEEDS-RULING/STUCK/hold with owner name…
+Flow-sim gap R4-G4, class K9 (divergent predicates for one state). Failing input: parked review run (or spent persist-retry budget) on head H; thread has an old operator comment or a REARM / 'changes requested' marker comment. that comment is edited (typo fix, or any tool that PATCHes it; the drain itself edits its park comment in place, we:merge-ai-prs.mjs:4801). GitHub bumps updatedAt, createdAt unchanged. Cited: we:scripts/conveyor/review-referral-hold.mjs:208, we:scripts/review-set-label.mjs:2781-2785. Soak-break sketch: double-act. A new full review panel (or a revived persist-retry budget) from an edit that carries no new request.
 
 ## Acceptance
 
