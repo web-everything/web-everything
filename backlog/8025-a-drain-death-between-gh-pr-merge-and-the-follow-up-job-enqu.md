@@ -1,15 +1,16 @@
 ---
+bornAs: xm7zlp6
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/collect-review-requests.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/lib/pr-merge-gate.mjs", "we:scripts/conveyor/orphan-claim-release.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Apply runs share one concurrency group with queueing; GitHub keeps only ONE pending run, so a middle push's r…
+# A drain death between 'gh pr merge' and the follow-up job enqueue loses resolve-on-land for good; the only ba…
 
-Flow-sim gap R7b-G3, class K3 (one-shot step, no re-driver). Failing input: Run R1 (push P1) is in progress (npm ci, apply loop, ledger push takes minutes). Two sessions each stage a verdict: push P2 (we:10-accepted.json) then push P3 (we:11-changes.json) while R1 still runs. 'P3's run enters the concurrency group; P2's run is still pending. Cited: we:scripts/collect-review-requests.mjs:98, we:scripts/collect-review-requests.mjs:22-25. Soak-break sketch: Workflow-level: assert the workflow file has no bare concurrency group for a diff-by-push consumer (parse YAML; fail unless the collect step lists the whole directory minus a ledger of applied requests, or concurrency uses a per-ref/per-sha group). Unit: coll…
+Flow-sim gap R8a-G1, class K3 (one-shot step, no re-driver). Failing input: WE PR #P (head lane/4459-foo, carries item 4459, status:active card) is approved and in the cascade. Default merge method (--merge). gh pr merge succeeds, then the drain process dies (kill, OOM, host sleep) before line 7453 enqueues the drain-followup job. On restart the PR is MERGED, so it is not a candidate and never re-enter… Cited: we:scripts/merge-ai-prs.mjs:7153, we:scripts/merge-ai-prs.mjs:7453-7455, we:scripts/merge-ai-prs.mjs:7635, we:scripts/backlog-stranded-sweep.mjs:209-215, we:scripts/lib/pr-merge-gate.mjs:15-23. Soak-break sketch: Fixture: merged PR (state MERGED, headRef lane/4459-foo, merge commit subject 'Merge pull request #7000 from x/lane/4459-foo'), we:backlog/4459-foo.md status:active, no queue state, no job record. Action: run one drain pass + autoStrandedSweepPass(apply:true)…
 
 ## Acceptance
 

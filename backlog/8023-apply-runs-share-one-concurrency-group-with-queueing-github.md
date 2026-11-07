@@ -1,15 +1,16 @@
 ---
+bornAs: x9vq7im
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/collect-review-requests.mjs", "we:scripts/operations/record-verdict.mjs", "we:scripts/lib/git-transport-branch.mjs", "we:scripts/operations/record-verdict-io.mjs"]
+scope: ["we:scripts/collect-review-requests.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A request whose apply failed (or never ran) can never be re-delivered: re-staging the same verdict is a no-op…
+# Apply runs share one concurrency group with queueing; GitHub keeps only ONE pending run, so a middle push's r…
 
-Flow-sim gap R7b-G2, class K3 (one-shot step, no re-driver). Failing input: we:10-changes.json (or we:10-accepted.json) pushed to ops/review-requests. The apply job exits non-zero (the CLI refused: PR not OPEN, #2844 self-clear, mandatory referral not cleared, gh 5xx, ledger transport unreachable F4) or the run failed at setup. 'The session (or operator) re-runs record-verdict --to=<same> for the same … Cited: we:scripts/collect-review-requests.mjs:98, we:scripts/operations/record-verdict.mjs:160, we:scripts/lib/git-transport-branch.mjs:320-323, we:scripts/operations/record-verdict-io.mjs:387-389. Soak-break sketch: Fixture: a transport branch already holding we:10-changes.json byte-identical to what record-verdict would stage, PR labels show no verdict applied. Action: run the stage effect sink again. Assertion that fails today: the sink (or a follow-up check) re-delive…
+Flow-sim gap R7b-G3, class K3 (one-shot step, no re-driver). Failing input: Run R1 (push P1) is in progress (npm ci, apply loop, ledger push takes minutes). Two sessions each stage a verdict: push P2 (we:10-accepted.json) then push P3 (we:11-changes.json) while R1 still runs. 'P3's run enters the concurrency group; P2's run is still pending. Cited: we:scripts/collect-review-requests.mjs:98, we:scripts/collect-review-requests.mjs:22-25. Soak-break sketch: Workflow-level: assert the workflow file has no bare concurrency group for a diff-by-push consumer (parse YAML; fail unless the collect step lists the whole directory minus a ledger of applied requests, or concurrency uses a per-ref/per-sha group). Unit: coll…
 
 ## Acceptance
 

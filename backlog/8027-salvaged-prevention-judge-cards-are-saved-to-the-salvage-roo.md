@@ -1,15 +1,16 @@
 ---
+bornAs: xwpwkhn
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lib/prevention-landing-job.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/review-set-label.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/land-prevention-card.mjs"]
+scope: ["we:scripts/operations/land-prevention-card.mjs", "we:scripts/lib/lane-card-salvage.mjs", "we:scripts/lib/salvage-index.mjs", "we:scripts/conveyor/health-smells/untracked-backlog-card.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# review-loop prevention / round-cards card accepted on 'queued' only; landing job failure leaves no card, no r…
+# Salvaged prevention/judge cards are saved to the salvage root and the lane is declared clean, but nothing eve…
 
-Flow-sim gap E-G5, class K3 (one-shot step, no re-driver). Failing input: review-pr run parks at confirm with prevention-outstanding or round-cards decision; filer is fileItemForPreventionViaLandingJob' 'detached land-prevention-card job fails after spawn (lane exhaustion, red gate, refused PR) or is killed Cited: we:scripts/lib/prevention-landing-job.mjs:75-123, we:scripts/operations/review-loop-cli.mjs:196-207, we:scripts/operations/review-loop-cli.mjs:864-865, we:scripts/review-set-label.mjs:995, we:scripts/lib/review-loop-policy.mjs. Soak-break sketch: PR accepted (and may merge) with the debt recorded nowhere. The land-prevention-card header says failures are 'BEST-EFFORT, LOGGED, NEVER RETRIED' (:49).
+Flow-sim gap R7c-G1, class K3 (one-shot step, no re-driver). Failing input: A daemon-spawned `land-prevention-card` job (review-loop or approval-time) has acquired a lane and file-item wrote `backlog/x<hash>we:-prevention-....md` (untracked). PR is already review:accepted (review-loop resumes accept on 'queued'). The job fails BEFORE `git add`/commit lands the card, e.g. `git commit` is rejected by a h… Cited: we:scripts/operations/land-prevention-card.mjs:761-775, we:scripts/lib/lane-card-salvage.mjs:94-170, we:scripts/lib/salvage-index.mjs:92-96, we:scripts/lib/salvage-index.mjs:23, we:scripts/lib/salvage-index.mjs:72-77. Soak-break sketch: Fixture: a lane with an untracked we:backlog/x1abc23-prevention-foo.md and a lease; salvage root in a tmp dir; land step stubbed to fail at commit. Action: run landPreventionCard failure path, then refreshSalvageIndex with now = +15 days, then scan origin/mai…
 
 ## Acceptance
 
