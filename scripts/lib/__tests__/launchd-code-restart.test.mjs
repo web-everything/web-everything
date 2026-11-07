@@ -206,6 +206,9 @@ describe('launchd restart by label (R703)', () => {
     ['nonzero status', () => ({ status: 1, stderr: 'denied' })],
     ['nonzero code', () => ({ code: 1, stderr: 'denied' })],
     ['error result', () => ({ error: new Error('launchctl failed') })],
+    ['missing result', () => undefined],
+    ['empty result', () => ({})],
+    ['signal without status', () => ({ status: null, signal: 'SIGTERM' })],
   ])('launchctl %s reports failure without recording sha; the same sha can retry', async (_name, fail) => {
     const o = fixture();
     o.launchctl.mockImplementationOnce(fail);

@@ -88,7 +88,7 @@ export async function restartServicesForClone({ settings, platform, env = proces
         if (!Number.isInteger(id) || id < 0) throw new Error('unreadable uid');
         assertActive(signal);
         const answer = await launchctl(['kickstart', '-k', `gui/${id}/${label}`]);
-        if (answer?.error || answer?.status != null && answer.status !== 0 || answer?.code != null && answer.code !== 0) {
+        if (!answer || answer.error || answer.status !== 0 || answer.code != null && answer.code !== 0) {
           throw new Error(message(answer.error ?? answer.stderr ?? 'launchctl failed'));
         }
         restarted.set(label, adoptedSha);
