@@ -1,0 +1,107 @@
+/** Clone-backed launchd processes must have started after the latest adopted rebuild. */
+import { dirname, isAbsolute, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { findStaleCodeServices } from '../../lib/launchd-code-restart.mjs';
+import { daemonCloneRoots } from '../../lib/daemon-clone-registry.mjs';
+import { workspaceOf } from '../../lib/automation-home.mjs';
+import { cloneKey } from '../../lib/daemon-overlays.mjs';
+
+// This registry includes overlay clones without requiring HEAD to be an ancestor of main.
+const managedRoots = () => daemonCloneRoots(workspaceOf(resolve(dirname(fileURLToPath(import.meta.url)), '../../..')));
+// cloneKey(root): first 16 hex chars of a sha256 — the only shape a real clone's state sidecars use.
+const CLONE_KEY = /^[0-9a-f]{16}$/;
+const subject = (root, service) => `clone:${root}:service:${service.label ?? service.plistPath ?? 'unknown'}`;
+const covered = key => ({ subject: `coverage:${key}`, breach: false, measure: { coverage: 'known' },
+  summary: 'Managed clone inventory is readable and its root is known.', recommendation: 'No inventory repair needed.' });
+const unknown = (key, reason) => ({ subject: `coverage:${key}`, breach: true, measure: { reason },
+  summary: `Clone coverage unknown: ${reason}`,
+  recommendation: 'Inspect the managed-clone registry and self-sync state; existing alerts remain open until service freshness is observed.' });
+
+export default {
+  id: 'stale-code-service', scope: 'host', cadence: 'every-tick', probes: ['selfSync'],
+  // The engine treats breach:null as clean. Missing subjects instead preserve their episodes;
+  // only explicit fresh/not-running observations below emit clean service results.
+  missingSubjectsUnknown: true,
+  openAfter: 1, closeAfter: 1, severity: 'high', action: 'alert',
+  recommendationHint: 'Inspect the LaunchAgent and rebuild state; restart approved stateless samplers onto adopted code.',
+  evaluate({ selfSync, cloneLag }, { findStaleCodeServices: findStale = findStaleCodeServices, listCloneRoots = managedRoots,
+    episodes, env = process.env } = {}) {
+    // The watching daemon is itself clone-backed and restarts through self-sync, not as a service to alert on.
+    const selfLabel = env.XPC_SERVICE_NAME || env.LAUNCH_JOB_LABEL || null;
+    const rows = [], roots = new Set(), completeRoots = new Set();
+    try {
+      const managed = listCloneRoots();
+      if (!Array.isArray(managed)) throw new Error('managed clone list unreadable');
+      for (const root of [...managed, ...(cloneLag || []).map(c => c.cloneRoot),
+        ...(selfSync || []).map(c => c.cloneRoot ?? c.root).filter(root => root !== undefined)]) {
+        if (typeof root !== 'string' || !isAbsolute(root)) throw new Error('managed clone root unreadable');
+        roots.add(root);
+      }
+    } catch (error) { return [unknown('managed-clones', String(error.message ?? error))]; }
+    const knownKeys = new Set([...roots].map(root => cloneKey(root)));
+    if (roots.size && Array.isArray(selfSync)) rows.push(covered('managed-clones'));
+    for (const c of selfSync || []) {
+      // probeSelfSync emits a row per state-directory entry (e.g. `conveyor-state`). Only a row that is a clone
+      // (a hashed clone key, or one carrying its root) counts; plain state dirs are skipped, not reported unknown.
+      if (typeof c.cloneKey === 'string' && (CLONE_KEY.test(c.cloneKey) || c.cloneRoot !== undefined || c.root !== undefined)) rows.push(knownKeys.has(c.cloneKey) ? covered(c.cloneKey) : unknown(c.cloneKey, 'self-sync clone has no known root'));
+    }
+    for (const cloneRoot of roots) {
+      const fresh = [];
+      let flags;
+      try {
+        flags = findStale({ cloneRoot, selfLabel, onFreshService: service => fresh.push(service) });
+        if (!Array.isArray(flags)) throw new Error('service inspection returned incomplete evidence');
+        // Recover the synthetic inspection-failure episode independently of service
+        // freshness. Returned unknown evidence still owns that subject and cannot clear it.
+        const inspectionSubject = subject(cloneRoot, {});
+        // Complete = every flag is a per-service result; an unreadable plist, directory or process table hides services.
+        if (flags.every(flag => typeof flag.label === 'string')) completeRoots.add(cloneRoot);
+        if (!flags.some(flag => subject(cloneRoot, flag) === inspectionSubject)) rows.push({
+          subject: inspectionSubject, breach: false, measure: { cloneRoot, inspection: 'complete' },
+          summary: 'Service inspection completed successfully; individual service results remain authoritative.',
+          recommendation: 'No inspection repair needed; address any remaining service alerts.',
+        });
+      } catch (error) { flags = [{ label: null, reason: 'inspection-failed', error: String(error.message ?? error) }]; fresh.length = 0; }
+      if (!flags.length) rows.push({ subject: `clone:${cloneRoot}`, breach: false, measure: { cloneRoot },
+        summary: 'No stale clone-backed services detected.', recommendation: 'No restart needed.' });
+      rows.push(...flags.map(flag => ({
+        subject: subject(cloneRoot, flag), breach: true, measure: { cloneRoot, ...flag },
+        summary: `${flag.label ?? flag.plistPath ?? 'LaunchAgent'}: ${flag.reason}`,
+        recommendation: flag.reason === 'stale-code'
+          ? 'Inspect the LaunchAgent; kickstart -k the approved stateless sampler to load the adopted build.'
+          : 'Inspect and repair the unreadable plist, process evidence or rebuild state; freshness cannot be established. Escalate to the operator before restarting.',
+      })));
+      for (const service of fresh) {
+        const clean = { breach: false, measure: { cloneRoot, ...service }, summary: 'Service is fresh or positively not running.', recommendation: 'No restart needed.' };
+        rows.push({ ...clean, subject: subject(cloneRoot, service) });
+        // A readable fresh plist also clears its earlier label-unknown read-error subject.
+        if (service.plistPath) rows.push({ ...clean, subject: subject(cloneRoot, { plistPath: service.plistPath }) });
+      }
+    }
+    // missingSubjectsUnknown keeps an episode open when its subject is not re-emitted. Close it only on
+    // positive evidence: its clone was inspected completely (service removed, renamed or no longer
+    // clone-backed), or coverage is fully known and the clone left the managed inventory.
+    const inventoryKnown = roots.size > 0 && !rows.some(row => row.breach && row.subject.startsWith('coverage:'));
+    const emitted = new Set(rows.map(row => row.subject));
+    for (const ep of Object.values(episodes ?? {})) {
+      if (ep?.smell !== 'stale-code-service' || typeof ep.subject !== 'string' || emitted.has(ep.subject)) continue;
+      // A `coverage:<key>` episode opened before non-clone state-directory rows (conveyor-state, ...) were skipped is
+      // never re-emitted; with readable self-sync evidence a key that is not a clone key is positively not coverage.
+      const coverageKey = /^coverage:(.+)$/.exec(ep.subject)?.[1];
+      if (coverageKey !== undefined) {
+        if (Array.isArray(selfSync) && coverageKey !== 'managed-clones' && !CLONE_KEY.test(coverageKey) && !knownKeys.has(coverageKey)) {
+          rows.push(covered(coverageKey));
+        }
+        continue;
+      }
+      // Prefer a known root (a root may itself contain ":service:"); only retired roots fall back to parsing.
+      const cloneRoot = [...roots].find(root => ep.subject.startsWith(`clone:${root}:service:`))
+        ?? /^clone:(.+?):service:/.exec(ep.subject)?.[1];
+      if (cloneRoot === undefined || !(completeRoots.has(cloneRoot) || inventoryKnown && !roots.has(cloneRoot))) continue;
+      rows.push({ subject: ep.subject, breach: false, measure: { cloneRoot },
+        summary: 'Service is no longer observed in a complete inspection of its clone, or the clone is no longer managed.',
+        recommendation: 'No repair needed.' });
+    }
+    return rows;
+  },
+};

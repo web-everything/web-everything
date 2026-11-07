@@ -42,6 +42,7 @@
  */
 
 import { fileURLToPath } from 'node:url';
+// stale-code-service.mjs is registered through the same automatic directory discovery.
 import { dirname } from 'node:path';
 
 import { loadModuleRegistry } from '../../registry-discovery.mjs';

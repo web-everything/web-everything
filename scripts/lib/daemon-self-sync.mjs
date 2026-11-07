@@ -117,6 +117,7 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
+import { restartServicesForClone } from './launchd-code-restart.mjs';
 import { readReadyCandidate } from './daemon-rebuild/state.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
@@ -135,6 +136,19 @@ import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
 import { maybeMaintainClone, cloneHasRebuildJob } from './clone-maintenance.mjs';
+
+// Production wiring for the post-adoption service restart: an injected hook always wins; the real
+// launchd restart runs only on the real-IO path (no injected `rebuild`), so hermetic tests never kick services.
+export function resolveRestartServices(restartServicesOpt, realIo, real = restartServicesForClone) {
+  return restartServicesOpt ?? (realIo ? real : () => {});
+}
+
+// Production wiring for the owed-restart retry on non-adopting ticks: an injected retry always wins; the real
+// launchd retry runs only on the real-IO path AND when no restart hook was injected, otherwise null (no retry),
+// so hermetic tests never read the real state directory or kick a service.
+export function resolveRetryPendingRestarts(retryPendingOpt, restartServicesOpt, realIo, real = restartServicesForClone) {
+  return retryPendingOpt ?? (realIo && restartServicesOpt === undefined ? real : null);
+}
 
 /** PURE: env → rebuild.maxAdoptWaitTicks → default, with the effective policy source. */
 export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
@@ -669,7 +683,7 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
 export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
-  mainOnly = false, rebuild: rebuildOpt, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
+  mainOnly = false, rebuild: rebuildOpt, restartServices: restartServicesOpt, retryPendingRestarts: retryPendingOpt, restartServicesTimeoutMs, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
   readReady = readReadyCandidate, maxAdoptWaitTicks: maxAdoptWaitTicksOpt,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,
@@ -699,9 +713,44 @@ export function withSelfSync(effects, {
   let readyIdentity = null;
   let adoptWaitTicks = 0;
   const rebuildAsJob = rebuildAsJobOpt === undefined ? resolveSelfSyncRebuildAsJob({ entries, env }) : !!rebuildAsJobOpt;
-  const rebuild = rebuildOpt ?? ((o = {}) => rebuildClone({
+  const rebuildImpl = rebuildOpt ?? ((o = {}) => rebuildClone({
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
+  const restartServices = resolveRestartServices(restartServicesOpt, realIo);
+  const restartWaitMs = Number.isFinite(restartServicesTimeoutMs) && restartServicesTimeoutMs > 0 ? restartServicesTimeoutMs : 15_000;
+  const restartError = error => {
+    try { log.error?.(`daemon-self-sync: service restart failed: ${String(error?.message ?? error)}`); } catch { /* best effort */ }
+  };
+  // A restart the cooldown deferred is owed to a LATER tick (the adopter exits right after adoption). Only the
+  // real launchd restart retries; an injected hook (hermetic tests) is never called on non-adopting ticks.
+  const retryPendingRestarts = resolveRetryPendingRestarts(retryPendingOpt, restartServicesOpt, realIo);
+  const runRestart = async (fn, extra) => {
+    const controller = new AbortController();
+    let timer;
+    try {
+      // Finish sibling kickstarts before onRestart can exit this adopter. The timeout
+      // releases a hung inspection; cancellation prevents late kicks after that bound.
+      await Promise.race([
+        Promise.resolve().then(() => fn({ cloneRoot: root,
+          selfLabel: env.XPC_SERVICE_NAME || env.LAUNCH_JOB_LABEL || null,
+          env, log, signal: controller.signal, ...extra })),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`timed out after ${restartWaitMs}ms (source ${restartWaitMs === restartServicesTimeoutMs ? 'option' : 'standard'}); inspect LaunchAgents and restart approved samplers manually`));
+          }, restartWaitMs);
+        }),
+      ]);
+    } catch (error) { restartError(error); }
+    finally { clearTimeout(timer); }
+  };
+  const rebuild = async (...args) => {
+    const result = await rebuildImpl(...args);
+    // A recovered adoption (moved=false, adopted=true) also put new code on disk that running services have not loaded.
+    if (result?.adopted && (result.moved || result.reason === 'recovered-adopted')) await runRestart(restartServices, { adoptedSha: result.head });
+    else if (retryPendingRestarts) await runRestart(retryPendingRestarts, { pendingOnly: true });
+    return result;
+  };
   const bg = background === undefined
     ? resolveBackgroundBuild({ entry: entries?.[0], settings: loadBackgroundBuildSettings(), env })
     : (background ? { ...BUILT_IN_BACKGROUND_BUILD_SETTINGS, ...background, enabled: !!background.enabled } : null);
