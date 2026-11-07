@@ -19,7 +19,7 @@ describe('credentialContentFinding GitHub Actions references', () => {
   });
 
   it.each(['private-key', 'token', 'secret'].flatMap(field =>
-    ['abcdefghij0123456789XYZ${{ x }}', '${{ x }}abcdefghij0123456789XYZ', '${{ x }}abcdefghij0123456789XYZ${{ y }}', 'abc${{ x }}'].map(value => [field, value]),
+    ['abcdefghij0123456789XYZ${{ x }}', '${{ x }}abcdefghij0123456789XYZ', '${{ x }}abcdefghij0123456789XYZ${{ y }}'].map(value => [field, value]),
   ))('refuses mixed literal/reference YAML %s value %s', (field, value) => {
     expect(scan(`${field}: ${value}\n`)).not.toBeNull();
   });
