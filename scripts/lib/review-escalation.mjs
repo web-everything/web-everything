@@ -27,6 +27,7 @@ import { POLICY_THRESHOLDS, POLICY_VERSION, POLICY_DIGEST } from './review-polic
 // `parseReviewedDiff`, `parseReviewedContribution`, `parseLatestHumanClearedSha`) now runs every comment through
 // before matching its marker, closing the residual `marker-authorship.mjs`'s own header named as a follow-up.
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isHumanOperatorComment } from './operator-identity.mjs';
 
 /** Shared operation identity; core consumers must not import operation declarations. */
 export const REVIEW_PR_OP_ID = 'review-pr';
@@ -2041,7 +2042,9 @@ export function parseLatestHumanClearedSha(comments) {
   for (const c of Array.isArray(comments) ? comments : []) {
     const body = c && typeof c.body === 'string' ? c.body : '';
     if (!body) continue;
-    if (!isTrustedMarkerAuthor(c)) continue; // #4140 — an untrusted commenter's marker is never counted
+    // R690 — a human clearance is a HUMAN's: only a human operator login counts (automation, an app/bot, an unknown or
+    // unreadable author all skip, so a forged automation comment neither clears nor masks a real older clearance).
+    if (!isHumanOperatorComment(c)) continue;
     REVIEWED_SHA_RE.lastIndex = 0;
     let m;
     let bodySha = null;
@@ -2071,7 +2074,7 @@ export function parseLatestHumanClearedSha(comments) {
 export function headEverHumanCleared(comments, headSha) {
   if (!Array.isArray(comments) || typeof headSha !== 'string' || !headSha.trim()) return false;
   const head = headSha.toLowerCase();
-  return comments.some((c) => isTrustedMarkerAuthor(c) && parseLatestHumanClearedSha([c]) === head);
+  return comments.some((c) => isHumanOperatorComment(c) && parseLatestHumanClearedSha([c]) === head);
 }
 
 /**

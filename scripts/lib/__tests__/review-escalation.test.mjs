@@ -2266,14 +2266,17 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
 
   describe('headEverHumanCleared', () => {
     const head = 'abcdef1';
-    const clear = (sha, author = { login: 'web-everything' }) => ({
+    const clear = (sha, author = { login: 'chalbert' }) => ({
       body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('Ada')}`, author,
     });
     const accept = { body: buildReviewedShaMarker(head), author: { login: 'web-everything' } };
 
     it('preserves clearance after a plain accept on the same SHA, case-insensitively', () => {
       const comments = [clear(head), accept];
-      expect(parseLatestHumanClearedSha(comments)).toBeNull();
+      // R690 — the automation plain accept is not a human comment, so it no longer masks the real clearance
+      // (it cannot clear anything either; the head-bound callers compare the returned sha to the live head).
+      expect(parseLatestHumanClearedSha(comments)).toBe(head);
+      expect(parseLatestHumanClearedSha([clear(head), { ...accept, author: { login: 'chalbert' } }])).toBeNull();
       expect(headEverHumanCleared(comments, head.toUpperCase())).toBe(true);
     });
 
@@ -2296,7 +2299,7 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
   it('#xuboo0q — parseLatestHumanClearedSha binds the SHA and the clear-human marker to the SAME comment', () => {
     // A real clear-human comment stamps BOTH markers together, in one comment. #4140 — posted under the
     // automation's own login, as every real one is (the reader is trusted-author gated).
-    const bot = { login: 'web-everything' };
+    const bot = { login: 'chalbert' }; // R690 — the human operator, as review-set-label posts it
     const clearHumanAt111 = { body: `${buildReviewedShaMarker('1111111')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
     expect(parseLatestHumanClearedSha([clearHumanAt111])).toBe('1111111');
     // A plain accept stamps ONLY reviewed-sha — never covers a tampering finding.
@@ -2382,7 +2385,7 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
     // = 3333333" (from the new plain accept) — even though no human ever looked at 3333333. That combination
     // would let #2440's anti-gaming gate be silently bypassed by a plain agent accept riding on a stale human
     // clearance. This function must report null for the new head instead.
-    const bot = { login: 'web-everything' };
+    const bot = { login: 'chalbert' }; // R690 — a human plain accept still masks an older clearance
     const clearHumanAt111 = { body: `${buildReviewedShaMarker('1111111')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
     const laterPlainAcceptAt333 = { body: buildReviewedShaMarker('3333333'), author: bot };
     expect(parseLatestHumanClearedSha([clearHumanAt111, laterPlainAcceptAt333])).toBe(null);
