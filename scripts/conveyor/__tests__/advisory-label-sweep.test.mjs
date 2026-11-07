@@ -289,7 +289,7 @@ describe('PR #4708 — a cut-off comment list never removes a label, and the liv
     const got = defaultReadPr({ repo: 'web-everything/web-everything', number: 4708, exec, readComments });
     expect(got.comments).toHaveLength(120);
     expect(got.headRefOid).toBe(LIVE_HEAD);
-    expect(calls[0]).toEqual(['gh', 'pr', 'view', '4708', '--repo', 'web-everything/web-everything', '--json', 'number,state,labels,headRefOid']);
+    expect(calls[0]).toEqual(['gh', 'pr', 'view', '4708', '--repo', 'web-everything/web-everything', '--json', 'number,state,labels,headRefOid,reviews']);
     expect(calls[1]).toEqual(['readComments', 4708, 'web-everything/web-everything']);
     // A failed comment read throws (never a partial thread).
     expect(() => defaultReadPr({ repo: 'o/n', number: 1, exec, readComments: () => { throw new Error('502'); } })).toThrow('502');
