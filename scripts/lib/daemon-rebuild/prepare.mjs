@@ -676,6 +676,26 @@ export async function prepareRebuild({
       // ordinary build+smoke path instead, which keeps the watch and gives the successor a smoke of its own.
       let guardUndeclared = false;
       try { guardUndeclared = !carryDeclared && forceWatchGuards({ root, env: stEnv, sha: prevHead }); } catch { guardUndeclared = true; }
+      // R508: a force-adopted build is never a trusted smoke baseline (`forceUnverifiedTrees`, see smoke.mjs `changedSince`). This unsmoked
+      // successor inherits that status BEFORE it is adopted, or a docs-only hop would launder it and the next incremental smoke would
+      // skip the checks the force-adopted build failed. Fail closed: if it cannot be recorded, build and smoke the successor instead.
+      if (!guardUndeclared) {
+        try {
+          const trees = Array.isArray(state.forceUnverifiedTrees) ? state.forceUnverifiedTrees : [];
+          if (trees.length) {
+            const fromTree = verifyRev(git, `${prevHead}^{tree}`);
+            if (!fromTree || trees.includes(fromTree)) {
+              const toTree = verifyRev(git, `${plan.finalSha}^{tree}`);
+              if (!toTree) throw new Error('successor tree unresolvable');
+              state.forceUnverifiedTrees = [toTree, ...trees.filter((t) => t !== toTree)].slice(0, 5);
+              writeState();
+            }
+          }
+        } catch {
+          guardUndeclared = true;
+          if (carryDeclared) { try { declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: null }); } catch { /* best effort */ } }
+        }
+      }
       if (guardUndeclared) {
         log?.error?.(`daemon-rebuild: NOT skipping rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — an open force-adopt watch guards ${String(prevHead).slice(0, 9)} and its carry could not be declared; building and smoking it instead`);
       } else {

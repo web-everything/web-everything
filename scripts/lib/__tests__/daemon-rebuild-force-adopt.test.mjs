@@ -21,6 +21,7 @@ import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, r
 import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
+import { withWriteLock } from '../daemon-clone-lock.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -728,6 +729,45 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     expect(runSmoke).toHaveBeenCalled();
     expect(runSmoke.mock.calls[0][0].changedFiles).toBeNull(); // NOT the incremental F→S file list: F is not a trusted baseline
     expect(headOf(cloneDir)).not.toBe(S); // the failing full smoke keeps S out (it would have been adopted with F's defect before)
+  });
+
+  it('F → docs-only successor D (adopted unsmoked) → S touching only scripts/lane-pool.mjs: D inherits the unverified status, S gets a full smoke', async () => {
+    const { originDir, cloneDir, env, F } = await forceAdoptF();
+    const D = advanceMain(originDir, (dir) => writeFile(dir, 'docs.md', 'docs only\n')); // a DIFFERENT tree from F, adopted without a smoke
+    const skipped = passing();
+    const r = await tick(cloneDir, env, { runSmoke: skipped, forceWatchProbe: healthy, skipCheck: () => ({ skip: true, reason: 'docs-only' }) });
+    expect(r).toMatchObject({ reason: 'skipped-unrelated', skippedSmoke: true });
+    expect(headOf(cloneDir)).toBe(D);
+    expect(D).not.toBe(F);
+    const S = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// only the pool changed\n'));
+    const runSmoke = incrementalAware();
+    await tick(cloneDir, env, { runSmoke, forceWatchProbe: healthy });
+    expect(runSmoke.mock.calls[0][0].changedFiles).toBeNull(); // not the incremental D→S list: D carries F's unverified status
+    expect(headOf(cloneDir)).not.toBe(S); // F's failing check re-runs and keeps S out
+  });
+
+  it('a force-adopted build whose unverified record cannot be written (write lock refused) is not finalized: no adoption, no watch', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const lastGood = headOf(cloneDir);
+    const F = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: F, rulingsText: RULINGS }).ok).toBe(true);
+    const lockRoot = env.WE_DAEMON_CLONE_LOCK_ROOT;
+    let releaseForeign;
+    // The smoke runs unlocked: a foreign live process (our parent) takes the clone write lock and keeps it through finalize.
+    const runSmoke = vi.fn(async () => {
+      void withWriteLock(cloneDir, () => new Promise((resolve) => { releaseForeign = resolve; }), { lockRoot, pid: process.ppid, owner: 'foreign-writer', waitMs: 2000 });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'dispatch-dry-run', detail: 'F defect', mayBeTransient: false }] } };
+    });
+    try {
+      // like any finalize that throws: the watch and ready candidate are cleared (abort) before the error propagates
+      await expect(tick(cloneDir, env, { runSmoke, forceWatchProbe: healthy, lockOpts: { ...LOCK_OPTS, lockRoot, waitMs: 300 } }))
+        .rejects.toThrow(/could not record it as unverified/);
+    } finally { releaseForeign?.(); }
+    expect(headOf(cloneDir)).toBe(lastGood); // never adopted with no unverified record
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
   });
 
   it('the same successor IS adopted once the full smoke passes, and a later successor goes back to the incremental smoke', async () => {

@@ -394,7 +394,15 @@ export async function smokeAndAdopt({
   // xhiqxz3 — which overlays of a build need the real dispatch smoke (none when the setting is off).
   const dsm = await resolveDispatchSmoke(dispatchSmoke, env);
   if (dsm.unavailable) alert('dispatch-smoke-unavailable', { error: dsm.unavailable });
-  const adoptedApplied = adoptedHead && adoptedHead === prevHead && Array.isArray(adoptedState?.applied) ? adoptedState.applied : null;
+  // R508: a force-adopted build's overlays never passed the real dispatch smoke (its smoke failed first), so they are not "already
+  // adopted and proven": every overlay stays a dispatch-smoke suspect until a build passes a smoke (`adoptedApplied: null` = all count).
+  const forceUnverifiedHead = (() => {
+    const trees = readRebuildState(root, stEnv).forceUnverifiedTrees;
+    if (!Array.isArray(trees) || !trees.length) return false;
+    const headTree = verifyRev(git, `${prevHead}^{tree}`);
+    return !headTree || trees.includes(headTree);
+  })();
+  const adoptedApplied = adoptedHead && adoptedHead === prevHead && !forceUnverifiedHead && Array.isArray(adoptedState?.applied) ? adoptedState.applied : null;
   const suspectsFor = (applied) => (dsm.on ? dispatchSmokeSuspects({
     git, applied, adoptedApplied, patterns: dsm.settings.dispatchPaths, match: dsm.match,
   }) : []);
@@ -435,6 +443,7 @@ export async function smokeAndAdopt({
     // the next smoke runs every check (null = full smoke), or a chain of busy skips would launder the pool code.
     const rs = readRebuildState(root, stEnv);
     // R508: a force-adopted build (adopted over a failed smoke) is likewise never a trusted baseline: full smoke until a build passes one.
+    // Unverified status is INHERITED by an unsmoked skip-unrelated successor (prepare.mjs), so a docs-only hop does not launder it.
     for (const trees of [rs.busySkippedTrees, rs.forceUnverifiedTrees]) {
       if (Array.isArray(trees) && trees.length) {
         const headTree = verifyRev(git, `${prevHead}^{tree}`);
@@ -580,7 +589,9 @@ export async function smokeAndAdopt({
     if (readyMeta?.forced === true) {
       const tree = verifyRev(git, `${p.finalSha}^{tree}`);
       if (!tree) throw new Error('forced build: tree unresolvable, cannot record it as unverified');
-      await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
+      // `locked` returns null (it does not throw) when the write lock is refused: that must not finalize the force with no record.
+      const recorded = await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
+      if (!recorded) throw new Error('forced build: could not record it as unverified (write lock refused)');
     }
     writeReadyCandidate(root, {
       ...readyMeta,
