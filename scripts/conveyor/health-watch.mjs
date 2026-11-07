@@ -54,6 +54,7 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { mirrorSyncForTick } from '../lib/mirror-sync.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
 import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -1119,6 +1120,8 @@ export function probeOverlayMainSync(flags, roots = () => daemonCloneRoots(works
 }
 
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
+// The one place this file calls the needs-you feed publisher (shared by every NEEDS-YOU line the tick writes).
+const feedPublish = (item, opts) => publishAttention(item, opts);
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
   const now = flags.now ? Date.parse(flags.now) : started;
@@ -1374,6 +1377,19 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     if (got.probes.prs && got.probes.agents) ghCache.at = now;
   }
 
+  // Mirror freshness has its own cadence, independent of GitHub probes and --no-gh.
+  await attempt('mirrorSync', async () => {
+    const mirrorSync = await mirrorSyncForTick({
+      flags, fixtureTick, dryRun: !!flags['dry-run'], now, config,
+      deps: { syncMirror: deps.syncMirror, stateDir: dir },
+    });
+    if (flags['dry-run'] || fixtureTick) return;
+    if (!['synced', 'rate-limited', 'locked'].includes(mirrorSync?.status)) {
+      throw new Error(`${mirrorSync?.status || 'unavailable'}: ${mirrorSync?.reason || 'mirror refresh did not complete'}`);
+    }
+  });
+  if (probeErrors.mirrorSync) probeErrors.mirrorSync = probeErrors.mirrorSync.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 240);
+
   // A tick the watchdog killed last time is the overrun smell's input.
   const overrunPath = join(dir, 'overrun.json');
   const overrun = readJson(overrunPath, null);
@@ -1417,7 +1433,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   else if (prev.prSweep) state.prSweep = prev.prSweep;
   if (!flags['state-root'] && !flags['dry-run']) {
     for (const t of result.transitions.filter(t => t.type === 'opened' && t.episode?.smell === 'disk-space')) {
-      attempt('diskSpaceNeedsYou', () => publishAttention({
+      attempt('diskSpaceNeedsYou', () => feedPublish({
         repo: `host/${hostname()}`, pr: 0,
         // Episode report ids have minute precision. openedAt distinguishes even
         // two openings in the same minute and supplies the feed's complete identity.
@@ -1534,11 +1550,37 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // `notifyDesktopChecked` already reports its own failure rather than throwing; a delivery failure here must
   // never fail the tick.
   const notifications = [];
-  for (const p of result.plan.filter((x) => x.kind === 'notify' && !x.suppressed)) {
+  // A failed NEEDS-YOU publish retries next tick (not only on the next notify transition); desktop notify is not repeated.
+  const needsYouRetries = Object.entries(state.episodes ?? {})
+    .filter(([k, e]) => e?.smell === 'claude-auth-expired' && Number.isFinite(e.needsYouFailedAt) && !Number.isFinite(e.needsYouAt) && !e.tracked
+      && (e.status === 'open' || e.status === 'flapping') && !result.plan.some((x) => x.key === k && x.kind === 'notify' && !x.suppressed))
+    .map(([key]) => ({ key, kind: 'notify', retry: true }));
+  for (const p of [...result.plan.filter((x) => x.kind === 'notify' && !x.suppressed), ...needsYouRetries]) {
     const ep = state.episodes[p.key];
+    if (ep?.smell === 'claude-auth-expired' && !Number.isFinite(ep.needsYouAt) && !flags['no-notify']) {
+      const item = { key: p.key, repo: 'health-watch', kind: 'needs-you', pr: 0,
+        head: `${p.key}:${ep.openedAt ?? ep.firstBreachAt}`,
+        reason: 'Claude login expired — re-login', title: 'Claude login expired — re-login (run /login)',
+        at: new Date(now).toISOString() };
+      if (flags['dry-run']) {
+        notifications.push({ key: p.key, channel: 'needs-you', dryRun: true, item });
+      } else {
+        try {
+          await (deps.publishNeedsYou ?? feedPublish)(item);
+          // Reminder/unsilence plans may notify again; the feed alerts once per episode.
+          ep.needsYouAt = now;
+          notifications.push({ key: p.key, channel: 'needs-you', item, ok: true, error: null });
+        } catch (e) {
+          const error = String(e?.message || e).split('\n')[0].slice(0, 200);
+          ep.needsYouFailedAt = now;
+          console.error(`health-watch: NEEDS-YOU publish failed: ${error}`);
+          notifications.push({ key: p.key, channel: 'needs-you', item, ok: false, error });
+        }
+      }
+    }
     // `--dry-run`/`--no-notify` both skip actually SENDING one (an OS-visible side effect, unlike the
     // read-only diagnoses above) — a dry-run reports what it would have sent via `result.plan` already.
-    if (!ep || flags['no-notify'] || flags['dry-run']) continue;
+    if (!ep || p.retry || flags['no-notify'] || flags['dry-run']) continue;
     if (ALERT_ONCE_PER_SUBJECT.has(ep.smell)) continue; // sent once per break by the block below
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
