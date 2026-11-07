@@ -56,11 +56,10 @@ describe('credentialContentFinding GitHub Actions references', () => {
     expect(scan(`${field}: ${value}\n`)).not.toBeNull();
   });
 
-  // YAML parsers (libyaml/Psych) treat NEL, LS and PS as line breaks, so a continuation led by one is still
-  // a more-indented continuation of the reference line. The scanner must break lines the same way.
-  it.each([
-    ['LS', ' '], ['PS', ' '], ['NEL', '\u0085'],
-  ])('refuses a literal continuation after a reference when a %s line break precedes it', (_name, brk) => {
+  // YAML parsers (libyaml/Psych) treat NEL, LS and PS as line breaks, so a continuation led by one is
+  // still a more-indented continuation. Built from char codes: no literal separators in this file.
+  const breaks = [['NEL', 0x85], ['LS', 0x2028], ['PS', 0x2029]].map(([name, code]) => [name, String.fromCharCode(code)]);
+  it.each(breaks)('refuses a literal continuation after a reference across a %s line break', (_name, brk) => {
     for (const field of ['private-key', 'token', 'secret']) {
       expect(scan(`${field}: \${{ secrets.WE_APP_PRIVATE_KEY }}\n${brk} ${literal}\n`)).not.toBeNull();
       expect(scan(`${field}: \${{ secrets.WE_APP_PRIVATE_KEY }}${brk} ${literal}\n`)).not.toBeNull();
@@ -69,9 +68,37 @@ describe('credentialContentFinding GitHub Actions references', () => {
     expect(scan(`private-key: \${{ secrets.X }}\n${brk} ${literal}\n`)).toBe('high-entropy-private-key');
   });
 
-  it.each([' ', ' ', '\u0085'])('still allows a reference followed by a same-indent sibling key across a %j line break', brk => {
-    expect(scan(`  private-key: \${{ secrets.X }}${brk}  name: CI\n`)).toBeNull();
+  it.each(breaks)('still refuses a literal tucked behind a %s break on a non-reference credential line', (_name, brk) => {
+    expect(scan(`signing_key: x${brk}  ${literal}\n`)).toBe('high-entropy-signing_key');
+    expect(scan(`signing_key: "x${brk}${literal}"\n`)).toBe('high-entropy-signing_key');
+    expect(scan(`signing_key:${brk}  ${literal}\n`)).toBe('high-entropy-signing_key');
+    expect(scan(`secret:${brk}  ${literal}\n`)).not.toBeNull();
+  });
+
+  it.each(breaks)('sees a credential key that follows a %s break on the same physical line', (_name, brk) => {
+    expect(scan(`name: x${brk}signing_key: ${literal}\n`)).toBe('high-entropy-signing_key');
+  });
+
+  it.each(breaks)('allows a reference followed by a same-indent sibling key across a %s break', (_name, brk) => {
     expect(scan(`private-key: \${{ secrets.X }}\n${brk}name: CI\n`)).toBeNull();
+  });
+
+  // The continuation check covers every more-indented line, not only the first one.
+  it.each([
+    ['value on the next line', `signing_key:\n  ${literal}\n`],
+    ['next-line list item', `token:\n  - ${literal}\n`],
+    ['block scalar', `signing_key: |\n  ${literal}\n`],
+    ['folded scalar', `signing_key: >-\n  ${literal}\n`],
+    ['quoted multi-line scalar', `signing_key: "x\n  ${literal}"\n`],
+    ['literal on the second continuation line', `private-key: \${{ secrets.X }}\n  x\n  ${literal}\n`],
+    ['secret split across short continuation lines', 'private-key: ${{ secrets.X }}\n  Zk9xQ2vB7mT4pL8wRc3\n  Yh6NdAAAAAAAAAAAAAA\n'],
+  ])('refuses a credential literal in a YAML continuation: %s', (_name, content) => {
+    expect(scan(content)).not.toBeNull();
+  });
+
+  it('refuses a continuation longer than the scan bound instead of passing it', () => {
+    const lines = Array.from({ length: 300 }, () => '  x').join('\n');
+    expect(scan(`private-key: \${{ secrets.X }}\n${lines}\n`)).toBe('unbounded-continuation-private-key');
   });
 
   it('refuses a literal continuation led by a non-breaking space after a reference', () => {

@@ -111,6 +111,25 @@ function entropy(text) {
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
   return [...counts.values()].reduce((bits,n)=>bits-(n/chars.length)*Math.log2(n/chars.length),0);
 }
+// YAML parsers (libyaml/Psych) break lines at CR, LF, NEL, LS and PS. The separators are built
+// from char codes: a literal U+2028/U+2029 in a regex literal is a JS syntax error.
+const lineBreaks=`\r\n${String.fromCharCode(0x85,0x2028,0x2029)}`;
+const assignmentLine=new RegExp(`(?:^|[${lineBreaks}])([\\t ]*)(?:-[\\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\\t ]*[:=][\\t ]*([^${lineBreaks}]*)`,'g');
+const physicalTail=/[^\r\n]*/y;
+const continuationRe=new RegExp(`[${lineBreaks}]([\\t ]*)([^${lineBreaks}]*)`,'y');
+const maxContinuationLines=256;
+// Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
+// line that is not. Returns null when more than maxContinuationLines remain (caller refuses).
+function continuationLines(text,from,indent) {
+  const lines=[];
+  continuationRe.lastIndex=from;
+  for(let m;(m=continuationRe.exec(text));) {
+    if(m[2].trim()==='')continue;
+    if(m[1].length<=indent)return lines;
+    if(lines.push(m[2].trim())>maxContinuationLines)return null;
+  }
+  return lines;
+}
 // Content scan for a name-flagged file (R323: EVERY type, no type-based skip).
 // JSON gets the full structural scan; other UTF-8 text gets raw token patterns
 // and fail-closed secret assignments. Unknown encodings stay excluded.
@@ -129,23 +148,33 @@ export function credentialContentFinding(path,content) {
   if(raw)return raw;
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
-  // YAML parsers (libyaml/Psych) also break lines at NEL, LS and PS, so a continuation led by one is a real
-  // continuation. Break lines the same way here (indices below are into this normalized text).
-  text=text.replace(/[\u0085  ]/g,'\n');
-  for(const match of text.matchAll(/(?:^|[\r\n])([\t ]*)(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
-    const [,indent,field,value]=match;
+  for(const match of text.matchAll(assignmentLine)) {
+    const [,indent,field]=match;
+    // `value` is the whole physical (CR/LF-bounded) value, including any text after a NEL/LS/PS
+    // break; the match itself stops at that break so a second key on the same line is still seen.
+    physicalTail.lastIndex=match.index+match[0].length;
+    const tail=physicalTail.exec(text)[0],value=match[3]+tail;
     const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
     // Only dotted context references (optionally joined by ||) prove that the
     // expression contains no literal credential. Unknown expression forms refuse.
     // Raw token patterns above still apply, including inside the reference.
-    if(/^\$\{\{\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+(?:\s*\|\|\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+)*\s*\}\}$/.test(literal)) {
-      // A more-indented next non-blank line can extend a YAML plain scalar.
-      // In that case the first line alone cannot prove a whole-value reference.
-      const nextLine=/^([\t ]*)([^\t \r\n][^\r\n]*)/m.exec(text.slice(match.index+match[0].length));
-      if(!nextLine||nextLine[1].length<=indent.length)continue;
-      if(secretField.test(field)&&nextLine[2].length>=20&&entropy(nextLine[2])>=3.5)return `high-entropy-${field}`;
+    const reference=/^\$\{\{\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+(?:\s*\|\|\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+)*\s*\}\}$/.test(literal);
+    const credentialNamed=secretField.test(field);
+    let continuation=[];
+    if(reference||credentialNamed) {
+      // More-indented following lines extend a YAML scalar (plain, quoted or block). Scan every
+      // one, singly and joined (a folded scalar can split a secret across short lines).
+      continuation=continuationLines(text,match.index+match[0].length+tail.length,indent.length);
+      if(!continuation)return `unbounded-continuation-${field}`;
+      if(credentialNamed) {
+        for(const line of [...continuation,continuation.join('')]) {
+          if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${field}`;
+        }
+      }
     }
-    if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    // A whole-value reference with no continuation line cannot hide a literal.
+    if(reference&&!continuation.length)continue;
+    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.
       if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
