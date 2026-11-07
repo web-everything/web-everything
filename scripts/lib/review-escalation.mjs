@@ -2052,8 +2052,8 @@ function humanClearanceStates(comments) {
   for (const c of thread) {
     const login = c?.author?.login ?? c?.user?.login;
     if (typeof login !== 'string' || !login.trim()) continue; // Unknown poster, including viewer-only evidence.
+    if (!isTrustedMarkerAuthor(c)) continue; // operators are trusted authors, so every human clearance passes this
     const human = isHumanOperatorComment(c);
-    if (!human && !isTrustedMarkerAuthor(c)) continue;
     const body = typeof c?.body === 'string' ? c.body : '';
     // A plain accept's marker name is matched case-insensitively here so it can never be dodged by casing.
     const sha = parseReviewedShaMarker(body)
