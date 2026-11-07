@@ -1,5 +1,14 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/operations/__tests__/probation-build-run.test.mjs::separate processes append all scorecards under the existing store lock",
+      "brokenSha": "f04ffbc35f",
+      "owner": "card:probation-build-run-concurrency-flake",
+      "reason": "R157 flake: concurrent-process scorecard append test (unchanged 3 weeks) lost 1 of 4 appends under CI load on main f04ffbc3 (run 42397151000); not related to #6494 diff.",
+      "addedAt": 1794074593845,
+      "expiresAt": 1794160993845
+    }
+  ],
   "mode": "quarantine"
 }
