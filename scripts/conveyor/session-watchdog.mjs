@@ -32,6 +32,8 @@
  *     health smell AND a typed hand-off event for the fixer-escalation ladder (contract below);
  *   - a fix claim held past the standard duration while the PR head still equals the claimed head → a finding for
  *     the `fix-claim-held-no-progress` smell;
+ *   - an idle finished session or older duplicate → bounded `stop-session` via `claude stop`, protecting live
+ *     claim holders and the watchdog's own session; successful stops append `session-stops.jsonl` events;
  *   - a ghost → `claude rm <id>` (session-reaper's own `rmSessionRecord`, the deregistration `claude agents` reads;
  *     the reaper already `claude stop`-ped these — a pending in-flight cron task kept them listed `working`), then
  *     ONE re-listing to confirm it is gone: `claude rm` can report success and leave the row (Claude Code issue
@@ -79,7 +81,8 @@ import { readStandardMinutes, admissionLockRoot } from '../readiness/heavy-admis
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listLiveFixClaims, releaseFixClaim, FIXING_KIND } from './fix-procedure.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
-import { makeCompletionResolver, rmSessionRecord } from './session-reaper.mjs';
+import { makeCompletionResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
+import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { isProcessAlive } from './health-smells/ghost-sessions-inflate-cap.mjs';
@@ -111,6 +114,8 @@ export const DEFAULT_SESSION_WATCHDOG = Object.freeze({
   stalledIdleMinutes: 30,
   stalledBlockedMinutes: 45,
   finishedIdleMinutes: 10,
+  reapFinishedGraceMinutes: 10,
+  reapMaxStopsPerTick: 5,
   ghostHours: 24,
   prHeadMaxAgeMinutes: 30,
   // R502 item 3 (`stale-claim-or-binding` smell): a fix claim older than this, whose holder has been silent for
@@ -123,7 +128,7 @@ export const DEFAULT_SESSION_WATCHDOG = Object.freeze({
 });
 const SCALAR_KEYS = ['intervalMinutes', 'standardFactor', 'minSamples', 'waitLoopRepeats', 'waitLoopWindowCalls', 'waitLoopMinMinutes',
   'stalledIdleMinutes', 'stalledBlockedMinutes', 'finishedIdleMinutes', 'ghostHours', 'prHeadMaxAgeMinutes', 'staleClaimMinutes', 'staleClaimIdleMinutes',
-  'tailLines', 'tailMaxBytes'];
+  'tailLines', 'tailMaxBytes', 'reapFinishedGraceMinutes', 'reapMaxStopsPerTick'];
 const KIND_MAP_KEYS = ['floorMinutes', 'fallbackMinutes'];
 
 /**
@@ -319,7 +324,7 @@ export function classifyWatchdogSession({ row, tail, nowMs, standard, cfg = DEFA
   Object.assign(ev, {
     idleMinutes: Math.round(idleMs / MINUTE), totalCalls: tail.totalCalls, distinct: tail.distinct,
     edits: tail.edits, commits: tail.commits, pushes: tail.pushes,
-    repeats: tail.dominant.count, repeatMinutes: tail.dominant.minutes, signature: tail.dominant.sig, pendingTool: tail.pending?.tool ?? null,
+    repeats: tail.dominant.count, repeatMinutes: tail.dominant.minutes, signature: tail.dominant.sig, pendingTool: tail.pending ? (tail.pending.tool ?? 'unknown') : null,
   });
   if (completionDone === true) return { class: CLASSES.FINISHED, reason: 'completion-record-done', evidence: ev };
   if (idleMs >= ghostMs && pidAlive !== true) return { class: CLASSES.GHOST, reason: 'transcript-older-than-ghost-threshold', evidence: ev };
@@ -358,9 +363,11 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
   const confirmedDead = (r) => r.class === CLASSES.GHOST && r.pidAlive === false;
   const nameShared = (r) => rows.some((o) => o !== r && o.name === r.name && !confirmedDead(o));
   const claimedBy = new Set();
+  const claimHolders = new Set();
   for (const c of claims || []) {
     const m = c.meta || {};
     const holder = holderOf(c);
+    if (holder) claimHolders.add(holder);
     if (holder) claimedBy.add(holder.name);
     const claimedMs = Date.parse(m.claimedAt ?? '');
     const claimAgeMs = Number.isFinite(claimedMs) ? nowMs - claimedMs : null;
@@ -408,6 +415,33 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
       }
     }
   }
+  const reapKinds = new Set(['fix', 'ci-heal', 'prepare']);
+  const eligible = (r) => r.listingKind === 'background' && reapKinds.has(r.kind) && r.state === 'idle'
+    && !!r.id && !!r.sessionId && !claimHolders.has(r) && !r.evidence?.pendingTool
+    && Number.isFinite(r.evidence?.idleMinutes) && r.evidence.idleMinutes >= cfg.reapFinishedGraceMinutes;
+  const stopRows = new Set();
+  const addStop = (r, mode, reason) => {
+    if (stopRows.has(r)) return;
+    stopRows.add(r);
+    actions.push({ type: 'stop-session', handle: r.id, session: r.name, sessionId: r.sessionId,
+      mode, reason, idleMinutes: r.evidence.idleMinutes });
+  };
+  for (const r of rows) if (r.class === CLASSES.FINISHED && eligible(r)) addStop(r, 'finished', 'finished session past idle grace');
+  const groups = new Map();
+  const start = (r) => typeof r.startedAt === 'number' ? r.startedAt : Date.parse(r.startedAt ?? '');
+  for (const r of rows) {
+    if (r.listingKind !== 'background' || !reapKinds.has(r.kind) || !r.prBound || !r.repo || !r.target) continue;
+    const key = JSON.stringify([r.repo, r.kind, r.target]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  for (const group of groups.values()) {
+    // Unknown chronology cannot establish which session supersedes another.
+    if (group.some((r) => !Number.isFinite(start(r)))) continue;
+    const protectedRows = group.filter((r) => r.state === 'working' || claimHolders.has(r));
+    const keeper = (protectedRows.length ? protectedRows : group).reduce((a, b) => start(b) > start(a) ? b : a);
+    for (const r of group) if (eligible(r) && start(r) < start(keeper)) addStop(r, 'duplicate', `older duplicate; keeping ${keeper.name} (${keeper.id})`);
+  }
   return { findings, actions, events };
 }
 
@@ -436,6 +470,11 @@ export function readEscalationLedger(dir = watchdogEventDir()) {
 export function appendEscalationEvent(event, dir = watchdogEventDir()) {
   mkdirSync(dir, { recursive: true });
   appendFileSync(join(dir, 'fixer-escalations.jsonl'), `${JSON.stringify(event)}\n`);
+}
+
+export function appendReapEvent(event, dir = watchdogEventDir()) {
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(join(dir, 'session-stops.jsonl'), `${JSON.stringify(event)}\n`);
 }
 
 /** Ghost handles `claude rm` already failed to remove: `{<id>: <iso of the failed attempt>}`. */
@@ -507,16 +546,26 @@ export function runSessionWatchdogPass({
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
   completionFor = makeCompletionResolver(),
   rm = rmSessionRecord,
+  stop = stopSessionWithRetry,
+  ownSessionId = process.env.CLAUDE_CODE_SESSION_ID,
   releaseFixing = releaseFixClaim,
   releaseDispatch = releaseSessionFixDispatchClaims,
   eventDir = watchdogEventDir(),
   readLedger = () => readEscalationLedger(eventDir),
   appendEvent = (e) => appendEscalationEvent(e, eventDir),
+  appendReapEvent: appendStopEvent = (e) => appendReapEvent(e, eventDir),
   relist = listAgents,
   readRmLedger = () => readRmIneffective(eventDir),
   writeRmLedger = (l) => writeRmIneffective(l, eventDir),
   log = () => {},
 } = {}) {
+  const reapKeys = ['reapFinishedGraceMinutes', 'reapMaxStopsPerTick'];
+  const standard = Object.fromEntries(reapKeys.map((k) => [k, DEFAULT_SESSION_WATCHDOG[k]]));
+  const tool = Object.fromEntries(reapKeys.filter((k) => config[k] !== undefined && config[k] !== standard[k]).map((k) => [k, config[k]]));
+  const policy = cascadePolicy('sessionWatchdog', tool, { standard,
+    valid: Object.fromEntries(reapKeys.map((k) => [k, (v) => Number.isFinite(v) && v > 0])), log: () => {} });
+  config = { ...config, ...Object.fromEntries(reapKeys.map((k) => [k, policy.value[k]])) };
+  log(formatCascadeSourcesLine('sessionWatchdog', policy));
   const listing = (agents ?? listAgents()) || [];
   const procs = processes === undefined ? readProcesses() : processes;
   let heavy = null;
@@ -548,7 +597,9 @@ export function runSessionWatchdogPass({
   }
 
   let claims = [];
-  try { claims = listClaims() || []; } catch { claims = []; }
+  let claimsReadable = false;
+  try { claims = listClaims(); claimsReadable = Array.isArray(claims); } catch { /* refuse stops without claim evidence */ }
+  if (!claimsReadable) { claims = []; log('session-watchdog: claim store unreadable; stops refused until a successful read'); }
   const plan = planWatchdog({ rows, claims, prHeadFor, standardFor, nowMs, cfg: config });
 
   // Escalation events: write each key once; report which ones a consumer acknowledged.
@@ -567,10 +618,28 @@ export function runSessionWatchdogPass({
   try { rmLedger = readRmLedger() || {}; } catch { rmLedger = {}; }
   const retryMs = config.ghostHours * 60 * MINUTE;
   const removed = [];
+  let stopCount = 0;
   for (const a of plan.actions) {
     if (!act) { done.push({ ...a, ok: null, detail: 'report-only' }); continue; }
     try {
-      if (a.type === 'clear-ghost') {
+      if (a.type === 'stop-session') {
+        if (!claimsReadable || !a.handle || !a.sessionId || (ownSessionId && a.sessionId === ownSessionId)) {
+          done.push({ ...a, ok: false, detail: !claimsReadable ? 'refused: claim store unreadable' : a.sessionId === ownSessionId ? 'refused: own session' : 'refused: missing session identity' });
+          continue;
+        }
+        if (stopCount >= Math.floor(config.reapMaxStopsPerTick)) {
+          done.push({ ...a, ok: false, deferred: true, detail: 'deferred: per-tick stop bound' }); continue;
+        }
+        stopCount++;
+        const r = stop({ handle: a.handle });
+        const ok = r?.stopped === true;
+        done.push({ ...a, ok, detail: ok ? 'stopped' : (r?.reason ?? 'stop unconfirmed') });
+        if (ok) {
+          try { appendStopEvent({ type: 'session-watchdog.session-stopped', v: 1, sessionId: a.sessionId,
+            name: a.session, handle: a.handle, mode: a.mode, reason: a.reason, idleMinutes: a.idleMinutes, at: new Date(nowMs).toISOString() }); }
+          catch (err) { log(`session-watchdog: stop event write failed ${a.handle}: ${err?.message || err}`); }
+        }
+      } else if (a.type === 'clear-ghost') {
         if (!a.safe) { done.push({ ...a, ok: false, detail: 'refused: process liveness unknown or no handle' }); continue; }
         const prior = Date.parse(rmLedger[a.handle] ?? '');
         if (Number.isFinite(prior) && nowMs - prior < retryMs) {
