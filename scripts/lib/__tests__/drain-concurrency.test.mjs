@@ -9,6 +9,21 @@ import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
 const pause = () => new Promise(resolve => setTimeout(resolve, 5));
 
+describe('post-merge numbering preserves the judged PR head at enqueue', () => {
+  it('does not prepare a hash-bearing PR when numberCardsBeforeEnqueue is false', () => {
+    const readFiles = vi.fn(() => ['backlog/xabc123-card.md']);
+    const required = createBranchPreparationRequired({ enabled: false, serial: true, readFiles,
+      hasPendingCards: files => hashBacklogFiles(files).length > 0 });
+    expect(shouldPrepareBranchBeforeEnqueue({ required: required({ headSha: 'a'.repeat(40) }), enqueues: true })).toBe(false);
+    expect(readFiles).not.toHaveBeenCalled();
+  });
+
+  it('resolves the shipped numbering default to false without an environment override', async () => {
+    const { resolveQueueNumbering } = await import('../queue-branch-numbering.mjs');
+    expect(resolveQueueNumbering({ env: {} })).toMatchObject({ value: false, invalid: [] });
+  });
+});
+
 describe('bounded drain concurrency', () => {
   it.each([
     [true, true, true], [true, false, false], [false, true, false], [false, false, false],

@@ -3,8 +3,177 @@ import * as realFs from 'node:fs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import * as queueNumbering from '../queue-branch-numbering.mjs';
 
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
+
+describe('post-merge batch numbering on main', () => {
+  // Exercise the existing repair body until the promoted export exists: missing
+  // behavior must fail at its assertion, rather than hide behind a missing import.
+  const numberMain = options => (queueNumbering.numberLandedHashesOnMain ?? queueNumbering.repairHashOnMain)(options);
+  const hashes = ['xbbbbbb', 'xaaaaaa', 'xcccccc']; // first-parent merge order, deliberately not lexical
+  function mainFixture({ changedPaths = [], rejectPushes = 0, concurrentWinner = false } = {}) {
+    let remoteNext = 101, fetchedNext = 101, pending = [...hashes], numbered = false;
+    let pushes = 0;
+    const remoteAssignments = [];
+    const fs = {
+      readFileSync: () => JSON.stringify({ reservations: [] }),
+      mkdtempSync: () => 'scratch/numbering', mkdirSync: vi.fn(), rmSync: vi.fn(),
+    };
+    const number = vi.fn((_cwd, { minNext, order } = {}) => {
+      numbered = true;
+      return { committed: true, assigned: (order ?? [...pending].sort()).map((hash, i) => ({ hash, nnn: String(minNext + i) })) };
+    });
+    const exec = vi.fn((cmd, args) => {
+      if (cmd !== 'git') throw new Error(`unexpected subprocess: ${cmd}`);
+      switch (args[0]) {
+        case 'fetch': fetchedNext = remoteNext; numbered = false; return '';
+        case 'ls-tree': return [`backlog/${fetchedNext - 1}-existing.md`, ...pending.map(h => `backlog/${h}-card.md`)].join('\n');
+        case 'log': {
+          // Git's --reverse first-parent additions; do not confuse a later edit
+          // of A with its first appearance. Support name-only and commit readers.
+          if (args.includes('--name-only')) return [...pending.map(h => `backlog/${h}-card.md`), 'backlog/xaaaaaa-card.md'].join('\n');
+          return ['b'.repeat(40), 'a'.repeat(40), 'c'.repeat(40)].join('\n');
+        }
+        case 'diff-tree': return `backlog/${hashes[['b', 'a', 'c'].indexOf(args.find(a => /^[abc]{40}$/.test(a))?.[0])]}-card.md\n`;
+        case 'ls-files': return numbered ? '' : pending.map(h => `backlog/${h}-card.md`).join('\n');
+        case 'diff': return args.includes('--name-status')
+          ? changedPaths.map(p => `M\t${p}`).join('\n') : changedPaths.join(args.includes('-z') ? '\0' : '\n');
+        case 'show': return '';
+        case 'rev-parse': return 'd'.repeat(40);
+        case 'worktree': return '';
+        case 'push': {
+          pushes++;
+          if (pushes <= rejectPushes) {
+            if (concurrentWinner) {
+              remoteAssignments.push({ hash: 'xbbbbbb', nnn: '101' });
+              remoteNext = 102; pending = ['xaaaaaa', 'xcccccc'];
+            }
+            throw new Error(concurrentWinner ? 'non-fast-forward' : 'remote temporarily unavailable');
+          }
+          // Model git's fast-forward arbiter. A stale writer never wins.
+          if (fetchedNext !== remoteNext) throw new Error('non-fast-forward');
+          const assigned = number.mock.results.at(-1).value.assigned;
+          remoteAssignments.push(...assigned); remoteNext += assigned.length; pending = [];
+          return '';
+        }
+        default: throw new Error(`unexpected git argv: ${args.join(' ')}`);
+      }
+    });
+    const options = { cwd: 'checkout', statePath: 'state/reservations.json', fs, exec, number,
+      lock: vi.fn(fn => ({ ran: true, result: fn() })), log: { write: vi.fn() } };
+    return { options, exec, number, remoteAssignments, remotePending: () => [...pending] };
+  }
+
+  it('promotes numberLandedHashesOnMain and retains repairHashOnMain as the same exported alias', () => {
+    expect(queueNumbering.numberLandedHashesOnMain).toBeTypeOf('function');
+    expect(queueNumbering.repairHashOnMain).toBe(queueNumbering.numberLandedHashesOnMain);
+  });
+
+  it('passes first-parent first-addition merge order B, A, C to numberPendingHashes and numbers in that order', () => {
+    const x = mainFixture();
+    const result = numberMain(x.options);
+    expect(result.warning).toBeUndefined();
+    expect(x.number).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ minNext: 101, order: hashes }));
+    expect(result).toMatchObject({ pushed: true, assigned: [
+      { hash: 'xbbbbbb', nnn: '101' }, { hash: 'xaaaaaa', nnn: '102' }, { hash: 'xcccccc', nnn: '103' },
+    ] });
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'log' && args.includes('--first-parent') && args.includes('origin/main'))).toBe(true);
+    expect(x.options.lock).toHaveBeenCalledWith(expect.any(Function), { runUnlockedOnContention: false });
+  });
+
+  it('refetches and renumbers the losing writer above the winning writer after non-fast-forward rejection, never forcing', () => {
+    const x = mainFixture({ rejectPushes: 1, concurrentWinner: true });
+    const result = numberMain(x.options);
+    expect(result).toMatchObject({ pushed: true, assigned: [
+      { hash: 'xaaaaaa', nnn: '102' }, { hash: 'xcccccc', nnn: '103' },
+    ] });
+    expect(x.remoteAssignments.map(a => a.nnn)).toEqual(['101', '102', '103']);
+    const commands = x.exec.mock.calls.map(([, args]) => args);
+    const firstPush = commands.findIndex(args => args[0] === 'push');
+    expect(commands.slice(firstPush + 1).some(args => args[0] === 'fetch')).toBe(true);
+    expect(commands.filter(args => args[0] === 'push')).toHaveLength(2);
+    expect(commands.filter(args => args[0] === 'push').every(args =>
+      args.includes('HEAD:refs/heads/main') && !args.some(a => a.startsWith('--force') || a.startsWith('+')))).toBe(true);
+  });
+
+  it('keeps failed pushes nonfatal with legal hash cards unchanged on main and raises needs-you after K consecutive failures', async () => {
+    const x = mainFixture({ rejectPushes: 100 });
+    // Explicit shared state survives ticks; the implementation owns the counter.
+    const failureState = { consecutiveFailures: 0 };
+    const before = vi.mocked(appendDaemonEvent).mock.calls.length;
+    const tick = () => numberMain({ ...x.options, failureState, maxConsecutiveFailures: 3 });
+    expect(tick()).toMatchObject({ pushed: false, warning: expect.stringContaining('remote temporarily unavailable') });
+    expect(tick()).toMatchObject({ pushed: false });
+    expect(vi.mocked(appendDaemonEvent).mock.calls.slice(before).filter(([e]) => e.kind === 'needs-you')).toHaveLength(0);
+    expect(tick()).toMatchObject({ pushed: false });
+    await Promise.resolve();
+    expect(x.remoteAssignments).toEqual([]);
+    expect(x.remotePending()).toEqual(hashes);
+    expect(vi.mocked(appendDaemonEvent).mock.calls.slice(before).some(([e]) => e.kind === 'needs-you')).toBe(true);
+    expect(x.exec.mock.calls.some(([, args]) => args.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+
+  it.each(['src/runtime.mjs', '.github/workflows/ci.yml', 'scripts/merge-ai-prs.mjs'])(
+    'refuses a numbering commit touching %s outside backlog and reference rewrites before any push', path => {
+      const x = mainFixture({ changedPaths: [path] });
+      const result = numberMain(x.options);
+      expect(x.exec.mock.calls.filter(([, args]) => args[0] === 'push')).toEqual([]);
+      expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/path|scope|allow|numbering/i) });
+      expect(x.remoteAssignments).toEqual([]);
+    });
+
+  it('fails closed without pushing when numbering diff evidence cannot be read', () => {
+    const x = mainFixture();
+    const baseExec = x.options.exec;
+    x.options.exec = vi.fn((cmd, args, opts) => {
+      if (args[0] === 'diff') throw new Error('numbering diff unreadable');
+      return baseExec(cmd, args, opts);
+    });
+    expect(numberMain(x.options)).toMatchObject({ pushed: false, warning: expect.stringContaining('unreadable') });
+    expect(x.remoteAssignments).toEqual([]);
+  });
+
+  it('treats landed hash cards as normal pending numbering rather than a merge-group gate failure', () => {
+    const log = { write: vi.fn() };
+    const result = queueNumbering.probeQueuedLand('checkout', { log, exec: () => 'backlog/xabc123-card.md\n' });
+    expect(result.files).toEqual(['backlog/xabc123-card.md']);
+    expect(result.warning ?? '').not.toContain('merge_group gate should have refused it');
+    expect(log.write.mock.calls.flat().join('')).not.toContain('merge_group gate should have refused it');
+  });
+
+  it('never sweeps or dequeues hash-bearing queue entries when branch numbering is disabled', () => {
+    const exec = vi.fn(() => { throw new Error('retired sweep must perform no IO'); });
+    const prepare = vi.fn();
+    queueNumbering.sweepQueuedHashCards({ repo: 'owner/repo', cwd: 'checkout', numberCardsBeforeEnqueue: false,
+      exec, prepare, emit: vi.fn(), log: { write: vi.fn() } });
+    expect(exec).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+  });
+});
+
+describe('post-merge numbering debounce', () => {
+  // Proposed pure seam: shouldNumberLandedHashes({ pending, queueIdle, now, settings }).
+  const now = Date.parse('2026-11-07T12:00:00Z');
+  const settings = { maxPending: 3, maxAgeMinutes: 10, whenQueueIdle: true };
+  const pending = (count, ageMinutes) => Array.from({ length: count }, (_, i) => ({
+    hash: ['xaaaaaa', 'xbbbbbb', 'xcccccc'][i], landedAt: now - ageMinutes * 60_000,
+  }));
+  it.each([
+    ['empty queue', 1, 1, true, true], ['batch threshold', 3, 1, false, true],
+    ['age threshold', 1, 10, false, true], ['young small batch with busy queue', 2, 9, false, false],
+    ['no pending cards even when idle', 0, 0, true, false],
+  ])('decides %s deterministically', (_name, count, age, queueIdle, expected) => {
+    expect(queueNumbering.shouldNumberLandedHashes).toBeTypeOf('function');
+    expect(queueNumbering.shouldNumberLandedHashes({ pending: pending(count, age), queueIdle, now, settings })).toBe(expected);
+  });
+  it('honors whenQueueIdle=false and uses the oldest card rather than the newest card', () => {
+    expect(queueNumbering.shouldNumberLandedHashes).toBeTypeOf('function');
+    const decide = queueNumbering.shouldNumberLandedHashes;
+    expect(decide({ pending: pending(1, 1), queueIdle: true, now, settings: { ...settings, whenQueueIdle: false } })).toBe(false);
+    expect(decide({ pending: [...pending(1, 11), ...pending(1, 1)], queueIdle: false, now, settings })).toBe(true);
+  });
+});
 
 describe('queue branch numbering', () => {
   it('probes main for the branch-numbering CI contract and fails closed', () => {
