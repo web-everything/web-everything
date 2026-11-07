@@ -319,6 +319,7 @@ export function classifyWatchdogSession({ row, tail, nowMs, standard, cfg = DEFA
   const ghostMs = cfg.ghostHours * 60 * MINUTE;
   const ev = { runtimeMinutes: runtimeMs == null ? null : Math.round(runtimeMs / MINUTE), standardMinutes: Math.round(standard.ms / MINUTE) };
   if (tail?.hadUnparseableLine) ev.unparseableTail = true;
+  if (tail?.truncatedTail) ev.truncatedTail = true;
   if (runtimeMs != null && runtimeMs < standard.ms) return { class: CLASSES.WITHIN, reason: 'runtime-within-standard', evidence: ev };
   if (!tail || !Number.isFinite(tail.lastActivityMs)) {
     if (pidAlive === false && runtimeMs != null && runtimeMs >= ghostMs) {
@@ -328,7 +329,7 @@ export function classifyWatchdogSession({ row, tail, nowMs, standard, cfg = DEFA
   }
   const idleMs = nowMs - tail.lastActivityMs;
   Object.assign(ev, {
-    idleMinutes: Math.round(idleMs / MINUTE), totalCalls: tail.totalCalls, distinct: tail.distinct,
+    idleMs, idleMinutes: Math.round(idleMs / MINUTE), totalCalls: tail.totalCalls, distinct: tail.distinct,
     edits: tail.edits, commits: tail.commits, pushes: tail.pushes,
     repeats: tail.dominant.count, repeatMinutes: tail.dominant.minutes, signature: tail.dominant.sig, pendingTool: tail.pending ? (tail.pending.tool ?? 'unknown') : null,
   });
@@ -434,9 +435,10 @@ export function planWatchdog({ rows, claims, stopClaims = claims, prHeadFor = ()
   }
   const reapKinds = new Set(['fix', 'ci-heal', 'prepare']);
   const eligible = (r) => r.listingKind === 'background' && reapKinds.has(r.kind) && r.state === 'idle'
-    && !r.evidence?.unparseableTail
+    && !r.evidence?.unparseableTail && !r.evidence?.truncatedTail
     && !!r.id && !!r.sessionId && !claimHolders.has(r) && !r.evidence?.pendingTool
-    && Number.isFinite(r.evidence?.idleMinutes) && r.evidence.idleMinutes >= cfg.reapFinishedGraceMinutes;
+    && Number.isFinite(r.evidence?.idleMinutes) && Number.isFinite(r.evidence?.idleMs)
+    && r.evidence.idleMs >= cfg.reapFinishedGraceMinutes * MINUTE;
   const stopRows = new Set();
   const addStop = (r, mode, reason) => {
     if (stopRows.has(r)) return;
@@ -510,10 +512,24 @@ export function writeRmIneffective(ledger, dir = watchdogEventDir()) {
 
 /** Bounded tail read of one listed session's own transcript, through `hung-session.mjs`'s shared primitive. */
 export function readWatchdogTail(row, cfg = DEFAULT_SESSION_WATCHDOG, nowMs = Date.now(), io = {}) {
-  const t = readTranscriptTailActivity(row, { tailLines: cfg.tailLines, maxBytes: cfg.tailMaxBytes, fieldMax: 200, tailLinesFn: tailLines, summarizeEntryFn: summarizeEntry, ...io });
+  const { tailLinesFn = tailLines, ...activityIo } = io;
+  let truncatedTail = false;
+  const t = readTranscriptTailActivity(row, {
+    tailLines: cfg.tailLines, maxBytes: cfg.tailMaxBytes, fieldMax: 200, summarizeEntryFn: summarizeEntry, ...activityIo,
+    tailLinesFn: (file, count, maxBytes) => {
+      const read = tailLinesFn(file, count, maxBytes);
+      // The shared activity reader drops the tail reader's metadata. Capture it before that happens.
+      // Hitting either bound is incomplete evidence, even if the helper cannot prove a line was omitted.
+      if (read.truncatedHead || read.truncated || read.partialFirstLine
+        || (Number.isFinite(read.size) && read.size >= maxBytes)
+        || (Number.isFinite(read.bytesRead) && read.bytesRead >= maxBytes)
+        || read.lines?.length >= count) truncatedTail = true;
+      return read;
+    },
+  });
   if (!t) return null;
   const s = summarizeTail(t.entries, { windowCalls: cfg.waitLoopWindowCalls, nowMs, hadUnparseableLine: t.hadUnparseableLine });
-  return { ...s, lastActivityMs: t.lastActivityMs, file: t.file };
+  return { ...s, lastActivityMs: t.lastActivityMs, file: t.file, truncatedTail };
 }
 
 /** PR head from the shared open-PR snapshot, CACHE ONLY (never a fetch). `null` when unknown. */

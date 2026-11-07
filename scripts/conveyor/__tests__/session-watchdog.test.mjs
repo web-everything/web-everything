@@ -498,7 +498,7 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
   const cfg = { ...CFG, reapFinishedGraceMinutes: 10, reapMaxStopsPerTick: 5 };
   const finished = (over = {}) => row({
     listingKind: 'background', kind: 'fix', repo: 'we', target: '3771', prBound: true,
-    state: 'idle', class: CLASSES.FINISHED, evidence: { idleMinutes: 40, pendingTool: null }, ...over,
+    state: 'idle', class: CLASSES.FINISHED, evidence: { idleMinutes: 40, idleMs: 40 * MIN, pendingTool: null }, ...over,
   });
   // ACTIVE isolates duplicate selection from the separate finished-session rule.
   const duplicate = (over = {}) => finished({ class: CLASSES.ACTIVE, ...over });
@@ -512,26 +512,26 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
   }).actions.filter((a) => a.type === 'stop-session');
 
   it.each(['fix', 'ci-heal', 'prepare'])('stops an idle FINISHED %s background session at the grace boundary', (kind) => {
-    const r = finished({ kind, evidence: { idleMinutes: 10 }, prBound: kind !== 'prepare' });
+    const r = finished({ kind, evidence: { idleMinutes: 10, idleMs: 10 * MIN }, prBound: kind !== 'prepare' });
     expect(stops([r])).toEqual([{
       type: 'stop-session', handle: r.id, session: r.name, sessionId: r.sessionId,
       mode: 'finished', reason: expect.stringMatching(/\S/), idleMinutes: 10,
     }]);
   });
   it('uses the configured finished grace rather than a hardcoded ten minutes', () => {
-    const r = finished({ evidence: { idleMinutes: 3 } });
+    const r = finished({ evidence: { idleMinutes: 3, idleMs: 3 * MIN } });
     expect(stops([r])).toEqual([]);
     expect(stops([r], [], { ...cfg, reapFinishedGraceMinutes: 3 })).toHaveLength(1);
   });
   it.each([
-    ['idle below grace', { evidence: { idleMinutes: 9.9 } }],
+    ['idle below grace', { evidence: { idleMinutes: 9.9, idleMs: 9.9 * MIN } }],
     ['working (busy)', { state: 'working' }],
     ['unknown state', { state: undefined }],
     ['another non-idle state', { state: 'paused' }],
-    ['pending tool', { evidence: { idleMinutes: 40, pendingTool: 'Bash' } }],
+    ['pending tool', { evidence: { idleMinutes: 40, idleMs: 40 * MIN, pendingTool: 'Bash' } }],
     ['missing idle evidence', { evidence: {} }],
-    ['NaN idle evidence', { evidence: { idleMinutes: NaN } }],
-    ['infinite idle evidence', { evidence: { idleMinutes: Infinity } }],
+    ['NaN idle evidence', { evidence: { idleMinutes: NaN, idleMs: NaN * MIN } }],
+    ['infinite idle evidence', { evidence: { idleMinutes: Infinity, idleMs: Infinity * MIN } }],
     ['review kind', { kind: 'review' }],
     ['build kind', { kind: 'build' }],
     ['interactive listing', { listingKind: 'interactive' }],
@@ -615,11 +615,11 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
   });
   it.each([
     ['busy duplicate', { state: 'working' }],
-    ['pending tool call', { evidence: { idleMinutes: 40, pendingTool: 'Bash' } }],
+    ['pending tool call', { evidence: { idleMinutes: 40, idleMs: 40 * MIN, pendingTool: 'Bash' } }],
     ['unreadable idle evidence', { evidence: {} }],
-    ['NaN idle evidence', { evidence: { idleMinutes: NaN } }],
-    ['infinite idle evidence', { evidence: { idleMinutes: Infinity } }],
-    ['idle below grace', { evidence: { idleMinutes: 9 } }],
+    ['NaN idle evidence', { evidence: { idleMinutes: NaN, idleMs: NaN * MIN } }],
+    ['infinite idle evidence', { evidence: { idleMinutes: Infinity, idleMs: Infinity * MIN } }],
+    ['idle below grace', { evidence: { idleMinutes: 9, idleMs: 9 * MIN } }],
     ['unknown startedAt', { startedAt: undefined }],
     ['invalid startedAt', { startedAt: 'unreadable' }],
     ['same start time as keeper', { startedAt: T0 - 60 * MIN }],
@@ -628,7 +628,7 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
     expect(stops([duplicate(over), newer({ state: 'working' })])).toEqual([]);
   });
   it('accepts finite idle evidence exactly at grace for an older duplicate', () => {
-    expect(stops([duplicate({ evidence: { idleMinutes: 10 } }), newer()])).toEqual([
+    expect(stops([duplicate({ evidence: { idleMinutes: 10, idleMs: 10 * MIN } }), newer()])).toEqual([
       expect.objectContaining({ handle: 'f29aeb29', mode: 'duplicate', idleMinutes: 10 }),
     ]);
   });
@@ -654,6 +654,11 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
   ])('never reaps %s groups as duplicates', (_label, over) => {
     expect(stops([duplicate(over), newer(over)])).toEqual([]);
   });
+  it.each(['finished', 'duplicate'])('missing exact idleMs refuses %s stops even with rounded idle minutes', (mode) => {
+    const old = (mode === 'finished' ? finished : duplicate)({ evidence: { idleMinutes: 40 } });
+    expect(stops(mode === 'finished' ? [old] : [old, newer()])).toEqual([]);
+  });
+
   it('finished mode wins when the same row is also an eligible older duplicate: no double stop', () => {
     const old = finished();
     expect(stops([old, newer()])).toEqual([
@@ -1101,6 +1106,76 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     expect(chatSpawnGuardFor(listing())).toBeNull();
     code = 'ENOENT';
     expect(chatSpawnGuardFor(listing({ sessionId: 'sid-next' }))).toMatchObject({ blocked: false, reason: 'no-link' });
+  });
+
+  it.each(['finished', 'duplicate'])('exact idle below grace (9.6 min) refuses %s stops; 10.0 min allows them', (mode) => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    for (const idleMinutes of [9.6, 10]) {
+      const idleMs = idleMinutes * MIN;
+      const tail = summarizeTail(bash('git status --short', T0 - idleMs - 1000, 1000), { nowMs: T0 });
+      const { result, calls, actions } = base({
+        agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail,
+        completionFor: () => mode === 'finished' ? { done: true } : null,
+      });
+      expect(result.rows[0].evidence).toMatchObject({ idleMinutes: 10, idleMs });
+      expect(calls.stop).toEqual(idleMinutes === 10 ? [old.id] : []);
+      expect(actions).toEqual(idleMinutes === 10 ? [expect.objectContaining({ mode, idleMinutes: 10, ok: true })] : []);
+      expect(calls.reapEvents).toEqual(idleMinutes === 10 ? [expect.objectContaining({ mode, idleMinutes: 10 })] : []);
+    }
+  });
+
+  it.each(['finished', 'duplicate'])('byte- or line-truncated transcript tails refuse %s stops; a complete tail allows them', (mode) => {
+    const root = mkdtempSync(join(tmpdir(), 'watchdog-truncated-tail-'));
+    try {
+      const file = join(root, 'session.jsonl');
+      const old = listing({ cwd: root });
+      const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+      const timestamp = new Date(T0 - 40 * MIN).toISOString();
+      const pending = JSON.stringify({ type: 'assistant', timestamp, message: { content: [
+        { type: 'tool_use', id: 'hidden-pending-tool', name: 'Bash', input: { command: 'wait ' + 'x'.repeat(2048) } },
+      ] } });
+      const retained = JSON.stringify({ type: mode === 'finished' ? 'assistant' : 'user', timestamp, message: { content: [
+        mode === 'finished' ? { type: 'text', text: 'Done.' } : { type: 'tool_result', tool_use_id: 'another-tool', content: 'done' },
+      ] } });
+      for (const bound of ['bytes', 'lines', 'complete']) {
+        writeFileSync(file, (bound === 'complete' ? '' : pending + '\n') + retained + '\n');
+        const config = { ...CFG, tailLines: bound === 'lines' ? 1 : CFG.tailLines,
+          tailMaxBytes: bound === 'bytes' ? Buffer.byteLength(retained) + 2 : CFG.tailMaxBytes };
+        const tail = readWatchdogTail(old, config, T0, { resolveTranscript: () => file });
+        expect(tail.pending).toBeNull();
+        expect(tail.truncatedTail).toBe(bound !== 'complete');
+        const { result, calls, actions } = base({ config,
+          agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail,
+          completionFor: () => mode === 'finished' ? { done: true } : null,
+        });
+        if (bound !== 'complete') {
+          expect(result.rows[0].evidence.truncatedTail).toBe(true);
+          expect(actions).toEqual([]);
+          expect(calls.reapEvents).toEqual([]);
+        } else {
+          expect(actions).toEqual([expect.objectContaining({ mode, ok: true })]);
+        }
+        expect(calls.stop).toEqual(bound === 'complete' ? [old.id] : []);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['truncatedHead', { truncatedHead: true }], ['truncated', { truncated: true }],
+    ['partial-first-line', { partialFirstLine: true }], ['byte-count cap', { bytesRead: CFG.tailMaxBytes }],
+    ['file-size cap', { size: CFG.tailMaxBytes }],
+  ])('reader truncation evidence (%s) is preserved and refuses stops', (_label, metadata) => {
+    const old = listing({ cwd: 'scratch/session' });
+    const tail = readWatchdogTail(old, CFG, T0, {
+      resolveTranscript: () => 'fixture.jsonl',
+      tailLinesFn: () => ({ ...metadata, lines: [JSON.stringify({ type: 'assistant', timestamp: new Date(T0 - 40 * MIN).toISOString(),
+        message: { content: [{ type: 'text', text: 'Done.' }] } })] }),
+    });
+    const { result, calls, actions } = base({ readTail: () => tail });
+    expect(result.rows[0].evidence.truncatedTail).toBe(true);
+    expect(calls.stop).toEqual([]);
+    expect(actions).toEqual([]);
   });
 
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
