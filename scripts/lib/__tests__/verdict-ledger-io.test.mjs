@@ -6,6 +6,8 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
   resolveLedgerReadSettings, formatLedgerReadSettings, sizedLedgerRun, DEFAULT_LEDGER_READ_MAX_BYTES, LEDGER_READ_MAX_BYTES_ENV,
@@ -40,6 +42,47 @@ describe('readLedgerFromGit: unreadable is never empty', () => {
     const r = readLedgerFromGit({ board: '/board', repo: REPO, run });
     expect(r.status).toBe('ok');
     expect(r.records).toHaveLength(1);
+  });
+});
+
+describe('readLedgerFromGit: every read is fresh unless the caller opts into the TTL cache', () => {
+  const mkRun = (dir, calls) => (args) => { calls.push(args[0]); return args[0] === 'rev-parse' ? `${dir}\n` : ''; };
+  const fetchCount = (calls) => calls.filter((c) => c === 'fetch').length;
+  it('fresh: true fetches every time; only an explicit fresh: false coalesces', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
+    const cached = []; const fresh = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached), fresh: false });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached), fresh: false });
+    expect(fetchCount(cached)).toBe(1);
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
+    expect(fetchCount(fresh)).toBe(2);
+  });
+  // PR #6489 red team: pr-label-mirror reads with no `fresh` flag and re-added a cleared review:human from a
+  // 30s-stale ledger. Ledger rows drive labels, holds and merges, so a read that names no flag must fetch.
+  it('a read that passes no fresh flag fetches every time, even with a warm stamp', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
+    const calls = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), fresh: false }); // warm the stamp
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    expect(fetchCount(calls)).toBe(3);
+  });
+  it('the shared git store (label mirror, holds, every store reader) fetches on each read by default', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
+    const calls = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), fresh: false }); // warm the stamp
+    const store = createGitLedgerStore();
+    expect(await store.read({ board: '/board', repo: REPO, run: mkRun(dir, calls) })).toMatchObject({ status: 'ok' });
+    expect(await store.read({ board: '/board', repo: REPO, run: mkRun(dir, calls) })).toMatchObject({ status: 'ok' });
+    expect(fetchCount(calls)).toBe(3);
+  });
+});
+
+describe('the merge gate is a decision reader', () => {
+  it('merge-gate-check reads the ledger with fresh: true (never the TTL cache)', () => {
+    const src = readFileSync(join(import.meta.dirname, '../../merge-gate-check.mjs'), 'utf8');
+    expect(src).toMatch(/readLedgerFromGit\(\{[^}]*fresh: true/);
   });
 });
 
