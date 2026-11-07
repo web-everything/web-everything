@@ -182,6 +182,9 @@ describe('agent command audit', () => {
     `zip -P ${zq} a.zip f`, `unzip -P ${zq} a.zip`, `7z a -p${zq} a.7z`, `ssh-keygen -N ${zq} -f k`,
     `smbclient -U user%${zq}`, `curl -b s=${zq} u`, `htpasswd -b f user ${zq}`, `curl -d '{"password":"${zq}"}' u`,
     `curl -d '{"api_key": "${zq}"}' u`, `curl -d "{\\"password\\":\\"${zq}\\"}" u`, `cmd --tok\\\nen ${zq}`,
+    // round 4: both readings of a continuation, and unquoted object-literal keys
+    `x --pass\\\n${zq}`, `x --pat\\\n${zq}`, `curl --user\\\nme:${zq}`, `node -e "login({password: \\"${zq}\\"})"`,
+    `node -e "f({ password: '${zq}' })"`, `node -e "f({pin: ${zq}})"`,
   ])('redacts the round-3 credential shape %s', command => {
     const out = redact(command);
     expect(out).not.toContain(zq);
@@ -189,11 +192,23 @@ describe('agent command audit', () => {
   });
   it.each([
     'git config --global user.name Bob', 'npx vitest --config vitest.config.ts run', `curl -d '{"name":"bob"}' u`,
+    'node -e "f({ name: 1 })"', 'docker run -p 80:80 img',
   ])('leaves harmless config keys and JSON members in %s unchanged', command => expect(redact(command)).toBe(command));
+  it('reads --body-file as its own option, not --body', () => {
+    expect(redact('gh secret set X --body-file f')).toContain('--body-file f');
+  });
+  it('keeps every new redaction rule linear on long adversarial input', () => {
+    const started = Date.now();
+    for (const unit of ['b', 'htpasswd -b', '{"password":"', 'password: ', 'config set ', 'gh secret set x ', 'x\\\n']) {
+      redact((unit === 'b' ? 'htpasswd -' : '') + unit.repeat(Math.ceil(16000 / unit.length)));
+    }
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
   it.each([
     ["cat > f <<'EOF'\n" + 'hello world\n'.repeat(1500) + 'EOF', []],
     ['cat <<EOF\nnpm test\nEOF', []],
-    ['bash <<EOF\nnpm test\nEOF', ['npm test/check']],
+    ['bash <<EOF\nnpm test\nEOF', ['npm test/check']], ['cd /x && bash <<EOF\nnpm test\nEOF', ['npm test/check']],
+    ["set -e; bash -s <<'EOF'\nnpm test\nEOF", ['npm test/check']],
     ['npm --loglevel silent test', ['npm test/check']], ['npm --tag x test', ['npm test/check']],
     ['nohup npm test', ['npm test/check']], ["eval 'npm test'", ['npm test/check']], ['NPM test', ['npm test/check']],
   ])('classifies long plain text, heredocs, npm value options and launchers: %s', (command, categories) => {

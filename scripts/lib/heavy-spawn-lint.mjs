@@ -58,7 +58,9 @@ function heavyCommand(command, { depth = 0, substitutions = true, scripts = pack
   // An unterminated scan keeps the raw text (fail closed). Substitutions in a body were already scanned above.
   const heredocs = heredocScan(command);
   const text = heredocs.unterminated ? command : heredocs.text;
-  if (!heredocs.unterminated && heredocs.heredocs.some(doc => /^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(canonicalCommand(doc.head))
+  // The heredoc feeds the head's last segment (`cd x && bash <<EOF`, `set -e; bash -s <<'EOF'`).
+  const feeds = doc => canonicalCommand(parseSegments(doc.head).segments.at(-1) ?? doc.head);
+  if (!heredocs.unterminated && heredocs.heredocs.some(doc => /^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(feeds(doc))
     && inner(doc.body, false))) return true;
   return parseSegments(text).segments.some(segment => {
     // The Bash guard's own classifier first: package test scripts (`npm test`, `npm --prefix . test`, `pnpm t`),

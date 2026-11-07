@@ -38,13 +38,14 @@ const SECRET_SHORT_OPTIONS = [
 ];
 const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w./-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?![\w-])`, 'g');
 // Long options that carry a secret only for one program (`gh secret set X --body v`).
-const SECRET_LONG_OPTIONS = /(?<![\w./-])gh\s+secret\s+set\b[^;|&\n]*?\s(--body)(=?)/g;
+const SECRET_LONG_OPTIONS = /(?<![\w./-])gh\s+secret\s+set\b[^;|&\n]*?\s(--body)(?![\w-])(=?)/g;
 // `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
 // `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key.
 const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:--?[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
 const configKeyIsCredential = key => CREDENTIAL_ASSIGNMENT.test(key.split(/[/:.]/).filter(Boolean).pop() || '');
 // JSON / object-literal members whose name is a credential (`{"password":"v"}`, `{\"api_key\": \"v\"}`, `pin: 1234`).
-const JSON_MEMBER = /(\\?["'])([\w.-]+)\1\s*:\s*(\\?"(?:[^"\\]|\\.)*?\\?"|\\?'[^']*?\\?'|[^\s,}'"]+)/g;
+// The name may be unquoted (`{password: "v"}`, `{ pin: 1234 }`); a name start is anchored, so it stays linear.
+const JSON_MEMBER = /(?<![\w.$-])(\\?["']|)([\w.$-]+)\1\s*:\s*(\\?"(?:[^"\\]|\\.)*?\\?"|\\?'[^']*?\\?'|[^\s,}'"]+)/g;
 // Commands longer than this are cut before redaction so every rule stays linear-time; the cut is marked.
 export const REDACT_MAX_CHARS = 16384;
 
@@ -133,7 +134,8 @@ function redactShortPasswords(text) {
 
 /** `htpasswd -b[…] file user password` (or `-nb user password`): the password is the segment's last word. */
 function redactHtpasswd(text) {
-  return text.replace(/(?<![\w./-])htpasswd\s+-\w*b\w*\s[^;|&\n]*/g, segment => {
+  // `[^\sb]*b` has one way to match a flag cluster, so a long `-bbbb…` cannot backtrack quadratically.
+  return text.replace(/(?<![\w./-])htpasswd\s+-[^\sb]*b\S*\s[^;|&\n]*/g, segment => {
     const lastWord = segment.trimEnd().search(/\S+$/);
     return lastWord < 0 ? segment : segment.slice(0, lastWord) + '[REDACTED]';
   });
@@ -154,22 +156,38 @@ function redactJsonMembers(text) {
     ? `${quote}${name}${quote}:[REDACTED]` : all));
 }
 
+// An unescaped `\`+newline (a line continuation); an escaped backslash before a newline (`x\\⏎`) is none.
+const CONTINUATION = /(?<!\\)((?:\\\\)*)\\\r?\n/g;
+// Past this many words redacted only in the spaced reading, the whole command is withheld (fail closed).
+const CONTINUATION_MAX_WORDS = 256;
+
 export function redact(text) {
-  // An unescaped `\`+newline is a line continuation: bash deletes it, joining the words around it (`--tok\⏎en v`
-  // is `--token v`), so it is removed here too. The backslash can then never pose as an escaped-space value
-  // (`--token \⏎ v`). Before an option dash it becomes a space instead (`line\⏎--password v`), so a glued-on
-  // option is still read as one. An escaped backslash before a newline (`x\\⏎--token v`) is no continuation:
-  // the newline stays a word break.
-  let clean = stripVTControlCharacters(String(text))
-    .replace(/(?<!\\)((?:\\\\)*)\\\r?\n(-?)/g, (all, pairs, dash) => pairs + (dash ? ' -' : ''))
-    .replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
+  const raw = stripVTControlCharacters(String(text));
+  CONTINUATION.lastIndex = 0;
+  if (!CONTINUATION.test(raw)) return redactLine(raw);
+  // Bash deletes a continuation, joining the words around it (`--tok\⏎en v` is `--token v`). A malformed or
+  // multi-line command can also be read with the continuation as a word break (`--pass\⏎v`, `line\⏎--password
+  // v`). Both readings are redacted: the joined one is the output, and every word the spaced reading redacted
+  // is redacted from it too. Deleting the backslash means it can never pose as an escaped-space value.
+  const joined = redactLine(raw.replace(CONTINUATION, '$1'));
+  const spacedText = raw.replace(CONTINUATION, '$1 ');
+  const kept = new Set(redactLine(spacedText).split(/\s+/));
+  const removed = [...new Set(spacedText.slice(0, REDACT_MAX_CHARS).split(/(?:[\s\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp})+/u))]
+    .filter(word => word.length >= 3 && !kept.has(word)); // a 1–2 character word would mangle the whole text
+  if (removed.length > CONTINUATION_MAX_WORDS) return '[REDACTED: command with line continuations]';
+  return removed.sort((a, b) => b.length - a.length).reduce((out, word) => out.split(word).join('[REDACTED]'), joined);
+}
+
+function redactLine(text) {
+  let clean = String(text).replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
   if (clean.length > REDACT_MAX_CHARS) clean = clean.slice(0, REDACT_MAX_CHARS) + ' …[truncated]';
   // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
   // Every rule that starts with a repeated class is anchored to a word start, so none of them is quadratic.
   return redactAssignments(redactJsonMembers(redactPositionalSecrets(redactShortPasswords(redactCredentialOptions(clean
     .replace(/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@"']+@/gi, '$1[REDACTED]@')
     // HTTP-style credential headers and `token: v`, with or without an auth scheme word.
-    .replace(/(?<![\w-])([\w-]+)\s*:\s*(?:(?:Bearer|Basic|Digest|Negotiate|token)\s+)?[^\s"';]+/gi,
+    // A value opening with an escaped quote (`password: \"v\"`) is a quoted member, left to redactJsonMembers.
+    .replace(/(?<![\w-])([\w-]+)\s*:\s*(?:(?:Bearer|Basic|Digest|Negotiate|token)\s+)?[^\s"';\\][^\s"';]*/gi,
       (all, name) => (CREDENTIAL_HEADER.test(name) ? '[REDACTED]' : all))
     // curl/git-style `user:password` pairs.
     .replace(/(?<!\S)(?:--user(?:=|\s+)|-u\s*)[^\s:]*:\S+/g, '[REDACTED]'))))))
@@ -237,7 +255,9 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
   const heredocs = heredocScan(String(cmd));
   if (!heredocs.unterminated) {
     for (const doc of heredocs.heredocs) {
-      if (/^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(canonicalCommand(doc.head))) out.push(...classifyCommand(doc.body, depth + 1, false));
+      // The heredoc feeds the head's last segment (`cd x && bash <<EOF`, `set -e; bash -s <<'EOF'`).
+      const feeds = canonicalCommand(parseSegments(doc.head).segments.at(-1) ?? doc.head);
+      if (/^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(feeds)) out.push(...classifyCommand(doc.body, depth + 1, false));
     }
   }
   for (const segment of parseSegments(heredocs.unterminated ? String(cmd) : heredocs.text).segments) {

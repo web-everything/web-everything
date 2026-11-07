@@ -119,6 +119,8 @@ describe('daemon heavy spawn admission lint', () => {
     "spawnSync('n' + 'pm', ['test']);",
     "spawnSync('node', [`--te${'st'}`]);",
     "execSync('bash <<EOF\\nnpm test\\nEOF');",
+    "execSync('cd /x && bash <<EOF\\nnpm test\\nEOF');",
+    "execSync(\"set -e; bash -s <<'EOF'\\nnpm test\\nEOF\");",
   ])('detects launcher / joined / fork spellings: %s', call => {
     expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
   });
