@@ -236,6 +236,152 @@ describe('soak workflow live PR body transport', () => {
   });
 });
 
+// Shared mock harness for the merge_group-path steps of BOTH gate workflows (soak-replay-gate.yml, merge-gate.yml).
+// Each step runs under `bash -e` ONLY — GitHub's default for a `run:` without a `shell:` key — so any pipefail a
+// step needs must be set inside the step itself, and the tests prove it is.
+const mgHead = 'f'.repeat(40);
+const mgBase = '1'.repeat(40);
+const groupPrs = { 7: { base: '2'.repeat(40), head: '3'.repeat(40) }, 8: { base: '4'.repeat(40), head: '5'.repeat(40) } };
+function stepFixture(files = []) {
+  const root = mkdtempSync(join(tmpdir(), 'gate-step-'));
+  roots.push(root);
+  mkdirSync(join(root, 'bin'));
+  mkdirSync(join(root, 'tmp'));
+  for (const rel of files) { mkdirSync(join(root, rel, '..'), { recursive: true }); writeFileSync(join(root, rel), '// fixture'); }
+  const executable = (name, source) => writeFileSync(join(root, 'bin', name), `#!${process.execPath}\n${source}`, { mode: 0o755 });
+  const record = name => `require('node:fs').appendFileSync(${JSON.stringify(`${name}.jsonl`)}, JSON.stringify(process.argv.slice(2)) + '\\n');`;
+  executable('git', `${record('git')}
+    const args = process.argv.slice(2);
+    const fail = (process.env.GIT_FAIL || '').split(',');
+    if (args[0] === 'merge-base' && fail.includes('no-merge-base:' + args[1])) process.exit(1);
+    if (args[0] === 'merge-base') console.log('0'.repeat(40));
+    if (args[0] === 'archive') { if (fail.includes('archive')) { console.error('fatal: unable to fetch blob from promisor remote'); process.exit(128); } process.stdout.write('tar-stream'); }
+  `);
+  // A tar that reads its stdin and exits 0 even on a stream cut at a member boundary — what real tar does.
+  executable('tar', `${record('tar')} process.stdin.resume(); process.stdin.on('end', () => process.exit(0));`);
+  executable('gh', `${record('gh')}
+    const n = process.argv[3].split('/').pop();
+    const pr = ${JSON.stringify(groupPrs)}[n];
+    process.stdout.write(JSON.stringify({ title: 'fix(daemon): #' + n, body: 'soak-waiver: x', base: { sha: pr.base }, head: { sha: pr.head } }));
+  `);
+  executable('jq', `
+    let s = ''; process.stdin.on('data', d => { s += d; }).on('end', () => {
+      const o = JSON.parse(s); const f = process.argv[3];
+      const v = { '.title // ""': o.title, '.body // ""': o.body, '.base.sha': o.base.sha, '.head.sha': o.head.sha }[f];
+      process.stdout.write(String(v) + '\\n');
+    });
+  `);
+  executable('node', `${record('node')}
+    if (process.argv.includes('--list-group')) console.log('7 8');
+  `);
+  const log = name => existsSync(join(root, `${name}.jsonl`)) ? readFileSync(join(root, `${name}.jsonl`), 'utf8').trim().split('\n').map(JSON.parse) : [];
+  const run = (script, env) => spawnSync('bash', ['--noprofile', '--norc', '-e', '-c', script], {
+    cwd: root, encoding: 'utf8', timeout: 10000,
+    env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, RUNNER_TEMP: join(root, 'tmp'), ...env },
+  });
+  return { root, log, run };
+}
+
+// The class, not the instance: every gate step that pipes without an explicit bash `shell:` must set pipefail itself.
+describe.each(['soak-replay-gate', 'merge-gate'])('%s workflow: piped steps fail closed', name => {
+  const wf = yaml.load(readFileSync(new URL(`../../../.github/workflows/${name}.yml`, import.meta.url), 'utf8'));
+  const piped = wf.jobs[name].steps.filter(s => s.run && /(^|[^|])\|([^|]|$)/m.test(s.run) && s.shell !== 'bash');
+  it('has at least one piped step to check', () => expect(piped.length).toBeGreaterThan(0));
+  it.each(piped.map(s => [s.name, s]))('%s sets -o pipefail', (_n, s) => expect(s.run).toMatch(/^\s*set -o pipefail/m));
+});
+
+describe('soak workflow merge_group step', () => {
+  const mgStep = steps.find(s => s.name?.startsWith('Merge group'));
+  const env = gitFail => ({ GH_TOKEN: 'x', PR_REPO: 'fixture/repo', MG_HEAD_SHA: mgHead, MG_BASE_SHA: mgBase, MG_HEAD_REF: 'gh-readonly-queue/main/pr-7', GIT_FAIL: gitFail });
+  const cliCalls = f => f.log('node').filter(a => a[0] === 'scripts/soak-replay-gate-cli.mjs').map(a => a.find(x => x.startsWith('--head-sha=')));
+  const files = ['scripts/soak-replay-gate-cli.mjs', 'scripts/merge-gate-check.mjs'];
+
+  it('evaluates every PR of the group against its own base/head', () => {
+    const f = stepFixture(files);
+    const result = f.run(mgStep.run, env(''));
+    expect(result.status).toBe(0);
+    expect(cliCalls(f)).toEqual([`--head-sha=${groupPrs[7].head}`, `--head-sha=${groupPrs[8].head}`]);
+    expect(f.log('git').filter(a => a[0] === 'merge-base')).toEqual([['merge-base', groupPrs[7].base, groupPrs[7].head], ['merge-base', groupPrs[8].base, groupPrs[8].head]]);
+  });
+
+  it('merge_group rejects a PR without a merge-base: nonzero status, CLI never run for that PR, the rest still evaluated', () => {
+    const f = stepFixture(files);
+    const result = f.run(mgStep.run, env(`no-merge-base:${groupPrs[7].base}`));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/no merge-base for PR #7/);
+    expect(cliCalls(f)).toEqual([`--head-sha=${groupPrs[8].head}`]);
+  });
+});
+
+describe('merge-gate workflow narrow fetch and merge-group history', () => {
+  const mg = yaml.load(readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8'));
+  const mgSteps = mg.jobs['merge-gate'].steps;
+  const checkout = mgSteps.find(s => s.uses?.startsWith('actions/checkout@'));
+  const fetchStep = mgSteps.find(s => s.name === 'Fetch main history (blobless)');
+  const evalStep = mgSteps.find(s => s.name === "Evaluate the drain's merge gates");
+  const files = ['scripts/merge-gate-check.mjs', '.github/workflows/merge-gate.yml'];
+  const mgEnv = gitFail => ({ REPO: 'fixture/repo', EVENT: 'merge_group', PR_NUMBER: '', MG_HEAD_SHA: mgHead, MG_BASE_SHA: mgBase, MG_HEAD_REF: 'gh-readonly-queue/main/pr-7', GIT_FAIL: gitFail });
+  const gateRuns = f => f.log('node').filter(a => a[0] === 'scripts/lib/merge-gate-ci.mjs');
+
+  it('checks out the main tip only, then fetches complete blobless main history in the very next step', () => {
+    expect(checkout.with).toEqual({ ref: 'main', 'fetch-depth': 1 });
+    expect(mgSteps.indexOf(fetchStep)).toBe(mgSteps.indexOf(checkout) + 1);
+    expect(fetchStep.run).toContain("--unshallow --filter=blob:none origin '+refs/heads/main:refs/remotes/origin/main'");
+  });
+
+  // The fetch step's own shell, against the soak fixture's git mock (same SHALLOW / GIT_FAIL knobs).
+  const runFetch = opts => { const f = fixture('modern'); narrowRun(f, opts); return f; };
+  const narrowRun = (f, { shallow = false, gitFail = '' } = {}) => {
+    f.result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-c', fetchStep.run], {
+      cwd: f.root, encoding: 'utf8', timeout: 10000,
+      env: { ...process.env, PATH: `${join(f.root, 'bin')}:${process.env.PATH}`, GIT_FAIL: gitFail, SHALLOW: shallow ? '1' : '0', MAIN_TIP: mainTip },
+    });
+  };
+
+  it('narrow fetch passes on complete history', () => {
+    const f = runFetch();
+    expect(f.result.status).toBe(0);
+    expect(f.log('git.jsonl')[0]).toEqual(['fetch', '--no-tags', '--unshallow', '--filter=blob:none', 'origin', mainRefspec]);
+  });
+
+  it.each([
+    [{ shallow: true }, /merge-gate: history is still shallow/],
+    [{ gitFail: 'fetch-unshallow' }, /merge-gate: could not fetch main history/],
+    [{ gitFail: 'rev-parse' }, /merge-gate: main tip does not resolve/],
+  ])('narrow fetch fails closed on %j', (opts, message) => {
+    const f = runFetch(opts);
+    expect(f.result.status).not.toBe(0);
+    expect(f.result.stderr).toMatch(message);
+  });
+
+  it('merge group: extracts the group backlog tree and runs the gate against it', () => {
+    const f = stepFixture(files);
+    const result = f.run(evalStep.run, mgEnv(''));
+    expect(result.status).toBe(0);
+    expect(f.log('git')).toContainEqual(['merge-base', mgBase, mgHead]);
+    expect(f.log('tar')).toEqual([['-x', '-C', join(f.root, 'tmp/group-tree')]]);
+    expect(gateRuns(f)).toHaveLength(1);
+    expect(gateRuns(f)[0]).toContain(`--group-tree=${join(f.root, 'tmp/group-tree')}`);
+  });
+
+  it('merge group: no merge-base between the group base and head fails closed before the gate', () => {
+    const f = stepFixture(files);
+    const result = f.run(evalStep.run, mgEnv(`no-merge-base:${mgBase}`));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/no merge-base between the merge group's base and head/);
+    expect(gateRuns(f)).toEqual([]);
+  });
+
+  // Blobless clone: `git archive` lazily fetches backlog blobs and can die mid-stream; tar still exits 0 on a stream
+  // cut at a member boundary. Under GitHub's default `bash -e` (no pipefail) that would gate a partial tree.
+  it('merge group: a failed git archive (lazy blob fetch) fails the step instead of gating a partial tree', () => {
+    const f = stepFixture(files);
+    const result = f.run(evalStep.run, mgEnv('archive'));
+    expect(result.status).not.toBe(0);
+    expect(gateRuns(f)).toEqual([]);
+  });
+});
+
 // Real Git + the real CLI: the YAML's own shell runs against an actual origin whose main moved after the event fired.
 describe('soak workflow against a real Git history (stale event base)', () => {
   const gitEnv = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_'))),

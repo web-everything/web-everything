@@ -139,6 +139,10 @@ jobs:
           DISPATCH_PRS: ${{ inputs.prs }}
           MERGE_GATE_MODE: ${{ vars.MERGE_GATE_MODE }}
         run: |
+          # A `run:` with no `shell:` key is `bash -e {0}` — no pipefail. The blobless clone makes `git archive` below
+          # fetch backlog blobs lazily; if that dies mid-stream, tar still exits 0 and the gate would read a partial
+          # tree. pipefail turns a failed archive into a failed step (fail closed).
+          set -o pipefail
           if [ ! -f scripts/merge-gate-check.mjs ]; then
             if [ -f .github/workflows/merge-gate.yml ]; then
               echo "::error::scripts/merge-gate-check.mjs is missing from main although .github/workflows/merge-gate.yml is there (renamed or removed?) — failing closed." >&2

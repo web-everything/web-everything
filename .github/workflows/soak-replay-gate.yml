@@ -162,6 +162,7 @@ jobs:
           MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
         run: |
+          set -o pipefail # no `shell:` key ⇒ `bash -e` without pipefail; keep every pipe below fail-closed
           if [ ! -f scripts/soak-replay-gate-cli.mjs ] || [ ! -f scripts/merge-gate-check.mjs ]; then
             echo "::error::soak-replay gate: merge-group support not on main yet — failing closed." >&2
             exit 1
