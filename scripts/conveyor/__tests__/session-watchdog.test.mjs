@@ -7,7 +7,7 @@
  *   bounded reader.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +24,7 @@ import sessionStuck from '../health-smells/session-stuck.mjs';
 import ghostListed from '../health-smells/ghost-session-listed.mjs';
 import { probeSessionWatchdog } from '../health-watch.mjs';
 import { runHealthTick, emptyHealthState } from '../health-watch-core.mjs';
-import { fixDispatchClaimRoot } from '../fix-claim-store.mjs';
+import { fixDispatchClaimRoot, listFixDispatchClaims } from '../fix-claim-store.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, '..', 'soak', 'breaks', 'fixtures', 'fix-3771-wait-loop.jsonl');
@@ -273,7 +273,7 @@ describe('runSessionWatchdogPass — the IO shell with fakes', () => {
     const opts = {
       nowMs: NOW, agents: listing, processes: [{ pid: 2009, command: 'claude' }, { pid: 3, command: 'claude' }],
       readTail: (r) => { calls.tailReads.push(r.name); return tails[r.sessionId] ?? null; },
-      readHeavy: () => null, listClaims: () => claims, prHeadFor: () => 'abc', completionFor: () => null,
+      listDispatchClaims: () => [], awaitingVerifyFor: () => null, readHeavy: () => null, listClaims: () => claims, prHeadFor: () => 'abc', completionFor: () => null,
       rm: ({ handle }) => { calls.rm.push(handle); return { removed: true, alreadyGone: false }; },
       releaseFixing: () => ({ released: false, reason: 'absent' }), releaseDispatch: () => ({ released: [], skipped: [] }),
       readLedger: () => ({ emitted: new Set(), acked: new Set() }), appendEvent: (e) => calls.events.push(e),
@@ -671,7 +671,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     const result = runSessionWatchdogPass({
       nowMs: T0, act: true, agents: [listing()], processes: [{ pid: 2009, command: 'claude' }],
       readTail: (r) => { calls.tailReads.push(r.sessionId); return finishedTail(); },
-      readHeavy: () => null, listClaims: () => [], prHeadFor: () => null, completionFor: () => null,
+      listDispatchClaims: () => [], awaitingVerifyFor: () => null, readHeavy: () => null, listClaims: () => [], prHeadFor: () => null, completionFor: () => null,
       stop: ({ handle }) => { calls.stop.push(handle); return { stopped: true }; },
       appendReapEvent: (e) => calls.reapEvents.push(e), log: (line) => calls.logs.push(line),
       ownSessionId: 'orchestrator-not-listed',
@@ -722,6 +722,99 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
       expect(actions).toEqual([expect.objectContaining({ ok: true })]);
     }
   });
+  it.each(['EACCES', 'ENOENT', 'malformed'])('refuses stops for an unreadable entry (%s), naming only the entry', (failure) => {
+    const logs = [];
+    const path = join(fixDispatchClaimRoot(), 'bad-entry', 'lock.json');
+    const readEntry = vi.fn(() => {
+      if (failure === 'malformed') return '{secret-content';
+      throw Object.assign(new Error('secret-content'), { code: failure });
+    });
+    const { calls, actions } = base({
+      claimStoreReadable: () => defaultClaimStoreReadable(() => ['bad-entry'], readEntry, line => logs.push(line)),
+      log: line => logs.push(line),
+    });
+    expect(readEntry).toHaveBeenCalledWith(path, 'utf8');
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+    expect(logs.some(line => line.includes('claim store unreadable') && line.includes('bad-entry/lock.json'))).toBe(true);
+    expect(logs.join(' ')).not.toContain('secret-content');
+  });
+
+  it('reads every entry, including entries after a valid lock', () => {
+    const read = vi.fn(path => path.includes('good-entry')
+      ? JSON.stringify({ owner: 'holder', heartbeatAt: new Date(T0).toISOString() }) : '{}');
+    expect(defaultClaimStoreReadable(() => ['good-entry', 'bad-entry'], read)).toBe(false);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['finished', 'duplicate'])('live dispatch claims of every kind protect %s holders by sessionId or name', (mode) => {
+    const agents = [listing(), listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN })];
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    for (const kind of ['fix', 'ci-heal', 'future-kind']) {
+      for (const sessionId of ['sid-1', undefined]) {
+        const dispatch = { meta: { repo: 'we', pr: 3771, kind, who: 'fix-3771', sessionId } };
+        const listDispatchClaims = vi.fn(() => [dispatch]);
+        const { calls, actions, result } = base({ agents, readTail: () => tail, listDispatchClaims });
+        expect(calls.stop).not.toContain(agents[0].id);
+        if (!sessionId) expect(calls.stop).toEqual([]);
+        expect(actions.every(a => a.sessionId !== 'sid-1')).toBe(true);
+        expect(listDispatchClaims).toHaveBeenCalledWith(fixDispatchClaimRoot(), { liveOnly: true, nowMs: T0 });
+        expect(result.findings.filter(f => ['fixer-stuck', 'stale-claim', 'fix-claim-held-no-progress'].includes(f.type))).toEqual([]);
+        expect(result.events).toEqual([]);
+      }
+    }
+  });
+
+  it('dispatch claims without who use their canonical session name and protect every same-name row', () => {
+    const agents = [listing(), listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN })];
+    const { calls } = base({ agents, listDispatchClaims: () => [{ meta: { repo: 'we', pr: 3771, kind: 'fix' } }] });
+    expect(calls.stop).toEqual([]);
+  });
+
+  it.each(['throws', 'null'])('unreadable dispatch listing (%s) refuses stops', (failure) => {
+    const { calls, actions } = base({ listDispatchClaims: () => {
+      if (failure === 'throws') throw new Error('unreadable');
+      return null;
+    } });
+    expect(calls.stop).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+  });
+
+  it('expired dispatch claims do not protect finished or duplicate holders', () => {
+    const root = mkdtempSync(join(tmpdir(), 'watchdog-dispatch-'));
+    try {
+      mkdirSync(join(root, 'expired'));
+      writeFileSync(join(root, 'expired', 'lock.json'), JSON.stringify({
+        owner: 'holder', heartbeatAt: new Date(T0 - 11 * MIN).toISOString(),
+        meta: { repo: 'we', pr: 3771, kind: 'fix', who: 'fix-3771', sessionId: 'sid-1' },
+      }));
+      for (const mode of ['finished', 'duplicate']) {
+        const agents = [listing(), listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN })];
+        const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+        const { calls } = base({ agents, readTail: () => tail,
+          listDispatchClaims: (_root, options) => listFixDispatchClaims(root, options) });
+        expect(calls.stop).toContain(agents[0].id);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['finished', 'duplicate'])('awaiting verification and resolver throws refuse %s stops; false/null allow them', (mode) => {
+    const old = listing({ cwd: 'scratch/session', extraListingEvidence: true });
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    for (const outcome of ['awaiting', 'throws', 'false', 'null']) {
+      const awaitingVerifyFor = vi.fn(session => {
+        expect(session).toBe(old);
+        if (outcome === 'throws') throw new Error('unknown verification');
+        return outcome === 'null' ? null : { awaiting: outcome === 'awaiting' };
+      });
+      const { calls } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, awaitingVerifyFor });
+      expect(awaitingVerifyFor).toHaveBeenCalledWith(old);
+      expect(calls.stop).toEqual(['false', 'null'].includes(outcome) ? [old.id] : []);
+    }
+  });
+
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
     const { calls, actions } = base({ act: false });
     expect(actions).toEqual([expect.objectContaining({ type: 'stop-session', ok: null })]);

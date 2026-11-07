@@ -80,7 +80,9 @@ import { dispatchDemandMinutes } from '../readiness/heavy-queue-projection.mjs';
 import { readStandardMinutes, admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listLiveFixClaims, releaseFixClaim, FIXING_KIND } from './fix-procedure.mjs';
-import { fixDispatchClaimRoot } from './fix-claim-store.mjs';
+import { fixDispatchClaimRoot, fixDispatchSessionName, listFixDispatchClaims } from './fix-claim-store.mjs';
+import { parseLockEntry } from '../readiness/file-locks.mjs';
+import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
 import { makeCompletionResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
@@ -342,11 +344,12 @@ export function escalationKey({ repo, pr, sessionId, name, classification, headS
 }
 
 /**
- * Turn classified rows + live fix claims + PR heads into findings, actions and escalation events. PURE.
- * @param {{rows:Array<object>, claims:Array<object>, prHeadFor:(repo:string, pr:number)=>string|null,
+ * Turn classified rows + live fixing claims + PR heads into findings, actions and escalation events. PURE.
+ * stopClaims adds other live dispatch kinds to stop protection without changing fixing findings.
+ * @param {{rows:Array<object>, claims:Array<object>, stopClaims?:Array<object>, prHeadFor:(repo:string, pr:number)=>string|null,
  *   standardFor:(kind:string)=>{ms:number, minutes:number}, nowMs:number}} o
  */
-export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor, nowMs, cfg = DEFAULT_SESSION_WATCHDOG }) {
+export function planWatchdog({ rows, claims, stopClaims = claims, prHeadFor = () => null, standardFor, nowMs, cfg = DEFAULT_SESSION_WATCHDOG }) {
   const findings = [];
   const actions = [];
   const events = [];
@@ -365,7 +368,8 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
   const nameShared = (r) => rows.some((o) => o !== r && o.name === r.name && !confirmedDead(o));
   const claimedBy = new Set();
   const claimHolders = new Set();
-  for (const c of claims || []) {
+  // Stop protection includes every live dispatch kind; findings below still use only fixing claims.
+  for (const c of stopClaims || []) {
     const m = c.meta || {};
     const holder = holderOf(c);
     if (m.sessionId) {
@@ -374,6 +378,10 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
       // A name-only claim cannot distinguish sessions sharing a name; protect all of them from stops.
       for (const r of rows) if (r.name === m.who) claimHolders.add(r);
     }
+  }
+  for (const c of claims || []) {
+    const m = c.meta || {};
+    const holder = holderOf(c);
     if (holder) claimedBy.add(holder.name);
     const claimedMs = Date.parse(m.claimedAt ?? '');
     const claimAgeMs = Number.isFinite(claimedMs) ? nowMs - claimedMs : null;
@@ -538,9 +546,22 @@ const isNonTerminal = (a) => a?.state !== 'done' && a?.state !== 'stopped' && a?
  * @returns {{at:string, act:boolean, standards:object, rows:Array<object>, findings:Array<object>,
  *   actions:Array<object>, events:Array<object>, acked:string[]}}
  */
-export function defaultClaimStoreReadable(readDirectory = readdirSync) {
-  try { readDirectory(fixDispatchClaimRoot()); return true; }
+export function defaultClaimStoreReadable(readDirectory = readdirSync, readEntry = readFileSync, log = () => {}) {
+  const root = fixDispatchClaimRoot();
+  let entries;
+  try { entries = readDirectory(root); }
   catch (err) { return err?.code === 'ENOENT'; }
+  for (const entry of entries) {
+    let parsed = null;
+    try { parsed = parseLockEntry(readEntry(join(root, entry, 'lock.json'), 'utf8')); }
+    catch { /* An entry disappearing mid-scan is incomplete evidence, too. */ }
+    if (!parsed) {
+      // Quote the entry name to keep control characters inert; never log lock contents or read errors.
+      log(`session-watchdog: claim store unreadable (${JSON.stringify(`${entry}/lock.json`)}); stops refused until a successful read`);
+      return false;
+    }
+  }
+  return true;
 }
 
 export function runSessionWatchdogPass({
@@ -554,13 +575,15 @@ export function runSessionWatchdogPass({
   readTail = (row) => readWatchdogTail(row, config, nowMs),
   readHeavy = () => readStandardMinutes(admissionLockRoot(REPO_ROOT)),
   listClaims = listLiveFixClaims,
+  listDispatchClaims = listFixDispatchClaims,
   claimStoreReadable = () => {
     // Injected readers own their evidence; the default reader silently returns [] on directory read errors.
-    if (listClaims !== listLiveFixClaims) return true;
-    return defaultClaimStoreReadable();
+    if (listClaims !== listLiveFixClaims && listDispatchClaims !== listFixDispatchClaims) return true;
+    return defaultClaimStoreReadable(readdirSync, readFileSync, log);
   },
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
   completionFor = makeCompletionResolver(),
+  awaitingVerifyFor = makeAwaitingVerifyResolver(),
   rm = rmSessionRecord,
   stop = stopSessionWithRetry,
   ownSessionId = process.env.CLAUDE_CODE_SESSION_ID,
@@ -590,6 +613,7 @@ export function runSessionWatchdogPass({
   const standardFor = (kind) => (standardCache[kind] ??= standardDuration(kind, heavy, config));
 
   const rows = [];
+  const listingForRow = new Map();
   for (const a of listing) {
     if (!a || a.kind !== 'background' || !isNonTerminal(a)) continue;
     const k = watchdogKindOf(a.name);
@@ -610,18 +634,30 @@ export function runSessionWatchdogPass({
       standardMinutes: standard.minutes, standardSource: standard.source,
       class: verdict.class, reason: verdict.reason, evidence: verdict.evidence,
     });
+    listingForRow.set(rows[rows.length - 1], a);
   }
 
   let claims = [];
+  let dispatchClaims = [];
   let claimsReadable = false;
   try {
     if (claimStoreReadable() === true) {
       claims = listClaims === listLiveFixClaims ? listClaims({ nowMs }) : listClaims();
-      claimsReadable = Array.isArray(claims);
+      if (!Array.isArray(claims)) throw new Error('unreadable fixing claims');
+      const dispatch = listDispatchClaims(fixDispatchClaimRoot(), { liveOnly: true, nowMs });
+      if (!Array.isArray(dispatch)) throw new Error('unreadable dispatch claims');
+      dispatchClaims = dispatch.map((claim) => {
+        const meta = claim.meta;
+        // Dispatch acquisition can omit who. Resolve its canonical name only when no sessionId identifies it.
+        if (meta.sessionId || meta.who) return claim;
+        return { ...claim, meta: { ...meta, who: fixDispatchSessionName(meta) } };
+      });
+      claimsReadable = true;
     }
   } catch { /* refuse stops without claim evidence */ }
-  if (!claimsReadable) { claims = []; log('session-watchdog: claim store unreadable; stops refused until a successful read'); }
-  const plan = planWatchdog({ rows, claims, prHeadFor, standardFor, nowMs, cfg: config });
+  if (!Array.isArray(claims)) claims = [];
+  if (!claimsReadable) log('session-watchdog: claim store unreadable; stops refused until a successful read');
+  const plan = planWatchdog({ rows, claims, stopClaims: [...claims, ...dispatchClaims], prHeadFor, standardFor, nowMs, cfg: config });
 
   // Escalation events: write each key once; report which ones a consumer acknowledged.
   let ledger = { emitted: new Set(), acked: new Set() };
@@ -646,6 +682,22 @@ export function runSessionWatchdogPass({
       if (a.type === 'stop-session') {
         if (!claimsReadable || !a.handle || !a.sessionId || (ownSessionId && a.sessionId === ownSessionId)) {
           done.push({ ...a, ok: false, detail: !claimsReadable ? 'refused: claim store unreadable' : a.sessionId === ownSessionId ? 'refused: own session' : 'refused: missing session identity' });
+          continue;
+        }
+        const row = rows.find((r) => r.id === a.handle && r.sessionId === a.sessionId);
+        const source = listingForRow.get(row);
+        let awaiting = null;
+        try {
+          if (!source || typeof awaitingVerifyFor !== 'function') throw new Error('verification evidence unavailable');
+          awaiting = awaitingVerifyFor(source);
+        } catch {
+          done.push({ ...a, ok: false, detail: 'refused: awaiting verification unreadable' });
+          log(`session-watchdog: awaiting verification unreadable; stop refused for ${a.handle}`);
+          continue;
+        }
+        // A null verdict matches the reaper's not-awaiting convention; a thrown resolver refuses above.
+        if (awaiting?.awaiting === true) {
+          done.push({ ...a, ok: false, detail: 'refused: awaiting verification' });
           continue;
         }
         if (stopCount >= Math.floor(config.reapMaxStopsPerTick)) {
