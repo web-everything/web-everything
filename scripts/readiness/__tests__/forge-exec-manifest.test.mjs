@@ -43,6 +43,16 @@ describe('credentialContentFinding GitHub Actions references', () => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n' + content)).toBe(finding);
   });
 
+  // private-key is only refused by the entropy rule (value >= 20 chars); short forms carry no credential there.
+  const unsupported = ["${{ format('abcdefghij0123456789XYZ') }}", "${{ 'abcdefghij0123456789XYZ' }}", '${{ toJSON(secrets) }}',
+    "${{ secrets.X == 'abcdefghij0123456789XYZ' }}"];
+  it.each([
+    ...unsupported.map(value => ['private-key', value]),
+    ...['token', 'secret'].flatMap(field => [...unsupported, '${{ secrets }}', '${{ secrets.X[0] }}'].map(value => [field, value])),
+  ])('refuses unsupported whole-value Actions expression for %s: %s', (field, value) => {
+    expect(scan(`${field}: ${value}\n`)).not.toBeNull();
+  });
+
   it('refuses a literal continuation led by a non-breaking space after a reference', () => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n  \u00a0' + literal + '\n')).not.toBeNull();
   });

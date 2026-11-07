@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { scanBundleRange } from '../remote-git-bundle.mjs';
-import { runRemote } from '../remote-exec.mjs';
+import { logLocalLocation, runRemote } from '../remote-exec.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
 const git = (cwd, ...args) => {
@@ -128,6 +128,68 @@ describe('scanBundleRange lane first-parent scope', () => {
     await expect(scan(failingScopeExec)).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
     expect(failingScopeExec.mock.calls.some(([call]) => call.args.includes('--first-parent'))).toBe(true);
   });
+
+  it.each([
+    ['literal api_key', `api_key: ${literal}\n`, 'high-entropy-api_key'],
+    ['GitHub token', `${token}\n`, 'github-token'],
+  ])('catches a %s added and deleted on a merged side branch, though the merge tree is clean', async (_name, content, finding) => {
+    write('lane.txt', 'clean lane change\n');
+    commit('lane change');
+    git(lane, 'checkout', '-q', '-b', 'side');
+    write('side.yml', content);
+    commit('side adds credential');
+    git(lane, 'rm', '-q', '--', 'side.yml');
+    commit('side removes credential');
+    git(lane, 'checkout', '-q', 'lane');
+    git(lane, ...ident, 'merge', '--no-ff', '-q', '-m', 'merge side', 'side');
+    expect(git(lane, 'ls-tree', '-r', '--name-only', 'HEAD').split('\n')).not.toContain('side.yml');
+    expect(await scan()).toMatchObject({ path: 'side.yml', finding });
+  });
+
+  it.each(['deploy/id_rsa', 'certs/server.pem', 'keys/signing.key'])('rejects a lane-added regular key file %s even with innocuous contents', async path => {
+    write(path, 'not a secret\n');
+    commit('lane adds key-named file');
+    expect(await scan()).toEqual({ path, finding: 'excluded-path' });
+  });
+});
+
+describe('scanBundleRange fails closed on every Git failure shape', () => {
+  const ok = (stdout = '') => ({ code: 0, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0) });
+  const sha = 'a'.repeat(40);
+  const failing = (matches, reply) => vi.fn(async call => (matches(call) ? reply(call) : exec(call)));
+  const isLsTree = call => call.args.includes('ls-tree');
+  const isRevList = call => call.args.includes('rev-list');
+  const isRawLog = call => call.args.includes('--raw');
+
+  it.each([
+    ['non-zero exit', () => ({ code: 128, stdout: Buffer.alloc(0), stderr: Buffer.from('boom') })],
+    ['thrown exec', () => { throw new Error('spawn failed'); }],
+    ['null stdout', () => ({ code: 0, stdout: null, stderr: Buffer.alloc(0) })],
+    ['output without trailing NUL', () => ok(`100644 blob ${sha}\tbase.txt`)],
+    ['malformed meta', () => ok('not-a-mode blob zzz\tbase.txt\0')],
+    ['entry without a tab', () => ok('no-tab-entry\0')],
+    ['entry with an empty path', () => ok(`100644 blob ${sha}\t\0`)],
+  ])('refuses when the prerequisite ls-tree has %s', async (_name, reply) => {
+    write('lane.txt', 'clean lane change\n');
+    commit('lane change');
+    const injected = failing(isLsTree, reply);
+    await expect(scan(injected)).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+    expect(injected.mock.calls.some(([call]) => isLsTree(call))).toBe(true);
+  });
+
+  it.each([
+    ['rev-list non-zero exit', isRevList, () => ({ code: 1, stdout: Buffer.alloc(0), stderr: Buffer.from('boom') })],
+    ['rev-list returns a non-SHA token', isRevList, () => ok('not-a-sha\n')],
+    ['log throws', isRawLog, () => { throw new Error('spawn failed'); }],
+    ['log non-zero exit', isRawLog, () => ({ code: 128, stdout: Buffer.alloc(0), stderr: Buffer.from('boom') })],
+    ['log null stdout', isRawLog, () => ({ code: 0, stdout: null, stderr: Buffer.alloc(0) })],
+  ])('refuses when %s', async (_name, matches, reply) => {
+    write('lane.txt', 'clean lane change\n');
+    commit('lane change');
+    const injected = failing(matches, reply);
+    await expect(scan(injected)).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+    expect(injected.mock.calls.some(([call]) => matches(call))).toBe(true);
+  });
 });
 
 describe('runRemote local fallback location logging', () => {
@@ -142,5 +204,35 @@ describe('runRemote local fallback location logging', () => {
     expect(result).toMatchObject({ mode: 'not-started', terminated: true, reason: 'invalid-parameters' });
     expect(noDispatch).not.toHaveBeenCalled();
     expect(log.mock.calls).toEqual([['location=local reason=invalid-parameters\n']]);
+  });
+});
+
+describe('logLocalLocation', () => {
+  it.each(['not-started', 'fallback'])('logs exactly one location line for a %s result', mode => {
+    const log = vi.fn();
+    logLocalLocation({ mode, reason: 'forge-busy' }, log);
+    expect(log.mock.calls).toEqual([['location=local reason=forge-busy\n']]);
+  });
+
+  it.each([
+    ['LF', 'x\nlocation=remote'], ['CR', 'x\rlocation=remote'], ['CRLF', 'x\r\nlocation=remote'],
+    ['U+2028', 'x location=remote'], ['U+2029', 'x location=remote'], ['NEL', 'x\u0085location=remote'],
+    ['ESC', 'x\u001b[2Jlocation=remote'], ['NUL', 'x\u0000location=remote'],
+  ])('strips %s from a fallback reason so exactly one sanitised line is written', (_name, reason) => {
+    const log = vi.fn();
+    logLocalLocation({ mode: 'fallback', reason: `forge-rejected:${reason}` }, log);
+    expect(log).toHaveBeenCalledTimes(1);
+    const [[line]] = log.mock.calls;
+    expect(line.endsWith('\n') && line.indexOf('\n') === line.length - 1).toBe(true);
+    expect(line).toMatch(/^location=local reason=forge-rejected:x(?:\[2J)?location=remote\n$/);
+  });
+
+  it.each([
+    [{ mode: 'remote', reason: 'x' }], [{ mode: 'unconfirmed', reason: 'ambiguous-result' }],
+    [{ mode: 'not-started' }], [{ mode: 'fallback', reason: '' }], [undefined],
+  ])('writes nothing for %j', result => {
+    const log = vi.fn();
+    logLocalLocation(result, log);
+    expect(log).not.toHaveBeenCalled();
   });
 });
