@@ -8,7 +8,7 @@ import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReas
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
-import { buildReviewedShaMarker, buildClearedHumanMarker, parseLatestHumanClearedSha } from '../review-escalation.mjs';
+import { buildReviewedShaMarker, buildReviewedDiffMarker, buildClearedHumanMarker, buildClearedFromMarker, parseLatestHumanClearedSha } from '../review-escalation.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds } from '../../conveyor/standing-ruling-io.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { proveHumanOnlyLicense } from '../human-only-enqueue-license.mjs';
@@ -1265,10 +1265,10 @@ const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'bro
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 // The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.
 const human = { author: { login: 'chalbert' } };
-const accept = (sha, cleared = false, who = cleared ? human : bot) => ({ ...who, body: cleared
-  ? ['✅ review — `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n')
+const accept = (sha, cleared = false, who = cleared ? human : bot) => ({ ...who, ...(cleared ? { id: 'IC_clearance' } : {}), body: cleared
+  ? ['✅ review — `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildReviewedDiffMarker('d'.repeat(64)), buildClearedHumanMarker('operator')].join('\n')
   : ['✅ review — accepted', '', buildReviewedShaMarker(sha)].join('\n') });
-const restamp = sha => ({ ...bot, body: ['📌 review — acceptance re-stamped after a rebase (no new review)', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n') });
+const restamp = sha => ({ ...bot, body: ['📌 review — acceptance re-stamped after a rebase (no new review)', '', buildReviewedShaMarker(sha), buildReviewedDiffMarker('d'.repeat(64)), buildClearedHumanMarker('operator'), buildClearedFromMarker('IC_clearance')].join('\n') });
 // The exact body review-job.mjs posts when carryAcrossRebase moves a verdict from `from` to `to`.
 const carry = ({ from = prior, to = head, findings = [], gates = [], author = bot.author } = {}) => ({ author, body: [
   ...gates.map(o => redTeamGateMarker(5283, to, o)),

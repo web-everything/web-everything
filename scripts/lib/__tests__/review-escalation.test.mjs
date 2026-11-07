@@ -38,6 +38,9 @@ import {
   isPolicyDerivationPath,
   parseOperatorClearance,
   parseLatestHumanClearedSha,
+  latestHumanClearanceSourceId,
+  CLEARED_FROM_MARKER,
+  buildClearedFromMarker,
   headEverHumanCleared,
   shouldReparkForTestTampering,
   buildClearedHumanMarker,
@@ -2273,9 +2276,8 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
 
     it('preserves clearance after a plain accept on the same SHA, case-insensitively', () => {
       const comments = [clear(head), accept];
-      // R690 — the automation plain accept is not a human comment, so it no longer masks the real clearance
-      // (it cannot clear anything either; the head-bound callers compare the returned sha to the live head).
-      expect(parseLatestHumanClearedSha(comments)).toBe(head);
+      // R706 — trusted plain accepts supersede latest coverage; historical coverage remains.
+      expect(parseLatestHumanClearedSha(comments)).toBeNull();
       expect(parseLatestHumanClearedSha([clear(head), { ...accept, author: { login: 'chalbert' } }])).toBeNull();
       expect(headEverHumanCleared(comments, head.toUpperCase())).toBe(true);
     });
@@ -2362,7 +2364,7 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
       expect(parseLatestHumanClearedSha([operatorClear, forgedNewer])).toBe(head);
       expect(parseLatestHumanClearedSha([forgedNewer])).toBeNull();
       const forgedPlainNewer = { body: buildReviewedShaMarker('8'.repeat(40)), author: { login: 'web-everything' } };
-      expect(parseLatestHumanClearedSha([operatorClear, forgedPlainNewer])).toBe(head);
+      expect(parseLatestHumanClearedSha([operatorClear, forgedPlainNewer])).toBeNull();
     });
 
     it('the test-tampering re-park HOLDS on an automation-forged clearance and RELEASES on a real operator one', () => {
@@ -3028,5 +3030,93 @@ describe('pending beside accepted', () => {
     expect(r.comment).toContain(facts.acceptedSha);
     expect(r.comment).toContain(facts.headSha);
     expect(r.comment).toContain('review:pending');
+  });
+});
+
+
+describe('R706 — proven human-clearance carriers', () => {
+  const original = 'a'.repeat(40), head = 'b'.repeat(40), next = 'c'.repeat(40);
+  const diff = 'd'.repeat(64);
+  const source = (over = {}) => ({ id: 'IC_original', author: { login: 'chalbert' },
+    body: [buildReviewedShaMarker(original), buildClearedHumanMarker('Ada'), buildReviewedDiffMarker(diff)].join('\n'), ...over });
+  const carrier = (over = {}) => ({ author: { login: 'web-everything' },
+    body: [buildReviewedShaMarker(head), buildClearedHumanMarker('Ada'), buildClearedFromMarker('IC_original'), buildReviewedDiffMarker(diff)].join('\n'), ...over });
+
+  it('exports cleared-from and refuses empty or unsafe citation ids', () => {
+    expect(CLEARED_FROM_MARKER).toBe('cleared-from');
+    for (const id of ['', null, undefined, 'abc', 'IC_ x', 'IC_<>', 'IC_ok\n']) expect(buildClearedFromMarker(id)).toBe('');
+    expect(buildClearedFromMarker('IC_safe=-')).toBe('<!-- cleared-from: IC_safe=- -->');
+  });
+  it('carried restamp WITH cited human clearance and unchanged diff counts', () => {
+    const comments = [source(), carrier()];
+    expect(parseLatestHumanClearedSha(comments)).toBe(head);
+    expect(headEverHumanCleared(comments, head)).toBe(true);
+    expect(latestHumanClearanceSourceId(comments)).toBe('IC_original');
+  });
+  it('without citation the carried restamp is refused', () => {
+    const comments = [source(), carrier({ body: carrier().body.replace(buildClearedFromMarker('IC_original'), '') })];
+    expect(parseLatestHumanClearedSha(comments)).toBe(original);
+    expect(headEverHumanCleared(comments, head)).toBe(false);
+  });
+  it('citing a bot-authored source is refused', () => {
+    const comments = [source({ author: { login: 'web-everything' } }), carrier()];
+    expect(parseLatestHumanClearedSha(comments)).toBeNull();
+    expect(headEverHumanCleared(comments, head)).toBe(false);
+  });
+  it('changed diff is refused', () => {
+    const comments = [source(), carrier({ body: carrier().body.replace(diff, 'e'.repeat(64)) })];
+    expect(parseLatestHumanClearedSha(comments)).toBe(original);
+    expect(headEverHumanCleared(comments, head)).toBe(false);
+  });
+  it('unknown carrier author is refused', () => {
+    for (const author of [undefined, null, {}, { login: 'unknown' }]) {
+      const comments = [source(), carrier({ author, viewerDidAuthor: true })];
+      expect(parseLatestHumanClearedSha(comments)).toBe(original);
+      expect(headEverHumanCleared(comments, head)).toBe(false);
+    }
+  });
+  it('forged newer automation comment neither clears nor masks an older human clearance', () => {
+    const comments = [source(), carrier({ body: carrier().body.replace('IC_original', 'IC_forged') })];
+    expect(parseLatestHumanClearedSha(comments)).toBe(original);
+    expect(headEverHumanCleared(comments, head)).toBe(false);
+  });
+  it('a chain of two restamps resolves to the original human comment id', () => {
+    const comments = [source(), carrier({ id: 'IC_carrier' }), carrier({ body: carrier().body.replace(head, next) })];
+    expect(parseLatestHumanClearedSha(comments)).toBe(next);
+    expect(headEverHumanCleared(comments, head)).toBe(true);
+    expect(latestHumanClearanceSourceId(comments)).toBe('IC_original');
+    expect(parseLatestHumanClearedSha([...comments, carrier({ body: carrier().body.replace('IC_original', 'IC_carrier') })])).toBe(next);
+  });
+  it('a plain accept supersedes and a later bot restamp cannot revive the old clearance', () => {
+    for (const sha of [original, head]) {
+      const comments = [source(), { author: { login: 'web-everything' }, body: buildReviewedShaMarker(sha) }, carrier()];
+      expect(parseLatestHumanClearedSha(comments)).toBeNull();
+      expect(latestHumanClearanceSourceId(comments)).toBeNull();
+      expect(headEverHumanCleared(comments, head)).toBe(false);
+    }
+  });
+  it('refuses duplicate citations, missing ids, non-clearance sources and absent fingerprints', () => {
+    const rows = [
+      [source(), carrier({ body: carrier().body + '\n' + buildClearedFromMarker('IC_original') })],
+      [source({ id: undefined }), carrier()],
+      [source(), source(), carrier()],
+      [source({ body: buildReviewedShaMarker(original) }), carrier()],
+      [source({ body: source().body.replace(buildReviewedDiffMarker(diff), '') }), carrier()],
+      [source(), carrier({ body: carrier().body.replace(buildReviewedDiffMarker(diff), '') })],
+      [source(), carrier({ body: carrier().body.replace(diff, 'g'.repeat(64)) })],
+      [carrier(), source()],
+    ];
+    for (const comments of rows) {
+      expect(headEverHumanCleared(comments, head)).toBe(false);
+      expect(parseLatestHumanClearedSha(comments)).not.toBe(head);
+    }
+  });
+  it('round-trips buildVerdictComment restamp with humanClearance actor, sha and sourceId', async () => {
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const body = buildVerdictComment({ to: 'restamp', actor: 'drain', headSha: head, reviewedDiff: diff,
+      humanClearance: { actor: 'Ada', sha: original, sourceId: 'IC_original' } });
+    expect(body).toContain(buildClearedFromMarker('IC_original'));
+    expect(parseLatestHumanClearedSha([source(), carrier({ body })])).toBe(head);
+    expect(parseLatestHumanClearedSha([carrier({ body })])).toBeNull();
   });
 });

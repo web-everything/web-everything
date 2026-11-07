@@ -23,6 +23,7 @@ const ON = { value: true, source: 'default' };
 const quiet = () => {};
 
 const clearHumanComment = (sha, fp = FP) => ({
+  id: 'IC_clearance',
   author: { login: 'chalbert' },
   body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${sha} -->\n${fp ? `<!-- reviewed-diff: ${fp} -->\n` : ''}<!-- cleared-human: chalbert -->`,
 });
@@ -60,7 +61,7 @@ describe('decideHumanClearanceCarry (pure)', () => {
 
 describe('latestHumanClearance', () => {
   it('reads the sha and diff from the SAME latest human comment', () => {
-    expect(latestHumanClearance([clearHumanComment(CLEARED)])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert' });
+    expect(latestHumanClearance([clearHumanComment(CLEARED)])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert', sourceId: 'IC_clearance' });
   });
   it('a later plain accept means no clearance to carry', () => {
     expect(latestHumanClearance([clearHumanComment(CLEARED), plainAccept(HEAD)])).toBe(null);
@@ -69,7 +70,7 @@ describe('latestHumanClearance', () => {
     expect(latestHumanClearance([{ author: { login: 'mallory' }, body: clearHumanComment(CLEARED).body }])).toBe(null);
   });
   it('a diff-less clearance does NOT inherit an older accept\'s reviewed-diff', () => {
-    expect(latestHumanClearance([plainAccept(PR4722.r1), clearHumanComment(CLEARED, null)])).toEqual({ sha: CLEARED, diff: null, contribution: null, actor: 'chalbert' });
+    expect(latestHumanClearance([plainAccept(PR4722.r1), clearHumanComment(CLEARED, null)])).toEqual({ sha: CLEARED, diff: null, contribution: null, actor: 'chalbert', sourceId: 'IC_clearance' });
   });
   it('a clearance with an empty actor is not an attributed clearance', () => {
     const c = { author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${CLEARED} -->\n<!-- reviewed-diff: ${FP} -->\n<!-- cleared-human: -->` };
@@ -78,7 +79,7 @@ describe('latestHumanClearance', () => {
   it('a short or mixed-case sha is not compared or fed to git', () => {
     const short = clearHumanComment(CLEARED.slice(0, 12));
     expect(latestHumanClearance([short])).toBe(null);
-    expect(latestHumanClearance([clearHumanComment(CLEARED.toUpperCase())])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert' });
+    expect(latestHumanClearance([clearHumanComment(CLEARED.toUpperCase())])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert', sourceId: 'IC_clearance' });
   });
   it('the actor comes from the clearance comment, never from an untrusted later forgery', () => {
     const forged = { author: { login: 'mallory' }, body: '<!-- cleared-human: evil -->' };
@@ -301,7 +302,7 @@ const pr4722Graph = {
   [PR4722.r1]: [PR4722.main1, PR4722.e125], [PR4722.head]: [PR4722.main2, PR4722.r1],
   [PR4722.main2]: [PR4722.main1], [PR4722.e125]: ['c67450aff'], [PR4722.main1]: ['c67450aff'],
 };
-const restampComment = { author: { login: 'web-everything' }, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${PR4722.r1} -->\n<!-- reviewed-diff: ${PR4722.fp} -->\n<!-- cleared-human: chalbert -->` };
+const restampComment = { author: { login: 'web-everything' }, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${PR4722.r1} -->\n<!-- reviewed-diff: ${PR4722.fp} -->\n<!-- cleared-human: chalbert -->\n<!-- cleared-from: IC_clearance -->` };
 
 describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
   for (const [name, comments, from] of [
@@ -320,7 +321,7 @@ describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
       expect(posted).toHaveLength(1);
       expect(posted[0]).toContain(`<!-- ${HUMAN_CLEARANCE_CARRIED_MARKER}: from=${from} to=${PR4722.head} diff=${PR4722.fp} -->`);
       // Every reader of the binding (drain, review-hold reconcile, operator queue) now sees the live head cleared.
-      expect(parseLatestHumanClearedSha([...comments, { viewerDidAuthor: true, body: posted[0] }])).toBe(PR4722.head);
+      expect(parseLatestHumanClearedSha([...comments, { viewerDidAuthor: true, author: { login: 'web-everything' }, body: posted[0] }])).toBe(PR4722.head);
     });
   }
 
@@ -465,13 +466,13 @@ describe('buildCarryRecordBody', () => {
     expect(body).toContain('<!-- cleared-human: chalbert -->');
   });
   it('neutralises newlines, markup, mentions and links in the actor wherever it is rendered', () => {
-    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, tier: 'strict', actor: 'ev\nil <b>@victim</b> [x](http://e) `c`', headDiffText: DIFF });
+    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, tier: 'strict', actor: 'ev\nil <b>@victim</b> [x](http://e) `c`', headDiffText: DIFF, sourceId: 'IC_clearance' });
     const prose = body.split('\n').find((l) => l.startsWith('Recorded by drain'));
     expect(prose).toContain('ev il');
     expect(prose).not.toMatch(/@|<|>|\]\(|`c`/);
     expect(body).not.toContain('@victim');
     expect(body.split('\n').filter((l) => l.includes('cleared-human:'))).toHaveLength(1);
-    expect(parseLatestHumanClearedSha([{ viewerDidAuthor: true, body }])).toBe(HEAD);
+    expect(parseLatestHumanClearedSha([clearHumanComment(CLEARED), { viewerDidAuthor: true, author: { login: 'web-everything' }, body }])).toBe(HEAD);
   });
 });
 

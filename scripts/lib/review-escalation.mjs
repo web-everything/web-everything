@@ -26,8 +26,17 @@ import { POLICY_THRESHOLDS, POLICY_VERSION, POLICY_DIGEST } from './review-polic
 // #4140 — the shared trusted-author gate every coverage-deciding marker reader (`parseReviewedSha`,
 // `parseReviewedDiff`, `parseReviewedContribution`, `parseLatestHumanClearedSha`) now runs every comment through
 // before matching its marker, closing the residual `marker-authorship.mjs`'s own header named as a follow-up.
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { isHumanOperatorComment } from './operator-identity.mjs';
+import { isTrustedMarkerAuthor, OPERATOR_LOGINS } from './marker-authorship.mjs';
+
+// Restated from operator-identity.mjs#isHumanOperatorComment, deliberately not imported: operator-identity.mjs imports
+// red-team-gate.mjs, which imports this module, so importing it here is a cycle that leaves red-team-gate's
+// REVIEWED_SHA_MARKER in its temporal dead zone at load. Keep the two definitions identical.
+function isHumanOperatorComment(c) {
+  const a = typeof c === 'string' ? null : (c?.author ?? c?.user);
+  const login = String((typeof c === 'string' ? '' : (c?.author?.login ?? c?.user?.login)) ?? '').toLowerCase();
+  return login.length > 0 && String(a?.type ?? '') !== 'Bot' && !login.includes('[bot]')
+    && a?.is_bot !== true && OPERATOR_LOGINS.includes(login);
+}
 
 /** Shared operation identity; core consumers must not import operation declarations. */
 export const REVIEW_PR_OP_ID = 'review-pr';
@@ -2014,6 +2023,80 @@ export function parseChangesVerdictProse(body) {
   return actor ? { actor, channel: at === -1 ? '' : m[1].slice(at + 5).trim(), end: m.index + m[0].length } : null;
 }
 
+/** R706 — a carrier cites the original human comment, never another carrier. */
+export const CLEARED_FROM_MARKER = 'cleared-from';
+const CLEARED_FROM_ID_RE = /^[A-Za-z0-9_=-]{4,}$/;
+const CLEARED_FROM_RE = new RegExp(`<!--\\s*${CLEARED_FROM_MARKER}:\\s*([^>]*?)\\s*-->`, 'g');
+const CARRY_PROOF_RE = /<!--\s*human-clearance-carried:\s*from=([0-9a-fA-F]{40})\s+to=([0-9a-fA-F]{40})\s+diff=[0-9a-fA-F]{64}\s*-->/;
+const safeClearanceId = id => typeof id === 'string' && id.trim() === id && CLEARED_FROM_ID_RE.test(id);
+export function buildClearedFromMarker(id) {
+  return safeClearanceId(id)
+    ? `<!-- ${CLEARED_FROM_MARKER}: ${id} -->` : '';
+}
+
+// One ordered state machine for latest coverage, historical coverage, and original-source resolution.
+// Invalid carriers are invisible; trusted plain accepts reset the active source, even on another head.
+function humanClearanceStates(comments) {
+  const thread = Array.isArray(comments) ? comments : [];
+  const byId = new Map();
+  for (const c of thread) {
+    if (!safeClearanceId(c?.id)) continue;
+    // Ambiguous ids are unreadable evidence, never a choice of which source to trust.
+    byId.set(c.id, byId.has(c.id) ? null : c);
+  }
+  const states = [];
+  let sourceId = null;
+  let chainShas = [];
+  let plainSince = [];
+  const related = (a, b) => !!a && !!b && (a.startsWith(b) || b.startsWith(a));
+  for (const c of thread) {
+    const login = c?.author?.login ?? c?.user?.login;
+    if (typeof login !== 'string' || !login.trim()) continue; // Unknown poster, including viewer-only evidence.
+    const human = isHumanOperatorComment(c);
+    if (!human && !isTrustedMarkerAuthor(c)) continue;
+    const body = typeof c?.body === 'string' ? c.body : '';
+    // A plain accept's marker name is matched case-insensitively here so it can never be dodged by casing.
+    const sha = parseReviewedShaMarker(body)
+      || (human ? '' : (new RegExp(REVIEWED_SHA_RE.source, 'i').exec(body)?.[1] ?? '').toLowerCase());
+    if (!sha) continue;
+    const hasMarker = new RegExp(CLEARED_HUMAN_RE.source).test(body);
+    const cleared = hasMarker || (human && new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(body));
+    if (human) {
+      sourceId = cleared && safeClearanceId(c.id) && byId.get(c.id) === c ? c.id : null;
+      chainShas = [sha];
+      plainSince = [];
+    } else if (hasMarker) {
+      if (/^(unknown|ghost|none|null|undefined)$/i.test(login.trim())) continue; // a placeholder login is an unreadable author
+      const citations = [...body.matchAll(new RegExp(CLEARED_FROM_RE.source, 'g'))];
+      if (citations.length !== 1) continue;
+      const citedId = citations[0][1].trim();
+      const source = byId.get(citedId);
+      if (!sourceId || sourceId !== citedId || !source || !isHumanOperatorComment(source)) continue;
+      const sourceBody = typeof source.body === 'string' ? source.body : '';
+      if (!parseReviewedShaMarker(sourceBody)
+        || !(new RegExp(CLEARED_HUMAN_RE.source).test(sourceBody)
+          || new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(sourceBody))) continue;
+      const fingerprint = parseReviewedDiff([c]);
+      const sameDiff = !!fingerprint && fingerprint === parseReviewedDiff([source]);
+      // The drain's own mechanical carry record (human-clearance-carry.mjs) proves unchanged content by git proof
+      // rather than by the strict fingerprint: accept its carry marker when it names exactly this source head → this head.
+      // Restated here, not imported: human-clearance-carry.mjs imports this module, so importing it back is a cycle.
+      const carried = new RegExp(CARRY_PROOF_RE.source).exec(body);
+      const sourceSha = parseReviewedShaMarker(sourceBody);
+      const carryProof = !!carried && carried[1].toLowerCase() === sourceSha && carried[2].toLowerCase() === sha;
+      if (!sameDiff && !carryProof) continue;
+      // A trusted plain accept of the cleared head, any head already carried to, or the head being carried to, supersedes the clearance;
+      // one for an unrelated head does not (the same reading the drain's hold applies).
+      if (plainSince.some(p => related(p, sha) || chainShas.some(h => related(p, h)))) continue;
+      chainShas.push(sha);
+    } else {
+      plainSince.push(sha);
+    }
+    states.push({ sha, cleared, sourceId });
+  }
+  return states;
+}
+
 /**
  * #xuboo0q — did the LATEST accept-shaped comment (whichever comment stamped the most recent `reviewed-sha`
  * marker) ALSO carry the `clear-human` ceremony marker IN THAT SAME COMMENT? Pure.
@@ -2028,6 +2111,10 @@ export function parseChangesVerdictProse(body) {
  * `review-set-label.mjs --to=clear-human` comment stamps `reviewed-sha` and `cleared-human` together, so a
  * later plain accept (which stamps `reviewed-sha` alone) correctly reports no human coverage for its head.
  *
+ * R706: trusted automation may carry this clearance only by citing the active original human comment
+ * exactly once, with the same non-null reviewed-diff fingerprint. Invalid carriers are skipped entirely;
+ * a trusted plain accept resets the source and supersedes the clearance.
+ *
  * @returns {string|null} the reviewed SHA, lowercased, ONLY when the latest accept-shaped comment was a
  *   `clear-human` ceremony; `null` when it was a plain accept, or no accept-shaped comment exists at all.
  *
@@ -2037,35 +2124,19 @@ export function parseChangesVerdictProse(body) {
  * clearance (review round 1 on PR #2716 — the "piggyback").
  */
 export function parseLatestHumanClearedSha(comments) {
-  let latestSha = null;
-  let latestWasHumanCleared = false;
-  for (const c of Array.isArray(comments) ? comments : []) {
-    const body = c && typeof c.body === 'string' ? c.body : '';
-    if (!body) continue;
-    // R690 — a human clearance is a HUMAN's: only a human operator login counts (automation, an app/bot, an unknown or
-    // unreadable author all skip, so a forged automation comment neither clears nor masks a real older clearance).
-    if (!isHumanOperatorComment(c)) continue;
-    REVIEWED_SHA_RE.lastIndex = 0;
-    let m;
-    let bodySha = null;
-    while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
-    if (bodySha === null) continue; // not an accept-shaped comment — carries no reviewed-sha at all
-    CLEARED_HUMAN_RE.lastIndex = 0;
-    let bodyHumanCleared = CLEARED_HUMAN_RE.exec(body) !== null;
-    if (!bodyHumanCleared) {
-      CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
-      bodyHumanCleared = CLEARED_HUMAN_PROSE_RE.exec(body) !== null;
-    }
-    latestSha = bodySha;
-    latestWasHumanCleared = bodyHumanCleared;
-  }
-  return latestWasHumanCleared ? latestSha : null;
+  const latest = humanClearanceStates(comments).at(-1);
+  return latest?.cleared ? latest.sha : null;
+}
+
+/** Original human comment id of the active clearance; absent or superseded evidence → null. */
+export function latestHumanClearanceSourceId(comments) {
+  const latest = humanClearanceStates(comments).at(-1);
+  return latest?.cleared ? latest.sourceId : null;
 }
 
 /**
  * Whether any trusted-comment prefix human-cleared this head, even if a later plain accept hides it.
- * Each new clearance comes from one comment's paired markers, so checking comments individually preserves
- * prefix semantics without repeatedly scanning the growing thread.
+ * The shared ordered scan checks each carrier against the active original source at that prefix.
  * @param {Array<object>} comments comments in thread order
  * @param {string} headSha head to protect (case-insensitive)
  * @returns {boolean} false for non-array/empty comments or a blank head
@@ -2074,7 +2145,7 @@ export function parseLatestHumanClearedSha(comments) {
 export function headEverHumanCleared(comments, headSha) {
   if (!Array.isArray(comments) || typeof headSha !== 'string' || !headSha.trim()) return false;
   const head = headSha.toLowerCase();
-  return comments.some((c) => isHumanOperatorComment(c) && parseLatestHumanClearedSha([c]) === head);
+  return humanClearanceStates(comments).some(state => state.cleared && state.sha === head);
 }
 
 /**

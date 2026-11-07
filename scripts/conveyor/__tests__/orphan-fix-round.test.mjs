@@ -142,7 +142,7 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
 
   it('a trusted human clearance prevents rearm only when it names the current head', () => {
     const withClearance = (headSha) => pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
-      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha })),
+      { ...c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha }), { login: 'chalbert' }), id: 'IC_human_clearance' },
     ]);
     const olderHead = 'd9829f557f3f264ac885722cb9afef18bd91ca7f';
     const older = withClearance(olderHead);
@@ -156,7 +156,7 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
 
   it('clear-human then a same-head plain accept remains protected from orphan rearm', () => {
     const pr = pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
-      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: HEAD })),
+      { ...c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: HEAD }), { login: 'chalbert' }), id: 'IC_human_clearance' },
       c('2026-10-10T15:23:00Z', buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: HEAD })),
     ]);
     expect(parseLatestHumanClearedSha(pr.comments)).toBeNull();
@@ -164,13 +164,13 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
   });
 
   it.each([
-    ['trusted current-head clearance', HEAD, BOT, 'none'],
-    ['trusted stale-head clearance', 'd9829f557f3f264ac885722cb9afef18bd91ca7f', BOT, 'rearm'],
+    ['trusted current-head clearance', HEAD, { login: 'chalbert' }, 'none'],
+    ['trusted stale-head clearance', 'd9829f557f3f264ac885722cb9afef18bd91ca7f', { login: 'chalbert' }, 'rearm'],
     ['untrusted current-head marker', HEAD, { login: 'drive-by' }, 'rearm'],
     ['current-head marker with no author', HEAD, null, 'rearm'],
   ])('orphan guard respects %s with a mixed-case live head', (_name, headSha, author, decision) => {
     const pr = pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
-      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author),
+      { ...c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author), id: 'IC_human_clearance' },
     ], { headRefOid: HEAD.toUpperCase() });
     const plan = planOrphanFixRound({ pr, nowMs: NOW });
     expect(plan.decision).toBe(decision);

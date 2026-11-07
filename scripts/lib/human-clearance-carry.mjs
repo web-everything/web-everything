@@ -46,7 +46,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   parseLatestHumanClearedSha, parseReviewedSha, parseReviewedDiff, parseOperatorClearance, parseReviewedContribution,
-  buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker,
+  buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId,
 } from './review-escalation.mjs';
 import { compareCarryFingerprints, ensureCommitReadable, liveCarryFingerprints, proveReplayEquivalent, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isNumberingTolerableLaterBody, proveNumberingOnlyMove, resolveNumberingHumanClearanceSetting } from './numbering-carry.mjs';
@@ -99,7 +99,7 @@ export function latestHumanClearance(comments) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
   const clearance = parseOperatorClearance([latest]);
   if (!clearance) return null;
-  return { sha, diff: parseReviewedDiff([latest]), contribution: parseReviewedContribution([latest]), actor: sanitizeActor(clearance.actor) };
+  return { sha, diff: parseReviewedDiff([latest]), contribution: parseReviewedContribution([latest]), actor: sanitizeActor(clearance.actor), sourceId: latestHumanClearanceSourceId(list) };
 }
 
 /**
@@ -286,7 +286,7 @@ export function buildCarryMarker({ fromSha, toSha, fingerprint }) {
  * (what `parseLatestHumanClearedSha` requires), with the reviewed diff/contribution of the live net diff text.
  * @param {{fromSha:string, toSha:string, fingerprint:string, actor:string, headDiffText:string, mechanicalReason?:string, tier?:'strict'|'contribution'|'numbering'|'tree'}} o
  */
-export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawActor, headDiffText, mechanicalReason = '', tier = 'strict' }) {
+export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawActor, headDiffText, mechanicalReason = '', tier = 'strict', sourceId = '' }) {
   const actor = sanitizeActor(rawActor);
   return [
     '📌 review — human clearance carried forward (equivalent change after a mechanical refresh, no new review)',
@@ -308,6 +308,8 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     buildReviewedDiffMarker(headDiffText),
     buildReviewedContributionMarker(headDiffText),
     buildClearedHumanMarker(actor),
+    // R706 — the original human clearance comment this record carries; without it the parser refuses the record.
+    buildClearedFromMarker(sourceId),
     buildCarryMarker({ fromSha, toSha, fingerprint }),
   ].filter((l) => l !== undefined).join('\n');
 }
@@ -406,7 +408,7 @@ export function applyHumanClearanceCarry({
         reason: `human clearance carry (${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)}) not recorded: ${changed} — merge deferred this pass` };
     }
   }
-  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason });
+  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason, sourceId: evidence?.humanClearance?.sourceId ?? '' });
   try {
     exec('gh', ['pr', 'comment', String(pr), ...(repo ? ['--repo', repo] : []), '--body', body],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
