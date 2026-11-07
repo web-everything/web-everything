@@ -16,8 +16,9 @@ const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
 }).format(new Date(value));
 
-// Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, `--pass`, …).
-const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|^pass$|^pw$|credential|auth(?!or)|cookie|key$/i;
+// Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, `--pass`,
+// `--pat`/`--gitlab-pat` personal access tokens, …). `pat` is a whole name part, so `--path`/`--compat` stay data.
+const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|^pass$|^pw$|(?:^|[-_])pat$|credential|auth(?!or)|cookie|key$/i;
 // One whole shell word: concatenated quoted runs, `$'…'`, `$( … )`, backticks, escapes and plain characters.
 const SHELL_WORD = String.raw`(?:"(?:\\.|[^"\\])*"|'[^']*'|\$'(?:\\.|[^'\\])*'|\$\([^)]*\)|` + '`[^`]*`'
   + String.raw`|\\.|[^\s"'` + '`' + String.raw`;|&\\])+`;
@@ -25,7 +26,7 @@ const EMPTY_WORD = /^(?:""|'')+$/;
 // Header names (`Authorization:`, `PRIVATE-TOKEN:`, `x-api-key:`, `token:`) and assignment names
 // (`API_KEY=`, `MY_PASS=`, `GITLAB_AUTH=`) whose value is a credential. Tested on one captured name.
 const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|(?:api|access|private|secret|auth)[-_]?key/i;
-const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|pass(?:[_-]|$)|credential|auth(?!or)|cookie/i;
+const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|pass(?:[_-]|$)|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
 // Commands longer than this are cut before redaction so every rule stays linear-time; the cut is marked.
 export const REDACT_MAX_CHARS = 16384;
 

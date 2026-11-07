@@ -126,6 +126,8 @@ describe('agent command audit', () => {
     `-H "x-api-key: ${plain}"`, `-H "PRIVATE-TOKEN: ${plain}"`, `-H "X-Auth-Token: ${plain}"`, `token: ${plain}`,
     `--user u:${plain}`, `-u u:${plain}`, `-uu:${plain}`, `export PASS=${plain}`, `MY_PASS=${plain}`,
     `https://x.test/a?pass=${plain}`,
+    // A personal access token (`--pat`, `--gitlab-pat`, `GITLAB_PAT=`) is a credential too.
+    `--pat ${plain}`, `--pat=${plain}`, `--gitlab-pat ${plain}`, `GITLAB_PAT=${plain}`, `PAT=${plain}`,
   ])('redacts a prefix-free credential value in %s', value => {
     const out = redact(`npm ci ${value}`);
     expect(out).not.toContain('hunter2zq');
@@ -134,6 +136,7 @@ describe('agent command audit', () => {
   it.each([
     'npx vitest run a.test.mjs --passWithNoTests=false', 'git log --author=bob', 'git fetch origin main:main',
     'curl https://x.test/a', 'env -u HOME npm ci',
+    'git -C . log --path=a --compat x', 'PATH=/usr/bin npm ci', 'git diff --patience a',
   ])('leaves ordinary command %s unchanged', command => expect(redact(command)).toBe(command));
   it('stays linear-time and marks a cut on oversized input', () => {
     for (const unit of ['a.', 'a-', 'a+', '-a', 'token', '"--token ', 'x:']) {
