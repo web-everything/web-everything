@@ -78,6 +78,7 @@ const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEf
 const verdictOf = run => (typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict);
 // A verdict is PRESENT when it is anything but undefined or null: false, 0 and '' are malformed present verdicts, not absent ones.
 const hasVerdict = run => run.verdict !== undefined && run.verdict !== null;
+const abandonableReview = run => !hasVerdict(run) && run.resumeOf == null && run.resumedAt == null && isRunRecordTerminal(run);
 const undecidedUnfinished = run => {
   // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array, false, 0, '') counts as decided.
   return (!hasVerdict(run) || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
@@ -113,13 +114,14 @@ const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(v
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
   pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run),
   // Order key: the read start, or the resume stamp when later (a rewound run finishes after it resumes); NaN when unreadable.
-  orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null });
+  orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null, abandonable: abandonableReview(run) });
 // R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
 // record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Over the
 // records of this PR whose head is this head (or whose head cannot be read):
 //  - a `hard` record (open label effect, pending rejection, unrecognised verdict) holds, as does any head-less
 //    blocking record, whose place among the heads cannot be ordered;
-//  - an undecided record still inside the abandon horizon (a review that may be running) holds, as does one that started
+//  - a verdictless terminal, unresumed record quiet for the abandon horizon is ignored, regardless of its start;
+//  - any other undecided record still inside the abandon horizon (a review that may be running) holds, as does one that started
 //    at or after the settling comment (a later re-review that comment cannot answer) or whose start is unreadable;
 //  - an undecided record that was rewound and resumed holds (the loop may still reject);
 //  - otherwise only the NEWEST completed same-head review decides: a finished rejection holds while it is the newest,
@@ -150,6 +152,8 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (s.rev !== null && s.rev !== want) continue;
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
+        const quiet = now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
+        if (s.abandonable && quiet) continue;
         // maybe still running, or a rewound run the review loop will resume (which may still reject): holds. So does
         // a review that started at or after the settling comment (a later re-review the comment cannot answer), and one
         // whose start cannot be read, or a settle attempt that names no comment time: the chronology is strict.
@@ -157,7 +161,7 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
         // it started no later than that, so a quiet one written (beyond the mtime slack) before the comment cannot be a
         // later re-review, and a newer comment frees it instead of holding it forever.
         const startedBy = Number.isFinite(s.orderAt) ? s.orderAt : st.mtimeMs + RUN_MTIME_SLACK_MS;
-        if (s.resumed || !(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) || !(startedBy < settleAt)) return { complete: true, blocked: true };
+        if (s.resumed || !quiet || !(startedBy < settleAt)) return { complete: true, blocked: true };
         continue;
       }
       // Order only on a readable start that is not in the future. A rejection that cannot be ordered holds; an accept
@@ -184,7 +188,9 @@ export const RUN_MTIME_SLACK_MS = 2000;
 // unfinished review. A run waiting on a pending step or effect is never abandoned, however old, and
 // neither is a rewound resume (`resumeOf`): the review loop resumes that run, which may still reject.
 export const ABANDONED_REVIEW_AFTER_MS = 60 * 60 * 1000;
-const abandonedReview = (hit, now) => !hasVerdict(hit.run) &&hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
+// The bounded scan's predicate is unchanged (a `resumedAt` stamp alone does not keep a record in it); only the
+// complete same-head read additionally requires `resumedAt == null` (abandonableReview).
+const abandonedReview = (hit, now) => !hasVerdict(hit.run) && hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
   && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
 const TIE_ORDERS = ['id-asc', 'id-desc'];
 // R622: the times a result comment must beat to settle unknown evidence. Non-enumerable, so every existing
