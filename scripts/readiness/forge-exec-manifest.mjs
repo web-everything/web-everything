@@ -129,6 +129,9 @@ export function credentialContentFinding(path,content) {
   if(raw)return raw;
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
+  // YAML parsers (libyaml/Psych) also break lines at NEL, LS and PS, so a continuation led by one is a real
+  // continuation. Break lines the same way here (indices below are into this normalized text).
+  text=text.replace(/[\u0085  ]/g,'\n');
   for(const match of text.matchAll(/(?:^|[\r\n])([\t ]*)(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
     const [,indent,field,value]=match;
     const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;

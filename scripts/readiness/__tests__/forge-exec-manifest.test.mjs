@@ -56,6 +56,24 @@ describe('credentialContentFinding GitHub Actions references', () => {
     expect(scan(`${field}: ${value}\n`)).not.toBeNull();
   });
 
+  // YAML parsers (libyaml/Psych) treat NEL, LS and PS as line breaks, so a continuation led by one is still
+  // a more-indented continuation of the reference line. The scanner must break lines the same way.
+  it.each([
+    ['LS', ' '], ['PS', ' '], ['NEL', '\u0085'],
+  ])('refuses a literal continuation after a reference when a %s line break precedes it', (_name, brk) => {
+    for (const field of ['private-key', 'token', 'secret']) {
+      expect(scan(`${field}: \${{ secrets.WE_APP_PRIVATE_KEY }}\n${brk} ${literal}\n`)).not.toBeNull();
+      expect(scan(`${field}: \${{ secrets.WE_APP_PRIVATE_KEY }}${brk} ${literal}\n`)).not.toBeNull();
+      expect(scan(`  ${field}: \${{ secrets.X }}${brk}    ${literal}\n`)).not.toBeNull();
+    }
+    expect(scan(`private-key: \${{ secrets.X }}\n${brk} ${literal}\n`)).toBe('high-entropy-private-key');
+  });
+
+  it.each([' ', ' ', '\u0085'])('still allows a reference followed by a same-indent sibling key across a %j line break', brk => {
+    expect(scan(`  private-key: \${{ secrets.X }}${brk}  name: CI\n`)).toBeNull();
+    expect(scan(`private-key: \${{ secrets.X }}\n${brk}name: CI\n`)).toBeNull();
+  });
+
   it('refuses a literal continuation led by a non-breaking space after a reference', () => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n  \u00a0' + literal + '\n')).not.toBeNull();
   });
