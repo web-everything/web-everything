@@ -6,7 +6,7 @@
  *   the recorded transcript fixture (`soak/breaks/fixtures/fix-3771-wait-loop.jsonl`) read through agent-health's own
  *   bounded reader.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_SESSION_WATCHDOG, CLASSES, ESCALATION_EVENT_TYPE, resolveSessionWatchdogConfig, watchdogKindOf, standardDuration,
   commandSegments, summarizeTail, classifyWatchdogSession, planWatchdog, runSessionWatchdogPass, escalationKey,
-  readEscalationLedger, appendEscalationEvent, renderWatchdogPass,
+  readEscalationLedger, appendEscalationEvent, renderWatchdogPass, defaultClaimStoreReadable,
 } from '../session-watchdog.mjs';
 import { tailLines, summarizeEntry } from '../../../skills-src/inspect-agent-health/agent-health.mjs';
 import fixerStuck from '../health-smells/fixer-stuck.mjs';
@@ -24,6 +24,7 @@ import sessionStuck from '../health-smells/session-stuck.mjs';
 import ghostListed from '../health-smells/ghost-session-listed.mjs';
 import { probeSessionWatchdog } from '../health-watch.mjs';
 import { runHealthTick, emptyHealthState } from '../health-watch-core.mjs';
+import { fixDispatchClaimRoot } from '../fix-claim-store.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, '..', 'soak', 'breaks', 'fixtures', 'fix-3771-wait-loop.jsonl');
@@ -557,11 +558,18 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
       ]);
     }
   });
-  it('name-only claim fallback protects the first matching row exactly as holderOf does', () => {
+  it('a name-only claim protects every same-name row from stops in either listing order', () => {
     const first = finished();
     const second = newer({ class: CLASSES.FINISHED });
-    expect(stops([first, second], [claim({ sessionId: undefined })])).toEqual([
-      expect.objectContaining({ handle: second.id, mode: 'finished' }),
+    for (const rows of [[first, second], [second, first]]) {
+      expect(stops(rows, [claim({ sessionId: undefined })])).toEqual([]);
+    }
+  });
+  it('a sessionId-bearing claim protects only its holder from duplicate stops', () => {
+    const old = duplicate();
+    const keeper = newer();
+    expect(stops([old, keeper], [claim({ sessionId: keeper.sessionId })])).toEqual([
+      expect.objectContaining({ handle: old.id, mode: 'duplicate' }),
     ]);
   });
 
@@ -683,6 +691,36 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     const { calls, actions } = base();
     expect(calls.stop).toEqual(['f29aeb29']);
     expect(actions).toEqual([expect.objectContaining({ mode: 'finished', ok: true })]);
+  });
+  it.each([
+    ['false', () => false],
+    ['undefined', () => undefined],
+    ['truthy but not true', () => 'readable'],
+    ['throws', () => { throw new Error('unreadable'); }],
+  ])('refuses stops when the claim-store probe %s', (_label, claimStoreReadable) => {
+    const { calls, actions } = base({ claimStoreReadable });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ ok: false, detail: 'refused: claim store unreadable' })]);
+    expect(calls.logs).toContain('session-watchdog: claim store unreadable; stops refused until a successful read');
+  });
+  it.each(['success', 'ENOENT', 'EACCES'])('the default claim-store probe handles %s', (outcome) => {
+    const read = vi.fn(() => {
+      if (outcome === 'success') return [];
+      throw Object.assign(new Error(outcome), { code: outcome });
+    });
+    const claimStoreReadable = () => defaultClaimStoreReadable(read);
+    expect(claimStoreReadable()).toBe(outcome !== 'EACCES');
+    const { calls, actions } = base({ claimStoreReadable });
+    expect(read).toHaveBeenCalledWith(fixDispatchClaimRoot());
+    if (outcome === 'EACCES') {
+      expect(calls.stop).toEqual([]);
+      expect(calls.reapEvents).toEqual([]);
+      expect(actions).toEqual([expect.objectContaining({ ok: false, detail: 'refused: claim store unreadable' })]);
+    } else {
+      expect(calls.stop).toEqual(['f29aeb29']);
+      expect(actions).toEqual([expect.objectContaining({ ok: true })]);
+    }
   });
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
     const { calls, actions } = base({ act: false });
