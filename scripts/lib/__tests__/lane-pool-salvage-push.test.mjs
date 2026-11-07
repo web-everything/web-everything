@@ -173,7 +173,8 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
   // PR #6319 send-back: the auth exemption follows a VALIDATED primary (resolveRepo's primaryPath), never the
   // invoking checkout. A release run inside a lane keeps that lane as referencePath: without a validated primary its
   // credential helper refuses; with one, the listing runs in the primary and the lane's config is never consulted.
-  it.each(['credential.helper', 'http.extraHeader', 'core.askPass'])('refuses %s in a referencePath that is not the validated primary', key => {
+  // `hook.<name>.command`: a config-defined hook runs during a transport even with the core.hooksPath pin (git 2.54).
+  it.each(['credential.helper', 'http.extraHeader', 'core.askPass', 'hook.lanehook.command'])('refuses %s in a referencePath that is not the validated primary', key => {
     const { dir, primary, sha } = setup();
     try {
       const lane = join(dir, 'lane-1');
@@ -181,9 +182,13 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       execFileSync('git', ['config', key, '!touch marker'], { cwd: lane });
       const unvalidated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane }, backupRoot: join(dir, 'backups') });
       expect(() => unvalidated.remoteHeads()).toThrow(/lane-controlled transport/);
+      // The salvage ref check is the same canonical-origin listing: same cwd rule, same refusal.
+      expect(() => unvalidated.remoteSha('main')).toThrow(/lane-controlled transport/);
       const runGit = vi.fn(execFileSync);
       const validated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
       expect(validated.remoteHeads()).toEqual([sha]);
+      expect(validated.remoteSha('main')).toBe(sha);
+      expect(runGit.mock.calls.filter(([, args]) => args.includes('ls-remote'))).toHaveLength(2);
       expect(runGit.mock.calls.every(([, , options]) => options.cwd === primary)).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

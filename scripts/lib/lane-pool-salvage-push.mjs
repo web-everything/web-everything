@@ -118,8 +118,9 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       const unsafeRemote = aliasesOrigin || (!primary && remoteName !== null && remoteName !== 'origin');
       // `primary`: its auth/signing keys (credential helper, commit.gpgsign, …) are not lane control either.
       // URL rewrites (insteadOf / pushInsteadOf, above) and origin aliases are still refused there.
+      // `hook.*`: config-defined hooks (`hook.<name>.command` + `.event`) run even with the core.hooksPath pin.
       if (['local', 'worktree'].includes(scope)
-        && (unsafeRemote || !primary && /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
+        && (unsafeRemote || !primary && /^(?:hook\.|credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
       }
     }
@@ -223,21 +224,25 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       }
     }
   };
+  // Every canonical-origin listing (the release proof and the salvage ref check) runs here. The primary's auth keys
+  // are exempt only in a checkout resolveRepo validated as the primary (found by name, or proven not a lane):
+  // `primaryPath`. A release run from inside a lane keeps that lane as referencePath, so without a validated primary
+  // the listing runs under the strict lane rules, where a credential helper, http.* or askpass key refuses
+  // (PR #6319 send-back).
+  const listOrigin = (...patterns) => {
+    const args = transport('ls-remote', origin, ...patterns);
+    const primaryDir = repo.primaryPath || null;
+    const dir = primaryDir || repo.referencePath;
+    checkTransportConfig(dir, { primary: !!primaryDir });
+    return git(dir, args, 120_000, true);
+  };
   return {
     fetchHeads,
     fetchVerifyObjects,
     /** The canonical origin's branch tips right now (ops/* excluded), read in the primary checkout, never the lane.
      *  Throws on anything but complete `<sha>\trefs/heads/<name>` lines, so a caller can fail closed. */
     remoteHeads: () => {
-      const args = transport('ls-remote', origin, 'refs/heads/*');
-      // The primary's auth keys are exempt only in a checkout resolveRepo validated as the primary (found by name,
-      // or proven not a lane): `primaryPath`. A release run from inside a lane keeps that lane as referencePath, so
-      // without a validated primary the listing runs under the strict lane rules, where a credential helper, http.*
-      // or askpass key refuses (PR #6319 send-back).
-      const primaryDir = repo.primaryPath || null;
-      const dir = primaryDir || repo.referencePath;
-      checkTransportConfig(dir, { primary: !!primaryDir });
-      const output = git(dir, args, 120_000, true);
+      const output = listOrigin('refs/heads/*');
       const shas = [];
       for (const line of output ? output.split('\n') : []) {
         const match = /^([a-f0-9]{40}|[a-f0-9]{64})\trefs\/heads\/(.+)$/.exec(line);
@@ -265,7 +270,8 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       return { ok: true };
     },
     remoteSha: ref => {
-      const output = transportGit(repo.referencePath, 'ls-remote', origin, `refs/heads/${ref}`);
+      if (preflightError) throw preflightError;
+      const output = listOrigin(`refs/heads/${ref}`);
       if (!output) return null;
       const lines = output.split('\n');
       const [sha, name] = lines[0].split(/\s+/);
