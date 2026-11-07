@@ -442,3 +442,58 @@ describe('unlabeled unpublished red-team discovery', () => {
     expect(posts).toBe(0);
   });
 });
+
+// R707 #2 (flow-sim R6b-G1): a clean result for the head, an unfinished same-head re-review started after it, and an
+// operator accept settle to red-team:clear only when the sweep carries the live formal reviews to the settle.
+describe('red-team label deadlock: accept stand-in needs the live reviews in the sweep', () => {
+  const T = Date.parse('2026-11-06T14:42:13Z');
+  const iso = ms => new Date(ms).toISOString();
+  const resultComment = ({ rev = NEW_HEAD, confirmed = false } = {}) => ({
+    author: { login: 'web-everything' }, createdAt: iso(T),
+    body: renderRedTeamComment({ pr: 42, rev, provider: 'codex', model: 'fixture',
+      foldedVerdict: confirmed ? 'changes' : 'accept', findings: confirmed ? [{
+        summary: 'confirmed break', category: 'edge-case', impactIfUnfixed: 'broken',
+        confirmedByRecheck: true, file: 'scripts/example.mjs', filesRead: ['scripts/example.mjs'],
+      }] : [] }),
+  });
+  const accept = (sha = NEW_HEAD) => ({ author: { login: 'web-everything' }, createdAt: iso(T + 14 * 60e3),
+    body: `Cleared by operator.\n<!-- reviewed-sha: ${sha} -->\n<!-- cleared-human: chalbert -->` });
+  const evidence = () => ({ ok: false, reason: 'review-unfinished', settleBounds: {
+    unfinishedStartedAt: T + 6 * 60e3, unfinishedActiveAt: T + 16 * 60e3, evaluatedAt: T + 2 * 3600e3, unfinishedUndecided: true,
+    completeHeadRead: () => ({ complete: true, blocked: false }) } });
+  const run = ({ comments, reviews, head = NEW_HEAD }) => {
+    const p = provider();
+    p.ensureLabel = () => {};
+    const listed = pr(42, ['red-team:pending'], head, []);
+    const live = { ...pr(42, ['red-team:pending'], head, comments), ...(reviews === undefined ? {} : { reviews }) };
+    const out = rawSweep({ repo: 'o/n', provider: p, listPrs: () => [listed], readPr: () => live,
+      readStatusEvidence: () => evidence(), log: () => {} });
+    return { out, p };
+  };
+
+  it('settles clear for the deadlock input (clear result, unfinished re-review, operator accept, quiet over 60 min)', () => {
+    const { out, p } = run({ comments: [resultComment(), accept()], reviews: [] });
+    expect(out).toEqual([{ num: 42, add: 'red-team:clear', remove: ['red-team:pending'] }]);
+    expect(p.calls.set).toEqual([{ repo: 'o/n', number: 42, spec: { add: 'red-team:clear', remove: ['red-team:pending'] } }]);
+  });
+  it('stays pending when the result and accept name an older head (newer head)', () => {
+    const { out } = run({ comments: [resultComment({ rev: HEAD }), accept(HEAD)], reviews: [] });
+    expect(out).toEqual([]);
+  });
+  it('stays blocked for a confirmed break', () => {
+    const { out } = run({ comments: [resultComment({ confirmed: true }), accept()], reviews: [] });
+    expect(out).toEqual([{ num: 42, add: 'red-team:blocked', remove: ['red-team:pending'] }]);
+  });
+  it('stays pending (fails closed) when the formal reviews are unreadable', () => {
+    expect(run({ comments: [resultComment(), accept()], reviews: undefined }).out).toEqual([]);
+    expect(run({ comments: [resultComment(), accept()], reviews: null }).out).toEqual([]);
+  });
+  it('stays pending when a later formal review holds after the accept', () => {
+    const hold = { state: 'CHANGES_REQUESTED', submittedAt: iso(T + 20 * 60e3), author: { login: 'chalbert' } };
+    expect(run({ comments: [resultComment(), accept()], reviews: [hold] }).out).toEqual([]);
+  });
+  it('defaultReadPr reads the formal reviews with the live PR', () => {
+    const exec = (file, argv) => { expect(argv[argv.indexOf('--json') + 1]).toBe('number,state,labels,headRefOid,reviews'); return JSON.stringify({ reviews: [{ state: 'APPROVED' }] }); };
+    expect(defaultReadPr({ repo: 'o/n', number: 1, exec, readComments: () => [] }).reviews).toEqual([{ state: 'APPROVED' }]);
+  });
+});
