@@ -8,7 +8,7 @@
 
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, statSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, statSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -906,6 +906,61 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
       rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+
+  // Round 6 (block): checkout config or index bits Codex can set make git's view hide a worktree edit, so both
+  // diffs come back empty and an "exact" empty patch would let cleanup delete the only copy of that edit.
+  const commitTracked = (dir, git) => {
+    writeFileSync(join(dir, 'tool.sh'), '#!/bin/sh\necho hi\n');
+    writeFileSync(join(dir, 'text.txt'), 'a\nb\n');
+    git('add', 'tool.sh', 'text.txt');
+    git('-c', 'user.name=t', '-c', 'user.email=t@example.test', '-c', 'commit.gpgSign=false', 'commit', '--quiet', '-m', 'tracked');
+    return git('rev-parse', 'HEAD');
+  };
+  it.each([
+    ['core.fileMode=false hides an executable-bit edit', (dir, git) => { git('config', 'core.fileMode', 'false'); chmodSync(join(dir, 'tool.sh'), 0o755); },
+      fresh => expect(statSync(join(fresh, 'tool.sh')).mode & 0o111).not.toBe(0)],
+    ['core.autocrlf=true hides a CRLF-only edit', (dir, git) => { git('config', 'core.autocrlf', 'true'); writeFileSync(join(dir, 'text.txt'), 'a\r\nb\r\n'); },
+      fresh => expect(readFileSync(join(fresh, 'text.txt'), 'utf8')).toBe('a\r\nb\r\n')],
+  ])('binarySafe: %s — the patch still carries it', (_name, mutate, check) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-config-hide-'));
+    const fresh = `${dir}-fresh`;
+    try {
+      const git = initGitRepo(dir);
+      const startSha = commitTracked(dir, git);
+      mutate(dir, git);
+      const report = captureDiff({ dir, startSha, binarySafe: true });
+      expect(report.hasChanges).toBe(true);
+      expect(report.patchExact).toBe(true);
+      execFileSync('git', ['clone', '--quiet', '-c', 'core.autocrlf=false', dir, fresh]);
+      writeFileSync(join(fresh, '.patch'), report.patch);
+      execFileSync('git', ['-C', fresh, '-c', 'core.autocrlf=false', 'apply', '--binary', '.patch']);
+      check(fresh);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['an assume-unchanged index bit', (dir, git) => git('update-index', '--assume-unchanged', 'text.txt'), /assume-unchanged or skip-worktree/],
+    ['a skip-worktree index bit', (dir, git) => git('update-index', '--skip-worktree', 'text.txt'), /assume-unchanged or skip-worktree/],
+    ['core.ignoreStat=true', (dir, git) => { git('config', 'core.ignoreStat', 'true'); git('update-index', '--really-refresh'); }, /assume-unchanged or skip-worktree/],
+    ['a .git/info/attributes file', (dir, git) => writeFileSync(join(dir, '.git', 'info', 'attributes'), '* text=auto\n'), /info\/attributes/],
+  ])('binarySafe: an edit hidden by %s is not byte-exact (the clone is kept)', (_name, mutate, reason) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-index-hide-'));
+    try {
+      const git = initGitRepo(dir);
+      const startSha = commitTracked(dir, git);
+      mutate(dir, git);
+      writeFileSync(join(dir, 'text.txt'), 'a\r\nb\r\nc\r\n');
+      const report = captureDiff({ dir, startSha, binarySafe: true });
+      expect(report.patchExact).toBe(false);
+      expect(report.patchError).toMatch(reason);
+      expect(diffProvesNoEdits(report)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

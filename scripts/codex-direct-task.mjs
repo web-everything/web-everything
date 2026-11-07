@@ -114,11 +114,11 @@ import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
-  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, fchmodSync, readSync, writeSync, realpathSync,
+  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, fchmodSync, readSync, writeSync, realpathSync, statSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -845,7 +845,7 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe 
 
   // Codex can write this checkout's git config: the shared lane pins apply, diff drivers and textconv stay off, and a
   // checkout that defines a filter driver (which `status`/`diff` would run on worktree content) is refused first.
-  const git = (args, extra = {}) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
+  const git = (args, extra = {}) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), ...CAPTURE_GIT_CONFIG_ARGS, '--no-replace-objects', ...hardenLaneGitArgs(args)],
     { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS, ...extra });
   assertNoLaneFilterDrivers(git);
   // `--untracked-files=all`: a `status.showUntrackedFiles=no` the checkout sets must not hide new files.
@@ -860,9 +860,16 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe 
   const commitsRaw = git(['log', '--oneline', `${startSha}..HEAD`]);
   const commits = commitsRaw.split('\n').map((l) => l.trim()).filter(Boolean);
   const result = { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };
-  if (binarySafe) Object.assign(result, captureBinaryPatch(git, startSha, { untracked, intentToAddError }));
+  if (binarySafe) Object.assign(result, captureBinaryPatch(git, startSha, { dir, untracked, intentToAddError }));
   return result;
 }
+
+/** Checkout config Codex can write that makes git's view HIDE a worktree edit (both diffs empty, so an empty "exact"
+ *  patch would let cleanup delete the only copy): `core.fileMode=false` drops executable-bit edits, `core.autocrlf`
+ *  normalizes CRLF-only edits away, `core.ignoreStat` stops git noticing edits. Pinned for every capture read.
+ *  Index bits (assume-unchanged, skip-worktree) and `.git/info/attributes` cannot be pinned off: they are refused
+ *  as not byte-exact in `captureBinaryPatch`. */
+export const CAPTURE_GIT_CONFIG_ARGS = Object.freeze(['-c', 'core.fileMode=true', '-c', 'core.autocrlf=false', '-c', 'core.ignoreStat=false']);
 
 /** Fixed output shape for the byte-exact patch: the checkout's git config (which Codex can write) or the host's
  *  must not colour it, drop or rename its `a/`/`b/` prefixes, or narrow it to a subdirectory — any of those
@@ -878,7 +885,13 @@ const GITLINK_PATCH_RE = /^(?:(?:new file|deleted file|new|old) mode 160000|inde
 const notExact = (reason) => ({ patch: null, patchExact: false, patchError: String(reason?.message ?? reason).split('\n')[0] });
 
 /** `captureDiff`'s byte-exact patch (see its `binarySafe`). Never throws: any doubt is a not-exact patch. */
-function captureBinaryPatch(git, startSha, { untracked, intentToAddError }) {
+/** A non-empty regular file at `path`; a missing path is false, any other stat failure is doubt (true). */
+function hasContent(path) {
+  try { const st = statSync(path); return st.isFile() && st.size > 0; }
+  catch (error) { return error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR'; }
+}
+
+function captureBinaryPatch(git, startSha, { dir, untracked, intentToAddError }) {
   // A new file the intent-to-add step could not stage is missing from every diff, so the patch is incomplete.
   if (intentToAddError) return notExact(`new files could not be staged for the diff: ${intentToAddError.message ?? intentToAddError}`);
   try {
@@ -888,6 +901,22 @@ function captureBinaryPatch(git, startSha, { untracked, intentToAddError }) {
     const seen = new Set(untracked);
     const hidden = String(listed ?? '').split('\0').filter(path => path && !seen.has(path));
     if (hidden.length) return notExact(`${hidden.length} new file(s) hidden by an exclude file outside .gitignore (e.g. ${JSON.stringify(hidden[0])})`);
+    // An assume-unchanged (lowercase tag) or skip-worktree (`S`) bit makes git skip a tracked path's worktree
+    // content, so an edit to it is in neither diff. Any entry this cannot parse is doubt too.
+    const flagged = [];
+    for (const entry of String(git(['ls-files', '-z', '-v']) ?? '').split('\0')) {
+      if (!entry) continue;
+      const match = /^([A-Za-z?]) (.+)$/s.exec(entry);
+      if (!match) return notExact(`unreadable index entry ${JSON.stringify(entry.slice(0, 80))}`);
+      if (match[1] === 'S' || match[1] !== match[1].toUpperCase()) flagged.push(match[2]);
+    }
+    if (flagged.length) return notExact(`${flagged.length} tracked path(s) carry an assume-unchanged or skip-worktree index bit, so edits to them are hidden (e.g. ${JSON.stringify(flagged[0])})`);
+    // `.git/info/attributes` sits outside the committed tree and no config turns it off: its text/eol rules can
+    // normalize an edit away. Only the repository's own `.gitattributes` files count.
+    const attributesPath = String(git(['rev-parse', '--git-path', 'info/attributes']) ?? '').trim();
+    if (attributesPath && hasContent(isAbsolute(attributesPath) ? attributesPath : join(dir, attributesPath))) {
+      return notExact('a .git/info/attributes file outside the committed tree can hide edits');
+    }
   } catch (error) { return notExact(error); }
   let raw;
   try { raw = git([...BINARY_PATCH_DIFF_ARGS, startSha], { encoding: 'buffer' }); }
