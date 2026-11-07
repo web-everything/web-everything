@@ -266,6 +266,9 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, tr
   // could forge the head listing of) any SSH transport; GIT_SSH is dropped with it so the pin alone decides.
   delete out.GIT_SSH_COMMAND;
   delete out.GIT_SSH;
+  // Git applies GIT_CONFIG_PARAMETERS AFTER the GIT_CONFIG_COUNT list, so an inherited one would outrank every pin
+  // below (an inherited `credential.helper` lands after the reset; `core.fsmonitor` beats its pin).
+  delete out.GIT_CONFIG_PARAMETERS;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
   const pins = [...LANE_GIT_CONFIG_PINS, ...trustedPins, ...(remoteProbe ? REMOTE_PROBE_CONFIG_PINS : [])];

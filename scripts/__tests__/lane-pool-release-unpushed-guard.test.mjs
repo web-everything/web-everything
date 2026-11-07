@@ -814,6 +814,20 @@ describe('lane git hardening keeps the trusted credential helpers', () => {
     expect(existsSync(evilRan), 'the inherited command-scope helper ran').toBe(false);
   });
 
+  it('an inherited GIT_CONFIG_PARAMETERS (applied after the pins by git) is dropped, so its helper and fsmonitor never run', () => {
+    const fsmonitorRan = join(root, 'fsmonitor-ran');
+    const inherited = { ...base, GIT_CONFIG_PARAMETERS:
+      `'credential.helper'='!f() { touch ${evilRan}; }; f' 'core.fsmonitor'='touch ${fsmonitorRan}; false'` };
+    const env = harden(inherited);
+    expect(env).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
+    const filled = fill(env);
+    expect(filled.status, filled.stderr).toBe(0);
+    expect(filled.stdout).toContain('password=trusted-pass');
+    expect(existsSync(evilRan), 'the inherited GIT_CONFIG_PARAMETERS helper ran').toBe(false);
+    run(['status', '--porcelain'], env);
+    expect(existsSync(fsmonitorRan), 'the inherited GIT_CONFIG_PARAMETERS fsmonitor ran').toBe(false);
+  });
+
   it('only the GLOBAL core.askPass is replayed; the lane\'s askpass never runs', () => {
     const askHome = homeWith('ask-home', ['core.askPass', askpass]);
     const env = harden({ ...base, HOME: askHome }, askHome);
