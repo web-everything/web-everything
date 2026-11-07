@@ -231,32 +231,25 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     expect(logged(f, 'pnpm install failed; falling back')).toBe(true);
   });
 
-  it('runs pnpm in the snapshot and leaves shared store files and metadata unchanged', () => {
+  it('revised rule: pnpm runs in the snapshot with --frozen-lockfile and --ignore-scripts; the daemon never creates the store or rewrites its generation file', () => {
     const f = setup();
     ensureStoreGeneration(f.storeDir);
-    mkdirSync(join(f.storeDir, 'content'));
-    writeFileSync(join(f.storeDir, 'content', 'sentinel'), 'shared content');
-    const snapshot = (dir) => {
-      const stat = statSync(dir);
-      return {
-        mtime: stat.mtimeMs, ctime: stat.ctimeMs,
-        contents: stat.isDirectory()
-          ? readdirSync(dir).sort().map((name) => [name, snapshot(join(dir, name))])
-          : readFileSync(dir, 'utf8'),
-      };
-    };
-    const before = snapshot(f.storeDir);
+    const generationFile = join(f.storeDir, '.we-lane-store-generation');
+    const generationBefore = readFileSync(generationFile, 'utf8');
+    const mtimeBefore = statSync(generationFile).mtimeMs;
     const exec = f.exec.getMockImplementation();
     f.exec.mockImplementation((cmd, args, opts) => {
       if (args[0] === 'install') {
         expect(opts.cwd).toBe(f.into);
-        expect(snapshot(f.storeDir)).toEqual(before);
+        expect(args).toEqual(expect.arrayContaining(['--frozen-lockfile', '--ignore-scripts']));
+        expect(readFileSync(generationFile, 'utf8')).toBe(generationBefore);
       }
       return exec(cmd, args, opts);
     });
     pnpmAwareInstaller(f)(f.into);
     expect(installs(f)).toHaveLength(1);
-    expect(snapshot(f.storeDir)).toEqual(before);
+    expect(readFileSync(generationFile, 'utf8')).toBe(generationBefore);
+    expect(statSync(generationFile).mtimeMs).toBe(mtimeBefore);
     expectMarker(f, 'pnpm');
   });
 });
