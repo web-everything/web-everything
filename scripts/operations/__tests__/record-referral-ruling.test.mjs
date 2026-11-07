@@ -779,3 +779,26 @@ describe('fileCard digest is parseable by the real card dedupe', () => {
     expect(items[0]).toMatchObject({ file: 'scripts/x.mjs', line: 7 });
   });
 });
+
+describe('fileCard fail-closed dedupe and setting validation', () => {
+  it('refuses to file when findings match several existing cards (no duplicate)', async () => {
+    const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
+    const landPreventionCard = vi.fn();
+    const card = (rel) => ({ rel, host: 'main' });
+    const dedupe = () => ({ action: 'mention', matches: [{ card: card('backlog/a.md') }, { card: card('backlog/b.md') }] });
+    const r = await landRulingCard({ title: 't' }, { dedupe, landPreventionCard });
+    expect(r).toMatchObject({ ok: false, step: 'dedupe' });
+    expect(landPreventionCard).not.toHaveBeenCalled();
+  });
+  it('refuses to file on a partial match', async () => {
+    const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
+    const landPreventionCard = vi.fn();
+    const dedupe = () => ({ action: 'partial', matches: [{ card: { rel: 'backlog/a.md', host: 'main' } }] });
+    expect(await landRulingCard({ title: 't' }, { dedupe, landPreventionCard })).toMatchObject({ ok: false, step: 'dedupe' });
+    expect(landPreventionCard).not.toHaveBeenCalled();
+  });
+  it('rejects a malformed tool settings block', async () => {
+    const { readCardRulingFileMode } = await import('../record-referral-ruling-io.mjs');
+    expect(() => readCardRulingFileMode({ env: {}, tool: 'unsafe', log: () => {} })).toThrow(/tool settings/);
+  });
+});

@@ -155,6 +155,7 @@ function readProtectionContext(thread, { repo, pr, readJson, cardReadable, chang
 
 /** Resolve and reject invalid evidence at any layer, rather than silently falling back. */
 export function readCardRulingFileMode({ env = process.env, tool, log = line => console.error(line) } = {}) {
+  if (tool !== undefined && (!tool || typeof tool !== 'object' || Array.isArray(tool))) throw new Error('invalid cardRuling tool settings: expected an object');
   const resolved = cascadePolicy('cardRuling', tool, {
     standard: { cardRulingFileMode: 'two-step' }, env, log,
     envValues: { cardRulingFileMode: env.WE_CARD_RULING_FILE_MODE },
@@ -177,6 +178,10 @@ export async function landRulingCard(input, { repo, pr, dedupe = runCardDedupe,
     });
     if (refs.every(Boolean) && new Set(refs).size === 1)
       return { ok: true, reused: true, ref: refs[0], pr: plan.matches[0].card.host?.pr ?? null };
+  }
+  // Fail closed: any other match (several cards, or only some findings matched) would file a duplicate.
+  if (plan?.matches?.length) {
+    return { ok: false, step: 'dedupe', reason: 'findings already match existing open card(s) but not as one card; cite the right one with --card instead of filing a duplicate' };
   }
   const result = await landPreventionCard(input, { ...landingOptions,
     dedupe: () => null, batch: async () => ({ batched: false, disabled: true }) });
