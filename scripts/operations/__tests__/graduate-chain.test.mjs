@@ -71,9 +71,7 @@ const prs = n => Array.from({ length: n }, (_, i) => ({ number: i + 1, author: {
 describe('graduate-chain', () => {
   for (const dryRun of [false, true]) {
     it(`hardens every Git subprocess after composing its environment (dryRun=${dryRun})`, () => {
-      // NOSYSTEM (PR #6319): Apple git's built-in `credential.helper=osxkeychain` is replayed after the pins as a trusted
-      // helper, and this test reads the pins back last-value-wins.
-      const inherited = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor',
+      const inherited = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor',
         GIT_CONFIG_VALUE_0: 'untrusted-monitor', GIT_EXTERNAL_DIFF: 'untrusted-diff', KEEP_ME: 'present' };
       const objects = { GIT_OBJECT_DIRECTORY: '/temporary/objects',
         GIT_ALTERNATE_OBJECT_DIRECTORIES: '/source/objects' };

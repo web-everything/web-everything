@@ -345,8 +345,7 @@ describe('runFixCli', () => {
     expect(m.io.readFile).not.toHaveBeenCalledWith('/lanes/lane-5/src/fix.mjs', expect.anything());
     for (const [index, call] of m.calls.entries()) {
       if (call.includes('cat-file') || call.includes('diff') || call.includes('ls-tree') || call.includes('merge-base'))
-        // NOSYSTEM like the test process (PR #6319): Apple git's built-in osxkeychain would be replayed as a trusted helper.
-        expect(m.envs[index]).toMatchObject({ GIT_LITERAL_PATHSPECS: '1', ...laneGitHardeningEnv({ GIT_CONFIG_NOSYSTEM: '1' }) });
+        expect(m.envs[index]).toMatchObject({ GIT_LITERAL_PATHSPECS: '1', ...laneGitHardeningEnv({}) });
     }
   });
   it('accepts test evidence by tracked changed file and line at HEAD', async () => {

@@ -1,11 +1,11 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { readLaneJournal } from '../lib/lane-history.mjs';
-import { laneGitConfigArgs, laneGitHardeningEnv, MAX_TRUSTED_CREDENTIAL_PINS, scrubGitRepoEnv, trustedCredentialPins } from '../lib/lane-git-hardening.mjs';
+import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
 
 const script = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 const git = (args, cwd) => execFileSync('git', args, {
@@ -730,87 +730,74 @@ describe('release from inside a lane with a discoverable primary', () => {
   });
 });
 
-// PR #6319 send-back (R10): the `credential.helper=` reset pin cleared EVERY scope, so the operator's own helper
-// (osxkeychain, `gh auth git-credential`) stopped running and HTTPS listings/pushes failed with "could not read Username
-// … terminal prompts disabled". The hardening must keep rejecting lane helpers while replaying trusted ones.
-describe('lane git hardening keeps the trusted credential helpers', () => {
-  let root, home, lane, evilRan, trustedRan, scopedRan, askpassRan, helper, scopedHelper, askpass, globalConfig, base;
+// PR #6319 operator ruling (R674 route a): a git call in a LANE keeps the `credential.helper` / `core.askPass` reset
+// pins, so no helper or askpass the lane (or an inherited command-scope entry) names runs on an unattended transport.
+// Only a call in the validated primary uses `credentialPins: false`, so the operator's own helper authenticates there
+// (the realSalvageIo listing test in scripts/lib/__tests__/lane-pool-salvage-push.test.mjs drives that end to end).
+describe('lane git hardening blocks lane credential helpers; the primary-only form keeps the operator helper', () => {
+  let root, home, lane, evilRan, trustedRan, helper, base;
   const script = (file, body) => { writeFileSync(file, `#!/bin/sh\n${body}\n`); chmodSync(file, 0o755); return file; };
-  const run = (args, env, input) => spawnSync('git', args, { cwd: lane, env, input, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
-  const fill = (env, host = 'example.invalid', pre = []) => run([...pre, 'credential', 'fill'], env, `protocol=https\nhost=${host}\n\n`);
-  // The fixture `home` stands in for the OS account's home (`os.userInfo().homedir`), the only place trusted config is read.
-  const trusted = (env = base, homedir = home) => trustedCredentialPins(env, { homedir });
-  const harden = (env = base, homedir = home) => laneGitHardeningEnv(env, { trustedPins: trusted(env, homedir) });
-  const homeWith = (name, ...entries) => {
-    const dir = join(root, name);
-    mkdirSync(dir, { recursive: true });
-    for (const [k, v] of entries) git(['config', '--file', join(dir, '.gitconfig'), '--add', k, v], root);
-    return dir;
-  };
+  const run = (args, env, input, cwd = lane) => spawnSync('git', args, { cwd, env, input, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+  const fill = (env, cwd = lane, pre = []) => run([...pre, 'credential', 'fill'], env, 'protocol=https\nhost=example.invalid\n\n', cwd);
+  const pinsOf = env => Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'trusted-cred-'));
-    [evilRan, trustedRan, scopedRan, askpassRan] = ['evil-ran', 'trusted-ran', 'scoped-ran', 'askpass-ran'].map(f => join(root, f));
+    root = mkdtempSync(join(tmpdir(), 'lane-cred-'));
+    [evilRan, trustedRan] = ['evil-ran', 'trusted-ran'].map(f => join(root, f));
     helper = script(join(root, 'trusted-helper'), `touch '${trustedRan}'\n[ "$1" = get ] && printf 'username=trusted-user\\npassword=trusted-pass\\n'\nexit 0`);
-    scopedHelper = script(join(root, 'scoped-helper'), `touch '${scopedRan}'\n[ "$1" = get ] && printf 'username=scoped-user\\npassword=scoped-pass\\n'\nexit 0`);
-    askpass = script(join(root, 'trusted-askpass'), `touch '${askpassRan}'\necho askpass-answer`);
     const evil = script(join(root, 'evil'), `touch '${evilRan}'\n[ "$1" = get ] && printf 'username=evil\\npassword=evil\\n'\necho evil`);
     home = join(root, 'home');
     mkdirSync(home);
-    globalConfig = join(home, '.gitconfig');
-    git(['config', '--file', globalConfig, 'credential.helper', helper], root);
-    // The `gh auth setup-git` shape: a URL-scoped reset, then the URL-scoped helper.
-    git(['config', '--file', globalConfig, '--add', 'credential.https://scoped.invalid.helper', ''], root);
-    git(['config', '--file', globalConfig, '--add', 'credential.https://scoped.invalid.helper', scopedHelper], root);
+    git(['config', '--file', join(home, '.gitconfig'), 'credential.helper', helper], root);
     lane = join(root, 'lane');
     git(['init', '--quiet', lane], root);
     // The lane's own config: a malicious helper (plain and URL-scoped) and askpass.
     git(['config', 'credential.helper', `!f() { touch '${evilRan}'; }; f`], lane);
-    git(['config', '--add', 'credential.https://scoped.invalid.helper', evil], lane);
+    git(['config', '--add', 'credential.https://example.invalid.helper', evil], lane);
     git(['config', 'core.askPass', evil], lane);
     base = { ...scrubGitRepoEnv(process.env), HOME: home, GIT_CONFIG_NOSYSTEM: '1' };
     delete base.XDG_CONFIG_HOME;
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-  it('a lane .git/config credential.helper=!evil is NOT run, while the global helper IS still in the effective list', () => {
-    const env = harden();
-    // The command-scope pins are exactly the reset followed by the trusted values, in order.
+  it('a lane .git/config credential.helper=!evil is NOT run under the lane pins, nor the global helper (reset first)', () => {
+    const env = laneGitHardeningEnv(base);
     const listed = run(['config', '--show-scope', '--get-all', 'credential.helper'], env).stdout.split('\n').filter(Boolean)
       .map(line => line.split('\t'));
-    expect(listed.filter(([scope]) => scope === 'command').map(([, v]) => v ?? '')).toEqual(['', helper]);
-    expect(listed.filter(([scope]) => scope === 'local').map(([, v]) => v)).toEqual([`!f() { touch '${evilRan}'; }; f`]);
+    // The command-scope reset comes after every file scope, so the effective helper list is empty.
+    expect(listed.at(-1)).toEqual(['command', '']);
     const filled = fill(env);
+    expect(filled.status).not.toBe(0);
+    expect(existsSync(evilRan), 'the lane credential helper or askpass ran').toBe(false);
+  });
+
+  it('credentialPins:false drops ONLY the two credential resets; every other pin, the env drops and the prompt-off stay', () => {
+    const inherited = { ...base, GIT_ASKPASS: join(root, 'x'), SSH_ASKPASS: join(root, 'x'), GIT_SSH_COMMAND: 'x', GIT_SSH: 'x', GIT_EXTERNAL_DIFF: 'x' };
+    const lanePins = pinsOf(laneGitHardeningEnv(inherited));
+    const primary = laneGitHardeningEnv(inherited, { credentialPins: false });
+    expect(pinsOf(primary)).toEqual(lanePins.filter(([k]) => !['credential.helper', 'core.askPass'].includes(k)));
+    expect(primary.GIT_TERMINAL_PROMPT).toBe('0');
+    for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_EXTERNAL_DIFF']) expect(primary).not.toHaveProperty(key);
+    // In a checkout with no lane-set helper (the primary), the operator's global helper then authenticates.
+    const clean = join(root, 'primary');
+    git(['init', '--quiet', clean], root);
+    const filled = fill(primary, clean);
     expect(filled.status, filled.stderr).toBe(0);
     expect(filled.stdout).toContain('password=trusted-pass');
     expect(existsSync(trustedRan)).toBe(true);
+  });
+
+  it('the -c argv form keeps the reset pins, so a lane helper never runs through it', () => {
+    const args = laneGitConfigArgs();
+    expect(args).toEqual(expect.arrayContaining(['-c', 'credential.helper=', '-c', 'core.askPass=']));
+    const filled = fill({ ...base, GIT_TERMINAL_PROMPT: '0' }, lane, args);
+    expect(filled.status).not.toBe(0);
     expect(existsSync(evilRan), 'the lane credential helper ran').toBe(false);
   });
 
-  it('replays URL-scoped trusted helpers in order and never the lane\'s URL-scoped one', () => {
-    const filled = fill(harden(), 'scoped.invalid');
-    expect(filled.status, filled.stderr).toBe(0);
-    expect(filled.stdout).toContain('password=scoped-pass');
-    expect(existsSync(scopedRan)).toBe(true);
-    expect(existsSync(trustedRan), 'the URL-scoped reset no longer clears the generic helper').toBe(false);
-    expect(existsSync(evilRan), 'the lane URL-scoped helper ran').toBe(false);
-  });
-
-  it('the -c argv form replays the same trusted helpers, so a push through it still authenticates', () => {
-    const args = laneGitConfigArgs({ env: base, trustedPins: trusted() });
-    expect(args.slice(args.indexOf('credential.helper=') - 1)).toEqual(expect.arrayContaining(['-c', `credential.helper=${helper}`]));
-    expect(args.indexOf(`credential.helper=${helper}`)).toBeGreaterThan(args.indexOf('credential.helper='));
-    const filled = fill({ ...base, GIT_TERMINAL_PROMPT: '0' }, 'example.invalid', args);
-    expect(filled.status, filled.stderr).toBe(0);
-    expect(filled.stdout).toContain('password=trusted-pass');
-    expect(existsSync(evilRan), 'the lane credential helper ran').toBe(false);
-  });
-
-  it('an inherited command-scope helper is reset and never replayed as trusted', () => {
+  it('an inherited command-scope helper is reset by the pins that follow it', () => {
     const inherited = { ...base, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: `!f() { touch '${evilRan}'; }; f` };
-    expect(trusted(inherited)).toEqual([['credential.helper', helper],
-      ['credential.https://scoped.invalid.helper', ''], ['credential.https://scoped.invalid.helper', scopedHelper]]);
-    const filled = fill(harden(inherited));
-    expect(filled.status, filled.stderr).toBe(0);
+    const filled = fill(laneGitHardeningEnv(inherited));
+    expect(filled.status).not.toBe(0);
     expect(existsSync(evilRan), 'the inherited command-scope helper ran').toBe(false);
   });
 
@@ -818,69 +805,29 @@ describe('lane git hardening keeps the trusted credential helpers', () => {
     const fsmonitorRan = join(root, 'fsmonitor-ran');
     const inherited = { ...base, GIT_CONFIG_PARAMETERS:
       `'credential.helper'='!f() { touch ${evilRan}; }; f' 'core.fsmonitor'='touch ${fsmonitorRan}; false'` };
-    const env = harden(inherited);
-    expect(env).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
-    const filled = fill(env);
+    const clean = join(root, 'primary');
+    git(['init', '--quiet', clean], root);
+    for (const [name, env, cwd] of [['lane pins', laneGitHardeningEnv(inherited), lane],
+      ['primary form', laneGitHardeningEnv(inherited, { credentialPins: false }), clean]]) {
+      expect(env, name).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
+      fill(env, cwd);
+      expect(existsSync(evilRan), `${name}: the inherited GIT_CONFIG_PARAMETERS helper ran`).toBe(false);
+      run(['status', '--porcelain'], env, undefined, cwd);
+      expect(existsSync(fsmonitorRan), `${name}: the inherited GIT_CONFIG_PARAMETERS fsmonitor ran`).toBe(false);
+    }
+  });
+
+  it('the primary form drops every inherited GIT_CONFIG_COUNT entry, so an inherited helper cannot outlive the missing reset', () => {
+    const inherited = { ...base, GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: `!f() { touch '${evilRan}'; }; f`,
+      GIT_CONFIG_KEY_1: 'core.askPass', GIT_CONFIG_VALUE_1: join(root, 'evil'), GIT_CONFIG_KEY_7: 'credential.helper', GIT_CONFIG_VALUE_7: 'orphan' };
+    const env = laneGitHardeningEnv(inherited, { credentialPins: false });
+    expect(pinsOf(env).map(([k]) => k)).not.toContain('credential.helper');
+    expect(Object.keys(env).filter(k => /^GIT_CONFIG_(KEY|VALUE)_/.test(k))).toHaveLength(2 * Number(env.GIT_CONFIG_COUNT));
+    const clean = join(root, 'primary');
+    git(['init', '--quiet', clean], root);
+    const filled = fill(env, clean);
     expect(filled.status, filled.stderr).toBe(0);
     expect(filled.stdout).toContain('password=trusted-pass');
-    expect(existsSync(evilRan), 'the inherited GIT_CONFIG_PARAMETERS helper ran').toBe(false);
-    run(['status', '--porcelain'], env);
-    expect(existsSync(fsmonitorRan), 'the inherited GIT_CONFIG_PARAMETERS fsmonitor ran').toBe(false);
-  });
-
-  it('only the GLOBAL core.askPass is replayed; the lane\'s askpass never runs', () => {
-    const askHome = homeWith('ask-home', ['core.askPass', askpass]);
-    const env = harden({ ...base, HOME: askHome }, askHome);
-    expect(run(['config', '--get', 'core.askpass'], env).stdout.trim()).toBe(askpass);
-    const filled = fill(env);
-    expect(filled.status, filled.stderr).toBe(0);
-    expect(filled.stdout).toContain('password=askpass-answer');
-    expect(existsSync(askpassRan)).toBe(true);
-    expect(existsSync(evilRan), 'the lane askpass ran').toBe(false);
-  });
-
-  it('fails closed (reset only, no helper) above the trusted-helper bound and on an unreadable global config', () => {
-    const many = homeWith('many-home', ...Array.from({ length: MAX_TRUSTED_CREDENTIAL_PINS + 1 }, () => ['credential.helper', helper]));
-    expect(trusted({ ...base, HOME: many }, many)).toEqual([]);
-    const filled = fill(harden({ ...base, HOME: many }, many));
-    expect(filled.status).not.toBe(0);
-    expect(existsSync(trustedRan)).toBe(false);
-    expect(existsSync(evilRan), 'the lane credential helper ran').toBe(false);
-  });
-
-  it('a failed read is not cached: once the global config reads again, its helper is replayed', () => {
-    const flaky = homeWith('flaky-home');
-    writeFileSync(join(flaky, '.gitconfig'), '[credential\n\thelper = broken');
-    expect(trusted({ ...base, HOME: flaky }, flaky)).toEqual([]);
-    writeFileSync(join(flaky, '.gitconfig'), `[credential]\n\thelper = ${helper}\n`);
-    expect(trusted({ ...base, HOME: flaky }, flaky)).toEqual([['credential.helper', helper]]);
-  });
-
-  // Self-review of the fix: the env is the caller's (a lane CLI controls it), so a config location it names is not the
-  // operator's. Each redirect makes the hardened git read the attacker's file as "global" / "system"; nothing replays.
-  it.each([
-    ['GIT_CONFIG_GLOBAL', dir => join(dir, '.gitconfig')],
-    ['XDG_CONFIG_HOME', dir => { mkdirSync(join(dir, 'git'), { recursive: true }); return dir; }],
-    ['HOME', dir => dir],
-    ['GIT_CONFIG_SYSTEM', dir => join(dir, '.gitconfig')],
-  ])('a caller-chosen %s holding a helper is never replayed as trusted, and the helper never runs', (key, location) => {
-    const attacker = join(root, 'attacker');
-    mkdirSync(attacker, { recursive: true });
-    const value = location(attacker);
-    const evilHelper = `!f() { touch '${evilRan}'; echo username=evil; echo password=evil; }; f`;
-    for (const file of [join(attacker, '.gitconfig'), join(attacker, 'git', 'config')]) {
-      if (existsSync(dirname(file))) git(['config', '--file', file, 'credential.helper', evilHelper], root);
-    }
-    const env = { ...base, [key]: value };
-    if (key === 'GIT_CONFIG_SYSTEM') delete env.GIT_CONFIG_NOSYSTEM; // so the hardened git reads the redirected system file
-    expect(trusted(env)).toEqual([]);
-    const filled = fill(harden(env));
-    expect(filled.status).not.toBe(0);
-    expect(existsSync(evilRan), `the ${key} helper ran`).toBe(false);
-  });
-
-  it('the account\'s own default locations named explicitly are still trusted', () => {
-    expect(trusted({ ...base, XDG_CONFIG_HOME: join(home, '.config') })).toEqual(trusted());
-    expect(trusted()).toHaveLength(3);
+    expect(existsSync(evilRan), 'the inherited command-scope helper ran').toBe(false);
   });
 });

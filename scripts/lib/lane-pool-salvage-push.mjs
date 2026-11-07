@@ -45,7 +45,11 @@ export async function salvagePushLane({ lane, laneDir, io, now = () => new Date(
 }
 
 export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync }) {
-  const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
+  const baseEnv = { ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' };
+  const env = laneGitHardeningEnv(baseEnv);
+  // The canonical-origin listing run in the VALIDATED primary only: the operator's own credential helper / askpass
+  // there authenticates an HTTPS origin. No lane is ever the cwd of a call with this env (PR #6319, R674 route a).
+  const primaryEnv = laneGitHardeningEnv(baseEnv, { credentialPins: false });
   // resolveRepo makes configured local origins absolute; explicit --origin paths remain invocation-relative.
   const origin = repo.originUrl ? (/^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl)) : null;
   const normalizeRemoteName = name => name.toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '');
@@ -55,10 +59,10 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       '-c', 'remote.origin.pushurl=', '-c', 'push.gpgSign=false', '-c', 'gpg.ssh.defaultKeyCommand=', command, ...args];
   };
   // `bounded` runs the command under git-bounded.mjs so a timeout kills the whole process group (index-pack, ssh).
-  const git = (dir, args, timeout = 120_000, bounded = false) => {
+  const git = (dir, args, timeout = 120_000, bounded = false, callEnv = env) => {
     const cmd = bounded ? boundedGitCommand(args, timeout) : { file: 'git', args };
     return runGit(cmd.file, cmd.args, {
-      cwd: dir, env, encoding: 'utf8', timeout: bounded ? timeout + BOUNDED_GIT_GRACE_MS : timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
+      cwd: dir, env: callEnv, encoding: 'utf8', timeout: bounded ? timeout + BOUNDED_GIT_GRACE_MS : timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
   };
@@ -228,13 +232,15 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
   // are exempt only in a checkout resolveRepo validated as the primary (found by name, or proven not a lane):
   // `primaryPath`. A release run from inside a lane keeps that lane as referencePath, so without a validated primary
   // the listing runs under the strict lane rules, where a credential helper, http.* or askpass key refuses
-  // (PR #6319 send-back).
+  // (PR #6319 send-back). Only the validated-primary listing drops the credential.helper / core.askPass reset pins, so
+  // the operator's own helper authenticates an HTTPS origin; the fallback (a possible lane) keeps them, as do every
+  // lane fetch and the salvage push (PR #6319 operator ruling, R674 route a). Terminal prompts stay off either way.
   const listOrigin = (...patterns) => {
     const args = transport('ls-remote', origin, ...patterns);
     const primaryDir = repo.primaryPath || null;
     const dir = primaryDir || repo.referencePath;
     checkTransportConfig(dir, { primary: !!primaryDir });
-    return git(dir, args, 120_000, true);
+    return git(dir, args, 120_000, true, primaryDir ? primaryEnv : env);
   };
   return {
     fetchHeads,

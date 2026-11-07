@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join, resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
@@ -192,7 +192,7 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(runGit.mock.calls.every(([, , options]) => options.cwd === primary)).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it('pins every transport to no credential helper, no askpass, no inherited ssh command and no terminal prompt', () => {
+  it('pins lane transports to no credential helper and no askpass; every transport drops inherited askpass / ssh and prompts', () => {
     const { dir, primary } = setup();
     try {
       // A caller inside a lane controls its own env: an inherited askpass program must not reach the transport.
@@ -200,19 +200,71 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       vi.stubEnv('SSH_ASKPASS', join(dir, 'lane-ssh-askpass'));
       vi.stubEnv('GIT_SSH_COMMAND', join(dir, 'lane-ssh'));
       vi.stubEnv('GIT_SSH', join(dir, 'lane-ssh'));
+      const lane = join(dir, 'lane-1');
+      execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
       const runGit = vi.fn(execFileSync);
-      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
       io.remoteHeads();
-      const listing = runGit.mock.calls.find(([, args]) => args.includes('ls-remote'));
-      const { env } = listing[2];
-      const pins = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
-      expect(pins).toMatchObject({ 'credential.helper': '', 'core.askPass': '' });
-      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
-      expect(env).not.toHaveProperty('GIT_ASKPASS');
-      expect(env).not.toHaveProperty('SSH_ASKPASS');
-      expect(env).not.toHaveProperty('GIT_SSH_COMMAND');
-      expect(env).not.toHaveProperty('GIT_SSH');
-      expect(pins['core.sshCommand']).toBe('ssh');
+      io.fetchHeads(lane);
+      // The same listing without a validated primary runs where it can (here the lane): it keeps the reset pins.
+      const fallbackGit = vi.fn(execFileSync);
+      realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane }, backupRoot: join(dir, 'backups'), runGit: fallbackGit }).remoteHeads();
+      const pinsOf = ({ env }) => Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      const transports = {
+        primaryListing: runGit.mock.calls.find(([, args]) => args.includes('ls-remote'))[2],
+        laneFetch: runGit.mock.calls.find(([, args]) => args.includes('fetch'))[2],
+        fallbackListing: fallbackGit.mock.calls.find(([, args]) => args.includes('ls-remote'))[2],
+      };
+      expect(transports.primaryListing.cwd).toBe(primary);
+      expect(pinsOf(transports.primaryListing)).not.toHaveProperty('credential.helper');
+      expect(pinsOf(transports.primaryListing)).not.toHaveProperty('core.askPass');
+      for (const name of ['laneFetch', 'fallbackListing']) {
+        expect(transports[name].cwd, name).toBe(lane);
+        expect(pinsOf(transports[name]), name).toMatchObject({ 'credential.helper': '', 'core.askPass': '' });
+      }
+      for (const [name, options] of Object.entries(transports)) {
+        const { env } = options;
+        expect(env.GIT_TERMINAL_PROMPT, name).toBe('0');
+        for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH']) expect(env, `${name} ${key}`).not.toHaveProperty(key);
+        expect(pinsOf(options)['core.sshCommand'], name).toBe('ssh');
+        expect(pinsOf(options)['core.hooksPath'], name).toBe('/dev/null');
+      }
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  // PR #6319 operator ruling (R674 route a): the validated primary's own credential helper (local or global scope)
+  // authenticates the canonical-origin listing; a lane-set helper never runs on a lane transport.
+  it.each(['local', 'global'])('the primary listing authenticates with a %s dummy helper while a lane-set helper stays blocked', scope => {
+    const { dir, primary } = setup();
+    try {
+      const home = join(dir, 'home');
+      mkdirSync(home);
+      const primaryRan = join(dir, 'primary-helper-ran'), evilRan = join(dir, 'lane-helper-ran');
+      const helper = `!f() { touch '${primaryRan}'; [ "$1" = get ] && printf 'username=operator\\npassword=primary-pass\\n'; }; f`;
+      if (scope === 'local') execFileSync('git', ['config', 'credential.helper', helper], { cwd: primary });
+      else execFileSync('git', ['config', '--file', join(home, '.gitconfig'), 'credential.helper', helper]);
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('XDG_CONFIG_HOME', undefined);
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      const lane = join(dir, 'lane-1');
+      execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      io.remoteHeads();
+      io.fetchHeads(lane);
+      const envOf = command => runGit.mock.calls.find(([, args]) => args.includes(command))[2].env;
+      const fill = (cwd, env) => spawnSync('git', ['credential', 'fill'], { cwd, env, input: 'protocol=https\nhost=example.invalid\n\n', encoding: 'utf8', timeout: 20_000 });
+      const listingEnv = envOf('ls-remote');
+      expect(listingEnv.GIT_TERMINAL_PROMPT).toBe('0');
+      const filled = fill(primary, listingEnv);
+      expect(filled.status, filled.stderr).toBe(0);
+      expect(filled.stdout).toContain('password=primary-pass');
+      expect(existsSync(primaryRan)).toBe(true);
+      // The lane transport keeps the reset pins: a helper the lane sets afterwards is not run and nothing answers.
+      execFileSync('git', ['config', 'credential.helper', `!f() { touch '${evilRan}'; echo username=evil; echo password=evil; }; f`], { cwd: lane });
+      execFileSync('git', ['config', 'core.askPass', `${join(dir, 'lane-askpass')}`], { cwd: lane });
+      const laneFill = fill(lane, envOf('fetch'));
+      expect(laneFill.status).not.toBe(0);
+      expect(existsSync(evilRan), 'the lane credential helper ran').toBe(false);
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
   it('accepts operator auth/signing keys in the primary and excludes ops/* heads', () => {
