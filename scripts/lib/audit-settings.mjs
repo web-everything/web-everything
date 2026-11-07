@@ -109,12 +109,33 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * file) besides other work, so only an import of their lock API by name (LOCK_API) makes a module a lock user
  * (PR #6381 self-review: atomic-json-file.mjs#withFileLock and the inline holds were missed). An inline hold has no
  * import to scan for, so each is named here.
+ * The list is held to a RULE, not kept by hand (PR #6381 judge, R10): a source-scan test (audit-verdict.test.mjs, "the
+ * hold scan") finds every tracked module whose code takes an exclusive hold (a `'wx'` / `O_EXCL` create, a lock
+ * directory made without `recursive` beside an `EEXIST` check, or a `.lock` / `.lease` / `.mutex` file name) and fails
+ * unless each one is on the floor, by a name glob or by an entry here. The entries after the first block are the
+ * modules that scan found unprotected.
  */
 export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
-  'scripts/readiness/prepare-hold-state.mjs']);
+  'scripts/readiness/prepare-hold-state.mjs',
+  // Found by the hold scan (ci-queue-watch.mjs#withHistoryLock and its finalizer among them).
+  'scripts/broadcast-inject.mjs', 'scripts/ci/refresh-timings.mjs', 'scripts/conveyor/ci-queue-watch.mjs',
+  'scripts/conveyor/ci-red-recovery-watch.mjs', 'scripts/conveyor/health-watch-job.mjs', 'scripts/conveyor/infra-blocked.mjs',
+  'scripts/conveyor/open-pr-snapshot.mjs', 'scripts/conveyor/pr-sweep-job.mjs', 'scripts/conveyor/queue-store.mjs',
+  'scripts/conveyor/referral-reverify.mjs', 'scripts/conveyor/soak/breaks/fresh-stamp-commit-graph-repair.mjs',
+  'scripts/conveyor/unsupported-repo.mjs', 'scripts/conveyor/verified-push-salvage.mjs', 'scripts/lib/archive-retention.mjs',
+  'scripts/lib/daemon-boot-smoke.mjs', 'scripts/lib/daemon-rebuild/prepare.mjs', 'scripts/lib/daemon-rebuild/wrong-branch-heal.mjs',
+  'scripts/lib/daemon-version-migrate.mjs', 'scripts/lib/daemon-version-runtime.mjs', 'scripts/lib/daemon-version-switch.mjs',
+  'scripts/lib/daemon-version.mjs', 'scripts/lib/delivery-policy.mjs', 'scripts/lib/enqueue-on-event.mjs',
+  'scripts/lib/finished-ci-cache.mjs', 'scripts/lib/free-lane-list.mjs', 'scripts/lib/lane-alternates.mjs',
+  'scripts/lib/lane-card-salvage.mjs', 'scripts/lib/pr-facts.mjs', 'scripts/lib/review-scratch.mjs', 'scripts/lib/runs-writer-exclusion.mjs',
+  'scripts/operations/card-batch-extract.mjs', 'scripts/operations/codex-worker.mjs', 'scripts/operations/coroner-extract.mjs',
+  'scripts/operations/fix-run.mjs', 'scripts/operations/operator-notify-io.mjs', 'scripts/operations/perf-snapshot-io.mjs',
+  'scripts/operations/scheduled-sweep.mjs', 'scripts/readiness/already-done-refresh.mjs', 'scripts/readiness/forge-exec-bases.mjs',
+  'scripts/readiness/forge-exec-limits.mjs', 'scripts/readiness/forge-warm-base.mjs', 'scripts/readiness/red-main-remediation.mjs',
+  'scripts/readiness/remote-exec.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
@@ -175,7 +196,12 @@ export const LOCK_USERS = Object.freeze([
   'scripts/verify-lane.mjs', 'skills-src/conveyor/build-dispatch-daemon.mjs', 'skills-src/conveyor/pass-daemon.mjs',
   'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', 'skills-src/conveyor/review-daemon.mjs',
   'skills-src/conveyor/runner-lock.mjs', 'skills-src/conveyor/runner.mjs', 'skills-src/conveyor/supervisor-launcher.mjs',
-  'skills-src/conveyor/verify-daemon.mjs']);
+  'skills-src/conveyor/verify-daemon.mjs',
+  // Callers of a hold-scan holder's lock API (PR #6381 judge).
+  'scripts/conveyor/backfill-changed-files.mjs', 'scripts/conveyor/run-scorecard-store.mjs',
+  'scripts/conveyor/soak/breaks/daemon-entry-boot-crash.mjs', 'scripts/conveyor/soak/breaks/exhausted-retry-recovery.mjs',
+  'scripts/lib/drain-facts-source.mjs', 'scripts/lib/merge-queue-hook.mjs', 'scripts/lib/pr-size-admission.mjs',
+  'scripts/lib/renamed-pr-refresh.mjs', 'scripts/operations/operator-notify-cli.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
@@ -266,6 +292,13 @@ const pathOf = key => SECTION_PATHS[key] ?? [key];
 const get = (tool, key) => {
   const [a, b] = pathOf(key);
   return b === undefined ? tool?.[a] : tool?.[a]?.[b];
+};
+/** A setting's value in one raw layer, own keys only (as the cascade reads a layer); undefined when it is not set. */
+const ownGet = (layer, key) => {
+  const [a, b] = pathOf(key);
+  if (!isObj(layer) || !Object.hasOwn(layer, a)) return undefined;
+  if (b === undefined) return layer[a];
+  return isObj(layer[a]) && Object.hasOwn(layer[a], b) ? layer[a][b] : undefined;
 };
 /**
  * Malformed explicit entries the cascade's leaf flattening hides (PR #6381): an empty object at a setting has no
@@ -434,9 +467,12 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   // A platform preference that is present but not an object flattens to one root leaf and reads as all-omitted.
   const platBad = platUnreadable || (plat !== undefined && plat !== null && !isObj(plat));
   if (platBad) warn(`audit platform preference ${platUnreadable ? 'unreadable' : 'is not an object'}; every setting resolves to its strictest option`);
+  // The cascade still runs (it logs each policy's sources, and a layer it cannot survive fails closed), but no value is
+  // read from its merge: it keys each leaf by its NUL-joined path, so an unknown key `"verdict" + NUL + "mode"` takes the
+  // slot of `verdict.mode` and drops it, and an explicit shadow mode read as omitted (PR #6381 judge). Each setting is
+  // read from the RAW layers instead, own keys only, the file over the platform, as the cascade layers them.
   let cascade;
   try { cascade = cascadePolicy('audit', tool, { standard: undefined, platform: plat === undefined ? null : plat, env, log }); } catch { cascade = null; }
-  const layered = cascade?.layered ?? {};
   for (const [name, layer] of [['platform chain', chainPlat], ['platform', plat], ['file', tool]]) {
     const unknown = unknownKeys(layer);
     if (unknown.length) warn(`audit ${name} layer has unknown setting(s) ${JSON.stringify(unknown.slice(0, 20))}; ignored (check the spelling)`);
@@ -447,8 +483,9 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   const value = {}; const sources = {};
   for (const key of Object.keys(DEFAULTS)) {
     // The source names the layer the value came from: the cascade layers the file over the platform (PR #6381 send-back).
-    let v = get(layered, key);
-    let src = get(isObj(tool) ? tool : undefined, key) !== undefined ? 'file' : get(isObj(plat) ? plat : undefined, key) !== undefined ? 'platform' : 'built-in';
+    const fromFile = ownGet(tool, key); const fromPlat = ownGet(plat, key);
+    let v = fromFile !== undefined ? fromFile : fromPlat;
+    let src = fromFile !== undefined ? 'file' : fromPlat !== undefined ? 'platform' : 'built-in';
     const bad = platBad || malformed(key, VALID[key]);
     if (v === undefined && !unreadable && cascade && !bad) { v = DEFAULTS[key]; src = 'built-in'; }
     if (unreadable || !cascade || bad || !VALID[key](v)) {

@@ -351,6 +351,60 @@ describe('R473 pure classified verdict', () => {
       }
     }
   });
+  // PR #6381 judge (R10): naming lock holders by hand never converged ("the floor omits module X", nine rounds). The
+  // floor is held to a RULE instead: every tracked module whose source takes an exclusive hold must be protected, by a
+  // name glob or by LOCK_HOLDERS. A hold is read from the source, comments removed, in three forms:
+  //  - an exclusive create: the `'wx'` / `'wx+'` open flag or `O_EXCL`;
+  //  - a lock directory: a `mkdir` without `recursive: true` near an `EEXIST` check (the create fails if it exists);
+  //  - a lock file name: a string naming a `.lock`, `.lease` or `.mutex` file (or a `-lock.json`-style name, or a
+  //    `locks/` folder). `package-lock.json` and `x.endsWith('.lock')`-style name checks are not holds.
+  // Protecting more only ever blocks more, so a module that only reads, checks or removes a lock file counts too.
+  const stripComments = s => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1');
+  const HOLD_FORMS = Object.freeze({
+    exclusiveCreate: /(['"`])wx\+?\1|\bO_EXCL\b/,
+    lockDirectory: /\bmkdir(?:Sync)?\s*\((?![^)]*recursive\s*:\s*true)[^)]*\)[\s\S]{0,400}?EEXIST|EEXIST[\s\S]{0,400}?\bmkdir(?:Sync)?\s*\((?![^)]*recursive\s*:\s*true)/,
+    lockFileName: /['"`][^'"`\s]*(?:\.(?:lock|lease|mutex)s?|[-_.](?:lock|lease|mutex)s?\.(?:json|d|pid|txt))['"`]|['"`/](?:lock|lease|mutex)s\//i,
+  });
+  const holdFormsOf = src => {
+    const s = stripComments(src).replace(/package-lock\.json/g, '').replace(/\.(?:endsWith|startsWith|includes)\(\s*(['"`])[^'"`\n]*\1\s*\)/g, '');
+    return Object.entries(HOLD_FORMS).filter(([, re]) => re.test(s)).map(([form]) => form);
+  };
+  const scannedHolders = [...lockSources.keys()].filter(p => holdFormsOf(lockSources.get(p)).length > 0);
+  it('the hold scan is live: it finds the known holders and ignores non-holds (PR #6381 judge)', () => {
+    expect(scannedHolders.length).toBeGreaterThan(50);
+    expect(scannedHolders).toEqual(expect.arrayContaining(['scripts/lib/atomic-json-file.mjs', 'scripts/conveyor/ci-queue-watch.mjs',
+      'scripts/readiness/file-locks.mjs']));
+    expect(holdFormsOf("openSync(p, 'wx')")).toEqual(['exclusiveCreate']);
+    expect(holdFormsOf("writeFileSync(p, x, { flag: \"wx\" })")).toEqual(['exclusiveCreate']);
+    expect(holdFormsOf('try { mkdirSync(dir); } catch (e) { if (e.code === "EEXIST") return false; }')).toEqual(['lockDirectory']);
+    expect(holdFormsOf('const lockPath = `${journal}.lock`;')).toEqual(['lockFileName']);
+    expect(holdFormsOf("join(root, 'locks/x.json')")).toEqual(['lockFileName']);
+    for (const none of ["mkdirSync(dir, { recursive: true }); if (e.code === 'EEXIST') {}", "read('package-lock.json')",
+      "name.endsWith('.lock')", "// openSync(p, 'wx')", "/* const p = 'x.lock' */", "writeFileSync(p, x, 'utf8')"]) {
+      expect(holdFormsOf(none), none).toEqual([]);
+    }
+  });
+  it.each(scannedHolders)('every module the hold scan finds is on the floor: a D3 race in %s never ships (PR #6381 judge)', async file => {
+    for (const stage of ['prerelease', 'prod']) {
+      const result = await compute([finding({ class: 'D3', file })], options(stage, { guardFloorPaths: [], raceBlockPaths: [] }));
+      expect(result.verdict, `${file}: ${holdFormsOf(lockSources.get(file)).join(', ')}`).toBe('WEAKENED');
+      expect(result.ships).toEqual([]);
+    }
+  });
+  it.each([
+    ['scripts/lib/atomic-json-file.mjs', 'A finds the lock stale and reclaims it; B reclaims it too and takes it; A, the stale owner, deletes the lock file B now holds'],
+    ['scripts/conveyor/ci-queue-watch.mjs', 'withHistoryLock: A\'s hold goes stale and B takes it; A\'s finalizer removes the lock B now holds'],
+  ])('a D3 stale-lock reclaim race in %s with an interleaving blocks as B4, never NOT WEAKENED with an advisory card (PR #6381 judge)', async (file, trigger) => {
+    for (const stage of ['prerelease', 'prod']) {
+      const f = finding({ class: 'D3', file, invariant: 'Only the lock owner removes the lock', trigger, interleaving,
+        consequence: 'Two writers hold the lock at once and one write is lost' });
+      const result = await compute([f], options(stage, { guardFloorPaths: [], raceBlockPaths: [] }));
+      expect(result.verdict).toBe('WEAKENED');
+      expect(result.ships).toEqual([]);
+      expect(result.cards).toEqual([]);
+      expect(result.blocks).toEqual([expect.objectContaining({ id: 'f1', class: 'B4' })]);
+    }
+  });
   // The anywhere-in-basename globs also capture files whose name holds the word inside another word (`release` holds
   // `lease`), tests and golden-corpus data. Protecting more only ever blocks more, so this over-capture is accepted.
   // Every tracked file the wide form captures and the old start-of-name form did not is derived from git and listed.
@@ -1040,7 +1094,9 @@ describe('card outcomes, proof binding and the default card reader (PR #6381 jud
   });
   it('the default reader refuses a non-card path without running git', () => {
     const run = vi.fn(() => ok('x'));
-    for (const p of ['../x.md', 'backlog/a/b.md', 'backlog/x.txt', 'backlog/x.md\n', 7, undefined]) expect(readCardFromMain(p, { run })).toBeNull();
+    // A line break after the name (end-of-input anchor, as HASH_64 has: PR #6381 judge) or a `.md` folder is not a card.
+    for (const p of ['../x.md', 'backlog/a/b.md', 'backlog/x.txt', 'backlog/x.md\n', 'backlog/x.md\r', 'backlog/x.md\r\n',
+      `backlog/x.md${String.fromCodePoint(0x2028)}`, 'backlog/x.md/', 7, undefined]) expect(readCardFromMain(p, { run })).toBeNull();
     expect(run).not.toHaveBeenCalled();
   });
 });

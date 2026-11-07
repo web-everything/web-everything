@@ -77,7 +77,8 @@ function globMatch(file, pattern) {
 }
 
 const REPO_ROOT = fileURLToPath(new NodeURL('../../', import.meta.url));
-const CARD_PATH = /^backlog\/[A-Za-z0-9._-]+\.md$/;
+// End-of-input anchor, as HASH_64 has (PR #6381 judge): `$` would also match before a line break under the `m` flag.
+const CARD_PATH = /^backlog\/[A-Za-z0-9._-]+\.md(?![\s\S])/;
 /**
  * Default card reader: the card must exist on origin/main AS IT IS NOW. A local origin/main can be stale (a card since
  * deleted or a pay-by since moved would still read), so the ref is fetched first (PR #6381 judge). Any failure,

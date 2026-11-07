@@ -278,6 +278,32 @@ describe('audit settings (R528)', () => {
       expect(r.value.releaseStage).toBe('prod');
       expect(r.sources.releaseStage).toBe('strictest');
     });
+  // PR #6381 judge: the cascade keys each leaf by its NUL-joined path, so an unknown key `"verdict" + NUL + "mode"` took
+  // the slot of `verdict.mode` and dropped it: an explicit shadow mode read as omitted and earned the default `model`.
+  // An unknown key holding any control or format character must change no explicit setting: the result equals the
+  // same layer with that character replaced by a plain letter (an ordinary unknown key).
+  const CONTROL_CHARS = [0x00, 0x01, 0x09, 0x1f, 0x7f, 0x85, 0x2028, 0x200b, 0xfeff].map(c => String.fromCodePoint(c));
+  it.each(CONTROL_CHARS.map(c => [c.codePointAt(0).toString(16), c]))(
+    'an unknown key holding U+%s changes no explicit setting in the file or the platform layer (PR #6381 judge)', (_hex, c) => {
+      const layers = sep => [
+        { verdict: { mode: 'shadow' }, [`verdict${sep}mode`]: 'computed', recheck: { max: 0 }, [`recheck${sep}max`]: 3 },
+        { preExisting: { mode: 'block', baseRecheckMax: 0 }, [`preExisting${sep}baseRecheckMax`]: 3, [`cards${sep}requirePayBy`]: false },
+      ];
+      for (const [i, audit] of layers(c).entries()) {
+        const control = layers('X')[i];
+        const viaFile = resolveAuditSettings({ fileRead: file(audit), platform: null, env: {}, log: () => {} });
+        const viaPlatform = resolveAuditSettings({ fileRead: file({}), platform: audit, env: {}, log: () => {} });
+        const fileControl = resolveAuditSettings({ fileRead: file(control), platform: null, env: {}, log: () => {} });
+        const platformControl = resolveAuditSettings({ fileRead: file({}), platform: control, env: {}, log: () => {} });
+        expect(viaFile.value).toEqual(fileControl.value);
+        expect(viaPlatform.value).toEqual(platformControl.value);
+      }
+      const r = resolveAuditSettings({ fileRead: file(layers(c)[0]), platform: null, env: {}, log: () => {} });
+      expect(r.value).toMatchObject({ verdictMode: 'shadow', recheckMax: 0 });
+      // The platform says shadow; a file key that collides with its leaf must not hide it either.
+      const across = resolveAuditSettings({ fileRead: file({ [`verdict${c}mode`]: 'computed' }), platform: { verdict: { mode: 'shadow' } }, env: {}, log: () => {} });
+      expect(across.value.verdictMode).toBe('shadow');
+    });
   it('section-level whitespace variants fail the setting closed (PR #6381)', () => {
     for (const audit of [{ verdict: { 'mode ': 'computed' } }, { 'verdict ': { mode: 'computed' } }]) {
       const r = resolveAuditSettings({ fileRead: file(audit), platform: null, env: {}, log: () => {} });
