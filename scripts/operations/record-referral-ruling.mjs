@@ -465,7 +465,17 @@ export function rulingCardSteps(readRulingContext, planCard, type, selectJudge) 
       const landed = landedRulingCard(v.findings);
       const judge = v.findings.cardPlan?.mode === 'judge';
       if (judge && !v.input.preview && !landed?.judgeEvidence) throw new Error('missing judge confirmation result; ask the operator');
-      if (judge && landed?.input?.ruling === 'not-real') return v.findings.read;
+      if (judge && landed?.input?.ruling === 'not-real') {
+        let fresh;
+        try { fresh = readRulingContext({ repo: v.input.repo, pr: v.input.pr, card: v.input.card, asJudge: v.input.asJudge, evidenceFile: v.input.evidenceFile, disagreements: v.input.disagreements }); }
+        catch { throw new Error('disagreement history unreadable after judge confirmation; operator-only; no ruling recorded'); }
+        if (!Number.isInteger(fresh?.disagreements) || fresh.disagreements < 0
+          || fresh.disagreements >= 2 || fresh.disagreements > v.findings.read.disagreements)
+          throw new Error('disagreement history unknown, repeated, or increased after judge confirmation; operator-only; no ruling recorded');
+        if (fresh.head !== v.findings.read.head)
+          throw new Error('PR head changed during judge confirmation; operator-only; no ruling recorded');
+        return fresh;
+      }
       if (v.findings.cardPlan && !v.input.preview && (!landed?.ok || !landed.ref))
         throw new Error('card filing result missing; no ruling recorded');
       if ((!judge && v.findings.cardPlan?.mode !== 'one-call') || !landed?.ok) return v.findings.read;

@@ -1108,6 +1108,40 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       });
       return reader({ repo, pr: 7, finding: 'all-open', break: '1', asJudge, evidenceFile: 'evidence.json', disagreements: 0 });
     }
+    for (const [label, options, count] of [
+      ['0 -> 2', { repeated: true }, 2],
+      ['0 -> unreadable', { unknown: true }, undefined],
+      ['0 -> 1 below the repeated-disagreement threshold', {}, 1],
+    ]) it(`${kind}: disagreement count ${label} during confirm => operator-only, nothing posted`, async () => {
+      const h = await fixture(kind, { inputOver: { disagreements: 1 } });
+      h.judgeConfirm.mockImplementation(async () => {
+        const fresh = await realContext(h, options);
+        if (count === 1) fresh.disagreements = 1;
+        expect(fresh.disagreements).toBe(count);
+        Object.assign(h.snapshot, fresh);
+        return { verdict: 'agree' };
+      });
+      await expect(h.run()).rejects.toThrow(/operator-only/);
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+      expect(h.landRulingCard).not.toHaveBeenCalled();
+      expect(h.written).toEqual([]);
+      expect(h.noIO).not.toHaveBeenCalled();
+    });
+    for (const failure of ['thread read throws', 'head changed'])
+      it(`${kind}: ${failure} after judge confirmation => operator-only, nothing posted`, async () => {
+        const h = await fixture(kind);
+        h.judgeConfirm.mockImplementation(async () => {
+          if (failure === 'head changed') h.snapshot.head = 'b'.repeat(40);
+          else Object.defineProperty(h.snapshot, 'disagreements', { enumerable: true,
+            get() { throw new Error('thread unavailable'); } });
+          return { verdict: 'agree' };
+        });
+        await expect(h.run()).rejects.toThrow(/operator-only/);
+        expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.written).toEqual([]);
+        expect(h.noIO).not.toHaveBeenCalled();
+      });
     it(`${kind}: real reader derives two disagreements; supplied zero cannot clear in open`, async () => {
       const h = await fixture(kind, { mode: 'open', inputOver: { disagreements: 0 } });
       Object.assign(h.snapshot, await realContext(h, { repeated: true }));
