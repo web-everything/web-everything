@@ -702,3 +702,44 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     if (w) expect(w).toMatchObject({ sha: target, rollbackPending: 'health-failed' });
   });
 });
+
+describe('R508 force-adopt: a force-adopted build stays unverified (never the incremental-smoke baseline)', () => {
+  // The real smoke skips a check when the files changed since the adopted build do not touch its code (`changedFiles` non-null).
+  // Emulate that: the defect of the force-adopted build is only visible to a FULL smoke (`changedFiles === null`).
+  const incrementalAware = () => vi.fn(async ({ changedFiles }) => (changedFiles === null
+    ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'dispatch-dry-run', detail: 'F defect', mayBeTransient: false }, { ok: false, name: 'reconcile-dry-run', detail: 'F defect', mayBeTransient: false }] } }
+    : { verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+  const forceAdoptF = async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const F = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: F, rulingsText: RULINGS }).ok).toBe(true);
+    const failF = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'dispatch-dry-run', detail: 'F defect', mayBeTransient: false }] } }));
+    await tick(cloneDir, env, { runSmoke: failF, forceWatchProbe: healthy });
+    expect(headOf(cloneDir)).toBe(F); // F is force-adopted
+    return { originDir, cloneDir, env, F };
+  };
+
+  it('a successor touching only an unrelated file re-runs the checks F failed (full smoke) and is not adopted while they fail', async () => {
+    const { originDir, cloneDir, env, F } = await forceAdoptF();
+    const S = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// only the pool changed\n'));
+    const runSmoke = incrementalAware();
+    await tick(cloneDir, env, { runSmoke, forceWatchProbe: healthy });
+    expect(runSmoke).toHaveBeenCalled();
+    expect(runSmoke.mock.calls[0][0].changedFiles).toBeNull(); // NOT the incremental F→S file list: F is not a trusted baseline
+    expect(headOf(cloneDir)).not.toBe(S); // the failing full smoke keeps S out (it would have been adopted with F's defect before)
+  });
+
+  it('the same successor IS adopted once the full smoke passes, and a later successor goes back to the incremental smoke', async () => {
+    const { originDir, cloneDir, env } = await forceAdoptF();
+    const S = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// only the pool changed\n'));
+    const full = passing();
+    await tick(cloneDir, env, { runSmoke: full, forceWatchProbe: healthy });
+    expect(full.mock.calls[0][0].changedFiles).toBeNull();
+    expect(headOf(cloneDir)).toBe(S); // a build that passes the full smoke is a trusted baseline again
+    advanceMain(originDir, (dir) => writeFile(dir, 'other.txt', 'y\n'));
+    const next = passing();
+    await tick(cloneDir, env, { runSmoke: next, forceWatchProbe: healthy });
+    expect(Array.isArray(next.mock.calls[0][0].changedFiles)).toBe(true);
+  });
+});

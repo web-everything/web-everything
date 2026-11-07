@@ -433,10 +433,13 @@ export async function smokeAndAdopt({
     // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`skipped: busy pool`) was never
     // live-verified on those checks, so "unchanged since the last live-verified build" does not hold for it:
     // the next smoke runs every check (null = full smoke), or a chain of busy skips would launder the pool code.
-    const busyTrees = readRebuildState(root, stEnv).busySkippedTrees;
-    if (Array.isArray(busyTrees) && busyTrees.length) {
-      const headTree = verifyRev(git, `${prevHead}^{tree}`);
-      if (!headTree || busyTrees.includes(headTree)) return null;
+    const rs = readRebuildState(root, stEnv);
+    // R508: a force-adopted build (adopted over a failed smoke) is likewise never a trusted baseline: full smoke until a build passes one.
+    for (const trees of [rs.busySkippedTrees, rs.forceUnverifiedTrees]) {
+      if (Array.isArray(trees) && trees.length) {
+        const headTree = verifyRev(git, `${prevHead}^{tree}`);
+        if (!headTree || trees.includes(headTree)) return null;
+      }
     }
     const d = git(['diff', '--name-only', prevHead, sha]);
     return d.status === 0 ? String(d.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
@@ -567,6 +570,17 @@ export async function smokeAndAdopt({
       const tree = verifyRev(git, `${p.finalSha}^{tree}`);
       alert('smoke-busy-pool-skipped', { checks: busySkipped, message: 'lane-pool probe(s) skipped under a busy pool; the next smoke re-runs every check' });
       if (tree) await locked((st) => { st.busySkippedTrees = [tree, ...(st.busySkippedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
+    }
+    // R508: a force-adopted build is adopted OVER a failed smoke, so it was never live-verified on the checks it failed. It must not become
+    // the trusted baseline `changedSince` reads, or a successor touching only unrelated files would skip those checks as "unchanged" and be
+    // adopted with the force-adopted build's defect (and the force watch would then clear as "superseded", with no rollback). Recorded
+    // BEFORE adopting; the next smoke runs the FULL smoke until a build passes one. (prepare's skip-unrelated path is unaffected on purpose:
+    // it adopts docs-only successors and carries the open force watch, which still guards the force-adopted code.)
+    // Fail closed: if the tree cannot be resolved or the record cannot be written, the force is not finalized (the caller aborts it).
+    if (readyMeta?.forced === true) {
+      const tree = verifyRev(git, `${p.finalSha}^{tree}`);
+      if (!tree) throw new Error('forced build: tree unresolvable, cannot record it as unverified');
+      await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
     }
     writeReadyCandidate(root, {
       ...readyMeta,
