@@ -1023,3 +1023,97 @@ it.each([['drain', readDrainRedTeamEvidence, 'review-pr-a'], ['recovery', readRe
     stat: path => ({ mtimeMs: path.includes(expectedId) ? 3000 : 4000 }), read: id => runs[id] });
   expect(result.newest ?? result.loopPayload).toEqual(runs[expectedId]);
 });
+
+// A red-team result older than an unfinished review whose accept came by label (human cleared on the same head).
+describe('settleUnknownEvidenceByComment: result older than the unfinished review, accepted on the same head', async () => {
+  const { settleUnknownEvidenceByComment } = await import('../drain-red-team-evidence.mjs');
+  const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+  const pr = 6416, head = 'c'.repeat(40), other = 'd'.repeat(40);
+  const T = Date.parse('2026-11-06T14:42:13Z');
+  const iso = ms => new Date(ms).toISOString();
+  const result = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, createdAt: iso(T),
+    body: renderRedTeamComment({ pr, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
+  const accept = (sha = head, at = T + 14 * 60e3, login = 'web-everything') => ({ author: { login }, createdAt: iso(at),
+    body: `Cleared by operator.\n<!-- reviewed-sha: ${sha} -->\n<!-- cleared-human: chalbert -->` });
+  const started = T + 6 * 60e3; // unfinished review began after the result
+  const bounds = o => ({ unfinishedUndecided: true, unfinishedStartedAt: started, unfinishedActiveAt: T + 16 * 60e3, evaluatedAt: T + 2 * 3600e3,
+    completeHeadRead: () => ({ complete: true, blocked: false }), ...o });
+  const unknown = o => Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: bounds(o), enumerable: false });
+  const settle = (ev, comments, reviews = []) => settleUnknownEvidenceByComment(ev, comments, pr, head, reviews);
+  const review = (state, at, login = 'chalbert') => ({ state, submittedAt: iso(at), author: { login } });
+
+  it('holds when a formal COMMENTED review was submitted after the accept (operator hold)', () => {
+    expect(settle(unknown(), [result(), accept()], [review('COMMENTED', T + 20 * 60e3)])).toMatchObject({ ok: false });
+  });
+  it('holds when a formal CHANGES_REQUESTED review stands after the accept', () => {
+    expect(settle(unknown(), [result(), accept()], [review('CHANGES_REQUESTED', T + 20 * 60e3)])).toMatchObject({ ok: false });
+  });
+  // "Nothing held after the accept" across the comment channels, not only formal reviews.
+  it('holds when a later trusted comment is a body-derived hold (manifest baseline mismatch)', () => {
+    const park = { author: { login: 'web-everything' }, createdAt: iso(T + 20 * 60e3), body: 'Drain parked: manifest baseline mismatch on this head.' };
+    expect(settle(unknown(), [result(), accept(), park])).toMatchObject({ ok: false });
+  });
+  it('holds when a later human comment is unrecognised (e.g. a "hold" note), from any author', () => {
+    for (const login of ['chalbert', 'web-everything']) {
+      const note = { author: { login }, createdAt: iso(T + 20 * 60e3), body: 'hold — do not merge until I have looked at this' };
+      expect(settle(unknown(), [result(), accept(), note])).toMatchObject({ ok: false });
+    }
+  });
+  it('holds when a later comment is a changes-requested verdict', () => {
+    const verdict = { author: { login: 'web-everything' }, createdAt: iso(T + 20 * 60e3), body: '🔁 review — changes requested\n\nfix the thing' };
+    expect(settle(unknown(), [result(), accept(), verdict])).toMatchObject({ ok: false });
+  });
+  it('still settles when the only later comment is a recognised machine note (non-regression pin)', () => {
+    const note = { author: { login: 'web-everything' }, createdAt: iso(T + 20 * 60e3), body: '' };
+    expect(settle(unknown(), [result(), accept(), note])).toMatchObject({ ok: true, settledByComment: 'review-unfinished' });
+  });
+  it('holds (fails closed) when the formal reviews are unreadable or not supplied', () => {
+    expect(settle(unknown(), [result(), accept()], null)).toMatchObject({ ok: false });
+    expect(settleUnknownEvidenceByComment(unknown(), [result(), accept()], pr, head)).toMatchObject({ ok: false });
+  });
+  it('still settles when only reviews older than the accept exist', () => {
+    expect(settle(unknown(), [result(), accept()], [review('COMMENTED', T + 8 * 60e3), review('APPROVED', T + 30 * 60e3)])).toMatchObject({ ok: true, settledByComment: 'review-unfinished' });
+  });
+
+  it('settles when a trusted accept on this head is newer than the unfinished review start', () => {
+    expect(settle(unknown(), [result(), accept()])).toMatchObject({ ok: true, settledByComment: 'review-unfinished' });
+  });
+  it('hands the accept time (not the older result time) to the complete same-head read', () => {
+    const seen = [];
+    settle(unknown({ completeHeadRead: a => { seen.push(a.at); return { complete: true, blocked: false }; } }), [result(), accept()]);
+    expect(seen).toEqual([T + 14 * 60e3]);
+  });
+  it('holds when the red-team result is missing', () => {
+    expect(settle(unknown(), [accept()])).toMatchObject({ ok: false });
+  });
+  it('holds when the unfinished run is not quiet', () => {
+    expect(settle(unknown({ unfinishedActiveAt: T + 2 * 3600e3 - 60e3 }), [result(), accept()])).toMatchObject({ ok: false });
+  });
+  it('holds when the complete read is blocked or incomplete', () => {
+    expect(settle(unknown({ completeHeadRead: () => ({ complete: true, blocked: true }) }), [result(), accept()])).toMatchObject({ ok: false });
+    expect(settle(unknown({ completeHeadRead: () => ({ complete: false, blocked: false }) }), [result(), accept()])).toMatchObject({ ok: false });
+  });
+  it('holds when the result is for another head', () => {
+    expect(settle(unknown(), [result(other), accept()])).toMatchObject({ ok: false });
+  });
+  it('holds when the accept is for another head', () => {
+    expect(settle(unknown(), [result(), accept(other)])).toMatchObject({ ok: false });
+  });
+  it('holds when the accept is older than the unfinished start', () => {
+    expect(settle(unknown(), [result(), accept(head, started - 60e3)])).toMatchObject({ ok: false });
+  });
+  it('holds when the accept comes from an untrusted author', () => {
+    expect(settle(unknown(), [result(), accept(head, T + 14 * 60e3, 'someone-else')])).toMatchObject({ ok: false });
+  });
+  it('holds when the result comes from an untrusted author', () => {
+    expect(settle(unknown(), [result(head, 'someone-else'), accept()])).toMatchObject({ ok: false });
+  });
+  it('holds when the unfinished run already decided', () => {
+    expect(settle(unknown({ unfinishedUndecided: false }), [result(), accept()])).toMatchObject({ ok: false });
+  });
+  it('holds when a confirmed break is on the head result', () => {
+    const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
+    const ev = settle(unknown(), [result(head, 'web-everything', broken), accept()]);
+    expect(redTeamEnqueueHold({ ...ev, comments: [result(head, 'web-everything', broken), accept()], pr, head, env: {} })).toMatch(/break requiring send-back|evidence unknown/);
+  });
+});
