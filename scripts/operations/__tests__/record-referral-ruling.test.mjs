@@ -903,6 +903,12 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
   // Inspect evidence without prescribing its container/key on the two different record formats.
   const objects = x => x && typeof x === 'object' ? [x, ...Object.values(x).flatMap(objects)] : [];
   const storedEvidence = x => objects(x).find(o => o.command === evidence().command && o.headSha === head);
+  // Strip HTML comments until stable, then drop any stray opener: a single-pass replace can leave `<!--` behind.
+  const stripComments = s => {
+    let out = String(s);
+    for (let prev = null; prev !== out;) { prev = out; out = out.replace(/<!--[\s\S]*?-->/g, ''); }
+    return out.replaceAll('<!--', '');
+  };
 
   for (const kind of ['referral', 'red-team']) {
     for (const mode of ['open', 'evidence-required']) {
@@ -1419,7 +1425,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     expect(JSON.stringify(storedEvidence(v.record))).toContain('agree');
     const body = h.written[0].payload.body;
     // Strip the encoded record: evidence must also be visible to the operator.
-    const text = body.replace(/<!--[\s\S]*?-->/g, '');
+    const text = stripComments(body);
     for (const value of [...Object.values(evidence()), 'evidence-required', 'agree']) expect(text).toContain(value);
     expect(storedEvidence(parseOperatorRulingComment(gh(body)).record)).toMatchObject(evidence());
   });
@@ -1437,7 +1443,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     });
     for (const effect of h.written) await sinks[effect.type](effect.payload);
     expect(storedEvidence(h.written)).toMatchObject({ ...evidence(), mode: 'evidence-required' });
-    const text = posted.join('\n').replace(/<!--[\s\S]*?-->/g, '');
+    const text = stripComments(posted.join('\n'));
     for (const value of [...Object.values(evidence()), 'evidence-required', 'agree']) expect(text).toContain(value);
     expect(posted.some(body => body.includes(rt.OPERATOR_NOT_REAL_OUTCOME) && body.includes(evidence().output))).toBe(true);
   });
