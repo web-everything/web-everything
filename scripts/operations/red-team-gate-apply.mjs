@@ -40,7 +40,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, classOnlyCards, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
@@ -63,6 +63,9 @@ export const RED_TEAM_GATE_CHANNEL = 'review daemon (redTeam.confirmedBreaks)';
 const where = (f) => (f.file ? `\`${sanitizeCardField(f.file, 200)}${f.line ? `:${f.line}` : ''}\`` : '`(no file cited)`');
 const findingLine = (f, i) => `${i + 1}. ${where(f)} — (${sanitizeCardField(f.category, 40)}, ${sanitizeCardField(f.impact ?? 'impact not stated', 40)}) `
   + `${sanitizeCardField(f.summary, 600)}${f.scenario ? `\n   - Scenario: ${sanitizeCardField(f.scenario, 1200)}` : ''}`
+  + `${f.findingClass ? `\n   - Class: ${sanitizeCardField(f.findingClass, 80)}${f.classBasis ? ` (basis: ${sanitizeCardField(f.classBasis, 1200)})` : ''}` : ''}`
+  + `${f.alsoClasses?.length ? `\n   - Also class: ${f.alsoClasses.map(c => sanitizeCardField(c, 80)).join(', ')}` : ''}`
+  + `${f.securityReachableToday === true ? '\n   - Security class: security-reachable-today' : ''}`
   + `${f.recheck ? `\n   - Claude's re-check: ${sanitizeCardField(f.recheck, 600)}` : ''}`;
 
 /** The send-back write-up: the fix list. PURE. */
@@ -80,11 +83,12 @@ export function buildSendBackBody({ pr, head, findings }) {
 /** The `file-item` input for ONE follow-up card carrying every carded finding. PURE. */
 export function buildRedTeamCardInput({ repo, pr, head, findings }) {
   const files = [...new Set(findings.map(cleanFindingFile).filter(Boolean))];
+  const classes = [...new Set(findings.flatMap(f => [f.findingClass, ...(f.alsoClasses ?? []), ...(f.securityReachableToday === true ? ['security-reachable-today'] : [])]).filter(Boolean))].map(c => sanitizeCardField(c, 80));
   const digest = `Filed mechanically by the red-team gate: the post-accept red team on ${repo}#${pr} (reviewed head \`${head}\`) `
     + 'found these, Claude\'s re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up '
     + 'card instead of blocking the PR:\n\n' + findings.map(findingLine).join('\n');
   return {
-    title: `Red-team follow-ups from ${repo}#${pr} (head ${String(head).slice(0, 9)})`,
+    title: `Red-team follow-ups${classes.length ? ` [${classes.join(', ')}]` : ''} from ${repo}#${pr} (head ${String(head).slice(0, 9)})`,
     kind: 'story', size: '2',
     digest: qualifyLocusRefs(digest, files),
     scope: files.map((f) => `${IN_REPO_LOCUS}${f}`).join(','),
@@ -102,8 +106,8 @@ export function buildSendBackArgv({ repo, pr, bodyPath }) {
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
-export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP }) {
-  const lines = [redTeamGateMarker(pr, head, outcome, result, grantIds),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
+export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP, classCards = null }) {
+  const lines = [redTeamGateMarker(pr, head, outcome, result, grantIds, classCards),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
       ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${cap})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them (${plan.sendBack.map(f => `#${f.index}`).join(', ')}).`
@@ -213,7 +217,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       cardResult = io.fileCard(cardInput);
       // A card that was not filed records nothing: a permanent per-head record here would make the failure unretryable.
       if (!cardResult?.ok) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
-      cardMarker = record(GATE_OUTCOMES.CARD_QUEUED, { sendBack: [], card: plan.card, advisory: sendPending ? [] : plan.advisory }, { cardResult });
+      cardMarker = record(GATE_OUTCOMES.CARD_QUEUED, { sendBack: [], card: plan.card, advisory: sendPending ? [] : plan.advisory }, { cardResult, classCards: classOnlyCards(plan.card, setting.value).map(f => f.index) });
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
       if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
     }

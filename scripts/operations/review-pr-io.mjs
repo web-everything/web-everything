@@ -907,6 +907,24 @@ export function createChangedLinesReader(ghJson) {
   };
 }
 
+/** Required checks that evaluate the review verdict itself, so they cannot be a precondition of publishing it. */
+const VERDICT_DEPENDENT_CHECKS = Object.freeze(['merge-gate', 'review-gate']);
+/**
+ * The strict gate's "some required rows are not green" refusals (review-ci-gate.mjs#reviewCiGate): a required
+ * review-gate among them names the reason `required-review-gate-conflict`. A trusted stale required-set read
+ * suffixes either one (review-ci-gate-io.mjs#withSource). Any other reason is not an affected-rows judgment.
+ */
+const AFFECTED_ROW_REFUSALS = Object.freeze(['required-checks-not-successful', 'required-review-gate-conflict']);
+const STALE_CACHE_SUFFIX = / \(stale-cache cache-age-ms=[^()]*\)$/;
+
+/** True when a strict refusal on the reviewed head is held up ONLY by missing/pending verdict-dependent checks. */
+function onlyVerdictDependentPending(ci, reviewedHead) {
+  if (ci?.allowed !== false || ci.headSha !== reviewedHead || typeof ci.reason !== 'string') return false;
+  if (!AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))) return false;
+  return Array.isArray(ci.affected) && ci.affected.length > 0
+    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name) && ['missing', 'pending'].includes(row?.reason));
+}
+
 /**
  * THE SINKS, bound to a repo root and an output channel.
  *
@@ -998,6 +1016,9 @@ export function createReviewPrSinks({
         if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
           throw notApplied('review void: head moved or CI became red');
         if (ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
+        // merge-gate / review-gate evaluate THIS verdict and only appear after it lands: waiting on them deadlocks the
+        // accept. Judge the rest; the merge itself still enforces them. Any other affected row keeps the hold.
+        if (onlyVerdictDependentPending(ci, payload.reviewedHead)) return;
         if (ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path');
         const remaining = deadline - now();
         if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head');

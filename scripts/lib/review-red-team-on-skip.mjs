@@ -16,6 +16,7 @@ import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-g
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
+import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -277,7 +278,14 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
 
 const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation';
 
-/** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
+/**
+ * PURE: readers are injected; each refusal produces one decision, including unreadable evidence.
+ *
+ * @verdicts-partial the planner is not a verdict reducer. It names only `accept` and `prevention-outstanding`: a stored
+ *   `accept` (or a judge-accepted `prevention-outstanding`) with a provable accept comment on the live head may settle
+ *   a kept `red-team:pending`. Every other stored verdict flows through the evidence and owed-ness checks unchanged,
+ *   so a verdict added to the enum needs no branch here.
+ */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
   setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns }) {
@@ -389,6 +397,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
       const acceptedReview = verdict === VERDICTS.ACCEPT
         && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
+      // A judge accept after the round cap leaves prevention-outstanding stored; the trusted accept comment on this head proves it.
+      const judgeAccepted = verdict === VERDICTS.PREVENTION_OUTSTANDING
+        && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
       const provenanceEscalation = keepsPending && !acceptedReview ? { escalate: true,
         escalationContext: 'red-team:pending kept: not-owed review lacks acceptance provenance; needs a human look' } : {};
       const notOwed = (why = 'stored review does not owe a red team') => {
@@ -439,6 +450,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           // The stored verdict may predate the acceptance (a round-budget accept leaves `changes` behind);
           // a finished not-owed status on this accepted head settles as policy-clear (R100/R338).
           && (redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+            // A judge/round-budget accept (provable accept comment on this head) leaves prevention-outstanding stored.
+            // A red-team-only job returns not-owed for it WITHOUT writing a status, so dispatching one would only
+            // re-run that no-op each cooldown; with no red-team state at all, settle the kept pending label here.
+            || (keepsPending && judgeAccepted && evidence.status == null && status == null)
             || [evidence.status, status].every(candidate => candidate?.status === 'finished'
               && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'))
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
@@ -446,7 +461,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
           const refusal = publishableClearGuard(context);
           if (refusal) return { ...guardedSkip(refusal), ...provenanceEscalation };
-          if (keepsPending && !acceptedReview) return notOwed();
+          if (keepsPending && !acceptedReview && !judgeAccepted) return notOwed();
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
         if (!owed || finishedNotOwed) return notOwed();
@@ -722,7 +737,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
           try {
-            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw Error('stale abandonment refused');
+            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
@@ -739,12 +754,21 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode ?? row.action });
               started = true;
             }
-          } catch {
-            // A throw may follow a spawn: retain its reservation until the next live process read.
-            capacity.lanes--;
-            if (capacity.remainingStarts != null) capacity.remainingStarts--;
-            capacity.take?.();
-            row.why = 'dispatch failed; start unknown';
+          } catch (error) {
+            const message = safeErrorText(error);
+            const text = safeLine(message).slice(0, 300);
+            note(`review-daemon: ${repo}#${row.prNumber} red-team dispatch threw: ${text}`);
+            if (error instanceof PreStartDispatchRefusalError) {
+              // These guards refuse before spawning; leave capacity and cooldown available for retry.
+              if (reserved) budget.left++;
+              row.why = `dispatch refused before start: ${text}`;
+            } else {
+              // An unclassified throw may follow a spawn: retain its reservation until the next live process read.
+              capacity.lanes--;
+              if (capacity.remainingStarts != null) capacity.remainingStarts--;
+              capacity.take?.();
+              row.why = `dispatch failed; start unknown: ${text}`;
+            }
           }
         }
         if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }

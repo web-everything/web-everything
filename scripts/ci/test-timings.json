@@ -1848,6 +1848,7 @@
   "scripts/conveyor/soak/breaks/daemon-version-rolled-back-sha-rebuilt.soak.test.mjs": 1.05,
   "scripts/conveyor/soak/breaks/drain-restamp-stale-code-clone.soak.test.mjs": 0.65,
   "scripts/conveyor/soak/breaks/fix-dispatch-stalls-on-unrelated-clone-lag.soak.test.mjs": 1.85,
+  "scripts/conveyor/soak/breaks/fix-end-rearms-review.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/fix-scope-stale-claim-head.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/fixer-stuck-never-reclaimed.soak.test.mjs": 1.09,
   "scripts/conveyor/soak/breaks/idle-status-fixer-claim-never-released.soak.test.mjs": 1.1,
@@ -1868,8 +1869,12 @@
   "scripts/conveyor/soak/breaks/scope-bloat-net-diff-deadlock.soak.test.mjs": 0.81,
   "scripts/conveyor/soak/breaks/superseded-pr-dispatched.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/takeover-void-cancels-later-retry.soak.test.mjs": 0.32,
+  "scripts/conveyor/soak/breaks/red-team-stale-refusal-burns-start-slot.soak.test.mjs": 1.5,
+  "scripts/conveyor/soak/breaks/overlay-main-sync-tests-stderr-tail.soak.test.mjs": 1.5,
+  "scripts/conveyor/soak/breaks/red-team-clear-reverted-by-unfinished-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
   "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
+  "scripts/conveyor/soak/breaks/fixer-brief-chains-rearm-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
   "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,
@@ -1913,8 +1918,10 @@
   "scripts/conveyor/soak/breaks/prepare-stamped-needs-you-park.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/quarantine-safety-net-twice-per-tick.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/red-team-deadline-merges-without-result.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/stale-owed-resumes-starve-live.soak.test.mjs": 2.2,
   "scripts/conveyor/soak/breaks/red-team-round-cap-never-rulable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/ruling-answers-unrelated-or-stale-stand-down.soak.test.mjs": 1.4,
-  "scripts/conveyor/soak/breaks/stale-referral-hold-never-resumes.soak.test.mjs": 1.4
+  "scripts/conveyor/soak/breaks/stale-referral-hold-never-resumes.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/sticky-load-shaped-rejection.soak.test.mjs": 1.4
  }
 }

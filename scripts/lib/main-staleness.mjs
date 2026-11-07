@@ -142,6 +142,9 @@ export function staleRemedy(st, base) {
  *  react to a mid-tick stale refusal immediately instead of wasting the rest of the tick.) */
 export const STALE_MAIN_REFUSAL_MARKER = 'STALE code from this checkout';
 
+/** Only throw before invoking a dispatch spawn; consumers may refund reserved start capacity. */
+export class PreStartDispatchRefusalError extends Error {}
+
 /** Does this tick-failure message look like {@link assertMainNotStale}'s own refusal? See
  *  {@link STALE_MAIN_REFUSAL_MARKER}. Accepts anything falsy/non-string as "no" (a null/undefined `why`/
  *  `error` field is common on the non-error branches of the same shape). */
@@ -322,7 +325,7 @@ export function assertMainNotStale(root, checkStaleness, {
       return { ...st, reexeced: true }; // only reached when `reexec` is injected (the real one exits)
     }
     if (action === 'refuse') {
-      throw new Error(
+      throw new PreStartDispatchRefusalError(
         `${label}: fast-forwarded the dispatching checkout ${st.behind} commit(s) to origin/${base}, but this process `
         + `had already loaded the pre-fast-forward code, so it would run ${STALE_MAIN_REFUSAL_MARKER}'s own import path `
         + '(the old copy in memory) — refusing to dispatch (xgqz204). '
@@ -333,7 +336,7 @@ export function assertMainNotStale(root, checkStaleness, {
     }
   }
   if (st && st.action === 'warn') {
-    throw new Error(
+    throw new PreStartDispatchRefusalError(
       `${label}: the dispatching checkout is ${st.behind} commit(s) behind origin/${base} — refusing to `
       + `dispatch a review that would run ${STALE_MAIN_REFUSAL_MARKER}'s own import path (#3439). `
       + (managedClone
