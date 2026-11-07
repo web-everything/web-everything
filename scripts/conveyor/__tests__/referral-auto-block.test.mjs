@@ -24,7 +24,7 @@ const cardReadable = () => true;
 /** The ruling comment the daemon's `record-referral-ruling` run would post, built by the real planner. */
 function autoPolicyComment(pr, { actor = AUTO_POLICY_ACTOR, ruling = 'block' } = {}) {
   const o = openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: pr.headRefOid, cardReadable });
-  const read = { head: pr.headRefOid, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null,
+  const read = { identity: { login: 'chalbert', type: 'User' }, head: pr.headRefOid, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null,
     now: '2026-10-08T12:00:00.000Z', clearerId: 's' };
   const plan = planOperatorRuling(read, { repo, pr: pr.number, finding: 'all-open', ruling, actor, channel: 'review daemon', reason: AUTO_BLOCK_REASON });
   return { plan, comment: { body: plan.body, createdAt: '2026-10-08T12:00:00.000Z', author: { login: 'web-everything' } } };
@@ -250,7 +250,7 @@ describe('operator-mode ledger is unchanged', () => {
   it('an operator-authored structured block is NOT a standing block; only auto-policy is', () => {
     const base = parked();
     const o = openReferralFindings({ comments: base.comments, repo, pr: 3794, head: H1, cardReadable });
-    const read = { head: H1, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null, now: '2026-10-08T12:00:00.000Z', clearerId: 's' };
+    const read = { identity: { login: 'chalbert', type: 'User' }, head: H1, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null, now: '2026-10-08T12:00:00.000Z', clearerId: 's' };
     const plan = planOperatorRuling(read, { repo, pr: 3794, finding: 'all-open', ruling: 'block', actor: OPERATOR_LOGINS[0], channel: 'chat', reason: 'fix it' });
     const comment = { body: plan.body, createdAt: '2026-10-08T12:00:00.000Z', author: { login: OPERATOR_LOGINS[0] } };
     const comments = [...base.comments, comment, recordComment(record({ head: H2, runId: 'run-2' }), 20)];
