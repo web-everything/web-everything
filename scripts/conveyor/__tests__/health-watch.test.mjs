@@ -59,6 +59,94 @@ let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-watch-test-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
+describe('tick() — Claude auth expired NEEDS-YOU delivery', () => {
+  const start = Date.parse('2026-11-07T01:52:00Z');
+  const key = 'claude-auth-expired::claude-auth';
+  const sessions = [
+    { name: 'ci-heal-6469', startedAt: Date.parse('2026-11-07T00:13:54Z') },
+    { name: 'ci-heal-6472', startedAt: Date.parse('2026-11-07T00:14:07Z') },
+    { name: 'fix-6467', startedAt: Date.parse('2026-11-07T01:49:00Z') },
+    { name: 'ci-heal-6469', startedAt: Date.parse('2026-11-07T01:51:00Z') },
+  ];
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockClear(); });
+  const setup = () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'),
+      'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    const publishNeedsYou = vi.fn();
+    const run = (rows = sessions, offset = 0, extra = {}) => {
+      episodeReplay.probes = { authExpired: rows };
+      return tick({ ...flags, now: new Date(start + offset).toISOString(), ...extra }, { publishNeedsYou });
+    };
+    return { run, publishNeedsYou, statePath: join(healthDir(flags['state-root']), 'state.json') };
+  };
+
+  it('replays the four real sessions and publishes once across two ticks and a later reminder', async () => {
+    const { run, publishNeedsYou } = setup();
+    const first = await run();
+    expect(first.transitions).toContainEqual({ type: 'opened', key });
+    expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(publishNeedsYou.mock.calls[0][0]).toEqual({
+      key, repo: 'health-watch', kind: 'needs-you', pr: 0, head: `${key}:${start}`,
+      reason: 'Claude login expired — re-login', title: 'Claude login expired — re-login (run /login)',
+      at: new Date(start).toISOString(),
+    });
+    await run(sessions, 60_000);
+    const later = 5 * 3_600_000;
+    await run(sessions.map(s => ({ ...s, startedAt: s.startedAt + later })), later);
+    expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not publish for a single blip session', async () => {
+    const { run, publishNeedsYou } = setup();
+    const result = await run(sessions.slice(-1));
+    expect(result.transitions).not.toContainEqual({ type: 'opened', key });
+    expect(publishNeedsYou).not.toHaveBeenCalled();
+  });
+
+  it('publishes a new feed identity after recovery and reopening', async () => {
+    const { run, publishNeedsYou } = setup();
+    await run();
+    expect((await run([], 1_000)).transitions).toContainEqual({ type: 'closed', key });
+    await run(sessions, 2_000);
+    expect(publishNeedsYou).toHaveBeenCalledTimes(2);
+    expect(publishNeedsYou.mock.calls.map(([item]) => item.head)).toEqual([`${key}:${start}`, `${key}:${start + 2_000}`]);
+  });
+
+  it('reports the proposed item in dry-run without publishing or persisting', async () => {
+    const { run, publishNeedsYou, statePath } = setup();
+    const result = await run(sessions, 0, { 'dry-run': true });
+    expect(publishNeedsYou).not.toHaveBeenCalled();
+    expect(episodeReplay.send).not.toHaveBeenCalled();
+    expect(existsSync(statePath)).toBe(false);
+    expect(result.notifications).toContainEqual(expect.objectContaining({
+      key, channel: 'needs-you', dryRun: true,
+      item: expect.objectContaining({ head: `${key}:${start}`, reason: 'Claude login expired — re-login' }),
+    }));
+  });
+
+  it('honors no-notify for both delivery channels', async () => {
+    const { run, publishNeedsYou } = setup();
+    const result = await run(sessions, 0, { 'no-notify': true });
+    expect(publishNeedsYou).not.toHaveBeenCalled();
+    expect(episodeReplay.send).not.toHaveBeenCalled();
+    expect(result.notifications).toEqual([]);
+  });
+
+  it('logs a rejected publication and completes the tick', async () => {
+    const { run, publishNeedsYou } = setup();
+    publishNeedsYou.mockRejectedValueOnce(new Error('feed unavailable'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await run();
+      expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('feed unavailable'));
+      expect(result.notifications).toContainEqual(expect.objectContaining({ channel: 'needs-you', ok: false, error: 'feed unavailable' }));
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('lane scan cache target isolation', () => {
   it.each([
     { flags: {}, fixtureTick: false, allowed: true },
