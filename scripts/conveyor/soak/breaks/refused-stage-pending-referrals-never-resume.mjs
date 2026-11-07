@@ -2,7 +2,8 @@
  * A stageVerdict refusal consumes confirm but retains cached pending referral keys.
  * Later standing rulings must release and rewind that same run, without another panel.
  * RED: the cached pending verdict keeps the refused run stuck after every ruling arrives.
- * GREEN: all keys ruled on this run/head resume; incomplete or mismatched evidence stays held.
+ * GREEN: all keys ruled (or durably retired) on this head resume, including keys inherited from an earlier run's
+ * record; incomplete or mismatched evidence stays held.
  */
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -21,6 +22,8 @@ export default {
     try {
       const hold = readFileSync(join(root, HOLD), 'utf8');
       return hold.includes('export function refusedReferralsAreRuled') && hold.includes('run.pending.filter(key => !PENDING_REASON_TOKENS.has(key))')
+        // Round 3: any run's record on this head, every referral (dropped included), not only this run's active ones.
+        && hold.includes('&& r.head === run.head).flatMap(r => r.referrals.map(f => f.key))')
         && readFileSync(join(root, LOOP), 'utf8').includes('parkedEvidence?.referralStageRefused');
     } catch { return false; }
   },
@@ -37,7 +40,7 @@ export default {
       const { runReviewLoopOnce } = await load(LOOP);
       const { reviewRunEvidence, decideReferralHold, findResumableParkedRun } = await load(HOLD);
       const { referralFindingKey, normalizeFinding, mandatoryReferralReviewer, renderReferralRecord,
-        mandatoryReferralState, buildOperatorRulingComment } = await load('scripts/lib/jury-core.mjs');
+        mandatoryReferralState, buildOperatorRulingComment, REFERRAL_DROP_REASON } = await load('scripts/lib/jury-core.mjs');
       const { AUTOMATION_LOGINS, OPERATOR_LOGINS } = await load('scripts/lib/marker-authorship.mjs');
       const head = 'a'.repeat(40);
       const repo = 'o/n';
@@ -46,17 +49,23 @@ export default {
       const argv = [`--pr=${pr}`, `--repo=${repo}`];
       // PR #6465 round 2: an unstamped PR body caches `author-stamp-missing` beside the finding keys. That reason
       // token is answered by the live re-read, never by a record key, so a fully ruled unstamped run still resumes.
+      // PR #6465 round 3: `inherited-*` — the refused run did not raise the referrals; an earlier run's record holds them
+      // and takes the rulings. `dropped-*` — the sink later retired the optional-seat referrals with a valid
+      // append-only `dropped` snapshot, so no ruling is owed. Both must resume; an unruled inherited key stays held.
       for (const kind of ['all-ruled-auto', 'all-ruled-explicit', 'unruled', 'partial', 'other-head', 'other-run', 'other-key',
-        'unstamped-all-ruled-auto', 'unstamped-all-ruled-explicit', 'unstamped-unruled']) {
+        'unstamped-all-ruled-auto', 'unstamped-all-ruled-explicit', 'unstamped-unruled',
+        'inherited-all-ruled-auto', 'inherited-all-ruled-explicit', 'inherited-unruled', 'dropped-all-ruled-explicit']) {
         const runId = `soak-refused-${kind}`;
+        const recordRunId = kind.startsWith('inherited-') ? `soak-origin-${kind}` : runId;
+        const dropped = kind.startsWith('dropped-');
         const unstamped = kind.startsWith('unstamped-');
         const body = unstamped ? 'plain PR body, no author stamp' : '<!-- authored-by-actor: author -->';
         const referrals = [1, 2].map(n => {
           const original = { file: path, line: n, summary: `confirmed defect ${n}`, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
-          const seat = 'judgeCorrectnessAdvisory';
+          const seat = dropped ? 'judgeAntigravityReview' : 'judgeCorrectnessAdvisory';
           return { key: referralFindingKey(seat, original), seat, original, finding: normalizeFinding(original) };
         });
-        const rec = { version: 1, repo, pr, head, runId, reviewer: mandatoryReferralReviewer(runId),
+        const rec = { version: 1, repo, pr, head, runId: recordRunId, reviewer: mandatoryReferralReviewer(recordRunId),
           authorBody: body, attempted: true, referrals, rulings: [] };
         let comments = [{ body: renderReferralRecord(rec), author: { login: AUTOMATION_LOGINS[0] } }];
         const live = () => ({ headRefOid: head, number: pr, body, createdAt: '', comments });
@@ -89,11 +98,14 @@ export default {
         // Cache the durable projection BEFORE the later ruling; never refresh it from the thread.
         const rows = [reviewRunEvidence(refused.run)];
         const count = jurors;
-        if (!kind.endsWith('unruled')) {
+        if (dropped) {
+          comments = [...comments, { author: { login: AUTOMATION_LOGINS[0] }, body: renderReferralRecord({ ...rec,
+            dropped: referrals.map(f => ({ key: f.key, reason: REFERRAL_DROP_REASON })) }) }];
+        } else if (!kind.endsWith('unruled')) {
           const ruled = kind === 'partial' ? referrals.slice(0, 1) : referrals;
           comments = [...comments, { author: { login: OPERATOR_LOGINS[0] }, createdAt: '2026-11-06T13:25:00Z',
             body: buildOperatorRulingComment({ version: 1, repo, pr, head: kind === 'other-head' ? 'b'.repeat(40) : head,
-              rulings: ruled.map(f => ({ runId: kind === 'other-run' ? 'other' : runId,
+              rulings: ruled.map(f => ({ runId: kind === 'other-run' ? 'other' : recordRunId,
                 key: kind === 'other-key' ? `other-${f.key}` : f.key, result: 'card', card: 'we:backlog/123-test.md' })),
               actor: OPERATOR_LOGINS[0], channel: 'terminal', reason: 'track separately',
               at: '2026-11-06T13:25:00Z', clearerId: 'operator-session' }) }];
