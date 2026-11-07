@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { accessSync, constants, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync,
-  writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
+  statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { readLockfileParity } from '../check-lockfile-parity.mjs';
@@ -88,15 +88,39 @@ function readMarker(markerPath) {
 }
 
 /**
+ * True when a top-level node_modules entry (or a scoped package under `@scope/`) is a symlink whose target is
+ * gone: store content deleted underneath a lane while the store root and its token survived (a partial wipe,
+ * a disk cleaner). Unreadable node_modules counts as dangling (fail closed).
+ */
+export function hasDanglingTopLevelLink(nodeModules) {
+  try {
+    for (const entry of readdirSync(nodeModules, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue; // .bin, .modules.yaml, .pnpm …
+      const path = join(nodeModules, entry.name);
+      const children = entry.name.startsWith('@') && entry.isDirectory()
+        ? readdirSync(path, { withFileTypes: true }).map(child => [child, join(path, child.name)])
+        : [[entry, path]];
+      for (const [item, itemPath] of children) if (item.isSymbolicLink() && !existsSync(itemPath)) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * 'n/a' | 'missing' | 'stale' | 'ok' — ok when the marker matches the CURRENT hash of either backend. A pnpm
- * marker is ok only while the store it was installed into still carries the same generation token.
+ * marker is ok only while the store it was installed into still carries the same generation token AND the
+ * lane's top-level links still resolve into it.
  */
 export function depsReady(dir, markerPath, storeDir = resolvePnpmStoreDir()) {
   if (lockHash(dir) === null) return 'n/a'; // no package.json → nothing to install
-  if (!existsSync(join(dir, 'node_modules'))) return 'missing';
+  const nodeModules = join(dir, 'node_modules');
+  if (!existsSync(nodeModules)) return 'missing';
   const have = readMarker(markerPath);
   return DEPS_BACKENDS.some(backend => markerMatches(have, lockHash(dir, backend, storeDir), backend)
-    && (backend !== 'pnpm' || readStoreGeneration(storeDir) !== null)) ? 'ok' : 'stale';
+    && (backend !== 'pnpm' || (readStoreGeneration(storeDir) !== null && !hasDanglingTopLevelLink(nodeModules))))
+    ? 'ok' : 'stale';
 }
 
 /** The shared pnpm store: `WE_PNPM_STORE_DIR` when set, else `~/.cache/we-pnpm-store`. */
@@ -168,9 +192,10 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
   const state = depsReady(dir, markerPath, storeDir);
   if (state === 'n/a' || state === 'ok') return state;
   let plan = selectPlan();
+  let generation = null; // the store generation this pnpm install links into
   if (plan.backend === 'pnpm') {
     try {
-      ensureStoreGeneration(storeDir);
+      generation = ensureStoreGeneration(storeDir);
     } catch (error) {
       log('pnpm store unusable (' + error.message + '); using npm');
       plan = plan.fallback;
@@ -183,6 +208,12 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
     remove: () => rmSync(join(dir, 'node_modules'), { recursive: true, force: true }),
     log, exec,
   });
+  // The store was wiped and recreated WHILE pnpm installed: this lane's links point at the old generation's
+  // content. Stamp nothing, so the lane stays stale and the next acquire reinstalls into the new store.
+  if (result.backend === 'pnpm' && readStoreGeneration(storeDir) !== generation) {
+    log('pnpm store generation changed during install; leaving deps stale');
+    return 'stale';
+  }
   if (result.state === 'installed') writeFileSync(markerPath, result.marker);
   return result.state;
 }
@@ -202,17 +233,22 @@ export function whichOnPath(name, pathValue = process.env.PATH) {
 
 /**
  * The real subprocess wiring for `ensureLaneDeps`: `{ selectPlan, exec }` for one lane directory.
- *   - the `pnpm --version` probe is bounded (15s, 64 KiB) and captured, never printed;
+ *   - the `pnpm --version` probe is bounded (`probeTimeoutMs`, `probeMaxBuffer`) and captured, never printed;
+ *     a probe that hangs or floods output selects npm;
  *   - installer stdout goes to OUR stderr (fd 2), so a caller's `--json` stdout stays pure JSON;
  *   - installs are bounded by `installTimeoutMs` and SIGKILLed on overrun.
  */
+export const PROBE_TIMEOUT_MS = 15_000;
+export const PROBE_MAX_BUFFER = 64 * 1024;
 export function createLaneDepsRuntime({ dir, storeDir, env = process.env, installTimeoutMs,
+  probeTimeoutMs = PROBE_TIMEOUT_MS, probeMaxBuffer = PROBE_MAX_BUFFER,
   parity = () => readLockfileParity(dir).ok }) {
   return {
     selectPlan: () => selectInstaller({
       which: name => whichOnPath(name, env.PATH),
       exec: (command, args, { cwd }) => execFileSync(command, args, {
-        cwd, env, encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+        cwd, env, encoding: 'utf8', timeout: probeTimeoutMs, maxBuffer: probeMaxBuffer, killSignal: 'SIGKILL',
+        stdio: ['ignore', 'pipe', 'pipe'],
       }),
       hasPnpmLock: existsSync(join(dir, 'pnpm-lock.yaml')),
       hasNpmLock: existsSync(join(dir, 'package-lock.json')),

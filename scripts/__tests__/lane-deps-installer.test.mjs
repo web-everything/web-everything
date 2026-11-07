@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync,
+  writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { selectInstaller, runDepsInstaller, markerMatches, lockHash, depsReady, ensureLaneDeps,
   resolvePnpmStoreDir, ensureStoreGeneration, readStoreGeneration, STORE_GENERATION_FILE, whichOnPath,
-  createLaneDepsRuntime } from '../lib/lane-deps-installer.mjs';
+  createLaneDepsRuntime, hasDanglingTopLevelLink, PROBE_TIMEOUT_MS, PROBE_MAX_BUFFER } from '../lib/lane-deps-installer.mjs';
 
 function select(overrides = {}) {
   return selectInstaller({ which: () => '/bin/pnpm', exec: () => '12.18.0',
@@ -153,6 +154,40 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
     expect(exec).not.toHaveBeenCalled();
     expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
   });
+  it('a store wiped and recreated DURING a pnpm install leaves the lane stale, with no marker', () => {
+    const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
+    const exec = vi.fn(() => {
+      mkdirSync(join(dir, 'node_modules'), { recursive: true });
+      rmSync(storeDir, { recursive: true }); // operator wipe while pnpm runs …
+      ensureStoreGeneration(storeDir); // … and another lane recreates the store
+    });
+    expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => select({ storeDir }), exec })).toBe('stale');
+    expect(existsSync(markerPath)).toBe(false);
+    expect(depsReady(dir, markerPath, storeDir)).toBe('stale');
+  });
+  it('a pnpm lane whose top-level links dangle (store content deleted, token kept) reads stale', () => {
+    const { dir, markerPath, storeDir } = lane();
+    const target = join(storeDir, 'v11', 'links', 'a');
+    const scoped = join(storeDir, 'v11', 'links', 'b');
+    mkdirSync(target, { recursive: true });
+    mkdirSync(scoped, { recursive: true });
+    mkdirSync(join(dir, 'node_modules', '@s'));
+    symlinkSync(target, join(dir, 'node_modules', 'a'));
+    symlinkSync(scoped, join(dir, 'node_modules', '@s', 'b'));
+    symlinkSync(join(storeDir, 'gone'), join(dir, 'node_modules', '.ignored-dot-entry'));
+    writeFileSync(markerPath, pnpmMarker(dir, storeDir));
+    expect(hasDanglingTopLevelLink(join(dir, 'node_modules'))).toBe(false);
+    expect(depsReady(dir, markerPath, storeDir)).toBe('ok');
+    rmSync(scoped, { recursive: true });
+    expect(depsReady(dir, markerPath, storeDir)).toBe('stale');
+    mkdirSync(scoped);
+    rmSync(target, { recursive: true });
+    expect(hasDanglingTopLevelLink(join(dir, 'node_modules'))).toBe(true);
+    expect(depsReady(dir, markerPath, storeDir)).toBe('stale');
+    // npm lanes are not judged by links (npm installs real directories)
+    writeFileSync(markerPath, npmMarker(dir));
+    expect(depsReady(dir, markerPath, storeDir)).toBe('ok');
+  });
   it('a wiped store makes ensureLaneDeps reinstall a pnpm lane into the store it is given', () => {
     const { dir, markerPath, storeDir } = lane({ marker: pnpmMarker });
     rmSync(storeDir, { recursive: true });
@@ -278,7 +313,14 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
 describe('lane-pool runtime wiring (real subprocesses, shim installers on PATH)', () => {
   const SHIM = `#!/bin/sh
 printf '%s|%s|%s\\n' "$(basename "$0")" "$(pwd -P)" "$*" >> "$SHIM_LOG"
-if [ "$1" = "--version" ]; then echo 12.18.0; exit 0; fi
+if [ "$1" = "--version" ]; then
+  case "$SHIM_MODE" in
+    hang-probe) exec sleep 30 ;;
+    flood-probe) head -c 70000 /dev/zero | tr '\\000' 1; exit 0 ;;
+  esac
+  echo 12.18.0; exit 0
+fi
+if [ "$SHIM_MODE" = hang-install ]; then exec sleep 30; fi
 echo "SHIM-STDOUT-$(basename "$0")"
 mkdir -p node_modules
 `;
@@ -288,10 +330,11 @@ mkdir -p node_modules
     const dir = process.env.LANE_DIR;
     const storeDir = resolvePnpmStoreDir();
     const state = ensureLaneDeps({ dir, markerPath: dir + '/.git/.lane-pool-deps', storeDir,
-      ...createLaneDepsRuntime({ dir, storeDir, installTimeoutMs: 60_000 }) });
+      ...createLaneDepsRuntime({ dir, storeDir, installTimeoutMs: Number(process.env.INSTALL_TIMEOUT_MS || 60_000),
+        ...(process.env.PROBE_TIMEOUT_MS ? { probeTimeoutMs: Number(process.env.PROBE_TIMEOUT_MS) } : {}) }) });
     console.log(JSON.stringify({ state, storeDir }));
   `;
-  function fixture(shims) {
+  function fixture(shims, extraEnv = {}) {
     const root = mkdtempSync(join(tmpdir(), 'lane-deps-wiring-'));
     dirs.push(root);
     const dir = join(root, 'lane');
@@ -307,7 +350,8 @@ mkdir -p node_modules
     const log = join(root, 'shim.log');
     // The real lane-pool shape: a separate process whose stdout a caller parses as JSON.
     const run = spawnSync(process.execPath, ['--input-type=module', '--eval', CHILD], {
-      env: { PATH: bin + ':/bin:/usr/bin', HOME: root, WE_PNPM_STORE_DIR: store, SHIM_LOG: log, LANE_DIR: dir },
+      env: { PATH: bin + ':/bin:/usr/bin', HOME: root, WE_PNPM_STORE_DIR: store, SHIM_LOG: log, LANE_DIR: dir,
+        ...extraEnv },
       encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 60_000,
     });
     return { dir, store, log, run };
@@ -338,6 +382,28 @@ mkdir -p node_modules
     expect(readFileSync(log, 'utf8').trim().split('\n').map(line => line.split('|')))
       .toEqual([['npm', realpathSync(dir), 'ci']]);
     expect(readFileSync(join(dir, '.git', '.lane-pool-deps'), 'utf8')).toBe('npm:' + lockHash(dir, 'npm'));
+  });
+  it.each([['hangs', 'hang-probe'], ['floods its output', 'flood-probe']])(
+    'a pnpm --version probe that %s is cut off and selects npm', (_label, mode) => {
+      const started = Date.now();
+      const { dir, log, run } = fixture(['pnpm', 'npm'], { SHIM_MODE: mode, PROBE_TIMEOUT_MS: '500' });
+      expect(run.status).toBe(0);
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(JSON.parse(run.stdout.trim()).state).toBe('installed');
+      const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => line.split('|'));
+      expect(calls.map(call => call[0] + ' ' + call[2])).toEqual(['pnpm --version', 'npm ci']);
+      expect(readFileSync(join(dir, '.git', '.lane-pool-deps'), 'utf8')).toBe('npm:' + lockHash(dir, 'npm'));
+    });
+  it('a hanging install is killed at installTimeoutMs and leaves no marker', () => {
+    const started = Date.now();
+    const { dir, run } = fixture(['npm'], { SHIM_MODE: 'hang-install', INSTALL_TIMEOUT_MS: '500' });
+    expect(run.status).not.toBe(0);
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(run.stdout).toBe('');
+    expect(existsSync(join(dir, '.git', '.lane-pool-deps'))).toBe(false);
+  });
+  it('the default probe bounds are 15s and 64 KiB', () => {
+    expect([PROBE_TIMEOUT_MS, PROBE_MAX_BUFFER]).toEqual([15_000, 64 * 1024]);
   });
   it('PATH lookup skips empty and relative entries (they would depend on the cwd)', () => {
     const root = mkdtempSync(join(tmpdir(), 'lane-deps-which-'));
