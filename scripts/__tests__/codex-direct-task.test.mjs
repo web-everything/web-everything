@@ -13,6 +13,7 @@ import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
@@ -1594,7 +1595,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       import { existsSync, mkdtempSync } from 'node:fs';
       import { spawn } from 'node:child_process';
       import { join } from 'node:path';
-      const { codexDirectTask } = await import(${JSON.stringify(new URL('../codex-direct-task.mjs', import.meta.url).href)});
+      const { codexDirectTask } = await import(${JSON.stringify(pathToFileURL(resolve('scripts/codex-direct-task.mjs')).href)});
       const dirs = [];
       if (${host}) process.on(${JSON.stringify(signal)}, () => process.stdout.write('HOST\\n'));
       const execFn = (_bin, args) => args.includes('--absolute-git-dir') ? join(args[1], '.git')
