@@ -1586,19 +1586,23 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
 
   // R688 break 1: the worker wrapper kills Codex and re-raises the signal, and a default signal death fires
   // neither 'exit' nor `finally`. Deliver a REAL signal to a separate process once its worker has started.
-  it.each(['SIGTERM', 'SIGINT'])('R688 a real %s after the worker starts removes the scratch clone and task temp root and keeps the sibling log', async signal => {
+  // With a host handler installed, the host decides: the run continues, so its clone must survive until `finally`.
+  it.each([['SIGTERM', false], ['SIGINT', false], ['SIGHUP', false], ['SIGTERM', true]])('R688 a real %s after the worker starts (host handler: %s) cleans the scratch clone and task temp root only when it ends the process, and keeps the sibling log', async (signal, host) => {
     const event = '{"type":"thread.started","thread_id":"t1"}\n';
     const worker = keepAliveScript({ maxLifetimeMs: 20000, prelude: `process.stdout.write(${JSON.stringify(event)});` });
     const script = `
-      import { mkdtempSync } from 'node:fs';
+      import { existsSync, mkdtempSync } from 'node:fs';
       import { spawn } from 'node:child_process';
       import { join } from 'node:path';
       const { codexDirectTask } = await import(${JSON.stringify(new URL('../codex-direct-task.mjs', import.meta.url).href)});
       const dirs = [];
+      if (${host}) process.on(${JSON.stringify(signal)}, () => process.stdout.write('HOST\\n'));
       const execFn = (_bin, args) => args.includes('--absolute-git-dir') ? join(args[1], '.git')
         : args.includes('rev-parse') ? 'sha0' : args.includes('get-url') ? (() => { throw new Error('no remote'); })() : '';
       await codexDirectTask({ task: 't', repoRoot: '/repo', gate: 'none', selfReview: false, stream: false, log: false,
         installDeps: false, existsFn: () => false, execFn,
+        // Runs after the killed worker settles: the run is still going, so its clone must still be there.
+        readQuotaFn: () => { process.stdout.write('AFTER-WORKER ' + existsSync(dirs[0]) + '\\n'); return { quota: null, rolloutFile: null }; },
         mkTempDir: prefix => { const dir = mkdtempSync(prefix); dirs.push(dir); return dir; },
         spawnFn: (_cli, _argv, opts) => {
           const child = spawn(process.execPath, ['-e', ${JSON.stringify(worker)}], opts);
@@ -1609,10 +1613,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const proc = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
     let started;
     let stderr = '';
+    let out = '';
     proc.stderr.on('data', d => { stderr += d; });
     try {
       started = await new Promise((resolveStart, reject) => {
-        let out = '';
         proc.stdout.on('data', d => {
           out += d;
           const line = out.split('\n').find(l => l.startsWith('{'));
@@ -1626,8 +1630,17 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(readFileSync(join(scratch, '.git', 'codex-direct-task.jsonl'), 'utf8')).toBe(event);
       const exited = new Promise(resolveExit => proc.once('exit', (code, sig) => resolveExit({ code, sig })));
       proc.kill(signal);
-      // The cleanup re-raises the signal, so the process still dies of it (no 'FINISHED', no clean exit code).
-      expect(await exited).toEqual({ code: null, sig: signal });
+      if (host) {
+        // The host kept the process alive: the run finished on its intact clone, then `finally` cleaned up.
+        expect(await exited).toEqual({ code: 0, sig: null });
+        expect(out).toContain('HOST\n');
+        expect(out).toContain('AFTER-WORKER true\n');
+        expect(out).toContain('FINISHED\n');
+      } else {
+        // The cleanup re-raises the signal, so the process still dies of it (no 'FINISHED', no clean exit code).
+        expect(await exited).toEqual({ code: null, sig: signal });
+        expect(out).not.toContain('AFTER-WORKER');
+      }
       expect(existsSync(scratch)).toBe(false);
       expect(existsSync(taskTmp)).toBe(false);
       expect(readFileSync(`${scratch}.jsonl`, 'utf8')).toBe(event);

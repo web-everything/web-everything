@@ -620,6 +620,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
       clearTimeout(graceTimer);
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
+      process.removeListener('SIGHUP', onSighup);
     };
     const settle = (code, signal) => {
       if (settled) return;
@@ -650,6 +651,8 @@ export function detachedGateExecFn(bin, args, opts = {}) {
     };
     const onSigint = () => cancel('SIGINT');
     const onSigterm = () => cancel('SIGTERM');
+    // A detached gate never sees the terminal's hangup: kill it on ours.
+    const onSighup = () => cancel('SIGHUP');
     const fail = error => { failure ??= error; killGroup(); startGrace(); };
     for (const stream of ['stdout', 'stderr']) {
       child[stream].on('data', chunk => {
@@ -683,6 +686,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
     // Run before the internal-job listener exits and writes the failed job record.
     process.prependListener('SIGINT', onSigint);
     process.prependListener('SIGTERM', onSigterm);
+    process.prependListener('SIGHUP', onSighup);
   });
 }
 
@@ -1035,6 +1039,7 @@ export async function runCodexDirectExec({
     const removeSignalListeners = () => {
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
+      process.removeListener('SIGHUP', onSighup);
     };
     const killWorker = () => {
       try {
@@ -1049,6 +1054,8 @@ export async function runCodexDirectExec({
     };
     const onSigint = () => onSignal('SIGINT');
     const onSigterm = () => onSignal('SIGTERM');
+    // The worker is detached (its own session), so a terminal hangup reaches only us: kill it then too.
+    const onSighup = () => onSignal('SIGHUP');
     const settle = (r) => {
       if (settled) return;
       settled = true;
@@ -1074,6 +1081,7 @@ export async function runCodexDirectExec({
     // first, before that handler can exit the wrapper and leave its detached worker running.
     process.prependListener('SIGINT', onSigint);
     process.prependListener('SIGTERM', onSigterm);
+    process.prependListener('SIGHUP', onSighup);
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         killed = true;
@@ -1109,6 +1117,36 @@ export async function runCodexDirectExec({
 }
 
 // ── the orchestrator ──────────────────────────────────────────────────────────────────────────────
+
+/** The signals whose default action kills this process without running 'exit' handlers or `finally`. */
+export const TERMINATING_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+const signalCleanups = new Set();
+
+// R688: the worker and gate wrappers kill their child group, remove themselves and re-raise the signal, and the
+// default action then skips the 'exit' hook and `finally`. One shared handler runs every active run's cleanup
+// (a self-review repair nests a second run) and re-raises. When any other handler remains (an embedding host, a
+// --job child's exit handler) that handler decides: a run it lets continue must keep its clone, and the exit hook
+// and `finally` clean up when the run does end.
+function onTerminatingSignal(signal) {
+  if (process.listenerCount(signal) > 1) return;
+  const cleanups = [...signalCleanups];
+  signalCleanups.clear();
+  for (const name of TERMINATING_SIGNALS) process.removeListener(name, onTerminatingSignal);
+  for (const cleanup of cleanups) {
+    try { cleanup(); } catch { /* best effort before the signal ends the process */ }
+  }
+  process.kill(process.pid, signal);
+}
+
+/** Run `cleanup` synchronously if a terminating signal arrives; returns the unregister function. */
+function registerSignalCleanup(cleanup) {
+  if (signalCleanups.size === 0) for (const name of TERMINATING_SIGNALS) process.on(name, onTerminatingSignal);
+  signalCleanups.add(cleanup);
+  return () => {
+    if (!signalCleanups.delete(cleanup) || signalCleanups.size) return;
+    for (const name of TERMINATING_SIGNALS) process.removeListener(name, onTerminatingSignal);
+  };
+}
 
 /**
  * THE ENTRY POINT a caller (a CLI invocation, or another script) uses. Resolves the target directory
@@ -1262,22 +1300,8 @@ export async function codexDirectTask({
     return path;
   };
   process.once('exit', cleanupTemps);
-  // A signal's default action ends the process with neither 'exit' nor `finally` (R688): the worker and gate
-  // wrappers kill their child group and re-raise. So clean up synchronously on the same signal, then re-raise
-  // it once nothing else handles it (a --job child's own handler exits, and the exit hook above cleans up).
-  const onTerminatingSignal = (signal) => {
-    removeSignalCleanup();
-    cleanupTemps();
-    if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
-  };
-  const onSigint = () => onTerminatingSignal('SIGINT');
-  const onSigterm = () => onTerminatingSignal('SIGTERM');
-  const removeSignalCleanup = () => {
-    process.removeListener('SIGINT', onSigint);
-    process.removeListener('SIGTERM', onSigterm);
-  };
-  process.on('SIGINT', onSigint);
-  process.on('SIGTERM', onSigterm);
+  // A signal's default action ends the process with neither 'exit' nor `finally` (R688).
+  const removeSignalCleanup = registerSignalCleanup(cleanupTemps);
   try {
   let targetDir = dir;
   let scratch = null;
@@ -1909,8 +1933,8 @@ if (isMain) {
     try { finish(code); } catch (e) { console.error(`codex-direct-task: job update failed: ${e.message}`); process.exitCode = 1; }
   });
   if (internalJob) {
-    for (const signal of ['SIGINT', 'SIGTERM']) {
-      process.once(signal, () => process.exit(signal === 'SIGINT' ? 130 : 143));
+    for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) {
+      process.once(signal, () => process.exit(code));
     }
   }
   (async () => {
