@@ -1,15 +1,16 @@
 ---
+bornAs: x7pjvdt
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs", "we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/conveyor/pr-stall-sweep.mjs", "we:scripts/lib/red-team-pending-watchdog.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Corrupt or mismatched status file for a pending head leaves the label un-reconciled and stalls the whole stal…
+# One malformed legacy manifest on a remote-repo PR makes every drain pass 'incomplete context' and defers ever…
 
-Flow-sim gap B-C3, class K4 (poison record halts a whole pass). Failing input: PR labels: red-team:pending (or blocked). Status file for HEAD exists but is not valid JSON (partial write by a non-atomic tool, disk full, manual edit) or has a different head/pr inside (identity mismatch). No retry marker. any tick after the corruption. Cited: we:scripts/lib/drain-red-team-evidence.mjs:488-491, we:scripts/conveyor/advisory-label-sweep.mjs:190, we:scripts/lib/review-red-team-on-skip.mjs:303-333, we:scripts/conveyor/pr-stall-sweep.mjs:286, we:scripts/lib/red-team-pending-watchdog.mjs:11-12. Soak-break sketch: stuck (silent, permanent for that head; plus fleet-wide stall-sweep no-op while the file exists)
+Flow-sim gap R9c-G1, class K4 (poison record halts a whole pass). Failing input: Open PR in frontier-ui/plateau-app whose PR body has no lane-manifest block and whose head tree has we:.lane-manifest.json containing conflict markers or a trailing comma (a fixer or rebase edited it). Other open non-WE PRs carry no manifest (normal impl/orphan PRs). Drain pass reads the PR; gh contents API returns 200 with the… Cited: we:scripts/merge-ai-prs.mjs:5044-5053, we:scripts/merge-ai-prs.mjs:2144, we:scripts/merge-ai-prs.mjs:2147, we:scripts/merge-ai-prs.mjs:2063-2095, we:scripts/merge-ai-prs.mjs:2710-2711. Soak-break sketch: Fixture: two non-WE open PRs, A has a head-tree we:.lane-manifest.json = '{'item':12,'; B has none (gh stub returns 404 for B). Action: run buildCarrierHealth/reduceOpenPrContext + planLabelDrain via readRemoteManifestViaApi with a stub exec returning A's byt…
 
 ## Acceptance
 

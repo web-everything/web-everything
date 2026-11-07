@@ -1,15 +1,16 @@
 ---
+bornAs: xbxkmdq
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/lib/round-ledger.mjs", "we:scripts/conveyor/round-judge-shadow.mjs"]
+scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs", "we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/conveyor/pr-stall-sweep.mjs", "we:scripts/lib/red-team-pending-watchdog.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# round-ledger append is unlocked and a single bad line blocks all appends
+# Corrupt or mismatched status file for a pending head leaves the label un-reconciled and stalls the whole stal…
 
-Flow-sim gap C-G8, class K4 (poison record halts a whole pass). Failing input: round-ledger.jsonl exists. (a) two writers append for the same PR concurrently, or (b) a writer died mid appendFileSync leaving a torn last line, or (c) file unreadable with a code other than ENOENT.' 'E21 / E24 / E27 Cited: we:scripts/lib/round-ledger.mjs:40, we:scripts/conveyor/round-judge-shadow.mjs:190. Soak-break sketch: none
+Flow-sim gap B-C3, class K4 (poison record halts a whole pass). Failing input: PR labels: red-team:pending (or blocked). Status file for HEAD exists but is not valid JSON (partial write by a non-atomic tool, disk full, manual edit) or has a different head/pr inside (identity mismatch). No retry marker. any tick after the corruption. Cited: we:scripts/lib/drain-red-team-evidence.mjs:488-491, we:scripts/conveyor/advisory-label-sweep.mjs:190, we:scripts/lib/review-red-team-on-skip.mjs:303-333, we:scripts/conveyor/pr-stall-sweep.mjs:286, we:scripts/lib/red-team-pending-watchdog.mjs:11-12. Soak-break sketch: stuck (silent, permanent for that head; plus fleet-wide stall-sweep no-op while the file exists)
 
 ## Acceptance
 

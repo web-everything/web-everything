@@ -1,15 +1,16 @@
 ---
+bornAs: xcwp9g3
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/lib/round-ledger.mjs", "we:scripts/conveyor/round-judge-shadow.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# One malformed legacy manifest on a remote-repo PR makes every drain pass 'incomplete context' and defers ever…
+# round-ledger append is unlocked and a single bad line blocks all appends
 
-Flow-sim gap R9c-G1, class K4 (poison record halts a whole pass). Failing input: Open PR in frontier-ui/plateau-app whose PR body has no lane-manifest block and whose head tree has we:.lane-manifest.json containing conflict markers or a trailing comma (a fixer or rebase edited it). Other open non-WE PRs carry no manifest (normal impl/orphan PRs). Drain pass reads the PR; gh contents API returns 200 with the… Cited: we:scripts/merge-ai-prs.mjs:5044-5053, we:scripts/merge-ai-prs.mjs:2144, we:scripts/merge-ai-prs.mjs:2147, we:scripts/merge-ai-prs.mjs:2063-2095, we:scripts/merge-ai-prs.mjs:2710-2711. Soak-break sketch: Fixture: two non-WE open PRs, A has a head-tree we:.lane-manifest.json = '{'item':12,'; B has none (gh stub returns 404 for B). Action: run buildCarrierHealth/reduceOpenPrContext + planLabelDrain via readRemoteManifestViaApi with a stub exec returning A's byt…
+Flow-sim gap C-G8, class K4 (poison record halts a whole pass). Failing input: round-ledger.jsonl exists. (a) two writers append for the same PR concurrently, or (b) a writer died mid appendFileSync leaving a torn last line, or (c) file unreadable with a code other than ENOENT.' 'E21 / E24 / E27 Cited: we:scripts/lib/round-ledger.mjs:40, we:scripts/conveyor/round-judge-shadow.mjs:190. Soak-break sketch: none
 
 ## Acceptance
 
