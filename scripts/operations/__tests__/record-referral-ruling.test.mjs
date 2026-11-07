@@ -879,3 +879,287 @@ describe('fileCard strict dedupe readers', () => {
     expect(() => strictOpenCards(join(tmpdir(), 'no-such-dir-crfm'))).toThrow(/local backlog card lookup failed/);
   });
 });
+
+describe('R668 acting judge not-real requires evidence (red-first)', () => {
+  const modules = Promise.all([
+    import('../record-referral-ruling.mjs'), import('../record-red-team-ruling.mjs'),
+    import('../record-red-team-ruling-io.mjs'), import('../review-extra-seats.mjs'),
+    import('../../lib/red-team-gate.mjs'), import('../engine.mjs'), import('../../lib/policy-cascade.mjs'),
+  ]);
+  const evidence = () => ({ command: 'node scripts/repro.mjs', output: 'observed: claim disproved',
+    headSha: head, handler: 'scripts/x.mjs:7', provingTest: 'scripts/__tests__/repro.test.mjs' });
+  const claims = () => [{ file: 'scripts/x.mjs', line: 7, summary: 'coverage fixture', class: 'coverage-or-style' }];
+  const policy = (over = {}) => ({ mode: 'evidence-required', evidence: evidence(), liveHead: head,
+    findings: claims(), confirm: { verdict: 'agree' }, disagreements: 0, ...over });
+  const scratch = [];
+  afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  const prefsFile = prefs => {
+    const dir = mkdtempSync(join(tmpdir(), 'judge-not-real-'));
+    scratch.push(dir);
+    const file = join(dir, 'preferences.json');
+    writeFileSync(file, JSON.stringify(prefs));
+    return file;
+  };
+  // Inspect evidence without prescribing its container/key on the two different record formats.
+  const objects = x => x && typeof x === 'object' ? [x, ...Object.values(x).flatMap(objects)] : [];
+  const storedEvidence = x => objects(x).find(o => o.command === evidence().command && o.headSha === head);
+
+  async function fixture(kind, { mode = 'evidence-required', verdict = 'agree', inputOver = {}, readOver = {},
+    findingOver = {}, confirmThrows = false } = {}) {
+    const [ref, rt, rtIO, seats, gate, engine] = await modules;
+    const f = { ...finding('coverage fixture'), line: 7, impactIfUnfixed: kind === 'referral' ? 'broken' : 'degraded',
+      findingClass: 'coverage-or-style', classBasis: 'Missing test, no live break', ...findingOver };
+    const rec = referral();
+    rec.referrals[0].original = f;
+    rec.referrals[0].finding = normalizeFinding(f);
+    rec.referrals[0].key = referralFindingKey(rec.referrals[0].seat, f);
+    const comments = kind === 'referral' ? [gh(renderReferralRecord(rec))] : [
+      gh(seats.renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok',
+        foldedVerdict: 'changes', findingClasses: {}, findings: [{ ...f, confirmedByRecheck: true }] }),
+      'web-everything', { createdAt: '2026-10-04T14:00:00Z' }),
+      gh(gate.redTeamGateMarker(7, head, 'round-cap'), 'web-everything', { createdAt: '2026-10-04T14:01:00Z' }),
+    ];
+    const snapshot = { head, comments, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's',
+      judgeNotRealMode: { value: mode, source: 'standard' }, disagreements: 0,
+      cardFileMode: { value: 'one-call', source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false,
+      ...(kind === 'referral' ? openReferralFindings({ comments, ...ctx() }) : {
+        identity: { login: 'chalbert', type: 'User' }, labels: [{ name: 'review:human' }],
+        setting: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} }, scope: { value: { anyState: true } },
+      }), ...readOver };
+    const judgeConfirm = vi.fn(async () => {
+      if (confirmThrows) throw new Error('second model unreadable');
+      return verdict === null ? null : { verdict };
+    });
+    const landRulingCard = vi.fn(async () => ({ ok: true, ref: CARD, reused: false }));
+    const readRulingContext = vi.fn(({ card }) => ({ ...snapshot,
+      card: card ? { requested: card, ref: card, readable: true } : null }));
+    const operation = (kind === 'referral' ? ref.recordReferralRulingOperation : rt.recordRedTeamRulingOperation)({
+      readRulingContext, judgeConfirm,
+    });
+    const input = { repo, pr: 7, finding: 'all-open', break: '1', ruling: 'not-real', actor: 'chalbert',
+      channel: 'chat', reason: 'Reproduced and disproved', sendBack: false, asJudge: true, evidence: evidence(),
+      cause: inputOver.ruling && inputOver.ruling !== 'not-real' ? undefined : 'other', ...inputOver };
+    const noIO = vi.fn(() => { throw new Error('unexpected external IO'); });
+    const sinks = (kind === 'referral' ? createRecordReferralRulingSinks : rtIO.createRecordRedTeamRulingSinks)({
+      landRulingCard, judgeConfirm, env: {}, readJson: noIO, readThread: noIO, post: noIO,
+      appendEvents: noIO, readEvents: noIO, resolveIdentity: noIO, readScope: noIO,
+      readStandingRulingScope: noIO, syncLabels: noIO,
+    });
+    const view = { input, findings: {} }, written = [];
+    async function run() {
+      // Follow the declaration so an added confirmation step is exercised through the real engine reads.
+      for (const { name, step } of operation.steps) {
+        const projected = engine.projectReads(view, step.reads);
+        if (step.fn) {
+          view.findings[name] = await step.fn(projected);
+          if (name === 'plan') view.verdict = view.findings[name];
+        } else {
+          const effects = step.effects(projected);
+          if (name === 'write') { written.push(...effects); continue; }
+          const results = [];
+          for (const effect of effects) {
+            expect(typeof sinks[effect.type], `missing sink ${effect.type}`).toBe('function');
+            results.push({ type: effect.type, status: 'applied', result: await sinks[effect.type](effect.payload) });
+          }
+          view.findings[name] = { applied: true, effects: results };
+        }
+      }
+      return view.verdict;
+    }
+    const result = v => kind === 'referral' ? v.record.rulings[0].result : v.ruling;
+    return { run, result, operation, view, written, judgeConfirm, landRulingCard, noIO, snapshot, rtIO };
+  }
+
+  for (const kind of ['referral', 'red-team']) {
+    // Red-team uses the shared pure policy seam as well as its own operation below.
+    const plan = async over => { const [ref] = await modules; return ref.planJudgeNotReal(policy(over)); };
+    it(`${kind}: exports planJudgeNotReal; evidence present + model agrees => not-real`, async () => {
+      const [ref] = await modules;
+      expect(ref.planJudgeNotReal).toBeTypeOf('function');
+      expect(await plan()).toEqual({ ruling: 'not-real', evidence: evidence(), reason: expect.stringMatching(/\S/) });
+    });
+    for (const verdict of ['disagree', 'unsure']) it(`${kind}: model ${verdict === 'disagree' ? 'disagrees' : 'unsure'} => card (never not-real)`, async () => {
+      expect(await plan({ confirm: { verdict } })).toMatchObject({ ruling: 'card', reason: expect.stringMatching(/\S/) });
+      const h = await fixture(kind, { verdict });
+      expect(h.result(await h.run())).toBe('card');
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+      expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(h.written)).toContain(CARD);
+      expect(JSON.stringify(h.written)).not.toMatch(/"(?:result|ruling)":"not-real"/);
+      expect(h.noIO).not.toHaveBeenCalled();
+    });
+    const refusals = [
+      ['security-class finding => refused', { findings: [{ ...claims()[0], class: 'security' }] }, { findingOver: { findingClass: 'security' } }, /security|operator.only/i],
+      ['guard-file finding => refused', { findings: [{ ...claims()[0], file: 'scripts/guards/head.mjs' }] }, { findingOver: { file: 'scripts/guards/head.mjs' } }, /guard|operator.only/i],
+      ['disagreements>=2 => refused', { disagreements: 2 }, { readOver: { disagreements: 2 } }, /disagree|operator.only/i],
+      ['stale-head evidence => refused', { evidence: { ...evidence(), headSha: newHead } }, { inputOver: { evidence: { ...evidence(), headSha: newHead } } }, /stale|head/i],
+      ['missing evidence field => refused', { evidence: { ...evidence(), provingTest: undefined } }, { inputOver: { evidence: { ...evidence(), provingTest: undefined } } }, /evidence|provingTest/i],
+      ['mode off => refused', { mode: 'off' }, { mode: 'off' }, /off|disabled/i],
+      ['mode invalid => throws', { mode: 'typo' }, { mode: 'typo' }, /mode|invalid/i],
+    ];
+    for (const [name, pureOver, options, error] of refusals) it(`${kind}: ${name}`, async () => {
+      await expect(plan(pureOver)).rejects.toThrow(error);
+      const h = await fixture(kind, options);
+      await expect(h.run()).rejects.toThrow(error);
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(0);
+      expect(h.landRulingCard).not.toHaveBeenCalled();
+      expect(h.written).toEqual([]);
+    });
+    it(`${kind}: evidence-required calls judgeConfirm exactly once and preserves the operator login`, async () => {
+      const h = await fixture(kind);
+      expect(h.operation.input.asJudge).toMatchObject({ type: 'boolean', required: false });
+      expect(h.result(await h.run())).toBe('not-real');
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(h.written)).toContain('chalbert');
+      expect(h.landRulingCard).not.toHaveBeenCalled();
+    });
+    it(`${kind}: mode open still refuses security and still skips the confirm (confirm not called)`, async () => {
+      await expect(plan({ mode: 'open', confirm: null, findings: [{ ...claims()[0], class: 'security' }] })).rejects.toThrow(/security|operator.only/i);
+      const h = await fixture(kind, { mode: 'open', findingOver: { findingClass: 'security' } });
+      await expect(h.run()).rejects.toThrow(/security|operator.only/i);
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(0);
+      expect(h.written).toEqual([]);
+    });
+    it(`${kind}: open skips ONLY confirm; valid evidence records not-real with zero model calls`, async () => {
+      expect(await plan({ mode: 'open', confirm: null })).toMatchObject({ ruling: 'not-real' });
+      const h = await fixture(kind, { mode: 'open' });
+      expect(h.result(await h.run())).toBe('not-real');
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(0);
+    });
+    it(`${kind}: operator path (no asJudge) unchanged: operator still records not-real with no evidence`, async () => {
+      const h = await fixture(kind, { mode: 'off', inputOver: { asJudge: undefined, evidence: undefined } });
+      expect(h.result(await h.run())).toBe('not-real');
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(0);
+      expect(h.landRulingCard).not.toHaveBeenCalled();
+    });
+    for (const ruling of ['block', 'card']) it(`${kind}: asJudge with ruling ${ruling} => refused ('asJudge applies only to not-real')`, async () => {
+      const h = await fixture(kind, { inputOver: { ruling, ...(ruling === 'card' ? { card: CARD } : {}) } });
+      await expect(h.run()).rejects.toThrow(/asJudge applies only to not-real/);
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(0);
+      expect(h.landRulingCard).not.toHaveBeenCalled();
+      expect(h.written).toEqual([]);
+    });
+    for (const verdict of [null, 'invalid']) it(`${kind}: missing/malformed confirm ${verdict} => card`, async () => {
+      expect(await plan({ confirm: verdict === null ? null : { verdict } })).toMatchObject({ ruling: 'card' });
+      const h = await fixture(kind, { verdict });
+      expect(h.result(await h.run())).toBe('card');
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+      expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+    });
+    it(`${kind}: unreadable confirm => card through existing filing path`, async () => {
+      const h = await fixture(kind, { confirmThrows: true });
+      expect(h.result(await h.run())).toBe('card');
+      expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+      expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+    });
+
+    async function readMode({ prefs = {}, tool = {}, envOver = {} } = {}) {
+      const [, , rtIO, , gate, , cascade] = await modules;
+      cascade.resetCascadeLogForTest();
+      const lines = [];
+      const common = { env: { WE_PLATFORM_PREFERENCES_FILE: prefsFile(prefs), WE_POLICY_CASCADE_LOG: '1', ...envOver },
+        tool, log: line => lines.push(line), assertFresh: () => {} };
+      const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
+        readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null, readable: () => false,
+        openPrHead: () => { throw new Error('unexpected PR read'); },
+      }) : rtIO.createRecordRedTeamRulingReader({ ...common,
+        readThread: () => ({ headRefOid: head, comments: [], labels: [] }),
+        readSetting: () => ({ value: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
+        readScope: () => ({ value: { anyState: true }, sources: {} }), readStandingRulingScope: () => null,
+        resolveIdentity: () => ({ login: 'chalbert', type: 'User' }), resolveCard: () => null,
+      });
+      return { context: await reader({ repo, pr: 7 }), lines };
+    }
+    for (const [layer, options, value] of [
+      ['standard', {}, 'evidence-required'],
+      ['platform', { prefs: { judgeNotReal: { judgeNotRealMode: 'off' } } }, 'off'],
+      ['tool', { prefs: { judgeNotReal: { judgeNotRealMode: 'off' } }, tool: { judgeNotRealMode: 'open' } }, 'open'],
+      ['env', { tool: { judgeNotRealMode: 'off' }, envOver: { WE_JUDGE_NOT_REAL_MODE: 'open' } }, 'open'],
+    ]) it(`${kind}: settings provenance logged for ${layer} cascade layer`, async () => {
+      const { context, lines } = await readMode(options);
+      expect(context.judgeNotRealMode).toEqual({ value, source: layer });
+      expect(lines.join('\n')).toMatch(new RegExp(`judgeNotRealMode[=:]\\s*${value}.*${layer}`));
+    });
+    for (const value of ['', 'OPEN', 'typo', null, {}]) it(`${kind}: mode invalid at tool layer ${JSON.stringify(value)} => throws`, async () => {
+      await expect(readMode({ tool: { judgeNotRealMode: value } })).rejects.toThrow(/judgeNotRealMode|invalid.*mode/i);
+    });
+    it(`${kind}: mode invalid at env layer => throws`, async () => {
+      await expect(readMode({ envOver: { WE_JUDGE_NOT_REAL_MODE: 'typo' } })).rejects.toThrow(/judgeNotRealMode|WE_JUDGE_NOT_REAL_MODE/);
+    });
+  }
+
+  for (const mode of ['off', 'evidence-required', 'open']) {
+    for (const file of ['scripts/security/check.mjs', 'scripts/launchd/run.mjs', 'scripts/drain.mjs',
+      'scripts/merge.mjs', 'scripts/firewall.mjs', 'scripts/codex-shim.mjs']) {
+      it(`${mode}: protected ${file} remains operator-only`, async () => {
+        const [ref] = await modules;
+        expect(() => ref.planJudgeNotReal(policy({ mode, findings: [{ ...claims()[0], file }] }))).toThrow(/operator.only|security|protected/i);
+      });
+    }
+    it(`${mode}: retained security class and repeated disagreements remain operator-only`, async () => {
+      const [ref] = await modules;
+      for (const over of [{ findings: [{ ...claims()[0], classes: ['coverage-or-style', 'security'] }] }, { disagreements: 2 }]) {
+        expect(() => ref.planJudgeNotReal(policy({ mode, ...over }))).toThrow(/operator.only|security|disagree/i);
+      }
+    });
+  }
+  for (const field of Object.keys(evidence())) for (const value of [undefined, '', '  ', 7]) {
+    it(`missing/unreadable/malformed evidence.${field}=${JSON.stringify(value)} => refused`, async () => {
+      const [ref] = await modules;
+      expect(() => ref.planJudgeNotReal(policy({ evidence: { ...evidence(), [field]: value } }))).toThrow(/evidence|command|output|head|handler|provingTest/i);
+    });
+  }
+  for (const disagreements of [undefined, -1, 1.5, '0', null]) it(`invalid disagreements ${JSON.stringify(disagreements)} => refused`, async () => {
+    const [ref] = await modules;
+    expect(() => ref.planJudgeNotReal(policy({ disagreements }))).toThrow(/disagree|integer/i);
+  });
+  it('open still refuses absent evidence and malformed handler path:line', async () => {
+    const [ref] = await modules;
+    for (const e of [undefined, null, 'unreadable', { ...evidence(), handler: 'no-line' }]) {
+      expect(() => ref.planJudgeNotReal(policy({ mode: 'open', confirm: null, evidence: e }))).toThrow(/evidence|handler/i);
+    }
+  });
+  it('referral record AND posted comment text store all evidence, mode and confirm verdict', async () => {
+    const h = await fixture('referral');
+    const v = await h.run();
+    expect(storedEvidence(v.record)).toMatchObject({ ...evidence(), mode: 'evidence-required' });
+    expect(JSON.stringify(storedEvidence(v.record))).toContain('agree');
+    const body = h.written[0].payload.body;
+    // Strip the encoded record: evidence must also be visible to the operator.
+    const text = body.replace(/<!--[\s\S]*?-->/g, '');
+    for (const value of [...Object.values(evidence()), 'evidence-required', 'agree']) expect(text).toContain(value);
+    expect(storedEvidence(parseOperatorRulingComment(gh(body)).record)).toMatchObject(evidence());
+  });
+  it('red-team record AND posted comment text store evidence, mode and confirm verdict', async () => {
+    const [, rt] = await modules;
+    const h = await fixture('red-team');
+    await h.run();
+    const posted = [], events = [];
+    const sinks = h.rtIO.createRecordRedTeamRulingSinks({ env: {},
+      readThread: () => ({ headRefOid: head, comments: [...h.snapshot.comments, ...posted.map(b => gh(b, 'chalbert'))], labels: h.snapshot.labels }),
+      readScope: () => h.snapshot.scope, readStandingRulingScope: () => null,
+      resolveIdentity: () => h.snapshot.identity, post: (_repo, _pr, body) => posted.push(body),
+      appendEvents: async rows => events.push(...rows), readEvents: () => ({ status: 'ok', rows: events }),
+      syncLabels: () => ({}),
+    });
+    for (const effect of h.written) await sinks[effect.type](effect.payload);
+    expect(storedEvidence(h.written)).toMatchObject({ ...evidence(), mode: 'evidence-required' });
+    const text = posted.join('\n').replace(/<!--[\s\S]*?-->/g, '');
+    for (const value of [...Object.values(evidence()), 'evidence-required', 'agree']) expect(text).toContain(value);
+    expect(posted.some(body => body.includes(rt.OPERATOR_NOT_REAL_OUTCOME) && body.includes(evidence().output))).toBe(true);
+  });
+  it('oversized output is truncated with a marker at 4000 chars in the record and comment', async () => {
+    const output = 'x'.repeat(4000) + 'OVERSIZED-TAIL';
+    const [ref] = await modules;
+    const p = ref.planJudgeNotReal(policy({ evidence: { ...evidence(), output } }));
+    expect(p.evidence.output).toMatch(/truncat/i);
+    expect(p.evidence.output).not.toContain('OVERSIZED-TAIL');
+    expect(p.evidence.output.startsWith('xxx')).toBe(true);
+    expect(p.evidence.output.match(/^x*/)[0].length).toBeLessThanOrEqual(4000);
+    const h = await fixture('referral', { inputOver: { evidence: { ...evidence(), output } } });
+    const v = await h.run();
+    expect(storedEvidence(v.record).output).toBe(p.evidence.output);
+    expect(v.body).toContain(p.evidence.output);
+    expect(v.body).not.toContain('OVERSIZED-TAIL');
+  });
+});
