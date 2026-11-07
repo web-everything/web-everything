@@ -86,7 +86,7 @@ import {
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
-import { readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join as joinPath, basename } from 'node:path';
 
 /** Newest activity (ms) of the holder: the SAME transcript-tail read the hung detector uses for the main transcript
@@ -117,8 +117,69 @@ import { readHungInfo, readTranscriptTailActivity, resolveHungThresholdMs, PENDI
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { ghRepoSlug } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+
+import { guardedPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { laneStateSnapshot } from '../lib/lane-history.mjs';
+import { salvageLane, leaseSessionIds } from '../lib/lane-salvage.mjs';
+import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+
+/** Invalid bounds fall back through the cascade; the standard remains ten minutes. */
+export function resolveAbsentClaimRelease({ env = process.env, platform } = {}) {
+  if (platform === undefined) platform = readPlatformPreferences({ env }).prefs;
+  const raw = env?.WE_ABSENT_CLAIM_RELEASE_MINUTES;
+  const c = cascadePolicy('fixLoop.absentClaimRelease', null, {
+    env, platform: platform?.fixLoop?.absentClaimRelease ?? null,
+    standard: { minutes: 10 },
+    envValues: { minutes: typeof raw === 'string' && raw.trim() ? Number(raw) : raw },
+    valid: { minutes: v => typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 24 * 60 },
+  });
+  return { ...c.value, sources: c.sources, invalid: c.invalid };
+}
+
+/** Preserve lane work with the pool's verified bundle/patch salvage, without resetting the lane.
+ * Unknown discovery or work state throws; the sweep retains the claim for operator investigation. */
+function salvageAbsentClaim(entry, { name, nowMs }) {
+  const { meta } = entry;
+  const dirs = new Set();
+  const explicit = meta.laneDir || meta.lanePath || meta.lane?.path;
+  if (explicit) dirs.add(explicit);
+  const poolRoot = guardedPoolRoot();
+  const profile = CONSTELLATION_REPOS[meta.repo];
+  if (!profile) return { status: 'unknown' };
+  for (const pool of profile.dirs) {
+    const poolDir = joinPath(poolRoot, pool);
+    let children;
+    try { children = readdirSync(poolDir); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+    for (const child of children.filter(c => /^lane-\d+$/.test(c))) {
+      const dir = joinPath(poolDir, child);
+      if (Number(meta.lane?.lane ?? meta.lane) === Number(child.slice(5))) dirs.add(dir);
+      let lease;
+      try { lease = JSON.parse(readFileSync(joinPath(dir, '.git', LEASE_FILENAME), 'utf8')); }
+      catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+      if (!lease || typeof lease !== 'object' || Array.isArray(lease)) return { status: 'unknown' };
+      const ids = leaseSessionIds(lease).filter(Boolean);
+      if ((meta.sessionId && ids.includes(meta.sessionId)) || ids.includes(name)
+        || lease.holder === name || lease.holder === entry.owner) dirs.add(dir);
+    }
+  }
+  for (const dir of dirs) {
+    const awaiting = makeAwaitingVerifyResolver({ now: () => nowMs })({
+      cwd: dir, name, sessionId: meta.sessionId,
+    }, { pr: meta.pr });
+    if (awaiting?.awaiting === true) return { status: 'unknown' };
+    const state = laneStateSnapshot(dir);
+    if (state.unpushed === null) return { status: 'unknown' };
+    if (!state.unpushed) continue;
+    const lane = Number(/^lane-(\d+)$/.exec(basename(dir))?.[1]);
+    if (!Number.isSafeInteger(lane) || lane < 1) return { status: 'unknown' };
+    const saved = salvageLane({ dir, lane, pool: basename(dirname(dir)), branchRef: 'origin/main',
+      now: new Date(nowMs), reason: 'absent-session-dead', meta: { owner: entry.owner }, includeLocalBranches: true });
+    if (!saved?.bundle) return { status: 'unknown' };
+  }
+  return { status: dirs.size ? 'salvaged' : 'clean' };
+}
 
 /** Resolve the idle-head release window and retain its effective policy provenance. */
 export function resolveIdleClaimRelease({ env = process.env, platform } = {}) {
@@ -358,7 +419,8 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
  * starts a full new window. Legacy clocks without
  * `lastSeen` also restart. Runner-pid and awaiting-verify claims are exempt from idle release.
  * @param {{lockRoot?:string, listAgentsAll?:Function, hungInfoFor?:Function, hungThresholdMs?:number,
- *   awaitingVerifyFor?:Function|null, idleRelease?:object, prHeadFor?:Function, recordEvent?:Function,
+ *   awaitingVerifyFor?:Function|null, idleRelease?:object, absentRelease?:object, salvageFor?:Function,
+ *   prHeadFor?:Function, recordEvent?:Function,
  *   nowMs?:number, nowIso?:()=>string}} [o]
  * @returns {{checked:number, refreshed:Array<{repo:string, pr:number, kind:string, headSha:string|null, owner:string}>}}
  */
@@ -372,6 +434,8 @@ export function refreshLiveFixDispatchClaims({
   identity = pidIdentity,
   activityMsFor = transcriptActivityMs,
   idleRelease = resolveIdleClaimRelease(),
+  absentRelease = resolveAbsentClaimRelease(),
+  salvageFor = salvageAbsentClaim,
   prHeadFor = readPrHead,
   recordEvent = appendDaemonEvent,
   nowIso = () => new Date().toISOString(),
@@ -379,7 +443,8 @@ export function refreshLiveFixDispatchClaims({
 } = {}) {
   const claims = listFixDispatchClaims(lockRoot);
   if (!claims.length) return { checked: 0, refreshed: [] };
-  const listed = listAgentsAll();
+  let listed;
+  try { listed = listAgentsAll(); } catch { listed = null; }
   if (listed && typeof listed.then === 'function') {
     throw new TypeError('refreshLiveFixDispatchClaims: listAgentsAll must be synchronous (got a Promise)');
   }
@@ -390,6 +455,16 @@ export function refreshLiveFixDispatchClaims({
     const { repo, pr, kind, headSha = null, claimedAt = null } = entry.meta;
     const resource = fixDispatchResource({ repo, pr, kind });
     const claimedMs = Date.parse(claimedAt ?? '');
+    const resetAbsent = () => {
+      const cur = readUnchangedClaim(lockRoot, resource, entry);
+      if (!cur || (!Object.hasOwn(cur.meta, 'absentSince') && !Object.hasOwn(cur.meta, 'absentTicks'))) return;
+      const meta = { ...cur.meta };
+      delete meta.absentSince;
+      delete meta.absentTicks;
+      heartbeat(lockRoot, resource, cur.owner, cur.heartbeatAt, cur.pid ?? null, meta);
+    };
+    if (!Array.isArray(listed)) { resetAbsent(); clearClaimIdleHead(lockRoot, resource, entry); continue; }
+
     if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
       clearClaimIdleHead(lockRoot, resource, entry);
       continue;
@@ -408,13 +483,15 @@ export function refreshLiveFixDispatchClaims({
     // `claude agents` row: its liveness is its runner pid. Dead -> release now, with a reason; alive -> heartbeat.
     // (No pid stamped yet -> falls through to the plain TTL like any new claim.)
     if (Number.isInteger(entry.meta.runnerPid)) {
+      resetAbsent();
       let identityReason = null;
       const probeIdentity = (pid, expectations) => {
         const verdict = identity(pid, expectations);
         if (verdict.alive === false) identityReason = verdict.reason;
         return verdict;
       };
-      const runnerDead = isClaimRunnerDead(entry, alive, probeIdentity);
+      let runnerDead;
+      try { runnerDead = isClaimRunnerDead(entry, alive, probeIdentity); } catch { continue; }
       const heartbeatAt = runnerDead ? null : nowIso();
       const cur = readUnchangedClaim(lockRoot, resource, entry);
       if (!cur) continue;
@@ -453,6 +530,71 @@ export function refreshLiveFixDispatchClaims({
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
       try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
     });
+    const quietAliveHolder = agentsAll.some(a => {
+      if (!['idle', 'blocked'].includes(a.state) || !boundToClaim(a) || !Number.isInteger(a.pid)) return false;
+      try {
+        const at = activityMsFor(a);
+        return Number.isFinite(at) && nowMs - at >= hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER
+          && identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) })?.alive === true;
+      } catch { return false; }
+    });
+    if (quietAliveHolder) {
+      // Hung transcript evidence cannot pronounce a positively live, quiet holder dead.
+      for (let i = 0; i < agentsAll.length; i++) {
+        if (['idle', 'blocked'].includes(agentsAll[i].state)) agentsAll[i] = { ...agentsAll[i], hung: false };
+      }
+    }
+    if (agentsAll.length) resetAbsent();
+    if (!agentsAll.length) {
+      clearClaimIdleHead(lockRoot, resource, entry);
+      let awaitingAbsent = false;
+      try { awaitingAbsent = typeof awaitingVerifyFor === 'function'
+        && awaitingVerifyFor({ name, sessionId: entry.meta.sessionId,
+          cwd: entry.meta.laneDir || entry.meta.lanePath || entry.meta.lane?.path || '' }, { pr })?.awaiting === true; }
+      catch { resetAbsent(); continue; }
+      if (awaitingAbsent) {
+        resetAbsent();
+        const cur = readUnchangedClaim(lockRoot, resource, entry);
+        if (cur && heartbeat(lockRoot, resource, cur.owner, nowIso(), cur.pid ?? null, cur.meta)) {
+          refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
+          awaiting.push({ repo, pr, kind, owner: entry.owner });
+        }
+        continue;
+      }
+      const ownerPid = Number(/:(\d+)$/.exec(entry.owner ?? '')?.[1]);
+      const pid = Number.isInteger(entry.pid) && entry.pid > 0 ? entry.pid : ownerPid;
+      let verdict;
+      try { verdict = identity(pid); } catch { verdict = null; }
+      if (verdict?.alive !== false) { resetAbsent(); continue; }
+      const cur = readUnchangedClaim(lockRoot, resource, entry);
+      if (!cur) continue;
+      const since = Date.parse(cur.meta.absentSince ?? '');
+      const validSince = Number.isFinite(since) && since <= nowMs;
+      const ticks = validSince && Number.isSafeInteger(cur.meta.absentTicks) && cur.meta.absentTicks > 0
+        ? cur.meta.absentTicks + 1 : 1;
+      const meta = { ...cur.meta, absentSince: validSince ? cur.meta.absentSince : new Date(nowMs).toISOString(), absentTicks: ticks };
+      delete meta.idleHead;
+      // Persist evidence without renewing the dead holder's TTL.
+      heartbeat(lockRoot, resource, cur.owner, cur.heartbeatAt, cur.pid ?? null, meta);
+      if (ticks < 2 && !(validSince && nowMs - since >= absentRelease.minutes * 60_000)) continue;
+      let saved;
+      try { saved = salvageFor(entry, { name, nowMs }); } catch { continue; }
+      if (saved && typeof saved.then === 'function') {
+        void Promise.resolve(saved).catch(() => {});
+        continue; // this sweep is synchronous; unresolved salvage is never proof
+      }
+      if (!saved || !['clean', 'salvaged'].includes(saved.status)) continue;
+      if (!readUnchangedClaim(lockRoot, resource, entry)) continue;
+      const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+      if (result.released) {
+        released.push({ repo, pr, kind, owner: entry.owner,
+          reason: `absent-session-dead (${verdict.reason ?? 'dead'}, ${ticks} sweeps; ${absentRelease.minutes}m from ${absentRelease.sources.minutes})` });
+        recordIdleRelease({ kind: 'absent-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
+          detail: { kind, owner: entry.owner, absentSince: meta.absentSince, absentTicks: ticks,
+            minutes: absentRelease.minutes, sources: absentRelease.sources } }, recordEvent);
+      }
+      continue;
+    }
     if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name })) {
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
@@ -509,7 +651,7 @@ export function refreshLiveFixDispatchClaims({
     const isIdle = nonTerminal.length > 0
       && nonTerminal.every((a) => a.state === 'idle' && boundToClaim(a) && quietLongEnough(a));
     let idleHeadSha = null;
-    if (!isAwaiting && idleRelease.enabled && isIdle) {
+    if (!isAwaiting && !quietAliveHolder && idleRelease.enabled && isIdle) {
       try {
         const sha = prHeadFor({ repo, pr });
         if (typeof sha === 'string' && sha.trim()) idleHeadSha = sha;
@@ -543,6 +685,12 @@ export function refreshLiveFixDispatchClaims({
         }
         continue;
       }
+    }
+    if (!meta.stuckEmitted && quietAliveHolder) {
+      meta.stuckEmitted = true;
+      if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
+      recordIdleRelease({ kind: 'stuck-session', repo, pr, daemon: 'reconcile-fix-dispatch',
+        detail: { kind, owner: entry.owner } }, recordEvent);
     }
     if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
     if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
