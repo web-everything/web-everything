@@ -688,6 +688,10 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     const inputs = { labels: [REVIEW_LABELS.accepted], escalate: true, deviation: 'changed delivery scope' };
     expect(decideDrainReviewGate(inputs, acceptanceOptions(view)).action).toBe('park');
     view.comments[0].body += '\n<!-- cleared-human: operator -->';
+    // R690 — the same markers on an AUTOMATION-authored comment are refused; the human clearance is the operator's.
+    expect(decideDrainReviewGate(inputs, acceptanceOptions(view)).action).toBe('park');
+    view.comments[0].viewerDidAuthor = false;
+    view.comments[0].author = { login: 'chalbert' };
     expect(decideDrainReviewGate(inputs, acceptanceOptions(view)).action).toBe('merge');
     view.comments[0].viewerDidAuthor = false;
     view.comments[0].author = { login: 'untrusted-worker' };
@@ -734,6 +738,9 @@ describe('PR #4446 — permission-change hold: score -> drain gate hand-off', ()
   it('merges once a trusted head-bound human clearance is recorded', () => {
     const view = reviewedView();
     view.comments[0].body += '\n<!-- cleared-human: operator -->';
+    expect(drain(scoreOf([WF], diff4318), view).action).toBe('park'); // R690 — automation-authored clearance refused
+    view.comments[0].viewerDidAuthor = false;
+    view.comments[0].author = { login: 'chalbert' }; // posted by the operator, as review-set-label does
     expect(drain(scoreOf([WF], diff4318), view).action).toBe('merge');
   });
 

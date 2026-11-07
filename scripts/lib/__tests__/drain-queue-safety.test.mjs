@@ -1357,12 +1357,14 @@ describe('operator ruling at the round cap', () => {
   });
   it('a ruling on the prior head survives a proven carry (restamped clearance, carried round-cap and result)', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
-    expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
+    // R690 - automation-authored clearance is refused
+    expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
   });
   it('a plain accept of the carried head supersedes the prior head ruling; a bot cleared-human marker cannot revive it', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
     const carried = [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
-    expect(hold({ comments: carried })).toBeNull();
+    // R690 - automation-authored clearance is refused
+    expect(hold({ comments: carried })).toMatch(/requiring send-back/);
     expect(hold({ comments: [...carried, accept(head), restamp(head)] })).toMatch(/requiring send-back/);
   });
   it('a carry cannot revive a ruling superseded by a plain accept on its original head', () => {
@@ -1410,18 +1412,21 @@ describe('operator ruling at the round cap', () => {
   });
   it('an abbreviated plain accept of an unrelated head does not supersede a ruling', () => {
     const comments = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept('f'.repeat(12)), restamp(head)];
-    expect(hold({ comments })).toBeNull();
+    // R690 - automation-authored clearance is refused
+    expect(hold({ comments })).toMatch(/requiring send-back/);
   });
   it('a plain accept on an unrelated head does not supersede a carried ruling', () => {
     const comments = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true),
       accept('f'.repeat(40)), restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
-    expect(hold({ comments })).toBeNull();
+    // R690 - automation-authored clearance is refused
+    expect(hold({ comments })).toMatch(/requiring send-back/);
   });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);
     const ruledOnH0 = [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), accept(h0, true)];
     const toPrior = [restamp(prior), carry({ from: h0, to: prior, findings: broken, gates: ['round-cap'] })];
-    expect(hold({ comments: [...ruledOnH0, ...toPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
+    // R690 - automation-authored clearance is refused
+    expect(hold({ comments: [...ruledOnH0, ...toPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
     expect(hold({ comments: [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), ...toPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
   });
   it('a carry never invents a ruling the prior head did not have', () => {
@@ -1436,7 +1441,8 @@ describe('operator ruling at the round cap', () => {
       comments.push(restamp(to), carry({ from, to, findings: broken, gates: ['round-cap'] }));
       from = to;
     }
-    expect(hold({ comments })).toBeNull();
+    // R690 - automation-authored clearance is refused
+    expect(hold({ comments })).toMatch(/requiring send-back/);
   });
 });
 

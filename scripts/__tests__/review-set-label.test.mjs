@@ -2714,7 +2714,8 @@ describe('buildVerdictComment — a restamp carries a human clearance forward (#
     // The SHA marker it stamps is the NEW head — this comment vouches for THIS tree, and
     // `parseLatestHumanClearedSha` (which binds reviewed-sha + cleared-human to the SAME comment) must read
     // the marker as covering the new head, never the pre-rebase one it was originally granted against.
-    expect(parseLatestHumanClearedSha([{ body: out, author: { login: 'web-everything' } }])).toBe(NEW_HEAD.toLowerCase());
+    // R690 - automation-authored clearance is refused
+    expect(parseLatestHumanClearedSha([{ body: out, author: { login: 'web-everything' } }])).toBe(null);
   });
 
   it('says PLAINLY that the clearance was carried, and names the original clearance', () => {
@@ -2760,7 +2761,7 @@ describe('decideRestampHumanClearance (#x9krtkb — is a restamp carrying a huma
     // repaired dda3ff327..f2247f0ab. The first two match; the source-literal repair changes the third.
     const original = '95cb216548ba6b8e702c49527745ccd50355a7d6';
     const contribution = '27381bade5815ad928b373dff9ead23134402e24f9ea2a69dbc3405164c182dc';
-    const comments = [{ author: { login: 'web-everything' }, body: [
+    const comments = [{ author: { login: 'chalbert' }, body: [
       buildReviewedShaMarker(original),
       buildReviewedDiffMarker('be21b72e986d883b6ac7ab615b855b8469ce7db910e17fd94b23f8b509169c50'),
       buildReviewedContributionMarker(contribution), buildClearedHumanMarker('chalbert'),
@@ -2791,7 +2792,7 @@ describe('decideRestampHumanClearance (#x9krtkb — is a restamp carrying a huma
       buildReviewedShaMarker(sha), buildReviewedDiffMarker(diff), buildReviewedContributionMarker(contrib),
       buildClearedHumanMarker('chalbert'),
     ].join('\n'),
-    author: { login: 'web-everything' },
+    author: { login: 'chalbert' }, // R690 — a human clearance is posted by the operator login
   });
   const plainAcceptComment = (sha = HUMAN_SHA, diff = DIFF, contrib = CONTRIB) => ({
     body: [buildReviewedShaMarker(sha), buildReviewedDiffMarker(diff), buildReviewedContributionMarker(contrib)].join('\n'),
@@ -2845,7 +2846,7 @@ describe('decideRestampHumanClearance (#x9krtkb — is a restamp carrying a huma
     const forged = { ...humanClearedComment(HUMAN_SHA, DIFF, DIFF), author: { login: 'mallory' } };
     // Sanity: authored by a trusted login, this exact comment WOULD carry — so the null below is authorship.
     expect(decideRestampHumanClearance({
-      comments: [{ ...forged, author: { login: 'web-everything' } }], headSha: NEW_HEAD, headDiff: DIFF,
+      comments: [{ ...forged, author: { login: 'chalbert' } }], headSha: NEW_HEAD, headDiff: DIFF,
     })).toEqual({ actor: 'chalbert', sha: HUMAN_SHA });
     expect(decideRestampHumanClearance({ comments: [forged], headSha: NEW_HEAD, headDiff: DIFF })).toBe(null);
   });
@@ -2878,7 +2879,8 @@ describe('decideRestampHumanClearance (#x9krtkb — is a restamp carrying a huma
       comments: [humanClearedComment(), plainAcceptComment('a'.repeat(40), 'e'.repeat(64), 'e'.repeat(64))],
       headSha: NEW_HEAD, headDiff: 'e'.repeat(64),
     });
-    expect(out).toBe(null);
+    // R690 — the automation accept cannot mask the operator's earlier clearance.
+    expect(out).toEqual({ actor: 'chalbert', sha: HUMAN_SHA });
   });
 
   // THE ROUND TRIP TO THE ANTI-TEST-GAMING GATE — the whole point of the fix. Once `decideRestampHumanClearance`
@@ -2894,10 +2896,11 @@ describe('decideRestampHumanClearance (#x9krtkb — is a restamp carrying a huma
     const humanClearedSha = parseLatestHumanClearedSha([
       humanClearedComment(), { body: restampComment, author: { login: 'web-everything' } },
     ]);
-    expect(humanClearedSha).toBe(NEW_HEAD.toLowerCase());
+    // R690 - automation-authored clearance is refused
+    expect(humanClearedSha).toBe(HUMAN_SHA);
     expect(shouldReparkForTestTampering({
       tampered: true, netDiffScored: true, humanClearedSha, headSha: NEW_HEAD,
-    })).toBe(false);
+    })).toBe(true);
   });
 
   // THE NEGATIVE OF THAT SAME ROUND TRIP — a PLAIN restamp (no carry) leaves the gate exactly as re-park-prone
@@ -3003,7 +3006,7 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
         buildReviewedShaMarker(STALE_HEAD), buildReviewedDiffMarker(DIFF), buildReviewedContributionMarker(DIFF),
         buildClearedHumanMarker('chalbert'),
       ].join('\n'),
-      author: { login: 'web-everything' }, // #4140 — the markers' readers are trusted-author gated
+      author: { login: 'chalbert' }, // #4140/R690 — the clearance is the operator's own comment
     };
     const captured = [];
     // `reviewedDiff` inside `runReviewLabelCli` comes from `computeNetDiffText`, a REAL git call this stub
@@ -3147,8 +3150,9 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   });
 
   it.each([
-    ['trusted current-head clearance', 'a'.repeat(40), { login: 'web-everything' }, false],
-    ['trusted stale-head clearance', 'b'.repeat(40), { login: 'web-everything' }, true],
+    ['operator current-head clearance', 'a'.repeat(40), { login: 'chalbert' }, false],
+    ['automation current-head clearance (R690: refused)', 'a'.repeat(40), { login: 'web-everything' }, true],
+    ['operator stale-head clearance', 'b'.repeat(40), { login: 'chalbert' }, true],
     ['untrusted current-head marker', 'a'.repeat(40), { login: 'drive-by' }, true],
     ['current-head marker with no author', 'a'.repeat(40), undefined, true],
   ])('CLI rearm respects %s with a mixed-case live head', (_name, headSha, author, allowed) => {
@@ -3164,7 +3168,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
 
   it('CLI rearm preserves human clearance after a same-head plain accept', () => {
     const comments = ['clear-human', 'accepted'].map((to) => ({
-      body: buildVerdictComment({ to, actor: 'operator', headSha: 'a'.repeat(40) }), author: { login: 'web-everything' },
+      body: buildVerdictComment({ to, actor: 'operator', headSha: 'a'.repeat(40) }), author: { login: to === 'clear-human' ? 'chalbert' : 'web-everything' },
     }));
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments });
     expect(result.exitCode).toBe(1);
@@ -3174,7 +3178,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
 
   it('CLI rearm preserves human clearance with a whitespace-padded valid head', () => {
     const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
-      author: { login: 'web-everything' } }];
+      author: { login: 'chalbert' } }];
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, headRefOid: ` \t${'A'.repeat(40)}\n` });
     expect(result.exitCode).toBe(1);
     expect(result.calls).toEqual([]);
@@ -3192,7 +3196,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   it('CLI rearm preserves a trusted current-head clearance beyond the initial comment page', () => {
     const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
     const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
-      author: { login: 'web-everything' } };
+      author: { login: 'chalbert' } };
     const readComments = vi.fn(() => [...comments, clearance]);
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
     expect(readComments).toHaveBeenCalledTimes(1);
@@ -3277,6 +3281,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
         id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
       }));
+      comments[0].author = { login: 'chalbert' };
       comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'c'.repeat(40) });
       const readComments = vi.fn(() => [
         ...comments.map((c, i) => i === 0 ? { ...c, body: 'stale discussion' } : c),
@@ -3369,7 +3374,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
 
   it('ordinary rearm refuses the label swap when the second read carries a current-head clearance', () => {
     const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
-      author: { login: 'web-everything' } }];
+      author: { login: 'chalbert' } }];
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { freshState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(2);
     expect(result.exitCode).toBe(1);
@@ -3380,7 +3385,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   const missingArgs = ['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`];
   it('missing-only rearm refuses the label swap when clearance arrives during the comment write', () => {
     const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
-      author: { login: 'web-everything' } }];
+      author: { login: 'chalbert' } }];
     const result = run(missingArgs, [], { swapState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(3);
     expect(result.exitCode).toBe(1);
@@ -3405,7 +3410,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
 
   it('rearm preserves embedded-page clearance when pagination is empty or partial on initial and missing-only fresh reads', () => {
     const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
-      author: { login: 'web-everything' } };
+      author: { login: 'chalbert' } };
     const comments = [clearance, ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, () => ({ body: 'discussion' }))];
     for (const fresh of [false, true]) {
       for (const pagedComments of [[], [{ body: 'partial discussion' }]]) {
@@ -3431,6 +3436,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
         id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
       }));
+      comments[0].author = { login: 'chalbert' };
       comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head });
       const readComments = vi.fn(() => comments.map(c => ({ ...c, body: 'stale discussion' })));
       const result = fresh
@@ -3448,7 +3454,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       'refuses rearm without label, comment or ledger writes when pagination is %s', shape => {
         const fresh = read === 'fresh changed-head reread';
         const head = (fresh ? 'b' : 'a').repeat(40);
-        const comments = [{ id: 'IC_clearance', author: { login: 'web-everything' },
+        const comments = [{ id: 'IC_clearance', author: { login: 'chalbert' },
           body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head }) },
         ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }))];
         const pagedComments = shape === 'empty' ? [] : shape === 'shorter' ? comments.slice(1)
@@ -3480,7 +3486,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   it('missing-only rearm refuses without writes when clearance arrives beyond the fresh embedded comment page', () => {
     const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
     const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
-      author: { login: 'web-everything' } };
+      author: { login: 'chalbert' } };
     const readComments = vi.fn().mockReturnValueOnce([...comments, { body: 'later discussion' }]).mockReturnValue([...comments, clearance]);
     const result = run(missingArgs, [], { comments, readComments, freshState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(2);
@@ -3509,8 +3515,8 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   });
 
   it.each([
-    ['trusted current-head clearance', 'a'.repeat(40), { login: 'web-everything' }, false],
-    ['trusted stale-head clearance', 'b'.repeat(40), { login: 'web-everything' }, true],
+    ['trusted current-head clearance', 'a'.repeat(40), { login: 'chalbert' }, false],
+    ['trusted stale-head clearance', 'b'.repeat(40), { login: 'chalbert' }, true],
     ['untrusted current-head marker', 'a'.repeat(40), { login: 'drive-by' }, true],
     ['current-head marker with no author', 'a'.repeat(40), undefined, true],
   ])('missing-only rearm rechecks fresh %s before any write, even after a plain accept', (_name, headSha, author, allowed) => {
@@ -3607,7 +3613,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
 
     it('refuses rollback when a same-head human clearance arrives during the third failed comment attempt', () => {
       const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
-        author: verdict.author };
+        author: { login: 'chalbert' } };
       const labels = [REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL];
       const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3,
         postCommentFailureState: vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
@@ -3728,7 +3734,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     });
 
     it('refuses resume if a human clearance arrives before the marker write', () => {
-      const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }), author: verdict.author };
+      const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }), author: { login: 'chalbert' } };
       const result = run(argv, [REVIEW_LABELS.pending], { ...options, freshState: { comments: [verdict, clearance] } });
       expect(result.exitCode).toBe(1);
       expect(result.calls).toEqual([]);
@@ -4537,7 +4543,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   function run({ mode = 'plain', expected = healedHead, labels = ['review:accepted'], race, state = 'OPEN', extra = [], reviews = [] } = {}) {
-    let comment = { author: { login: 'web-everything' }, body: buildVerdictComment({
+    let comment = { author: { login: mode === 'human' ? 'chalbert' : 'web-everything' }, body: buildVerdictComment({
       to: mode === 'human' ? 'clear-human' : 'accepted', actor: 'original reviewer', headSha: reviewedHead, reviewedDiff,
     }) };
     if (mode === 'untrusted') comment.author.login = 'mallory';
@@ -4574,7 +4580,8 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     expect(parseReviewedSha(result.added)).toBe(healedHead);
     expect(parseReviewedDiff(result.added)).toBe(normalizeDiffFingerprint(healedDiff));
     expect(parseReviewedContribution(result.added)).toBe(normalizeContributionFingerprint(healedDiff));
-    expect(parseLatestHumanClearedSha(result.added)).toBe(mode === 'human' ? healedHead : null);
+    // R690 - automation-authored clearance is refused
+    expect(parseLatestHumanClearedSha(result.added)).toBe(null);
     expect(result.added[0].body).toContain(reviewedHead);
     expect(result.added[0].body).not.toContain("drain's own");
     expect(result.ledger).toHaveLength(1);

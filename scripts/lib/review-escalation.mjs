@@ -26,8 +26,7 @@ import { POLICY_THRESHOLDS, POLICY_VERSION, POLICY_DIGEST } from './review-polic
 // #4140 — the shared trusted-author gate every coverage-deciding marker reader (`parseReviewedSha`,
 // `parseReviewedDiff`, `parseReviewedContribution`, `parseLatestHumanClearedSha`) now runs every comment through
 // before matching its marker, closing the residual `marker-authorship.mjs`'s own header named as a follow-up.
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { isHumanOperatorComment } from './operator-identity.mjs';
+import { isTrustedMarkerAuthor, isOperatorAuthored } from './marker-authorship.mjs';
 
 /** Shared operation identity; core consumers must not import operation declarations. */
 export const REVIEW_PR_OP_ID = 'review-pr';
@@ -2015,6 +2014,20 @@ export function parseChangesVerdictProse(body) {
 }
 
 /**
+ * R690 — is this comment written by a HUMAN operator account? Same rule as `isHumanOperatorComment` in
+ * operator-identity.mjs (operator login, type not Bot, no `[bot]`, not `is_bot`), restated on the marker-authorship
+ * allowlist because of the import cycle operator-identity -> red-team-gate -> review-escalation (importing it here fails
+ * with a TDZ error at load). Follow-up: break the cycle, then import `isHumanOperatorComment` directly. `operator-authorship parity` is pinned by a test. Unknown or unreadable author: false.
+ */
+function isHumanOperatorAuthor(c) {
+  if (typeof c !== 'object' || c === null) return false;
+  const a = c.author ?? c.user;
+  if (typeof a !== 'object' || a === null) return false;
+  const login = String(a.login ?? '').toLowerCase();
+  return isOperatorAuthored(c) && !login.includes('[bot]') && String(a.type ?? '') !== 'Bot' && a.is_bot !== true;
+}
+
+/**
  * #xuboo0q — did the LATEST accept-shaped comment (whichever comment stamped the most recent `reviewed-sha`
  * marker) ALSO carry the `clear-human` ceremony marker IN THAT SAME COMMENT? Pure.
  *
@@ -2035,6 +2048,9 @@ export function parseChangesVerdictProse(body) {
  * neither BE the latest accept-shaped comment nor supply the `cleared-human` half of one. Without this, a forged
  * `reviewed-sha` + `cleared-human` comment posted after a REAL plain accept upgraded that accept into a human
  * clearance (review round 1 on PR #2716 — the "piggyback").
+ *
+ * R690 — AND HUMAN-AUTHORED: only a human operator login counts; an automation comment is skipped outright
+ * (never clears, never masks an older real clearance), and an unknown author fails closed.
  */
 export function parseLatestHumanClearedSha(comments) {
   let latestSha = null;
@@ -2044,7 +2060,7 @@ export function parseLatestHumanClearedSha(comments) {
     if (!body) continue;
     // R690 — a human clearance is a HUMAN's: only a human operator login counts (automation, an app/bot, an unknown or
     // unreadable author all skip, so a forged automation comment neither clears nor masks a real older clearance).
-    if (!isHumanOperatorComment(c)) continue;
+    if (!isHumanOperatorAuthor(c)) continue;
     REVIEWED_SHA_RE.lastIndex = 0;
     let m;
     let bodySha = null;
@@ -2074,7 +2090,7 @@ export function parseLatestHumanClearedSha(comments) {
 export function headEverHumanCleared(comments, headSha) {
   if (!Array.isArray(comments) || typeof headSha !== 'string' || !headSha.trim()) return false;
   const head = headSha.toLowerCase();
-  return comments.some((c) => isHumanOperatorComment(c) && parseLatestHumanClearedSha([c]) === head);
+  return comments.some((c) => isHumanOperatorAuthor(c) && parseLatestHumanClearedSha([c]) === head);
 }
 
 /**
