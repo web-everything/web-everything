@@ -7706,7 +7706,7 @@ async function runCli() {
   summarizeAsyncShadow(enqueueOutcomes, toMerge);
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
-  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
+  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked, enqueueOutcomes });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
