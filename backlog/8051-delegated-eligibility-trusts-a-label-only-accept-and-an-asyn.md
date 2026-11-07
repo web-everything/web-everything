@@ -1,15 +1,16 @@
 ---
+bornAs: x2zshas
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/lib/review-escalation.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/marker-authorship.mjs", "we:scripts/check-standards-rules.mjs"]
+scope: ["we:scripts/conveyor/delegated-clear-human.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Forged clearance by ANY commenter suppresses the human re-hold for a pass
+# Delegated eligibility trusts a label-only accept and an async red-team default
 
-Flow-sim gap C-G1, class K8 (authority asymmetry). Failing input: PR labels [review:accepted] (no review:human), humanRequired fresh score true, plain trusted accept comment with reviewed-sha A + a recorded reviewed-diff fingerprint, live head B != A, this pass's live diff read FAILED (headReadFailed). An outsider posts a comment starting '✅ review — `review:human` cleared via the sanctioned … Cited: we:scripts/lib/review-escalation.mjs:1953-1966, we:scripts/merge-ai-prs.mjs:784, we:scripts/lib/marker-authorship.mjs:43-46, we:scripts/check-standards-rules.mjs:55, we:scripts/lib/review-escalation.mjs:2044. Soak-break sketch: none found (grep clear-human/cleared-human/clearance in soak/breaks)
+Flow-sim gap C-G4, class K8 (authority asymmetry). Failing input: review:human + review:accepted label whose reviewed-sha names an OLDER head, or caller using liveReaders() without replacing redTeamClearAtHead; PR carries a stale red-team:clear label.' 'delegated pass evaluates eligibility Cited: we:scripts/conveyor/delegated-clear-human.mjs:65-66. Soak-break sketch: none
 
 ## Acceptance
 

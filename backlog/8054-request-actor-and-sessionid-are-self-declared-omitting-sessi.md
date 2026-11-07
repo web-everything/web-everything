@@ -1,15 +1,16 @@
 ---
+bornAs: xtfptpb
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/conveyor/supersede-rule.mjs", "we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/apply-review-request.mjs", "we:scripts/review-set-label.mjs", "we:scripts/lib/review-independence.mjs", "we:scripts/lib/auto-land-seam.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Supersedes target is never verified to relate to the declaring PR; any automation-authored PR can freeze any …
+# Request actor and sessionId are self-declared; omitting sessionId turns the #2844 self-clear refusal into 'un…
 
-Flow-sim gap R9b-G5, class K8 (authority asymmetry). Failing input: Trusted (automation) PR #B merged with line 'Supersedes #5000' where #5000 is an unrelated open PR (typo, copy of a template line, wrong number, or a cross-repo number).' 'supersede-watch tick. Cited: we:scripts/conveyor/supersede-rule.mjs:274-280, we:scripts/conveyor/stand-down.mjs:233, we:scripts/conveyor/reconcile-core.mjs:2573. Soak-break sketch: fixture: merged trusted PR whose card/files do not overlap open PR #5000's; body 'Supersedes: #5000'. action: planSupersedeHolds. assert hold is not terminal-posted without relation evidence (or is posted as advisory) - today a terminal hold is planned.
+Flow-sim gap R7b-G4, class K8 (authority asymmetry). Failing input: PR opened by session S (author stamp in PR body). Session S (or anything that can push to ops/review-requests) pushes we:10-accepted.json with actor='independent-reviewer' and NO sessionId. 'apply workflow runs the label CLI with CLAUDE_CODE_SESSION_ID deleted. Cited: we:scripts/apply-review-request.mjs:142-152, we:scripts/apply-review-request.mjs:185-190, we:scripts/review-set-label.mjs:1417-1431, we:scripts/lib/review-independence.mjs:261-270, we:scripts/lib/auto-land-seam.mjs:151. Soak-break sketch: Fixture: PR body with author stamp for session S; request {to:'accepted', actor:'x', no sessionId}. Action: apply main() with fake spawn and real decideClearerIndependence. Assertion that fails today: the request is refused (apply requires sessionId for `acce…
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xv28z38
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/operations/operator-queue-needs-person.mjs", "we:scripts/lib/marker-authorship.mjs", "we:scripts/operations/operator-queue.mjs", "we:scripts/operations/needs-you-feed.mjs"]
+scope: ["we:scripts/lib/review-escalation.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# needs-person ask is cleared by ANY comment from the operator login, including daemon comments posted under th…
+# Label-only approval has no actor check; marker from an older accept is reusable
 
-Flow-sim gap R8b-G9, class K8 (authority asymmetry). Failing input: Trusted note 'needs your decision' on PR (key e.g. round-cap-exhausted:5:fix:4/4). Later the conveyor, running on the operator's personal gh auth fallback (documented in we:marker-authorship.mjs header), posts any comment (stand-down, rearm, heal marker, status) or the operator posts an unrelated remark.' 'operator-queue run. Cited: we:scripts/operations/operator-queue-needs-person.mjs:8, we:scripts/lib/marker-authorship.mjs:120-132, we:scripts/operations/operator-queue.mjs:793-794, we:scripts/operations/needs-you-feed.mjs:160. Soak-break sketch: Fixture: comments [botNote(ci-heal-exhausted) t1, operatorLogin comment 'rearm: review-loop re-armed' t2 (automation fallback)]. Assert needsPersonRow still returns a row (no answer command ran: no extend-rounds/stand-down-answer/send-back marker); fails toda…
+Flow-sim gap C-G10, class K8 (authority asymmetry). Failing input: Head H has a trusted plain accept comment (reviewed-sha H), later sent back (review:changes label), head unchanged.' 'E1 anyone with label-write adds review:accepted and removes review:changes by hand Cited: we:scripts/lib/review-escalation.mjs:3075, we:scripts/lib/review-escalation.mjs:2361-2380, we:scripts/lib/review-escalation.mjs:1202, we:scripts/lib/review-escalation.mjs:3. Soak-break sketch: none
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xeh5230
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/lib/review-escalation.mjs"]
+scope: ["we:scripts/lib/review-escalation.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/marker-authorship.mjs", "we:scripts/check-standards-rules.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Label-only approval has no actor check; marker from an older accept is reusable
+# Forged clearance by ANY commenter suppresses the human re-hold for a pass
 
-Flow-sim gap C-G10, class K8 (authority asymmetry). Failing input: Head H has a trusted plain accept comment (reviewed-sha H), later sent back (review:changes label), head unchanged.' 'E1 anyone with label-write adds review:accepted and removes review:changes by hand Cited: we:scripts/lib/review-escalation.mjs:3075, we:scripts/lib/review-escalation.mjs:2361-2380, we:scripts/lib/review-escalation.mjs:1202, we:scripts/lib/review-escalation.mjs:3. Soak-break sketch: none
+Flow-sim gap C-G1, class K8 (authority asymmetry). Failing input: PR labels [review:accepted] (no review:human), humanRequired fresh score true, plain trusted accept comment with reviewed-sha A + a recorded reviewed-diff fingerprint, live head B != A, this pass's live diff read FAILED (headReadFailed). An outsider posts a comment starting '✅ review — `review:human` cleared via the sanctioned … Cited: we:scripts/lib/review-escalation.mjs:1953-1966, we:scripts/merge-ai-prs.mjs:784, we:scripts/lib/marker-authorship.mjs:43-46, we:scripts/check-standards-rules.mjs:55, we:scripts/lib/review-escalation.mjs:2044. Soak-break sketch: none found (grep clear-human/cleared-human/clearance in soak/breaks)
 
 ## Acceptance
 

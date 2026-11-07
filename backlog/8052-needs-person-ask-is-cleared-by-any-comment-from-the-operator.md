@@ -1,15 +1,16 @@
 ---
+bornAs: xbfeat8
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/apply-review-request.mjs", "we:scripts/review-set-label.mjs", "we:scripts/lib/review-independence.mjs", "we:scripts/lib/auto-land-seam.mjs"]
+scope: ["we:scripts/operations/operator-queue-needs-person.mjs", "we:scripts/lib/marker-authorship.mjs", "we:scripts/operations/operator-queue.mjs", "we:scripts/operations/needs-you-feed.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Request actor and sessionId are self-declared; omitting sessionId turns the #2844 self-clear refusal into 'un…
+# needs-person ask is cleared by ANY comment from the operator login, including daemon comments posted under th…
 
-Flow-sim gap R7b-G4, class K8 (authority asymmetry). Failing input: PR opened by session S (author stamp in PR body). Session S (or anything that can push to ops/review-requests) pushes we:10-accepted.json with actor='independent-reviewer' and NO sessionId. 'apply workflow runs the label CLI with CLAUDE_CODE_SESSION_ID deleted. Cited: we:scripts/apply-review-request.mjs:142-152, we:scripts/apply-review-request.mjs:185-190, we:scripts/review-set-label.mjs:1417-1431, we:scripts/lib/review-independence.mjs:261-270, we:scripts/lib/auto-land-seam.mjs:151. Soak-break sketch: Fixture: PR body with author stamp for session S; request {to:'accepted', actor:'x', no sessionId}. Action: apply main() with fake spawn and real decideClearerIndependence. Assertion that fails today: the request is refused (apply requires sessionId for `acce…
+Flow-sim gap R8b-G9, class K8 (authority asymmetry). Failing input: Trusted note 'needs your decision' on PR (key e.g. round-cap-exhausted:5:fix:4/4). Later the conveyor, running on the operator's personal gh auth fallback (documented in we:marker-authorship.mjs header), posts any comment (stand-down, rearm, heal marker, status) or the operator posts an unrelated remark.' 'operator-queue run. Cited: we:scripts/operations/operator-queue-needs-person.mjs:8, we:scripts/lib/marker-authorship.mjs:120-132, we:scripts/operations/operator-queue.mjs:793-794, we:scripts/operations/needs-you-feed.mjs:160. Soak-break sketch: Fixture: comments [botNote(ci-heal-exhausted) t1, operatorLogin comment 'rearm: review-loop re-armed' t2 (automation fallback)]. Assert needsPersonRow still returns a row (no answer command ran: no extend-rounds/stand-down-answer/send-back marker); fails toda…
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xtopkid
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/conveyor/delegated-clear-human.mjs"]
+scope: ["we:scripts/conveyor/supersede-rule.mjs", "we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Delegated eligibility trusts a label-only accept and an async red-team default
+# Supersedes target is never verified to relate to the declaring PR; any automation-authored PR can freeze any …
 
-Flow-sim gap C-G4, class K8 (authority asymmetry). Failing input: review:human + review:accepted label whose reviewed-sha names an OLDER head, or caller using liveReaders() without replacing redTeamClearAtHead; PR carries a stale red-team:clear label.' 'delegated pass evaluates eligibility Cited: we:scripts/conveyor/delegated-clear-human.mjs:65-66. Soak-break sketch: none
+Flow-sim gap R9b-G5, class K8 (authority asymmetry). Failing input: Trusted (automation) PR #B merged with line 'Supersedes #5000' where #5000 is an unrelated open PR (typo, copy of a template line, wrong number, or a cross-repo number).' 'supersede-watch tick. Cited: we:scripts/conveyor/supersede-rule.mjs:274-280, we:scripts/conveyor/stand-down.mjs:233, we:scripts/conveyor/reconcile-core.mjs:2573. Soak-break sketch: fixture: merged trusted PR whose card/files do not overlap open PR #5000's; body 'Supersedes: #5000'. action: planSupersedeHolds. assert hold is not terminal-posted without relation evidence (or is posted as advisory) - today a terminal hold is planned.
 
 ## Acceptance
 
