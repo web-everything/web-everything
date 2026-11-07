@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkReviewLabelSingleHomeCode } from '../review-skill-guard.mjs';
 import { proveHumanClearanceCarry } from '../human-clearance-carry.mjs';
-import { normalizeDiffFingerprint } from '../review-escalation.mjs';
+import { buildClearedFromMarker, normalizeDiffFingerprint } from '../review-escalation.mjs';
 import {
   resolveNumberingHumanClearanceSetting, MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
   planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering as restampWithoutGuard,
@@ -1155,7 +1155,7 @@ describe('numbering acceptance restamp', () => {
 // #5414: clear-human at 4301480c → the drain's numbering commit 21ce5fcd.
 // Use real git objects and the production gate, including its live re-read and writer.
 describe('#5414 human clearance through the drain gate', () => {
-  function replay({ mixed = false, fingerprint = true, workflow = false, human = true, liveHold = false, numberingSetting } = {}) {
+  function replay({ mixed = false, fingerprint = true, workflow = false, human = true, liveHold = false, numberingSetting, mechanicalCarry = { value: 'trust-drain-record', source: 'test' } } = {}) {
     const r = repo();
     const head = r.number(mixed);
     const comments = [{ id: 'IC_clearance', author: { login: 'chalbert' }, createdAt: '2026-10-15T23:45:00Z',
@@ -1185,7 +1185,7 @@ describe('#5414 human clearance through the drain gate', () => {
       pr: 5414, repo: 'web-everything/web-everything', cwd: r.cwd, local: true, exec,
       files: [workflow ? '.github/workflows/ci.yml' : 'scripts/app.mjs'], filesComplete: true, listedHeadSha: head,
       netDiff: () => ({ scored: true, text: 'numbered diff', rev: head, revSha: head }),
-      carry: { log: () => {}, ...(numberingSetting ? { numberingSetting } : {}) },
+      carry: { ...(mechanicalCarry ? { mechanicalCarry } : {}), log: () => {}, ...(numberingSetting ? { numberingSetting } : {}) },
     });
     return { result, posted, views, from: r.base, head };
   }
@@ -1196,6 +1196,12 @@ describe('#5414 human clearance through the drain gate', () => {
     expect(r.posted).toHaveLength(1);
     expect(r.posted[0]).toContain('<!-- cleared-human: chalbert -->');
     expect(r.posted[0]).toContain(`from=${r.from} to=${r.head}`);
+    expect(r.posted[0]).toContain(buildClearedFromMarker('IC_clearance'));
+  });
+  it('default refuses a proven numbering carry without posting a record', () => {
+    const r = replay({ mechanicalCarry: null });
+    expect(r.result.action).not.toBe('merge');
+    expect(r.posted).toEqual([]);
   });
   it('carries a SHA-only human clearance using the exact numbering proof', () => {
     const r = replay({ fingerprint: false });

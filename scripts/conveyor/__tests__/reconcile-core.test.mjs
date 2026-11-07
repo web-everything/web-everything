@@ -2207,7 +2207,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
   describe.each(['stale-advisory', 'addressed-advisory'])('%s human clearance', branch => {
     const clearedHead = REAL_2766_HEAD;
     const commentsFor = () => [
-      { author: AUTOMATION, body: `${buildReviewedShaMarker(clearedHead)}\n${buildClearedHumanMarker('chalbert')}` },
+      { id: 'IC_human_clearance', author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(clearedHead)}\n${buildClearedHumanMarker('chalbert')}` },
       ...(branch === 'stale-advisory' ? live2766Comments() : [
         advisoryNote, { author: AUTOMATION, body: buildAdvisoryFixComment({}) },
       ]),
@@ -4397,7 +4397,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
       kind: 'review', attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP,
       mechanicalRound: expect.objectContaining({ ok: true, action: 'review' }),
     })]);
-    const refused = plan([{ author: AUTOMATION,
+    const refused = plan([{ id: 'IC_human_clearance', author: { login: 'chalbert' },
       body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` }, ...comments]);
     expect(refused.dispatch).toEqual([]);
     expect(refused.refusals).toEqual([expect.objectContaining({
@@ -4411,7 +4411,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
       const pr = prFor(branch);
       expect(run(pr).dispatch).toEqual([expect.objectContaining(expected(branch))]);
       // A later plain accept must not erase the earlier human clearance of this head.
-      pr.comments.unshift({ author: AUTOMATION,
+      pr.comments.unshift({ id: 'IC_human_clearance', author: { login: 'chalbert' },
         body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
       const plan = run(pr);
       expect(plan.dispatch).toEqual([]);
@@ -4422,13 +4422,13 @@ describe('human clearance and complete evidence before review dispatch (live #55
     });
 
     it.each([
-      ['current-head latest', HEAD, AUTOMATION, true],
-      ['current-head followed by plain accept', HEAD, AUTOMATION, true],
-      ['older-head', OLD, AUTOMATION, false],
+      ['current-head latest', HEAD, { login: 'chalbert' }, true],
+      ['current-head followed by plain accept', HEAD, { login: 'chalbert' }, true],
+      ['older-head', OLD, { login: 'chalbert' }, false],
       ['untrusted current-head', HEAD, { login: 'drive-by' }, false],
     ])('honors %s clearance before considering advisory dispatch', (_name, sha, author, cleared) => {
-      const clearance = { author, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('chalbert')}` };
-      expect(parseLatestHumanClearedSha([clearance])).toBe(author === AUTOMATION ? sha : null);
+      const clearance = { id: 'IC_human_clearance', author, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('chalbert')}` };
+      expect(parseLatestHumanClearedSha([clearance])).toBe(author.login === 'chalbert' ? sha : null);
       const pr = prFor(branch);
       if (_name === 'current-head latest') pr.comments.push(clearance);
       else pr.comments.unshift(clearance); // A later plain accept cannot erase clearance.
@@ -4446,7 +4446,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
   it('refuses clearance for HEAD followed by a plain accept of another sha', () => {
     const pr = prFor('advisoryOwed');
     pr.comments = [
-      { author: AUTOMATION, body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` },
+      { id: 'IC_human_clearance', author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` },
       { ...accept, body: `✅ review — accepted\n\n${buildReviewedShaMarker(OLD)}` },
     ];
     const plan = run(pr);
@@ -4460,7 +4460,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
   it('refuses a label-dropped cleared head without relabel dispatch', () => {
     const pr = prFor('relabelOwed');
     expect(run(pr).dispatch).toEqual([expect.objectContaining(expected('relabelOwed'))]);
-    pr.comments.unshift({ author: AUTOMATION,
+    pr.comments.unshift({ id: 'IC_human_clearance', author: { login: 'chalbert' },
       body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
     const plan = run(pr);
     expect(plan.dispatch).toEqual([]);
@@ -4473,7 +4473,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
 
   it('still reviews a different head after human clearance of an older head', () => {
     const pr = prFor('advisoryOwed');
-    pr.comments = [{ author: AUTOMATION,
+    pr.comments = [{ id: 'IC_human_clearance', author: { login: 'chalbert' },
       body: `${buildReviewedShaMarker(OLD)}\n${buildClearedHumanMarker('chalbert')}` }];
     const plan = run(pr);
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 5530 })]);
