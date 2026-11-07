@@ -121,7 +121,7 @@ describe('#4979 the sanctioned writer', () => {
   const rec = referral({ summaries: ['first', 'second'], rulings: ['block'] });
   const comments = [gh(renderReferralRecord(rec))];
   const read = (over = {}) => ({ head, ...openReferralFindings({ comments, repo, pr: 7, head, body: rec.authorBody, cardReadable: (c) => c === CARD }),
-    card: { requested: 'xvm9vbu', ref: CARD, readable: true }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
+    identity: { login: 'chalbert', type: 'User' }, card: { requested: 'xvm9vbu', ref: CARD, readable: true }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
   const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'Accept', ...over });
 
   it('persists optional not-real cause and finding lens through the marked comment', () => {
@@ -160,11 +160,11 @@ describe('#4979 the sanctioned writer', () => {
 
   it('the sink refuses a moved head, never double-posts, and proves the gate can read what it wrote', async () => {
     const plan = planOperatorRuling(read(), input());
-    const payload = { repo, pr: 7, head, body: plan.body };
+    const payload = { repo, pr: 7, head, body: plan.body, actor: 'chalbert' };
     let thread = { headRefOid: head, comments: [...comments] };
     const posts = [];
     const sinks = (login = 'web-everything') => createRecordReferralRulingSinks({
-      readJson: () => structuredClone(thread),
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
       post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, login)); },
     })[OPERATOR_RULING_POST_EFFECT];
     await expect(sinks()(payload)).resolves.toMatchObject({ posted: true });
@@ -245,7 +245,7 @@ describe('#4979 the sanctioned writer', () => {
       const reader = createRecordReferralRulingReader({ root, assertFresh: () => {},
         readable: (ref) => ref.endsWith('@pr7'),
         openPrHead: (args) => { seen.push(args); return { list: () => ['x0e6tik-follow-up.md'], read: () => '---\na: 1\n---\n' }; },
-        readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
+        readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
       const context = reader({ repo, pr: 7, card: 'x0e6tik' });
       expect(seen).toEqual([{ repo, pr: 7, head }]);
       expect(context.card).toMatchObject({ ref: 'we:backlog/x0e6tik-follow-up.md@pr7', readable: true, foundIn: 'pr-head' });
@@ -293,7 +293,7 @@ describe('operator finding selectors and follow-up', () => {
     { index: 2, runId: 'r', key: 'second-key', seat: 'security', file: 'src/y.ts', line: null, summary: 'second', state: 'pending', rationale: '' },
   ];
   const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'block', actor: 'chalbert', channel: 'chat', reason: 'Fix it', ...over });
-  const read = (over = {}) => ({ head, open, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
+  const read = (over = {}) => ({ head, open, identity: { login: 'chalbert', type: 'User' }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
   const follow = (over = {}) => planRulingFollowUp({ open, selected: open, ruling: 'block', reason: 'Fix it', enabled: true, head, ...over });
 
   it('selects file:line, a no-line file, and exact keys before file matching', () => {
@@ -342,7 +342,7 @@ describe('operator finding selectors and follow-up', () => {
   it('reads the environment opt-out in the reader', () => {
     const rec = referral();
     const reader = createRecordReferralRulingReader({ env: { WE_REFERRAL_RULING_FOLLOW_UP: '0' },
-      readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
     const context = reader({ repo, pr: 7 });
     expect(context.followUpEnabled).toBe(false);
     expect(planOperatorRuling(context, input()).followUp).toBeNull();
@@ -522,9 +522,10 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
       gh(gate.redTeamGateMarker(7, head, 'round-cap'), 'web-everything', { createdAt: '2026-10-04T14:01:00Z' }),
     ];
     const snapshot = { head, comments, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's',
+      identity: { login: 'chalbert', type: 'User' },
       cardFileMode: { value: mode, source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false,
       ...(kind === 'referral' ? openReferralFindings({ comments, ...ctx(), cardReadable: () => false }) : {
-        identity: { login: 'chalbert', type: 'User' }, labels: [{ name: 'review:human' }],
+        labels: [{ name: 'review:human' }],
         setting: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} }, scope: { value: { anyState: true } },
       }) };
     const readRulingContext = vi.fn(({ card }) => ({ ...snapshot,
@@ -700,7 +701,7 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
         const common = { env, tool, log: line => lines.push(line), assertFresh: () => {},
           now: () => '2026-10-04T14:30:00Z' };
         const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
-          readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null,
+          readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null,
           readable: () => false, openPrHead: () => { throw new Error('unexpected PR read'); },
         }) : rtIO.createRecordRedTeamRulingReader({ ...common,
           readThread: () => ({ headRefOid: head, comments: [], labels: [] }), readEvents: () => ({ status: 'ok', rows: [] }),
@@ -1032,10 +1033,11 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       gh(gate.redTeamGateMarker(7, head, 'round-cap'), 'web-everything', { createdAt: '2026-10-04T14:01:00Z' }),
     ];
     const snapshot = { head, comments, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's',
+      identity: { login: 'chalbert', type: 'User' },
       judgeNotRealMode: { value: mode, source: 'standard' }, disagreements: 0,
       cardFileMode: { value: 'one-call', source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false,
       ...(kind === 'referral' ? openReferralFindings({ comments, ...ctx() }) : {
-        identity: { login: 'chalbert', type: 'User' }, labels: [{ name: 'review:human' }],
+        labels: [{ name: 'review:human' }],
         setting: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} }, scope: { value: { anyState: true } },
       }), ...readOver };
     const judgeConfirm = vi.fn(async () => {
@@ -1238,7 +1240,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       }
       if (kind === 'referral' && unknown) comments.push(gh('<!-- mandatory-referrals-v1: broken -->'));
       const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
-        readJson: () => ({ headRefOid: head, body: '', comments }), readable: () => false, changedLines: () => null,
+        readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, body: '', comments }), readable: () => false, changedLines: () => null,
       }) : rtIO.createRecordRedTeamRulingReader({ ...common,
         readThread: () => ({ headRefOid: head, comments, labels: h.snapshot.labels }),
         readSetting: () => ({ value: h.snapshot.setting }), readScope: () => h.snapshot.scope,
@@ -1415,7 +1417,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       const common = { env: { WE_PLATFORM_PREFERENCES_FILE: prefsFile(prefs), WE_POLICY_CASCADE_LOG: '1', ...envOver },
         tool, log: line => lines.push(line), assertFresh: () => {} };
       const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
-        readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null, readable: () => false,
+        readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null, readable: () => false,
         openPrHead: () => { throw new Error('unexpected PR read'); },
       }) : rtIO.createRecordRedTeamRulingReader({ ...common,
         readThread: () => ({ headRefOid: head, comments: [], labels: [] }), readEvents: () => ({ status: 'ok', rows: [] }),
@@ -1551,7 +1553,7 @@ describe('R671 v1 acting judge referral blocks', () => {
   });
   it('operator referral reasons retain the existing treatment of review tokens', () => {
     const reason = 'reviewed-sha and CLEARED-HUMAN in operator prose';
-    const plan = planOperatorRuling(snapshot(), request('block', { actor: 'chalbert', reason }));
+    const plan = planOperatorRuling(snapshot({ identity: { login: 'chalbert', type: 'User' } }), request('block', { actor: 'chalbert', reason }));
     expect(plan.record.reason).toBe(reason);
     expect(plan.body).toContain(reason);
   });
@@ -1594,7 +1596,7 @@ describe('R671 v1 acting judge referral blocks', () => {
   });
   it('unknown actor stays refused and the existing operator record stays operator-worded', () => {
     expect(() => planOperatorRuling(snapshot(), request('block', { actor: 'judge:unknown' }))).toThrow(/actor|operator/i);
-    const plan = planOperatorRuling(snapshot(), request('block', { actor: 'chalbert' }));
+    const plan = planOperatorRuling(snapshot({ identity: { login: 'chalbert', type: 'User' } }), request('block', { actor: 'chalbert' }));
     expect(plan.record.actor).toBe('chalbert');
     expect(plan.body).toMatch(/operator ruling/i);
     expect(plan.body).not.toContain(attribution);
@@ -1661,7 +1663,7 @@ describe('R671 v1 acting judge referral blocks', () => {
     const read = snapshot({ open: [], disputed });
     expect(() => planOperatorRuling(read, request())).toThrow('judge cannot supersede rulings; operator-only');
     // control: the operator's auto-supersede of the same disputed finding still plans
-    expect(planOperatorRuling(read, request('block', { actor: 'chalbert' })).supersedes).toEqual(['operator:aaaaaaaaa:0123456789ab']);
+    expect(planOperatorRuling({ ...read, identity: { login: 'chalbert', type: 'User' } }, request('block', { actor: 'chalbert' })).supersedes).toEqual(['operator:aaaaaaaaa:0123456789ab']);
   });
 
   // The structured-referral READER enforces the same judge refusals the writer does (a crafted canonical record).
@@ -1690,7 +1692,7 @@ describe('R671 v1 acting judge referral blocks', () => {
   });
   it('judge referral planning refuses a clearance token in the rendered body, not only in the reason', () => {
     // the channel is rendered into the body; the reason is clean
-    expect(planOperatorRuling(snapshot(), request('block', { actor: 'chalbert', channel: 'chat reviewed-sha' })).body).toMatch(/reviewed-sha/);
+    expect(planOperatorRuling(snapshot({ identity: { login: 'chalbert', type: 'User' } }), request('block', { actor: 'chalbert', channel: 'chat reviewed-sha' })).body).toMatch(/reviewed-sha/);
     expect(() => planOperatorRuling(snapshot(), request('block', { channel: 'chat reviewed-sha' }))).toThrow(/judge.*reserved.*review.*token/i);
   });
   it('persisted judge referral block carrying supersedes is ignored', () => {
