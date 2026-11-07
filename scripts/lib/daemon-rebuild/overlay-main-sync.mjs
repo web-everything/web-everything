@@ -766,7 +766,9 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     // forced every scratch test run back onto the Mac. A local clone is cheap (hardlinked objects) and committed-only.
     if (io.existsSync(frontier)) output(git(['clone', '--quiet', '--local', frontier, join(scratchParent, 'frontierui')], scratchParent));
     setStep('test-select');
-    const runnable = await runnableTestFiles({ scratch, env, runner: deps.testListRunner });
+    // Discover tests in the environment they will run in: reuse the test run's own construction, never a copy.
+    const { env: testEnv } = buildHeavyTestInvocation({ root, scratch, selected: [], testReport: join(scratchParent, 'inventory.json'), env, io });
+    const runnable = await runnableTestFiles({ scratch, env: testEnv, runner: deps.testListRunner });
     const scratchReal = io.realpathSync(scratch);
     tests = tests.filter(file => runnable.has(join(scratchReal, file)));
     const filteredNotRunnable = selected.size - tests.length;

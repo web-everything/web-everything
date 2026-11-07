@@ -35,7 +35,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false, noisy = false } = {}) {
+function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false, noisy = false, laneGated = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -51,6 +51,9 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   // A config that, like many real ones, only discovers tests under the Vitest CLI's own environment.
   if (envGated) write(root, 'vitest.config.ts',
     "export default { test: { include: process.env.VITEST === 'true' && process.env.TEST === 'true' && process.env.NODE_ENV === 'test' ? ['*.test.mjs'] : [] } };\n");
+  // A config that, like the test run, must not see the lane-pool variable the daemon itself runs under.
+  if (laneGated) write(root, 'vitest.config.ts',
+    "export default { test: { include: process.env.LANE_POOL_ROOT ? [] : ['*.test.mjs'] } };\n");
   // A config or plugin that logs to stdout: a banner, a JSON-looking line, an unterminated write, and late output at exit.
   if (noisy) write(root, 'vitest.config.ts', [
     "console.log('plugin banner');",
@@ -207,6 +210,24 @@ describe('overlay main sync', () => {
     delete f.deps.testListRunner;
     expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
   }, 90_000);
+
+  it('Vitest listing runs in the test run\'s environment, so a config that reacts to the daemon\'s LANE_POOL_ROOT cannot drop tests', async () => {
+    const f = fixture({ laneGated: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    f.env.LANE_POOL_ROOT = join(f.base, 'lanes'); // set for the daemon, deleted for the test run
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('inventory and test run receive the identical environment (one shared construction)', async () => {
+    const f = fixture();
+    f.env.LANE_POOL_ROOT = join(f.base, 'lanes');
+    await job(f);
+    const listEnv = f.deps.testListRunner.mock.calls[0][2].env, runEnv = f.deps.testRunner.mock.calls[0][0].env;
+    expect(listEnv).toEqual(runEnv);
+    expect(listEnv).not.toHaveProperty('LANE_POOL_ROOT');
+  });
 
   it('Vitest listing keeps an operator-chosen NODE_ENV, as the CLI only defaults it', async () => {
     const f = fixture({ envGated: true });
