@@ -12,7 +12,7 @@
  * teaching `pass-daemon.mjs` a new way to resolve a path. The mechanism is proven here with fixture entries
  * (see the test file), not real ones — a real entry is a one-line addition once its slice lands.
  *
- * @typedef {{ script: string, args?: string[], intervalMs: number, defaultLaunch?: boolean }} DaemonManifestEntry
+ * @typedef {{ script: string, args?: string[], intervalMs: number, defaultLaunch?: boolean, eventRole?: string }} DaemonManifestEntry
  *   - `defaultLaunch`: `false` keeps the entry out of the supervisor launcher's default launch set (an entry
  *     that is only safe to start by name, e.g. a resident singleton). Absent/`true` = launched by default.
  *   - `script`: repo-relative path to the pass's own CLI entry point (e.g.
@@ -20,6 +20,8 @@
  *     never containing `..` (validated below).
  *   - `args`: the fixed argv this entry always spawns with (e.g. `['sweep']`) — not user-suppliable at launch
  *     time, so a manifest entry is a complete, reviewed launch spec, not a template.
+ *   - `eventRole` (optional, R689): names the PR-event rule that wakes this pass early (see `passSleepFor` in
+ *     `we:skills-src/conveyor/pass-daemon.mjs`); absent = plain timer. `intervalMs` stays the backstop.
  *   - `intervalMs`: how often {@link ../pass-daemon.mjs} re-runs this pass after each run completes.
  */
 
@@ -53,10 +55,10 @@ export function loadFlakeReverifyIntervalMs(env = process.env) {
  * @param {string[]} args
  * @returns {Record<string, DaemonManifestEntry>}
  */
-function perRepoEntries(passName, script, args) {
+function perRepoEntries(passName, script, args, extra = {}) {
   const out = {};
   for (const [key, { slug }] of Object.entries(CONSTELLATION_REPOS)) {
-    out[`${passName}-${key}`] = { script, args: [...args, `--repo=${slug}`], intervalMs: DEFAULT_PASS_INTERVAL_MS };
+    out[`${passName}-${key}`] = { script, args: [...args, `--repo=${slug}`], intervalMs: DEFAULT_PASS_INTERVAL_MS, ...extra };
   }
   return out;
 }
@@ -141,7 +143,7 @@ export const DAEMON_MANIFEST = {
   // launcher's default launch set must never spawn it bare. Still resolvable by name for the resident start.
   'health-responder': { script: 'scripts/conveyor/health-responder.mjs', args: ['tick'], intervalMs: 60_000, defaultLaunch: false },
   'orphan-claim-release': { script: 'scripts/conveyor/orphan-claim-release.mjs', args: ['--apply'], intervalMs: ORPHAN_CLAIM_INTERVAL_MS },
-  'merge-orphan-sweep': { script: 'scripts/merge-ai-prs.mjs', args: [], intervalMs: MERGE_ORPHAN_SWEEP_INTERVAL_MS },
+  'merge-orphan-sweep': { script: 'scripts/merge-ai-prs.mjs', args: [], intervalMs: MERGE_ORPHAN_SWEEP_INTERVAL_MS, eventRole: 'drain' },
   'branch-drift': { script: 'scripts/conveyor/branch-drift.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
   'load-flake-reverify': { script: 'scripts/conveyor/load-flake-reverify.mjs', args: ['sweep'], intervalMs: loadFlakeReverifyIntervalMs() },
   'infra-blocked': { script: 'scripts/conveyor/infra-blocked.mjs', args: ['retry'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
@@ -172,12 +174,12 @@ export const DAEMON_MANIFEST = {
   // own independent `action:'current'` short-circuit) is what makes running this unconditionally on the default
   // cadence safe — the same "efficiency no-op, not a safety refusal" trade `merge-orphan-sweep` above already
   // documents for its own always-on entry.
-  ...perRepoEntries('ci-red-recovery-watch', 'scripts/conveyor/ci-red-recovery-watch.mjs', ['sweep', '--apply']),
+  ...perRepoEntries('ci-red-recovery-watch', 'scripts/conveyor/ci-red-recovery-watch.mjs', ['sweep', '--apply'], { eventRole: 'ci-red-recovery' }),
   // The `advisory:*` label backstop (`we:scripts/conveyor/advisory-label-sweep.mjs`): drops a label whose head
   // moved AND repairs a human-gated PR whose newest covering advisory disagrees with its labels (the `advise`
   // step's label write is a separate effect that can fail after its note posts — live PR #4015, 2026-10-05).
   // It only ever ran inside the legacy `runner.mjs` tick, which the daemon split retired, so nothing ran it.
-  ...perRepoEntries('advisory-label-sweep', 'scripts/conveyor/advisory-label-sweep.mjs', ['sweep']),
+  ...perRepoEntries('advisory-label-sweep', 'scripts/conveyor/advisory-label-sweep.mjs', ['sweep'], { eventRole: 'advisory-label-sweep' }),
   ...perRepoEntries('parked-pr-conflict-watch', 'scripts/conveyor/parked-pr-conflict-watch.mjs', ['sweep']),
   ...perRepoEntries('parked-pr-progress-watch', 'scripts/conveyor/parked-pr-progress-watch.mjs', ['sweep']),
   ...perRepoEntries('lane-pool-health-watch', 'scripts/conveyor/lane-pool-health-watch.mjs', []),
@@ -196,7 +198,7 @@ export const DAEMON_MANIFEST = {
     alertOnConsecutiveFailures: true },
   // Card 106 — durable schedules (we:scripts/operations/scheduled-sweep.mjs). Opt-in: `defaultLaunch:false` keeps
   // them out of the supervisor's default set; the operator installs them with install-scheduled-sweeps.mjs.
-  'pr-merge-watch': { script: 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs', args: [`--repo=${CONSTELLATION_REPOS.we.slug}`], intervalMs: 5 * 60_000, defaultLaunch: false },
+  'pr-merge-watch': { script: 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs', args: [`--repo=${CONSTELLATION_REPOS.we.slug}`], intervalMs: 5 * 60_000, defaultLaunch: false, eventRole: 'pr-merge-watch' },
   'pr-movement-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'pr-movement'], intervalMs: 30 * 60_000, defaultLaunch: false },
   'coroner-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'coroner'], intervalMs: 6 * 60 * 60_000, defaultLaunch: false },
   'opus-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'opus'], intervalMs: 24 * 60 * 60_000, defaultLaunch: false },
@@ -258,6 +260,9 @@ export function assertValidManifestEntry(name, entry) {
   }
   if (entry.defaultLaunch !== undefined && typeof entry.defaultLaunch !== 'boolean') {
     throw new TypeError(`daemon-manifest: entry "${name}"'s defaultLaunch must be a boolean`);
+  }
+  if (entry.eventRole !== undefined && (typeof entry.eventRole !== 'string' || !entry.eventRole)) {
+    throw new TypeError(`daemon-manifest: entry "${name}"'s eventRole must be a non-empty string`);
   }
   if (!Number.isFinite(entry.intervalMs) || entry.intervalMs <= 0) {
     throw new TypeError(`daemon-manifest: entry "${name}"'s intervalMs must be a positive number (got ${JSON.stringify(entry.intervalMs)})`);
