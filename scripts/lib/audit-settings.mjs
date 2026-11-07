@@ -110,7 +110,7 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * (PR #6381 self-review: atomic-json-file.mjs#withFileLock and the inline holds were missed). An inline hold has no
  * import to scan for, so each is named here.
  * The list is held to a RULE, not kept by hand (PR #6381 judge, R10): a source-scan test (audit-verdict.test.mjs, "the
- * hold scan") finds every tracked module whose code takes an exclusive hold (a `'wx'` / `O_EXCL` create, a lock
+ * hold scan") finds every tracked module whose code takes an exclusive hold (a `'wx'` / `O_EXCL` / `link` create, a lock
  * directory made without `recursive` beside an `EEXIST` check, or a `.lock` / `.lease` / `.mutex` file name) and fails
  * unless each one is on the floor, by a name glob or by an entry here. The entries after the first block are the
  * modules that scan found unprotected.
@@ -135,7 +135,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/operations/fix-run.mjs', 'scripts/operations/operator-notify-io.mjs', 'scripts/operations/perf-snapshot-io.mjs',
   'scripts/operations/scheduled-sweep.mjs', 'scripts/readiness/already-done-refresh.mjs', 'scripts/readiness/forge-exec-bases.mjs',
   'scripts/readiness/forge-exec-limits.mjs', 'scripts/readiness/forge-warm-base.mjs', 'scripts/readiness/red-main-remediation.mjs',
-  'scripts/readiness/remote-exec.mjs']);
+  'scripts/readiness/remote-exec.mjs',
+  // A no-clobber `link` create (fails with EEXIST) is an exclusive create too (PR #6381 self-review).
+  'scripts/conveyor/health-responder-state.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;

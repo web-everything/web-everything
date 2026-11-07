@@ -354,14 +354,15 @@ describe('R473 pure classified verdict', () => {
   // PR #6381 judge (R10): naming lock holders by hand never converged ("the floor omits module X", nine rounds). The
   // floor is held to a RULE instead: every tracked module whose source takes an exclusive hold must be protected, by a
   // name glob or by LOCK_HOLDERS. A hold is read from the source, comments removed, in three forms:
-  //  - an exclusive create: the `'wx'` / `'wx+'` open flag or `O_EXCL`;
+  //  - an exclusive create: the `'wx'` / `'wx+'` open flag, `O_EXCL`, or a `link` / `linkSync` (a hard link fails with
+  //    EEXIST when the name exists, so it is a no-clobber create; `unlink` is not one);
   //  - a lock directory: a `mkdir` without `recursive: true` near an `EEXIST` check (the create fails if it exists);
   //  - a lock file name: a string naming a `.lock`, `.lease` or `.mutex` file (or a `-lock.json`-style name, or a
   //    `locks/` folder). `package-lock.json` and `x.endsWith('.lock')`-style name checks are not holds.
   // Protecting more only ever blocks more, so a module that only reads, checks or removes a lock file counts too.
   const stripComments = s => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1');
   const HOLD_FORMS = Object.freeze({
-    exclusiveCreate: /(['"`])wx\+?\1|\bO_EXCL\b/,
+    exclusiveCreate: /(['"`])wx\+?\1|\bO_EXCL\b|(?:^|[^\w$])link(?:Sync)?\s*\(/m,
     lockDirectory: /\bmkdir(?:Sync)?\s*\((?![^)]*recursive\s*:\s*true)[^)]*\)[\s\S]{0,400}?EEXIST|EEXIST[\s\S]{0,400}?\bmkdir(?:Sync)?\s*\((?![^)]*recursive\s*:\s*true)/,
     lockFileName: /['"`][^'"`\s]*(?:\.(?:lock|lease|mutex)s?|[-_.](?:lock|lease|mutex)s?\.(?:json|d|pid|txt))['"`]|['"`/](?:lock|lease|mutex)s\//i,
   });
@@ -369,18 +370,27 @@ describe('R473 pure classified verdict', () => {
     const s = stripComments(src).replace(/package-lock\.json/g, '').replace(/\.(?:endsWith|startsWith|includes)\(\s*(['"`])[^'"`\n]*\1\s*\)/g, '');
     return Object.entries(HOLD_FORMS).filter(([, re]) => re.test(s)).map(([form]) => form);
   };
-  const scannedHolders = [...lockSources.keys()].filter(p => holdFormsOf(lockSources.get(p)).length > 0);
+  // Every tracked script, not only .mjs: a .cjs, .js or .ts module can take a hold too (PR #6381 self-review).
+  const holdSources = new Map(execFileSync('git', ['ls-files', '-z', '--', ...['scripts', 'skills-src'].flatMap(d =>
+    ['mjs', 'cjs', 'js', 'mts', 'cts', 'ts'].map(ext => `:(glob)${d}/**/*.${ext}`))], { cwd: lockScanRoot, encoding: 'utf8', maxBuffer: 8 << 20 })
+    .split('\0').filter(Boolean).filter(p => !p.includes('/__tests__/') && !/\.test\.[cm]?[jt]s$/.test(p))
+    .map(p => [p, lockSources.get(p) ?? readFileSync(`${lockScanRoot}${p}`, 'utf8')]));
+  const scannedHolders = [...holdSources.keys()].filter(p => holdFormsOf(holdSources.get(p)).length > 0);
   it('the hold scan is live: it finds the known holders and ignores non-holds (PR #6381 judge)', () => {
     expect(scannedHolders.length).toBeGreaterThan(50);
     expect(scannedHolders).toEqual(expect.arrayContaining(['scripts/lib/atomic-json-file.mjs', 'scripts/conveyor/ci-queue-watch.mjs',
-      'scripts/readiness/file-locks.mjs']));
+      'scripts/readiness/file-locks.mjs', 'scripts/conveyor/health-responder-state.mjs']));
     expect(holdFormsOf("openSync(p, 'wx')")).toEqual(['exclusiveCreate']);
+    expect(holdFormsOf('try { linkSync(tmp, path); } catch (e) { if (e.code !== "EEXIST") throw e; }')).toEqual(['exclusiveCreate']);
+    expect(holdFormsOf('await fsp.link(tmp, path);')).toEqual(['exclusiveCreate']);
+    expect(holdFormsOf('const fd = openSync(p, constants.O_CREAT | constants.O_EXCL);')).toEqual(['exclusiveCreate']);
     expect(holdFormsOf("writeFileSync(p, x, { flag: \"wx\" })")).toEqual(['exclusiveCreate']);
     expect(holdFormsOf('try { mkdirSync(dir); } catch (e) { if (e.code === "EEXIST") return false; }')).toEqual(['lockDirectory']);
     expect(holdFormsOf('const lockPath = `${journal}.lock`;')).toEqual(['lockFileName']);
     expect(holdFormsOf("join(root, 'locks/x.json')")).toEqual(['lockFileName']);
     for (const none of ["mkdirSync(dir, { recursive: true }); if (e.code === 'EEXIST') {}", "read('package-lock.json')",
-      "name.endsWith('.lock')", "// openSync(p, 'wx')", "/* const p = 'x.lock' */", "writeFileSync(p, x, 'utf8')"]) {
+      "name.endsWith('.lock')", "// openSync(p, 'wx')", "/* const p = 'x.lock' */", "writeFileSync(p, x, 'utf8')", 'unlinkSync(p); await unlink(q);',
+      'makeLink(x); hyperlink(y);']) {
       expect(holdFormsOf(none), none).toEqual([]);
     }
   });
