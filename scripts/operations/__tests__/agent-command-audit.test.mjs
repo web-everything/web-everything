@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { classifyCommand, redact, auditLines } from '../agent-command-audit.mjs';
+import { classifyCommand, redact, auditLines, REDACT_MAX_CHARS } from '../agent-command-audit.mjs';
 
 const queue = 'node scripts/readiness/heavy-admission.mjs run -- ';
 const claude = (command, timestamp = '2026-07-02T04:30:00Z') => JSON.stringify({ timestamp, message: { content: [{ type: 'tool_use', name: 'Bash', input: { command } }] } });
@@ -259,10 +259,17 @@ describe('agent command audit', () => {
     expect(redact('sort -u file')).toBe('sort -u file');
     expect(redact('git clone https://github.com/a/b')).toBe('git clone https://github.com/a/b');
   });
-  it('redacts a password cut by the length bound, and marks the cut after redaction', () => {
+  it('redacts an over-long htpasswd password whole, before the length bound can cut it', () => {
+    // The password is found on the full text, so nothing is left to cut: no part of it survives and no cut mark is owed.
     const out = redact(`htpasswd -nb user 'firstPart ${'x'.repeat(20000)} secondPart'`);
-    expect(out).not.toMatch(/firstPart|xxxxxxxxxx|secondPart/);
+    expect(out).toBe('htpasswd -nb user [REDACTED]');
+  });
+  it('marks a cut after redaction when the redacted text still exceeds the length bound', () => {
+    const out = redact(`htpasswd -nb user 'pw' && echo ${'x'.repeat(20000)}`);
+    expect(out).not.toMatch(/pw'/);
+    expect(out).toContain('htpasswd -nb user [REDACTED]');
     expect(out.endsWith(' …[truncated]')).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(REDACT_MAX_CHARS + ' …[truncated]'.length);
   });
   // Review #6461 round 3: the source is the transcript's own path, so real uuid-named files keep distinct keys.
   it('keeps real-shaped transcript paths as distinct bySource keys', () => {
