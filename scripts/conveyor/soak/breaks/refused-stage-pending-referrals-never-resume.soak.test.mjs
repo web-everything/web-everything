@@ -18,7 +18,9 @@ it('reproduces the cached-pending stageVerdict refusal on the committed fix pare
     for (const name of ['node_modules', 'src', 'schemas', 'docs', 'skills-src', 'package.json']) {
       if (existsSync(join(root, name))) symlinkSync(join(root, name), join(scratch, name));
     }
-    for (const path of b.fixedBy.paths) {
+    // review-red-team-on-skip.mjs imports the new export, so the parent replay must restore its
+    // pre-fix version too; otherwise the import fails before the scenario starts.
+    for (const path of [...b.fixedBy.paths, 'scripts/lib/review-red-team-on-skip.mjs']) {
       writeFileSync(join(scratch, path), execFileSync('git', ['show', `${b.fixedBy.sha}^:${path}`],
         { cwd: root, maxBuffer: 1024 * 1024 }));
     }
