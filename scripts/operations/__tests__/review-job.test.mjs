@@ -628,6 +628,125 @@ describe('dead running red-team owner behind an unfinished review', () => {
       witnessOptions, readWitness, plan, abandon, planningOptions };
   }
 
+
+  function operatorFixture() {
+    const f = fixture();
+    const decided = { ...f.decided, verdict: { verdict: 'needs-human', humanRequired: true,
+      findings: [{ summary: 'stored finding' }] } };
+    f.put(decided, 90 * 60_000);
+    const live = { number: f.key.pr, headRefOid: f.key.head,
+      labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
+      comments: [{ author: { login: 'chalbert' }, createdAt: '2026-11-07T11:00:00Z',
+        body: `✅ review — accepted
+<!-- reviewed-sha: ${f.key.head} -->
+<!-- cleared-human: chalbert -->` }] };
+    const readWitness = key => evidence.readRecoveryWitness({ ...f.witnessOptions,
+      operatorCleared: key?.operatorCleared === true });
+    const planningOptions = { ...f.planningOptions, rawPrs: [live], readWitness };
+    const abandon = key => recovery.abandonStaleRedTeamRun({ ...f.key, ...key }, {
+      readWitness: () => readWitness(key), now: () => f.now, probe: f.probe,
+      deadlineMs: f.planningOptions.recoveryOptions.deadlineMs,
+      operatorCleared: key?.operatorCleared === true,
+    });
+    return { ...f, decided, live, readWitness, planningOptions, abandon };
+  }
+
+  it.each(['trusted', 'untrusted', 'wrong head', 'later hold', 'formal hold', 'comments unreadable',
+    'reviews unreadable', 'labels unreadable', 'conflicting label'])('operator clearance recovery: %s', kind => {
+    const f = operatorFixture();
+    if (kind === 'untrusted') f.live.comments[0].author.login = 'stranger';
+    if (kind === 'wrong head') f.live.comments[0].body = f.live.comments[0].body.replace(f.key.head, 'b'.repeat(40));
+    if (kind === 'later hold') f.live.comments.push({ body: 'Please hold this acceptance', author: { login: 'chalbert' } });
+    if (kind === 'formal hold') f.live.reviews.push({ state: 'CHANGES_REQUESTED', submittedAt: '2026-11-07T11:30:00Z' });
+    if (kind === 'comments unreadable') f.live.comments = null;
+    if (kind === 'reviews unreadable') f.live.reviews = null;
+    if (kind === 'labels unreadable') f.live.labels = null;
+    if (kind === 'conflicting label') f.live.labels.push('review:human');
+    const row = recovery.planRedTeamOnSkip(f.planningOptions)[0];
+    expect(row.action).toBe(kind === 'trusted' ? 'dispatch' : 'skip');
+    const io = createReviewJobIo({ root: dir, env: { ...f.env, WE_RED_TEAM_STATUS_LABELS: 'false' },
+      readWitness: f.readWitness, recoveryProbe: f.probe,
+      readOperatorAcceptanceEvidence: () => f.live });
+    if (kind === 'trusted') {
+      const stored = io.readRedTeamOnlyPayload(f.key);
+      expect(stored.loopPayload).toEqual(f.decided);
+      expect(f.abandon({ operatorCleared: true })).toEqual({ ok: true });
+      expect(() => io.redTeamStatus({ ...f.key, loopPayload: { ...f.decided,
+        verdict: { ...f.decided.verdict, verdict: 'accept' } }, status: 'queued', redTeamMode: 'fresh' })).not.toThrow();
+    } else {
+      expect(() => io.readRedTeamOnlyPayload(f.key)).toThrow(/inspect/);
+    }
+  });
+
+  it.each(['untrusted', 'later hold', 'formal hold', 'changed head', 'unreadable', 'asserted flag'])(
+    'red-team-only execution independently refuses %s clearance', kind => {
+      const f = operatorFixture();
+      const liveRead = vi.fn(() => {
+        if (kind === 'unreadable') throw Error('PR unreadable');
+        const live = structuredClone(f.live);
+        if (kind === 'untrusted') live.comments[0].author.login = 'stranger';
+        if (kind === 'later hold') live.comments.push({ body: 'hold', author: { login: 'chalbert' } });
+        if (kind === 'formal hold') live.reviews.push({ state: 'CHANGES_REQUESTED' });
+        if (kind === 'changed head') live.headRefOid = 'b'.repeat(40);
+        return live;
+      });
+      const runRedTeam = vi.fn(), redTeamStatus = vi.fn();
+      const { io, calls } = fakeIo({
+        prepareLane: () => ({ head: f.key.head }),
+        readRedTeamOnlyPayload: () => ({ head: f.key.head, loopPayload: f.decided, operatorCleared: true }),
+        ...(kind === 'asserted flag' ? {} : { readOperatorAcceptanceEvidence: liveRead }),
+        runRedTeam, redTeamStatus,
+      });
+      expect(runReviewJob({ pr: f.key.pr, repo: REPO, redTeamOnly: true,
+        redTeamMode: 'fresh', operatorCleared: true }, io).outcome).toBe('red-team-not-owed');
+      expect(runRedTeam).not.toHaveBeenCalled();
+      expect(redTeamStatus).not.toHaveBeenCalled();
+      expect(calls.some(c => c[0] === 'loop')).toBe(false);
+    });
+
+  it('queued admission re-proves acceptance after a hold arrives and ignores caller clearance', () => {
+    const f = operatorFixture();
+    expect(f.abandon({ operatorCleared: true })).toEqual({ ok: true });
+    f.live.comments.push({ body: 'Please hold this acceptance', author: { login: 'chalbert' } });
+    const io = createReviewJobIo({ root: dir, env: { ...f.env, WE_RED_TEAM_STATUS_LABELS: 'false' },
+      readWitness: f.readWitness, recoveryProbe: f.probe, readOperatorAcceptanceEvidence: () => f.live });
+    expect(() => io.redTeamStatus({ ...f.key, loopPayload: recovery.operatorRedTeamPayload(f.decided),
+      status: 'queued', redTeamMode: 'fresh', operatorCleared: true })).toThrow(/inspect/);
+    expect(JSON.parse(fs.readFileSync(f.writerPath, 'utf8')).status).toBe('running');
+  });
+
+  it('operator accepted live shape dispatches once, admits only red team, and preserves stored findings and labels', () => {
+    const f = operatorFixture();
+    const setLabels = vi.fn(), syncLabels = vi.fn();
+    const io = createReviewJobIo({ root: dir, env: { ...f.env, WE_RED_TEAM_STATUS_LABELS: 'false' },
+      readWitness: f.readWitness, recoveryProbe: f.probe, readOperatorAcceptanceEvidence: () => f.live });
+    const dispatch = vi.fn(() => {
+      const stored = io.readRedTeamOnlyPayload(f.key);
+      const { io: arcIo } = fakeIo({
+        prepareLane: () => ({ head: f.key.head }),
+        readRedTeamOnlyPayload: () => stored,
+        readOperatorAcceptanceEvidence: () => f.live,
+        fetchRedTeamHead: () => ({ head: f.key.head }),
+        redTeamStatus: io.redTeamStatus,
+        runRedTeam: vi.fn(() => ({ status: 'ran' })),
+      });
+      const out = runReviewJob({ pr: f.key.pr, repo: REPO, redTeamOnly: true, redTeamMode: 'fresh' }, arcIo);
+      expect(out.outcome).toBe('red-team-only');
+      return { jobPid: process.pid };
+    });
+    const options = { ...f.planningOptions, plan: { refusals: f.planningOptions.refusals },
+      env: f.env, now: () => f.now, capacity: { lanes: 1, remainingStarts: 1 },
+      provider: { readPrState: () => f.live, setLabels, ensureLabel: vi.fn() },
+      syncLabels, dispatch, abandon: f.abandon, escalate: vi.fn() };
+    expect(recovery.runRedTeamOnSkip(options).rows[0]).toMatchObject({ action: 'dispatch', staleRecovery: true });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(recovery.runRedTeamOnSkip(options).rows[0].action).toBe('skip');
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(setLabels).not.toHaveBeenCalled();
+    expect(syncLabels).not.toHaveBeenCalled();
+    expect(store.readRun(f.decided.id, f.env.WE_SHARED_RUNS_DIR)).toEqual(f.decided);
+  });
+
   it.each([false, true])('recovers the dead running writer with the newest decided advisory accept (failed seat=%s)', failedSeat => {
     const f = fixture({ failedSeat });
     const witness = f.readWitness();
@@ -639,6 +758,40 @@ describe('dead running red-team owner behind an unfinished review', () => {
     // The drain reader must retain its unfinished-review hold.
     expect(evidence.readDrainRedTeamEvidence(f.witnessOptions)).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
+
+  it.each(['readable', 'missing start', 'future start', 'unreadable payload'])(
+    'complete-read referral recovery after early stop with 40 older runs: %s', kind => {
+      const f = operatorFixture();
+      const hour = evidence.ABANDONED_REVIEW_AFTER_MS;
+      const decided = structuredClone(f.decided);
+      if (kind === 'missing start') decided.stepTimings = [];
+      if (kind === 'future start') decided.stepTimings[0].startedAt = new Date(f.now + hour).toISOString();
+      f.put(decided, 5 * hour);
+      for (let i = 0; i < 40; i++) {
+        f.put({ ...f.decided, id: `review-pr-other-${i}`,
+          findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }, 7 * hour);
+      }
+      // The bounded scan sees only the newer owned referral, leaving the decided run unread.
+      const drain = evidence.readDrainRedTeamEvidence(f.witnessOptions);
+      expect(drain).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      expect(drain.settleBounds.exactDecided).toBeNull();
+      expect(drain.settleBounds).not.toHaveProperty('unreadBoundaryAt');
+      const read = vi.fn((id, runsDir) => {
+        if (kind === 'unreadable payload' && id === decided.id
+          && read.mock.calls.filter(([seen]) => seen === id).length === 2) throw Error('run unreadable');
+        return store.readRun(id, runsDir);
+      });
+      const witness = evidence.readRecoveryWitness({ ...f.witnessOptions, read, operatorCleared: true });
+      if (kind === 'readable') {
+        expect(witness.newest).toEqual(decided);
+        expect(read.mock.calls[0][0]).toBe(f.unfinished.id);
+        expect(read.mock.calls.filter(([id]) => id === decided.id)).toHaveLength(2);
+        expect(recovery.planRedTeamRecovery(witness, { ...f.planningOptions.recoveryOptions,
+          operatorCleared: true })).toMatchObject({ mode: 'fresh', abandon: true });
+      } else {
+        expect(witness).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      }
+    });
 
   it('holds an older rejection with an in-flight label effect left unread by early stop', () => {
     const f = fixture();
@@ -744,12 +897,13 @@ describe('dead running red-team owner behind an unfinished review', () => {
     expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
 
-  it('holds when an older unfinished run on another head has a verdict', () => {
+  it.each([1000, 80 * 60_000])('only holds a recent unfinished verdict on another head (quietMs=%s)', quietMs => {
     const f = fixture();
     f.put({ ...f.unfinished, id: 'review-pr-older-rejection', verdict: 'changes',
       stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(f.now - 4 * evidence.ABANDONED_REVIEW_AFTER_MS).toISOString() }],
-      findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }, 80 * 60_000);
-    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }, quietMs);
+    if (quietMs < evidence.ABANDONED_REVIEW_AFTER_MS) expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    else expect(f.readWitness().newest).toEqual(f.decided);
   });
 
   it('holds a capped scan with an unread boundary even after finding the decided review', () => {

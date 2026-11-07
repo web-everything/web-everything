@@ -144,6 +144,7 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
     // Same id universe as the bounded scan and every other review-run reader: the `review-pr-` id minted for the op.
     // A review run given another id by `--run-id` is invisible to all of them before settlement is ever asked.
     let newest = null; // the newest completed review of this exact head: { at, rejects }
+    let newestDecided = null; // recovery only: summary and file order, never the payload
     for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
       const st = stat(join(runsDir, `${id}.json`));
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
@@ -159,6 +160,14 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if (s.rev !== null && s.rev !== want) continue;
       if (recoveryReferralId !== null) {
+        // Recovery cannot choose a decided payload from an incomplete chronology, even
+        // when settlement could ignore an unorderable accept or quiet verdictless run.
+        if (s.rev === null || !Number.isFinite(s.orderAt) || s.orderAt > now + RUN_MTIME_SLACK_MS) return incomplete;
+        if (s.hasVerdict && (!newestDecided || s.orderAt > newestDecided.summary.orderAt
+          || (s.orderAt === newestDecided.summary.orderAt && (st.mtimeMs > newestDecided.at
+            || (st.mtimeMs === newestDecided.at && id.localeCompare(newestDecided.id) > 0))))) {
+          newestDecided = { id, at: st.mtimeMs, summary: s };
+        }
         // This exception is bound to the owned referral, never shared with comment settlement.
         if (id === recoveryReferralId && s.rev === want && s.referralWait
           && now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) continue;
@@ -192,7 +201,7 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (!newest || at > newest.at) newest = { at, rejects };
       else if (at === newest.at) newest.rejects ||= rejects;
     }
-    return { complete: true, blocked: newest?.rejects === true };
+    return { complete: true, blocked: newest?.rejects === true, ...(recoveryReferralId !== null ? { newestDecided } : {}) };
   } catch { return incomplete; }
 }
 
@@ -324,7 +333,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records,
-  probe = { host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime } } = {}) {
+  probe = { host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime }, operatorCleared = false } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
   if (bytes !== null && (!parsed || parsed.repo !== repo || Number(parsed.pr) !== Number(pr) || parsed.head !== head)) throw Error('recovery writer identity mismatch');
@@ -350,10 +359,19 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
       && JSON.stringify(unfinished.run.effects[0].payload?.read) === JSON.stringify(writerRead);
     if (ownsReferral
       && Number.isFinite(bounds.unfinishedActiveAt) && Number.isFinite(bounds.evaluatedAt)
-      && bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS
-      && bounds.exactDecided?.run && redTeamOwedFor(bounds.exactDecided.run)) {
-      let complete;
-      try { complete = bounds.completeHeadRead({ pr, head, at: now, recoveryReferralId: unfinished.id }); }
+      && bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS) {
+      let complete, decided = bounds.exactDecided;
+      try {
+        complete = bounds.completeHeadRead({ pr, head, at: now, recoveryReferralId: unfinished.id });
+        if (!decided && complete?.complete === true && complete.blocked === false && complete.newestDecided) {
+          const candidate = complete.newestDecided;
+          const run = read(candidate.id, runsDir);
+          // Re-reading the selected payload must still agree with the complete-read summary.
+          if (JSON.stringify(summarizeRun(run)) === JSON.stringify(candidate.summary)) {
+            decided = { id: candidate.id, run, at: candidate.at };
+          }
+        }
+      }
       catch { /* Unreadable complete evidence retains the original hold. */ }
       let dead = false;
       try {
@@ -367,7 +385,8 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
           }
         }
       } catch { /* Unreadable liveness evidence retains the original unfinished-review hold. */ }
-      if (dead && complete?.complete === true && complete.blocked === false) latest = bounds.exactDecided;
+      if (dead && complete?.complete === true && complete.blocked === false && decided?.run
+        && (operatorCleared === true || redTeamOwedFor(decided.run))) latest = decided;
     }
   }
   let carryEvidence;

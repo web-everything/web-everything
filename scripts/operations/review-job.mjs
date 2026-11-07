@@ -93,7 +93,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { provenRedTeamAcceptance, operatorRedTeamPayload, readCompletePrReviews, planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -313,6 +313,7 @@ export function execReadRaw(file, args, options = {}) {
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
+  readOperatorAcceptanceEvidence,
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
 } = {}) {
@@ -335,10 +336,31 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   });
   const provider = createGhProvider({ exec: (args, options) => exec('gh', args,
     { ...options, cwd: root, env, timeout: 60_000 }) });
+  const readAcceptance = readOperatorAcceptanceEvidence ?? (({ repo, pr }) => {
+    // Hermetic callers without injected live IO cannot prove clearance.
+    if (exec === execReadRaw && (isUnderTest(env) || isUnderTest(process.env))) return null;
+    return {
+      ...provider.readPrState(repo, pr),
+      comments: readComments({ repo, pr }),
+      reviews: readCompletePrReviews({ repo, pr, env,
+        exec: (args, options) => exec('gh', args, { ...options, cwd: root, env }) }),
+    };
+  });
+  const cleared = key => {
+    try { return provenRedTeamAcceptance(readAcceptance(key), key.head); }
+    catch { return false; } // Hold; operator must inspect unreadable live PR evidence.
+  };
+  const recoveryWitness = key => {
+    const initial = readWitness(key);
+    if (initial?.ok !== false && redTeamOwedFor(initial.newest)) return { witness: initial, operatorCleared: false };
+    const operatorCleared = cleared(key);
+    return { witness: operatorCleared ? readWitness({ ...key, operatorCleared: true }) : initial, operatorCleared };
+  };
   const postComment = ({ repo, pr, body }) => exec('gh', [
     'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
   ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
+    readOperatorAcceptanceEvidence: readAcceptance,
     restoreRedTeamAdmission: restoreAdmission,
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
@@ -370,8 +392,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       try {
         if (queued) {
           if (input.redTeamMode) {
-            witness = readWitness(key);
-            recovery = planRedTeamRecovery(witness, { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env) });
+            const live = recoveryWitness(key);
+            witness = live.witness;
+            recovery = planRedTeamRecovery(witness, { now: Date.now(), probe: recoveryProbe,
+              deadlineMs: staleRunDeadlineMs(env), operatorCleared: live.operatorCleared });
             if (recovery.mode === 'skip' || recovery.abandon || recovery.mode !== input.redTeamMode
               || JSON.stringify(recovery.payload?.findings?.read) !== JSON.stringify(input.loopPayload?.findings?.read)) throw Error(recovery.why ?? 'recovery evidence changed; retry next tick');
           }
@@ -408,7 +432,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         attempted = true;
         writeStatus(input, { env, ...(witness ? { expectedSha256: witness.rawWriter.sha256 } : {}) });
         if (queued) {
-          stored = witness ? readWitness(key).rawWriter.parsed : readStatus(key);
+          stored = readStatus(key);
           if (stored?.status !== 'queued' || stored.pid !== process.pid
             || stored.admissionId !== admissionId
             || JSON.stringify(stored.result) !== JSON.stringify(priorResult)
@@ -459,7 +483,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { head };
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => {
-      const w = readWitness({ pr, repo, head });
+      const { witness: w } = recoveryWitness({ pr, repo, head });
       if (w?.ok === false) throw Error(`red-team evidence ${w.reason}; hold and inspect run evidence`);
       if (w?.carryEvidence?.ok === false) throw Error(`red-team evidence ${w.carryEvidence.reason}; hold and inspect run evidence`);
       const legacy = w.carryEvidence;
@@ -1188,6 +1212,12 @@ function runReviewArc({
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
       let loopPayload = stored?.loopPayload;
+      if (!redTeamOwedFor(loopPayload)) {
+        let operatorCleared = false;
+        try { operatorCleared = provenRedTeamAcceptance(io.readOperatorAcceptanceEvidence?.({
+          pr: planned.pr, repo: planned.repo, head }), head); } catch { /* unreadable retains the hold */ }
+        if (operatorCleared) loopPayload = operatorRedTeamPayload(loopPayload);
+      }
       if (stored?.carryConflict) {
         classified = { outcome: 'red-team-not-owed', reason: 'later review supersedes the carry' };
         return result({ ...classified, lanePath });

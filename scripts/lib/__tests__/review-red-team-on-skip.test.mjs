@@ -5,7 +5,7 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { provenRedTeamAcceptance, planRedTeamRecovery, cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
@@ -1873,5 +1873,29 @@ describe('unprovable accepted head move — fresh full review', () => {
     const o = moved({ readEvidence: () => ({ loopPayload: payload(), inFlight: false, recorded: false, seatRecorded: false }) });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
     expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+  });
+});
+
+describe('operator clearance is a head-bound red-team obligation', () => {
+  it('copies the run for execution without rewriting its stored verdict or findings', () => {
+    const newest = { verdict: { verdict: 'needs-human', humanRequired: true,
+      findings: [{ summary: 'retained concern' }] }, findings: { read: { netBasis: { rev: head } } } };
+    const witness = { head, newest, rawWriter: { parsed: null }, markers: {}, seats: [] };
+    expect(planRedTeamRecovery(witness).mode).toBe('skip');
+    const plan = planRedTeamRecovery(witness, { operatorCleared: true });
+    expect(plan).toMatchObject({ mode: 'fresh', payload: { verdict: { verdict: 'accept' } } });
+    expect(plan.payload.findings).toBe(newest.findings);
+    expect(plan.payload.verdict.findings).toBe(newest.verdict.findings);
+    expect(newest.verdict.verdict).toBe('needs-human');
+  });
+
+  it.each(['comments', 'reviews', 'labels'])('unreadable %s cannot prove operator acceptance', field => {
+    const live = { headRefOid: head, comments: [{ author: { login: OPERATOR_LOGINS[0] },
+      body: `✅ review — accepted
+<!-- reviewed-sha: ${head} -->` }],
+      reviews: [], labels: ['review:accepted', 'red-team:pending'] };
+    expect(provenRedTeamAcceptance(live, head)).toBe(true);
+    live[field] = null;
+    expect(provenRedTeamAcceptance(live, head)).toBe(false);
   });
 });

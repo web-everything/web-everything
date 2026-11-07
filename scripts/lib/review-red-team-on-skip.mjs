@@ -43,12 +43,13 @@ const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWrite
   && typeof w.markers.redispatch?.abandonedAt === 'string';
 
 /** Pure decision on a raw witness. Probes and time are supplied by the caller. */
-export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
+export function planRedTeamRecovery(w, { now, probe, deadlineMs, operatorCleared = false } = {}) {
   if (w?.ok === false) return { mode: 'skip', why: w.reason };
   const raw = w.rawWriter.parsed;
   let executionPrior = raw;
   const reject = why => ({ rawWriter: w.rawWriter, executionPrior, mode: 'skip', why });
-  const payload = w.newest;
+  const payload = operatorCleared === true && w.newest
+    ? operatorRedTeamPayload(w.newest) : w.newest;
   if (!redTeamOwedFor(payload) || payload?.carriedFrom || payload?.findings?.read?.netBasis?.rev !== w.head) return reject('newest review does not owe a pass');
   const active = ['queued', 'running'].includes(raw?.status);
   let dead = !active;
@@ -106,11 +107,11 @@ export const recoveryProbe = () => ({ host: hostname(), namespace: pidNamespace(
 
 /** Spend one abandonment before spawning. The marker binds raw bytes, rows and newest review, never a plan. */
 export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,
-  probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env), writeJson = writeJsonAtomic } = {}) {
+  probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env), operatorCleared = false, writeJson = writeJsonAtomic } = {}) {
   const path = join(redTeamStatusDir(key.env), `${encodeURIComponent(key.repo)}-${Number(key.pr)}-${key.head}.json`);
   try {
     return withRedTeamStatusClaim(path, () => {
-      const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs });
+      const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs, operatorCleared });
       if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
       if (!p.abandon || p.mode === 'skip' || (w.markers.redispatch && !pendingAbandonment(w))) return { ok: false };
       const marker = `${path}.stale-redispatch-1`;
@@ -159,7 +160,7 @@ function isSettledReferralPauseNotice(comment) {
 }
 
 /** A reviewed-sha marker alone never proves acceptance or supersedes a newer hold. */
-function provenAcceptance({ comments, reviews, labels, head }) {
+export function provenAcceptance({ comments, reviews, labels, head }) {
   if (!isRealHead(head) || !Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string')
     || !Array.isArray(reviews) || laterReviewHold(reviews) || !Array.isArray(labels)) return null;
   const names = labels.map(label => typeof label === 'string' ? label : label?.name);
@@ -172,6 +173,19 @@ function provenAcceptance({ comments, reviews, labels, head }) {
   if (comments.some((comment, index) => isLaterVerdictBody(comment.body)
     && (index > acceptance.index || Date.parse(comment.createdAt ?? comment.created_at) > acceptedAt))) return null;
   return acceptance;
+}
+
+/** Operator clearance authorizes red-team execution only; pending is the pass being recovered. */
+export function provenRedTeamAcceptance(pr, head) {
+  if (pr?.headRefOid !== head) return false;
+  const acceptance = provenAcceptance({ ...pr, head });
+  return acceptance !== null && !pr.labels.some(label =>
+    conflictsWithPolicyClear(label, { settlesPending: true }));
+}
+
+/** Copy the run for execution; persisted verdicts/findings remain evidence, never rewritten. */
+export function operatorRedTeamPayload(payload) {
+  return payload ? { ...payload, verdict: { ...payload.verdict, verdict: VERDICTS.ACCEPT } } : payload;
 }
 
 /** Live holds supersede both carried and stored policy-clears. PURE.
@@ -357,10 +371,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
       if (readWitness) {
-        const w = readWitness({ repo, pr, head });
+        const operatorCleared = provenRedTeamAcceptance(rawPr, head);
+        const w = readWitness({ repo, pr, head, ...(operatorCleared ? { operatorCleared } : {}) });
         if (w?.ok === false) return failedRead(w);
         if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
-          const recovery = planRedTeamRecovery(w, recoveryOptions);
+          const recovery = planRedTeamRecovery(w, { ...recoveryOptions, operatorCleared });
           return recovery.mode === 'skip' ? skip(recovery.why)
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
@@ -631,7 +646,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     if (error) throw Error(error);
     return result;
   },
-  abandon = key => abandonStaleRedTeamRun({ ...key, env }),
+  abandon = key => abandonStaleRedTeamRun({ ...key, env }, { operatorCleared: key.operatorCleared === true }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels } = {}) {
   const rows = [], dispatched = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
@@ -780,7 +795,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
           try {
-            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
+            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head,
+              ...(provenRedTeamAcceptance(planningPrs.find(p => Number(p.number) === row.prNumber), row.head)
+                ? { operatorCleared: true } : {}) }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
