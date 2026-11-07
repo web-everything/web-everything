@@ -1,5 +1,7 @@
 // Restart reviewed launchd labels when the adopted sha differs from their last successful restart.
 import childProcess from 'node:child_process';
+import { cloneKey } from './daemon-overlays.mjs';
+import { readRebuildState } from './daemon-rebuild/state.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 
 const commandOptions = { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 };
@@ -103,4 +105,84 @@ export async function restartServicesForClone({ settings, platform, env = proces
     report('errors', {}, message(error));
   }
   return result;
+}
+
+function processStart(label, { launchctl, uid, ps }) {
+  const id = typeof uid === 'function' ? uid() : uid;
+  if (!Number.isInteger(id) || id < 0) throw new Error('unreadable uid');
+  let printed;
+  try { printed = launchctl(['print', `gui/${id}/${label}`]); }
+  catch (error) {
+    if (/could not find service/i.test(String(error.stderr ?? error.message))) return null;
+    throw error;
+  }
+  if (printed?.error || printed?.status != null && printed.status !== 0
+    || printed?.code != null && printed.code !== 0) throw new Error('launchctl print failed');
+  const output = typeof printed === 'string' ? printed : printed?.stdout;
+  if (typeof output !== 'string') throw new Error('unreadable launchctl print');
+  const pid = output.match(/\bpid\s*=\s*(\d+)/)?.[1];
+  if (!pid) {
+    if (/state\s*=\s*(?:not running|waiting|exited)/i.test(output)) return null;
+    throw new Error('unknown launchctl process state');
+  }
+  const start = Date.parse(ps(['-o', 'lstart=', '-p', pid]).trim());
+  if (!Number.isFinite(start)) throw new Error('unreadable process start');
+  const cwd = output.match(/^\s*working directory = (.+)$/m)?.[1]?.trim().replace(/^"(.*)"$/, '$1');
+  if (!cwd) throw new Error('unknown service clone: inspect launchctl working directory');
+  const root = childProcess.execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], commandOptions).trim();
+  if (!root) throw new Error('unknown service clone: inspect its working directory');
+  return { start, cloneRoot: root, precisionMs: 1000 };
+}
+
+// null adoption means no adopted build; NaN means an unusable adoption timestamp.
+const readAdoption = root => {
+  const adopted = readRebuildState(root)?.adopted;
+  return adopted == null ? { atMs: null, head: null }
+    : { atMs: Date.parse(adopted.at ?? ''), head: adopted.head ?? null };
+};
+
+/** Inspect only policy-approved labels; fresh callbacks require positive process evidence. */
+export function findStaleCodeServices({ cloneRoot, settings, platform, env = process.env, envValues, log,
+  selfLabel = null, readProcessStartMs = processStart, readAdoptedAtMs,
+  onFreshService = () => {}, now = Date.now, graceMs = 120_000,
+  launchctl = argv => childProcess.execFileSync('launchctl', argv, commandOptions), uid = userId,
+  ps = argv => childProcess.execFileSync('ps', argv, commandOptions) } = {}) {
+  let p;
+  try {
+    const policy = resolveRestartPolicy({ settings, platform, env, envValues, log });
+    p = policy.value;
+    safeLog(log, `daemon.serviceRestart inspection ${JSON.stringify({ values: p, sources: policy.sources })}`);
+  }
+  catch (error) { return [{ label: null, reason: 'policy-unreadable', error: message(error) }]; }
+  const flags = [];
+  // Keep unresolved evidence distinct from an empty, complete inspection without changing the array API.
+  Object.defineProperty(flags, 'complete', { value: true, writable: true });
+  for (const label of new Set(p.allowedLabels)) {
+    if (!p.enabled || label === selfLabel || neverRestartReason(label, p)) { flags.complete = false; continue; }
+    const service = { label };
+    try {
+      // Injected numeric readers supply already-scoped evidence; the host reader also supplies ownership.
+      const evidence = readProcessStartMs(label, { launchctl, uid, ps });
+      if (evidence && typeof evidence === 'object' && cloneKey(evidence.cloneRoot) !== cloneKey(cloneRoot)) {
+        onFreshService(service); continue; // Positively no longer owned by this clone; never compare its adoption.
+      }
+      const start = evidence && typeof evidence === 'object' ? evidence.start : evidence;
+      if (start === null) { onFreshService(service); continue; }
+      if (!Number.isFinite(start)) throw new Error('unreadable process start');
+      let adopted;
+      try {
+        adopted = readAdoptedAtMs ? readAdoptedAtMs(cloneRoot) : readAdoption(cloneRoot).atMs;
+        if (adopted !== null && !Number.isFinite(adopted)) throw new Error('unreadable adoption time');
+      } catch (error) { flags.complete = false; flags.push({ ...service, reason: 'adoption-unreadable', error: message(error) }); continue; }
+      if (adopted === null) { flags.complete = false; continue; }
+      // ps lstart has whole-second precision; injected millisecond readings retain their exact boundary.
+      const boundary = evidence?.precisionMs === 1000 ? Math.floor(adopted / 1000) * 1000 : adopted;
+      if (start >= boundary) { onFreshService(service); continue; }
+      const at = now();
+      if (!Number.isFinite(at) || !Number.isFinite(graceMs) || graceMs < 0) throw new Error('unreadable grace window');
+      if (at - adopted > graceMs) flags.push({ ...service, reason: 'stale-code', processStartMs: start, adoptedAtMs: adopted });
+      else flags.complete = false;
+    } catch (error) { flags.complete = false; flags.push({ ...service, reason: 'process-unreadable', error: message(error) }); }
+  }
+  return flags;
 }
