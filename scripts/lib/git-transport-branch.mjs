@@ -35,7 +35,7 @@
  */
 import { retryTransientGit } from './git-fetch-retry.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
 /**
@@ -363,15 +363,79 @@ function readExisting(abs) {
  * @param {{board: string, branch: string, paths: string[], run?: Function}} o
  * @returns {Record<string, string|null>} path -> text, or null when the path is not on the branch.
  */
-export function readFromTransportBranch({ board, branch, paths = [], run = defaultGit } = {}) {
+export function readFromTransportBranch({
+  board, branch, paths = [], run = defaultGit, now = Date.now, env = process.env, log = defaultFetchLog, sleep = sleepSync,
+} = {}) {
   if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
-  retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
+  coalescedReadFetch({ board, branch, run, now, env, log, sleep });
   const out = {};
   for (const path of paths) {
     const listed = run(['ls-tree', '--name-only', `origin/${branch}`, '--', path], { cwd: board }).trim();
     out[path] = listed ? run(['show', `origin/${branch}:${path}`], { cwd: board }) : null;
   }
   return out;
+}
+
+/** Default TTL for a READ's origin fetch of a transport branch; override with WE_OPS_FETCH_TTL_MS (0 = always fetch). */
+export const OPS_READ_FETCH_TTL_MS = 30_000;
+const OPS_LOCK_STALE_MS = 120_000;
+const OPS_LOCK_WAIT_MS = 60_000;
+
+function defaultFetchLog(msg) { process.stderr.write(`${msg}\n`); }
+function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+
+/**
+ * READS ONLY. Many lanes and daemons read the same ops branch every tick and each ran its own network fetch
+ * (a ~10 MB ledger: ~70% CPU in `git unpack-objects`). A per-repo+branch stamp inside the repo's own git dir
+ * records the last successful fetch; a read within the TTL uses the existing remote-tracking ref. A lock
+ * (atomic mkdir) lets concurrent callers share one fetch: the loser re-checks the stamp the winner wrote.
+ * Writes (`stageOnTransportBranch`) never use this: they always fetch before staging. Any unreadable stamp or
+ * lock problem falls back to a plain fetch (fail closed). Logs `source=cache|origin`.
+ */
+function coalescedReadFetch({ board, branch, run, now, env, log, sleep }) {
+  const rawTtl = env?.WE_OPS_FETCH_TTL_MS;
+  const fromEnv = rawTtl !== undefined && rawTtl !== '' && Number.isFinite(Number(rawTtl));
+  const ttl = fromEnv ? Number(rawTtl) : OPS_READ_FETCH_TTL_MS;
+  const tag = `ttlMs=${ttl}(${fromEnv ? 'env' : 'default'})`;
+  const fetchOrigin = (why) => {
+    retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
+    log(`ops-fetch branch=${branch} source=origin ${tag} ${why}`);
+  };
+  let stampFile; let lockDir;
+  try {
+    if (!(ttl > 0)) return fetchOrigin('ttl-disabled');
+    const gitDir = resolve(board, run(['rev-parse', '--git-common-dir'], { cwd: board }).trim());
+    const dir = join(gitDir, 'we-ops-fetch');
+    mkdirSync(dir, { recursive: true });
+    stampFile = join(dir, encodeURIComponent(branch));
+    lockDir = `${stampFile}.lock`;
+  } catch { return fetchOrigin('stamp-unavailable'); }
+  const fresh = () => {
+    try {
+      const at = Number(readFileSync(stampFile, 'utf8').trim());
+      return Number.isFinite(at) && at > 0 && now() - at >= 0 && now() - at < ttl;
+    } catch { return false; }
+  };
+  const hit = () => { log(`ops-fetch branch=${branch} source=cache ${tag}`); };
+  if (fresh()) return hit();
+  const deadline = now() + OPS_LOCK_WAIT_MS;
+  let held = false;
+  while (!held) {
+    try { mkdirSync(lockDir); held = true; continue; } catch { /* held by another */ }
+    if (fresh()) return hit();
+    try {
+      if (now() - statSync(lockDir).mtimeMs > OPS_LOCK_STALE_MS) rmSync(lockDir, { recursive: true, force: true });
+      else if (now() > deadline) return fetchOrigin('lock-timeout');
+      else sleep(100);
+    } catch { /* lock vanished: retry */ }
+  }
+  try {
+    if (fresh()) return hit();
+    fetchOrigin('stamp-stale');
+    try { writeFileSync(stampFile, String(now())); } catch { /* next reader just fetches */ }
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
 }
 
 function defaultGit(args, opts) {
