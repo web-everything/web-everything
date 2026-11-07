@@ -29,7 +29,7 @@ it('reproduces the cached-pending stageVerdict refusal on the committed fix pare
     const report = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', code, scratch],
       { cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 }));
     expect(report.violations.filter(message => message.startsWith('scenario failed:'))).toEqual([]);
-    expect(report.cases).toHaveLength(10);
+    expect(report.cases).toHaveLength(14);
     for (const kind of ['all-ruled-auto', 'all-ruled-explicit', 'unstamped-all-ruled-auto', 'unstamped-all-ruled-explicit']) {
       // Automatic pre-fix recovery may complete a fresh panel; completion alone
       // is insufficient. The scenario requires this run and its cached keys to clear.

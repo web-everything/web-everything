@@ -242,8 +242,12 @@ export function persistRetryBudgetSpent(run) {
   return Boolean(run?.persistenceFailed) && 1 + (Number(run.persistRetries) || 0) > REFERRAL_RETRY_MS.length;
 }
 
-/** Re-read standing rulings, never a timestamp heuristic or an empty/missing thread. The cached pending finding keys
- * must all occur in this run's live record; otherwise an unrelated cleared record could erase a lost referral.
+/** Re-read standing rulings, never a timestamp heuristic or an empty/missing thread. Every cached pending finding key
+ * must occur in a valid live record on this repo/PR/head; otherwise a cleared thread could erase a lost referral.
+ * The record may belong to an EARLIER run: a run's pending list legitimately inherits that run's open referrals, and
+ * the record that raised a key is where its ruling lands (PR #6465 round 3). Every referral of the record counts,
+ * not only the active ones: a key the sink durably retired (`dropped`, `superseded`, `carried`) stays in the record's
+ * append-only `referrals`, so it is still provably the saved finding, and the empty live pending list says it is settled.
  * Reason tokens (`author-stamp-missing`, …) are answered by the empty live pending list, never by a record key.
  * This only authorizes a rewind: mandatoryReferrals still derives and persists the actual verdict. */
 export function refusedReferralsAreRuled(pr, run, { repo,
@@ -255,7 +259,7 @@ export function refusedReferralsAreRuled(pr, run, { repo,
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
     if (live.pending.length) return false;
     const keys = new Set(live.records.filter(r => r.repo === repo && r.pr === run.pr
-      && r.head === run.head && r.runId === run.id).flatMap(r => activeReferrals(r).map(f => f.key)));
+      && r.head === run.head).flatMap(r => r.referrals.map(f => f.key)));
     const findingKeys = run.pending.filter(key => !PENDING_REASON_TOKENS.has(key));
     return findingKeys.length > 0 && findingKeys.every(key => keys.has(key));
   } catch { return false; }
