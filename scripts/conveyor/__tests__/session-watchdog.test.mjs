@@ -498,7 +498,7 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
   const cfg = { ...CFG, reapFinishedGraceMinutes: 10, reapMaxStopsPerTick: 5 };
   const finished = (over = {}) => row({
     listingKind: 'background', kind: 'fix', repo: 'we', target: '3771', prBound: true,
-    state: 'idle', class: CLASSES.FINISHED, evidence: { idleMinutes: 40, idleMs: 40 * MIN, pendingTool: null }, ...over,
+    state: 'idle', pidAlive: true, class: CLASSES.FINISHED, evidence: { idleMinutes: 40, idleMs: 40 * MIN, pendingTool: null }, ...over,
   });
   // ACTIVE isolates duplicate selection from the separate finished-session rule.
   const duplicate = (over = {}) => finished({ class: CLASSES.ACTIVE, ...over });
@@ -657,6 +657,19 @@ describe('planWatchdog — finished and duplicate stop-session contract', () => 
   it.each(['finished', 'duplicate'])('missing exact idleMs refuses %s stops even with rounded idle minutes', (mode) => {
     const old = (mode === 'finished' ? finished : duplicate)({ evidence: { idleMinutes: 40 } });
     expect(stops(mode === 'finished' ? [old] : [old, newer()])).toEqual([]);
+  });
+
+  it('a newest confirmed-dead ghost cannot justify stopping an older unfinished duplicate', () => {
+    expect(stops([duplicate(), newer({ class: CLASSES.GHOST, pidAlive: false })])).toEqual([]);
+  });
+
+  it('a newest finished-stop candidate cannot justify stopping the only unfinished survivor', () => {
+    const keeper = newer({ class: CLASSES.FINISHED });
+    expect(stops([duplicate(), keeper])).toEqual([expect.objectContaining({ handle: keeper.id, mode: 'finished' })]);
+  });
+
+  it('no provably live keeper means no duplicate stops', () => {
+    expect(stops([duplicate({ pidAlive: false }), newer({ pidAlive: null })])).toEqual([]);
   });
 
   it('finished mode wins when the same row is also an eligible older duplicate: no double stop', () => {
@@ -850,7 +863,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
       expect(tail.hadUnparseableLine).toBe(malformed);
       const { result, calls, actions } = base({
         agents: mode === 'duplicate' ? [old, keeper] : [old], readTail: () => tail,
-        completionFor: () => mode === 'completion' ? { done: true } : null,
+        completionFor: () => mode === 'completion' ? { done: true, sessionId: 'sid-1' } : null,
       });
       if (malformed) {
         expect(result.rows[0].evidence.unparseableTail).toBe(true);
@@ -1116,7 +1129,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
       const tail = summarizeTail(bash('git status --short', T0 - idleMs - 1000, 1000), { nowMs: T0 });
       const { result, calls, actions } = base({
         agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail,
-        completionFor: () => mode === 'finished' ? { done: true } : null,
+        completionFor: () => mode === 'finished' ? { done: true, sessionId: 'sid-1' } : null,
       });
       expect(result.rows[0].evidence).toMatchObject({ idleMinutes: 10, idleMs });
       expect(calls.stop).toEqual(idleMinutes === 10 ? [old.id] : []);
@@ -1147,7 +1160,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
         expect(tail.truncatedTail).toBe(bound !== 'complete');
         const { result, calls, actions } = base({ config,
           agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail,
-          completionFor: () => mode === 'finished' ? { done: true } : null,
+          completionFor: () => mode === 'finished' ? { done: true, sessionId: 'sid-1' } : null,
         });
         if (bound !== 'complete') {
           expect(result.rows[0].evidence.truncatedTail).toBe(true);
@@ -1188,7 +1201,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
       ];
       const tail = summarizeTail(entries, { nowMs: T0 });
       const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail,
-        completionFor: () => mode === 'finished' ? { done: true } : null });
+        completionFor: () => mode === 'finished' ? { done: true, sessionId: 'sid-1' } : null });
       expect(calls.stop).toEqual(resolved ? [old.id] : []);
       expect(actions).toEqual(resolved ? [expect.objectContaining({ mode, ok: true })] : []);
       expect(calls.reapEvents).toHaveLength(resolved ? 1 : 0);
@@ -1314,6 +1327,33 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     expect(actions).toEqual([expect.objectContaining({ detail: 'refused: chat-spawn guarded' })]);
   });
 
+  it('a stale same-name sessionId-less completion older than session start cannot authorize a finished stop', () => {
+    const tail = summarizeTail(bash('git status --short', T0 - 41 * MIN, MIN), { nowMs: T0 });
+    const { calls, actions } = base({ readTail: () => tail,
+      completionFor: () => ({ done: true, updatedAt: new Date(T0 - 120 * MIN).toISOString() }) });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([]);
+  });
+
+  it.each(['no timestamp', 'invalid timestamp', 'unknown start'])('unbound completion with %s refuses finished stops', (evidence) => {
+    const tail = summarizeTail(bash('git status --short', T0 - 41 * MIN, MIN), { nowMs: T0 });
+    const { calls, actions } = base({ readTail: () => tail,
+      agents: [listing(evidence === 'unknown start' ? { startedAt: undefined } : {})],
+      completionFor: () => ({ done: true, updatedAt: evidence === 'no timestamp' ? undefined : evidence === 'invalid timestamp' ? 'bad' : new Date(T0).toISOString() }) });
+    expect(calls.stop).toEqual([]);
+    expect(actions).toEqual([]);
+  });
+
+  it.each(['matching sessionId', 'timestamp at session start'])('bound completion (%s) still authorizes a finished stop', (evidence) => {
+    const tail = summarizeTail(bash('git status --short', T0 - 41 * MIN, MIN), { nowMs: T0 });
+    const { calls, actions } = base({ readTail: () => tail, completionFor: () => ({ done: true,
+      ...(evidence === 'matching sessionId' ? { sessionId: 'sid-1' } : { updatedAt: new Date(T0 - 90 * MIN).toISOString() }),
+    }) });
+    expect(calls.stop).toEqual(['f29aeb29']);
+    expect(actions).toEqual([expect.objectContaining({ mode: 'finished', ok: true })]);
+  });
+
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
     const { calls, actions } = base({ act: false });
     expect(actions).toEqual([expect.objectContaining({ type: 'stop-session', ok: null })]);
@@ -1417,7 +1457,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
   });
   it('stops a completion-record-done session past grace with a readable tail and no pending call', () => {
     const tail = summarizeTail(bash('git status --short', T0 - 41 * MIN, MIN), { nowMs: T0 });
-    const { result, calls, actions } = base({ completionFor: () => ({ done: true }), readTail: () => tail });
+    const { result, calls, actions } = base({ completionFor: () => ({ done: true, sessionId: 'sid-1' }), readTail: () => tail });
     expect(tail.endedOnReply).toBe(false);
     expect(tail.pending).toBeNull();
     expect(result.rows[0]).toMatchObject({ class: CLASSES.FINISHED, reason: 'completion-record-done' });

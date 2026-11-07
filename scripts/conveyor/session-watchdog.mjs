@@ -84,7 +84,8 @@ import { fixDispatchClaimRoot, fixDispatchSessionName } from './fix-claim-store.
 import { isLeaseExpired, parseLockEntry } from '../readiness/file-locks.mjs';
 import { awaitVerifyStoreDir, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyPath, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
-import { makeChatSpawnGuardResolver, makeCompletionResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
+import { makeChatSpawnGuardResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
+import { isForeignCompletionSessionId, tryReadCompletion } from '../operations/completion-store.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -440,6 +441,7 @@ export function planWatchdog({ rows, claims, stopClaims = claims, prHeadFor = ()
   }
   const reapKinds = new Set(['fix', 'ci-heal', 'prepare']);
   const eligible = (r) => r.listingKind === 'background' && reapKinds.has(r.kind) && r.state === 'idle'
+    && (r.reason !== 'completion-record-done' || r.evidence?.completionBound === true)
     && !r.evidence?.unparseableTail && !r.evidence?.truncatedTail
     && !!r.id && !!r.sessionId && !claimHolders.has(r) && !r.evidence?.pendingTool
     && Number.isFinite(r.evidence?.idleMinutes) && Number.isFinite(r.evidence?.idleMs)
@@ -463,8 +465,10 @@ export function planWatchdog({ rows, claims, stopClaims = claims, prHeadFor = ()
   for (const group of groups.values()) {
     // Unknown chronology cannot establish which session supersedes another.
     if (group.some((r) => !Number.isFinite(start(r)))) continue;
-    const protectedRows = group.filter((r) => r.state === 'working' || claimHolders.has(r));
-    const keeper = (protectedRows.length ? protectedRows : group).reduce((a, b) => start(b) > start(a) ? b : a);
+    const survivors = group.filter((r) => r.pidAlive === true && r.class !== CLASSES.GHOST && !stopRows.has(r));
+    if (!survivors.length) continue;
+    const protectedRows = survivors.filter((r) => r.state === 'working' || claimHolders.has(r));
+    const keeper = (protectedRows.length ? protectedRows : survivors).reduce((a, b) => start(b) > start(a) ? b : a);
     for (const r of group) if (eligible(r) && start(r) < start(keeper)) addStop(r, 'duplicate', `older duplicate; keeping ${keeper.name} (${keeper.id})`);
   }
   return { findings, actions, events };
@@ -718,7 +722,13 @@ export function runSessionWatchdogPass({
     return defaultClaimStoreReadable(readdirSync, readFileSync, log);
   },
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
-  completionFor = makeCompletionResolver(),
+  completionFor = (row) => {
+    try {
+      const record = tryReadCompletion(row.name);
+      return record && !isForeignCompletionSessionId(row.sessionId, record.sessionId)
+        ? { ...record, done: record.status === 'done' } : null;
+    } catch { return null; }
+  },
   awaitingVerifyFor = makeStopAwaitingVerifyResolver({ now: () => nowMs }),
   chatSpawnGuardFor = makeStopChatSpawnGuardResolver({ now: () => nowMs }),
   rm = rmSessionRecord,
@@ -761,9 +771,17 @@ export function runSessionWatchdogPass({
     let tail = null;
     if (pastStandard) { try { tail = readTail(a); } catch { tail = null; } }
     let completionDone = null;
-    try { completionDone = completionFor({ name: a.name, sessionId: a.sessionId })?.done ?? null; } catch { completionDone = null; }
+    let completionBound = false;
+    try {
+      const completion = completionFor({ name: a.name, sessionId: a.sessionId });
+      completionDone = completion?.done ?? null;
+      const completedMs = Date.parse(completion?.endedAt ?? completion?.updatedAt ?? '');
+      completionBound = (typeof completion?.sessionId === 'string' && !!completion.sessionId && completion.sessionId === a.sessionId)
+        || (Number.isFinite(startedMs) && Number.isFinite(completedMs) && completedMs >= startedMs);
+    } catch { completionDone = null; }
     const pidAlive = isProcessAlive(a, procs);
     const verdict = classifyWatchdogSession({ row: a, tail, nowMs, standard, cfg: config, completionDone, pidAlive });
+    if (completionDone === true) verdict.evidence.completionBound = completionBound;
     rows.push({
       name: a.name, id: a.id ?? null, sessionId: a.sessionId ?? null, state: a.state ?? null, listingKind: a.kind,
       kind: k.kind, repo: k.repo, target: k.id, prBound: k.prBound, pid: Number.isInteger(a.pid) ? a.pid : null, pidAlive,
