@@ -1533,6 +1533,18 @@ Every edit — including an ad-hoc "just fix this one thing" — happens in an *
 node scripts/lane-pool.mjs status --json     # per-lane path / head / clean / deps
 node scripts/lane-pool.mjs provision --count=N   # create/refresh N lanes
 ```
+Lane deps prefer pnpm 12+ with matching lockfiles and a shared store at `~/.cache/we-pnpm-store` (override `WE_PNPM_STORE_DIR`); npm ci remains the per-lane fallback, and backend switches rebuild `node_modules`. A lane whose marker matches either backend's current hash is left alone, so a lane changes backend only when its install inputs change: the lockfiles, or for pnpm the store path and the store's generation token (`.we-lane-store-generation`, created once per store). A pnpm lane also reads stale when a top-level `node_modules` link no longer resolves (store content deleted under it), and an install during which the store was wiped and recreated stamps no marker. A not-ready pnpm lane always reinstalls from an empty `node_modules`. The shared store trades per-lane isolation for disk and speed: a write into a store file is visible to every lane and survives `git clean`. To recover, delete the whole store directory; the recreated store gets a new token, so every pnpm lane reads stale and reinstalls on its next acquire. Lockfile parity also requires each pnpm package's registry integrity to be one of npm's hashes for that name@version; any other pnpm resolution fails parity, and lanes then use npm ci. Keep `package-lock.json` authoritative for npm and run `npm run check:lockfile-parity` after lockfile updates.
+
+With a `packageManager` pin, pnpm 12 writes a YAML stream containing an environment lockfile
+and a project lockfile. The parity reader and installer helper run before `node_modules`
+exists, so they must import only `node:` builtins. Keep a copied-script child-process
+regression with real YAML lockfiles and no dependency installation. Parity must read all
+documents and select the project importer;
+the environment's own `packages` map is not project dependency evidence. Run the
+`pnpm --version` probe from `os.tmpdir()`, since probing inside the repository can rewrite
+its lockfile. Regression coverage lives in `check-lockfile-parity.test.mjs` and
+`lane-deps-installer.test.mjs` under `scripts/__tests__/`.
+
 Use a `clean` lane. `git -C <lane> reset --hard <sha>` to check out any local commit (shared objects — no fetch needed, works for un-pushed HEADs).
 
 **2 — Boot the lane's OWN dev pair.** The `.env.local` port pair is **not auto-loaded** — export it first, or the servers fall back to the main band (`:3000`/`:8080`) and collide:
@@ -4042,3 +4054,19 @@ Unreadable records still throw, never skip.
 
 The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
 test `settings-files`; use heavy admission.
+
+
+## Refused referral reviews re-read standing rulings
+
+A `stageVerdict` refusal has consumed its confirm and has no `pending` step. Preserve that
+shape in `reviewRunEvidence`; live thread evidence must stay outside its durable projection cache.
+Before releasing or rewinding this refusal, re-derive `mandatoryReferralState` through
+`liveReferralState`, requiring every saved pending finding key in the same run/head record.
+Reason tokens such as `author-stamp-missing` (`PENDING_REASON_TOKENS`, the one set `attempted`,
+`count` and this check share) name no finding: the empty
+live pending list answers them, so an unstamped PR body still resumes once every finding is ruled. Missing
+records, partial rulings, malformed comments, unreadable cards and subject mismatches keep it
+blocked. A comment timestamp alone cannot prove a ruling stands. Reuse `mandatoryReferrals`
+rewind so the sink, reducer and acceptance gates still decide the resulting verdict.
+`review-ruling-resume.test.mjs` covers explicit and automatic resumes without new jurors,
+and the closed paths; run it and the referral-hold suites through heavy-admission.

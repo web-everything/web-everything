@@ -61,6 +61,7 @@ import { resolveBuildPolicy } from './lib/build-policy.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
+import { signalVerifyRequest } from './lib/fix-handoff.mjs';
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
@@ -603,6 +604,7 @@ if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, st
 // (below): a request never actually runs the gate itself, so it has no business queuing on the capacity
 // semaphore — that cost belongs to whichever `verify-dispatch.mjs` tick actually executes it.
 if (MODE === 'request') {
+  signalVerifyRequest();
   emit({ sha: headSha, status: 'requested', reason: 'requested', exitCode: null, detail: `verification requested for ${headSha.slice(0, 8)} (suites: ${GATE}) — poll \`node scripts/verify-lane.mjs check\` for the result.` }, 0);
 }
 

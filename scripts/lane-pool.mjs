@@ -18,7 +18,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * lanes are long-lived under `~/workspace/.lanes/<repo>/lane-<n>` and merely fetch + hard-reset to
  * origin/main between batches. Git OBJECTS are shared with the primary checkout via `git clone
  * --reference`, so a lane costs little disk and clones fast (objects come from the local primary, not the
- * network). Node deps (`node_modules`) are NOT shared — `ensureDeps` runs `npm ci` per lane on a fresh
+ * network). Node deps (`node_modules`) are per lane — `ensureDeps` prefers pnpm 12 with a shared store on a fresh
  * clone or when the lockfile changes, so each lane can run its own gate.
  *
  * Repo-parameterized: the pool is keyed by repo NAME, so cross-repo slice 4 (lanes of
@@ -79,6 +79,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  */
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname, tmpdir } from 'node:os';
@@ -822,20 +823,8 @@ function existingPools() {
 
 // ── deps (node_modules) — not shared by --reference, so installed per lane on fresh-clone / lockfile change ──
 const DEPS_MARKER = (dir) => join(dir, '.git', '.lane-pool-deps'); // inside .git ⇒ never tracked or git-cleaned
-function lockHash(dir) {
-  const lock = join(dir, 'package-lock.json');
-  const pkg = join(dir, 'package.json');
-  const file = existsSync(lock) ? lock : existsSync(pkg) ? pkg : null;
-  if (!file) return null;
-  return createHash('sha256').update(readFileSync(file)).digest('hex');
-}
-function depsReady(dir) {
-  const want = lockHash(dir);
-  if (want === null) return 'n/a'; // no package.json → nothing to install
-  if (!existsSync(join(dir, 'node_modules'))) return 'missing';
-  const have = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  return have === want ? 'ok' : 'stale';
-}
+// Hashing, readiness and the install orchestration live in lib/lane-deps-installer.mjs (unit-tested there).
+const depsReady = (dir) => laneDepsReady(dir, DEPS_MARKER(dir));
 // #3461 — `npm ci`/`npm install` here is a DELIBERATE, NAMED EXCEPTION to the heavy-command admission queue
 // (`scripts/readiness/heavy-admission.mjs`), not an oversight. #3456's own ruling is explicit that the cap
 // applies at heavy-command-INVOCATION time, never at lane-ACQUIRE time — "a lane may always be acquired
@@ -848,16 +837,13 @@ function depsReady(dir) {
 // that is comparatively cheap and already deduped by `depsReady`'s lockfile-hash skip (most acquires do
 // nothing here at all). This function stays ungated.
 function ensureDeps(dir) {
-  const state = depsReady(dir);
-  if (state === 'n/a' || state === 'ok') return state;
-  const useCi = existsSync(join(dir, 'package-lock.json'));
-  log(`  deps ${state} → npm ${useCi ? 'ci' : 'install'} in ${dir} …`);
-  // #x5n4zn3 review — npm's stdout goes to OUR stderr (fd 2), never our stdout: `acquire --json` prints its
-  // result on stdout, and a caller that captures it (`orphan-claim-release.mjs`'s `acquireLane`) must parse
-  // pure JSON even on the acquires that actually install. Stays visible on a terminal either way.
-  execFileSync('npm', [useCi ? 'ci' : 'install'], { cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL' });
-  writeFileSync(DEPS_MARKER(dir), lockHash(dir));
-  return 'installed';
+  const storeDir = resolvePnpmStoreDir();
+  // The runtime routes installer stdout to OUR stderr: acquire --json must remain pure JSON (tested in the lib).
+  return ensureLaneDeps({
+    dir, markerPath: DEPS_MARKER(dir), storeDir,
+    log: message => log(`  ${message} in ${dir} …`),
+    ...createLaneDepsRuntime({ dir, storeDir, installTimeoutMs: NPM_TIMEOUT_MS }),
+  });
 }
 
 // ── lease (#2275) — an exclusive hold so a lane is never recycled or double-acquired while in use ─────

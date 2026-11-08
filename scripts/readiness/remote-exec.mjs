@@ -1059,6 +1059,14 @@ export function spawnPresync({cwd,host,env=process.env,spawnFn=spawn}={}) {
   } catch { /* presync is best effort */ }
 }
 
+/** One `location=local reason=…` line per local-fallback result; control and line/paragraph separators are stripped so a reason can never forge extra log lines. */
+export function logLocalLocation(result,log) {
+  if((result?.mode==='not-started'||result?.mode==='fallback')&&result.reason) {
+    const reason=String(result.reason).replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu,'');
+    (log??(text=>process.stderr.write(text)))(`location=local reason=${reason}\n`);
+  }
+}
+
 export async function runRemote(options={}) {
   const clock=options.clock??Date.now,timings=[],start=clock();
   const pending=new Map();
@@ -1068,6 +1076,7 @@ export async function runRemote(options={}) {
     return extra=>{pending.delete(item);Object.assign(item,{ms:Math.max(0,Math.round(clock()-at)),...extra});};
   };
   const result=await executeRemote({...options,clock,timings,begin});
+  logLocalLocation(result,options.log);
   for(const [item,at] of pending)item.ms=Math.max(0,Math.round(clock()-at));
   timings.push({stage:'total',startedAtET:easternTimestamp(start),ms:Math.max(0,Math.round(clock()-start))});
   // Only the real transport presyncs; injected transports opt in explicitly.
