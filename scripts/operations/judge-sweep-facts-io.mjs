@@ -28,6 +28,12 @@ import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseFindings } from '../review-corpus/mine-review-corpus.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
+import { findSuspendedReferralRuns, resolveReferralJudgeWindow } from '../lib/suspended-referral-run.mjs';
+import { resolveRunsDir } from './run-store.mjs';
+import { publishAttention } from './needs-you-feed.mjs';
+import { createActionStore } from './action-store.mjs';
+import { actionResource } from './action-record.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 import { STALL_DEFAULTS } from './judge-sweep-facts.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
@@ -174,6 +180,8 @@ const validFreshFacts = facts => facts && typeof facts === 'object' && Array.isA
 /** Injectable at every boundary; tests never need the host's credentials, process table, or ledgers. */
 export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.now(),
   readFile = readFileSync,
+  findSuspendedRuns = findSuspendedReferralRuns, publishAlert, alertClaimsDir,
+  env = process.env, log = line => console.error(line),
   exec = execFileSync,
   readLedgerRows = readRows, readFixRows = readFixLoopRows,
   readJobs = () => parseLiveJobs(exec('ps', ['-axo', 'pid,etime,command'], {
@@ -273,7 +281,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         minutesSinceHeadChange: minutesSince(lastCommit?.committedDate),
         minutesSinceFixDispatch: minutesSince(lastDispatch?.at),
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
-        openReferrals: null, openSendBacks: null, lastFixLoop, humanRequired: null,
+        suspendedReferralRun: null, openReferrals: null, openSendBacks: null, lastFixLoop, humanRequired: null,
         minutesSinceFixLoop: lastFixLoop && Number.isFinite(Date.parse(lastFixLoop.at))
           ? Math.max(0, (start - Date.parse(lastFixLoop.at)) / 60_000) : null,
         minutesSinceUpdate: Math.max(0, (start - Date.parse(p.updatedAt)) / 60_000),
@@ -338,6 +346,46 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         const ignored = ignoredRulings(view, { restackOf: () => false });
         result.ignoredFindingReturned = (ignored?.effectiveMisses ?? 0) >= 2;
       } catch { evidenceErrors.push('comment evidence unreadable or budget exhausted'); }
+      try {
+        const suspended = findSuspendedRuns({ repo, pr: p.number, head: headSha, now: start });
+        for (const held of suspended) {
+          const evidence = { runId: held.id, ageMinutes: held.ageMs / 60_000, findings: held.findings };
+          result.suspendedReferralRun ??= evidence;
+          // Require an explicit ruling for every saved finding; an empty thread proves none.
+          const ruled = held.findings.length > 0 && held.findings.every(f =>
+            result.openReferrals?.some(r => r.key === f.key && r.ruled === true));
+          const window = resolveReferralJudgeWindow({ env, log, readFile });
+          if (!ruled && evidence.ageMinutes >= window.value.windowMinutes && (publishAlert || !isUnderTest(process.env))) {
+            const publish = publishAlert ?? publishAttention;
+            // Reserve the run before publication, including across processes. No expiry or liveness probe:
+            // an uncertain publication stays claimed for operator inspection rather than being sent twice.
+            const dir = alertClaimsDir ?? join(resolveRunsDir(), 'referral-judge-alert-claims');
+            mkdirSync(dir, { recursive: true });
+            const store = createActionStore({ root: join(dir, createHash('sha256').update(held.id).digest('hex')), now: () => start });
+            const resource = actionResource(repo, { type: 'pr', id: String(p.number) });
+            const kind = 'suspended-referral-no-ruling';
+            if (store.attempts(resource).some(r => r.kind === kind && r.state === 'terminal' && r.outcome === 'settled')) continue;
+            const claim = store.claim({ resource, kind, owner: `judge-sweep:${process.pid}`, evidence: { runId: held.id, head: headSha } });
+            if (!claim.ok) continue;
+            let rec = claim.record;
+            const sending = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+              from: 'intent', to: 'dispatching', patch: { dispatchingSince: start } });
+            if (!sending.ok) throw Error('referral alert claim lost; inspect run store');
+            rec = sending.record;
+            log(`${repo}#${p.number} NEEDS-YOU run ${held.id}: referral judge windowMinutes=${window.value.windowMinutes} source=${window.sources.windowMinutes}`);
+            publish({ repo, pr: p.number, head: headSha, kind: 'suspended-referral-no-ruling',
+              reason: `PR #${p.number} run ${held.id} awaits referral ruling: ${held.findings.map(f => `${f.key}: ${f.summary}`).join('; ') || 'inspect saved referral findings'}`,
+              pick: `https://github.com/${repo}/pull/${p.number}` });
+            const observed = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+              from: 'dispatching', to: 'observed', patch: { handle: 'needs-you-feed' } });
+            if (!observed.ok) throw Error('referral alert observation lost; inspect run store');
+            rec = observed.record;
+            const settled = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+              from: 'observed', to: 'terminal', patch: { outcome: 'settled' } });
+            if (!settled.ok) throw Error('referral alert settlement lost; inspect run store');
+          }
+        }
+      } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
       if (labels.includes('review:human')) {
         try {
           // A retarget or base advance can change the net files without changing the head.
