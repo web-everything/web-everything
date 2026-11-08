@@ -155,17 +155,22 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     expect(decide(`env ${opt} npx vitest run a`, {})).toContain('`env ' + opt + ' ' + queue + 'npx vitest run a`');
   });
   // Self-review of round 4: options inside an env -S string, and the other peeled wrappers' value options.
-  const wrapperValueOptions = ['env -S "-i ', 'env -S "-u X ', 'env -S "-- ', "env -S '-a x ",
-    'sudo -p x ', 'sudo -D /tmp ', 'sudo -h h ', 'sudo -C 3 ', 'sudo -T 5 ', 'sudo --user x ', 'sudo --prompt=x ',
-    'nohup sudo -p x ', 'xargs -n 1 ', 'xargs -I {} ', 'xargs -a f ', 'xargs -P 2 -n1 ', 'command -p ', 'command -- '];
-  it.each(wrapperValueOptions)('denies a heavy run behind `%s…`', prefix => {
-    const close = prefix.includes('"') ? '"' : prefix.includes("'") ? "'" : '';
+  // `@` stands for the heavy run.
+  const wrapperValueOptions = ['env -S "-i @"', 'env -S "-u X @"', 'env -S "-- @"', "env -S '-a x @'",
+    'sudo -p x @', 'sudo -D /tmp @', 'sudo -h h @', 'sudo -C 3 @', 'sudo -T 5 @', 'sudo --user x @', 'sudo --prompt=x @',
+    'nohup sudo -p x @', 'xargs -n 1 @', 'xargs -I {} @', 'xargs -a f @', 'xargs -P 2 -n1 @', 'command -p @', 'command -- @',
+    // Second self-review of round 4: BSD/macOS xargs -J/-R/-S, words after the env -S string, nice's value options.
+    'xargs -J % @', 'xargs -R 1 -I {} @', 'xargs -S 255 -I {} @', 'env -S "-u X" @', 'env -S "" @', 'env -S "-i" @',
+    'env --split-string=-i @', 'nice -n 5 @', 'nice -5 @', 'nice --adjustment 5 @', 'nice --adjustment=5 @', 'nice -n5 @'];
+  it.each(wrapperValueOptions)('denies a heavy run behind `%s`', template => {
     for (const run of ['npx vitest run a', 'npx playwright test a', 'node --test a.test.mjs']) {
-      expect(decide(prefix + run + close, {}), prefix + run + close).toMatch(/heavy-enforce|heavy-command admission queue/);
+      const cmd = template.replace('@', run);
+      expect(decide(cmd, {}), cmd).toMatch(/heavy-enforce|heavy-command admission queue/);
     }
   });
   it.each(['env -S "-i git push --force origin main"', 'sudo -p x git push --force origin main',
-    'xargs -n 1 git push --force origin main'])('the shared peel also reaches the push guard: `%s`', cmd => {
+    'xargs -n 1 git push --force origin main', 'nice -n 5 git push --force origin main',
+    'env -S "-u X" git push --force origin main'])('the shared peel also reaches the push guard: `%s`', cmd => {
     expect(decide(cmd, {})).not.toBeNull();
   });
   it.each(['command -v npx', 'command -V vitest', 'sudo -p x ls', 'xargs -n 1 echo', 'env -S "-i ls"', 'sudo -h'])('still allows `%s`', cmd => {

@@ -280,7 +280,10 @@ describe('daemon heavy spawn admission lint', () => {
     expect(findUngatedHeavySpawns(source, file)).toEqual([]);
   });
   it.each(["execSync('env -S \"-i npx playwright test a\"');", "execSync('sudo -p x npx playwright test a');",
-    "execSync('xargs -n 1 npx playwright test');"])('rejects option-led env -S strings and valued wrapper options: %s', call => {
+    "execSync('xargs -n 1 npx playwright test');", "execSync('xargs -J % node --test %');",
+    "execSync('xargs -R 1 -I {} npx playwright test {}');", "execSync('env -S \"-u X\" npx playwright test a');",
+    "execSync('env -S \"-i\" npx vitest run a');", "execSync('nice -n 5 npx playwright test a');",
+  ])('rejects option-led env -S strings and valued wrapper options: %s', call => {
     expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
   });
   it('rejects an unrelated unadmitted spawn beside an admitted call', () => {

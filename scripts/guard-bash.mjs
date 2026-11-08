@@ -720,11 +720,14 @@ function envOptionWidth(opt) {
 }
 
 /** Value-taking options of the other wrappers the peel walks past, in the same shape as env's table.
- *  sudo: -u/-g/-U/-p/-D/-h/-C/-T/-r/-t/-R; xargs: -a/-d/-E/-I/-L/-n/-P/-s (-e/-i/-l take an attached value only). */
+ *  sudo: -u/-g/-U/-p/-D/-h/-C/-T/-r/-t/-R; xargs: -a/-d/-E/-I/-L/-n/-P/-s and BSD/macOS -J/-R/-S (-e/-i/-l take
+ *  an attached value only); nice: -n/--adjustment (and the attached `-5`). */
 const SUDO_VALUE_SHORT = 'ugUpDhCTrtR';
 const SUDO_VALUE_LONG = ['--user', '--group', '--other-user', '--prompt', '--chdir', '--host', '--close-from',
   '--command-timeout', '--role', '--type', '--chroot'];
-const XARGS_VALUE_SHORT = 'adEILnPs';
+const NICE_VALUE_SHORT = 'n';
+const NICE_VALUE_LONG = ['--adjustment'];
+const XARGS_VALUE_SHORT = 'adEILnPsJRS';
 const XARGS_VALUE_LONG = ['--arg-file', '--delimiter', '--max-args', '--max-procs', '--max-chars', '--process-slot-var'];
 
 /** How many words option `opt` occupies (2 when its value is the next word, else 1), given the program's
@@ -820,7 +823,16 @@ function wrapperPrefixLength(words) {
       while (words[i] === '-p' || words[i] === '--') i += 1;
       continue;
     }
-    if (w === 'builtin' || w === 'nice') { i += 1; continue; }
+    if (w === 'nice') {                                                       // nice [-n N | -N | --adjustment N] <cmd>
+      i += 1;
+      while (i < words.length && words[i].startsWith('-') && words[i] !== '-') {
+        const opt = words[i];
+        if (opt === '--') { i += 1; break; }
+        i += /^-\d+$/.test(opt) ? 1 : optionWidth(opt, NICE_VALUE_SHORT, NICE_VALUE_LONG);
+      }
+      continue;
+    }
+    if (w === 'builtin') { i += 1; continue; }
     if (w === 'sudo') {                                                       // sudo -n -u <user> -p <prompt> … <cmd>
       i += 1;
       while (i < words.length && words[i].startsWith('-')) {
@@ -3596,30 +3608,35 @@ export function stripShellControl(segment) {
  *  cluster holding S) splits into argv and runs, or null. env runs that string as the command, so it is the
  *  head the heavy classifiers must see. Pure. */
 export function envSplitString(segment) {
-  const words = headWords(stripShellControl(segment).replace(/^[({]\s*/, ''));
+  const src = stripShellControl(segment).replace(/^[({]\s*/, '');
+  const words = headWords(src);
   const w = words.map((word) => word.text);
   const at = w.findIndex((word) => /(?:^|\/)env$/.test(word));
   if (at < 0 || wrapperPrefixLength(w.slice(0, at)) !== at) return null;
+  // env runs the split words FOLLOWED BY the words after the string (`env -S "-u X" npx vitest run a`, review
+  // #6461 r4), so the remaining raw text is appended. `next` is the index of the first word after the string.
+  const split = (text, next) => envSplitText(text, words[next] ? src.slice(words[next].start) : '');
   for (let i = at + 1; i < w.length; i += 1) {
     const opt = w[i];
     if (opt === '--' || !opt.startsWith('-') || opt === '-') return null; // options end; the command follows
     // GNU accepts any unambiguous prefix of a long option (`--split`, `--sp=`).
     const [name, value] = opt.includes('=') ? [opt.slice(0, opt.indexOf('=')), opt.slice(opt.indexOf('=') + 1)] : [opt, null];
     const longOf = (full, min) => name.length >= min && full.startsWith(name);
-    if (longOf('--split-string', 4)) return envSplitText(value ?? w[i + 1]);
+    if (longOf('--split-string', 4)) return value !== null ? split(value, i + 1) : split(w[i + 1], i + 2);
     if (opt.startsWith('--')) { i += envOptionWidth(opt) - 1; continue; }
     for (let k = 1; k < opt.length; k += 1) {
       if (ENV_VALUE_SHORT.includes(opt[k])) { if (k === opt.length - 1) i += 1; break; }
-      if (opt[k] === 'S') return envSplitText(opt.slice(k + 1) || w[i + 1]);
+      if (opt[k] === 'S') return opt.slice(k + 1) ? split(opt.slice(k + 1), i + 1) : split(w[i + 1], i + 2);
     }
   }
   return null;
 }
 
 /** env -S's own escapes: `\_` is a space (`npx\_vitest` runs `npx vitest`), `\t` a tab. */
-function envSplitText(text) {
+function envSplitText(text, tail = '') {
   if (text == null) return null;
-  const split = String(text).replace(/\\_/g, ' ').replace(/\\t/g, '\t');
+  // The escapes belong to the split string only; `tail` is the shell text after it, kept raw.
+  const split = String(text).replace(/\\_/g, ' ').replace(/\\t/g, '\t') + (tail ? ' ' + tail : '');
   // env reads options inside the split string too (`env -S "-i npx vitest run a"`), so a string that starts with
   // one is classified as the env command it is (review #6461 r4).
   return /^\s*-/.test(split) ? 'env ' + split.trimStart() : split;
