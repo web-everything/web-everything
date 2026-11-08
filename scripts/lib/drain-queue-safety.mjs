@@ -420,10 +420,31 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine }) {
     const infra = failed.every(check => infraConclusions.has(check.conclusion)
       || [check.output?.title, check.output?.summary].some(value => typeof value === 'string' && runnerLoss.test(value))
         && ![check.output?.title, check.output?.summary, check.output?.text].some(value => typeof value === 'string' && testFailure.test(value)));
-    const runs = readPages(`repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`, 'workflow_runs');
+    // These queries need only their first page, regardless of the workflow's history size.
+    const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
+    const readRunPage = (endpoint, limit, allowEmpty = false) => {
+      if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
+      const result = JSON.parse(exec('gh', ['api', endpoint],
+        { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+          stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+      const runs = result?.workflow_runs;
+      if (!Number.isSafeInteger(result?.total_count) || result.total_count < 0
+        || !Array.isArray(runs) || runs.length !== Math.min(result.total_count, limit)
+        || (runs.length === 0 && !(allowEmpty && result.total_count === 0)))
+        throw new Error('invalid retry evidence page');
+      const ids = new Set();
+      for (const run of runs) {
+        if (!Number.isSafeInteger(run?.id) || run.id <= 0 || ids.has(run.id))
+          throw new Error('invalid retry evidence identity');
+        ids.add(run.id);
+      }
+      return runs;
+    };
+    const newest = readRunPage(`${mainEndpoint}&per_page=1`, 1);
+    const runs = readRunPage(`${mainEndpoint}&status=completed&created=<${new Date(removedAt).toISOString()}&per_page=100`, 100, true);
     const conclusions = new Set([...passing, ...infraConclusions, 'failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
-    if (runs.some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
+    if ([...newest, ...runs].some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
       || run.event !== 'push' || (run.status === 'completed' ? !conclusions.has(run.conclusion)
         : !unfinished.has(run.status) || run.conclusion !== null)
       || !Number.isFinite(timestamp(run.created_at))
@@ -434,7 +455,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine }) {
     const mainRed = ['failure', 'cancelled', 'timed_out'].includes(before?.conclusion);
     const failedNames = failed.filter(check => !infraConclusions.has(check.conclusion))
       .map(check => (typeof check.name === 'string' ? check.name : 'unnamed').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')).slice(0, 5);
-    return { mainGreen: runs[0].status === 'completed' && runs[0].conclusion === 'success', failedNames,
+    return { mainGreen: newest[0].status === 'completed' && newest[0].conclusion === 'success', failedNames,
       infra: infra ? 'infra' : mainRed ? 'main-red' : null,
       mergeState: readMqMergeState({ repo, pr, head, exec }) };
   } catch { return null; }
