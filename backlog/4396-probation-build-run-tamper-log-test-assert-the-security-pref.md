@@ -5,8 +5,8 @@ status: open
 scope: ["we:scripts/operations/__tests__/probation-build-run.test.mjs"]
 estimatedLoc: 6
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-02"
-preparedAgainstSha: "12a7f4ab8f9ac22a3751b3b3a8a357baa1afecc8"
+preparedDate: "2026-11-06"
+preparedAgainstSha: "fa7d3c16872ce1d496af6261a0cc0199af94270d"
 tags: []
 ---
 
@@ -55,3 +55,4 @@ None required for this advisory. Other security log branches remain outside this
 - Source evidence: the shared fake logger discards messages at we:scripts/operations/__tests__/probation-build-run.test.mjs:106; the runtime wraps messages at we:scripts/operations/probation-build-run.mjs:311 and emits the worker-tamper security diagnostic at line 520 of that same file. The adjacent restore-failure case at we:scripts/operations/__tests__/probation-build-run.test.mjs:616–621 already covers quarantine behavior; this task introduces no new fallback.
 - No prior estimate existed. Set `estimatedLoc: 6`: one existing test file × approximately six added lines for a local message array, callback, assertion, and spacing. No size change or blocker change is proposed.
 - Preparation is based on source inspection; no implementation or test run is claimed. Stamping and checks remain runner-owned.
+- Re-prepare 2026-11-06: the scope file changed on main after the earlier stamp (PR #5484). Re-verified against current `main`: goal not delivered (no `SECURITY` assertion in the test file); citations still hold (test at :600–614, shared logger :106, runtime :311 and :520). No design change; re-stamped.

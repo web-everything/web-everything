@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["plateau:scripts/wip-publish.ts", "plateau:scripts/__tests__/wip-publish.test.mjs", "plateau:src/wip/wip-agent-options.ts", "plateau:src/wip/wip-agent-options.test.ts", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-03"
-preparedAgainstSha: "1b2aa007d3d7e718e7cf272da107a675f2cf5792"
+preparedDate: "2026-11-07"
+preparedAgainstSha: "f9a9e945e8cbccfc769dcee13c73ada3b58b0113"
 tags: []
 ---
 
@@ -33,6 +33,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/plateau-app#187@
 - Fixture precision: the original slow-read plan required only “exceed two” after removing the override. `plateau:src/wip/wip-agent.ts:192-199` serializes each `sync` caller, while `plateau:src/wip/wip-agent.ts:368` invokes `sync` directly for each timer tick. Thus a read held until 25,000 ms queues socket-open plus the 10,000 and 20,000 ms ticks: four total reads after settlement under the missing-override mutation, versus two with publisher options. Watcher notifications use the distinct coalescing `kick` path. Pin these counts and the literal 120,000 ms value; no runtime/default change is needed.
 - Caller recheck still finds only the live call and the existing tests at `plateau:src/wip/wip-agent.test.ts:47` and `plateau:src/wip/wip-feeds.test.ts:38`. The source guard must allow the separate `fingerprint` import from the agent module at `plateau:scripts/wip-publish.ts:43`; count the named factory binding and its uses, not all imports from that module. Size remains 3 (old 3 → new 3), retaining the approximately 265 changed-line allocation above. Scope, dependency edges and preparation stamps remain unchanged.
 
+- Revalidation on 2026-11-07 (WE main `f9a9e945e8`): Plateau origin/main is still `af64fef`; the live call and override remain at `plateau:scripts/wip-publish.ts:188,199`, and the assembler and both suites are still absent. The WE guidance list in `we:docs/agent/testing.md` gained 14 lines since the earlier stamp (items 5-6 now end at line 1471; the new item 7 for the timing guideline goes after it), and the exact A4 sentence is still absent. Goal undelivered; scope, size 3 (old 3 → new 3) and design unchanged.
+
 ## Design
 
 Add a pure live-publisher options assembler named `createPublisherAgentOptions` (proposed) in planned `plateau:src/wip/wip-agent-options.ts`, accepting `Omit<AgentDeps, 'readEveryMs'>` and returning `AgentDeps`. Import the type from `plateau:src/wip/wip-agent.ts` and the cadence constant from `plateau:src/wip/wip-source.ts`. Spread dependencies first, then set `readEveryMs: PUBLISH_EVERY_MS`, so even an extra runtime property cannot override the publisher's cadence. Remove the inline `readEveryMs` property from the live dependency object and wrap that object with this assembler in `plateau:scripts/wip-publish.ts`. Preserve every other dependency, feed, handler, watcher and staleness hook by identity. Keep the generic default and HTTP/once branches unchanged.
@@ -54,6 +56,16 @@ Extend the quality guidelines in `we:docs/agent/testing.md`: manually probed fix
 - Hold the first startup read for 25,000 fake milliseconds, opening the socket at time zero. Resolve it and flush microtasks; allow the single queued socket-open read to settle immediately, assert exactly two reads total, and assert no further read before 120,000 ms. The generic 10-second fallback queues additional timer reads at 10 and 20 seconds, so removing the override must produce exactly four reads after settlement at 25,000 ms (startup, socket-open, and two queued timer calls). Do not hold every read indefinitely or mistake the legitimate open-triggered read for a timer regression. A separate watcher case fires before that boundary and must read promptly. Count injected read calls, not sends or heavy cache misses. Stop the agent and restore real timers after every case.
 - In planned `plateau:scripts/__tests__/wip-publish.test.mjs`, name cases `live publisher uses cadence assembler` and `wiring guard refuses incomplete or bypassed evidence`. Read the actual script from disk. Exercise bypass, override, comment-only decoy, missing/duplicate call, wrong-module import, shadowed binding, escaped/indirect alias, malformed source, unsupported call shape and injected read failure fixtures through the same checker. Fail with a diagnostic requiring guard review; there is no permissive fallback.
 - Re-run existing `plateau:src/wip/wip-agent.test.ts`, `plateau:src/wip/wip-source.test.ts`, `plateau:src/wip/wip-publish.test.ts` and `plateau:src/wip/wip-feeds.test.ts` to protect the unchanged generic caller/default, watchers, feeds and HTTP behavior. Run through host heavy admission with Plateau root/config, never a bare test invocation.
+
+## Edge cases this change must handle
+
+1. Untrusted text: n/a: no LLM, PR, card or CLI text reaches a shell, argv, path or regex; the wiring guard parses repo source with the TypeScript parser and never evaluates it.
+2. Truncated reads: the guard reads the whole script from disk; an unreadable file fails the test with the source path (injected read-failure fixture), and a truncated file is rejected by the parse plus exactly-one-call checks. No `gh`/`git` reads are added.
+3. Shared state files: n/a: no state file is written; the suites use injected fakes only.
+4. Fail closed: a parse error, unreadable source, absent or duplicate call, unsupported syntax or wrong-module import fails the test with a "review/update the guard" diagnostic; never a skip, `[]` or pass (A3 negative fixtures).
+5. Identity scoping: imports are matched by actual module path (assembler must resolve to `plateau:src/wip/wip-agent-options.ts`) and named binding, not exported name alone; shadowed or aliased bindings are rejected.
+6. State over time: fake timers cover the two initialization reads, the 120,000 ms and 240,000 ms boundaries, a read held to 25,000 ms, and a watcher kick before the boundary; timers are stopped and real timers restored after every case. No persisted cadence state exists.
+7. Who wrote it: handled: no comment, ref, label or job name grants trust; comment-only decoys must not satisfy the guard (tested).
 
 ## Acceptance
 

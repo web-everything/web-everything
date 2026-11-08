@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 
 import {
   salvageHintFor, salvageEntriesFor, salvageHintLine, withSalvageHint, refreshSalvageIndex, readSalvageIndex, parseSalvageStamp,
-  backfillSalvageDir, isUnderSalvageRoot,
+  backfillSalvageDir, isUnderSalvageRoot, isSalvageLanded,
 } from '../salvage-index.mjs';
 import { salvageLane, appendSalvageIndex } from '../lane-salvage.mjs';
 import { classifyPoolLeftover } from '../pool-leftovers.mjs';
@@ -82,6 +82,29 @@ describe('refreshSalvageIndex + backfill (real git)', () => {
     expect(existsSync(rec.bundle)).toBe(false);
     expect(readSalvageIndex(salvageRoot)).toEqual([]);
     expect(git(lane, 'for-each-ref', 'refs/salvage')).toBe('');
+  });
+
+  it('R618 — an entry with nestedRepos is never proven landed, even when every tip is already on main (isSalvageLanded → null; refreshSalvageIndex never sets landed)', () => {
+    writeFileSync(join(lane, 'a.txt'), 'work\n');
+    const now = new Date('2026-09-27T02:00:00Z');
+    const rec = salvageLane({ dir: lane, lane: 3, pool: 'p', branchRef: 'origin/main', salvageRoot, now });
+    // The same change lands on main by another path, so every snapshot tip is covered.
+    const other = join(root, 'other');
+    execFileSync('git', ['clone', '-q', origin, other], { stdio: 'ignore' });
+    for (const [k, v] of [['user.name', 't'], ['user.email', 't@t'], ['commit.gpgsign', 'false']]) git(other, 'config', k, v);
+    writeFileSync(join(other, 'a.txt'), 'work\n'); git(other, 'commit', '-qam', 'landed'); git(other, 'push', '-q', 'origin', 'main');
+    git(lane, 'fetch', '-q', 'origin');
+    // Control: without nested repos the very same entry IS provably landed.
+    expect(isSalvageLanded(rec, { repoDir: lane })).toBe(true);
+    // A nested-repo copy is plain files no git tip carries: landing can never be proven.
+    const nested = { rel: 'sub/repo', dest: join(salvageRoot, 'p', 'nested-copy') };
+    expect(isSalvageLanded({ ...rec, nestedRepos: [nested] }, { repoDir: lane })).toBeNull();
+    // Through the index: the persisted row carrying nestedRepos is never marked landed.
+    const idx = join(salvageRoot, 'index.jsonl');
+    const rows = readFileSync(idx, 'utf8').split('\n').filter(Boolean).map((l) => ({ ...JSON.parse(l), nestedRepos: [nested] }));
+    writeFileSync(idx, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    expect(refreshSalvageIndex({ root: salvageRoot, nowMs: now.getTime() }).landed).toHaveLength(0);
+    expect(readSalvageIndex(salvageRoot)[0].landed).toBe(false);
   });
 
   it('#4273 — expiry removes a DIRECTORY-shaped litter artifact (lane-N.wt-litter/) cleanly, and counts its EXACT nested size (no double-count from also listing litter[].dest)', () => {

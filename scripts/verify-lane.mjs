@@ -61,9 +61,11 @@ import { resolveBuildPolicy } from './lib/build-policy.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
+import { signalVerifyRequest } from './lib/fix-handoff.mjs';
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
+import { createOutputTail } from './lib/output-tail.mjs';
 import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
 import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
@@ -602,6 +604,7 @@ if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, st
 // (below): a request never actually runs the gate itself, so it has no business queuing on the capacity
 // semaphore — that cost belongs to whichever `verify-dispatch.mjs` tick actually executes it.
 if (MODE === 'request') {
+  signalVerifyRequest();
   emit({ sha: headSha, status: 'requested', reason: 'requested', exitCode: null, detail: `verification requested for ${headSha.slice(0, 8)} (suites: ${GATE}) — poll \`node scripts/verify-lane.mjs check\` for the result.` }, 0);
 }
 
@@ -673,6 +676,8 @@ const PHASE_TIMEOUT_MS = verifySetting('phaseTimeoutMs', process.env);
 const PHASE_TIMEOUT_SOURCE = verifySettingSource('phaseTimeoutMs', process.env);
 process.stderr.write(`verify-lane: phase timeout ${PHASE_TIMEOUT_MS}ms (phaseTimeoutMs, ${PHASE_TIMEOUT_SOURCE})\n`);
 let phaseTimeout = null;
+// Last 200 scrubbed output lines of the first phase that timed out or was killed (persisted on the infrastructure record).
+let killedOutputTail = null;
 // Named per verify-lane process, so a nested verify-lane (a test of this file) adds its own marker instead of replacing ours.
 const GATE_PHASE_MARKER_ENV = `WE_VERIFY_GATE_PHASE_${process.pid}`;
 const HEAVY_ADMISSION_MODULE = new URL('./readiness/heavy-admission.mjs', import.meta.url).href;
@@ -712,6 +717,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
   }
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
+  const outputTail = createOutputTail();
   let bytes = 0;
   // xaipsbs — the gate's own `npm run test:unit` / `check:standards` are wrapped in `heavy-admission.mjs run`;
   // this flag makes those nested wrappers pass through instead of asking for a second slot for the same work.
@@ -726,6 +732,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
         collector.push(chunk, name);
+        outputTail.push(chunk, name);
         bytes += Buffer.byteLength(chunk);
         if (bytes <= MAX_TIMEOUT_LOG_BYTES) output[name] += chunk;
         // Flush each chunk before the terminal JSON; no pending writable queue can overtake it.
@@ -785,7 +792,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
   });
   const reports = readRemoteReport(reportFile);
   if (reports.some(r => r.location === 'local-fallback')) process.stderr.write('verify-lane: remote attempt fell back to local admission (nested wrapper owns the slot)\n');
-  return { ...result, remoteAttempt: forgeDispatch, ranOn: phaseRunLocation(reports, { remoteAttempt: forgeDispatch }), failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
+  return { ...result, ...(result.timedOut || result.signal ? { outputTail: outputTail.finish() } : {}), remoteAttempt: forgeDispatch, ranOn: phaseRunLocation(reports, { remoteAttempt: forgeDispatch }), failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
   } finally { rmSync(reportDir, { recursive: true, force: true }); }
 }
 // #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
@@ -850,6 +857,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     const remoteFailure = remoteInfrastructureFailure(result);
     if (remoteFailure) remoteUnconfirmed = true;
     if (result.timedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
+    if ((result.timedOut || result.signal) && result.outputTail?.length) killedOutputTail ??= result.outputTail;
     if (kind) recordOutcome(outcomeKey ?? kind, { ...buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }), ...(remoteFailure ? { reason: 'remote-termination-unconfirmed', infrastructure: remoteFailure } : {}) });
     return result;
   } catch (error) {
@@ -1039,8 +1047,10 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
+const infrastructureBase = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
   ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
+const infrastructure = infrastructureBase && killedOutputTail && ['verify-timeout', 'verify-signal'].includes(infrastructureBase.reason)
+  ? { ...infrastructureBase, outputTail: killedOutputTail } : infrastructureBase;
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).

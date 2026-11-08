@@ -80,7 +80,7 @@ import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPo
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { findResumableParkedRun, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -647,13 +647,14 @@ export async function runReviewLoopOnce({
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
-  } else {
+  }
+  if (!parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused) {
     // Card xq1xbsl — A RULING ON AN UNCHANGED HEAD RESUMES THE PAUSED REVIEW; IT DOES NOT START A NEW PANEL. A fresh
     // panel judges the same head again, raises referrals the first one did not, and parks the PR for a ruling it
     // already had (live 2026-10-08, #4361/#4388). The parked run already holds the panel's verdict and findings, so it
     // goes back to the step that reads the rulings and carries on from there. New referrals come only from a new push.
-    let resumedId = null;
-    if (parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
+    let resumedId = parsed.control.resume ?? null;
+    if (!resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
       try { resumedId = findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }); } catch { resumedId = null; }
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
@@ -674,6 +675,16 @@ export async function runReviewLoopOnce({
       // Card 5752 — a parked run whose referral persist failed and whose retry budget is spent is never replaced by a
       // fresh panel: that is the operator's call now (the exhausted hold raises the needs-you), so the round refuses.
       const parkedEvidence = parked && parked.op === declaration.name ? reviewRunEvidence(parked) : null;
+      if (parkedEvidence?.referralStageRefused) {
+        let ruled = false;
+        try {
+          ruled = declaration.steps[parked.cursor]?.name === 'stageVerdict'
+            && refusedReferralsAreRuled({ ...readAcceptancePr(parked.input), number: parked.input.pr }, parkedEvidence,
+              { repo: parked.input.repo, cardReadable });
+        } catch { /* unreadable live evidence keeps the refusal */ }
+        if (!ruled) return { code: 2, run: parked, stopped: 'refused',
+          lines: [`error: run ${parked.id} still requires readable standing referral rulings on its reviewed head; resume after ruling every finding.`] };
+      }
       const resumeAdvise = parkedEvidence?.resumeAdvise === true;
       const adviseAttempts = Math.max(0, Number(parked?.resumeOf?.adviseAttempts) || 0);
       // A fresh-panel fallback cannot resolve an unknown external write. Keep its non-idempotent replay fence
@@ -686,7 +697,7 @@ export async function runReviewLoopOnce({
       if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
         persistSpent = parked.id;
       } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
-        && (parked.pending?.kind === 'confirm' || unfinishedResume)) {
+        && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused)) {
         // Continue an interrupted advisory step in place: its effect history skips applied writes and refuses
         // unknown non-idempotent outcomes. Rewinding it would discard both protections. Persistence attempts do
         // not consume this later step's retry budget.

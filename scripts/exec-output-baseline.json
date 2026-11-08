@@ -55,7 +55,6 @@
   "scripts/operations/record-verdict-io.mjs": 2,
   "scripts/operations/review-extra-seats.mjs": 1,
   "scripts/operations/runner-freshness.mjs": 1,
-  "scripts/pr-body-edit.mjs": 1,
   "scripts/pr-land.mjs": 4,
   "scripts/pr-state.mjs": 1,
   "scripts/progress-board.mjs": 1,

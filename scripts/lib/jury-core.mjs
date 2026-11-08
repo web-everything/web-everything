@@ -1,3 +1,4 @@
+import { FINDING_CLASSES, classAction, readFindingClassPolicy, validAlsoClasses } from './finding-class-policy.mjs';
 /**
  * jury-core.mjs — the subject-agnostic JURY ENGINE core (#2653, foundational slice of epic #2649).
  *
@@ -44,7 +45,8 @@ import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
 import { CARE_LEVELS } from './review-escalation.mjs';
-import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isTrustedMarkerAuthor,
+  readJudgeActorPolicy } from './marker-authorship.mjs';
 // #2438's labelled data fence (#2967 moved it to a leaf so this module can reach it — `review-core.mjs`,
 // where it used to live, imports THIS module, so importing back would be a cycle).
 import { FENCED_DATA_RULE, fenceUntrusted } from './mandate-fence.mjs';
@@ -373,6 +375,10 @@ export function normalizeFinding(raw) {
   if (!String(summary).trim()) return null;
   /** @type {Finding} */
   const out = { summary: String(summary).trim() };
+  if (raw.securityReachableToday === true) out.securityReachableToday = true;
+  if (FINDING_CLASSES.includes(raw.findingClass)) out.findingClass = raw.findingClass;
+  if (out.findingClass && validAlsoClasses(raw.alsoClasses, out.findingClass).length) out.alsoClasses = validAlsoClasses(raw.alsoClasses, out.findingClass);
+  if (typeof raw.classBasis === 'string') out.classBasis = raw.classBasis.trim();
   if (raw.file) out.file = String(raw.file);
   if (raw.failure_scenario) out.failure_scenario = String(raw.failure_scenario);
   if (raw.category) out.category = String(raw.category);
@@ -1385,8 +1391,8 @@ export function redTeamRequired(verdict) {
  * @param {{ran?: boolean, findings?: Finding[]|Array<object>}} [o]
  * @returns {'accept'|'changes'|'needs-human'|'prevention-outstanding'}
  */
-export function foldRedTeamVerdict({ ran = false, findings = [] } = {}) {
-  return deriveVerdict({ findings, humanRequired: !ran });
+export function foldRedTeamVerdict({ ran = false, findings = [], findingClasses = readFindingClassPolicy() } = {}) {
+  return deriveVerdict({ findings: findings.filter(f => classAction(f, findingClasses) !== 'defer-card'), humanRequired: !ran });
 }
 
 /**
@@ -3835,9 +3841,10 @@ export function validateOperatorRuling(r) {
   try {
     if (!r || r.version !== 1 || !/^[^/\s]+\/[^/\s]+$/.test(r.repo) || !Number.isInteger(r.pr) || r.pr < 1
       || !/^[a-f0-9]{40}$/.test(r.head)) return false;
-    if (typeof r.actor !== 'string' || !/^[\w-]+$/.test(r.actor)) return false;
+    if (typeof r.actor !== 'string' || !(/^[\w-]+$/.test(r.actor) || r.actor === JUDGE_ACTOR)) return false;
     // `auto-policy` (review.referralDefault=auto-block) is NOT an operator. It may only HOLD: every ruling is `block`.
     if (r.actor.toLowerCase() === AUTO_POLICY_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
+    else if (r.actor === JUDGE_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
     else if (!OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
     if (typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel) || r.channel.length > 200) return false;
     if (typeof r.reason !== 'string' || !r.reason.trim() || r.reason.length > 4000) return false;
@@ -3874,7 +3881,7 @@ export function buildOperatorRulingComment(r) {
   });
   const auto = r.actor.toLowerCase() === AUTO_POLICY_ACTOR;
   return `## ${auto ? 'Automatic policy ruling' : 'Operator ruling'} on mandatory referrals\n\n`
-    + (auto ? `Recorded by policy, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`. The operator can override it with a card or not-real ruling.\n`
+    + (r.actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n` : auto ? `Recorded by policy, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`. The operator can override it with a card or not-real ruling.\n`
       : `Recorded on the operator's explicit instruction: @${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n`)
     + `This rules only on the findings listed; it applies to this head only and does not change review labels.\n\n`
     + `${quote}\n\n${lines.join('\n')}\n\n`
@@ -3895,9 +3902,16 @@ export function parseOperatorRulingComment(comment) {
   let record = null;
   try { record = match ? JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')) : null; } catch { record = null; }
   const head = typeof record?.head === 'string' && /^[a-f0-9]{40}$/.test(record.head) ? record.head : undefined;
+  if (record?.actor === JUDGE_ACTOR && (!AUTOMATION_LOGINS.includes(login)
+    || !Array.isArray(record.rulings) || record.rulings.some(x => x?.result !== 'block'))) return null;
   if (!trusted || !record || !validateOperatorRuling(record)) return { malformed: true, head };
   try { if (buildOperatorRulingComment(record) !== normalized) return { malformed: true, head }; }
   catch { return { malformed: true, head }; }
+  // A judge record only adds holds (#6494): no supersession (a judge block never retires a standing ruling) and no
+  // review-clearance token anywhere — the red-team reader's refusal. Checked only AFTER the integrity check above, so a
+  // hand-edited judge comment stays malformed (and holds) instead of being silently dropped.
+  if (record.actor === JUDGE_ACTOR && (record.rulings.some(x => Array.isArray(x?.supersedes) && x.supersedes.length)
+    || JUDGE_RESERVED_TOKEN_RE.test(normalized))) return null;
   return { record };
 }
 
@@ -3911,7 +3925,7 @@ export function operatorRulingId(o) {
 }
 
 /** Every valid operator ruling in thread order, flattened to one entry per (run, finding). */
-export function readOperatorRulings(comments, { head } = {}) {
+export function readOperatorRulings(comments, { head, judgePolicy = () => readJudgeActorPolicy().value } = {}) {
   const rulings = [];
   let malformed = false;
   const current = /^[a-f0-9]{40}$/.test(head ?? '') ? head : null;
@@ -3920,6 +3934,7 @@ export function readOperatorRulings(comments, { head } = {}) {
   // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
   // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
   let recordRepos, blockRepos;
+  let judge; // the judge policy, read once per call and only when a judge record is met
   const blockSubject = (repo, pr, head, runId, key) => JSON.stringify([canonicalRepoSlug(repo), pr, head, runId, key]);
   const spellingOf = (repo, pr, head, runId, key, result) => {
     // A `block` never adopts: only a clearing ruling is made MORE visible, so a spelling mismatch can never hide a hold.
@@ -3956,6 +3971,12 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
+      if (r.actor === JUDGE_ACTOR) {
+        if (x.result !== 'block') continue;
+        // An unreadable policy refuses every judge row (fail closed) and is not re-read per row.
+        if (judge === undefined) { try { judge = judgePolicy() ?? null; } catch { judge = null; } }
+        if (judge?.enabled !== true || judge.actor !== JUDGE_ACTOR) continue;
+      }
       rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId, x.key, x.result), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));

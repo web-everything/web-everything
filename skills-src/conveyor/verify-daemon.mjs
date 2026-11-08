@@ -72,6 +72,7 @@ import { runVerifyDispatch, recordKilledVerification, killOrphanGroup, killAdopt
 import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { createVerifyGateJobs, resolveGateAsJob } from '../../scripts/conveyor/verify-gate-job.mjs';
+import { createFixHandoffSleep, verifyHandoffDir } from '../../scripts/lib/fix-handoff.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Fix-dispatch
  *  and Review daemons' own keys (#3870, #3876), so none of them ever contend on the same lock dir (#3877).
@@ -195,6 +196,39 @@ export function cloneHeadChanged({ bootHead, readHead }) {
 // between ticks, not incidental background bookkeeping safe to drop on exit. Copied here verbatim, on purpose
 // — do NOT add `.unref()` to this function.
 export function realSleep(ms) { return new Promise((resolve) => { setTimeout(resolve, ms); }); }
+
+/** Coalesce requests until quiet, bounded by the existing interval deadline.
+ * Watch failures disable early waking for this process; the ref'd timer remains the backstop. */
+export function createVerifyWakeSleep({ dir = verifyHandoffDir(), debounceMs = 100, statPollMs = 1000,
+  watchDir, intervalFallback = realSleep, log = console.error,
+} = {}) {
+  let handoffSleep;
+  const fallback = error => {
+    handoffSleep = null;
+    log(`verify-daemon: verify request watcher failed; falling back to interval timer: ${String(error?.message || error).split('\n')[0]}`);
+  };
+  try {
+    handoffSleep = createFixHandoffSleep({ dir, statPollMs, watchDir, failOnWatchError: true });
+  } catch (error) { fallback(error); }
+  return async ms => {
+    const deadline = Date.now() + ms;
+    let requested = false;
+    try {
+      if (handoffSleep) {
+        // Every iteration awaits an event or a timer; each new request restarts the quiet window.
+        do {
+          const remaining = Math.max(0, deadline - Date.now());
+          const reason = await handoffSleep(requested ? Math.min(debounceMs, remaining) : remaining);
+          if (reason !== 'handoff') return requested ? 'handoff' : 'interval';
+          requested = true;
+        } while (Date.now() < deadline);
+        return 'handoff';
+      }
+    } catch (error) { fallback(error); }
+    await intervalFallback(Math.max(0, deadline - Date.now()));
+    return 'interval';
+  };
+}
 
 /**
  * #4130 — THE INDEPENDENT HEARTBEAT: a real `setInterval`, started BESIDE (never inside) `runDaemonLoop`'s own
@@ -392,7 +426,16 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
       if (gateJobs && result.dispatched?.length) await gateJobs.sync(inFlight);
       return { ...result, orphaned };
     },
-    sleep: realSleep,
+    sleep: (() => {
+      const wakeSleep = createVerifyWakeSleep({ log: message => log.error(message) });
+      return async ms => {
+        const reason = await wakeSleep(ms);
+        log.error(reason === 'handoff'
+          ? 'verify-daemon: woke early on verify request'
+          : 'verify-daemon: woke on interval');
+        return reason;
+      };
+    })(),
     isAlive,
     onTick: (result) => {
       const { dispatched = [], deferred = [], draining = false, orphaned = [] } = result || {};

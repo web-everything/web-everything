@@ -19,9 +19,10 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -564,6 +565,50 @@ export function runSafetyNet({
   }
 }
 
+export const RERUN_MARKER_PREFIX = 'red-main-quarantine-rerun-';
+
+/**
+ * After a quarantine add, re-run the FAILED jobs of main's CI run for the broken sha so the merge-gate red-main-freeze
+ * can lift without a human (the freeze only lifts on a new green main run, and nothing can merge to make one). Once per
+ * broken sha: the claim is a per-sha marker file created exclusively BEFORE the request, so concurrent adds cannot both
+ * rerun, and an unwritable claim means no rerun (fail closed). Only when the latest main CI run for that sha is
+ * completed+failed. It never touches the freeze itself: a rerun that still fails leaves the freeze in place. Never
+ * throws; a failed request is reported (`error`, with the manual fallback command) and the claim kept: at most one logical request per sha (the shared gh throttle may retry a rate-limited call, bounded).
+ * @returns {{rerun:boolean, runId?:number, reason?:string, error?:string}}
+ */
+export function rerunRedMainFailedJobs({ brokenSha: rawSha, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug, dir = join(tmpdir(), 'we-red-main-quarantine') } = {}) {
+  if (!/^[0-9a-f]{7,40}$/i.test(String(rawSha ?? ''))) return { rerun: false, reason: 'no-broken-sha' };
+  const brokenSha = String(rawSha).toLowerCase(); // git/GitHub shas are lowercase; compare and claim on one spelling
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' };
+  let marker = null;
+  try {
+    const runs = JSON.parse(String(exec('gh', ['run', 'list', '--repo', repoSlug, '--workflow', 'ci.yml', '--branch', 'main', '--limit', '30', '--json', 'databaseId,headSha,status,conclusion,createdAt'], opts) || '[]'));
+    const mine = (Array.isArray(runs) ? runs : []).filter((r) => r && typeof r.headSha === 'string' && r.headSha.toLowerCase().startsWith(brokenSha));
+    const latest = mine.sort((x, y) => Date.parse(y.createdAt) - Date.parse(x.createdAt) || y.databaseId - x.databaseId)[0];
+    if (!latest) return { rerun: false, reason: 'no-run-for-sha' };
+    if (latest.status !== 'completed' || latest.conclusion !== 'failure') return { rerun: false, reason: 'latest-run-not-failed', runId: latest.databaseId };
+    try {
+      mkdirSync(dir, { recursive: true });
+      marker = join(dir, `${RERUN_MARKER_PREFIX}${latest.headSha.toLowerCase()}.json`);
+      writeFileSync(marker, JSON.stringify({ runId: latest.databaseId, at: new Date().toISOString() }), { flag: 'wx' });
+    } catch (e) {
+      const taken = marker && e?.code === 'EEXIST';
+      marker = null;
+      return taken ? { rerun: false, reason: 'already-rerun' } : { rerun: false, error: `rerun claim unwritable: ${String(e?.message || e).split('\n')[0]}` };
+    }
+    try {
+      exec('gh', ['run', 'rerun', String(latest.databaseId), '--repo', repoSlug, '--failed'], opts);
+    } catch (e) {
+      // The claim STAYS: at most one request per sha, so a failing gh can never turn into a storm (a lost response may
+      // even have been accepted). The operator-visible fallback is the manual command named in the error.
+      return { rerun: false, runId: latest.databaseId, error: `${String(e?.message || e).split('\n')[0]} (claim kept; rerun by hand: gh run rerun ${latest.databaseId} --failed)` };
+    }
+    return { rerun: true, runId: latest.databaseId };
+  } catch (e) {
+    return { rerun: false, error: String(e?.message || e).split('\n')[0] };
+  }
+}
+
 function flagsOf(argv) {
   const f = {};
   for (const a of argv) { if (!a.startsWith('--')) continue; const i = a.indexOf('='); if (i < 0) f[a.slice(2)] = true; else f[a.slice(2, i)] = a.slice(i + 1); }
@@ -578,6 +623,26 @@ function flagsOf(argv) {
 export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = false }) {
   if (!r?.ok || r.list?.mode !== 'quarantine') return [];
   return testsToSkip({ list: r.list, now, prNumber, fixPrs, onMain });
+}
+
+/**
+ * The `add` command: write the quarantine change, then (only when the write did not report `ok:false`) re-run the failed
+ * jobs of the broken main run and attach the result as `rerun`. Pure wiring over injectable `write`/`rerun`, so the
+ * CLI path (the `--dir` pass-through, the skip on a refused write, the `rerun` field in the output) has a test.
+ * @returns {object} the object the CLI prints as JSON
+ */
+export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChange, rerun = rerunRedMainFailedJobs } = {}) {
+  const tests = String(f.tests ?? '').split(',').filter(Boolean);
+  const ttlMs = f['ttl-min'] ? Number(f['ttl-min']) * 60_000 : undefined;
+  // One spelling end to end: the list validator is lowercase-only and git/GitHub shas are lowercase, so an uppercase
+  // --broken-sha is normalized here, before it reaches either the list write or the run match.
+  const brokenSha = typeof f['broken-sha'] === 'string' ? f['broken-sha'].toLowerCase() : f['broken-sha'];
+  const out = write({
+    actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(brokenSha).slice(0, 9)}, by ${f.actor})`,
+    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
+  });
+  const result = out?.ok === false ? undefined : rerun({ brokenSha, ...(f.dir ? { dir: f.dir } : {}) });
+  return result ? { ...out, rerun: result } : out;
 }
 
 function cli(argv) {
@@ -598,13 +663,7 @@ function cli(argv) {
   }
   if (cmd === 'show') { writeAllSync(1, JSON.stringify(readQuarantine(), null, 2) + '\n'); return; }
   if (cmd === 'add') {
-    const tests = String(f.tests ?? '').split(',').filter(Boolean);
-    const ttlMs = f['ttl-min'] ? Number(f['ttl-min']) * 60_000 : undefined;
-    const out = writeQuarantineChange({
-      actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(f['broken-sha']).slice(0, 9)}, by ${f.actor})`,
-      change: (cur) => addEntries(cur, { tests, brokenSha: f['broken-sha'], owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
-    });
-    writeAllSync(1, JSON.stringify(out) + '\n');
+    writeAllSync(1, JSON.stringify(runAddCommand(f, { now })) + '\n');
     return;
   }
   if (cmd === 'prune') {

@@ -68,6 +68,9 @@ import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { latestAcceptRecord, resolveAcceptCarryForward } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
+import { createMqLiveReader } from '../lib/drain-queue-safety.mjs';
+import { execRead } from '../lib/proc-read.mjs';
 import {
   REVIEW_LABELS, hasReviewLabel, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
   parseLatestHumanClearedSha,
@@ -76,6 +79,7 @@ import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { sweepAuthorStamps } from '../lib/author-stamp-restore.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
@@ -157,10 +161,24 @@ export const STRANDED_RECHECK_MS = 30 * 60_000;
 export const STRANDED_BACKOFF_MS = 5 * 60_000;
 export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
 
+/**
+ * The default PR state, review and comment readers. Their answers are re-read right before a label write or
+ * comment (a hold can arrive mid-proof), so they must never come from the smoke read memo: a cached answer
+ * would pass that re-check. Both the provider and the comment reader strip the memo on every gh call.
+ */
+export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {}) {
+  const liveRun = createMqLiveReader((file, args, opts) => run(args, opts));
+  const liveRead = createMqLiveReader(read);
+  return {
+    provider: createGhProvider({ exec: (args, opts) => liveRun('gh', args, { encoding: 'utf8', ...opts }) }),
+    readComments: (number, opts = {}) => readCompletePrComments(number, { ...opts, exec: liveRead }),
+  };
+}
+
 export function sweepReviewHoldLabels({
-  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
-  readComments = readCompletePrComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
+  repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
+  acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
+  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -176,6 +194,20 @@ export function sweepReviewHoldLabels({
     if (typeof resolvedRepo !== 'string' || !resolvedRepo.trim()) throw new Error('missing repository');
     return resolvedRepo;
   };
+  // Injected listings remain hermetic unless their caller explicitly supplies the restore seam.
+  if (restoreStamps !== undefined || listPrs === defaultListPrs) {
+    try {
+      for (const r of (restoreStamps ?? sweepAuthorStamps)({ repo: repoOf(), dryRun, log })) {
+        if (r.action === 'skip') continue; // a stamped PR is the normal case: no result, no log line
+        results.push({ num: r.num, stampRestore: r.action, detail: r.detail });
+        log(`  PR #${r.num}: author stamp ${r.action} — ${String(r.detail?.reason ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
+      }
+    } catch (e) {
+      const reason = String(e?.message ?? e).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+      results.push({ num: 0, stampRestore: 'refuse', detail: { reason } });
+      log(`  author stamp sweep refused: ${reason}`);
+    }
+  }
   const restamped = new Set();
   for (const pr of Array.isArray(prs) ? prs : []) {
     const names = labelNames(pr.labels);

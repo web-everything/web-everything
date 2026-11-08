@@ -28,7 +28,57 @@ function gitExec({file='git',args,cwd,env,input}) {
 // Trusted wrapper only: never clone client remotes/configuration or fetch a
 // client-supplied URL. The warm mirror is only an object cache: public origin
 // must supply both current main and the exact, manifest-bound Mac HEAD.
-export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec}) {
+// git-bundle transport (R593): the Mac ships its own tip as a bundle over the
+// rsync channel. The slot user wrote that file, so copy it out of slot reach
+// while hashing, then compare against the Mac-declared size and digest.
+export const BUNDLE_MAX_BYTES=512*1024*1024;
+export const BUNDLE_MODES=Object.freeze(['none','incremental','full']);
+export function validBundleEvidence(bundle) {
+  return !!bundle&&BUNDLE_MODES.includes(bundle.mode)&&(bundle.mode==='none'
+    ||typeof bundle.sha256==='string'&&/^[a-f0-9]{64}$/.test(bundle.sha256)&&Number.isSafeInteger(bundle.bytes)&&bundle.bytes>0&&bundle.bytes<=BUNDLE_MAX_BYTES);
+}
+export async function stageBundle(source,destination,{sha256,bytes},io=fs) {
+  const handle=await io.open(source,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+  try {
+    const st=await handle.stat();
+    if(!st.isFile()||st.size!==bytes||st.size>BUNDLE_MAX_BYTES)throw new Error('Bundle size mismatch');
+    const out=await io.open(destination,'wx',0o600),hash=createHash('sha256'),buffer=Buffer.allocUnsafe(1024*1024);
+    let total=0;
+    try {
+      for(;;) {
+        const {bytesRead}=await handle.read(buffer,0,buffer.length,null);
+        if(!bytesRead)break;
+        total+=bytesRead;if(total>bytes)throw new Error('Bundle size mismatch');
+        const chunk=buffer.subarray(0,bytesRead);hash.update(chunk);await out.write(chunk);
+      }
+    } finally {await out.close();}
+    if(total!==bytes||hash.digest('hex')!==sha256)throw new Error('Bundle digest mismatch');
+  } finally {await handle.close();}
+}
+// A shared clone borrows objects from repo.git through an alternate, so it is only
+// safe when no slot user can write the mirror (sandbox decision S4). Otherwise
+// keep today's full --no-local copy.
+export async function mirrorReadOnlyForSlots(mirror,io=fs) {
+  try {
+    for(const path of [mirror,join(mirror,'objects')]) {
+      const st=await io.lstat(path);
+      if(!st.isDirectory()||st.isSymbolicLink()||(st.mode&0o022))return false;
+    }
+    return true;
+  } catch {return false;}
+}
+// R559: the warmer stamps every successful fetch of public main; a missing, unreadable or implausible stamp is "unknown".
+export const MAIN_FETCH_STAMP='main-fetched.json';
+export const BUNDLE_MAIN_MAX_AGE_CEILING_MS=1440*60_000;
+export async function readMainFetchStamp(root,{clock=Date.now,io=fs}={}) {
+  try {
+    const stamp=JSON.parse((await baseFile(join(root,MAIN_FETCH_STAMP),io)).toString('utf8'));
+    const age=clock()-stamp.fetchedAtMs;
+    return Number.isSafeInteger(stamp.fetchedAtMs)&&age>=0&&revision(stamp.sha)?{ageMs:age,sha:stamp.sha}:undefined;
+  } catch {return undefined;}
+}
+export async function readMainFetchAge(root,options) {return (await readMainFetchStamp(root,options))?.ageMs;}
+export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec,bundle,sharedClone=false,clock=Date.now}) {
   if(!revision(head)||manifest?.git?.head!==head||baseSha!==undefined&&!revision(baseSha)||digestManifest(manifest)!==manifestDigest)throw new Error('Invalid Git evidence');
   const {siblings,git:logical,...primary}=manifest;
   if(logical.diffCoverageBase!==undefined&&!revision(logical.diffCoverageBase))throw new Error('Invalid coverage base SHA');
@@ -68,12 +118,38 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     await fs.mkdir(cloned);
     // Mirror cloning works even with the warmer's unborn bare HEAD and copies
     // no client configuration. A cached object never proves public availability.
-    await git(['clone','--no-local','--no-hardlinks','--mirror','--template=',local?mirror:PUBLIC_REPOSITORY,join(cloned,'.git')],root);
+    const shared=sharedClone&&local&&await mirrorReadOnlyForSlots(mirror);
+    await git(['clone',...(shared?['--shared']:['--no-local','--no-hardlinks']),'--mirror','--template=',local?mirror:PUBLIC_REPOSITORY,join(cloned,'.git')],root);
     await git(['config','core.bare','false'],cloned);
     await git(['config','remote.origin.mirror','false'],cloned);
     await git(['config','remote.origin.fetch','+refs/heads/*:refs/remotes/origin/*'],cloned);
     await git(['remote','set-url','origin',PUBLIC_REPOSITORY],cloned);
-    await git(['fetch','--no-tags','--no-write-fetch-head','origin',
+    if(bundle!==undefined) {
+      // No network: public main comes from the mirror clone; the Mac tip comes from
+      // the verified bundle (or is already in the mirror when mode is none).
+      if(!local||!validBundleEvidence(bundle))throw new Error('Bundle transport unavailable');
+      // Freshness bound (R559): never fail open on an unknown or old public-main fetch.
+      // R559 ruling: mirror main counts as fresh public main only inside the bound, ceiling-capped, with the stamp's sha
+      // equal to the mirror ref that this admission actually uses.
+      const stamp=await readMainFetchStamp(root,{clock});
+      if(!(Number.isFinite(bundle.maxMainAgeMs)&&bundle.maxMainAgeMs>0&&bundle.maxMainAgeMs<=BUNDLE_MAIN_MAX_AGE_CEILING_MS)||stamp===undefined||stamp.ageMs>bundle.maxMainAgeMs)throw new Error('Public main fetch is stale or unknown');
+      // The warmer refreshes refs/remotes/origin/main in the mirror; the mirror clone copied it. Never fall back to a cached local main.
+      if(await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned,undefined,true)===null)throw new Error('Mirror public main missing');
+      if(await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned)!==stamp.sha)throw new Error('Main fetch stamp does not match the mirror ref');
+      if(bundle.mode!=='none') {
+        const staged=join(pending,'git.bundle');
+        await stageBundle(bundle.file,staged,bundle);
+        await git(['bundle','verify',staged],cloned);
+        const heads=(await git(['bundle','list-heads',staged],cloned)).split('\n').filter(Boolean).map(line=>line.trim().split(' '));
+        // Exactly one head, the manifest-bound tip, under the client's temporary ref namespace.
+        if(heads.length!==1||heads[0][0]!==head||!/^refs\/we\/bundle-[a-f0-9]{16}$/.test(heads[0][1]??''))throw new Error('Bundle tip mismatch');
+        await git(['config','transfer.fsckObjects','true'],cloned);
+        await git(['config','fetch.fsckObjects','true'],cloned);
+        await git(['fetch','--no-tags','--no-write-fetch-head',staged,'+'+heads[0][1]+':refs/we/bundle-tip'],cloned);
+        if(await git(['rev-parse','--verify','refs/we/bundle-tip^{commit}'],cloned)!==head)throw new Error('Bundle tip mismatch');
+        await git(['update-ref','-d','refs/we/bundle-tip'],cloned);
+      }
+    } else await git(['fetch','--no-tags','--no-write-fetch-head','origin',
       '+refs/heads/main:refs/remotes/origin/main',head],cloned);
     await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned);
     await git(['cat-file','-e',head+'^{commit}'],cloned);

@@ -2,13 +2,17 @@ import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
 import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
+import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
+import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -35,6 +39,200 @@ function fixture(over = {}) {
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('#6345 — resume a stored needs-human review after its refused referrals are ruled', () => {
+  function parkedFixture(kind = 'ruled') {
+    const id = 'review-pr-stale-referral-trigger';
+    const body = '<!-- authored-by-actor: author -->';
+    const at = '2026-11-06T13:25:00Z';
+    const referrals = ['first defect', 'second defect'].map(summary => {
+      const original = { summary, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      return { key: referralFindingKey('judge', original), seat: 'judge', original, finding: normalizeFinding(original) };
+    });
+    const record = { version: 1, repo, pr, head, runId: id,
+      reviewer: mandatoryReferralReviewer(id), authorBody: body, attempted: true, referrals, rulings: [] };
+    const run = newRunRecord({ id, op: 'review-pr', input: { repo, pr } });
+    run.findings = {
+      read: { repo, pr, netBasis: { rev: head } },
+      mandatoryReferrals: { applied: true, effects: [{ type: 'review.mandatory-referrals', status: 'applied',
+        result: { records: [record], pending: referrals.map(f => f.key) } }] },
+      referralVerdict: { verdict: 'needs-human', pendingReferrals: referrals.map(f => f.key), referrals },
+    };
+    run.verdict = run.findings.referralVerdict;
+    run.pending = null;
+    run.refusedStage = 'stageVerdict';
+    run.stepTimings = [
+      { step: 'read', startedAt: '2026-11-06T13:20:00Z', finishedAt: '2026-11-06T13:21:00Z' },
+      { step: 'advise', startedAt: '2026-11-06T13:22:00Z', finishedAt: '2026-11-06T13:23:00Z' },
+      { step: 'stageVerdict', startedAt: '2026-11-06T13:24:00Z' },
+    ];
+    const comments = [{ body: renderReferralRecord(record), author: { login: 'web-everything' } }];
+    if (kind !== 'unruled referral') comments.push({
+      body: buildOperatorRulingComment({ version: 1, repo, pr,
+        head: kind === 'ruling for other head' ? 'b'.repeat(40) : head,
+        rulings: referrals.slice(0, kind === 'partial rulings' ? 1 : 2).map(f => ({
+          runId: kind === 'ruling for other run' ? 'review-pr-other' : id, key: f.key,
+          result: kind === 'unreadable referral card' ? 'card' : 'not-real',
+          ...(kind === 'unreadable referral card' ? { card: 'we:backlog/9999999-missing-referral-card.md' } : {}),
+        })), actor: 'chalbert', channel: 'terminal', reason: 'verified ruling', at, clearerId: 'operator-session' }),
+      author: { login: 'chalbert' }, createdAt: at,
+    });
+    const projected = reviewRunEvidence(run);
+    expect(projected).toMatchObject({ id, repo, pr, head, parked: true, referralStageRefused: true,
+      pending: referrals.map(f => f.key) });
+    const why = 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back';
+    // The production shape (notifyReferralHoldNotice): why + findings block + episode marker.
+    const findings = '\n\nWaiting on your ruling (block, card or not-real):\n- `scripts/x.mjs:1` — first defect\n- `no file` — second defect';
+    const marker = '\n\n<!-- review-referral-hold: 0123456789abcdef -->';
+    const notice = `${why}${findings}${marker}`;
+    if (/pause notice/.test(kind)) comments.push({ body: notice, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    // The daemon sometimes posts under the operator's own credential; the producer's dedupe trusts that author too.
+    if (kind === 'notice posted under the operator credential') comments.push({ body: notice, author: { login: OPERATOR_LOGINS[0] }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'bare notice without episode marker') comments.push({ body: why, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (/notice with persistence detail/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `${why}\n\nReferral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z.${marker}` });
+    // Finding summaries are interpolated into the notice, so one may quote the persistence phrases without being that detail.
+    if (kind === 'a finding summary quoting "Referral persistence failed"') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `${why}\n\nWaiting on your ruling (block, card or not-real):\n- \`scripts/x.mjs:1\` — Referral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z is quoted\n- \`no file\` — second defect${marker}` });
+    if (kind === 'a finding summary quoting "Referral persistence retries are exhausted"') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `${why}\n\nWaiting on your ruling (block, card or not-real):\n- \`scripts/x.mjs:1\` — Referral persistence retries are exhausted; waiting for a new event.\n- \`no file\` — second defect${marker}` });
+    if (/findings block then real exhausted detail/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `${why}${findings}\n\nReferral persistence retries are exhausted; waiting for a new event.${marker}` });
+    if (/findings block then real failed detail/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `${why}${findings}\n\nReferral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z.${marker}` });
+    // The retries-spent notice as the producer posts it: its own lead, the findings block, the exhausted detail, the marker.
+    if (/exhausted-lead notice/.test(kind)) comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `review paused: 2 referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply${findings}\n\nReferral persistence retries are exhausted; waiting for a new event.${marker}` });
+    if (kind === 'persist-exhausted notice') comments.push({ body: 'review paused: 2 referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply',
+      author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'notice from another author') comments.push({ body: notice, author: { login: 'stranger' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'other hold comment') comments.push({ body: '🛑 conveyor fix — stood down', author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    // The production parked run need not carry red-team:pending: "only review:pending" pins that label set.
+    const onlyReviewPending = /only review:pending/.test(kind);
+    const labels = [...(onlyReviewPending ? [] : ['red-team:pending']), ...(/review:pending/.test(kind) ? ['review:pending'] : []),
+      ...(/review:human/.test(kind) ? ['review:human'] : [])];
+    const rawPr = { number: pr, headRefOid: head, body, comments, reviews: [], labels };
+    // Validate the fixture through the real shared gate, without a planner-only mock seam.
+    expect(refusedReferralsAreRuled(rawPr, projected, { repo })).toBe(![
+      'unruled referral', 'partial rulings', 'ruling for other head', 'ruling for other run', 'unreadable referral card',
+    ].includes(kind));
+    let runs = [projected];
+    const loopPayload = { verdict: run.verdict, findings: { read: run.findings.read } };
+    if (kind === 'no parked run') runs = [];
+    // A run that still fails to persist: its persistence notices describe a live hold, so nothing resumes.
+    if (/persistence still failing/.test(kind)) runs = [{ ...projected, persistenceFailed: true }];
+    if (kind === 'run for other head') runs = [{ ...projected, head: 'b'.repeat(40) }];
+    if (kind === 'run for other repo') runs = [{ ...projected, repo: 'other/repo' }];
+    if (kind === 'run for other PR') runs = [{ ...projected, pr: pr + 1 }];
+    if (kind === 'stored verdict not needs-human') loopPayload.verdict = { verdict: 'changes' };
+    if (kind === 'stored review on other head') loopPayload.findings.read = { ...run.findings.read, netBasis: { rev: 'b'.repeat(40) } };
+    if (kind === 'missing comments') rawPr.comments = undefined;
+    if (kind === 'formal review hold') rawPr.reviews = [{ state: 'CHANGES_REQUESTED', author: { login: 'reviewer' } }];
+    if (kind === 'unreadable reviews') rawPr.reviews = undefined;
+    // The daemon snapshot omits formal reviews; the wrapper must fetch them itself through the reader.
+    const snapshot = /daemon snapshot/.test(kind);
+    if (snapshot) delete rawPr.reviews;
+    const fetched = /with formal review hold/.test(kind) ? [{ state: 'CHANGES_REQUESTED', author: { login: 'reviewer' } }] : [];
+    return runFixture({ rawPrs: [rawPr], readReviews: vi.fn(() => {
+      if (/reader throws/.test(kind)) throw new Error('offline');
+      return snapshot ? fetched : rawPr.reviews;
+    }), readEvidence: () => ({ loopPayload, inFlight: false,
+      queued: false, recorded: false, seatRecorded: false }),
+    readReviewRuns: vi.fn(() => {
+      if (kind === 'unreadable run reader') throw new Error('run evidence unreadable');
+      return runs;
+    }) });
+  }
+
+  it('dispatches one full review for an already-reviewed needs-human head whose refused referrals are all ruled', () => {
+    const o = parkedFixture();
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
+      why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
+    expect(o.readReviewRuns).toHaveBeenCalled();
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+  });
+
+  it.each([
+    'pause notice', 'review:pending label', 'pause notice and review:pending label', 'notice posted under the operator credential',
+    'a finding summary quoting "Referral persistence failed"', 'a finding summary quoting "Referral persistence retries are exhausted"',
+    // Persistence recovered (the newest run no longer fails to persist) and every referral is ruled: the old notices are stale.
+    'recovered persistence, stale notice with persistence detail',
+    'recovered persistence, stale findings block then real failed detail',
+    'recovered persistence, stale findings block then real exhausted detail',
+    'recovered persistence, stale exhausted-lead notice',
+  ])('resumes when the parked run carries its own settled marks: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
+      why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'only review:pending label, daemon snapshot without reviews',
+    'only review:pending label and pause notice, daemon snapshot without reviews',
+  ])('fetches the missing formal reviews itself and resumes: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
+      why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
+    expect(o.readReviews).toHaveBeenCalledOnce();
+    expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
+    expect(o.rawPrs[0]).not.toHaveProperty('reviews');
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'only review:pending label, daemon snapshot with formal review hold',
+    'only review:pending label, daemon snapshot, reader throws',
+  ])('fails closed when the fetched formal reviews hold or are unreadable: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.readReviews).toHaveBeenCalledOnce();
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'persist-exhausted notice', 'notice from another author', 'bare notice without episode marker', 'other hold comment', 'review:human label',
+    'pause notice and review:human label',
+    'persistence still failing, findings block then real failed detail',
+    'persistence still failing, findings block then real exhausted detail',
+    'persistence still failing, exhausted-lead notice',
+    'persistence still failing, pause notice',
+  ])('fails closed: a hold that is not the settled referral pause still skips: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'unruled referral', 'partial rulings', 'ruling for other head', 'ruling for other run',
+    'unreadable run reader', 'no parked run', 'stored verdict not needs-human',
+    'run for other head', 'run for other repo', 'run for other PR', 'stored review on other head',
+    'unreadable referral card', 'missing comments', 'formal review hold', 'unreadable reviews',
+  ])('fails closed: %s skips without dispatch', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.lastDispatch.size).toBe(0);
+  });
+
+  it('fails closed: an older ruled run does not mask a newer same-head run that is not ruled', () => {
+    const o = parkedFixture();
+    const [ruledRun] = o.readReviewRuns();
+    // The newer run owes a key no referral record on this head carries, so it is genuinely unruled.
+    o.readReviewRuns = vi.fn(() => [{ ...ruledRun, startedAt: 1 },
+      { ...ruledRun, id: 'review-pr-newer', startedAt: 2, pending: [...ruledRun.pending, 'judge:unrecorded-newer-defect'] }]);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('shares the full-review per-head retry cooldown', () => {
+    const o = parkedFixture();
+    o.lastDispatch.set(`${repo}#${pr}@${head}`, o.now() - 1);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+});
 
 describe('R100 — #5910 accepted stored review does not owe a red team', () => {
   const storedHead = '682e81b3ae1c'.padEnd(40, '0'), storedPr = 5910;
@@ -70,6 +268,106 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
       expect(planRedTeamOnSkip(f)).toEqual([{ prNumber: storedPr, head: storedHead,
         action: 'skip', why: 'stored review does not owe a red team' }]);
     });
+
+  // A red-team-only job on a prevention-outstanding stored verdict returns `red-team-not-owed` before it writes any
+  // status (review-job.mjs), so the planner must never dispatch it: it would re-run the same no-op each cooldown.
+  const judgeAcceptedFixture = (labels, evidenceOver = {}) => {
+    const f = storedFixture(); const rev = storedHead;
+    f.rawPrs[0].labels = labels;
+    f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
+      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false,
+    ...evidenceOver });
+    return f;
+  };
+
+  it('clears pending directly for a judge-accepted head with no red-team state, never dispatching a no-op job (#6438 deadlock)', () => {
+    const [row] = planRedTeamOnSkip(judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending']));
+    expect(row).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+    expect(row.action).not.toBe('dispatch');
+  });
+
+  it('does not clear a judge-accepted head without a pending label (no new policy-clear comment for settled heads)', () => {
+    const [row] = planRedTeamOnSkip(judgeAcceptedFixture(['ready-to-merge', 'review:accepted']));
+    expect(row.action).toBe('skip');
+  });
+
+  it('does not clear a prevention-outstanding head whose accept label has no provable accept comment', () => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending']);
+    f.rawPrs[0].comments = [];
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('does not clear a judge-accepted head without the review:accepted label', () => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'red-team:pending']);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it.each([
+    ['a recorded red-team run', { recorded: true }],
+    ['a recorded seat', { seatRecorded: true }],
+    ['an in-flight pass', { inFlight: true }],
+    ['a queued pass', { queued: true }],
+  ])('does not clear a judge-accepted head with %s', (_name, evidenceOver) => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending'], evidenceOver);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it.each([
+    ['running', { status: 'running' }],
+    ['failed', { status: 'finished', result: { status: 'failed' } }],
+    ['deferred by cap', { status: 'finished', result: { status: 'not-owed', deferredByCap: true } }],
+  ])('does not clear a judge-accepted head whose red-team status is %s', (_name, status) => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending'], { status });
+    f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0].action).not.toBe('clear');
+  });
+
+  // Each conjunct of the judge-accepted clear gate, flipped one at a time: the planner must neither clear nor dispatch.
+  const pendingLabels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+  const acceptComment = (sha = storedHead) => ({ body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->`, author: { login: 'web-everything' } });
+  it.each([
+    ['a later hold comment after the accept', f => { f.rawPrs[0].comments.push({ body: '🔁 review — changes requested', author: { login: 'web-everything' } }); }],
+    ['an accept comment for a different head', f => { f.rawPrs[0].comments = [acceptComment('b'.repeat(40))]; }],
+    ['unreadable formal reviews', f => { f.rawPrs[0].reviews = null; }],
+    ['a formal changes-requested review', f => { f.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', commit: { oid: storedHead }, author: { login: 'someone' } }]; }],
+    ['a blocking review:changes label', f => { f.rawPrs[0].labels = [...pendingLabels, 'review:changes']; }],
+    ['a blocking review:human label', f => { f.rawPrs[0].labels = [...pendingLabels, 'review:human']; }],
+    ['a blocking red-team:blocked label', f => { f.rawPrs[0].labels = [...pendingLabels, 'red-team:blocked']; }],
+  ])('refuses to clear or dispatch a judge-accepted head with %s', (_name, mutate) => {
+    const f = judgeAcceptedFixture(pendingLabels); mutate(f);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('refuses to clear a judge-accepted head when the red-team status is finished not-owed but the accept is not provable', () => {
+    const status = { status: 'finished', result: 'not-owed' };
+    const f = judgeAcceptedFixture(pendingLabels, { status }); f.rawPrs[0].comments = []; f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('refuses to clear when only the live status read shows red-team state (evidence status absent)', () => {
+    const f = judgeAcceptedFixture(pendingLabels); f.readStatus = () => ({ status: 'running' });
+    expect(planRedTeamOnSkip(f)[0].action).not.toBe('clear');
+  });
+
+  it.each(['recorded', 'seatRecorded'])('does not treat an omitted %s as proof the head never ran (explicit-false contrast)', key => {
+    const omitted = judgeAcceptedFixture(pendingLabels);
+    const evidence = { loopPayload: { verdict: { verdict: 'prevention-outstanding' }, findings: { read: { netBasis: { rev: storedHead } } } },
+      recorded: false, seatRecorded: false, inFlight: false, queued: false };
+    delete evidence[key];
+    omitted.readEvidence = () => evidence;
+    // Whatever the planner does with an omitted flag, it must never dispatch the known no-op red-team job.
+    expect(planRedTeamOnSkip(omitted)[0].action).not.toBe('dispatch');
+  });
+
+  it('clears pending for a judge-accepted head whose red team already finished not-owed (#6438 live state)', () => {
+    const f = storedFixture(); const rev = storedHead;
+    f.rawPrs[0].labels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+    const status = { status: 'finished', result: 'not-owed' };
+    f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
+      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false, status });
+    f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'clear' });
+  });
 
   it.each(['inFlight', 'queued'])('skips an accepted not-owed review while %s', key => {
     const f = storedFixture(), evidence = { ...f.readEvidence(), [key]: true };
@@ -656,7 +954,7 @@ describe('runRedTeamOnSkip', () => {
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: 5530, headSha: head });
     o.rawPrs.push({ number: 5530, headRefOid: head, comments: [] });
     const out = runRedTeamOnSkip(o);
-    expect(out.rows[0].why).toBe('dispatch failed; start unknown');
+    expect(out.rows[0].why).toBe('dispatch failed; start unknown: unknown start');
     expect(o.dispatch).toHaveBeenCalledTimes(1);
     expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
     expect(take).toHaveBeenCalledTimes(1);
@@ -681,8 +979,67 @@ describe('runRedTeamOnSkip', () => {
   });
   it('a throw retains the reservation and becomes a row, never an exception', () => {
     const o = runFixture({ dispatch: () => { throw Error('failed'); } });
-    expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown');
+    expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown: failed');
     expect(o.capacity.budget.left).toBe(0); expect(o.lastDispatch.size).toBe(0);
+  });
+  it.each(['behind origin/main — refusing', 'stale guard', 'stale abandonment refused'])(
+    'a pre-start refusal refunds capacity, logs the cause and retries next tick: %s', message => {
+      const take = vi.fn(), log = vi.fn();
+      const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+        dispatch: vi.fn(() => { throw new PreStartDispatchRefusalError(message); }) });
+      const out = runRedTeamOnSkip(o);
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: `dispatch refused before start: ${message}` });
+      expect(out.dispatched).toEqual([]);
+      expect(o.capacity).toEqual({ lanes: 2, budget: { left: 2 }, remainingStarts: 1, take });
+      expect(take).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+      expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${message}`);
+      runRedTeamOnSkip(o);
+      expect(o.dispatch).toHaveBeenCalledTimes(2);
+    });
+  it('the real staleness guard emits a pre-start refusal that refunds recovery capacity', () => {
+    const take = vi.fn(), log = vi.fn();
+    const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dispatch: () => assertMainNotStale('/fixture', () => ({ action: 'warn', behind: 1 }), {
+        listBehindFiles: () => null, lastGood: () => null, rebuildGrace: () => null,
+      }) });
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0].why).toMatch(/^dispatch refused before start: .*behind origin\/main/);
+    expect(o.capacity).toEqual({ lanes: 2, budget: { left: 2 }, remainingStarts: 1, take });
+    expect(take).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+    expect(log.mock.calls[0][0]).toContain('red-team dispatch threw: review-dispatch:');
+  });
+  it('an unclassified dispatch error logs boom and retains all start reservations', () => {
+    const take = vi.fn(), log = vi.fn();
+    const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dispatch: () => { throw Error('boom'); } });
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0]).toMatchObject({ action: 'skip', why: 'dispatch failed; start unknown: boom' });
+    expect(out.dispatched).toEqual([]);
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
+    expect(take).toHaveBeenCalledOnce(); expect(o.lastDispatch.size).toBe(0);
+    expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: boom`);
+  });
+  it.each(['stale post-spawn record', 'refusing post-spawn cleanup', 'behind origin/main — refusing'])(
+    'a post-spawn keyword-bearing error consumes every reservation: %s', message => {
+      const take = vi.fn(), spawn = vi.fn(), log = vi.fn();
+      const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+        dispatch: vi.fn(() => { spawn(); throw Error(message); }) });
+      const out = runRedTeamOnSkip(o);
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: `dispatch failed; start unknown: ${message}` });
+      expect(out.dispatched).toEqual([]);
+      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
+      expect(take).toHaveBeenCalledOnce(); expect(o.lastDispatch.size).toBe(0);
+      expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${message}`);
+    });
+  it('bounds oversized dispatch error text and strips controls from rows and logs', () => {
+    const log = vi.fn(), message = `boom\n\u001b${'x'.repeat(500)}`;
+    const o = runFixture({ log, dispatch: () => { throw Error(message); } });
+    const out = runRedTeamOnSkip(o);
+    const text = `boom  ${'x'.repeat(294)}`;
+    expect(out.rows[0].why).toBe(`dispatch failed; start unknown: ${text}`);
+    expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${text}`);
+    expect(o.capacity.budget.left).toBe(0);
   });
   it('bounds starts across multiple refusals', () => {
     const o = runFixture();
@@ -1487,12 +1844,19 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(o.dispatch).not.toHaveBeenCalled();
     expect(o.lastDispatch.size).toBe(0);
   });
-  it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked', 'red-team:pending'])(
+  it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked'])(
     'does not re-review a held PR with %s', label => {
       const o = moved(); o.rawPrs[0].labels.push(label);
       expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
       expect(o.dispatch).not.toHaveBeenCalled();
     });
+  // R640: operator-accepted change, class correctness-in-normal-use.
+  it('R640 (operator ruling): a lone red-team:pending does not block the full review', () => {
+    const o = moved(); o.rawPrs[0].labels.push('red-team:pending');
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('review');
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.rawPrs[0].labels).toContain('red-team:pending');
+  });
   it.each(['inFlight', 'queued', 'recorded', 'seatRecorded', 'completedRecorded', 'status', 'unknown'])(
     'fails closed with live-head %s evidence', kind => {
       const o = moved(), evidence = o.readEvidence();

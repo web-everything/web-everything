@@ -67,6 +67,8 @@ import { BUILD_DISPATCH_POLICY } from '../../../scripts/conveyor/build-dispatch-
 import { createFileRunStore, newRunRecord } from '../../../scripts/operations/run-store.mjs';
 import { DISPATCH_EFFECT } from '../../../scripts/operations/dispatch-lane.mjs';
 import { loadBuilderPausedPollPolicy, PAUSED_POLL_ENV } from '../../../scripts/lib/builder-launch-policy.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 
 describe('effectiveTickIntervalMs', () => {
   const paused = { maxConcurrentBuilds: 0, maxConcurrentExternalBuilds: 0 };

@@ -6,7 +6,7 @@ import {createRunner as productionRunner, digestArgv, digestInput, manifestWire,
 import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 import * as bases from '../forge-exec-bases.mjs';
-import {buildManifest} from '../remote-exec.mjs';
+import {buildManifest, verifyReceipt} from '../remote-exec.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
 
@@ -19,6 +19,9 @@ const workerIdentity=user=>{
 const slotStat=async path=>Object.assign(await fs.lstat(path),{uid:process.getuid(),gid:workerIdentity(path).gid});
 const createRunner=options=>productionRunner({testSlotStat:slotStat,
   testWorkerIdentity:workerIdentity,...options});
+// Every case does real fs/chmod work and many spawn real git/bash; vitest's 5s
+// default times out under loaded CI shards (red main @ e4acbe7ac).
+vi.setConfig({testTimeout:60_000});
 let root, runner;
 const nonce='a'.repeat(32), hash=value=>createHash('sha256').update(value).digest('hex');
 beforeEach(async()=>{
@@ -79,6 +82,63 @@ describe('per-user worker reservations',()=>{
     const argv=['npm','run','test:unit'];
     return {...p,nonce,argv,env:{},lock:hash('lock'),manifest,manifestDigest:digestManifest(manifest),inputDigest:await digestInput(dir),argvDigest:digestArgv(argv)};
   }
+  it('persists granted units and runs with 24 workers despite a smaller task env override',async()=>{
+    const calls=vi.fn(async()=>({code:0,stdout:'',stderr:''}));
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:calls});
+    const p=await runner.prepare({nonce,slotUnits:3}),request=await requestFor(p);
+    request.env.WE_VITEST_MAX_WORKERS='1';
+    expect((await runner.run(request)).code).toBe(0);
+    expect(calls).toHaveBeenCalled();
+    for(const [call] of calls.mock.calls)expect(call.env).toMatchObject({WE_VITEST_MAX_WORKERS:'24',FORGE_SLOT_CPUS:'24'});
+    await runner.finish({...p,nonce});
+    expect(await fs.readdir(join(root,'receipts'))).not.toContain('worker-active-1');
+  });
+  it.each([1,3].flatMap(units=>[false,true].flatMap(near=>[false,true].map(optIn=>[units,near,optIn]))))
+  ('runner-to-client receipt contract: %i units, task-pressure note %s, opted-in %s',async(slotUnits,near,optIn)=>{
+    const processCount=near ? 1950*slotUnits : 1;
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:async()=>({
+      code:0,stdout:'',stderr:'',usage:{processCount},
+    })});
+    const p=await runner.prepare({nonce,slotUnits,...(optIn ? {capabilities:{taskPressure:1}} : {})}),request=await requestFor(p);
+    const result=await runner.run(request);
+    expect(result.code).toBe(0);
+    const stored=JSON.parse(await fs.readFile(join(root,'receipts',p.run+'.receipt'),'utf8'));
+    const receipt=await runner.finish({...p,nonce});
+    expect(receipt).toEqual(stored);
+    const expected={v:1,nonce,run:p.run,inputDigest:request.inputDigest,argvDigest:request.argvDigest,
+      manifestDigest:request.manifestDigest,lock:request.lock};
+    expect(verifyReceipt(JSON.stringify(receipt),expected,result.code)).toBe(true);
+    expect(receipt).not.toHaveProperty('slotUnits');
+    expect(receipt).not.toHaveProperty('receiptCapabilities');
+    expect(receipt.resources.slotCpus).toBe(8*slotUnits);
+    if(near && optIn)expect(receipt).toMatchObject({processCount,tasksMax:2048*slotUnits,tasksNear:true,tasksNote:expect.any(String)});
+    else for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(receipt).not.toHaveProperty(key);
+  });
+  describe('elastic grant validated against the reserved worker',()=>{
+    const testLimits={parent:{cpuQuota:'2800%',memoryMax:'56G'},slot:{cpuQuota:'800%',memoryMax:'12G',tasksMax:2048,ioWeight:100},
+      slots:{2:{cpuQuota:'1200%',memoryMax:'12G',tasksMax:2048,ioWeight:100}}};
+    it('rejects and releases a slot-2 grant that exceeds the parent even though slot 1 would fit',async()=>{
+      runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testLimits});
+      const first=await runner.prepare({nonce});          // slot 1 is now busy; the elastic request gets slot 2
+      expect(first.slot).toBe('forge-exec-1');
+      await expect(runner.prepare({nonce,slotUnits:3})).rejects.toThrow('Slot units exceed parent CPU quota');
+      expect((await fs.readdir(join(root,'receipts'))).filter(name=>name.startsWith('worker-active')))
+        .toEqual(['worker-active-1']);
+      expect((await fs.readdir(join(root,'receipts'))).filter(name=>/\.(prepared|running|receipt)$/.test(name)))
+        .toEqual([first.run+'.prepared']);
+      await runner.finish({...first,nonce});
+    });
+    it('accepts the same grant on slot 1 and records its units',async()=>{
+      runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testLimits});
+      const granted=await runner.prepare({nonce,slotUnits:3});
+      expect(granted.slot).toBe('forge-exec-1');
+      await runner.finish({...granted,nonce});
+    });
+  });
+  it('rejects oversized units before reserving a worker',async()=>{
+    await expect(runner.prepare({nonce,slotUnits:257})).rejects.toThrow('Invalid slot units');
+    expect((await fs.readdir(join(root,'receipts'))).filter(name=>name.startsWith('worker-active'))).toEqual([]);
+  });
   async function pruneWithoutUidProcesses(before='',after='') {
     const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
     const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
@@ -373,7 +433,8 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_va
     }
     const running=requests.map(r=>runner.run(r));
     try {
-      await vi.waitFor(()=>expect(pending).toHaveLength(2));
+      // waitFor defaults to 1s; a miss would also strand `running` in the finally.
+      await vi.waitFor(()=>expect(pending).toHaveLength(2),{timeout:30_000});
       const tasks=calls.filter(c=>c.argv[1]==='run');
       expect(tasks.map(c=>c.worker.uid).sort()).toEqual([workerIdentity('forge-exec-1').uid,workerIdentity('forge-exec-2').uid]);
       expect(tasks.map(c=>c.cwd).sort()).toEqual([work(a),work(b)].sort());

@@ -42,6 +42,24 @@
 import { repoProfile, gateFor } from '../lib/repo-profile.mjs';
 import { laneRefItemNum } from './lease-reaper.mjs';
 
+/** Split authored scope entries, inheriting prefixes only within each entry. */
+export function splitScopeEntries(raw) {
+  if (!Array.isArray(raw)) return [];
+  const entries = [];
+  for (const entry of raw) {
+    let inherited = '';
+    const pieces = String(entry ?? '').trim().split(/\s+/).filter(Boolean);
+    // Several globs in one entry stay joined: normalizeBriefScope refuses them (they may overlap); splitting would bypass that.
+    if (pieces.filter((p) => p.includes('*')).length > 1) { entries.push(String(entry).trim()); continue; }
+    for (const piece of pieces) {
+      const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+      if (own) inherited = own;
+      entries.push(own ? piece : inherited + piece);
+    }
+  }
+  return [...new Set(entries)];
+}
+
 /**
  * we:scripts/conveyor/pr-work-unit.mjs#isSafeFallbackScopeEntry — may this PR-author-controlled string become a
  * scope-fence entry? PURE. MOVED HERE (from `reconcile-fix-dispatch.mjs`, which still re-exports it for
@@ -123,7 +141,7 @@ export function resolvePrWorkUnit({ repo, pr, findItem, fetchDiffPaths, fetchCar
     return {
       attribution: 'item',
       itemNum: String(item.num),
-      scope: Array.isArray(item.scope) ? item.scope.map(String) : [],
+      scope: splitScopeEntries(item.scope),
       gate,
     };
   }
@@ -163,7 +181,12 @@ export function resolvePrWorkUnit({ repo, pr, findItem, fetchDiffPaths, fetchCar
       //      safe for the live case this feature exists for (PR #2553): every one of its card's 7 declared
       //      scope entries is also in that PR's own diff.
       const diffScopeSet = new Set(diffScope);
-      const safeCardScope = cardScope.filter(isSafeFallbackScopeEntry).filter((entry) => diffScopeSet.has(entry));
+      // An authored entry may join several paths with whitespace (#6424): split it, and keep it only when EVERY
+      // piece passes both guards — one bad piece rejects the whole entry, never leaving a sibling alone.
+      const safeCardScope = [...new Set(cardScope.flatMap((entry) => {
+        const pieces = splitScopeEntries([entry]);
+        return pieces.length && pieces.every((p) => isSafeFallbackScopeEntry(p) && diffScopeSet.has(p)) ? pieces : [];
+      }))];
       if (safeCardScope.length) {
         return { attribution: 'item', itemNum, scope: safeCardScope, gate, scopeSource: 'card' };
       }

@@ -180,7 +180,8 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
     try {
       if (pin.error) throw new Error(`head not pinned: ${pin.error}`);
       let blobSize;
-      const read = readLedgerFromGit({ board: cwd, repo, exec: (args, opts) => {
+      // fresh: this read decides a merge, so it never uses the 30s transport-branch cache
+      const read = readLedgerFromGit({ board: cwd, repo, fresh: true, exec: (args, opts) => {
         const output = exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
         if (args[0] === 'cat-file' && args[1] === '-s') blobSize = Number(String(output).trim());
         if (args[0] === 'cat-file' && args[1] === 'blob' && Buffer.byteLength(output) !== blobSize) {

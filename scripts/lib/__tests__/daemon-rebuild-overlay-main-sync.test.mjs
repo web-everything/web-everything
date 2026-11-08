@@ -5,7 +5,7 @@ import ts from 'typescript';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode } from '../daemon-rebuild/overlay-main-sync.mjs';
+import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
@@ -35,7 +35,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false } = {}) {
+function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false, noisy = false, laneGated = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -43,6 +43,24 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   const lines = Array.from({ length: 30 }, (_, i) => `export const value${i} = ${i};`);
   write(root, 'worker.mjs', `${lines.join('\n')}\n`);
   write(root, 'unrelated.mjs', 'export default 0;\n');
+  if (unrunnable) {
+    write(root, 'outside/ignored.test.mjs', "import '../worker.mjs';\n");
+    write(root, 'excluded.test.mjs', "import './worker.mjs';\n");
+    write(root, 'vitest.config.ts', "export default { test: { include: ['*.test.mjs'], exclude: ['excluded.test.mjs'] } };\n");
+  }
+  // A config that, like many real ones, only discovers tests under the Vitest CLI's own environment.
+  if (envGated) write(root, 'vitest.config.ts',
+    "export default { test: { include: process.env.VITEST === 'true' && process.env.TEST === 'true' && process.env.NODE_ENV === 'test' ? ['*.test.mjs'] : [] } };\n");
+  // A config that, like the test run, must not see the lane-pool variable the daemon itself runs under.
+  if (laneGated) write(root, 'vitest.config.ts',
+    "export default { test: { include: process.env.LANE_POOL_ROOT ? [] : ['*.test.mjs'] } };\n");
+  // A config or plugin that logs to stdout: a banner, a JSON-looking line, an unterminated write, and late output at exit.
+  if (noisy) write(root, 'vitest.config.ts', [
+    "console.log('plugin banner');",
+    'console.log(\'{"not":"the inventory"}\');',
+    "process.stdout.write('[]');",
+    "process.on('exit', () => { console.log('[]'); process.stdout.write('late'); });",
+    "export default { test: { include: ['*.test.mjs'] } };", ''].join('\n'));
   if (mainUnion) write(root, 'docs/agent/testing.md', '# Testing\n');
   for (let i = 0; i < count; i++) write(root, `worker${i}.test.mjs`, "import './worker.mjs';\n");
   if (deleteFinalTest) write(root, 'scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs',
@@ -84,6 +102,9 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     io: { ...fs, mkdtempSync: prefix => { const p = fs.mkdtempSync(prefix); scratched.push(p); temps.push(p); return p; } },
     git: vi.fn((args, opts) => { if (args[0] === 'push') pushes.push([...args]); return run(args, opts); }),
     appendOverlayEvent: (root, event, opts) => { events.push(event); return appendOverlayEvent(root, event, opts); },
+    testListRunner: vi.fn((_command, _args, { cwd }) => ({ status: 0,
+      stdout: `\n${VITEST_INVENTORY_MARK}` + JSON.stringify(ok(cwd, ['ls-files']).split('\n').filter(f => /\.test\.mjs$/.test(f)
+        && !['outside/ignored.test.mjs', 'excluded.test.mjs'].includes(f)).map(f => join(fs.realpathSync(cwd), f))) + '\n', stderr: '' })),
     testRunner: vi.fn(async ({ root: scratch, args, testReport }) => {
       expect(allowedCommand(args.slice(args.indexOf('--') + 1))).toBe(true);
       fs.writeFileSync(testReport, JSON.stringify({
@@ -115,6 +136,108 @@ const unchanged = f => {
 };
 
 describe('overlay main sync', () => {
+
+  it('filters include-outside and exclude-listed selections, logs the count, and syncs runnable files', async () => {
+    const f = fixture({ unrunnable: true });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await job(f);
+    expect(result).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+    expect(f.deps.testListRunner).toHaveBeenCalledOnce();
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-test-selection', filteredNotRunnable: 2 }));
+    expect(log.mock.calls.flat().join(' ')).toContain('filteredNotRunnable: 2');
+  });
+
+  it('a listed runnable file missing from runner evidence still fails testFailure', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = async options => {
+      const result = await passing(options), report = json(options.testReport);
+      report.testResults.pop();
+      fs.writeFileSync(options.testReport, JSON.stringify(report));
+      return result;
+    };
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', message: expect.stringContaining('selected tests did not pass or execute') });
+    expect(f.pushes).toEqual([]);
+  });
+
+  it.each([
+    ['failure', { status: 1, stdout: '', stderr: 'listing failed' }],
+    ['timeout', { status: null, stdout: '', error: Object.assign(new Error('listing timed out'), { code: 'ETIMEDOUT' }) }],
+    ['unparseable', { status: 0, stdout: `${VITEST_INVENTORY_MARK}not JSON\n`, stderr: '' }],
+    ['unmarked JSON only', { status: 0, stdout: '[]\n', stderr: '' }],
+    ['noise without an inventory line', { status: 0, stdout: 'plugin banner\n[]\n', stderr: '' }],
+    ['invalid paths', { status: 0, stdout: `${VITEST_INVENTORY_MARK}[123]\n`, stderr: '' }],
+    ['oversized', { status: 0, stdout: ' '.repeat(8 * 1024 * 1024 + 1), stderr: '' }],
+  ])('listing %s fails closed at test-select with operator diagnostics', async (_mode, result) => {
+    const f = fixture();
+    f.deps.testListRunner = vi.fn(() => result);
+    await expect(job(f)).rejects.toMatchObject({ step: 'test-select',
+      message: expect.stringContaining('operator review required'), stderrTail: expect.stringMatching(/.+/) });
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(f.pushes).toEqual([]);
+    expect(f.deps.testListRunner).toHaveBeenCalledWith(process.execPath,
+      ['--input-type=module', '-e', expect.any(String)], expect.objectContaining({ timeout: 60_000, maxBuffer: 8 * 1024 * 1024 }));
+  });
+
+  it('skips when no selected files are runnable', async () => {
+    const f = fixture();
+    f.deps.testListRunner = vi.fn(() => ({ status: 0, stdout: `noise\n${VITEST_INVENTORY_MARK}[]\n`, stderr: '' }));
+    expect(await job(f)).toEqual({ skipped: true, reason: 'no-relevant-tests' });
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+  });
+
+  it('Vitest 1.x listing loads the scratch vitest.config.ts include and exclude without running tests', async () => {
+    const f = fixture({ unrunnable: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('Vitest listing establishes the CLI environment, so a config gated on VITEST/TEST/NODE_ENV still discovers tests', async () => {
+    const f = fixture({ envGated: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    // The daemon is started outside Vitest: none of the CLI's flags are present.
+    for (const key of ['TEST', 'VITEST', 'NODE_ENV']) delete f.env[key];
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('Vitest listing ignores config or plugin stdout around the inventory (banner, JSON-like lines, unterminated and late writes)', async () => {
+    const f = fixture({ noisy: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('Vitest listing runs in the test run\'s environment, so a config that reacts to the daemon\'s LANE_POOL_ROOT cannot drop tests', async () => {
+    const f = fixture({ laneGated: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    f.env.LANE_POOL_ROOT = join(f.base, 'lanes'); // set for the daemon, deleted for the test run
+    delete f.deps.testListRunner;
+    expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
+  }, 90_000);
+
+  it('inventory and test run receive the identical environment (one shared construction)', async () => {
+    const f = fixture();
+    f.env.LANE_POOL_ROOT = join(f.base, 'lanes');
+    await job(f);
+    const listEnv = f.deps.testListRunner.mock.calls[0][2].env, runEnv = f.deps.testRunner.mock.calls[0][0].env;
+    expect(listEnv).toEqual(runEnv);
+    expect(listEnv).not.toHaveProperty('LANE_POOL_ROOT');
+  });
+
+  it('Vitest listing keeps an operator-chosen NODE_ENV, as the CLI only defaults it', async () => {
+    const f = fixture({ envGated: true });
+    fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
+    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    for (const key of ['TEST', 'VITEST']) delete f.env[key];
+    f.env.NODE_ENV = 'production'; // the gated config requires 'test', so nothing is discoverable: skip, never run
+    delete f.deps.testListRunner;
+    expect(await job(f)).toEqual({ skipped: true, reason: 'no-relevant-tests' });
+  }, 90_000);
 
   it('gives the scratch tests a real, clean frontierui sibling (never a link the Forge manifest would refuse)', async () => {
     const f = fixture(), sibling = join(f.base, 'frontierui');
@@ -422,13 +545,15 @@ describe('overlay main sync', () => {
     expect(fs.existsSync(`${sidecar(f)}.clone.lock`)).toBe(false);
   });
 
-  it.each(['synced', 'failed', 'busy'])('%s worker outcome emits exactly one line and one daemon event', async outcome => {
+  it.each(['synced', 'failed', 'busy'])('%s worker outcome emits one outcome line and daemon event plus selection output when reached', async outcome => {
     const f = fixture(), events = [], log = vi.spyOn(console, 'error').mockImplementation(() => {});
     f.deps.appendDaemonEvent = e => events.push(e);
     if (outcome === 'failed') f.deps.testRunner = async () => ({ status: 1, stdout: '', stderr: 'broken tests' });
     if (outcome === 'busy') { fs.mkdirSync(dirname(marker(f)), { recursive: true }); fs.writeFileSync(marker(f), 'owner'); }
     await job(f).catch(() => {});
-    expect(log).toHaveBeenCalledOnce(); expect(events).toHaveLength(1);
+    expect(log).toHaveBeenCalledTimes(outcome === 'busy' ? 1 : 2);
+    if (outcome !== 'busy') expect(log.mock.calls[0][0]).toContain('filteredNotRunnable: 0');
+    expect(events).toHaveLength(1);
     expect(events[0].kind).toBe(`overlay-main-sync-${outcome === 'busy' ? 'skipped' : outcome}`);
   });
 
@@ -449,6 +574,59 @@ describe('overlay main sync', () => {
     expect(alerts(f)[0].detail.reason).toContain(step);
     expect(log.mock.calls.flat().join('\n')).toContain(`step=${step}`);
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({ kind: 'overlay-main-sync-needs-you', repo: 'web-everything', ref }));
+  });
+
+  it('tests failure preserves stdout test names ahead of a long tmp-leak stderr footer', async () => {
+    const f = fixture(), events = [];
+    f.deps.appendDaemonEvent = event => events.push(event);
+    f.deps.testRunner = async () => ({ status: 1,
+      stdout: 'FAIL scripts/x.test.mjs > suite > case name\nAssertionError: expected true to be false\n',
+      stderr: '[tmp-leak] ' + 'temporary directory detail\n'.repeat(100),
+    });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    const failure = events.find(event => event.kind === 'overlay-main-sync-failed');
+    expect(failure.detail.stderrTail).toContain('scripts/x.test.mjs');
+    expect(failure.detail.stderrTail).toContain('case name');
+    expect(failure.detail.stderrTail.length).toBeLessThanOrEqual(500);
+    expect(failure.detail.stderrTail).toMatch(/^scripts\/x\.test\.mjs > suite > case name/);
+    expect(failure.detail.stderrTail).toContain('temporary directory detail');
+    expect(failure.detail.stderrTail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  });
+
+  it.each(['fullName', 'title', 'file only', 'failed file without assertions', 'incomplete report'])('tests failure preserves structured %s evidence ahead of the output tail', async mode => {
+    const f = fixture(), events = [];
+    f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = '0';
+    f.deps.appendDaemonEvent = event => events.push(event);
+    f.deps.testRunner = async ({ root: scratch, args, testReport }) => {
+      const assertion = mode === 'fullName' ? { status: 'failed', fullName: 'suite > structured case' }
+        : mode === 'file only' ? { status: 'failed' }
+          : { status: 'failed', ancestorTitles: ['suite'], title: 'structured case' };
+      const testResults = args.filter(file => /\.test\.mjs$/.test(file)).map(file => ({
+        name: join(fs.realpathSync(scratch), file), status: 'failed',
+        assertionResults: mode === 'failed file without assertions' ? [] : [assertion],
+      }));
+      fs.writeFileSync(testReport, JSON.stringify({ testResults: mode === 'incomplete report' ? testResults.slice(0, 1) : testResults }));
+      return { status: mode === 'incomplete report' ? 1 : 0,
+        stdout: 'FAIL misleading.test.mjs > wrong case\nAssertionError: structured failure\n',
+        stderr: '[tmp-leak] ' + 'footer\x00\n'.repeat(200),
+      };
+    };
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    const { stderrTail } = events.find(event => event.kind === 'overlay-main-sync-failed').detail;
+    expect(stderrTail).toMatch(/^overlay\.test\.mjs/);
+    if (!['file only', 'failed file without assertions'].includes(mode)) expect(stderrTail).toContain('overlay.test.mjs > suite > structured case');
+    expect(stderrTail).not.toContain('misleading.test.mjs');
+    expect(stderrTail).toHaveLength(500);
+    expect(stderrTail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  });
+
+  it('tests failure includes stdout diagnostics when stderr is empty and no names are known', async () => {
+    const f = fixture(), events = [];
+    f.deps.appendDaemonEvent = event => events.push(event);
+    f.deps.testRunner = async () => ({ status: 1, stdout: 'AssertionError: stdout-only diagnostic\n', stderr: '' });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    expect(events.find(event => event.kind === 'overlay-main-sync-failed').detail.stderrTail)
+      .toBe('AssertionError: stdout-only diagnostic');
   });
 
   it('invalid rev-parse evidence fails closed and names its step even without a main SHA', async () => {
@@ -900,7 +1078,8 @@ describe('overlay main sync', () => {
     expect(state.firstFailureAt[ref]).toBe(started);
     expect(state.lastSyncedMain[ref]).toBeUndefined();
     expect(events).toEqual([{ kind: 'overlay-main-sync-failed', detail: expect.objectContaining({ ref, step: 'push' }) }]);
-    expect(log).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(log.mock.calls[0][0]).toContain('filteredNotRunnable: 0');
     expect(alerts(f)).toEqual([]); expect(synced(f)).toEqual([]);
     expect(ok(f.origin, ['rev-parse', ref]) === f.oldSha).toBe(mode !== 'published');
     unchanged(f);

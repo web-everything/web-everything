@@ -7,7 +7,7 @@ import {createHash} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
-import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
+import {createRunner, digestInput, digestArgv, supervisorSource, elasticRunLimits, taskPressureNote} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
 import {scanScope} from '../../lib/repo-scan-tests.mjs';
@@ -612,6 +612,166 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status],{encoding:'utf8',timeout:10000});
     expect(result.status,result.stderr).toBe(0);
     expect(await readFile(status,'utf8')).toBe('3');
+  });
+  it.each(['wall limit', 'orphan sweep', 'normal exit'].flatMap(mode => [[mode, false], [mode, true]]))('supervisor enforces %s with cancel configured=%s', async (mode, withCancel) => {
+    const status=join(root,'bounded-supervisor-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
+from unittest.mock import patch
+source, root, status, mode, with_cancel = sys.argv[1:]
+now, waits = 0, 0
+killed, swept = [], []
+entries = {
+    101: (b'S', 100), 102: (b'S', 101),
+    201: (b'S', 100), 202: (b'S', 201),
+    203: (b'Z', 100), 204: (b'Z', 201),
+    301: (b'S', 999),
+}
+def listproc(path):
+    assert path == '/proc'
+    if now >= 4: entries[205] = (b'S', 100)
+    return [*(str(pid) for pid in entries), 'self', '9999']
+def proc_open(path, *args, **kwargs):
+    pid = int(path.split('/')[2])
+    if pid not in entries: raise FileNotFoundError(path)
+    state, ppid = entries[pid]
+    return io.BytesIO(str(pid).encode() + b' (name ) with delimiters) ' + state + b' ' + str(ppid).encode() + b' 0 0\n')
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def wait(timeout=None):
+    global now, waits
+    waits += 1
+    if mode == 'normal exit': return 7
+    assert timeout == (0.1 if with_cancel == 'true' else 2), ('unbounded wait', timeout)
+    assert waits <= 3, 'supervisor did not enforce its bound'
+    if mode == 'orphan sweep' and waits == 3:
+        swept.extend(killed)
+        assert set(swept) == {201, 202}, swept
+        return 9
+    now += 2
+    raise subprocess.TimeoutExpired('fixture', timeout)
+def reap(*args):
+    assert {101, 102}.issubset(killed), killed
+    assert 301 not in killed, killed
+    raise ChildProcessError()
+writer = dict(guard=os.path.join(root, 'bounded-writer'), reservation=os.path.join(root, 'bounded-reservation.json'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer,
+           wallMs=3000 if mode == 'wall limit' else 10000, orphanGraceMs=3000)
+if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
+     patch.object(builtins, 'open', side_effect=proc_open), patch.object(os, 'kill', side_effect=kill), \
+     patch.object(os, 'waitpid', side_effect=reap), patch.object(time, 'monotonic', side_effect=lambda: now):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.pid = 101
+    worker.return_value.wait.side_effect = wait
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+if mode == 'orphan sweep': assert set(swept) == {201, 202}, swept
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,mode,String(withCancel)],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':mode==='orphan sweep'?'9':'7');
+    if(mode==='wall limit') expect(result.stderr).toMatch(/wall.*limit/i);
+  });
+  it.each([
+    ['wall limit diagnostic', 'wall limit', 'false', []],
+    ['wall limit diagnostic with cancel configured', 'wall limit', 'true', []],
+    ['task-pressure diagnostic', 'normal exit', 'false', ['usage']],
+    ['wall limit diagnostic, full undrained pipe', 'wall limit', 'false', ['full']],
+    ['wall limit diagnostic with cancel configured, full undrained pipe', 'wall limit', 'true', ['full']],
+    ['task-pressure diagnostic, full undrained pipe', 'normal exit', 'false', ['usage', 'full']],
+  ])('broken or stalled stderr pipe never aborts or blocks cleanup or status publication: %s', async (_name, mode, withCancel, extra) => {
+    const status=join(root,'closed-stderr-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
+from unittest.mock import patch
+source, root, status, mode, with_cancel, *extra = sys.argv[1:]
+now, killed, reaped = 0, [], []
+def listproc(path):
+    return ['101']
+def proc_open(path, *args, **kwargs):
+    if path == '/proc/101/stat': return io.BytesIO(b'101 (name) S 100 0 0\n')
+    raise FileNotFoundError(path)
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def wait(timeout=None):
+    global now
+    if mode == 'normal exit': return 7
+    now += 2
+    raise subprocess.TimeoutExpired('fixture', timeout)
+def reap(*args):
+    reaped.append(True)
+    raise ChildProcessError()
+writer = dict(guard=os.path.join(root, 'closed-writer'), reservation=os.path.join(root, 'closed-reservation.json'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer, wallMs=3000, orphanGraceMs=3000)
+if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
+if 'usage' in extra: cfg['usage'] = os.path.join(root, 'closed-usage')
+rd, wr = os.pipe()
+if 'full' in extra:
+    # Keep the read end open but never drain it: fill the pipe so any blocking
+    # diagnostic write stalls, then restore blocking mode like an inherited pipe.
+    import fcntl
+    flags = fcntl.fcntl(wr, fcntl.F_GETFL)
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True: os.write(wr, b'x' * 4096)
+    except BlockingIOError: pass
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags)
+else:
+    os.close(rd)
+sys.stderr = os.fdopen(wr, 'w', buffering=1)
+real_open = builtins.open
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
+     patch.object(builtins, 'open', side_effect=lambda path, *a, **k: proc_open(path) if str(path).startswith('/proc/') or str(path).startswith('/sys/') else real_open(path, *a, **k)), \
+     patch.object(os, 'kill', side_effect=kill), patch.object(os, 'waitpid', side_effect=reap), \
+     patch.object(time, 'monotonic', side_effect=lambda: now):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.pid = 101
+    worker.return_value.wait.side_effect = wait
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+`;
+    // The probe's own failures must stay readable, so the broken pipe is only
+    // installed on the supervisor's sys.stderr; exit status and files are the proof.
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,mode,withCancel,...extra],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':'7');
+  });
+  it.each(['closed', 'full'])('supervisor crash traceback never blocks exit on a %s stderr pipe', pipeState => {
+    // An uncaught supervisor error (here: the subreaper is unavailable) prints a
+    // traceback; on a full undrained pipe that blocking write used to hang the
+    // supervisor, holding its writer lock, instead of exiting non-zero.
+    const probe=String.raw`import ctypes, fcntl, json, os, sys
+from unittest.mock import patch
+source, state = sys.argv[1:]
+rd, wr = os.pipe()
+if state == 'full':
+    flags = fcntl.fcntl(wr, fcntl.F_GETFL)
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True: os.write(wr, b'x' * 4096)
+    except BlockingIOError: pass
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags)
+else:
+    os.close(rd)
+os.dup2(wr, 2)
+sys.stderr = os.fdopen(2, 'w', buffering=1, closefd=False)
+with patch.object(ctypes, 'CDLL') as libc:
+    libc.return_value.prctl.return_value = -1
+    sys.argv = ['supervisor', json.dumps({})]
+    exec(source)
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,pipeState],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
   });
 });
 
@@ -1385,6 +1545,37 @@ describe('sibling manifest verification', () => {
 
 
 describe('slot resource environment and receipts',()=>{
+  it.each([[1950,2048,true],[1600,2048,false],[1638,2048,false],[1639,2048,true],
+    [80,100,false],[81,100,true],[1950,6144,false],[4916,6144,true],
+    [null,2048,false],[-1,2048,false],[Number.MAX_SAFE_INTEGER+1,2048,false]])
+  ('receipt task pressure count=%s limit=%s near=%s stays out of Mac telemetry',async(processCount,tasksMax,near)=>{
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>({
+      code:0,stdout:'',stderr:'',usage:{processCount},tasksMax,
+    })});
+    const opted=await runner.prepare({nonce:request.nonce,capabilities:{taskPressure:1}});
+    work=join(root,'runs',opted.run,'work');
+    await writeFile(join(work,'package-lock.json'),'lock');
+    request={...request,run:opted.run};
+    await runner.run(request);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(taskPressureNote(processCount,tasksMax).tasksNear === true).toBe(near);
+    const expectedNote = taskPressureNote(processCount,2048);
+    if(expectedNote.tasksNear)expect(receipt).toMatchObject({...expectedNote,tasksNote:expect.stringContaining('80%')});
+    else for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(receipt).not.toHaveProperty(key);
+    const telemetry=JSON.parse(await readFile(join(root,'receipts','telemetry.json'),'utf8'));
+    // Exact legacy keys are checked without testRoot in forge-protocol-capabilities.test.mjs.
+    expect(()=>manifestAPI.parseTelemetry(JSON.stringify(telemetry))).not.toThrow();
+    for(const row of telemetry.recent)for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(row).not.toHaveProperty(key);
+    const {checkRemoteHealth}=await import('../forge-remote-health.mjs');
+    expect(await checkRemoteHealth({root:join(root,'health'),settings:{maxLoadPerCore:1e6,minFreeRamPct:0},readTelemetry:async()=>telemetry})).toEqual({ok:true});
+  });
+  it('scales TasksMax with the elastic grant and preserves an unlimited operator cap',()=>{
+    const limits={parent:{cpuQuota:'2800%'},slot:{cpuQuota:'800%',memoryMax:'12G',tasksMax:2048}};
+    expect(elasticRunLimits(limits,1,1).tasksMax).toBe(2048);
+    expect(elasticRunLimits(limits,1,3).tasksMax).toBe(6144);
+    expect(elasticRunLimits({...limits,slot:{...limits.slot,tasksMax:'infinity'}},1,3).tasksMax).toBe('infinity');
+  });
+
   it.each([undefined,'3'])('defaults worker count while permitting a request override %s',async workers=>{
     const seen=[];
     runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async call=>{
@@ -1442,6 +1633,7 @@ it.each([false,true])('reads supervisor cgroup counters with missing counters=%s
 from unittest.mock import patch
 source, usage, missing = sys.argv[1:]
 cfg = {'usage': usage}
+process_count = None
 files = {'/proc/self/cgroup': '0::/forge-exec.slice/forge-exec-3.slice/scope\n',
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.peak': '12345',
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n',
@@ -1463,7 +1655,63 @@ else:
   const result=spawnSync('python3',['-I','-c',probe,source,usage,String(missing)],{encoding:'utf8',timeout:10000});
   expect(result.status,result.stderr).toBe(0);
   expect(JSON.parse(await readFile(usage,'utf8'))).toEqual(missing
-    ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null}
-    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1});
+    ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null,processCount:null}
+    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1,processCount:null});
   expect(supervisorSource.indexOf("if 'usage' in cfg:")).toBeGreaterThan(supervisorSource.indexOf('if not uid_processes(): break'));
+});
+
+describe('bounded supervisor task pressure sample',()=>{
+  it.each([
+    ['peak','1950','1',1950,false],
+    ['kill',null,'1950',1950,true],
+    ['unreadable',null,null,null,false],
+    ['oversized','9'.repeat(100),'9'.repeat(100),null,false],
+  ])('samples %s before cleanup without scanning proc for the count',async(label,peak,current,expected,cancel)=>{
+    const usage=join(root,'task-usage'),status=join(root,'task-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, subprocess, sys
+from unittest.mock import patch
+source, root, status, usage, peak, current, cancel = sys.argv[1:]
+peak, current, cancel = json.loads(peak), json.loads(current), json.loads(cancel)
+real_open = builtins.open
+writer = dict(guard=os.path.join(root, 'tasks-writer'), reservation=os.path.join(root, 'tasks-reservation'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with real_open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+reads = []
+def proc_open(path, *args, **kwargs):
+    if path == '/proc/self/cgroup': return io.StringIO('0::/test-scope\n')
+    if path.startswith('/sys/fs/cgroup/test-scope/'):
+        name = path.rsplit('/', 1)[1]
+        values = {'pids.peak': peak, 'pids.current': current, 'memory.peak': '100', 'cpu.stat': 'usage_usec 10', 'memory.events': 'oom_kill 0'}
+        value = values.get(name)
+        if value is None: raise FileNotFoundError(path)
+        class Counter(io.StringIO):
+            def read(self, size=-1):
+                if name.startswith('pids.'):
+                    assert 0 < size <= 65, size
+                    reads.append(name)
+                return super().read(size)
+        return Counter(value)
+    return real_open(path, *args, **kwargs)
+def reap(*args):
+    if peak is not None or current is not None: assert reads, 'task count sampled after cleanup'
+    raise ChildProcessError()
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, usage=usage, writer=writer)
+if cancel:
+    cfg['cancel'] = os.path.join(root, 'tasks-cancel')
+    with real_open(cfg['cancel'], 'w') as stream: stream.write('')
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', return_value=[]), patch.object(os, 'waitpid', side_effect=reap), \
+     patch.object(builtins, 'open', side_effect=proc_open):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.wait.return_value = 0
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,usage,JSON.stringify(peak),JSON.stringify(current),JSON.stringify(cancel)],
+      {encoding:'utf8',timeout:10000,maxBuffer:65536});
+    expect(result.status,result.stderr).toBe(0);
+    expect(JSON.parse(await readFile(usage,'utf8')).processCount).toBe(expected);
+    if(expected===null)expect(result.stderr).toContain('task-pressure sample unavailable');
+  });
 });

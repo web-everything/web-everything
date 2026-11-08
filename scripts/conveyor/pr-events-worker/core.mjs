@@ -31,7 +31,7 @@ export const ACCEPTED_EVENTS = Object.freeze({
   check_suite: new Set(['completed']),
   check_run: new Set(['completed']),
   pull_request_review: new Set(['submitted', 'dismissed']),
-  // Kept ONLY when the comment is on a PR and is an advisory note or an operator ruling (see classifyPrComment);
+  // Kept ONLY when the comment is on a PR and is an advisory note, an operator ruling or a red-team result (see classifyPrComment);
   // stored as a `kind` tag — never the body. Live 2026-10-09 (PR #4624): these are what make a fix owed, and the
   // fix daemon could not wake on them.
   issue_comment: new Set(['created']),
@@ -42,9 +42,16 @@ export const ACCEPTED_EVENTS = Object.freeze({
  *  bundle must not import repo code. */
 export const OPERATOR_RULING_COMMENT_MARKER = 'mandatory-referral-operator-ruling-v1';
 
-/** PURE: `'advisory'`, `'ruling'`, or `null` for a PR comment body. */
+/** The red-team result comment's leading marker. Inlined (the Worker bundle must not import repo code); a test pins
+ *  it equal to `red-team-gate.mjs#RED_TEAM_COMMENT_MARKER`. */
+export const RED_TEAM_COMMENT_MARKER = '<!-- we:red-team-advisory';
+const RED_TEAM_MARKER_RE = new RegExp(`^${RED_TEAM_COMMENT_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} pr=\\d+ rev=[0-9a-f]{7,64} -->`, 'i');
+
+/** PURE: `'advisory'`, `'ruling'`, `'redteam'`, or `null` for a PR comment body. */
 export function classifyPrComment(body) {
   const b = typeof body === 'string' ? body : '';
+  // Same shape the gate parses: the marker leads the (CRLF-normalised, left-trimmed) body.
+  if (RED_TEAM_MARKER_RE.test(b.replace(/\r\n/g, '\n').trimStart())) return 'redteam';
   if (b.includes(OPERATOR_RULING_COMMENT_MARKER)) return 'ruling';
   if (/^\*\*Verdict:\*\*/m.test(b) && /^Net basis: `[a-f0-9]+\.\.[a-f0-9]+`/im.test(b)) return 'advisory';
   return null;

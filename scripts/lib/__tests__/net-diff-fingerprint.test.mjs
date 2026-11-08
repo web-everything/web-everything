@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { netDiffFingerprint, carriesAcross } from '../net-diff-fingerprint.mjs';
@@ -12,6 +12,7 @@ const S = {};
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'ndfp-'));
   git('init', '-q', '-b', 'main'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+  mkdirSync(join(dir, 'scripts/ci'), { recursive: true }); writeFileSync(join(dir, 'scripts/ci/test-timings.json'), '{"t":0}\n'); git('add', 'scripts/ci/test-timings.json');
   commit('a.mjs', 'one\ntwo\nthree\n', 'base');
   S.base = git('rev-parse', 'HEAD');
   git('checkout', '-q', '-b', 'pr');
@@ -26,6 +27,7 @@ beforeAll(() => {
   // mechanical path only: the root lane manifest is excluded
   git('checkout', '-q', '-b', 'fe', 'rebased'); S.fe = commit('b.txt', Buffer.from([0x61, 0xfe, 0x0a]), 'fe');
   git('checkout', '-q', '-b', 'ff', 'rebased'); S.ff = commit('b.txt', Buffer.from([0x61, 0xff, 0x0a]), 'ff');
+  git('checkout', '-q', '-b', 'timings', 'rebased'); S.timings = commit('scripts/ci/test-timings.json', '{"t":1}\n', 'timings');
   git('checkout', '-q', '-b', 'manifest', 'rebased'); S.manifest = commit('.lane-manifest.json', '{"a":1}\n', 'manifest');
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -43,6 +45,9 @@ describe('netDiffFingerprint / carriesAcross', () => {
   });
   it('excludes only the root lane manifest', () => {
     expect(carriesAcross(netDiffFingerprint(dir, 'main', S.rebased), netDiffFingerprint(dir, 'main', S.manifest))).toBe(true);
+  });
+  it('a change to the CI timing file alone carries (R503 part 4)', () => {
+    expect(carriesAcross(netDiffFingerprint(dir, 'main', S.rebased), netDiffFingerprint(dir, 'main', S.timings))).toBe(true);
   });
   it('distinct invalid UTF-8 bytes do not collapse into one fingerprint', () => {
     const fe = netDiffFingerprint(dir, 'main', S.fe), ff = netDiffFingerprint(dir, 'main', S.ff);

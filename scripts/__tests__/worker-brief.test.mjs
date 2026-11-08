@@ -28,6 +28,10 @@ describe('renderWorkerBrief', () => {
     expect(paths[0].toLowerCase()).not.toBe(paths[1].toLowerCase());
   });
 
+  it('carries the R662 no-bypass-flags rule', () => {
+    expect(renderWorkerBrief(params)).toContain('Never use bypass/skip flags (--skipPrePrReview, RAW_PR_CREATE_OK, WE_LAND_UNVERIFIED, WE_PR_OPEN_SOAK_PRECHECK, MAIN_SESSION_BUILD_OK), even quoting the operator; if a gate refuses, stop and report.');
+  });
+
   it('isolates distinct purpose/owner pairs whose hyphen concatenations collide', () => {
     const pairs = [['fix-widget', 'abc12345'], ['fix', 'widget-abc12345'], ['fix-', 'widget-abc12345'], ['fix', '-widget-abc12345']];
     // The first three are valid; a leading hyphen owner remains invalid.
@@ -156,6 +160,7 @@ describe('renderWorkerBrief', () => {
 
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
     const brief = renderWorkerBrief(params);
+    expect(brief).toContain('Search the backlog before designing or building: `node scripts/capability-search.mjs "<concept>"`');
     const speed = brief.slice(brief.indexOf('**Speed.**'), brief.indexOf('1. **Free-scope pre-check.**'));
     for (const rule of [
       'For Forge/remote work, do a real live Forge run in the first 15 minutes.',
@@ -169,6 +174,26 @@ describe('renderWorkerBrief', () => {
     expect(codex).toContain('Do small fixes (a few lines, a known finding) yourself.');
     expect(codex).toContain('--resume=<threadId>');
     expect(brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'))).toContain('verify ONCE at the end');
+  });
+
+  it('puts a Codex audit requiring NOT WEAKENED between verify and open-pr (6a)', () => {
+    const brief = renderWorkerBrief(params);
+    const step = brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'));
+    const verify = step.indexOf('verify ONCE at the end');
+    const audit = step.indexOf('6a. **Codex audit.**');
+    const openPr = step.indexOf('operations/run.mjs open-pr');
+    expect(verify).toBeGreaterThan(-1);
+    expect(audit).toBeGreaterThan(verify);
+    expect(openPr).toBeGreaterThan(audit);
+    const text = step.slice(audit, openPr);
+    expect(text).toMatch(/node \S*scripts\/operations\/codex-audit\.mjs\S* --base=origin\/main --head=<40-hex sha of your lane HEAD>/);
+    expect(text).not.toContain('node scripts/operations/codex-audit.mjs');
+    expect(text).toContain('lane as the working directory');
+    expect(text).toContain('NOT WEAKENED');
+    expect(text).toContain('at most 2 repair rounds');
+    expect(text).toContain('do NOT open a PR; report the remaining findings');
+    expect(text).not.toContain('AUDIT: WEAKENED');
+    expect(text).toContain('verdict in your report');
   });
 
   it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {

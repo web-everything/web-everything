@@ -71,6 +71,8 @@ const stage = (root) => {
   // Link review-escalation like gh-throttle above so its larger graph resolves from the source tree;
   // the queue's optional readers remain absent from this partial copy.
   copyFileSync(join(dirname(LEAF), 'red-team-gate.mjs'), join(root, 'lib/red-team-gate.mjs'));
+  // The gate's finding-class policy reader is a required dependency (imports policy-cascade, staged above).
+  copyFileSync(join(dirname(LEAF), 'finding-class-policy.mjs'), join(root, 'lib/finding-class-policy.mjs'));
   // The gate's ruling-precedence resolver is a required, import-free dependency.
   copyFileSync(join(dirname(LEAF), 'red-team-disposition.mjs'), join(root, 'lib/red-team-disposition.mjs'));
   // The disposition reader's operator identity helper imports marker-authorship and red-team-gate, both staged here.

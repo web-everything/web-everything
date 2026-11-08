@@ -15,7 +15,7 @@ export function boundFailureDetails(value) {
   for (const entry of value.tests) {
     if (!entry || typeof entry.file !== 'string' || !(entry.name === null || typeof entry.name === 'string')) { truncated = true; continue; }
     if (tests.length === 20) { truncated = true; break; }
-    tests.push({ file: clip(entry.file, 512), name: entry.name === null ? null : clip(entry.name, 512) });
+    tests.push({ file: clip(entry.file, 512), name: entry.name === null ? null : clip(entry.name, 512), ...(entry.timeout === true ? { timeout: true } : {}) });
   }
   let summary = clip(value.summary, 2048);
   while (Buffer.byteLength(summary) > 2048) { summary = Array.from(summary).slice(1).join(''); truncated = true; }
@@ -28,9 +28,10 @@ export function boundFailureDetails(value) {
 export function createFailureCollector({ cwd = process.cwd() } = {}) {
   const streams = new Map();
   const tests = [];
+  const otherErrors = new Set();
   let summary = '';
   let truncated = false;
-  function line(text, dropped) {
+  function line(text, dropped, state) {
     if (dropped) truncated = true;
     const clean = stripVTControlCharacters(text).trim();
     if (!clean) return;
@@ -39,28 +40,41 @@ export function createFailureCollector({ cwd = process.cwd() } = {}) {
     // reserve `truncated` for dropped/clipped evidence, so a long successful prefix cannot mask completeness.
     if (summary.length > 2048) summary = Array.from(summary).slice(-1024).join('');
     if (dropped) { truncated = true; return; }
+    if (/Failed Suites|Unhandled Errors|Unhandled Rejection|Uncaught Exception|^Errors\s+\d+ errors/i.test(clean)) truncated = true;
+    if (/^[⎯─]+\[\d+\/\d+\]/.test(clean)) state.current = [];
+    if (state.current.length && /^(?:\w*Error|Caused by):/.test(clean)) {
+      const timeout = /^Error: Test timed out in \d+\s*ms\./.test(clean);
+      for (const test of state.current) {
+        if (!timeout) { otherErrors.add(test); delete test.timeout; }
+        else if (!otherErrors.has(test)) test.timeout = true;
+      }
+      state.errored = true;
+    }
     const match = /^FAIL\s+(?:\[[^\]]+\]\s+)?(.+?\.(?:[cm]?[jt]sx?))(?:\s+>\s+(.+))?$/.exec(clean);
-    if (!match) return;
+    if (!match) { if (/^FAIL\s/.test(clean)) { truncated = true; state.current = []; } return; }
     const file = isAbsolute(match[1]) ? relative(cwd, match[1]) : match[1].replace(/^\.\//, '');
-    if (file.startsWith('../') || isAbsolute(file)) return;
+    if (file.startsWith('../') || isAbsolute(file)) { truncated = true; state.current = []; return; }
     const entry = { file, name: match[2] ?? null };
-    if (tests.some(t => t.file === file && t.name === entry.name)) return;
+    if (state.errored) { state.current = []; state.errored = false; }
+    const existing = tests.find(t => t.file === file && t.name === entry.name);
+    if (existing) { if (!state.current.includes(existing)) state.current.push(existing); return; }
     if (tests.length >= 20) { truncated = true; return; }
     tests.push(entry);
+    state.current.push(entry);
   }
   return {
     push(chunk, stream = 'stdout') {
-      if (!streams.has(stream)) streams.set(stream, { decoder: new StringDecoder('utf8'), pending: '', dropped: false });
+      if (!streams.has(stream)) streams.set(stream, { decoder: new StringDecoder('utf8'), pending: '', dropped: false, current: [], errored: false });
       const state = streams.get(stream);
       const text = typeof chunk === 'string' ? chunk : state.decoder.write(chunk);
       for (const char of text) {
-        if (char === '\n') { line(state.pending, state.dropped); state.pending = ''; state.dropped = false; }
+        if (char === '\n') { line(state.pending, state.dropped, state); state.pending = ''; state.dropped = false; }
         else if (state.pending.length < 4096) state.pending += char;
         else state.dropped = true;
       }
     },
     finish() {
-      for (const state of streams.values()) line(state.pending + state.decoder.end(), state.dropped);
+      for (const state of streams.values()) line(state.pending + state.decoder.end(), state.dropped, state);
       return boundFailureDetails({ tests, summary: summary.trim(), truncated });
     },
   };

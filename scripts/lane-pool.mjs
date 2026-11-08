@@ -18,7 +18,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * lanes are long-lived under `~/workspace/.lanes/<repo>/lane-<n>` and merely fetch + hard-reset to
  * origin/main between batches. Git OBJECTS are shared with the primary checkout via `git clone
  * --reference`, so a lane costs little disk and clones fast (objects come from the local primary, not the
- * network). Node deps (`node_modules`) are NOT shared — `ensureDeps` runs `npm ci` per lane on a fresh
+ * network). Node deps (`node_modules`) are per lane — `ensureDeps` prefers pnpm 12 with a shared store on a fresh
  * clone or when the lockfile changes, so each lane can run its own gate.
  *
  * Repo-parameterized: the pool is keyed by repo NAME, so cross-repo slice 4 (lanes of
@@ -79,6 +79,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  */
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname, tmpdir } from 'node:os';
@@ -125,7 +126,7 @@ import { retryTransientGit } from './lib/git-fetch-retry.mjs';
 import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } from './lib/lane-repair.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
-import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
+import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, touchFreeLaneList, isProvablyCleanAndPushed, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
 import { normScope } from './readiness/scope-lease.mjs';
@@ -810,20 +811,8 @@ function existingPools() {
 
 // ── deps (node_modules) — not shared by --reference, so installed per lane on fresh-clone / lockfile change ──
 const DEPS_MARKER = (dir) => join(dir, '.git', '.lane-pool-deps'); // inside .git ⇒ never tracked or git-cleaned
-function lockHash(dir) {
-  const lock = join(dir, 'package-lock.json');
-  const pkg = join(dir, 'package.json');
-  const file = existsSync(lock) ? lock : existsSync(pkg) ? pkg : null;
-  if (!file) return null;
-  return createHash('sha256').update(readFileSync(file)).digest('hex');
-}
-function depsReady(dir) {
-  const want = lockHash(dir);
-  if (want === null) return 'n/a'; // no package.json → nothing to install
-  if (!existsSync(join(dir, 'node_modules'))) return 'missing';
-  const have = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  return have === want ? 'ok' : 'stale';
-}
+// Hashing, readiness and the install orchestration live in lib/lane-deps-installer.mjs (unit-tested there).
+const depsReady = (dir) => laneDepsReady(dir, DEPS_MARKER(dir));
 // #3461 — `npm ci`/`npm install` here is a DELIBERATE, NAMED EXCEPTION to the heavy-command admission queue
 // (`scripts/readiness/heavy-admission.mjs`), not an oversight. #3456's own ruling is explicit that the cap
 // applies at heavy-command-INVOCATION time, never at lane-ACQUIRE time — "a lane may always be acquired
@@ -836,16 +825,13 @@ function depsReady(dir) {
 // that is comparatively cheap and already deduped by `depsReady`'s lockfile-hash skip (most acquires do
 // nothing here at all). This function stays ungated.
 function ensureDeps(dir) {
-  const state = depsReady(dir);
-  if (state === 'n/a' || state === 'ok') return state;
-  const useCi = existsSync(join(dir, 'package-lock.json'));
-  log(`  deps ${state} → npm ${useCi ? 'ci' : 'install'} in ${dir} …`);
-  // #x5n4zn3 review — npm's stdout goes to OUR stderr (fd 2), never our stdout: `acquire --json` prints its
-  // result on stdout, and a caller that captures it (`orphan-claim-release.mjs`'s `acquireLane`) must parse
-  // pure JSON even on the acquires that actually install. Stays visible on a terminal either way.
-  execFileSync('npm', [useCi ? 'ci' : 'install'], { cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL' });
-  writeFileSync(DEPS_MARKER(dir), lockHash(dir));
-  return 'installed';
+  const storeDir = resolvePnpmStoreDir();
+  // The runtime routes installer stdout to OUR stderr: acquire --json must remain pure JSON (tested in the lib).
+  return ensureLaneDeps({
+    dir, markerPath: DEPS_MARKER(dir), storeDir,
+    log: message => log(`  ${message} in ${dir} …`),
+    ...createLaneDepsRuntime({ dir, storeDir, installTimeoutMs: NPM_TIMEOUT_MS }),
+  });
 }
 
 // ── lease (#2275) — an exclusive hold so a lane is never recycled or double-acquired while in use ─────
@@ -2253,6 +2239,11 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
   return dir;
 }
 
+// Event-driven free-lane-list refresh (acquire/release/trim): see free-lane-list.mjs#touchFreeLaneList.
+const touchFreeList = (repo, lane, free) => touchFreeLaneList({
+  path: resolveFreeLaneListPath({ repoName: repo.name, poolDir: repo.poolDir }), repoName: repo.name, poolDir: repo.poolDir, lane, free,
+});
+
 async function cmdAcquire(repo) {
   const assertExpectedHolder = (dir) => {
     if (flags['expect-holder'] === undefined) return;
@@ -2500,6 +2491,10 @@ async function cmdAcquire(repo) {
     // the SAME static list again on a later poll tick, which would just re-try the identical dead ends until
     // `--wait-ms` ran out instead of ever reaching the scan.
     let freeListExhausted = !freeList;
+    // The `--no-reset` guard's live remote heads: ONE lazy ls-remote per acquire call (only if a candidate is ahead),
+    // shared by every candidate. A failed probe is an empty set, so an ahead lane then fails closed.
+    let noResetRemoteShasValue = null;
+    const noResetRemoteShas = () => (noResetRemoteShasValue ??= liveRemoteShas(repo));
     while (chosen === null) {
       // #3383 — the scan's own budget is now the FULL configured/default scan timeout (`--scan-timeout-ms` /
       // `LANE_POOL_LIST_SCAN_TIMEOUT_MS`), never shrunk to this caller's OWN remaining `--wait-ms`: the
@@ -2511,7 +2506,7 @@ async function cmdAcquire(repo) {
       let candidateDirs;
       let usingFreeList = false;
       if (!freeListExhausted) {
-        const freeCands = freeLaneCandidates(freeList, { exclude: excluded });
+        const freeCands = freeLaneCandidates(freeList, { exclude: excluded, nowMs: Date.now(), maxAgeMs: freeListMaxAgeMs() });
         if (freeCands.length) {
           candidateDirs = freeCands.map((n) => laneDir(repo, n));
           usingFreeList = true;
@@ -2573,6 +2568,16 @@ async function cmdAcquire(repo) {
         // blip, the #2924 re-verify, a bad `--base`, an npm hiccup) — none of which are reasons to give up on
         // every OTHER candidate this pool might still offer.
         try {
+          // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
+          // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
+          // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
+          // scan's own (`effectiveDirtyOrAhead`: litter-only dirt is clean; an ahead commit counts as pushed only if a
+          // LIVE remote head contains it or it is patch-equivalent, e.g. squash-merged) — never a stricter or looser
+          // hand-rolled one, and never a possibly-stale local remote-tracking ref.
+          if (flags['no-reset']) {
+            const doa = effectiveDirtyOrAhead(laneDir(repo, pick), repo.branch, noResetRemoteShas);
+            if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
+          }
           provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
           chosen = pick;
           break;
@@ -2783,6 +2788,7 @@ async function cmdAcquire(repo) {
   }
   if (occupant) log(`  occupant: ${occupant} (--adopt) — Edit/Write from any OTHER session is now refused (#2997)`);
   else log(`  occupant: NOT declared — hand this lane off with \`node scripts/lane-pool.mjs adopt --lane=${chosen}\` run BY the agent that will work in it (or re-run acquire with --adopt if that is you); until then the Edit/Write guard stays fail-open for this lane`);
+  touchFreeList(repo, chosen, false);
   if (flags.json) process.stdout.write(JSON.stringify({ lane: chosen, path: dir, session, holder: holderSlug, workerSession: occupant, purpose: flags.purpose || null, branch: repo.branch, base: flags.base || null, reserved: !!flags.reserve }, null, 2) + '\n');
   else process.stdout.write(dir + '\n'); // stdout = path only, so `LANE=$(… acquire)` captures it clean
 }
@@ -3128,6 +3134,10 @@ async function cmdRelease(repo) {
     // `release --force` reclaim, which delegates here) leaves the registry pointing at a lane that is free
     // again, and conveyor-state.mjs's health-stall scan overcounts `building` forever.
     unmapLanes({ ...repo, referencePath: repo.registryReferencePath || repo.referencePath }, [n]);
+    // Only a lane PROVEN clean and IN SYNC with the integration branch right now is published as free. Stricter than the
+    // scan's bar (an ahead-but-pushed lane is not published; the scan can still find it), so a lane is never over-advertised.
+    const afterRelease = isReservedLease(lease) ? null : laneStateSnapshot(dir, `origin/${repo.branch}`);
+    touchFreeList(repo, n, isProvablyCleanAndPushed(afterRelease, { requireInSync: true }));
     log(`  released lane-${n} (was ${describeLease(lease)})`);
     released++;
   }
@@ -4302,6 +4312,7 @@ function cmdTrim(repo) {
     }
     unmapLanes(repo, [...toRemoveSet]); // stop proxying a lane before its files are deleted (#2139)
     for (const t of trashed) rmSync(t, { recursive: true, force: true });
+    for (const t of toRemoveSet) touchFreeList(repo, t, false);
     invalidateListCache(repo); // #xn432dz — the pool shape changed
   }
 

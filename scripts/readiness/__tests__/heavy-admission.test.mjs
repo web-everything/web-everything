@@ -114,6 +114,15 @@ describe('x6nuodj — load admission decided by admit() (enforce)', () => {
     expect(resolveLoadAdmission({ env: {}, root: lockRoot, now: at, shadow, admitFn, mode: 'enforce' }).held).toBe(true);
     expect(admitFn).not.toHaveBeenCalled();
   });
+  it('R559 gate-error: shadow and admit() both unavailable in enforce mode HOLD (no-sample must not admit)', () => {
+    const boom = () => { throw Error('shared decision unavailable'); };
+    const nonexistent = join(lockRoot, 'nonexistent-red-team-6401');
+    const d = resolveLoadAdmission({ env: {}, root: nonexistent, now: at, shadow: boom, admitFn: boom, mode: 'enforce' });
+    expect(d).toMatchObject({ held: true, reason: 'resource-admission: gate-error: shared decision unavailable',
+      resourceAdmission: { verdict: 'hold', decidedBy: 'legacy' } });
+    // shadow mode keeps the telemetry rule deciding (no gate-error refusal there)
+    expect(resolveLoadAdmission({ env: {}, root: nonexistent, now: at, shadow: boom, admitFn: boom, mode: 'shadow' }).held).toBe(false);
+  });
   it('the off / CI bypasses stay bypasses', () => {
     const admitFn = vi.fn();
     expect(resolveLoadAdmission({ env: { [LOAD_ADMISSION_SWITCH_ENV]: 'off' }, admitFn, mode: 'enforce' })).toMatchObject({ held: false, bypassed: 'off' });

@@ -1,0 +1,4 @@
+{
+  "$comment": "runs.scan.maxParses: positive safe integer, standard default 300. Standard -> platform runs.scan.maxParses -> tool runs.scan.maxParses; no env override. Empty tool block preserves the platform preference. Reaching the bound with incomplete evidence logs scan-capped and HOLDS; inspect omitted run records before deliberately raising the limit.",
+  "runs": { "scan": {} }
+}

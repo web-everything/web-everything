@@ -2,9 +2,10 @@
 bornAs: x40a9dk
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/readiness/heavy-admission.mjs we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-11-01"
+dateResolved: "2026-11-06"
 tags: []
 ---
 

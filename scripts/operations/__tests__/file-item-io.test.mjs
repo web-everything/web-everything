@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createFileItemReader, createFileItemSinks } from '../file-item-io.mjs';
 import { SCAFFOLD_EFFECT } from '../scaffold.mjs';
@@ -28,6 +28,30 @@ describe('createFileItemReader is scaffold\'s own reader, not a re-derived copy'
     })();
     expect(read.existingIds.sort()).toEqual(['001', 'xabc']);
     expect(read.dir).toBe('/repo/backlog');
+  });
+});
+
+describe('the real duplicate search binding', () => {
+  it('searches the reader root without truncating backlog matches and exposes malformed cards', () => {
+    const root = mkdtempSync(join(tmpdir(), 'file-item-search-'));
+    try {
+      mkdirSync(join(root, 'backlog'));
+      for (let n = 100; n < 107; n++) {
+        writeFileSync(join(root, 'backlog', `${n}-search.md`), '---\nstatus: open\n---\n# Duplicate admission\n');
+      }
+      const read = createFileItemReader({ root, allocate: () => ({ ok: false }), log: () => {} })();
+      expect(read.searchDuplicates('duplicate admission').backlog).toHaveLength(7);
+      writeFileSync(join(root, 'backlog', '200-bad.md'), '---\nbad: [\n---\n');
+      expect(read.searchDuplicates('duplicate admission').malformed).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('refuses an unreadable backlog directory rather than treating it as empty', () => {
+    const root = mkdtempSync(join(tmpdir(), 'file-item-search-missing-'));
+    try {
+      const read = createFileItemReader({ root, listFiles: () => [], allocate: () => ({ ok: false }), log: () => {} })();
+      expect(() => read.searchDuplicates('duplicate admission')).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

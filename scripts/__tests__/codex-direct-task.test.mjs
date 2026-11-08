@@ -2155,15 +2155,22 @@ describe('detached jobs', () => {
     let finishCleanup;
     const gate = new Promise(resolveCleanup => { finishCleanup = resolveCleanup; });
     const originalRm = fsPromises.rm;
+    // A frozen clock keeps the budget from being spent by real IO on a loaded host (the read, write and
+    // rename must all finish before the removal starts); it moves past the deadline only once the stuck
+    // removal begins, so the wait must return at that deadline while the removal is still pending.
+    let clock = 0;
+    let removalSettled = false;
     const rm = vi.spyOn(fsPromises, 'rm').mockImplementation(async (...args) => {
+      clock += 1000;
       await gate;
-      return originalRm(...args);
+      const removed = await originalRm(...args);
+      removalSettled = true;
+      return removed;
     });
-    const started = performance.now();
     try {
-      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250 }))
+      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250, now: () => clock }))
         .toMatchObject({ status: 'running', code: 75 });
-      expect(performance.now() - started).toBeLessThan(300);
+      expect(removalSettled).toBe(false);
       expect(rm).toHaveBeenCalledOnce();
       expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
     } finally {

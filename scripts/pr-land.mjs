@@ -122,6 +122,7 @@ import { POLICY_CARE_JURY } from './lib/review-policy.mjs'; // #2635 — the car
 import { parseManifest, embedManifestInBody, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs'; // xnsk54v — manifest rides the PR body, not a tracked file
 import { buildDelegationMarker, DELEGATION_MARKER, DELEGATION_TASK_TYPES } from './lib/delegation-marker.mjs';
 import { currentActorId, buildAuthorActorMarker, readAuthorActorStamps } from './lib/review-independence.mjs'; // #2844 — the author stamp the self-clear refusal compares against
+import { ghStderrTail } from './lib/gh-stderr-tail.mjs'; // the real gh stderr tail (redacted, ~800 chars) in create-failure details
 import { classifyPrOpenFailure, recordInfraBlockIO, infraStorePath, primaryRootFromClone, originSlugOf, infraHas, readInfraStore } from './conveyor/infra-blocked.mjs'; // #2659 — a post-push PR-open failure on an outside dependency → the infra-blocked state (recorded for auto-retry/resume), not a hard fail
 import { decideOpenPr, countOpenPrsForRepo, isGlobalOffLive, isBranchAllowedLive } from './lib/pr-limit.mjs'; // we:xniq7xs — the open-PR backpressure limit's pre-create refusal
 import { repoKeyForSlug } from './lib/constellation-repos.mjs'; // we:xniq7xs — map this checkout's origin slug to the internal repo key the limit is keyed by
@@ -795,7 +796,8 @@ async function runCli() {
   function onCreateFailed(e) {
     const errText = `${String(e?.message || e)}\n${String(e?.stderr || '')}`;
     const { infra, cause } = classifyPrOpenFailure(errText);
-    if (!infra) return ghFailed(`gh pr create failed (${String(e?.message || e).split('\n')[0]})`);
+    const stderrTail = ghStderrTail(e);
+    if (!infra) return ghFailed(`gh pr create failed (${String(e?.message || e).split('\n')[0]})${stderrTail ? ` — gh stderr: ${stderrTail}` : ''}`);
     // Record the pushed handle. pr-land runs in a LANE clone, so write the record into the PRIMARY checkout
     // (where the /conveyor tick's retry pass reads) via the clone's git alternates; fall back to this checkout
     // when not a lane clone (e.g. a direct /pr from the primary). Best-effort — a record hiccup never changes
@@ -824,7 +826,7 @@ async function runCli() {
       repo: REPO, merged: false, reason: 'blocked-on-infra',
       num: itemNum, ref: REF, sha: refSha, base: BASE, cause, recorded,
       resumeHandle: { ref: REF, sha: refSha, base: BASE },
-      detail: `PR-open failed on an outside dependency (${cause}) — lane ref ${REF} is PUSHED and recorded in the conveyor infra-blocked state${recorded ? '' : ' (record write failed — resume by hand from the ref)'}; it auto-retries + resume-opens once infra recovers (${BASE} left untouched, nothing stranded)`,
+      detail: `PR-open failed on an outside dependency (${cause})${stderrTail ? ` [gh stderr: ${stderrTail}]` : ''} — lane ref ${REF} is PUSHED and recorded in the conveyor infra-blocked state${recorded ? '' : ' (record write failed — resume by hand from the ref)'}; it auto-retries + resume-opens once infra recovers (${BASE} left untouched, nothing stranded)`,
     }, 4);
   }
 
