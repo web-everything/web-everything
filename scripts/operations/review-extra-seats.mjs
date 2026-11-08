@@ -5,7 +5,8 @@ import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-ev
 import { readRedTeamGateSource } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
-import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
@@ -2144,7 +2145,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     // pending check when the complete thread already holds this head's result.
     listComments: ({ pr, repo }) => {
       const page = JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [];
-      return Array.isArray(page) && page.length >= LIST_COMMENTS_PAGE_SIZE ? readCompleteComments({ pr, repo }) : page;
+      return Array.isArray(page) && page.length >= PR_COMMENTS_PAGE_SIZE ? readCompleteComments({ pr, repo }) : page;
     },
     postComment: ({ pr, repo, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
   };
