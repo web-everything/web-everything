@@ -227,7 +227,12 @@ describe('CLI daemon-clone mode (registered clones only)', () => {
       mkdirSync(signals);
       let ready;
       const atBoundary = new Promise((resolve) => { ready = resolve; });
-      const watcher = watch(signals, () => { if (existsSync(join(signals, 'ready'))) ready(); });
+      const notify = () => { if (existsSync(join(signals, 'ready'))) ready(); };
+      const watcher = watch(signals, notify);
+      // fs.watch (FSEvents on macOS) can coalesce or drop the 'ready' event under host load, which left the
+      // child paused until its 10s timeout. The watcher stays the primary signal; this slow re-check of the
+      // same file only closes that lost-event gap.
+      const recheck = setInterval(notify, 100);
       let child;
       const done = new Promise((resolve) => {
         child = execFile(process.execPath,
@@ -246,6 +251,7 @@ describe('CLI daemon-clone mode (registered clones only)', () => {
         return await done;
       } finally {
         watcher.close();
+        clearInterval(recheck);
         if (child.exitCode === null) child.kill();
         await done;
       }

@@ -200,6 +200,14 @@
         "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:276 — Missing, unreadable, or invalid rerun configuration falls back to allowing one rerun, enabling the weaker publication policy instead of retaining the original fail-closed behavior.",
         "scripts/conveyor/__tests__/prep-review.test.mjs:301 — Raises this test’s timeout to 30 seconds; the same relaxation at line 659 allows slower or stalled behavior to escape the previous timeout guard."
       ]
+    },
+    {
+      "ref": "lane/redteam-foreign-host",
+      "sha": "df6f584666eecef95c6a0b2c72d393cd8e54dd6d",
+      "ruling": "R757",
+      "findings": [
+        "scripts/lib/drain-red-team-evidence.mjs:541 — Replaces the foreign-host fail-closed hold with an age-based local PID check. Different machines can both have null PID namespaces; an absent or mismatched local PID cannot prove the remote writer stopped. After 30 minutes (configurable down to 10), a live remote review can lose its in-flight/queued protection, allowing review-job.mjs:387 to admit a replacement writer and overwrite its status."
+      ]
     }
   ]
 }
