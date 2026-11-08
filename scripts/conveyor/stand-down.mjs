@@ -409,7 +409,7 @@ export function isLoadOnlyRedStandDown(c) {
     && !isLoadFlakeStandDown(c) && !parseAltBranch(body)?.sha
     && ((/\bred only on\b/i.test(reason) && /\bhost[\s-]+load\b/i.test(reason)
       && /\b(?:wall-clock|timing|timeouts?|latency)\b/i.test(reason))
-      || statesOutOfDiffTimeoutEvidence(reason));
+      || (statesOutOfDiffTimeoutEvidence(reason) && /stopped rather than guessing:[^\n]*\n\n/.test(body))); // a persisted multi-line detail (text below the reason line) is never read as flake
 }
 
 /**

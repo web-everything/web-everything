@@ -696,6 +696,11 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
     expect(isLoadOnlyRedStandDown(mk(d))).toBe(false);
     expect(flattenTimeoutDetail('needs-judgment', 'a\nb')).toBe('a\nb');
   });
+  it('a persisted multi-line comment with a failure below the reason line stays terminal (audit)', () => {
+    const c = mk("foo.test.mjs timed out outside the diff; other tests pass\nbar.test.mjs AssertionError: expected 1 to be 2");
+    expect(isLoadOnlyRedStandDown(c)).toBe(false);
+    expect(standDownComments([c])).toHaveLength(1);
+  });
   it('a bare timeout with no unrelated/other-tests-pass evidence stays terminal', () => {
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
   });
