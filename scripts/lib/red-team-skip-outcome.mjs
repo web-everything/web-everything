@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { readRecoveryWitness, redTeamStatusDir } from './drain-red-team-evidence.mjs';
+import { VERDICTS } from './jury-core.mjs';
 import { redTeamOwedFor } from './review-red-team-policy.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -70,7 +71,7 @@ function storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam }) {
       : readRecoveryWitness({ repo, pr, head, env: io.env ?? process.env });
     const payload = stored?.ok === false ? null : stored?.newest;
     const verdict = payload?.verdict;
-    return Boolean(verdict) && typeof verdict === 'object' && payload?.findings?.read?.netBasis?.rev === head
+    return Boolean(verdict) && typeof verdict === 'object' && Object.values(VERDICTS).includes(verdict.verdict) && payload?.findings?.read?.netBasis?.rev === head
       && !redTeamOwedFor(payload);
   } catch { return false; }
 }

@@ -302,6 +302,8 @@ describe('stored-review not-owed rule (R730)', () => {
     expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
   });
   it.each([['missing', () => null], ['no verdict', () => review(head, null)], ['throws', () => { throw Error('x'); }],
+    ['empty verdict', () => review(head, {})], ['array verdict', () => review(head, [])],
+    ['bogus verdict', () => review(head, { verdict: 'bogus' })],
     ['owed', () => review(head, { verdict: 'accept' })], ['reader failed', () => ({ ok: false })]])(
     'a %s stored review stays with the operator', (_n, read) => {
       const f = fixture(); f.io.readStoredReview = read;
