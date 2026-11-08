@@ -421,9 +421,13 @@ export function isLoadOnlyRedStandDown(c) {
  */
 export function statesOutOfDiffTimeoutEvidence(reason) {
   const r = String(reason ?? '');
-  return /\btimed out\b|\btimeout\b/i.test(r) && !/\bassertion|\bexpected\b|\btouch(?:es|ed)\b|diff-touched|in-diff|in the diff\b/i.test(r)
+  // Any other failure word (assertion, received/expected, "failed", negation, a diff-touched file) keeps it terminal:
+  // the evidence must describe the timeout and nothing else red. "not in the diff" is the one allowed negation.
+  const rest = r.replace(/\bnot in (?:the |this )?(?:pr'?s? )?diff\b/gi, '');
+  return /\btimed out\b|\btimeout\b/i.test(r)
+    && !/\bassert|\bexpected\b|\breceived\b|\berrors?\b|\bfail|\bnot\b|n't\b|\bno\b|\btouch(?:es|ed)\b|diff-touched|in-diff|in the diff\b/i.test(rest)
     && /\bunrelated to this (?:change|pr)\b|\b(?:outside|not in) (?:the |this )?(?:pr'?s? )?diff\b/i.test(r)
-    && /\b(?:all \d+ other tests?|every other test|other tests? (?:all )?pass|passes? (?:alone|in isolation)|same (?:timeout|failure) on (?:base|main|[0-9a-f]{7,40}))/i.test(r);
+    && /\b(?:all \d+ other tests? (?:\w+ )?pass(?:ed)?|every other test passe?s?|other tests? (?:all )?pass(?:ed)?|passes? (?:alone|in isolation)|same (?:timeout|failure) on (?:base|main|[0-9a-f]{7,40}))\b/i.test(r);
 }
 
 function loadTrailer(body, name) {
