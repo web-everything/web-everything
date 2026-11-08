@@ -10,6 +10,8 @@ import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
+import { readQuarantine, readJobFailures } from './red-main-quarantine-io.mjs';
+import { activeEntries, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
@@ -82,7 +84,9 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     return hold(`failed_checks (${failedChecksRemovals} removals on this head); operator must inspect history and enqueue manually`);
   if (failedChecksRemovals === 1 && reenqueuedAfterFailure)
     return hold('failed_checks (the single infrastructure retry was already spent); operator must inspect history and enqueue manually');
-  if (failedChecksRemovals === 1 && !(retryEvidence?.mainGreen === true
+  // Every failing test is in the active red-main quarantine: a known flake, not a head failure.
+  const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
+  if (failedChecksRemovals === 1 && !quarantineRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     return hold('failed_checks');
   if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
@@ -90,7 +94,8 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   if (mergeConflictRemovals > 0 && mergeState !== 'CLEAN')
     return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
   return { hold: false, line: failedChecksRemovals === 1
-    ? hold(`failed_checks infra retry 1/1 (main green, PR CLEAN, ${retryEvidence.infra})`).line
+    ? hold(quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
+      : `failed_checks infra retry 1/1 (main green, PR CLEAN, ${retryEvidence.infra})`).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
     : null };
 }
@@ -299,10 +304,47 @@ const timelineHasFailedChecks = (timeline, head) => Array.isArray(timeline?.node
     && mqRemovalReason(event) === 'failed_checks'
     && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
 
+/** Same job scoping as CI's quarantine skip: an untagged entry covers unit shards only. */
+const localJob = name => typeof name === 'string' ? name.split(' / ').at(-1) : name;
+const entryCoversJob = (entry, job) => entry.job === undefined
+  ? /^test-shard \(\d+\)$/.test(localJob(job)) : localJob(entry.job) === localJob(job);
+
+/**
+ * Are ALL failing checks explained by active quarantine entries? Unit jobs must have a complete vitest failure
+ * list in their log and every failing test covered; aggregators (`test`, `coverage-merge`) only follow a unit job.
+ * Anything unreadable, incomplete or uncovered returns null, so the historical hold stays.
+ */
+function readQuarantineCover({ repo, failed, exec, quarantine }) {
+  try {
+    if (typeof quarantine?.readList !== 'function') return null;
+    const read = quarantine.readList();
+    if (read?.ok !== true) return null;
+    const now = (quarantine.now ?? Date.now)();
+    const entries = activeEntries(read.list, { now });
+    if (!entries.length) return null;
+    const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
+    const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
+    let units = 0;
+    for (const check of failed) {
+      if (typeof check.name !== 'string') return null;
+      if (derived.has(localJob(check.name))) continue;
+      if (!unitRe.test(check.name) || !Number.isSafeInteger(check.id) || check.id <= 0) return null;
+      const failures = readJobFailures(check.id, { exec, repoSlug: repo });
+      if (failures?.complete !== true) return null;
+      for (const { file, name } of failures.tests) {
+        if (!entries.some(e => entryCoversJob(e, check.name)
+          && (e.test === file || (name !== null && e.test === `${file}::${name}`)))) return null;
+      }
+      units++;
+    }
+    return units > 0 ? true : null;
+  } catch { return null; }
+}
+
 /** At most ten REST pages per retry probe, shared between checks and main history.
  * Incomplete evidence leaves the historical hold in place for operator inspection.
  */
-function readMqRetryEvidence({ repo, pr, head, timeline, exec }) {
+function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine }) {
   try {
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
@@ -346,6 +388,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec }) {
       return null;
     const failed = checks.filter(check => !passing.has(check.conclusion));
     if (!failed.length) return null;
+    if (readQuarantineCover({ repo, failed, exec, quarantine }))
+      return { mainGreen: false, infra: 'quarantined', failedNames: [], mergeState: readMqMergeState({ repo, pr, head, exec }) };
     // Runner terminology alone also appears in ordinary assertion failures.
     const runnerLoss = /\blost communication\b|\b(?:self-hosted[ \t]+)?runner[ \t]+(?:(?:has|was|is)[ \t]+)?(?:disconnected|went away|lost connection|stopped responding|failed to (?:start|connect))\b/i;
     // Any test-failure wording vetoes runner-loss: a real failure must never look like infrastructure.
@@ -377,6 +421,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec }) {
 function mqRetryDeclineReason(evidence, holdLine) {
   if (/removals on this head|already spent/.test(holdLine ?? '')) return 'retry bound reached (this head already had its single retry)';
   if (!evidence) return 'retry evidence unreadable or incomplete';
+  if (evidence.infra === 'quarantined')
+    return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return 'main CI is not green';
   if (!['infra', 'main-red'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
@@ -384,7 +430,9 @@ function mqRetryDeclineReason(evidence, holdLine) {
   return 'retry conditions not met';
 }
 
-export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh } = {}) {
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh,
+  // Hermetic under test: the live ops/quarantine branch is only consulted when a test injects a reader.
+  quarantine = { readList: process.env.VITEST || process.env.WE_UNDER_TEST ? null : () => readQuarantine() } } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
   // at enqueuePr's mutation boundary, even if another reader still reports the PR as queued.
@@ -398,7 +446,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
         retryEvidence: (retryEvidence = timelineHasFailedChecks(timeline, currentHead)
-          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec }) : undefined),
+          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, quarantine }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (!decision.hold && decision.line) log(decision.line);
   if (decision.hold) {
