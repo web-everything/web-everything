@@ -191,6 +191,29 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
     expect(readOperatorRulings([gh(buildOperatorRulingComment(legacy), 'web-everything')]).rulings).toHaveLength(1);
   });
 
+  it('a re-block split onto the App still holds: it withdraws the earlier operator not-real, in the comment gate and the ledger', async () => {
+    // The operator's own not-real clears the finding first.
+    transport.identityFallback = true;
+    transport.postAs = 'chalbert';
+    const ok = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async () => {} })[OPERATOR_RULING_POST_EFFECT];
+    await ok(sinkArgs(plan()));
+    expect(gatePending()).toEqual([]);
+    // Then a block that withdraws it lands under the App (credential split): the sink refuses, but the hold must stand.
+    transport.postAs = null;
+    const events = [];
+    const record = { version: 1, repo, pr: 7, head, rulings: [{ runId, key: rec.referrals[0].key, result: 'block' }],
+      actor: 'chalbert', channel: 'claude-code-chat', reason: 'withdraw', at: '2026-11-08T08:00:00Z', clearerId: 's', poster: 'chalbert' };
+    const block = { record, body: buildOperatorRulingComment(record) };
+    const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async (list) => { events.push(...list); } })[OPERATOR_RULING_POST_EFFECT];
+    await expect(sink(sinkArgs(block))).rejects.toThrow(/authored by "web-everything"/);
+    expect(events.map((e) => e.ruling)).toEqual(['block']);
+    expect(mandatoryReferralState(transport.thread.comments, repo7).blocked).toEqual([rec.referrals[0].key]);
+    // The App copy is read as holding only: its rows are blocks; a clearing row in such a copy would be dropped.
+    const appCopy = transport.thread.comments.at(-1);
+    expect(appCopy.author.login).toBe('web-everything');
+    expect(readOperatorRulings([appCopy]).rulings.map((r) => r.result)).toEqual(['block']);
+  });
+
   it('a ruling authored by the checked operator in different letter case is kept, not deleted', async () => {
     transport.identityFallback = true;
     transport.postAs = 'Chalbert';

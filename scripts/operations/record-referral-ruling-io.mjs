@@ -625,8 +625,13 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         }
       } catch (error) {
         // Clearing rows are already recorded (the F4 order) but the comment did not land readable: they must not stay live.
-        // A holding-only ruling is left alone: a wrong-author block comment can only hold, so deleting it would drop a hold.
-        if (!clearing.length) throw error;
+        // A holding-only ruling is left alone: a wrong-author block comment can only hold (the reader keeps a stamped
+        // copy's block rows), so deleting it would drop a hold. Its holding rows are still recorded, so the ledger holds too.
+        if (!clearing.length) {
+          const holdingRows = events.filter((e) => !clearsHold(e.ruling));
+          const holdMiss = holdingRows.length ? await tryAppend(holdingRows) : null;
+          throw new Error(`${String(error?.message ?? error)}${holdMiss ? ` [ledger-write-miss: the block was not recorded in the verdict ledger either: ${holdMiss}]` : ''}`);
+        }
         // Both compensations run, each independently: the thread (the comment gate) and the ledger (the ledger gate).
         const removal = removeStrays();
         throw new Error(`${String(error?.message ?? error)} [${removal ? `${removal}; ` : ''}${revertNote(clearing, await revertToHold(clearing))}; ${RERUN}]`);

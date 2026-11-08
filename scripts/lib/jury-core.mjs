@@ -3917,11 +3917,15 @@ export function parseOperatorRulingComment(comment) {
     || JUDGE_RESERVED_TOKEN_RE.test(normalized))) return null;
   // PR #6529 red team (rounds 2-3, card x5dmuoa): a record stamped with `poster` names the ONE login that may author it
   // (the writer stamps the identity it checked). Any other author — an automation copy posted after a per-call credential
-  // fallback split the check from the post, or another operator — is not that ruling at all: null, so the finding keeps
-  // whatever else decides it (pending by default). Not `malformed`, so a copy a failed cleanup left behind can never block
-  // the operator's own re-run. An unstamped (legacy) record keeps the trusted-author rule above (PR #5925: automation-
-  // posted operator rulings recorded before the stamp stay readable).
-  if (record.poster !== undefined && login !== record.poster) return null;
+  // fallback split the check from the post, or another operator — can only HOLD: its clearing rows (card / not-real) are
+  // dropped and its `block` rows are kept, so a re-block meant to withdraw an earlier clearance still withdraws it (fail
+  // closed). With no block row it is no ruling at all (null, not `malformed`, so a clearing copy a failed cleanup left
+  // behind can never block the operator's own re-run). An unstamped (legacy) record keeps the trusted-author rule above
+  // (PR #5925: automation-posted operator rulings recorded before the stamp stay readable).
+  if (record.poster !== undefined && login !== record.poster) {
+    const holds = record.rulings.filter(x => x.result === 'block');
+    return holds.length ? { record: { ...record, rulings: holds } } : null;
+  }
   return { record };
 }
 
