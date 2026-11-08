@@ -22,7 +22,7 @@ import {
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
   resolveProviderCap, reviewSeatCapUsage, toIsoInstant, extractAnswerJson, reserveSeatCalls, createExtraSeatsIo,
   withLedgerLock, isPinnedRev, repoRelativeFindings, readSeatCapUsage,
-  applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow,
+  applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow, createRedTeamIo,
 } from '../review-extra-seats.mjs';
 import { runReviewJob, summarizeExtraSeats } from '../review-job.mjs';
 import { ADVISORY_JUDGE_LENS, JUDGE_SEATS } from '../review-pr.mjs';
@@ -1687,5 +1687,42 @@ describe('red-team finding classes', () => {
     expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferBoth }).sendBack).toHaveLength(1);
     const deferOnly = { 'live-reproduced': 'defer-card', 'correctness-in-normal-use': 'defer-card' };
     expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferOnly }).card).toHaveLength(1);
+  });
+});
+
+describe('#6535 publish-first: a red-team round starts only after its in_progress check is posted', () => {
+  const spec = io => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: LOOP_PAYLOAD.findings.read, env: {}, post: true }, io);
+  const rig = redTeamStatus => {
+    const order = [];
+    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex', readHeadMessage: () => '',
+      redTeamStatus: input => { order.push(['status', input.status]); return redTeamStatus(input); },
+      runSeat: async () => { order.push(['seat']); return { report: { lastMessage: answer({}) } }; } });
+    return { io, order };
+  };
+  it('posts the running status strictly before the seat runs', async () => {
+    const { io, order } = rig(() => ({ published: true }));
+    await spec(io);
+    expect(order.slice(0, 2)).toEqual([['status', 'running'], ['seat']]);
+  });
+  it('does not start the round when the publication is reported unpublished (fail closed, retried next tick)', async () => {
+    const { io, order } = rig(() => ({ published: false, reason: 'GitHub write failed' }));
+    const pass = await spec(io);
+    expect(order).toEqual([['status', 'running']]);
+    expect(pass.status).toBe('skipped');
+    expect(pass.reason).toMatch(/not started.*GitHub write failed/s);
+  });
+  it('does not start the round when the status writer throws', async () => {
+    const { io, order } = rig(() => { throw new Error('disk full'); });
+    const pass = await spec(io);
+    expect(order).toEqual([['status', 'running']]);
+    expect(pass.status).toBe('skipped');
+    expect(pass.reason).toMatch(/disk full/);
+  });
+  it('the real io wrapper refuses a running status whose publication failed', () => {
+    const recordStatus = vi.fn(() => ({ published: false, reason: 'outage' }));
+    const io = createRedTeamIo({ env: {}, recordStatus });
+    const input = { repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD };
+    expect(() => io.redTeamStatus({ ...input, status: 'running' })).toThrow(/outage/);
+    expect(recordStatus).toHaveBeenCalledTimes(1);
   });
 });
