@@ -381,7 +381,9 @@ export function rebaseNodeModulesLinks({ from, copy, final }) {
   // real directory first. A root that resolves nowhere throws here (fail closed) with the copy still just the symlink.
   copy = resolve(copy);
   if (lstatSync(copy).isSymbolicLink()) {
-    const target = realpathSync(copy);
+    // Copy the tree the SOURCE root resolves to, never the copied link's text: `cp -R` keeps a relative link verbatim,
+    // and at the copy's location it would resolve against a different directory (dangling, or the wrong tree).
+    const target = realpathSync(from);
     const tmp = `${copy}.materialize.${process.pid}`;
     rmSync(tmp, { recursive: true, force: true });
     try {
@@ -467,7 +469,7 @@ export function swapNodeModules({ root, storeDir, exec = execFileSync, rename = 
   const tmp = join(root, `.node_modules.swap.${process.pid}`);
   const old = join(root, `.node_modules.old.${process.pid}`);
   for (const name of readdirSync(root)) {
-    if (/^\.node_modules\.(swap|old)\.\d+$/.test(name)) rmSync(join(root, name), { recursive: true, force: true });
+    if (/^\.node_modules\.(swap|old)\.\d+(\.materialize\.\d+)?$/.test(name)) rmSync(join(root, name), { recursive: true, force: true });
   }
   try { exec('cp', ['-cR', join(storeDir, 'node_modules'), tmp], { stdio: 'ignore', timeout: 5 * 60_000 }); } catch {
     rmSync(tmp, { recursive: true, force: true });

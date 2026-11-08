@@ -805,12 +805,44 @@ describe('swapNodeModules — pnpm links survive the change of depth (real cp, n
       expect(readFileSync(join(f.modules, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
     });
 
+    it('a RELATIVE root link copied verbatim to another depth is materialized from the SOURCE, not from where its text now points', () => {
+      const f = pnpmLayout();
+      const source = join(f.base, 'source-rel');
+      mkdirSync(source);
+      symlinkSync(relative(source, f.modules), join(source, 'node_modules')); // relative text, valid only from `source`
+      const snapshot = join(f.base, 'a', 'snapshot');
+      mkdirSync(snapshot, { recursive: true });
+      const dest = join(snapshot, 'node_modules');
+      execFileSync('cp', ['-R', join(source, 'node_modules'), dest]);
+      // At the copy's depth the same text resolves to a DIFFERENT directory: plant a decoy tree there.
+      const decoy = join(snapshot, readlinkSync(dest));
+      mkdirSync(decoy, { recursive: true });
+      writeFileSync(join(decoy, 'decoy.txt'), 'decoy');
+      rebaseNodeModulesLinks({ from: join(source, 'node_modules'), copy: dest, final: dest });
+      intact(f);
+      expect(lstatSync(dest).isSymbolicLink()).toBe(false);
+      expect(existsSync(join(dest, 'decoy.txt'))).toBe(false);
+      expect(readFileSync(join(dest, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+      expect(execFileSync('sh', [join(dest, '.bin', 'esbuild')], { encoding: 'utf8' })).toBe('esbuild');
+    });
+
+    it('a swap sweep removes a crashed materialize leftover (.node_modules.swap.N.materialize.N)', () => {
+      const f = pnpmLayout();
+      const leftover = join(f.clone, '.node_modules.swap.99999.materialize.99999');
+      mkdirSync(leftover);
+      swapNodeModules({ root: f.clone, storeDir: f.store });
+      expect(existsSync(leftover)).toBe(false);
+    });
+
     it('a symlinked root that resolves nowhere fails closed, leaving no copy behind', () => {
       const f = pnpmLayout();
       const dest = join(f.base, 'snapshot', 'node_modules');
       mkdirSync(join(f.base, 'snapshot'));
       symlinkSync(join(f.base, 'missing-tree'), dest);
-      expect(() => rebaseNodeModulesLinks({ from: f.modules, copy: dest, final: dest })).toThrow();
+      const dangling = join(f.base, 'source-dangling');
+      mkdirSync(dangling);
+      symlinkSync(join(f.base, 'missing-tree'), join(dangling, 'node_modules'));
+      expect(() => rebaseNodeModulesLinks({ from: join(dangling, 'node_modules'), copy: dest, final: dest })).toThrow();
       expect(readdirSync(join(f.base, 'snapshot'))).toEqual(['node_modules']);
       expect(lstatSync(dest).isSymbolicLink()).toBe(true);
       expect(readFileSync(join(f.modules, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild'); // the source tree is untouched
