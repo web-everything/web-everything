@@ -423,7 +423,25 @@ export async function reviewPreparePr(pr, deps) {
   const prior = priorPrepReviews(pr.comments);
   // Any review label means "labelled", but not "finished": a stale hold to lift, or a recorded hold (`blocked=1`) whose
   // `review:changes` never landed, still owes a label write. Those fall through to the planner, which owns that repair.
-  if (prior.some((p) => p.head === head) && names.some((n) => n.startsWith('review:')) && !staleBlockHold({ names, prior, head }) && !lostBlockHold({ mode, names, prior, head })) return { skipped: 'already-reviewed' };
+  if (prior.some((p) => p.head === head) && names.some((n) => n.startsWith('review:')) && !staleBlockHold({ names, prior, head }) && !lostBlockHold({ mode, names, prior, head })) {
+    const skipped = { skipped: 'already-reviewed' };
+    const trusted = pr.comments.filter(isTrustedMarkerAuthor);
+    // Migrate only absent evidence. Even a malformed tag (including one for another head) must remain for review.
+    if (!prepVerdictMarker({ head, verdict: 'clean' }) || latestPrepVerdict(pr.comments, head) !== null
+      || trusted.some((c) => typeof c.body !== 'string' || /prep-review-verdict/i.test(c.body))) return skipped;
+    const newest = trusted.filter((c) => priorPrepReviews([c]).some((p) => p.head === head)).at(-1);
+    const blocks = [...newest.body.matchAll(/^```json\r?\n([\s\S]*?)^```[ \t]*\r?$/gm)];
+    const block = blocks.at(-1);
+    if (!block || newest.body.slice(block.index + block[0].length).trim()) return skipped;
+    let stored;
+    try { stored = JSON.parse(block[1]); } catch { return skipped; }
+    const checked = validateWorkerResult(stored, { role: 'review' });
+    if (!checked.ok) return skipped;
+    const verdict = checked.result.outcome === 'done' ? 'clean' : 'findings';
+    if (!dryRun) await provider.postComment(repo, pr.number,
+      `${prepVerdictMarker({ head, verdict })}\nprep verdict marker (re-stamp for this head)`);
+    return { ...skipped, stamped: true, verdict };
+  }
   // Only a PR the repo's own automation or operator opened, from this repo's own branch, earns a model call and a trusted note.
   if (!(await trustedPrAuthor(pr, deps.readPrAuthor, repo))) return { skipped: 'untrusted-author' };
   // Lift the hold the stage applied for an older head BEFORE anything is recorded: the lift is judged by the `blocked=1` note

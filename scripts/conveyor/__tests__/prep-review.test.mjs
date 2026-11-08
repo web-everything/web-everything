@@ -843,6 +843,79 @@ describe('a reviewer\'s hold applied after the stage released its own is never r
 });
 
 
+describe('stamp-only migration of stored prep reviews', () => {
+  const head = 'a'.repeat(40);
+  const findings = buildPrepReviewResult({ deterministic: { findings: [{ ref: 'scope-not-real', note: 'Missing file.' }] }, model: { findings: [] } });
+  const note = (result = cleanModel, sha = head) => ({ ...bot, body: `<!-- prep-review: head=${sha} round=1 -->\n\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`` });
+  const pr = comments => prepPr({ labels: ['review:prep'], comments });
+  const fixture = (over = {}) => {
+    const { deps, calls } = mkDeps(over);
+    for (const key of ['judge', 'readCard', 'exists', 'checkAlreadyDone', 'readPrAuthor']) deps[key] = vi.fn(() => { throw new Error(`stamp must not call ${key}`); });
+    deps.provider.setLabels = vi.fn();
+    deps.provider.ensureLabel = vi.fn();
+    return { deps, calls };
+  };
+  const untouched = deps => {
+    for (const key of ['judge', 'readCard', 'exists', 'checkAlreadyDone', 'readPrAuthor']) expect(deps[key]).not.toHaveBeenCalled();
+    expect(deps.provider.setLabels).not.toHaveBeenCalled();
+    expect(deps.provider.ensureLabel).not.toHaveBeenCalled();
+  };
+
+  it.each([['clean', cleanModel], ['findings', findings]])('stamps %s from a validated stored result, without labels, judge or deterministic checks', async (verdict, result) => {
+    const { deps, calls } = fixture();
+    const comments = [note(result)];
+    expect(await reviewPreparePr(pr(comments), deps)).toEqual({ skipped: 'already-reviewed', stamped: true, verdict });
+    expect(calls.comments).toEqual([{ r: 'o/r', n: 4999, b: `${prepVerdictMarker({ head, verdict })}\nprep verdict marker (re-stamp for this head)` }]);
+    comments.push({ ...bot, body: calls.comments[0].b });
+    expect(latestPrepVerdict(comments, head)).toBe(verdict);
+    expect(await reviewPreparePr(pr(comments), deps)).toEqual({ skipped: 'already-reviewed' });
+    expect(calls.comments).toHaveLength(1);
+    untouched(deps);
+  });
+
+  it.each([
+    ['missing JSON', () => [note(), { ...bot, body: `<!-- prep-review: head=${head} round=2 -->` }]],
+    ['unreadable JSON', () => [note(), { ...note(), body: note().body.replace(JSON.stringify(cleanModel), '{bad') }]],
+    ['invalid result', () => [note({ outcome: 'done' })]],
+    ['oversized result', () => [note({ ...cleanModel, summary: 'x'.repeat(281) })]],
+    ['non-trailing JSON', () => [{ ...note(), body: note().body + '\nextra prose' }]],
+    ['untrusted-author round comment', () => [{ ...bot, body: `<!-- prep-review: head=${head} round=1 -->` }, { ...note(), author: { login: 'stranger' } }]],
+    ['result for another head', () => [{ ...bot, body: `<!-- prep-review: head=${head} round=1 -->` }, note(cleanModel, 'b'.repeat(40))]],
+    ['already stamped', () => [note(), { ...bot, body: prepVerdictMarker({ head, verdict: 'clean' }) }]],
+    ['malformed existing tag', () => [note(), { ...bot, body: 'prep-review-verdict malformed' }]],
+    ['uppercase existing tag', () => [note(), { ...bot, body: 'PREP-REVIEW-VERDICT malformed' }]],
+    ['tag for another head', () => [note(), { ...bot, body: prepVerdictMarker({ head: 'b'.repeat(40), verdict: 'clean' }) }]],
+    ['conflicting existing tags', () => [note(), { ...bot, body: ['clean', 'findings'].map(verdict => prepVerdictMarker({ head, verdict })).join('\n') }]],
+  ])('posts nothing for %s and leaves the skipped result plain', async (_name, comments) => {
+    const { deps, calls } = fixture();
+    expect(await reviewPreparePr(pr(comments()), deps)).toEqual({ skipped: 'already-reviewed' });
+    expect(calls.comments).toEqual([]);
+    untouched(deps);
+  });
+
+  it('uses the newest trusted round for this exact head in comment order', async () => {
+    const { deps, calls } = fixture();
+    expect(await reviewPreparePr(pr([note(), note(findings), note(cleanModel, 'b'.repeat(40)), { ...note(), author: { login: 'stranger' } }]), deps))
+      .toEqual({ skipped: 'already-reviewed', stamped: true, verdict: 'findings' });
+    expect(calls.comments).toHaveLength(1);
+    untouched(deps);
+  });
+
+  it('does not stamp an abbreviated head', async () => {
+    const { deps, calls } = fixture();
+    expect(await reviewPreparePr({ ...pr([note(cleanModel, 'a'.repeat(7))]), headRefOid: 'a'.repeat(7) }, deps)).toEqual({ skipped: 'already-reviewed' });
+    expect(calls.comments).toEqual([]);
+    untouched(deps);
+  });
+
+  it('dryRun reports the stamp without posting or changing labels', async () => {
+    const { deps, calls } = fixture({ dryRun: true });
+    expect(await reviewPreparePr(pr([note()]), deps)).toEqual({ skipped: 'already-reviewed', stamped: true, verdict: 'clean' });
+    expect(calls.comments).toEqual([]);
+    untouched(deps);
+  });
+});
+
 describe('structured prep verdicts', () => {
   const head = 'a'.repeat(40);
   const marker = verdict => `<!-- prep-review-verdict head=${head} verdict=${verdict} v=1 -->`;
