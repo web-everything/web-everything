@@ -677,6 +677,60 @@ if mode == 'orphan sweep': assert set(swept) == {201, 202}, swept
     expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':mode==='orphan sweep'?'9':'7');
     if(mode==='wall limit') expect(result.stderr).toMatch(/wall.*limit/i);
   });
+  it.each([
+    ['wall limit diagnostic', 'wall limit', 'false', []],
+    ['wall limit diagnostic with cancel configured', 'wall limit', 'true', []],
+    ['task-pressure diagnostic', 'normal exit', 'false', ['usage']],
+  ])('closed stderr pipe never aborts cleanup or status publication: %s', async (_name, mode, withCancel, extra) => {
+    const status=join(root,'closed-stderr-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
+from unittest.mock import patch
+source, root, status, mode, with_cancel, *extra = sys.argv[1:]
+now, killed, reaped = 0, [], []
+def listproc(path):
+    return ['101']
+def proc_open(path, *args, **kwargs):
+    if path == '/proc/101/stat': return io.BytesIO(b'101 (name) S 100 0 0\n')
+    raise FileNotFoundError(path)
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def wait(timeout=None):
+    global now
+    if mode == 'normal exit': return 7
+    now += 2
+    raise subprocess.TimeoutExpired('fixture', timeout)
+def reap(*args):
+    reaped.append(True)
+    raise ChildProcessError()
+writer = dict(guard=os.path.join(root, 'closed-writer'), reservation=os.path.join(root, 'closed-reservation.json'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer, wallMs=3000, orphanGraceMs=3000)
+if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
+if 'usage' in extra: cfg['usage'] = os.path.join(root, 'closed-usage')
+rd, wr = os.pipe()
+os.close(rd)
+sys.stderr = os.fdopen(wr, 'w', buffering=1)
+real_open = builtins.open
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
+     patch.object(builtins, 'open', side_effect=lambda path, *a, **k: proc_open(path) if str(path).startswith('/proc/') or str(path).startswith('/sys/') else real_open(path, *a, **k)), \
+     patch.object(os, 'kill', side_effect=kill), patch.object(os, 'waitpid', side_effect=reap), \
+     patch.object(time, 'monotonic', side_effect=lambda: now):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.pid = 101
+    worker.return_value.wait.side_effect = wait
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+`;
+    // The probe's own failures must stay readable, so the broken pipe is only
+    // installed on the supervisor's sys.stderr; exit status and files are the proof.
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,mode,withCancel,...extra],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':'7');
+  });
 });
 
 describe('setup and pruning contract', () => {

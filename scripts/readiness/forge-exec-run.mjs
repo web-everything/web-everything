@@ -493,6 +493,16 @@ import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat
 PR_SET_CHILD_SUBREAPER = 36
 if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
     raise RuntimeError('subreaper unavailable')
+# Diagnostics are best-effort: a closed or broken stderr pipe must never abort
+# worker cleanup or status publication. After one failed write, drop sys.stderr
+# so the pending buffer cannot turn the interpreter's exit flush into a failure.
+def diag(message):
+    if sys.stderr is None: return
+    try:
+        sys.stderr.write(message)
+        sys.stderr.flush()
+    except Exception:
+        sys.stderr = None
 cfg = json.loads(sys.argv[1])
 uid, gid = cfg['uid'], cfg['gid']
 writer = cfg['writer']
@@ -568,7 +578,7 @@ else:
             try: os.kill(pid, signal.SIGKILL)
             except ProcessLookupError: pass
         if cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
-            sys.stderr.write('forge-exec-run: wall limit exceeded; killing child tree\n')
+            diag('forge-exec-run: wall limit exceeded; killing child tree\n')
             return True
         return False
     if cfg.get('cancel'):
@@ -646,7 +656,7 @@ if cfg.get('usage') is not None:
         if samples: process_count = max(samples)
     except (OSError, StopIteration, ValueError): pass
     if process_count is None:
-        sys.stderr.write('forge-exec-run: task-pressure sample unavailable; near-limit status unknown; inspect the run cgroup\n')
+        diag('forge-exec-run: task-pressure sample unavailable; near-limit status unknown; inspect the run cgroup\n')
 deadline = time.monotonic() + 30
 while True:
     # Escaped sessions and externally reparented children still belong only to
