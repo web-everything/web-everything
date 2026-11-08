@@ -1,17 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "skills-src/conveyor/__tests__/verify-daemon.test.mjs::createVerifyWakeSleep + verify request handoff — real filesystem contract (red first) > debounce/burst: five signals produce exactly one early wake and the following sleep(80) reaches interval",
-      "brokenSha": "420fe04ec125b7d96b88750da910121058bb2afd",
-      "owner": "flake-verify-daemon-debounce-timing",
-      "reason": "CI run 42444167739 shard 8: single timing flake, debounce/burst sleep(80) elapsed 92.75ms under load; 161/162 files passed",
-      "addedAt": 1794111176638,
-      "expiresAt": 1794197576638
-    }
-  ],
-  "mode": "quarantine",
-  "fixPrs": [
-    6539
-  ]
+  "entries": [],
+  "mode": "quarantine"
 }
