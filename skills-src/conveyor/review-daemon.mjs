@@ -685,9 +685,10 @@ export function runReviewTick({
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
     finally {
       // Recovery reports the same start through multiple counters; count it only once, even on error.
-      const spentStarts = recoveryStarts === Infinity && capacity.remainingStarts === Infinity
-        ? 0 : recoveryStarts - capacity.remainingStarts;
-      occupiedLanes += Math.max(taken, spentStarts, recoveryLanes - capacity.lanes);
+      // An unbounded budget (Infinity) minus itself is NaN, which would poison every later `>=` limit check
+      // and silently disable host-start enforcement; an unbounded or garbage reading spent nothing.
+      const spent = (before, after) => { const n = before - after; return Number.isFinite(n) ? Math.max(0, n) : 0; };
+      occupiedLanes += Math.max(taken, spent(recoveryStarts, capacity.remainingStarts), spent(recoveryLanes, capacity.lanes));
     }
   };
   // Reserve recovery-first capacity only when ordinary reviews can still get a host start.

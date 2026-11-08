@@ -964,6 +964,21 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     }
   });
 
+  it('keeps host-start enforcement when lane capacity is unbounded and recovery starts nothing', () => {
+    // Default acquirableLanes is Infinity: Infinity - Infinity must not poison occupiedLanes with NaN.
+    for (const redTeamOnSkip of [vi.fn(() => ({ dispatched: [] })), vi.fn(() => { throw new Error('boom'); }), undefined]) {
+      const take = vi.fn();
+      const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+      const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, redTeamOnSkip, log: () => {},
+        hostAdmission: () => ({ admitted: true, maxPerTick: 2, take }),
+        tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+      // Recovery started nothing, so the whole host budget (2) is still available to ordinary reviews.
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      expect(out.dispatched).toHaveLength(2);
+      expect(take).toHaveBeenCalledTimes(2);
+    }
+  });
+
   it('host admission (verify-admission audit): one shared per-tick budget across repos, evaluated once', async () => {
     const { sharedHostBudget } = await import('../review-daemon.mjs');
     const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
