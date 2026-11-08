@@ -25,6 +25,7 @@ import {
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
   standDownComments, standDownReason, WATCHER_STAND_DOWN_ACTOR, countTerminalStandDowns,
   SUPERSEDE_STAND_DOWN_MARKER, isStandDownSuperseded, isSelfAuthored, AUTOMATION_LOGINS,
+  isLoadOnlyRedStandDown, loadFlakeHolds,
 } from '../stand-down.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../ci-heal-mark.mjs';
@@ -643,4 +644,29 @@ it('lapses only trusted current-head exhaustion when the red-main predicate prov
     { ...options, onLapse: () => {} });
   expect(result.standDownLapses).toEqual([lapse]);
   expect(countTerminalStandDowns(result.comments)).toBe(0);
+});
+
+// #6469 live: the fixer stood down (gate-red) on an out-of-diff test timeout and nothing re-armed it, because the
+// classifier only read "red only on ... host load" wording. Pins the evidence shape that now counts as a load flake.
+describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)', () => {
+  const author = { login: AUTOMATION_LOGINS[0] };
+  const mk = (detail) => ({ body: buildStandDownComment({ reason: 'gate-red', detail }), createdAt: '2026-11-08T01:22:11Z', author });
+  const LIVE = "constellation-ownership.test.mjs 'runs classify --json against git ls-files' timed out at 15000ms (unrelated to this change; same timeout on 81ab808ef); all 515 other tests incl. review-red-team-on-skip pass";
+  it('the exact #6469 text reads as a redispatch load-flake hold, not a terminal stand-down', () => {
+    const c = mk(LIVE);
+    expect(isLoadOnlyRedStandDown(c)).toBe(true);
+    expect(standDownComments([c])).toEqual([]);
+    expect(loadFlakeHolds([c])).toHaveLength(1);
+  });
+  it('states-the-evidence form (outside the diff, passes alone) also counts', () => {
+    expect(isLoadOnlyRedStandDown(mk("red only on foo.test.mjs 'x' timed out at 15000ms, a file outside the PR diff; it passes alone"))).toBe(true);
+  });
+  it('a diff-touched or assertion failure stays terminal', () => {
+    expect(isLoadOnlyRedStandDown(mk("review-red-team-on-skip.test.mjs 'x' timed out at 15000ms in a file this PR touches; 3 other tests pass"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' failed: AssertionError expected 1 to be 2 (unrelated to this change); all 515 other tests pass"))).toBe(false);
+    expect(standDownComments([mk('foo.test.mjs timed out at 15000ms in a diff-touched file')])).toHaveLength(1);
+  });
+  it('a bare timeout with no unrelated/other-tests-pass evidence stays terminal', () => {
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
+  });
 });
