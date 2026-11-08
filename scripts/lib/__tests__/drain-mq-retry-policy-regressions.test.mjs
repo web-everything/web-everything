@@ -164,7 +164,7 @@ describe('MQ signature cost and specificity bounds', () => {
       expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
     });
 
-  it.each([...standard, 'a'.repeat(200), 'outage[+*]+', 'outage\\(+\\)+'])('accepts specific bounded pattern %j', source => {
+  it.each([...standard, 'a'.repeat(200)])('accepts specific bounded pattern %j', source => {
     const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] }, platform: {} });
     expect(result.value.mqInfraSignatures).toEqual([source]);
     expect(result.sources.mqInfraSignatures).toBe('tool');
@@ -181,4 +181,46 @@ describe('MQ signature cost and specificity bounds', () => {
       expect(accepted.decision.hold).toBe(false);
       expect(accepted.reads[0].options.maxBuffer).toBe(bytes);
     });
+});
+
+describe('MQ signature whitelist grammar', () => {
+  it.each([
+    '[\\s\\S]{32,}', '.{32,}', 'outage(a{1,100})+$', '(a+)+$', '(.*)*',
+    '\\S+', 'a|b', 'abc', 'outage during \\S+\\d+', 'outage during \\s+\\S+',
+    'outage during checkout.', 'outage during [ab]', 'outage during a{2}',
+    '^outage during checkout', 'outage during checkout$', 'outage during a?',
+    'outage during a*', 'outage during a+', 'outage during \\S+?',
+    'outage during \\w+', 'outage during \\n', 'outage during \\a',
+    'outage during \\', 'outage\tduring checkout',
+    'outage \\S+ on \\d+ at \\s+ for \\S+', 'a'.repeat(201),
+    'a'.repeat(10) + '\\S+', 'a'.repeat(10) + '\\.',
+  ])('rejects non-whitelist source %j and reports the platform fallback', source => {
+    const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] },
+      platform: { mqInfraSignatures: ['platform outage'] } });
+    expect(result.value.mqInfraSignatures).toEqual(['platform outage']);
+    expect(result.sources.mqInfraSignatures).toBe('platform');
+    expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
+  });
+
+  it.each([
+    ...standard, 'disk full on \\S+ during checkout', 'a'.repeat(12), 'a'.repeat(200),
+    'outage \\S+ on \\d+ at \\s+ during checkout',
+    'disk\\.full\\-on\\:checkout\\/remote\\_path',
+    'a'.repeat(11) + '\\.',
+  ])('accepts whitelist source %j within the literal, wildcard and length bounds', source => {
+    const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] }, platform: {} });
+    expect(result.value.mqInfraSignatures).toEqual([source]);
+    expect(result.sources.mqInfraSignatures).toBe('tool');
+    expect(result.invalid).toEqual([]);
+  });
+
+  it('falls back to the standard and logs invalid oversized overrides', () => {
+    const log = vi.fn();
+    const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: ['a'.repeat(201)] },
+      platform: {}, log });
+    expect(result.value.mqInfraSignatures).toEqual(standard);
+    expect(result.sources.mqInfraSignatures).toBe('standard');
+    expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
+    expect(log.mock.calls.flat().join('\n')).toContain('(standard)');
+  });
 });

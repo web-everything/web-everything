@@ -21,34 +21,35 @@ const MQ_INFRA_MAX_JOBS = 10;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 const MQ_INFRA_SCAN_BYTES = 256 * 1024;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
-const MQ_INFRA_SIGNATURE_PROBES = ['', 'a', 'ab', 'x\ny', 'test failed', 'Error: assertion failed', 'ok', '1 passed'];
-
-function hasNestedUnboundedQuantifiers(source) {
-  // Track groups structurally so escaped syntax and character classes stay literal.
-  const groups = [false];
-  const unboundedAt = index => /^(?:[+*]|\{\d+,\})/.test(source.slice(index));
-  let inClass = false;
-  for (let i = 0; i < source.length; i++) {
-    const char = source[i];
-    if (char === '\\') { i++; continue; }
-    if (inClass) { if (char === ']') inClass = false; continue; }
-    if (char === '[') { inClass = true; continue; }
-    if (char === '(') groups.push(false);
-    else if (char === ')') {
-      const containsUnbounded = groups.pop();
-      if (containsUnbounded && unboundedAt(i + 1)) return true;
-      if (containsUnbounded) groups[groups.length - 1] = true;
-    } else if (unboundedAt(i)) groups[groups.length - 1] = true;
-  }
-  return false;
-}
 
 function validMqInfraSignatures(value) {
   return Array.isArray(value) && value.length > 0 && value.length <= 32 && value.every(source => {
-    if (typeof source !== 'string' || !source.trim() || source.length > 200) return false;
+    if (typeof source !== 'string' || source.length > 200) return false;
+    let literals = 0, wildcards = 0, previousWildcard = false;
+    // Consume only literal ASCII letters/digits/spaces, escaped punctuation,
+    // and the three wildcard tokens. Unknown syntax fails closed.
+    for (let i = 0; i < source.length;) {
+      if (/^[A-Za-z0-9 ]$/.test(source[i])) {
+        literals++;
+        previousWildcard = false;
+        i++;
+      } else if (source[i] === '\\') {
+        const escaped = source[i + 1];
+        if (['S', 'd', 's'].includes(escaped) && source[i + 2] === '+') {
+          if (previousWildcard || ++wildcards > 3) return false;
+          previousWildcard = true;
+          i += 3;
+        } else if (escaped && /[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/.test(escaped)) {
+          previousWildcard = false;
+          i += 2;
+        } else return false;
+      } else return false;
+    }
+    if (literals < 11) return false;
     try {
       const re = new RegExp(source);
-      return !hasNestedUnboundedQuantifiers(source) && !MQ_INFRA_SIGNATURE_PROBES.some(text => re.test(text));
+      // Generic failure wording is not an infra signature, whatever the grammar admits.
+      return !['test failed', 'Error: assertion failed', 'tests failed', 'command failed'].some(probe => re.test(probe));
     } catch { return false; }
   });
 }
