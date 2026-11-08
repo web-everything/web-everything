@@ -25,10 +25,15 @@ import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } fro
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
+import { readReviewRunEvidence, refusedReferralsAreRuled } from '../conveyor/review-referral-hold.mjs';
+
+// The shared reader returns reviewRunEvidence projections, not raw run records.
+const defaultReadReviewRuns = () => isUnderTest() ? [] : readReviewRunEvidence();
 
 export const staleRunDeadlineMs = (env = process.env) => /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '')
   && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS)) ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : 7_200_000;
@@ -125,15 +130,42 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
 
 // review-labels.mjs exports names only. Fail closed for every review hold namespace,
 // including future merge holds, rather than maintaining a partial list here.
-function conflictsWithPolicyClear(label, { settlesPending = false } = {}) {
+function conflictsWithPolicyClear(label, { settlesPending = false, settlesReviewPending = false } = {}) {
   const name = typeof label === 'string' ? label : label?.name;
   // A finished not-owed result settles the stale pending status; blocked and review holds still refuse (D-R338).
   if (settlesPending && name === 'red-team:pending') return false;
+  // A parked run retains review:pending itself, so once its referrals are ruled it is the resume's own label, not a hold.
+  if (settlesReviewPending && name === 'review:pending') return false;
   return typeof name === 'string' && (
     (name.startsWith('review:') && name !== 'review:accepted')
     || name.startsWith('review-status:')
     || (RED_TEAM_STATUS_LABELS.includes(name) && name !== 'red-team:clear')
   );
+}
+
+/** The daemon's own referral pause notice (`decideReferralHold`'s need-a-ruling shape, automation author only). Only a
+ * caller that has just proven every referral ruled may treat it as settled. A persistence-failure notice (detail
+ * paragraph, or the retries-spent lead) is settled only when the caller also proves persistence recovered
+ * (`persistRecovered`: the newest run is no longer persistenceFailed); the ledger variant and any look-alike from
+ * another author are different holds and stay. PURE. */
+const RULING_PAUSE_LEAD = /^review paused: \d+ referrals need a ruling; it resumes on a new push, a ruling, or a send-back(?:\n|$)/;
+const PERSIST_EXHAUSTED_LEAD = /^review paused: \d+ referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply(?:\n|$)/;
+const PERSIST_DETAIL = /\n\nReferral persistence (?:failed; the next bounded retry is at [0-9TZ:.-]+\.|retries are exhausted; waiting for a new event\.)\n\n<!-- review-referral-hold: [0-9a-f]+ -->$/;
+
+function isSettledReferralPauseNotice(comment, { persistRecovered = false } = {}) {
+  // Same trust set the producer's own dedupe uses (notifyReferralHoldNotice): the daemon sometimes posts under the operator's credential.
+  if (!isTrustedMarkerAuthor(comment) || typeof comment?.body !== 'string') return false;
+  const body = comment.body.trim();
+  // The real notice is `${why}${findings}${detail}\n\n<!-- review-referral-hold: <episode> -->` (notifyReferralHoldNotice):
+  // the leading line, an optional "Waiting on your ruling" findings block, then the episode marker. A persistence-failure
+  // detail means a persist hold, not a pause for rulings, so it never counts as settled. That detail is the standalone
+  // paragraph between the findings block and the marker, so it is matched only there, anchored to the marker:
+  // a finding summary (interpolated into the findings block) that merely quotes the phrase is not that detail.
+  if (!/\n<!-- review-referral-hold: [0-9a-f]+ -->$/.test(body)) return false;
+  // The caller proves persistence is no longer failing (the newest run has none), so a persistence notice is a stale
+  // episode from before the retry succeeded: the producer never removes it, and a ruling cannot clear it.
+  if (RULING_PAUSE_LEAD.test(body)) return persistRecovered || !PERSIST_DETAIL.test(body);
+  return persistRecovered && PERSIST_EXHAUSTED_LEAD.test(body);
 }
 
 /** A reviewed-sha marker alone never proves acceptance or supersedes a newer hold. */
@@ -155,7 +187,7 @@ function provenAcceptance({ comments, reviews, labels, head }) {
 /** Live holds supersede both carried and stored policy-clears. PURE.
  * Without an acceptance record nothing is "later", so any explicit hold comment stands (any author: fail closed).
  */
-function publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending = false }) {
+function publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending = false, settlesReviewPending = false }) {
   if (acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold) {
     return 'later verdict or hold supersedes acceptance';
   }
@@ -164,7 +196,7 @@ function publishableClearGuard({ labels, acceptance, comments, reviews, settlesP
   }
   if (acceptance?.reviewsUnreadable) return 'PR reviews unreadable; inspect formal reviews before policy-clear';
   if (!Array.isArray(labels)) return 'PR labels unreadable';
-  if (labels.some(label => conflictsWithPolicyClear(label, { settlesPending }))) {
+  if (labels.some(label => conflictsWithPolicyClear(label, { settlesPending, settlesReviewPending }))) {
     return 'conflicting label prevents policy-clear';
   }
   // A trusted marker alone is not acceptance provenance. Use numbering's whole-thread
@@ -288,7 +320,7 @@ const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run h
  */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
   setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
-  headNeverReviewed = headNeverReviewedFromRuns }) {
+  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -422,16 +454,36 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
-      if (needsReview) {
+      const fullReviewDecision = (why, { referralsRuled = false } = {}) => {
         // R640: pending is a merge hold, and does not prevent the full review.
-        const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
+        // Once every refused referral is ruled, the daemon's own "referrals need a ruling" pause notice (trusted author
+        // only) is settled, and the parked run's retained review:pending is the resume's own label. Every other hold stands.
+        const guardComments = referralsRuled && Array.isArray(rawPr.comments)
+          ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment, { persistRecovered: true })) : rawPr.comments;
+        const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
+        const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
+          settlesPending: true, settlesReviewPending: referralsRuled };
         const refusal = publishableClearGuard(context);
         if (refusal) return guardedSkip(refusal);
         // Formal holds apply even without an acceptance comment. No timestamp
         // floor: a missing acceptance cannot establish that a review was cleared.
         if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-        return dispatchDecision({ action: 'review', why: 'unprovable head move needs a full review' });
+        return dispatchDecision({ action: 'review', why });
+      };
+      if (needsReview) return fullReviewDecision('unprovable head move needs a full review');
+      if (verdict === VERDICTS.NEEDS_HUMAN && storedHead === head) {
+        let ruled = false;
+        try {
+          // Only the newest attempt on this head counts: an older ruled run must not mask a newer one that still owes a human.
+          const newest = readReviewRuns().filter(run => run?.repo === repo && Number(run.pr) === pr && run.head === head)
+            .reduce((best, run) => !best || Number(run.startedAt) > Number(best.startedAt) ? run : best, null);
+          // A run still failing to persist is the persistence retry path's, not a ruling resume (and its notices stay holds).
+          ruled = newest != null && newest.persistenceFailed === false
+            && refusedReferralsAreRuled({ ...rawPr, number: pr }, newest, { repo });
+        } catch { /* Unknown run evidence preserves the existing not-owed decision. */ }
+        if (ruled) return fullReviewDecision('stored review needs-human only on referrals now ruled; resume the parked run',
+          { referralsRuled: true });
       }
       if (!movedCardOnly && !pendingCardOnly && (!owed || accepted || finishedNotOwed)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
@@ -565,6 +617,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   env = process.env, setting,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
+  readReviewRuns = isUnderTest() || isUnderTest(env) ? () => [] : readReviewRunEvidence,
   readReviews, readCompleteReviews,
   // Test defaults use the supplied fixture without external IO. Race tests inject live readers.
   provider = isUnderTest() || isUnderTest(env) ? {
@@ -612,7 +665,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           && (r.headSha == null || r.headSha === head))
         || !Array.isArray(rawPr.comments) || redTeamForHead(rawPr.comments, pr, head)
         || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
-          ['review:accepted', 'red-team:pending'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
+          // review:pending is the parked run's own retained label: a ruled referral-blocked review resumes through
+          // fullReviewDecision, which needs the formal reviews even when no accept or red-team label is present.
+          ['review:accepted', 'red-team:pending', 'review:pending'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
       if (reviewsByPr.has(pr)) return { ...rawPr, reviews: reviewsByPr.get(pr) };
       let reviews;
       try {
@@ -623,7 +678,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus,
+      readEvidence, readStatus, readReviewRuns,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } };
     rows.push(...planRedTeamOnSkip(planningOptions));
