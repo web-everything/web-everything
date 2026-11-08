@@ -1817,6 +1817,7 @@
   "scripts/conveyor/soak/breaks/scorecard-dirt.soak.test.mjs": 330,
   "scripts/conveyor/soak/breaks/session-junk-in-daemon-clone.soak.test.mjs": 117.92,
   "scripts/conveyor/soak/breaks/shallow-clone-unrelated-histories.soak.test.mjs": 48.67,
+  "scripts/conveyor/soak/breaks/shared-node-modules-store-deleted-under-snapshot.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/short-job-behind-full-suite.soak.test.mjs": 5.47,
   "scripts/conveyor/soak/breaks/skipped-tick-ontick.soak.test.mjs": 17.87,
   "scripts/conveyor/soak/breaks/small-pr-lands-over-large-in-review.soak.test.mjs": 64.52,
