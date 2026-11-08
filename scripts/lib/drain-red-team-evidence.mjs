@@ -1,4 +1,9 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
+import { redTeamCheckRunPayload, postRedTeamCheckRun } from './red-team-check-run.mjs';
+import { redTeamEnqueueHold, sendBackReason } from './drain-queue-safety.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { isUnderTest } from './under-test.mjs';
+import { runGhSync } from './gh-throttle.mjs';
 import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -18,6 +23,17 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+
+/** Publication outbox only: no status parsing or review-run scan at enqueue. */
+export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }) {
+  const reason = 'red-team round not confirmed published; retry check publication before enqueue';
+  try {
+    statSync(`${statusPath({ repo, pr, head }, env)}.unpublished`);
+    return reason;
+  } catch (error) {
+    return error.code === 'ENOENT' ? null : `${reason} (publication hold unreadable; operator must inspect)`;
+  }
+}
 
 /** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */
 function retryMarkerSpent(path) {
@@ -377,7 +393,70 @@ export function recordRedTeamStatus(input, options = {}) {
   mkdirSync(dirname(path), { recursive: true });
   return withRedTeamStatusClaim(path, () => {
     if (Object.hasOwn(options, 'expectedSha256') && digest(optionalBytes(path)) !== options.expectedSha256) throw Error('raw recovery writer changed');
-    return writeRedTeamStatus(input, options);
+    // Every transition may invalidate a prior success, including a terminal
+    // failure. Keep its hold durable until publication is confirmed.
+    writeJsonAtomic(`${path}.unpublished`, { status: input.status });
+    const written = writeRedTeamStatus(input, options);
+    // Keep synchronous publication inside the claim: a newer writer must not persist or
+    // publish a hold before this writer's check has been posted. Local persistence
+    // still happens first and survives every publication failure.
+    // Test runs need explicit IO.
+    if (options.gh || (!isUnderTest(options.env) && !isUnderTest())) {
+      const report = outcome => {
+        if (!outcome.published) {
+          try { (options.log ?? (line => process.stderr.write(`${line}\n`)))(JSON.stringify(outcome)); }
+          catch { /* logging cannot fail the persisted local write */ }
+        }
+        return outcome;
+      };
+      const safeReason = value => String(value ?? 'red-team check publication failed')
+        .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
+      try {
+        const head = input.loopPayload?.findings?.read?.netBasis?.rev;
+        const gh = options.gh ?? ((args, opts) => runGhSync(args, { ...opts, env: options.env ?? process.env }));
+        let hold = 'red-team evidence unreadable; inspect the PR thread';
+        let sendBack = input.sendBack === true;
+        if (input.status === 'finished') {
+          try {
+            const comments = options.comments ?? readCompletePrComments(input.pr, { repo: input.repo,
+              exec: (_file, args, opts) => gh(args, opts) });
+            const live = JSON.parse(gh(['pr', 'view', String(input.pr), '--repo', input.repo, '--json', 'headRefOid,labels'],
+              { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+            if (live?.headRefOid !== head || !Array.isArray(live.labels)) throw Error('red-team live head or labels unreadable');
+            sendBack ||= !!sendBackReason(live.labels);
+            hold = redTeamEnqueueHold({ ...input, head, comments, scheduled: true,
+              recorded: input.result === 'ran', env: options.env ?? process.env });
+          } catch { /* unreadable evidence retains the hold */ }
+        }
+        const payload = redTeamCheckRunPayload({ headSha: head, status: input.status, hold, sendBack });
+        const post = payload => {
+          try {
+            const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, headSha: head, payload, gh });
+            return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
+          } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
+        };
+        const inProgress = payload.status === 'in_progress';
+        const maxAttempts = inProgress ? 3 : 1;
+        let posted;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          posted = post(payload);
+          if (posted.ok) {
+            rmSync(`${path}.unpublished`, { force: true });
+            return { published: true };
+          }
+        }
+        let reason = `Unpublished ${input.status} red-team round for PR #${input.pr} on ${head}: ${posted.reason}`;
+        {
+          const supersede = post(redTeamCheckRunPayload({ headSha: head, status: 'finished', hold: reason, sendBack: true }));
+          reason += supersede.ok ? '; failure check superseded prior success'
+            : `; failure supersede also failed: ${supersede.reason}; operator must inspect GitHub check history before merging`;
+        }
+        return report({ published: false, reason });
+      } catch (error) {
+        return report({ published: false, reason: safeReason(error?.message ?? error) });
+      }
+    }
+    return written;
   });
 }
 

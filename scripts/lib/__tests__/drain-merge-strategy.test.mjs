@@ -19,6 +19,8 @@ import { syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
 import * as completeComments from '../../conveyor/pr-comments-complete.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import { recordRedTeamStatus, readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
+import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
 
 // The real operator feed is never written from this file: every test either injects a publisher or relies on the
 // test-run guard, and the guard's own tests assert against this stand-in.
@@ -100,6 +102,63 @@ const MERGED = { state: 'MERGED', mergedAt: '2026-10-09T22:00:00Z', mergeCommit:
 const stampedBy = (login) => [{ author: { login }, body: buildClearanceComment(HEAD) }];
 
 describe('enqueue delegates red-team verdicts to merge-gate', () => {
+  it('rechecks publication holds when a new round starts after the first live admission read', () => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-late-publication-'));
+    try {
+      const env = { WE_UNDER_TEST: '1', WE_SHARED_RUNS_DIR: join(root, 'runs') };
+      let reads = 0;
+      const h = harness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'],
+        onView: { readLive: () => {
+          if (++reads === 2) recordRedTeamStatus({ repo: LOCAL, pr: 5283, status: 'running',
+            loopPayload: { findings: { read: { netBasis: { rev: HEAD } } } } }, {
+            env, gh: () => '', log: () => {}, postCheckRun: () => ({ ok: false, reason: 'outage' }),
+          });
+          return { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] };
+        } } });
+      expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+      expect(reads).toBe(2);
+      expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each(['pending', 'running'])('an older successful check cannot authorize enqueue after all %s publications fail', status => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-publication-enqueue-'));
+    try {
+      const env = { WE_UNDER_TEST: '1', WE_SHARED_RUNS_DIR: join(root, 'runs') };
+      const key = { repo: LOCAL, pr: 5283, head: HEAD, env };
+      const input = { repo: LOCAL, pr: 5283, loopPayload: { verdict: { verdict: 'accept' },
+        findings: { read: { netBasis: { rev: HEAD } } } } };
+      const runs = [], attempts = [], appId = 5037855;
+      const options = { env, log: () => {},
+        comments: [{ author: { login: 'web-everything' }, body:
+          `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` }],
+        gh: () => JSON.stringify({ headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] }),
+        postCheckRun: ({ payload }) => {
+          runs.push({ ...payload, id: runs.length + 1, app: { id: appId } });
+          return { ok: true };
+        } };
+      recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, options);
+      expect(evaluateRedTeamCheckFact({ headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
+      expect(readRedTeamPublicationHold(key)).toBeNull();
+      const result = recordRedTeamStatus({ ...input, status }, { ...options,
+        postCheckRun: ({ payload }) => { attempts.push(payload); return { ok: false, reason: 'checks publication outage' }; } });
+      expect(result.published).toBe(false);
+      expect(attempts.map(check => check.status)).toEqual(['in_progress', 'in_progress', 'in_progress', 'completed']);
+      // GitHub still has the old success; the durable publication hold closes this gap.
+      expect(evaluateRedTeamCheckFact({ headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
+      const makeDrain = () => harness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'] });
+      const first = makeDrain();
+      expect(first.s.prestage({ num: 5283 }, HEAD)).toMatchObject({ allowed: false });
+      expect(first.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending',
+        reason: expect.stringContaining('not confirmed published') });
+      expect(first.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+      // A fresh drain process must also observe the persisted hold.
+      expect(makeDrain().s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+      expect(recordRedTeamStatus({ ...input, status }, options)).toEqual({ published: true });
+      expect(readRedTeamPublicationHold(key)).toBeNull();
+      expect(makeDrain().s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('enqueues without reading local status files or scanning review runs', () => {
     const readRedTeamEvidence = vi.fn(() => { throw new Error('local status files and review scans must not be read'); });
     const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],

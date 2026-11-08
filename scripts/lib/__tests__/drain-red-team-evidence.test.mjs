@@ -4,11 +4,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
+import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
+import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -20,6 +22,157 @@ function fixture() {
     readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
 }
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+
+describe('status persistence and check publication share one claim', () => {
+  it('successful completion followed by failed publication of a terminal failure keeps the hold and attempts the failure supersede', () => {
+    const f = fixture(), appId = 5037855, runs = [], attempts = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'finished' };
+    const options = { env: f.env, log: () => {},
+      comments: [{ author: { login: 'web-everything' }, body:
+        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+      gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
+      postCheckRun: ({ payload: check }) => {
+        runs.push({ ...check, id: runs.length + 1, app: { id: appId } });
+        return { ok: true };
+      } };
+    expect(recordRedTeamStatus({ ...input, result: 'ran' }, options)).toEqual({ published: true });
+    expect(readRedTeamPublicationHold(f)).toBeNull();
+    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
+    const result = recordRedTeamStatus({ ...input, result: 'failed', sendBack: true }, {
+      ...options, comments: [], postCheckRun: ({ payload: check }) => {
+        expect(readRedTeamPublicationHold(f)).toMatch(/not confirmed published/);
+        attempts.push(check);
+        return { ok: false, reason: 'GitHub unavailable' };
+      },
+    });
+    expect(result).toMatchObject({ published: false, reason: expect.stringContaining('failure supersede also failed') });
+    expect(readRedTeamStatus(f)).toMatchObject({ status: 'finished', result: 'failed' });
+    expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+    expect(attempts).toHaveLength(2);
+    expect(attempts.every(check => check.head_sha === f.head && check.status === 'completed' && check.conclusion === 'failure')).toBe(true);
+    expect(attempts[1].output.summary).toContain('Unpublished finished red-team round');
+    // Only a confirmed publication can release this terminal-transition hold.
+    expect(recordRedTeamStatus({ ...input, result: 'failed', sendBack: true }, options)).toEqual({ published: true });
+    expect(readRedTeamPublicationHold(f)).toBeNull();
+    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }).ok).toBe(false);
+  });
+
+  it('publication holds are isolated by head and fail closed on unreadable marker paths', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env: f.env });
+    expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+    expect(readRedTeamPublicationHold({ ...f, head: 'c'.repeat(40) })).toBeNull();
+    // A non-directory ancestor makes the probe unreadable, rather than absent.
+    const blocked = join(redTeamStatusDir(f.env), 'not-a-directory');
+    writeFileSync(blocked, 'blocked');
+    expect(readRedTeamPublicationHold({ ...f, env: { WE_SHARED_RUNS_DIR: join(blocked, 'child', 'runs') } }))
+      .toMatch(/unreadable.*operator must inspect/);
+  });
+  it.each(['pending', 'running'])('success then failed %s publication attempts a failure supersede and reports published:false', status => {
+    const f = fixture(), appId = 5037855, runs = [], attempts = [], logs = [];
+    const input = { ...f, loopPayload: payload(f.head) };
+    const options = {
+      env: f.env,
+      comments: [{ author: { login: 'web-everything' }, body:
+        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+      gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
+      log: line => logs.push(JSON.parse(line)),
+      postCheckRun: ({ payload: check }) => {
+        attempts.push(check);
+        if (check.status === 'in_progress') {
+          // Both returned failures and thrown errors count against the same bound.
+          if (attempts.length === 3) throw Error('HTTP 503');
+          return { ok: false, reason: 'HTTP 503' };
+        }
+        runs.push({ ...check, id: runs.length + 1, app: { id: appId } });
+        return { ok: true };
+      },
+    };
+    expect(recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, options)).toEqual({ published: true });
+    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
+    const result = recordRedTeamStatus({ ...input, status }, options);
+    expect(result).toMatchObject({ published: false, reason: expect.stringContaining(`Unpublished ${status} red-team round`) });
+    expect(logs).toEqual([result]);
+    expect(readRedTeamStatus(f).status).toBe(status);
+    expect(attempts).toHaveLength(5); // original success, three pending attempts, one failure supersede
+    expect(attempts.slice(1, 4).every(check => check.status === 'in_progress')).toBe(true);
+    expect(attempts[4]).toMatchObject({ head_sha: f.head, status: 'completed', conclusion: 'failure',
+      output: { summary: expect.stringContaining(`Unpublished ${status} red-team round for PR #${f.pr} on ${f.head}`) } });
+    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/failed/) });
+  });
+
+  it('bounds retries and preserves the local write when pending and failure supersede publications both fail', () => {
+    const f = fixture(), attempts = [];
+    const result = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, {
+      env: f.env, gh: () => '', log: () => { throw Error('logger unavailable'); },
+      postCheckRun: ({ payload: check }) => { attempts.push(check); throw Error('GitHub unavailable'); },
+    });
+    expect(result).toMatchObject({ published: false,
+      reason: expect.stringMatching(/failure supersede also failed.*operator must inspect/) });
+    expect(attempts.map(check => check.status)).toEqual(['in_progress', 'in_progress', 'in_progress', 'completed']);
+    expect(readRedTeamStatus(f).status).toBe('running');
+  });
+
+  it('stops pending publication retries at the first success without posting a failure supersede', () => {
+    const f = fixture(), attempts = [];
+    const result = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'pending' }, {
+      env: f.env, gh: () => '',
+      postCheckRun: ({ payload: check }) => {
+        attempts.push(check);
+        return attempts.length === 2 ? { ok: true } : { ok: false, reason: 'HTTP 503' };
+      },
+    });
+    expect(result).toEqual({ published: true });
+    expect(attempts.map(check => check.status)).toEqual(['in_progress', 'in_progress']);
+  });
+
+  it('prevents reversed publication order so a newer pending hold remains authoritative', () => {
+    const f = fixture(), appId = 5037855, runs = [];
+    const input = { ...f, loopPayload: payload(f.head) };
+    let competingError;
+    const publish = ({ payload: check }) => {
+      runs.push({ ...check, id: runs.length + 1, app: { id: appId } });
+      return { ok: true };
+    };
+    const newerOptions = { env: f.env, gh: () => '', postCheckRun: publish };
+    recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, {
+      env: f.env,
+      comments: [{ author: { login: 'web-everything' }, body:
+        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+      gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
+      postCheckRun: args => {
+        // A is paused after persistence, before its success reaches GitHub. B
+        // attempts to persist and publish pending during that exact interval.
+        try { recordRedTeamStatus({ ...input, status: 'running' }, newerOptions); }
+        catch (error) { competingError = error; }
+        expect(readRedTeamStatus(f).status).toBe('finished');
+        return publish(args);
+      },
+    });
+    expect(competingError?.code).toBe('RED_TEAM_RETRY_ADMITTED');
+    expect(runs).toHaveLength(1);
+    expect(runs[0].conclusion).toBe('success');
+    // Once A releases the claim, B's next attempt owns both the local write and
+    // publication. A has no deferred publication left that could overtake it.
+    recordRedTeamStatus({ ...input, status: 'running' }, newerOptions);
+    expect(readRedTeamStatus(f).status).toBe('running');
+    expect(runs).toHaveLength(2);
+    expect(runs[1].status).toBe('in_progress');
+    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/progress|incomplete/) });
+  });
+
+  it('keeps the local write and releases the claim when check publication throws', () => {
+    const f = fixture(), input = { ...f, loopPayload: payload(f.head) };
+    expect(() => recordRedTeamStatus({ ...input, status: 'running' }, {
+      env: f.env, gh: () => '', postCheckRun: () => { throw Error('GitHub unavailable'); },
+    })).not.toThrow();
+    expect(readRedTeamStatus(f).status).toBe('running');
+    recordRedTeamStatus({ ...input, status: 'finished', result: 'failed' }, { env: f.env });
+    expect(readRedTeamStatus(f)).toMatchObject({ status: 'finished', result: 'failed' });
+  });
+});
 
 describe('historical fallback predicate clauses', () => {
   const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped' },

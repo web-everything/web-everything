@@ -122,6 +122,9 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
     for (const id of mergeGateIds) set(id, 'fail-closed', `PR read failed: ${facts?.prReadError || 'no PR facts'}`);
     return finish(num, out, policy, mergeEvent);
   }
+  const redTeam = facts.redTeamCheck;
+  set('red-team', typeof redTeam?.ok !== 'boolean' ? 'fail-closed' : redTeam.ok ? 'pass' : 'hold',
+    redTeam?.reason || 'red-team check fact missing or unreadable');
   const pinnedSha = facts.pinnedHead?.sha;
   let clearanceCarry = facts.clearanceCarry;
   let setting;

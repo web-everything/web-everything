@@ -43,6 +43,35 @@ describe('red-team check run contract', () => {
       run({ id: 12, head_sha: OLD_HEAD, conclusion: 'failure' })] }).ok).toBe(true);
   });
 
+  it.each([false, true])('a newer pending run supersedes an older success (reverse=%s)', reverse => {
+    const checkRuns = [run(), run({ id: 11, started_at: '2026-11-07T11:00:00Z', status: 'in_progress', conclusion: null })];
+    if (reverse) checkRuns.reverse();
+    expect(api.evaluateRedTeamCheckFact({ headSha: HEAD, checkRuns, appId: APP_ID }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/progress|pending|incomplete/i) });
+  });
+
+  it.each([undefined, null, '', 'invalid', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'missing or invalid WE_APP_ID fails closed before reading GitHub: %s', appId => {
+      const gh = vi.fn(() => JSON.stringify({ total_count: 1, check_runs: [run()] }));
+      expect(api.evaluateRedTeamCheckFact({ headSha: HEAD, checkRuns: [run()], appId }))
+        .toMatchObject({ ok: false, reason: expect.stringMatching(/WE_APP_ID/) });
+      expect(api.readRedTeamCheckFact({ repo: 'o/r', headSha: HEAD, appId, gh }))
+        .toMatchObject({ ok: false, reason: expect.stringMatching(/WE_APP_ID/) });
+      expect(gh).not.toHaveBeenCalled();
+    });
+
+  it.each([
+    ['truncated history containing a success', 101, 100],
+    ['oversized history beyond the read bound', 101, 101],
+    ['missing total count', undefined, 1],
+  ])('incomplete check history fails closed with an operator fallback: %s', (_name, totalCount, count) => {
+    const gh = vi.fn(() => JSON.stringify({ total_count: totalCount,
+      check_runs: Array.from({ length: count }, (_, index) => run({ id: index + 10 })) }));
+    expect(api.readRedTeamCheckFact({ repo: 'o/r', headSha: HEAD, appId: APP_ID, gh }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete.*operator.*inspect/i) });
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['finished clear', 'finished', null, false, 'completed', 'success'],
     ['finished held', 'finished', 'post-accept red team has no recorded result on the live head', false, 'completed', 'failure'],
