@@ -3,6 +3,7 @@ bornAs: xv6a4qs
 kind: story
 size: 3
 status: open
+related: ["4124"]
 scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-07"
 tags: []
