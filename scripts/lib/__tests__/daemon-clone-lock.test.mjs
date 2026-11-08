@@ -97,6 +97,60 @@ describe('symmetric reader/writer fairness', () => {
     expect(await f.write()).toEqual({ ok: true });
   });
 
+  it.each([undefined, 0])('bounds the override and rebuilds writer priority after yielding (max skips %s)', async (maxSkips) => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER', undefined);
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS', undefined);
+    try {
+      const f = await rotatingReaders({ existingReader: true, useDefaults: true });
+      const options = maxSkips === undefined ? {} : { writerPriorityMaxSkips: maxSkips };
+      await f.train(); // distinct priority readers rotate; the fourth still waits
+      const window = Math.max(1, (maxSkips ?? 2) + 1);
+      for (let attempt = 0; attempt < window; attempt += 1) {
+        expect(await f.write(options)).toMatchObject({
+          ok: false, reason: 'tick-in-progress', writerStarved: 4 + attempt,
+        });
+      }
+      expect(await f.write(options)).toMatchObject({ ok: false, reason: 'reader-priority' });
+      expect(inspectCloneLock(f.clone, { lockRoot: f.lockRoot }).writerClaim).toBeNull();
+      // Starting from zero gives readers three turns again, then the writer gets the clone
+      // even though the fourth reader's older priority claim is still pending.
+      for (let refusal = 1; refusal <= 3; refusal += 1) {
+        expect(await f.write(options)).toMatchObject({ ok: false, reason: 'reader-priority' });
+        expect(inspectCloneLock(f.clone, { lockRoot: f.lockRoot }).writerClaim.count).toBe(refusal);
+      }
+      releaseRead(f.clone, { owner: 'existing-reader', lockRoot: f.lockRoot });
+      expect(await f.write(options)).toEqual({ ok: true });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('releases the writer key and resets an exhausted claim when reader priority arises during drain', async () => {
+    const f = await rotatingReaders({ existingReader: true });
+    await f.train();
+    const lastReader = [...f.pending][0];
+    expect(f.read(lastReader)).toEqual({ ok: true });
+    releaseRead(f.clone, { owner: lastReader, lockRoot: f.lockRoot });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect(await f.write()).toMatchObject({ ok: false, reason: 'tick-in-progress', writerStarved: 4 + attempt });
+    }
+    expect(await f.write({
+      waitMs: 100, pollMs: 10,
+      sleep: async (ms) => {
+        f.advance(ms);
+        for (let refusal = 1; refusal <= 3; refusal += 1) {
+          expect(f.read('drain-reader', { writerPriorityMaxSkips: 0 })).toMatchObject({
+            ok: false, reason: 'writer-active', starved: refusal,
+          });
+        }
+      },
+    })).toMatchObject({ ok: false, reason: 'reader-priority', heldBy: 'drain-reader' });
+    const state = inspectCloneLock(f.clone, { lockRoot: f.lockRoot });
+    expect(state.writer).toBeNull();
+    expect(state.writerClaim).toBeNull();
+    expect(f.read('drain-reader')).toEqual({ ok: true });
+  });
+
   it('uses omitted-option defaults: three writer refusals override older reader claims, with reader admission after two skips', async () => {
     vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER', undefined);
     vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS', undefined);

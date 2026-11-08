@@ -184,9 +184,10 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
 // row leaves a writer-priority claim; while it is live, NEW reads by anyone else are refused `writer-priority`
 // (ticks already in flight are never touched, so #4044 never-read-mid-move holds trivially), so the in-flight ticks
 // drain and the next writer gets the clone. Any writer that gets the clone clears the claim (the clone is moving).
-// Once effective, the writer claim overrides reader starvation, including older claims: rotating readers must
-// not keep a writer yielding forever. Readers still bypass it after writerPriorityMaxSkips refusals, and the
-// claim expires on its TTL. Refusals by a writer claim never count toward reader starvation.
+// Once effective, the writer claim overrides reader starvation, including older claims, for at most
+// writerPriorityMaxSkips + 1 attempts. Then yielding to a starved reader resets the writer's count, so neither
+// side yields forever. Readers also bypass the claim after writerPriorityMaxSkips refusals, and the claim
+// expires on its TTL. Refusals by a writer claim never count toward reader starvation.
 
 /** Setting: consecutive `tick-in-progress` or `reader-priority` refusals after which a writer's claim blocks NEW reads. Default 3;
  *  `0` turns writer priority off (the pre-fix behaviour). */
@@ -508,6 +509,7 @@ export async function acquireWrite(root, opts = {}) {
     readerPriorityAfter = resolveReaderPriorityAfter(),
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
+    writerPriorityMaxSkips = resolveWriterPriorityMaxSkips(),
     writerWaitPriorityMs: writerWaitPriorityMsOpt = resolveWriterWaitPriorityMs(),
     writerWaitPriorityWindowMs: writerWaitPriorityWindowMsOpt = WRITER_WAIT_PRIORITY_WINDOW_MS,
   } = opts;
@@ -530,13 +532,21 @@ export async function acquireWrite(root, opts = {}) {
     });
     return c?.owner === owner ? c : null;
   };
-  const noteRefusal = (nowMs, heldBy) => writerPriorityAfter > 0
-    ? noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs: writerClaimTtlMs, probe }) : null;
+  const claimWindowEnd = writerPriorityAfter + Math.max(1, writerPriorityMaxSkips + 1);
+  const noteRefusal = (nowMs, heldBy, yieldingToReader = false) => {
+    if (yieldingToReader && ownClaim()?.count >= claimWindowEnd) {
+      clearWriterClaim(starvedRoot);
+      return null;
+    }
+    return writerPriorityAfter > 0
+      ? noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs: writerClaimTtlMs, probe }) : null;
+  };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
   const priorityFor = (nowMsN) => {
-    if (ownClaim()) return null;
+    const claim = ownClaim();
+    if (claim && claim.count < claimWindowEnd) return null;
     const waited = nowMsN - startMs;
-    const waitedPast = writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
+    const waitedPast = !claim && writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
       && waited < writerWaitPriorityMs + windowMs;
     const r = findPriorityReader(starvedRoot, {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
@@ -546,7 +556,7 @@ export async function acquireWrite(root, opts = {}) {
   };
   const yieldTo = priorityFor(startMs);
   if (yieldTo) {
-    noteRefusal(startMs, yieldTo.owner);
+    noteRefusal(startMs, yieldTo.owner, true);
     return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
   }
   const currentWriter = readLockEntry(writerRoot, WRITER_KEY);
@@ -586,7 +596,7 @@ export async function acquireWrite(root, opts = {}) {
     const starvedReader = priorityFor(nowMsN);
     if (starvedReader) {
       releaseLockDir(writerRoot, WRITER_KEY);
-      noteRefusal(nowMsN, starvedReader.owner);
+      noteRefusal(nowMsN, starvedReader.owner, true);
       return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
     }
     if (blockers.length === 0) {
