@@ -745,6 +745,34 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     expect(result.status,result.stderr).toBe(0);
     expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':'7');
   });
+  it.each(['closed', 'full'])('supervisor crash traceback never blocks exit on a %s stderr pipe', pipeState => {
+    // An uncaught supervisor error (here: the subreaper is unavailable) prints a
+    // traceback; on a full undrained pipe that blocking write used to hang the
+    // supervisor, holding its writer lock, instead of exiting non-zero.
+    const probe=String.raw`import ctypes, fcntl, json, os, sys
+from unittest.mock import patch
+source, state = sys.argv[1:]
+rd, wr = os.pipe()
+if state == 'full':
+    flags = fcntl.fcntl(wr, fcntl.F_GETFL)
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True: os.write(wr, b'x' * 4096)
+    except BlockingIOError: pass
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags)
+else:
+    os.close(rd)
+os.dup2(wr, 2)
+sys.stderr = os.fdopen(2, 'w', buffering=1, closefd=False)
+with patch.object(ctypes, 'CDLL') as libc:
+    libc.return_value.prctl.return_value = -1
+    sys.argv = ['supervisor', json.dumps({})]
+    exec(source)
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,pipeState],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+  });
 });
 
 describe('setup and pruning contract', () => {

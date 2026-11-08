@@ -489,35 +489,47 @@ finally:
 // A root supervisor is a subreaper: children which call setsid/double-fork are
 // adopted here, and killed before the ops process publishes any evidence.
 export const supervisorSource = String.raw`
-import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat, threading
-PR_SET_CHILD_SUBREAPER = 36
-if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
-    raise RuntimeError('subreaper unavailable')
+import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat, threading, select, traceback
 # Diagnostics are best-effort: a closed, broken or full-and-undrained stderr pipe
-# must never abort or block worker cleanup or status publication. The write goes
-# straight to the descriptor (never through sys.stderr, whose pending buffer would
-# make the interpreter's exit flush fail or block) on a daemon thread that is
-# waited for only briefly. One failed, partial or stalled write disables the rest.
+# must never abort or block worker cleanup, status publication or the supervisor's
+# own exit. The write goes straight to the descriptor (never through sys.stderr,
+# whose pending buffer would make the interpreter's exit flush fail or block).
+# A pipe with no room is skipped without starting a thread (so a stalled sink
+# never adds a task to the run cgroup); otherwise the write runs on a daemon
+# thread that is waited for only briefly. One failed, partial or stalled write
+# disables the rest. Uncaught errors are reported through the same path.
 diag_off = False
 def diag(message):
     global diag_off
     if diag_off: return
-    def emit():
+    def emit(fd):
         global diag_off
         try:
             data = message.encode('utf-8', 'replace')
-            fd = sys.stderr.fileno()
             while data:
                 data = data[os.write(fd, data):]
         except BaseException:
             diag_off = True
     try:
-        sender = threading.Thread(target=emit, daemon=True)
+        fd = sys.stderr.fileno()
+        probe = select.poll()
+        probe.register(fd, select.POLLOUT)
+        ready = probe.poll(0)
+        if not ready or ready[0][1] & (select.POLLERR | select.POLLHUP | select.POLLNVAL) or not ready[0][1] & select.POLLOUT:
+            diag_off = True
+            return
+        sender = threading.Thread(target=emit, args=(fd,), daemon=True)
         sender.start()
         sender.join(0.25)
         if sender.is_alive(): diag_off = True
     except BaseException:
         diag_off = True
+def crash_hook(kind, error, trace):
+    diag(''.join(traceback.format_exception(kind, error, trace)))
+sys.excepthook = crash_hook
+PR_SET_CHILD_SUBREAPER = 36
+if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    raise RuntimeError('subreaper unavailable')
 cfg = json.loads(sys.argv[1])
 uid, gid = cfg['uid'], cfg['gid']
 writer = cfg['writer']
