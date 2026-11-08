@@ -2,9 +2,11 @@
 bornAs: x4a0xpx
 kind: story
 size: 1
-status: open
+status: resolved
 scope: ["we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: cc26e10818c46a9dc3c8d9b74434c65d7444b392
 tags: []
 ---
 

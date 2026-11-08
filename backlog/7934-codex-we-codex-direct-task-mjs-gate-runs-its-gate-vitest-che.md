@@ -35,3 +35,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Progress (2026-11-07)
+
+PR #6458 makes bare vitest/playwright refuse inside Codex runs (shims, WE_HEAVY_ADMISSION_HELD): the same hole by a different mechanism than routing Codex --gate through heavy-admission. Remains: owner decides whether this satisfies the item; acceptance is still a TODO stub.
