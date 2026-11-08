@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync,
 import { dirname, join } from 'node:path';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
-import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
+import { readRecoveryWitness, redTeamStatusDir } from './drain-red-team-evidence.mjs';
+import { redTeamOwedFor } from './review-red-team-policy.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
@@ -47,6 +48,31 @@ export function classifyRedTeamSkip(redTeam) {
   return { kind: valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
     && !deferred
     ? 'policy' : 'non-policy', reason };
+}
+
+const STORED_NOT_OWED_RULE = 'stored-review-not-owed';
+const STORED_NOT_OWED_REASON = 'stored review does not owe a red team';
+
+/**
+ * R730 rule. Only the two not-owed skip reasons may settle, and only when the stored review record for this
+ * exact head (read here, never parsed from a message) has a verdict and states no red team is owed.
+ * Anything unreadable, missing, older-head or owed fails closed to the operator.
+ */
+function storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam }) {
+  const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
+  const candidate = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam) && !deferred
+    && (redTeam.status === 'not-owed'
+      || (redTeam.status === 'skipped' && !redTeam.policy && redTeam.reason === STORED_NOT_OWED_REASON));
+  if (!candidate) return false;
+  try {
+    const stored = io.readStoredReview
+      ? io.readStoredReview({ repo, pr, head })
+      : readRecoveryWitness({ repo, pr, head, env: io.env ?? process.env });
+    const payload = stored?.ok === false ? null : stored?.newest;
+    const verdict = payload?.verdict;
+    return Boolean(verdict) && typeof verdict === 'object' && payload?.findings?.read?.netBasis?.rev === head
+      && !redTeamOwedFor(payload);
+  } catch { return false; }
 }
 
 /** Retry notification IO only; old failures must not prevent this job's settlement. */
@@ -132,8 +158,15 @@ export function settleRedTeamSkip(input = {}) {
     // Ordinary job settlement retains its contradictory-not-owed refusal.
     const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
-    const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
+    let classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
       : classifyRedTeamSkip(redTeam);
+    let rule;
+    if (classified.kind !== 'policy' && realHead && isRealHead(input.readHead)
+      && input.readHead.toLowerCase() === head.toLowerCase()
+      && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam })) {
+      classified = { kind: 'policy', reason: 'not owed (stored review)' };
+      rule = STORED_NOT_OWED_RULE;
+    }
     let { reason } = classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
@@ -150,8 +183,8 @@ export function settleRedTeamSkip(input = {}) {
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
-        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${storedClear ? 'not owed (stored review)' : 'card-only diff (policy redTeam.skipCardOnly)'}` });
-        return { outcome: 'policy-clear' };
+        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${rule ? `not owed (stored review; rule ${rule})` : storedClear ? 'not owed (stored review)' : 'card-only diff (policy redTeam.skipCardOnly)'}` });
+        return { outcome: 'policy-clear', ...(rule ? { rule } : {}) };
       } catch (error) {
         reason = `policy-clear comment failed: ${safeErrorText(error)}`;
       }
