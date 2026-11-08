@@ -5,6 +5,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
+import { planSizeGrowth, planGrowthTransition, SIZE_OVER_CAP_LABEL } from '../lib/pr-size-admission.mjs';
 /**
  * Required, but a gate evaluator rather than CI: `merge-gate` also fails on review/freeze/candidacy holds (the label
  * writers excuse those via `excusePrMergeGateHolds`). Its failure never decides red here, but it does block green.
@@ -12,7 +13,51 @@ import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.
  * `reduceCheckState`.
  */
 export const FIX_PUSH_GATE_CHECK = 'merge-gate';
-const defaultRun = (cmd, args) => execFileSyncThrottled(cmd, args, { encoding: 'utf8', timeout: resolveChildTimeoutMs() });
+const defaultRun = (cmd, args) => execFileSyncThrottled(cmd, args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 4 * 1024 * 1024 });
+function defaultReadNumstat({ repo, pr, run, expectedFiles }) {
+  // The PR's own file count is the cross-check: an empty, stale or short read must never pass as a smaller diff.
+  if (!Number.isSafeInteger(expectedFiles) || expectedFiles < 0) throw new Error('PR file count unknown');
+  // A repo-less read would be implicit; callers always pass the slug, so no repo is unmeasurable (fails closed).
+  if (!repo) throw new Error('size evidence needs an explicit repo');
+  const text = run('gh', ['api', '--paginate', `repos/${repo}/pulls/${pr}/files`, '--jq', FILES_JQ]);
+  const rows = parseFilesRows(text);
+  if (rows.length !== expectedFiles) throw new Error('PR files do not match the PR file count');
+  return rowsToNumstat(rows);
+}
+/** One compact JSON object per file; `hasPatch` lets the reader tell a binary file from a measured zero. */
+export const FILES_JQ = '.[]|{additions,deletions,filename,previous_filename,hasPatch:(.patch != null)}|tojson';
+// Controls, DEL, U+2028/2029 and quotes in a path could forge numstat rows or break the framing.
+const UNSAFE_PATH_CHARS = new RegExp('[\\u0000-\\u001f\\u007f\\u2028\\u2029"]');
+const isCount = n => Number.isSafeInteger(n) && n >= 0;
+const isPath = p => typeof p === 'string' && p !== '' && !UNSAFE_PATH_CHARS.test(p);
+/** Validate the files-API rows (one JSON object per line). Any row that is not exactly well-formed throws. */
+export function parseFilesRows(text) {
+  if (typeof text !== 'string') throw new Error('incomplete PR files');
+  if (!text) return [];
+  if (!text.endsWith('\n')) throw new Error('truncated PR files');
+  const lines = text.slice(0, -1).split('\n');
+  // The files endpoint silently caps evidence at 3000 files.
+  if (lines.length >= 3000) throw new Error('incomplete PR files');
+  return lines.map(line => {
+    const { additions, deletions, filename, previous_filename: previous, hasPatch } = JSON.parse(line) ?? {};
+    if (!isCount(additions) || !isCount(deletions) || !isPath(filename) || typeof hasPatch !== 'boolean'
+      || (previous != null && !isPath(previous))) throw new Error('unreadable PR file row');
+    return { additions, deletions, filename, previous: previous && previous !== filename ? previous : null, hasPatch };
+  });
+}
+/**
+ * Rows to `git diff --numstat -z` text, which `parseNumstat` reads. The API reports binary files (and deletions of
+ * them) as 0/0 with no patch, which numstat spells `-\t-`: a zero-change row with no patch is unmeasurable, never a
+ * zero-sized diff. A rename carries BOTH paths (counts, empty path, old, new) so a move across the test/data
+ * boundary cannot hide its source.
+ */
+export function rowsToNumstat(rows) {
+  return rows.map(({ additions, deletions, filename, previous, hasPatch }) => {
+    const counts = !hasPatch && additions + deletions === 0 ? '-\t-' : `${additions}\t${deletions}`;
+    return previous ? `${counts}\t\0${previous}\0${filename}\0` : `${counts}\t${filename}\0`;
+  }).join('');
+}
+export const filesToNumstat = text => rowsToNumstat(parseFilesRows(text));
 export const FIX_PUSH_RED_CI_LABELS = Object.freeze(['ci:failed', 'status:ci-red']);
 export const FIX_PUSH_FIXER_LABELS = Object.freeze(['status:fixing', 'status:takeover-running']);
 export const FIX_PUSH_WAITING_LABELS = Object.freeze(['checking', 'status:awaiting-ci']);
@@ -56,22 +101,49 @@ export function fixPushLabelPlan(present, verdict) {
   if (verdict === 'red') return { handOff: false, remove: [...FIX_PUSH_FIXER_LABELS, ...FIX_PUSH_WAITING_LABELS, 'status:awaiting-review'].filter(has) };
   return { handOff: true, remove: [...FIX_PUSH_RED_CI_LABELS, ...FIX_PUSH_FIXER_LABELS, 'status:awaiting-review'].filter(has) };
 }
-export function markFixPushAwaitingCi({ repo, pr, head }, { run = defaultRun, recordPush = recordFixPush, readRequired = readRequiredChecksSafe } = {}) {
+export function markFixPushAwaitingCi({ repo, pr, head }, { run = defaultRun, recordPush = recordFixPush, readRequired = readRequiredChecksSafe, readNumstat = defaultReadNumstat } = {}) {
   recordPush({ repo, pr, head });
   const repoArgs = repo ? [`--repo=${repo}`] : [];
-  const view = JSON.parse(run('gh', ['pr', 'view', String(pr), ...repoArgs, '--json', 'headRefOid,labels,statusCheckRollup']));
+  const view = JSON.parse(run('gh', ['pr', 'view', String(pr), ...repoArgs, '--json', 'headRefOid,labels,statusCheckRollup,changedFiles']));
   if (!head || view.headRefOid !== head) return false;
   const present = (view.labels ?? []).map(l => l.name ?? l);
+  let numstatText;
+  try {
+    numstatText = readNumstat({ repo, pr, run, expectedFiles: view.changedFiles });
+    // Never repair a truncated last row into apparently complete evidence.
+    if (typeof numstatText !== 'string' || (numstatText && !/[\n\0]$/.test(numstatText))) numstatText = 'unreadable size evidence';
+  } catch { numstatText = 'unreadable size evidence'; }
+  const before = { status: present.includes(SIZE_OVER_CAP_LABEL) ? 'over-cap' : 'ok' };
+  const after = planSizeGrowth({ numstatText });
+  const transition = planGrowthTransition({ before, after });
+  let sizeError;
+  try {
+    if (transition.flag) {
+      run('gh', ['label', 'create', SIZE_OVER_CAP_LABEL, ...repoArgs, '--color', 'd93f0b', '--description',
+        'PR grew over the 300 non-test line cap: split plan proposed — auto-managed', '--force']);
+      if (transition.crossed) {
+        const body = `${after.event}: ${after.lines ?? 'unknown'} non-test lines.\n\n${after.splitPlan?.text ?? after.reason}\n\n`
+          + 'Proposed: split into the file groups above; the PR is not closed and review continues.';
+        run('gh', ['pr', 'comment', String(pr), ...repoArgs, '--body', body]);
+      }
+      // Record the crossing only after its visible event succeeds, so a failed comment can retry.
+      if (!present.includes(SIZE_OVER_CAP_LABEL)) run('gh', ['pr', 'edit', String(pr), ...repoArgs, '--add-label', SIZE_OVER_CAP_LABEL]);
+    } else if (after.status === 'ok' && present.includes(SIZE_OVER_CAP_LABEL)) {
+      run('gh', ['pr', 'edit', String(pr), ...repoArgs, '--remove-label', SIZE_OVER_CAP_LABEL]);
+    }
+  } catch (error) { sizeError = { error }; }
   // A same-head retry (a re-arm owed by an earlier run) can arrive after CI finished: that verdict stands.
   const verdict = view.statusCheckRollup?.length ? headCiVerdict(view.statusCheckRollup, readRequired(repo)) : 'pending';
   const plan = fixPushLabelPlan(present, verdict);
   if (!plan.handOff) {
     if (plan.remove.length) run('gh', ['pr', 'edit', String(pr), ...repoArgs, ...plan.remove.flatMap(l => ['--remove-label', l])]);
+    if (sizeError) throw sizeError.error;
     return false;
   }
   // Like fix-end, provision both labels before applying them: a repository may not have either yet.
   run('gh', ['label', 'create', 'checking', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI', '--force']);
   run('gh', ['label', 'create', 'status:awaiting-ci', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI — auto-managed', '--force']);
   run('gh', ['pr', 'edit', String(pr), ...repoArgs, '--add-label', 'checking', '--add-label', 'status:awaiting-ci', ...plan.remove.flatMap(l => ['--remove-label', l])]);
+  if (sizeError) throw sizeError.error;
   return true;
 }
