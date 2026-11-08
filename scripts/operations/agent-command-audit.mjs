@@ -27,27 +27,44 @@ const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|jwt|(?:^|[
 const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|passphrase|pass(?:[_-]|$)|(?:^|[_-])pwd$|jwt|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
 // Programs whose own short options carry a password or secret, attached (`mysql -pv`, `7z a -pv`) or separate
 // (`docker login -p v`, `redis-cli -a v`, `zip -P v f`, `ssh-keygen -N v`, `gh secret set X -b v`, `curl -b c=v`).
-// A word of a multi-word program may be quoted on its own (`'docker' login`, `"/usr/bin/gh" secret set`).
+// A program or keyword word may be quoted whole or in part (`'docker' login`, `"/usr/bin/gh" secret set`,
+// `my"sql"`, `htpass'wd'`, `npm 'config' set`): the shell reads the same word, so each name is matched through
+// `quotedWord`, which allows up to 3 quote or escape characters between its letters (review #6461 r6).
+const QUOTES = String.raw`["'\\]{0,3}`;
+const quotedWord = (...names) => `(?:${names.map(name => [...name].map(c => c.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')).join(QUOTES)).join('|')})`;
+// The space between two words of one program (`docker login`); an escaped space would join them into one word.
+const NEXT_WORD = String.raw`["']{0,3}\s+${QUOTES}`;
+// A program name starts its word: no word character, `.` or `-` before it, even behind quotes (`x'htpasswd'`,
+// `my-'mysql'` are other words). It ends its word, past any closing quotes, so the match ends where the operands start.
+const WORD_START = String.raw`(?<![\w.-]${QUOTES})`;
+const WORD_END = String.raw`["']{0,3}(?=\s|$)`;
+const GH_SECRET_SET = `${quotedWord('gh')}${NEXT_WORD}${quotedWord('secret')}${NEXT_WORD}${quotedWord('set')}`;
 const SECRET_SHORT_OPTIONS = [
-  [/(?:(?:docker|podman|nerdctl|buildah|skopeo|helm["']?\s+["']?registry)["']?\s+["']?login|sshpass|mysql\w*|mariadb\w*|mongo(?:sh|dump|restore|import|export)?|7z[ar]?)/, 'p'],
-  [/redis-cli/, 'a'],
-  [/(?:un)?zip|zipcloak/, 'P'],
-  [/ssh-keygen/, 'NP'],
-  [/gh["']?\s+["']?secret["']?\s+["']?set/, 'b'],
-  [/smbclient/, 'U'],
-  [/curl/, 'b'],
-];
+  [`(?:${quotedWord('docker', 'podman', 'nerdctl', 'buildah', 'skopeo')}|${quotedWord('helm')}${NEXT_WORD}${quotedWord('registry')})${NEXT_WORD}${quotedWord('login')}`
+    + `|${quotedWord('sshpass')}|${quotedWord('mysql', 'mariadb')}(?:${QUOTES}\\w)*`
+    + `|${quotedWord('mongo')}(?:${QUOTES}${quotedWord('sh', 'dump', 'restore', 'import', 'export')})?|${quotedWord('7z')}(?:${QUOTES}[ar])?`, 'p'],
+  [quotedWord('redis-cli'), 'a'],
+  [`(?:${quotedWord('un')}${QUOTES})?${quotedWord('zip')}|${quotedWord('zipcloak')}`, 'P'],
+  [quotedWord('ssh-keygen'), 'NP'],
+  [GH_SECRET_SET, 'b'],
+  [quotedWord('smbclient'), 'U'],
+  [quotedWord('curl'), 'b'],
+].map(([source, letters]) => [new RegExp(source), letters]);
 // A `/` may precede the program: a path-qualified program (`/usr/bin/mysql -pv`, `./mysql -pv`) runs the same one
 // (review #6461 r5), as htpasswd's own match already allows.
 // The name ends its shell word (a space, a closing quote or the end), so a folder that shares a program's name
 // (`-v /data/mysql:/var/lib/mysql -p 3306:3306`) is not read as that program.
-const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w.-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?=["']?(?:\s|$))`, 'g');
+const SECRET_SHORT_PROGRAMS = new RegExp(`${WORD_START}(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})${WORD_END}`, 'g');
 // The program whose `--body` long option carries a secret (`gh secret set X --body v`, `/usr/bin/gh secret set …`,
-// `'gh' secret set …`); its segment end is found quote-aware by redactPositionalSecrets.
-const SECRET_LONG_OPTIONS = /(?<![\w.-])gh["']?\s+["']?secret["']?\s+["']?set\b/g;
+// `'gh' secret set …`, `g'h' secret set …`); its segment end is found quote-aware by redactPositionalSecrets.
+const SECRET_LONG_OPTIONS = new RegExp(`${WORD_START}${GH_SECRET_SET}${WORD_END}`, 'g');
+// htpasswd, path-qualified (`/usr/bin/htpasswd`) or quoted (`'/usr/bin/htpasswd'`, `"htpasswd"`, `htpass'wd'`).
+const HTPASSWD_PROGRAM = new RegExp(`${WORD_START}${quotedWord('htpasswd')}${WORD_END}`, 'g');
 // `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
-// `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key.
-const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:-[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
+// `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key. The
+// keywords and options may be quoted (`npm 'config' set`, `aws configure 'set'`, `'--location=user'`).
+const CONFIG_KEY = new RegExp(String.raw`(?<![\w-]${QUOTES})${quotedWord('config')}(?:${QUOTES}${quotedWord('ure')})?${NEXT_WORD}`
+  + String.raw`(?:${quotedWord('set', 'add')}${NEXT_WORD})?(?:-[\w-]+(?:=\S*?)?["']{0,3}\s+["']{0,3})*([^\s=-][^\s=]*)()(?=\s)`, 'g');
 const configKeyIsCredential = key => CREDENTIAL_ASSIGNMENT.test(key.split(/[/:.]/).filter(Boolean).pop() || '');
 // JSON / object-literal members whose name is a credential (`{"password":"v"}`, `{\"api_key\": \"v\"}`, `pin: 1234`).
 // The name may be unquoted (`{password: "v"}`, `{ pin: 1234 }`); a name start is anchored, so it stays linear.
@@ -195,7 +212,9 @@ function redactShortPasswords(text) {
     const from = SECRET_SHORT_PROGRAMS.lastIndex;
     const end = shellSegmentEnd(text, from); // a quoted `;` (`-p'a;b'`) stays inside the value
     const segment = text.slice(from, end);
-    const letters = SECRET_SHORT_OPTIONS.filter(([re]) => new RegExp(`^(?:${re.source})$`).test(m[0])).map(([, l]) => l).join('');
+    // The program is read without its quotes and escapes (`my"sql"'` is mysql), as each name pattern allows.
+    const program = m[0].replace(/["'\\]/g, '');
+    const letters = SECRET_SHORT_OPTIONS.filter(([re]) => new RegExp(`^(?:${re.source})$`).test(program)).map(([, l]) => l).join('');
     // The value is glued on when a non-space follows the letter (`-pv`, `-p=v`).
     out += text.slice(last, from) + redactOptionValues(segment, new RegExp(`(?<!\\S)-([${letters}])(=?)`, 'g'), () => true,
       { attached: (o, at) => !/^\s?$/.test(segment[at] ?? ''), replacement: o => `-${o[1]} [REDACTED]` });
@@ -208,7 +227,8 @@ function redactShortPasswords(text) {
  *  password is the last operand. Words are whole shell words, so a quoted or concatenated password
  *  (`'first second'`, `"a b"'c d'`, `'p;w'`) is redacted entirely; a redirection after it is not an operand. */
 function redactHtpasswd(text) {
-  const program = /(?<![\w.-])htpasswd(?=\s|$)/g; // a path-qualified program (`/usr/bin/htpasswd`) too
+  const program = HTPASSWD_PROGRAM; // path-qualified (`/usr/bin/htpasswd`) or quoted (`'/usr/bin/htpasswd'`) too
+  program.lastIndex = 0;
   let out = '', last = 0;
   for (let m; (m = program.exec(text));) {
     const from = program.lastIndex, end = shellSegmentEnd(text, from);
@@ -394,13 +414,22 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
       for (const hit of classifyCommand(shellC.text, depth + 1, shellC.innerSubstitutions)) out.push({ ...hit, queued: queued || hit.queued });
       continue;
     }
-    const category = headCategory(head);
-    if (category) { out.push({ category, queued: queued || QUEUED_SCRIPT.test(head), command: redact(segment.trim()) }); continue; }
     // The command a launcher runs (`nohup …`, `setsid -f …`, `eval '…'`), unwrapped by the Bash guard's shared walker,
     // goes through this whole classifier again: its own segments, `sh -c` bodies, `env -S`, the admission wrapper and
     // heredocs, not only the head patterns (review #6461 r5). The depth bound reports a too-deep nest unparsed.
+    // It is unwrapped BEFORE the head is classified: the head classifier reads through the launcher too, so a
+    // launched string that starts with a classified run (`eval 'npx vitest run a; npx playwright test b'`) would be
+    // reported by its first command only (review #6461 r6).
     const launched = heavyRunHeads(head)?.[1]?.raw;
-    if (launched) for (const hit of classifyCommand(launched, depth + 1, false)) out.push({ ...hit, queued: queued || hit.queued });
+    if (launched) {
+      const hits = classifyCommand(launched, depth + 1, false);
+      for (const hit of hits) out.push({ ...hit, queued: queued || hit.queued });
+      if (hits.length) continue;
+    }
+    // A launcher whose string classified nothing still gets the head reading, and past the guard's unwrap bound
+    // (heavyRunHeads null) the head classifier fails closed to a test run.
+    const category = headCategory(head);
+    if (category) out.push({ category, queued: queued || QUEUED_SCRIPT.test(head), command: redact(segment.trim()) });
   }
   return out;
 }

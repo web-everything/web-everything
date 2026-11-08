@@ -292,7 +292,7 @@ describe('agent command audit', () => {
   });
   it('keeps every new redaction rule linear on long adversarial input', () => {
     const started = Date.now();
-    for (const unit of ['b', 'htpasswd -b', '{"password":"', 'password: ', 'config set ', 'gh secret set x ', 'x\\\n']) {
+    for (const unit of ['b', 'htpasswd -b', '{"password":"', 'password: ', 'config set ', 'gh secret set x ', 'x\\\n', "'", "h'", 'h"\'', "'htpasswd' -b ", "my'sql' ", "con'fig' set "]) {
       redact((unit === 'b' ? 'htpasswd -' : '') + unit.repeat(Math.ceil(16000 / unit.length)));
     }
     expect(Date.now() - started).toBeLessThan(2000);
@@ -335,6 +335,22 @@ describe('agent command audit', () => {
     expect(classifyCommand("eval 'npm ci; npx playwright test a'").map(row => row.category)).toEqual(['install/ci', 'playwright']);
     expect(classifyCommand('nohup cat <<EOF\nnpm test\nEOF')).toEqual([]);
   });
+  // Review #6461 round 6: a launched string that STARTS with a classified run was reported by its first command only,
+  // because the head classifier reads through the launcher; every later command must be reported too.
+  const firstRuns = [
+    ['npx vitest run a', 'vitest', false], ['node --test a.mjs', 'node --test', false], ['npm test', 'npm test/check', false],
+    ['npm run test:unit -- a', 'npm test/check', true], ['npm run check:standards', 'check:standards', true],
+  ];
+  const launchers = [s => `eval '${s}'`, s => `eval "${s}"`, s => `setsid -f eval '${s}'`, s => `nohup bash -c '${s}'`, s => `nohup eval '${s}'`];
+  it.each(firstRuns.flatMap(([first, category, queued]) => launchers.map(wrap => [wrap(`${first}; npx playwright test b && npm ci`), category, queued])))(
+    'classifies every command after a classified first run of a launched string: %s', (command, category, queued) => {
+      expect(classifyCommand(command).map(({ category: c, queued: q }) => [c, q]))
+        .toEqual([[category, queued], ['playwright', false], ['install/ci', false]]);
+    });
+  it('admits every command of a launched string run under the admission wrapper', () => {
+    expect(classifyCommand(`${queue}eval 'npx vitest run a; npx playwright test b'`).map(({ category, queued }) => [category, queued]))
+      .toEqual([['vitest', true], ['playwright', true]]);
+  });
   it.each(['nohup echo hi', 'nohup npx playwright --version', 'eval echo playwright test', 'setsid ls'])('leaves a harmless launched command unaudited: %s', cmd => {
     expect(classifyCommand(cmd)).toEqual([]);
   });
@@ -352,6 +368,30 @@ describe('agent command audit', () => {
     const out = redact(command);
     expect(out).not.toContain('Zq9vWm4Lp');
     expect(out).toContain('[REDACTED]');
+  });
+  // Review #6461 round 6: a program or keyword word quoted whole or in part (`'/usr/bin/htpasswd'`, `my"sql"`,
+  // `npm 'config' set`) is the same word to the shell, so its secret is redacted too.
+  it.each([
+    "'/usr/bin/htpasswd' -nb user Zq9vWm4Lp", '"htpasswd" -nb user Zq9vWm4Lp', "htpass'wd' -nb user Zq9vWm4Lp",
+    "'htpasswd' -b f user Zq9vWm4Lp", '"/usr/sbin/htpasswd" -B -b f user Zq9vWm4Lp', "x=$('htpasswd' -nb u Zq9vWm4Lp)",
+    "sh -c \"'htpasswd' -nb u Zq9vWm4Lp\"", 'my"sql" -pZq9vWm4Lp', "m'y'sql -p Zq9vWm4Lp", '"/usr/bin/mysql"dump -pZq9vWm4Lp',
+    '"redis"-cli -a Zq9vWm4Lp', "z'ip' -P Zq9vWm4Lp f", "g'h' secret set X --body Zq9vWm4Lp", "'gh' 'secret' 'set' X --body Zq9vWm4Lp",
+    "g'h' sec\"ret\" set X -b Zq9vWm4Lp", 'doc"ker" log\'in\' -p Zq9vWm4Lp', "npm 'config' set //r/:_authToken Zq9vWm4Lp",
+    'git "config" --global github.token Zq9vWm4Lp', "aws configure 'set' aws_secret_access_key Zq9vWm4Lp",
+    "npm config set '--location=user' //r/:_authToken Zq9vWm4Lp",
+  ])('redacts the secret of a quoted program or keyword word: %s', command => {
+    const out = redact(command);
+    expect(out).not.toContain('Zq9vWm4Lp');
+    expect(out).toContain('[REDACTED]');
+  });
+  it('redacts only the password of a quoted htpasswd program and keeps the next command', () => {
+    expect(redact("'/usr/bin/htpasswd' -nb user Zq9vWm4Lp; npm ci")).toBe("'/usr/bin/htpasswd' -nb user [REDACTED]; npm ci");
+    expect(redact('"htpasswd" -nb u Zq9vWm4Lp && echo ok')).toBe('"htpasswd" -nb u [REDACTED] && echo ok');
+  });
+  it('keeps a word that only contains a quoted program name as data', () => {
+    for (const command of ["x'htpasswd' -nb user Zq9vWm4Lp", "my-'mysql' -pZq9vWm4Lp", "x\\htpasswd -nb u Zq9vWm4Lp"]) {
+      expect(redact(command)).toContain('Zq9vWm4Lp');
+    }
   });
   it('keeps a hyphen- or dot-joined name, or a folder inside a path word, that is not the program as data', () => {
     expect(redact('my-mysql -pZq9vWm4Lp')).toContain('Zq9vWm4Lp');
