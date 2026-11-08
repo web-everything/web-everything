@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 
 const clean = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, 2000);
@@ -43,6 +43,10 @@ export async function salvagePushLane({ lane, laneDir, io, now = () => new Date(
     return { status: 'failed', unmatched, reason: clean(e?.message || e || 'salvage failed') };
   }
 }
+
+/** The filesystem root: owned by root and never a repository (git cannot discover one above it), so a git call run
+ *  there reads no repository config. Exported for its test. */
+export const NO_REPO_CWD = parse(resolve('/')).root;
 
 export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync, accountHome }) {
   const baseEnv = { ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' };
@@ -244,18 +248,23 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
   // (PR #6319 send-back). Only the validated-primary listing drops the credential.helper / core.askPass reset pins, so
   // the operator's own helper authenticates an HTTPS origin; the fallback (a possible lane) keeps them, as do every
   // lane fetch and the salvage push (PR #6319 operator ruling, R674 route a). Terminal prompts stay off either way.
+  // The no-pins listing is checked against the primary but RUNS outside any repository (`NO_REPO_CWD`): a URL listing
+  // needs none, and the primary's `.git/config` is writable by agents, so a helper or URL rewrite planted there after the
+  // check would otherwise run without the resets (PR #6319 self-review, check-then-run race). Only the account's global /
+  // system config applies to it — the scope the send-back trusts.
   const listOrigin = (...patterns) => {
     const args = transport('ls-remote', origin, ...patterns);
     const primaryDir = repo.primaryPath || null;
     const dir = primaryDir || repo.referencePath;
     const callEnv = primaryDir ? primaryEnv : env;
     checkTransportConfig(dir, { primary: !!primaryDir, callEnv });
-    return git(dir, args, 120_000, true, callEnv);
+    return git(primaryDir ? NO_REPO_CWD : dir, args, 120_000, true, callEnv);
   };
   return {
     fetchHeads,
     fetchVerifyObjects,
-    /** The canonical origin's branch tips right now (ops/* excluded), read in the primary checkout, never the lane.
+    /** The canonical origin's branch tips right now (ops/* excluded), checked against the primary checkout and read
+     *  outside any repository (never the lane).
      *  Throws on anything but complete `<sha>\trefs/heads/<name>` lines, so a caller can fail closed. */
     remoteHeads: () => {
       const output = listOrigin('refs/heads/*');

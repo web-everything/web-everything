@@ -3928,7 +3928,8 @@ fail-closed reads across reconcile and dispatch smoke passes within the unchange
 ## Lane release preservation guard
 
 `lane-pool release` checks HEAD and every local branch against the branch tips the pool's canonical
-origin lists right now (`ls-remote` run in the primary checkout, `ops/*` excluded) after known-litter
+origin lists right now (`ls-remote` checked against the primary checkout and run outside any repository, so a
+helper planted in the primary after the check never runs; `ops/*` excluded) after known-litter
 cleanup and salvage. No local `refs/remotes/*` ref is proof: stale, forged and symbolic-alias tracking
 refs all still refuse. A listed tip the lane has not fetched triggers one hardened fetch before refusing.
 That fetch is object-only: it writes into a fresh `refs/release-verify/<nonce>/*` namespace (no

@@ -6,9 +6,9 @@ import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
 // Intentionally absent in this red-first change: no implementation or import stub.
-let salvageStamp, salvageRefName, salvagePushLane, realSalvageIo;
+let salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD;
 beforeEach(async () => {
-  ({ salvageStamp, salvageRefName, salvagePushLane, realSalvageIo } = await import('../lane-pool-salvage-push.mjs'));
+  ({ salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD } = await import('../lane-pool-salvage-push.mjs'));
 });
 
 const date = new Date('2026-01-02T03:04:59.999Z');
@@ -189,7 +189,8 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(validated.remoteHeads()).toEqual([sha]);
       expect(validated.remoteSha('main')).toBe(sha);
       expect(runGit.mock.calls.filter(([, args]) => args.includes('ls-remote'))).toHaveLength(2);
-      expect(runGit.mock.calls.every(([, , options]) => options.cwd === primary)).toBe(true);
+      // The config checks read the validated primary; the no-pins listing itself runs outside any repository.
+      for (const [, args, options] of runGit.mock.calls) expect(options.cwd, args.join(' ')).toBe(args.includes('ls-remote') ? NO_REPO_CWD : primary);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('pins lane transports to no credential helper and no askpass; every transport drops inherited askpass / ssh and prompts', () => {
@@ -215,7 +216,7 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
         laneFetch: runGit.mock.calls.find(([, args]) => args.includes('fetch'))[2],
         fallbackListing: fallbackGit.mock.calls.find(([, args]) => args.includes('ls-remote'))[2],
       };
-      expect(transports.primaryListing.cwd).toBe(primary);
+      expect(transports.primaryListing.cwd).toBe(NO_REPO_CWD);
       expect(pinsOf(transports.primaryListing)).not.toHaveProperty('credential.helper');
       expect(pinsOf(transports.primaryListing)).not.toHaveProperty('core.askPass');
       for (const name of ['laneFetch', 'fallbackListing']) {
@@ -274,6 +275,40 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(laneFill.status).not.toBe(0);
       expect(existsSync(evilRan), 'the lane credential helper ran').toBe(false);
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  // PR #6319 self-review (check-then-run race): the primary's local config passes the check, then an agent with write
+  // access to that `.git/config` plants a helper and a URL rewrite before the no-pins listing starts. The listing must
+  // not read the primary's local config at all, so neither runs: it runs outside any repository.
+  it('a helper or URL rewrite planted in the primary after the config check never reaches the no-pins listing', () => {
+    const { dir, primary, sha } = setup();
+    try {
+      const home = join(dir, 'home'), marker = join(dir, 'planted-ran'), decoy = join(dir, 'decoy.git');
+      mkdirSync(home);
+      execFileSync('git', ['init', '--bare', '-q', '-b', 'main', decoy]);
+      execFileSync('git', ['push', '-q', decoy, `${sha}:refs/heads/main`, `${sha}:refs/heads/decoy-only`], { cwd: primary });
+      const seen = [];
+      const runGit = vi.fn((file, args, options) => {
+        if (args.includes('ls-remote')) {
+          // The race: the check has passed; the primary's local config changes before the listing runs.
+          execFileSync('git', ['config', 'credential.helper', `!f() { touch '${marker}'; echo username=evil; echo password=evil; }; f`], { cwd: primary });
+          execFileSync('git', ['config', `url.${decoy}.insteadOf`, join(dir, 'origin.git')], { cwd: primary });
+          const helpers = spawnSync('git', ['config', '--get-all', 'credential.helper'], { cwd: options.cwd, env: options.env, encoding: 'utf8' });
+          const fill = spawnSync('git', ['credential', 'fill'], { cwd: options.cwd, env: options.env, input: 'protocol=https\nhost=example.invalid\n\n', encoding: 'utf8', timeout: 20_000 });
+          const gitDir = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: options.cwd, env: options.env, encoding: 'utf8' });
+          seen.push({ cwd: options.cwd, helpers: helpers.stdout, filled: fill.stdout, gitDirStatus: gitDir.status });
+        }
+        return execFileSync(file, args, options);
+      });
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: home });
+      // The decoy carries an extra head: a rewrite that reached the listing would add it to the result.
+      expect(io.remoteHeads()).toEqual([sha]);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].cwd).not.toBe(primary);
+      expect(seen[0].gitDirStatus, 'the no-pins listing cwd is inside a repository').not.toBe(0);
+      expect(seen[0].helpers).not.toContain(marker);
+      expect(seen[0].filled).not.toContain('password=evil');
+      expect(existsSync(marker), 'the planted primary helper ran').toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   // PR #6319 self-review: the primary listing's config check reads the SAME global config the listing applies (the
   // account home), so a caller-set HOME cannot hide an account-level URL rewrite of the canonical origin from it.

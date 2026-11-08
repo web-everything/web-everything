@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { readLaneJournal } from '../lib/lane-history.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
+import { NO_REPO_CWD } from '../lib/lane-pool-salvage-push.mjs';
 
 const script = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 const git = (args, cwd) => execFileSync('git', args, {
@@ -14,7 +15,7 @@ const git = (args, cwd) => execFileSync('git', args, {
 let fixtureRoot, fixture, origin, reference, base, poolRoot, laneDir, marker, lease;
 function runPool(args, fault = '', remoteFault = '', extraEnv = {}) {
   // `remoteFault` runs for the canonical-origin listing (the only ls-remote here: recovery is off), which executes
-  // in the primary checkout rather than the lane.
+  // outside the lane (checked against the primary checkout, run outside any repository).
   const preload = `import os from 'node:os'; import cp from 'node:child_process';
     import { syncBuiltinESMExports } from 'node:module';
     os.userInfo = () => ({ homedir: ${JSON.stringify(base)} });
@@ -676,7 +677,7 @@ describe('release guard hidden-entry hash bound', () => {
 // HTTPS ls-remote: it records where the listing ran and asks git for credentials in that same cwd and env, exactly as
 // an authenticating transport would.
 describe('release from inside a lane with a discoverable primary', () => {
-  it('lists the canonical origin in the primary, never runs the invoking lane\'s credential helper, and keeps its lease', () => {
+  it('lists the canonical origin under the validated primary (outside any repository), never runs the invoking lane\'s credential helper, and keeps its lease', () => {
     const ws = join(base, 'ws');
     const lanesRoot = join(ws, '.lanes');
     const primary = join(ws, 'releaseguard');
@@ -722,7 +723,9 @@ describe('release from inside a lane with a discoverable primary', () => {
     expect(existsSync(helperMarker), 'the invoking lane\'s credential helper ran').toBe(false);
     const cwds = existsSync(cwdLog) ? readFileSync(cwdLog, 'utf8').split('\n').filter(Boolean) : [];
     expect(cwds.length, result.stderr).toBeGreaterThan(0);
-    expect(cwds.every(dir => dir === primary), cwds.join(', ')).toBe(true);
+    // The listing is checked against the primary but runs outside any repository (no lane, no primary local config).
+    expect(cwds.every(dir => dir === NO_REPO_CWD), cwds.join(', ')).toBe(true);
+    expect(primary).not.toBe(NO_REPO_CWD);
     expect(result.status, result.stderr).toBe(0);
     expect(result.data.released).toBe(1);
     expect(existsSync(join(lanesRoot, 'releaseguard', 'lane-2', '.git', '.lane-lease'))).toBe(false);
@@ -834,6 +837,8 @@ describe('lane git hardening blocks lane credential helpers; the primary-only fo
     const env = laneGitHardeningEnv(inherited, { credentialPins: false, home });
     expect(env.HOME).toBe(home);
     for (const k of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']) expect(env, k).not.toHaveProperty(k);
+    // A caller GIT_CONFIG (it replaces the repository config a `git config` read lists) is dropped by the form itself.
+    expect(laneGitHardeningEnv({ ...inherited, GIT_CONFIG: '/dev/null' }, { credentialPins: false, home })).not.toHaveProperty('GIT_CONFIG');
     const clean = join(root, 'primary');
     git(['init', '--quiet', clean], root);
     const filled = fill(env, clean);

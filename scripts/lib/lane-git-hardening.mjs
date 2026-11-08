@@ -178,7 +178,9 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   if (credentialPins === false) {
     for (const key of Object.keys(out)) if (key === 'GIT_CONFIG_COUNT' || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)
       || CREDENTIAL_ROUTING_ENV_RE.test(key)) delete out[key];
-    for (const key of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXEC_PATH']) delete out[key];
+    // `GIT_CONFIG` too: it replaces the repository config file a `git config` read lists, so a caller-set one could hide
+    // config from the check (callers scrub it already; the primary form does not rely on that).
+    for (const key of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXEC_PATH', 'GIT_CONFIG']) delete out[key];
     if (home) out.HOME = home; else delete out.HOME;
   }
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
