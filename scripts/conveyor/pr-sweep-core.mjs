@@ -69,6 +69,10 @@ export function resolveOwner(pr, signals = {}) {
     state: stuck ? 'stuck' : owner ? 'active' : 'none', why: smell ? `Open health episode: ${smell}` : stuck ? 'Owner signal is stale' : owner ? 'Live owner signal' : base.why,
     ...(smell ? { smell } : {}) };
 }
+/** Refusal kinds that name no missing action (`reconcile-core.mjs` REFUSAL_KINDS): `nothing-owed` = reviewed and queued or landed,
+ *  `draft` = parked until promoted. Everything else (no-lane, cap-exhausted, owed-elsewhere, ...) can name a real stall. */
+export const INFORMATIONAL_REFUSAL_KINDS = Object.freeze(new Set(['nothing-owed', 'draft']));
+const refusalKind = (reason) => /(?:reconcile-refused|\brefused)\s+([a-z][a-z0-9-]*)/.exec(String(reason ?? ''))?.[1] ?? null;
 /** R502 item 5 - the REAL reason a PR is waiting, so the sweep stops reporting the implied daemon as a stale owner.
  *  Precedence: a live fixer claim, then the daemon's latest refusal (when no later progress and, if it names a head,
  *  the current head), then a parked PR (draft or `review:human`). Null when nothing is known: the old report stands. PURE. */
@@ -79,7 +83,9 @@ export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}, { n
   const progressAt = Math.max(-Infinity, ...dated.filter((d) => d.kind === 'progress').map((d) => ms(d.at)));
   const refusal = dated.filter((d) => d.kind === 'refusal' && Number.isFinite(now) && ms(d.at) <= now + 60000 && now - ms(d.at) <= maxAgeMinutes * 60000 && ms(d.at) > progressAt && (d.head == null || d.head === pr.headRefOid))
     .sort((a, b) => ms(b.at) - ms(a.at))[0];
-  if (refusal) return { kind: 'refused', detail: String(refusal.reason ?? '').slice(0, 160), by: refusal.name ?? null, at: new Date(ms(refusal.at)).toISOString() };
+  // The daemon's latest word being a purely informational no-op (nothing owed, draft) is not a wait owner: those PRs
+  // are queued or parked, not blocked. An unparseable reason is NOT informational (fail closed).
+  if (refusal && !INFORMATIONAL_REFUSAL_KINDS.has(refusalKind(refusal.reason))) return { kind: 'refused', detail: String(refusal.reason ?? '').slice(0, 160), by: refusal.name ?? null, at: new Date(ms(refusal.at)).toISOString() };
   const labels = labelNames(pr) ?? [];
   if (pr.isDraft === true || labels.includes('review:human')) return { kind: 'parked', detail: pr.isDraft === true ? 'draft' : 'review:human' };
   return null;
