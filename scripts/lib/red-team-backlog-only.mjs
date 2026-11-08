@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
+import { indexOfUnfencedLine } from '../backlog/edge-case-classes.mjs';
 import { priorPrepReviews } from '../conveyor/prep-review.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
@@ -50,6 +51,9 @@ export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } 
   if (files.length >= 3000) return refuse('possibly truncated files; inspect full diff manually');
   if (files.some(f => !backlogPath(f?.filename)
     || Object.hasOwn(f, 'previous_filename') && !backlogPath(f.previous_filename))) return refuse('files outside backlog or unsafe paths');
+  if (files.some(f => !['added', 'modified', 'removed', 'changed', 'renamed', 'copied', 'unchanged'].includes(f.status)
+    || ['renamed', 'copied'].includes(f.status) && typeof f.previous_filename !== 'string'))
+    return refuse('file status or previous filename unreadable; inspect full diff manually');
   const ns = names(labels);
   if (!ns || ns.some(n => typeof n !== 'string') || !candidate(ns)) return refuse('required labels missing or unreadable');
   if (ns.some(n => ['review:changes', 'review:human', 'red-team:blocked'].includes(n))) return refuse('blocking label');
@@ -58,7 +62,11 @@ export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } 
     .filter(n => n.head === head).map(n => ({ ...n, body: comment.body })));
   if (prior.some(n => n.blocked || n.body.includes('**Verdict: findings**')))
     return refuse('trusted prep findings or blocked note for head');
-  if (!prior.at(-1)?.body.includes('**Verdict: clean**')) return refuse('no clean newest trusted prep note for head');
+  const body = prior.at(-1)?.body ?? '';
+  const verdicts = body.match(/^\*\*Verdict:.*$/gm) ?? [];
+  if (verdicts.length !== 1 || !/^\*\*Verdict: clean\*\*/.test(verdicts[0])
+    || indexOfUnfencedLine(body, /^\*\*Verdict: (clean|findings)\*\*/) < 0)
+    return refuse('no unambiguous clean newest trusted prep note for head');
   return { ok: true, rule: RULE };
 }
 
@@ -68,10 +76,12 @@ export function readHeadFiles({ repo, pr, head, exec = runGhSync }) {
   if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p))) throw Error('files response unreadable');
   const files = pages.flat().map(file => {
     if (!file || typeof file.filename !== 'string') throw Error('file entry unreadable');
-    return { filename: file.filename, ...(Object.hasOwn(file, 'previous_filename') ? { previous_filename: file.previous_filename } : {}) };
+    return { filename: file.filename, status: file.status, ...(Object.hasOwn(file, 'previous_filename') ? { previous_filename: file.previous_filename } : {}) };
   });
-  const live = JSON.parse(exec(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], options));
+  const live = JSON.parse(exec(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,changedFiles'], options));
   if (live?.headRefOid !== head) throw Error('head moved during files read');
+  if (!Number.isSafeInteger(live?.changedFiles) || live.changedFiles !== files.length || files.length >= 3000)
+    throw Error('files incomplete or possibly truncated; inspect full diff manually');
   return files;
 }
 
@@ -89,13 +99,17 @@ function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, re
     if (dryRun) return { ...row, why: 'dry run (backlog-only prep)' };
     const freshComments = readComments(key);
     if (!Array.isArray(freshComments)) throw Error('comments unreadable');
-    // The live head and labels are read LAST, right before the post, so a late block label is seen.
     const live = readLive(key), before = names(raw.labels), after = names(live?.labels);
     if (live?.headRefOid !== head || !after || after.some(n => typeof n !== 'string')
       || JSON.stringify([...before].sort()) !== JSON.stringify([...after].sort())) throw Error('head or labels changed before post');
     const freshProof = backlogOnlyPrepClear({ enabled: true, head, files, comments: freshComments, labels: live.labels });
     if (!freshProof.ok) return { ...row, why: freshProof.why };
     if (redTeamForHead(freshComments, pr, head)) return { ...row, why: 'already' };
+    const finalComments = readComments(key);
+    const finalProof = backlogOnlyPrepClear({ enabled: true, head, files, comments: finalComments, labels: live.labels });
+    if (!finalProof.ok) return { ...row, why: finalProof.why };
+    if (redTeamForHead(finalComments, pr, head)) return { ...row, why: 'already' };
+    // A race window between the last read and the post is inherent.
     post({ ...key, body: `${redTeamMarker(pr, head)}\n\n${REASON}` });
     syncLabels({ ...key, env, log });
     return { ...row, action: 'clear', why: REASON };

@@ -7,7 +7,7 @@ import * as policyCascade from '../policy-cascade.mjs';
 const head = 'a'.repeat(40), pr = 742, repo = 'owner/repo';
 const note = (sha = head, blocked = false, verdict = blocked ? 'findings' : 'clean') => ({ author: { login: 'chalbert' },
   body: `<!-- prep-review: head=${sha} round=1${blocked ? ' blocked=1' : ''} -->\n**Verdict: ${verdict}**` });
-const evidence = () => ({ enabled: true, head, files: [{ filename: 'backlog/742.md' }],
+const evidence = () => ({ enabled: true, head, files: [{ filename: 'backlog/742.md', status: 'modified' }],
   comments: [note()], labels: ['review:prep', 'red-team:pending'] });
 function fixture(over = {}) {
   const e = evidence();
@@ -146,11 +146,73 @@ describe('backlog-only prep', () => {
       expect(resolveBacklogOnlyPrepSetting({ env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: value }, readFile: () => JSON.stringify({ redTeam: { skipBacklogOnlyPrep: true } }) })).toEqual({ enabled });
     } finally { spy.mockRestore(); }
   });
-  it('reads paginated files and verifies current head', () => {
-    const exec = vi.fn().mockReturnValueOnce(JSON.stringify([[{ filename: 'backlog/a' }], [{ filename: 'backlog/b', previous_filename: 'backlog/c' }]]))
-      .mockReturnValueOnce(JSON.stringify({ headRefOid: head }));
-    expect(readHeadFiles({ repo, pr, head, exec })).toHaveLength(2);
+  it.each(['added', 'modified', 'removed', 'changed', 'unchanged', 'renamed', 'copied'])('accepts known status %s with complete paths', status => {
+    expect(backlogOnlyPrepClear({ ...evidence(), files: [{ filename: 'backlog/a', status,
+      ...(['renamed', 'copied'].includes(status) ? { previous_filename: 'backlog/b' } : {}) }] }).ok).toBe(true);
+  });
+  it.each(['renamed', 'copied', 'unknown', undefined, null])('refuses status %s without a string previous filename', status => {
+    for (const previous_filename of [undefined, null, 42]) {
+      const f = fixture({ readHeadFiles: () => [{ filename: 'backlog/a', status, ...(previous_filename === undefined ? {} : { previous_filename }) }] });
+      expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+      expect(f.post).not.toHaveBeenCalled();
+    }
+  });
+  it.each([
+    '**Verdict: clean**\n**Verdict: clean**',
+    '> **Verdict: clean**',
+    'prefix **Verdict: clean**',
+    '```markdown\n**Verdict: clean**\n```',
+    '~~~markdown\n**Verdict: clean**\n~~~',
+    '**Verdict: unknown**\n**Verdict: clean**',
+  ])('refuses ambiguous or nonplain verdict %j', verdict => {
+    const comments = [{ ...note(), body: note().body.split('\n')[0] + '\n' + verdict }];
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(false);
+    const f = fixture({ readComments: () => comments });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+    expect(f.post).not.toHaveBeenCalled();
+  });
+  it('reads final comments, live head and labels, comments again, then posts', () => {
+    const order = [];
+    const f = fixture({ readComments: () => { order.push('comments'); return [note()]; },
+      readLive: () => { order.push('live'); return { headRefOid: head, labels: evidence().labels }; },
+      post: vi.fn(() => order.push('post')) });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('clear');
+    expect(order).toEqual(['comments', 'comments', 'live', 'comments', 'post']);
+  });
+  it('holds when trusted findings arrive on the third comment read between live read and post', () => {
+    const readComments = vi.fn().mockReturnValueOnce([note()]).mockReturnValueOnce([note()])
+      .mockReturnValueOnce([note(), note(head, false, 'findings')]);
+    const f = fixture({ readComments });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+    expect(readComments).toHaveBeenCalledTimes(3);
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+  });
+  it('holds when the third comment read throws', () => {
+    const f = fixture({ readComments: vi.fn().mockReturnValueOnce([note()]).mockReturnValueOnce([note()])
+      .mockImplementationOnce(() => { throw Error('unreadable'); }) });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip'); expect(f.post).not.toHaveBeenCalled();
+  });
+  it.each([null, undefined])('holds when the third comment read is incomplete: %j', value => {
+    const f = fixture({ readComments: vi.fn().mockReturnValueOnce([note()]).mockReturnValueOnce([note()]).mockReturnValueOnce(value) });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip'); expect(f.post).not.toHaveBeenCalled();
+  });
+  it('reads paginated files and verifies current head and changedFiles count', () => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify([[{ filename: 'backlog/a', status: 'modified' }], [{ filename: 'backlog/b', status: 'renamed', previous_filename: 'backlog/c' }]]))
+      .mockReturnValueOnce(JSON.stringify({ headRefOid: head, changedFiles: 2 }));
+    expect(readHeadFiles({ repo, pr, head, exec })).toEqual([{ filename: 'backlog/a', status: 'modified' },
+      { filename: 'backlog/b', status: 'renamed', previous_filename: 'backlog/c' }]);
+    expect(exec.mock.calls[1][0]).toContain('headRefOid,changedFiles');
     expect(exec.mock.calls[0][0]).toContain('--paginate');
+  });
+  it.each([0, 2, undefined, null, '1', -1, 1.5])('throws for incomplete or invalid changedFiles count %j', changedFiles => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify([[{ filename: 'backlog/a', status: 'modified' }]]))
+      .mockReturnValueOnce(JSON.stringify({ headRefOid: head, changedFiles }));
+    expect(() => readHeadFiles({ repo, pr, head, exec })).toThrow(/files.*inspect full diff manually/i);
+  });
+  it('throws at the 3000-file cutoff even when the count matches, requesting full manual review', () => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify([Array(3000).fill({ filename: 'backlog/a', status: 'modified' })]))
+      .mockReturnValueOnce(JSON.stringify({ headRefOid: head, changedFiles: 3000 }));
+    expect(() => readHeadFiles({ repo, pr, head, exec })).toThrow(/inspect full diff manually/);
   });
   it.each(['bad json', '{}', 'null'])('throws for malformed file response %s', value => {
     expect(() => readHeadFiles({ repo, pr, head, exec: () => value })).toThrow();

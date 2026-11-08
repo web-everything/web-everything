@@ -1707,7 +1707,7 @@ describe('unprovable accepted head move — fresh full review', () => {
 describe('R742 independent backlog-only prep pass', () => {
   it('settles without refusals even when on-skip is disabled; own setting off preserves behavior', () => {
     const rawPrs = [{ number: pr, headRefOid: head, labels: ['ready-to-merge', 'review:prep', 'red-team:pending'],
-      files: [{ filename: 'backlog/742.md' }], comments: [{ author: { login: 'chalbert' },
+      files: [{ filename: 'backlog/742.md', status: 'modified' }], comments: [{ author: { login: 'chalbert' },
         body: `<!-- prep-review: head=${head} round=1 -->\n**Verdict: clean**` }] }];
     const syncLabels = vi.fn(); vi.mocked(runGhSync).mockClear();
     const options = { repo, rawPrs, plan: { refusals: [] }, setting: { enabled: false }, syncLabels,
