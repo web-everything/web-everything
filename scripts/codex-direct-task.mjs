@@ -583,6 +583,58 @@ export function collectAndClearRolloutQuota({
   return { quota, rolloutFile, deleted: true };
 }
 
+// ── scratch-clone cleanup (R731 slice 1) ─────────────────────────────────────────────────────────
+/**
+ * Delete a scratch clone ONLY when nothing in it could be lost: `git status --porcelain` is empty AND HEAD is
+ * still `startSha`. Anything else (untracked, modified, mode change, binary, a commit Codex made) keeps the
+ * clone and reports its path. No patch is written: the clone itself is the preserved artifact. Fails closed:
+ * if status or HEAD cannot be read, the clone is kept. Synchronous, so a signal handler can call it.
+ */
+export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmFn = rmSync } = {}) {
+  const keep = (reason) => ({ removed: false, path: dir, reason });
+  try {
+    const status = String(execFn('git', ['-C', dir, 'status', '--porcelain'], { timeout: GIT_STEP_TIMEOUT_MS }));
+    if (status.trim() !== '') return keep('uncommitted changes');
+    if (startSha) {
+      const head = String(execFn('git', ['-C', dir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS })).trim();
+      if (head !== startSha) return keep('HEAD moved');
+    }
+  } catch {
+    return keep('status unreadable');
+  }
+  try {
+    rmFn(dir, { recursive: true, force: true });
+  } catch {
+    return keep('delete failed');
+  }
+  return { removed: true, path: dir, reason: 'clean' };
+}
+
+/**
+ * Applies `cleanupScratchClone` on SIGINT/SIGTERM and when the run ends. Created before the clone exists;
+ * `arm(dir, startSha)` binds it. `finish()` is idempotent and removes the listeners. The signal handler only
+ * cleans up: it never exits (the CLI's own handler does that).
+ */
+export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmFn = rmSync } = {}) {
+  let target = null;
+  let result = null;
+  const run = () => {
+    if (result) return result;
+    if (!target) return null;
+    result = cleanupScratchClone({ ...target, execFn, rmFn });
+    return result;
+  };
+  const onSignal = () => { try { run(); } catch { /* never throw from a signal handler */ } off(); };
+  const off = () => { proc.removeListener('SIGINT', onSignal); proc.removeListener('SIGTERM', onSignal); };
+  proc.prependListener('SIGINT', onSignal);
+  proc.prependListener('SIGTERM', onSignal);
+  return {
+    arm(dir, startSha) { target = { dir, startSha }; },
+    setStart(startSha) { if (target) target.startSha = startSha; },
+    finish() { off(); return run(); },
+  };
+}
+
 // ── impure: scratch clone, diff capture, gate ────────────────────────────────────────────────────
 
 /** `execFileSync`-shaped default with room for large diffs and git/npm/gate output. */
@@ -1088,7 +1140,23 @@ export async function runCodexDirectExec({
  * @param {Function} [opts.loadTranscriptCheck] - injectable lazy checker import.
  * @returns {Promise<object>} the full report — see the CLI's `--json` output for its exact shape.
  */
-export async function codexDirectTask({
+export async function codexDirectTask(opts = {}) {
+  if (opts.dir) return runCodexDirectTask(opts);
+  const guard = createScratchGuard({ execFn: opts.execFn });
+  let report;
+  try {
+    report = await runCodexDirectTask({ ...opts, scratchGuard: guard });
+  } catch (error) {
+    guard.finish();
+    throw error;
+  }
+  const cleanup = guard.finish();
+  if (cleanup && report.scratch?.created) report.scratch.cleanup = cleanup;
+  return report;
+}
+
+async function runCodexDirectTask({
+  scratchGuard,
   caller = 'codex-direct-task.mjs', repo, pr, card, usageTaskKind,
   task,
   outputSchemaFile,
@@ -1162,6 +1230,7 @@ export async function codexDirectTask({
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
+    scratchGuard?.arm(scratch.dest);
   } else if (!existsFn(targetDir)) {
     throw new Error(`codex-direct-task: --dir=${targetDir} does not exist`);
   }
@@ -1171,6 +1240,7 @@ export async function codexDirectTask({
   }
 
   const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
+  scratchGuard?.setStart(startSha);
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
@@ -1682,6 +1752,11 @@ async function main() {
         ? `  origin wired to the real remote (--wire-origin-to-remote): ${report.scratch.realOrigin}`
         : `  origin left at the local clone source (#3782, not push-capable). Real remote: ${report.scratch.realOrigin}\n`
           + `    to push from here yourself: git -C ${report.dir} remote set-url origin ${report.scratch.realOrigin}`);
+    }
+    if (report.scratch.cleanup) {
+      console.log(report.scratch.cleanup.removed
+        ? '  scratch clone was clean: deleted'
+        : `  scratch clone KEPT (${report.scratch.cleanup.reason}): ${report.scratch.cleanup.path}`);
     }
     console.log(`  thread: ${report.events.threadId ?? '<none>'}  turns: ${report.events.turns}  terminal: ${report.events.terminal ?? '<none — timed out or killed>'}  timedOut: ${report.timedOut}  exit: ${report.exitCode}`);
     console.log(`  tool calls: ${report.events.commands.length}  files touched: ${report.events.filesChanged.length}`);
