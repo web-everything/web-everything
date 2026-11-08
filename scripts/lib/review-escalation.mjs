@@ -2046,7 +2046,9 @@ function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCar
     // The same comment can appear twice (an embedded page overlapping the full thread): an identical copy is one
     // comment; two DIFFERENT comments sharing an id are ambiguous evidence.
     const seen = byId.get(c.id);
-    const same = seen && seen.body === c.body && (seen.author?.login ?? seen.user?.login) === (c.author?.login ?? c.user?.login);
+    // "Same author" includes the bot identity: copies that disagree on is_bot or type are ambiguous, never one comment.
+    const who = x => { const a = x?.author ?? x?.user; return [a?.login, a?.is_bot === true, String(a?.type ?? '')].join('\u0000'); };
+    const same = seen && seen.body === c.body && who(seen) === who(c);
     byId.set(c.id, byId.has(c.id) && !same ? null : (seen ?? c));
   }
   const states = [];
