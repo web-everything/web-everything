@@ -930,6 +930,37 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(take).toHaveBeenCalledTimes(1);
   });
 
+  it('counts a red-team start exactly once after recovery throws and continues ordinary dispatch within host and lane bounds', () => {
+    // Exercise each bound independently; three reports of the same start must consume only one seat.
+    for (const [maxPerTick, lanes] of [[3, 5], [5, 3]]) {
+      const take = vi.fn();
+      const log = vi.fn();
+      const order = [];
+      const dispatch = vi.fn(({ pr }) => { order.push('ordinary'); return { agentId: `agent-${pr}` }; });
+      const redTeamOnSkip = vi.fn(({ capacity }) => {
+        order.push('red-team');
+        capacity.remainingStarts--;
+        capacity.lanes--;
+        capacity.take();
+        throw new Error('recovery failed after starting');
+      });
+      const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, redTeamOnSkip, log,
+        hostAdmission: () => ({ admitted: true, maxPerTick, take }), acquirableLanes: () => lanes,
+        tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      });
+      expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('red-team recovery failed'));
+      const ordinaryStarts = Math.min(maxPerTick - 1, lanes - 1);
+      expect(dispatch).toHaveBeenCalledTimes(ordinaryStarts);
+      expect(out.dispatched).toHaveLength(ordinaryStarts);
+      expect(out.dispatched.length).toBeLessThanOrEqual(maxPerTick - 1);
+      expect(out.dispatched.length + 1).toBeLessThanOrEqual(lanes);
+      expect(order).toEqual(['red-team', ...Array(ordinaryStarts).fill('ordinary')]);
+      expect(take).toHaveBeenCalledTimes(ordinaryStarts + 1);
+      expect(take.mock.calls).toEqual(Array.from({ length: ordinaryStarts + 1 }, () => [1]));
+    }
+  });
+
   it('host admission (verify-admission audit): one shared per-tick budget across repos, evaluated once', async () => {
     const { sharedHostBudget } = await import('../review-daemon.mjs');
     const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
