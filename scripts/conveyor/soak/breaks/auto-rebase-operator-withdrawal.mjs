@@ -37,7 +37,8 @@ export function inventoryRunOutcome(result) {
 }
 
 // realRunner exercises Vitest's actual file-filter/exclude behavior with the reported paths.
-export async function runTestInventoryCase({ mode = 'excluded', realRunner = false, rewriteBases, pendingFailure } = {}) {
+// `spawn` is injectable so a wrapper deferral exit can be exercised without a busy host queue.
+export async function runTestInventoryCase({ mode = 'excluded', realRunner = false, rewriteBases, pendingFailure, spawn = spawnSync } = {}) {
   const dir = fs.mkdtempSync(join(tmpdir(), 'soak-auto-inventory-'));
   const root = join(dir, 'clone');
   fs.mkdirSync(root);
@@ -84,7 +85,7 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
         // Same exclusion as the repository's unit config; no project setup or external state.
         fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { passWithNoTests: true, exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
         const admitted = admittedArgv(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(args.indexOf('--') + 3)]);
-        runnerResult = spawnSync(admitted.file, admitted.args, inventoryRunnerOptions(scratch, env));
+        runnerResult = spawn(admitted.file, admitted.args, inventoryRunnerOptions(scratch, env));
         if (runnerResult.status === 0) fs.writeFileSync(testReport, JSON.stringify(heavyTestReport(runnerResult.stdout, { root: fs.realpathSync(scratch), args })));
         return runnerResult;
       }
@@ -117,9 +118,11 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
   };
   try {
     try { await runAutoRebase({ root, ref: REF, env, deps }); } catch (error) { failure = error.message; }
+    const runnerOutcome = realRunner ? inventoryRunOutcome(runnerResult) : null;
+    // A busy queue means the tests never ran: report that, not the repair's generic test failure.
+    if (runnerOutcome?.outcome === 'deferred') failure = `inventory runner deferred by the admission queue: ${runnerOutcome.reason}`;
     const pending = `${overlayFilePath(root, env)}.auto-rebase`;
-    return { failure, pushed, registered, audited, events, runnerResult,
-      runnerOutcome: realRunner ? inventoryRunOutcome(runnerResult) : null,
+    return { failure, pushed, registered, audited, events, runnerResult, runnerOutcome,
       remaining: fs.existsSync(pending) ? fs.readdirSync(pending) : [],
       overlays: readOverlays(root, { env }).map(o => o.ref),
       cleaned: scratches.every(p => !fs.existsSync(p)),

@@ -716,13 +716,28 @@ const ENV_VALUE_LONG = ['--unset', '--chdir', '--argv0'];
 /** How many words the env option `opt` occupies: 2 when its value is the next word, else 1. `-S`/
  *  `--split-string` count as 1 here; `envSplitString` reads their string. Pure. */
 function envOptionWidth(opt) {
+  return optionWidth(opt, ENV_VALUE_SHORT, ENV_VALUE_LONG, 'S');
+}
+
+/** Value-taking options of the other wrappers the peel walks past, in the same shape as env's table.
+ *  sudo: -u/-g/-U/-p/-D/-h/-C/-T/-r/-t/-R; xargs: -a/-d/-E/-I/-L/-n/-P/-s (-e/-i/-l take an attached value only). */
+const SUDO_VALUE_SHORT = 'ugUpDhCTrtR';
+const SUDO_VALUE_LONG = ['--user', '--group', '--other-user', '--prompt', '--chdir', '--host', '--close-from',
+  '--command-timeout', '--role', '--type', '--chroot'];
+const XARGS_VALUE_SHORT = 'adEILnPs';
+const XARGS_VALUE_LONG = ['--arg-file', '--delimiter', '--max-args', '--max-procs', '--max-chars', '--process-slot-var'];
+
+/** How many words option `opt` occupies (2 when its value is the next word, else 1), given the program's
+ *  value-taking short letters and long names (any unambiguous prefix). A `stop` letter ends the cluster as a
+ *  1-word option. Pure. */
+function optionWidth(opt, short, long, stop = '') {
   if (opt.startsWith('--')) {
     if (opt.includes('=')) return 1;
-    return opt.length >= 3 && ENV_VALUE_LONG.some((full) => full.startsWith(opt)) ? 2 : 1;
+    return opt.length >= 3 && long.some((full) => full.startsWith(opt)) ? 2 : 1;
   }
   for (let k = 1; k < opt.length; k += 1) {
-    if (opt[k] === 'S') return 1;
-    if (ENV_VALUE_SHORT.includes(opt[k])) return k === opt.length - 1 ? 2 : 1; // `-uNAME` holds its value
+    if (stop.includes(opt[k])) return 1;
+    if (short.includes(opt[k])) return k === opt.length - 1 ? 2 : 1; // `-uNAME` holds its value
   }
   return 1;
 }
@@ -800,18 +815,28 @@ function wrapperPrefixLength(words) {
       i += 1; // the mask / priority
       continue;
     }
-    if (w === 'command' || w === 'builtin' || w === 'nice') { i += 1; continue; }
-    if (w === 'sudo') {                                                       // sudo -n -u <user> … <cmd>
+    if (w === 'command') {                                                    // command [-p] [--] <cmd>; -v/-V only look up
+      i += 1;
+      while (words[i] === '-p' || words[i] === '--') i += 1;
+      continue;
+    }
+    if (w === 'builtin' || w === 'nice') { i += 1; continue; }
+    if (w === 'sudo') {                                                       // sudo -n -u <user> -p <prompt> … <cmd>
       i += 1;
       while (i < words.length && words[i].startsWith('-')) {
-        const opt = words[i]; i += 1;
-        if (opt === '-u' || opt === '-g' || opt === '-U') i += 1;              // option that takes an argument
+        const opt = words[i];
+        if (opt === '--') { i += 1; break; }
+        i += optionWidth(opt, SUDO_VALUE_SHORT, SUDO_VALUE_LONG);
       }
       continue;
     }
-    if (w === 'xargs') {                                                      // xargs -n1 -I{} … <cmd>
+    if (w === 'xargs') {                                                      // xargs -n1 -n 1 -I {} … <cmd>
       i += 1;
-      while (i < words.length && words[i].startsWith('-')) i += 1;
+      while (i < words.length && words[i].startsWith('-')) {
+        const opt = words[i];
+        if (opt === '--') { i += 1; break; }
+        i += optionWidth(opt, XARGS_VALUE_SHORT, XARGS_VALUE_LONG);
+      }
       continue;
     }
     if (w === 'npx' || w === 'bunx') {                                        // npx [-y] [-p <pkg>] <cmd>
@@ -3593,7 +3618,11 @@ export function envSplitString(segment) {
 
 /** env -S's own escapes: `\_` is a space (`npx\_vitest` runs `npx vitest`), `\t` a tab. */
 function envSplitText(text) {
-  return text == null ? null : String(text).replace(/\\_/g, ' ').replace(/\\t/g, '\t');
+  if (text == null) return null;
+  const split = String(text).replace(/\\_/g, ' ').replace(/\\t/g, '\t');
+  // env reads options inside the split string too (`env -S "-i npx vitest run a"`), so a string that starts with
+  // one is classified as the env command it is (review #6461 r4).
+  return /^\s*-/.test(split) ? 'env ' + split.trimStart() : split;
 }
 
 /** The unqueued heavy run a segment starts, with the command text that classified (after env -S, launcher

@@ -5,7 +5,7 @@ import { resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findUngatedHeavySpawns } from '../lib/heavy-spawn-lint.mjs';
 import { ADMISSION_DEFERRED_EXIT, resolveAdmissionPolicy } from '../readiness/heavy-admission.mjs';
-import { INVENTORY_RUN_TIMEOUT_MS, inventoryRunnerOptions, inventoryRunOutcome } from '../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
+import { INVENTORY_RUN_TIMEOUT_MS, inventoryRunnerOptions, inventoryRunOutcome, runTestInventoryCase } from '../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
 
 const cp = "import { spawnSync } from 'node:child_process';\n";
 describe('daemon heavy spawn admission lint', () => {
@@ -245,6 +245,13 @@ describe('daemon heavy spawn admission lint', () => {
     expect(inventoryRunOutcome({ status: null, signal: 'SIGTERM' })).toEqual({ outcome: 'failed', reason: 'SIGTERM' });
     expect(inventoryRunOutcome(undefined)).toEqual({ outcome: 'failed', reason: 'no runner result' });
   });
+  it('the soak inventory case reports a deferred real runner explicitly and authorizes nothing', async () => {
+    const spawn = () => ({ status: ADMISSION_DEFERRED_EXIT, stdout: '', stderr: 'heavy-command admission-deferred: busy' });
+    const result = await runTestInventoryCase({ realRunner: true, mode: 'complete', spawn });
+    expect(result.runnerOutcome).toEqual({ outcome: 'deferred', reason: 'heavy-command admission-deferred: busy' });
+    expect(result.failure).toBe('inventory runner deferred by the admission queue: heavy-command admission-deferred: busy');
+    expect(result).toMatchObject({ pushed: false, registered: false, audited: false });
+  });
   it('accepts a file using the imported admission helper', () => {
     expect(findUngatedHeavySpawns(cp + "import { admittedArgv as admit } from './readiness/heavy-admission.mjs'; const a = admit('npx', ['vitest']); spawnSync(a.file, a.args);")).toEqual([]);
   });
@@ -254,12 +261,34 @@ describe('daemon heavy spawn admission lint', () => {
     expect(findUngatedHeavySpawns(source, 'scripts/lib/x.mjs')).toHaveLength(1);
     expect(findUngatedHeavySpawns(source)).toHaveLength(1);
   });
+  it.each([
+    ['scripts/tmp/readiness/evil.mjs', './heavy-admission.mjs'],
+    ['tests/readiness/evil.mjs', './heavy-admission.mjs'],
+    ['scripts/lib/x.mjs', '../../../../readiness/heavy-admission.mjs'],
+    ['scripts/lib/x.mjs', 'evil-pkg/readiness/heavy-admission.mjs'],
+    ['scripts/lib/x.mjs', '/abs/scripts/readiness/heavy-admission.mjs'],
+  ])('does not trust a look-alike admission module (%s imports %s)', (file, spec) => {
+    const source = cp + `import { admittedArgv } from '${spec}'; const a = admittedArgv('npx', ['vitest']); spawnSync(a.file, a.args);`;
+    expect(findUngatedHeavySpawns(source, file)).toHaveLength(1);
+  });
+  it.each([
+    ['scripts/lib/x.mjs', '../readiness/heavy-admission.mjs'],
+    ['scripts/conveyor/soak/breaks/x.mjs', '../../../readiness/heavy-admission.mjs'],
+    ['skills-src/conveyor/x.mjs', '../../scripts/readiness/heavy-admission.mjs'],
+  ])('trusts the repository admission module (%s imports %s)', (file, spec) => {
+    const source = cp + `import { admittedArgv } from '${spec}'; const a = admittedArgv('npx', ['vitest']); spawnSync(a.file, a.args);`;
+    expect(findUngatedHeavySpawns(source, file)).toEqual([]);
+  });
+  it.each(["execSync('env -S \"-i npx playwright test a\"');", "execSync('sudo -p x npx playwright test a');",
+    "execSync('xargs -n 1 npx playwright test');"])('rejects option-led env -S strings and valued wrapper options: %s', call => {
+    expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
+  });
   it('rejects an unrelated unadmitted spawn beside an admitted call', () => {
     const source = cp + "import { admittedArgv } from './readiness/heavy-admission.mjs';\n"
       + "const a = admittedArgv('node', ['light.mjs']); spawnSync(a.file, a.args);\n"
       + "spawnSync('vitest', ['run']);";
-    expect(findUngatedHeavySpawns(source, 'mixed.mjs')).toEqual([
-      expect.objectContaining({ filename: 'mixed.mjs', line: 4 }),
+    expect(findUngatedHeavySpawns(source, 'scripts/mixed.mjs')).toEqual([
+      expect.objectContaining({ filename: 'scripts/mixed.mjs', line: 4 }),
     ]);
   });
   it('requires both spawn arguments to come from the same admitted invocation', () => {

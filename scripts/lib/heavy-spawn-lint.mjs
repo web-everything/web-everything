@@ -110,8 +110,11 @@ function heavyCommand(command, { depth = 0, substitutions = true, scripts = pack
   }
 }
 
-/** `scripts` overrides the package script table (tests); by default this repository's package.json is read. */
-export function findUngatedHeavySpawns(source, filename = 'source.mjs', { scripts = packageScripts() } = {}) {
+const ADMISSION_MODULE = 'scripts/readiness/heavy-admission.mjs';
+
+/** `filename` is the file's path relative to the repository root (admission imports resolve against it).
+ *  `scripts` overrides the package script table (tests); by default this repository's package.json is read. */
+export function findUngatedHeavySpawns(source, filename = 'scripts/source.mjs', { scripts = packageScripts() } = {}) {
   if (typeof source !== 'string') return [{ filename, line: 1, reason: 'Unreadable source; inspect manually before clearing admission lint' }];
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   if (file.parseDiagnostics.length) return [{ filename, line: 1, reason: 'Unreadable syntax; inspect manually before clearing admission lint' }];
@@ -148,10 +151,10 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
           if (['execPath', 'argv0'].includes((e.propertyName || e.name).text)) processBinaryNames.add(e.name.text);
         }
       }
-      // A relative specifier is resolved against the linted file, so `./heavy-admission.mjs` inside readiness/
-      // counts (review #6461 r4); with no path to resolve against it does not (fail closed).
-      const resolved = mod.startsWith('.') ? posix.join(posix.dirname(filename), mod) : mod;
-      if ([mod, resolved].some(m => /(?:^|\/)readiness\/heavy-admission\.mjs$/.test(m)) && named && ts.isNamedImports(named)) {
+      // Only the repository's own admission module counts: a relative specifier resolved against the linted
+      // file's repo-relative path must name exactly scripts/readiness/heavy-admission.mjs. A package specifier, or
+      // a same-named module in any other readiness/ directory, does not (review #6461 r4).
+      if (mod.startsWith('.') && posix.join(posix.dirname(filename), mod) === ADMISSION_MODULE && named && ts.isNamedImports(named)) {
         for (const e of named.elements) if (['runUnderAdmission', 'admittedArgv'].includes((e.propertyName || e.name).text)) admission.set(e.name.text, (e.propertyName || e.name).text);
       }
     }
