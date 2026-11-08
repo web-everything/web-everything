@@ -73,16 +73,22 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  * second channel beside the check-runs API. The drain posts it when a red-team transition AND its failure supersede
  * both fail to publish, and posts `success` on the same context once publication is confirmed. Any CI host reads it,
  * so an older red-team success never passes there while the hold is set. A head-bound status cannot wedge a later
- * head. If every GitHub write fails, nothing remote can be written: only the drain-local hold binds then. */
+ * head. If every GitHub write fails, nothing remote can be written: only the drain-local hold binds then.
+ * A status binds a sha, and two PRs can share one head sha; so the context also names the PR (as the check run's
+ * external_id does), and one PR's confirmed clear can never clear another PR's hold on the same head. */
 export const RED_TEAM_PUBLICATION_CONTEXT = 'red-team/publication';
+/** The per-PR context, or null for an invalid PR number (callers then fail closed). */
+export const redTeamPublicationContext = pr => /^[1-9]\d*$/.test(String(pr ?? '')) && Number.isSafeInteger(Number(pr))
+  ? `${RED_TEAM_PUBLICATION_CONTEXT} #${Number(pr)}` : null;
 
-export function postRedTeamPublicationHold({ repo, headSha, held, reason = '', gh = runGhSync } = {}) {
+export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '', gh = runGhSync } = {}) {
   try {
-    if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid red-team publication hold identity');
+    const context = redTeamPublicationContext(pr);
+    if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context) throw Error('invalid red-team publication hold identity (repo, PR number and head required)');
     const description = String(held ? `held: ${reason || 'red-team round not confirmed published'}` : 'red-team publication confirmed')
       .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 140);
     gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
-      { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context: RED_TEAM_PUBLICATION_CONTEXT, description }) });
+      { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context, description }) });
     return { ok: true };
   } catch (error) {
     // A definite rejection (HTTP 4xx) created or changed no status. Read it from the FULL error text, before the
@@ -98,14 +104,16 @@ export function postRedTeamPublicationHold({ repo, headSha, held, reason = '', g
  * wins, ordered by id. Absent = no hold. An unreadable read, or a full page with no decision, holds.
  * `combined` is the per-context latest summary; `statuses` the full newest-first list, read only when the context
  * exists. */
-export function evaluateRedTeamPublicationHold({ combined, statuses, isTrusted = isTrustedMarkerAuthor } = {}) {
+export function evaluateRedTeamPublicationHold({ pr, combined, statuses, isTrusted = isTrustedMarkerAuthor } = {}) {
+  const context = redTeamPublicationContext(pr);
+  if (!context) return failure('red-team publication hold PR number missing or invalid');
   const latest = combined?.statuses;
   if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
     return failure('red-team publication hold unreadable or incomplete; operator must inspect commit statuses');
-  if (!latest.some(status => status?.context === RED_TEAM_PUBLICATION_CONTEXT)) return { ok: true, reason: 'no red-team publication hold on head' };
+  if (!latest.some(status => status?.context === context)) return { ok: true, reason: 'no red-team publication hold on head' };
   if (!Array.isArray(statuses) || statuses.length > 100 || statuses.some(status => !Number.isSafeInteger(status?.id)))
     return failure('red-team publication hold history unreadable; operator must inspect commit statuses');
-  const ordered = statuses.filter(status => status.context === RED_TEAM_PUBLICATION_CONTEXT).sort((a, b) => b.id - a.id);
+  const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
   for (const status of ordered) {
     if (status.state !== 'success')
       return failure(`red-team round not confirmed published (GitHub-visible hold, ${message(status.state)}); retry check publication before enqueue`);
@@ -115,13 +123,15 @@ export function evaluateRedTeamPublicationHold({ combined, statuses, isTrusted =
   return { ok: true, reason: 'no trusted red-team publication hold on head' };
 }
 
-export function readRedTeamPublicationHoldFact({ repo, headSha, gh = runGhSync, isTrusted } = {}) {
-  if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) return failure('invalid red-team publication hold identity');
+export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted } = {}) {
+  const context = redTeamPublicationContext(pr);
+  if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
+    return failure('invalid red-team publication hold identity (repo, PR number and head required)');
   try {
     const combined = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/status?per_page=100`], ioOptions));
-    const present = Array.isArray(combined?.statuses) && combined.statuses.some(status => status?.context === RED_TEAM_PUBLICATION_CONTEXT);
+    const present = Array.isArray(combined?.statuses) && combined.statuses.some(status => status?.context === context);
     const statuses = present ? JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions)) : undefined;
-    return evaluateRedTeamPublicationHold({ combined, statuses, ...(isTrusted ? { isTrusted } : {}) });
+    return evaluateRedTeamPublicationHold({ pr, combined, statuses, ...(isTrusted ? { isTrusted } : {}) });
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
 }
 

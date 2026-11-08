@@ -444,7 +444,7 @@ export function recordRedTeamStatus(input, options = {}) {
         const statusChannel = typeof options.postPublicationHold === 'function' || typeof options.gh === 'function' || !underTest;
         const postHold = ({ held, reason }) => {
           try {
-            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, headSha: head, held, reason, gh });
+            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh });
             if (result?.ok === true) return result;
             // `definite` is computed by the poster from the untruncated error; an injected poster may only say it in its reason.
             const why = String(result?.reason ?? '');
