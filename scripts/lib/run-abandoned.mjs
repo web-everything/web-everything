@@ -27,7 +27,9 @@ export function markRunAbandoned({ id, dir, reason, probes, by, now = Date.now()
   catch (e) {
     if (e.code !== 'EEXIST') throw e;
     if (isRunAbandoned(id, dir, { fs })) return { written: false, alreadyAbandoned: true };
-    replaceStaleTombstone(fs, path, body);
+    // A poisoned sidecar (a directory, EACCES, ENOSPC) must not abort a whole sweep: report it so the caller keeps this id.
+    try { replaceStaleTombstone(fs, path, body); }
+    catch (err) { return { written: false, alreadyAbandoned: false, staleUnreplaceable: String(err?.code ?? err?.message ?? 'unknown') }; }
     return { written: true, alreadyAbandoned: false, replacedStale: true };
   }
   try { fs.writeFileSync(fd, body, 'utf8'); }

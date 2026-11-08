@@ -107,7 +107,8 @@ it('never replaces a valid tombstone, even one a concurrent reaper just wrote', 
 it('stale replacement is atomic (temp + rename) and a failed rename leaves the old tombstone and no temp', () => {
   fs.writeFileSync(abandonedPath(id, dir), '');
   const renameSync = vi.fn(() => { throw Object.assign(Error('denied'), { code: 'EACCES' }); });
-  expect(() => markRunAbandoned({ ...bound(), fs: { ...fs, renameSync } })).toThrow('denied');
+  expect(markRunAbandoned({ ...bound(), fs: { ...fs, renameSync } }))
+    .toEqual({ written: false, alreadyAbandoned: false, staleUnreplaceable: 'EACCES' });
   expect(renameSync).toHaveBeenCalledTimes(1);
   expect(fs.readFileSync(abandonedPath(id, dir), 'utf8')).toBe('');
   expect(fs.readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);

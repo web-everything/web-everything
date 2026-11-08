@@ -391,6 +391,14 @@ it('re-abandons a resumed run that dies again: stale tombstone is replaced, not 
   expect(isRunAbandoned('review-dead', dir)).toBe(true);
   expect(readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
 });
+it('an unreplaceable stale tombstone (a directory) is kept and does not abort the sweep of other runs', () => {
+  record('review-poisoned'); record('review-dead');
+  mkdirSync(abandonedPath('review-poisoned', dir));
+  const r = sweep();
+  expect(r.kept['stale-tombstone-unreplaceable']).toEqual(['review-poisoned']);
+  expect(r.reaped).toEqual(['review-dead']);
+  expect(readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
+});
 it.each([['zero-byte', ''], ['partial', '{"at":']])('a crash-left %s tombstone does not make the run permanently un-reapable', (_n, body) => {
   record(); writeFileSync(abandonedPath('review-dead', dir), body);
   const r = sweep();

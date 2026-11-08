@@ -205,7 +205,10 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
       probes: { recordVersion: version(c.stat), ageMs: c.ageMs, thresholdMs: result.thresholdMs, thresholdSource: result.thresholdSource,
         reviewJobs: 'dead', handles: 'dead', writers: 'dead', leases: 'absent', sessions: 'absent' } });
     if (marked.written) result.reaped.push(c.id);
-    else keep('already-abandoned', c.id);
+    else if (marked.staleUnreplaceable) { // stale sidecar could not be replaced: retry next sweep, keep sweeping others
+      log(`reap-dead-review-runs: stale tombstone for ${c.id} could not be replaced (${String(marked.staleUnreplaceable).replace(/[\x00-\x1f\x7f]/g, ' ')}); remove or fix it and retry`);
+      keep('stale-tombstone-unreplaceable', c.id);
+    } else keep('already-abandoned', c.id);
   }
 
   return result;
