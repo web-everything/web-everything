@@ -658,9 +658,10 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
 }
 
 /**
- * Applies `cleanupScratchClone` on SIGINT/SIGTERM and when the run ends. Created before the clone exists;
- * `arm(dir, startSha)` binds it. `finish()` is idempotent and removes the listeners. The signal handler cleans
- * up, removes its listeners, and — because listening swallowed the signal's default action — re-raises the same
+ * Applies `cleanupScratchClone` when the run ends normally (`finish()`). Created before the clone exists;
+ * `arm(dir, startSha)` binds it. `finish()` is idempotent and removes the listeners. The signal handler NEVER
+ * deletes (the worker may still be writing): it prints the `scratch clone KEPT (...)` line, removes its
+ * listeners, and — because listening swallowed the signal's default action — re-raises the same
  * signal on `proc` when no other listener remains, so the process still terminates as it would have. When another
  * listener (the CLI's own handler) exists, it is left to do the exiting.
  */
@@ -680,7 +681,9 @@ export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmF
   const off = () => { for (const sig of Object.keys(handlers)) proc.removeListener(sig, handlers[sig]); };
   for (const sig of ['SIGINT', 'SIGTERM']) {
     handlers[sig] = () => {
-      try { report(run()); } catch { /* never throw from a signal handler */ }
+      // A signal NEVER deletes: the worker may still be writing (its kill is a separate listener), so the
+      // clone is kept and its path reported. Only a normal run end (`finish()`) applies the delete rule.
+      try { if (target) report({ removed: false, path: target.dir, reason: 'interrupted by signal' }); } catch { /* never throw from a signal handler */ }
       off();
       // We swallowed the default action by listening; restore it when nobody else is listening.
       if (typeof proc.kill === 'function' && proc.listenerCount(sig) === 0) proc.kill(proc.pid, sig);

@@ -3340,15 +3340,37 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
     expect(leftovers).toBe('');
   });
 
-  it('a signal during the run applies the same rule synchronously (clean deleted)', () => {
+  it('a signal during the run keeps even a clean clone and removes its listeners', () => {
     const { dir, sha } = makeClone();
     const proc = new EventEmitter();
     const guard = createScratchGuard({ proc });
     guard.arm(dir, sha);
     proc.emit('SIGTERM');
-    expect(() => statSync(dir)).toThrow();
+    expect(statSync(dir).isDirectory()).toBe(true);
     expect(proc.listenerCount('SIGTERM')).toBe(0);
     expect(proc.listenerCount('SIGINT')).toBe(0);
+  });
+
+  it('signal cleanup keeps the clone and reports its path', () => {
+    const { dir, sha } = makeClone();
+    for (const sig of ['SIGINT', 'SIGTERM']) {
+      const rm = vi.fn();
+      const written = [];
+      const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => { written.push(String(chunk)); return true; });
+      try {
+        // A live worker stand-in: its own signal listener (the real worker kill) is registered and still running.
+        const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+        const workerKill = vi.fn();
+        proc.on(sig, workerKill);
+        const guard = createScratchGuard({ proc, rmFn: rm });
+        guard.arm(dir, sha);
+        proc.emit(sig);
+        expect(workerKill).toHaveBeenCalledTimes(1);
+        expect(rm).not.toHaveBeenCalled();
+        expect(statSync(dir).isDirectory()).toBe(true);
+        expect(written.join('')).toContain(`scratch clone KEPT (interrupted by signal): ${dir}`);
+      } finally { spy.mockRestore(); }
+    }
   });
 
   it('a signal during the run keeps a dirty clone', () => {
