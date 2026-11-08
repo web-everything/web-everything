@@ -2,9 +2,11 @@
 bornAs: xfo5nr2
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/red-team-run-result.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-job.mjs"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: 83a872c0227182ab5e2c8119ecb89649967b95ca
 tags: []
 ---
 
