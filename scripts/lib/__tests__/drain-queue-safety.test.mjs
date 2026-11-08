@@ -966,9 +966,10 @@ describe('merge-queue same-head failure admission', () => {
       f.runs[0].conclusion = conclusion;
       f.expectHeld();
     }));
-    it.each(['queued', 'in_progress'])('guard holds for a newer %s main push despite older successful CI', status => fixture(f => {
+    it.each(['queued', 'in_progress'])('guard holds for a newer %s main push only when the older completed success is stale (>2h)', status => fixture(f => {
       f.runs.push({ ...f.runs[0], id: 13, created_at: '2026-11-01T14:00:00Z', status, conclusion: null });
       // The older completed success is stale; pending runs do not refresh it.
+      // drain-mq-retry-main-green.test.mjs covers accepting a pending push with an older fresh success.
       f.now = Date.parse('2026-11-01T15:01:00Z');
       f.expectHeld();
       const mainArgs = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.includes('/actions/')))[1];
@@ -983,19 +984,19 @@ describe('merge-queue same-head failure admission', () => {
       expect(f.mainReads ?? 0).toBe(0);
       expect(f.exec).toHaveBeenCalledTimes(7); // Queue, timeline, then five REST pages.
     }));
-    it('guard holds after ten shared REST pages when main history remains incomplete', () => fixture(f => {
+    it('guard holds after five check-run pages when the bounded main-history page is incomplete', () => fixture(f => {
       f.checkTotal = 500;
       f.checkPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
         ({ ...f.checks[0], id: page * 100 + index + 1 })));
       f.mainTotal = 501;
-      f.mainPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
+      f.mainPages = Array.from({ length: 1 }, (_, page) => Array.from({ length: 99 }, (_, index) =>
         ({ ...f.runs[0], id: page * 100 + index + 1 })));
-      // The bounded main lookups are readable; their completed successes are stale.
-      f.now = Date.parse('2026-11-01T15:01:00Z');
+      // With 501 reported runs, the bounded first page must contain 100; these successes are fresh.
       f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`);
       expect(f.checkReads).toBe(5);
-      expect(f.mainReads).toBe(2); // Newest-run and historical main lookups share the REST budget.
-      expect(f.exec).toHaveBeenCalledTimes(10); // Queue, timeline, five check pages, two main reads, merge state.
+      expect(f.mainReads).toBe(1); // The incomplete newest-run page prevents further evidence reads.
+      expect(f.exec).toHaveBeenCalledTimes(8); // Queue, timeline, five check pages, one main read.
       const endpoints = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => arg.includes('/check-runs')));
       expect(endpoints.map(endpoint => new URLSearchParams(endpoint.split('?')[1]).get('page')))
         .toEqual(['1', '2', '3', '4', '5']);
