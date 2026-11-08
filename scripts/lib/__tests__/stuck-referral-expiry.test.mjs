@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname, tmpdir } from 'node:os';
 import { pidNamespace } from '../pid-alive.mjs';
+import { LEASE_FILENAME } from '../lane-lease.mjs';
+import { fixDispatchClaimRoot } from '../../conveyor/fix-claim-store.mjs';
 import { newRunRecord, readRun, writeRun, runPath } from '../../operations/run-store.mjs';
-import { findSuspendedReferralRuns, planReferralExpiry, expireSuspendedReferralRun, expireStuckReferralRuns } from '../stuck-referral-expiry.mjs';
+import { defaultProbe, findSuspendedReferralRuns, planReferralExpiry, expireSuspendedReferralRun, expireStuckReferralRuns } from '../stuck-referral-expiry.mjs';
 import { readDrainRedTeamEvidence, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
 import { resolveReviewRedTeamOnSkip, runRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { needsJudgment } from '../../operations/judge-sweep-facts.mjs';
@@ -20,7 +22,8 @@ function fixture(age = 5 * hour, extra = {}) {
     pending: { kind: 'effect', step: 'mandatoryReferrals', stepIndex: 8, count: 1 },
     effects: ['pending', 'in-flight'].map((status, index) => ({ key: `effect-${index}`, type: 'review.mandatory-referrals', stepIndex: 1, index, status })), ...extra });
   writeRun(run, runsDir); utimesSync(runPath(run.id, runsDir), (now - age) / 1000, (now - age) / 1000);
-  return { runsDir, runId: run.id, repo, pr, head, now, deadlineMs, probe: { isRunBound: () => false } };
+  return { runsDir, runId: run.id, repo, pr, head, now, deadlineMs,
+    probe: { isRunBound: () => false, isLeaseBound: () => false } };
 }
 const bytes = f => readFileSync(runPath(f.runId, f.runsDir), 'utf8');
 describe('stuck referral expiry', () => {
@@ -63,10 +66,66 @@ describe('stuck referral expiry', () => {
   it('rechecks process ownership before writing', () => {
     const f = fixture(), before = bytes(f), write = vi.fn();
     const isRunBound = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
-    expect(expireSuspendedReferralRun({ ...f, probe: { isRunBound }, write }))
+    expect(expireSuspendedReferralRun({ ...f, probe: { ...f.probe, isRunBound }, write }))
       .toMatchObject({ expired: false, why: 'run bound to live process' });
     expect(isRunBound).toHaveBeenCalledTimes(2);
     expect(write).not.toHaveBeenCalled(); expect(bytes(f)).toBe(before);
+  });
+  it.each([
+    ['bound lease or claim', () => true, 'run bound to a lease or claim'],
+    ['throwing lease probe', () => { throw Error('lease unreadable'); }, 'run lease unreadable'],
+    ['non-boolean lease probe', () => null, 'run lease unreadable'],
+    ['missing lease probe', undefined, 'run lease unreadable'],
+  ])('holds %s without writing', (_name, isLeaseBound, why) => {
+    const f = fixture(), before = bytes(f), write = vi.fn();
+    const bound = isLeaseBound && vi.fn(isLeaseBound);
+    const probe = { ...f.probe, isLeaseBound: bound };
+    expect(planReferralExpiry(findSuspendedReferralRuns(f)[0], { now, deadlineMs, probe }))
+      .toEqual({ action: 'hold', why });
+    expect(expireSuspendedReferralRun({ ...f, probe, write })).toMatchObject({ expired: false, why });
+    if (bound) expect(bound).toHaveBeenCalledWith(readRun(f.runId, f.runsDir));
+    expect(write).not.toHaveBeenCalled(); expect(bytes(f)).toBe(before);
+  });
+  it('expires when the lease probe explicitly reports unbound', () => {
+    const f = fixture(), isLeaseBound = vi.fn(() => false);
+    expect(expireSuspendedReferralRun({ ...f, probe: { ...f.probe, isLeaseBound } }))
+      .toEqual({ expired: true, runId: f.runId, deadlineMs });
+    expect(isLeaseBound).toHaveBeenCalledTimes(2);
+  });
+  it('rechecks lease ownership before writing', () => {
+    const f = fixture(), before = bytes(f), write = vi.fn();
+    const isLeaseBound = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    expect(expireSuspendedReferralRun({ ...f, probe: { ...f.probe, isLeaseBound }, write }))
+      .toMatchObject({ expired: false, why: 'run bound to a lease or claim' });
+    expect(isLeaseBound).toHaveBeenCalledTimes(2);
+    expect(write).not.toHaveBeenCalled(); expect(bytes(f)).toBe(before);
+  });
+  it.each(['lane lease', 'fix-dispatch claim'])('default probe holds a run bound to a live %s without writing', store => {
+    const f = fixture(), before = bytes(f), write = vi.fn();
+    const poolRoot = join(f.runsDir, 'pool'), coordinationRoot = join(f.runsDir, 'coordination');
+    vi.stubEnv('LANE_POOL_ROOT', poolRoot);
+    vi.stubEnv('WE_COORDINATION_ROOT', coordinationRoot);
+    try {
+      if (store === 'lane lease') {
+        const lane = join(poolRoot, 'web-everything', 'lane-1');
+        mkdirSync(lane, { recursive: true });
+        writeFileSync(join(lane, LEASE_FILENAME), JSON.stringify({
+          acquiredAt: new Date().toISOString(), purpose: `review run=${f.runId}`,
+        }));
+      } else {
+        const claim = join(fixDispatchClaimRoot(coordinationRoot), 'fixture-claim');
+        mkdirSync(claim, { recursive: true });
+        writeFileSync(join(claim, 'lock.json'), JSON.stringify({
+          owner: `review run=${f.runId}`, heartbeatAt: new Date().toISOString(),
+          meta: { repo, pr, kind: 'fix' },
+        }));
+      }
+      expect(expireSuspendedReferralRun({ ...f, probe: { ...defaultProbe(), isRunBound: () => false }, write }))
+        .toMatchObject({ expired: false, why: 'run bound to a lease or claim' });
+      expect(write).not.toHaveBeenCalled(); expect(bytes(f)).toBe(before);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
   it('holds a proven live pid even when old', () => {
     const f = fixture(5 * hour, { host: 'host', pidNamespace: 'ns', pid: 123 }), before = bytes(f);
@@ -198,7 +257,7 @@ describe('stuck referral expiry', () => {
     utimesSync(runPath(blocked.id, f.runsDir), (now - 5 * hour) / 1000, (now - 5 * hour) / 1000);
     const before = readFileSync(runPath(blocked.id, f.runsDir), 'utf8');
     const escalate = vi.fn(), expiry = vi.fn(options => expireStuckReferralRuns({ ...options, runsDir: f.runsDir,
-      probe: { host: 'local', namespace: 'ns', isAlive: () => blocker === 'live', isRunBound: () => false },
+      probe: { ...f.probe, host: 'local', namespace: 'ns', isAlive: () => blocker === 'live' },
       write: (run, dir) => { if (run.id === blocked.id && blocker === 'write-error') throw Error('write failed'); writeRun(run, dir); } }));
     const result = runRedTeamOnSkip({ repo, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
       rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }], capacity: { lanes: 1 },
@@ -235,6 +294,7 @@ describe('stuck referral expiry', () => {
     ['recent terminal', {}, 0, 1],
     ['abandoned terminal', {}, 2 * hour, 0],
     ['resumed terminal', { resumeOf: 'prior' }, 2 * hour, 1],
+    ['resumedAt-only terminal', { resumedAt: new Date(now - 2 * hour).toISOString() }, 2 * hour, 1],
     ['open effect with verdict', { verdict: { verdict: 'changes' }, effects: [{ key: 'open', type: 'test', stepIndex: 0, index: 0, status: 'pending' }] }, 2 * hour, 1],
     ['finished verdict', { verdict: { verdict: 'changes' } }, 0, 0],
     ['other head', { input: { repo, pr, head: 'b'.repeat(40) }, findings: {} }, 0, 1],
@@ -263,8 +323,8 @@ describe('stuck referral expiry', () => {
     ['unreadable repo', 'review-pr', { repo: 42, pr }, 1],
     ['unreadable PR', 'review-pr', { repo, pr: String(pr) }, 1],
     ['unknown operation and identity', 'legacy-review', {}, 1],
-    ['known other repo with missing PR', 'review-pr', { repo: 'elsewhere/repo' }, 0],
-    ['known other PR with missing repo', 'review-pr', { pr: 2 }, 0],
+    ['known other repo with missing PR', 'review-pr', { repo: 'elsewhere/repo' }, 1],
+    ['known other PR with missing repo', 'review-pr', { pr: 2 }, 1],
   ])('post-expiry identity scan: %s', (_name, op, input, otherBlockers) => {
     const f = fixture();
     const blocked = { ...newRunRecord({ id: 'review-identity', op, input }),

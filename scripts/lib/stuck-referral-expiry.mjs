@@ -6,7 +6,8 @@
  * ABANDONED_REVIEW_AFTER_MS quiet horizon (60 minutes after this write). Until then it holds.
  * Unknown evidence holds for operator inspection; scans over 10,000 records also refuse.
  */
-import { statSync } from 'node:fs';
+import { statSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { listRunIds, readRun, writeRun, runPath, sharedRunsDir, resolveRunsDir, isRunRecordTerminal } from '../operations/run-store.mjs';
@@ -14,6 +15,9 @@ import { validateRunRecord } from '../operations/run-record.mjs';
 import { pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { ABANDONED_REVIEW_AFTER_MS } from './drain-red-team-evidence.mjs';
 import { resolveReviewRedTeamOnSkip } from './review-red-team-on-skip.mjs';
+import { LEASE_FILENAME, isLeaseStale } from './lane-lease.mjs';
+import { defaultPoolRoot } from './lane-pool-paths.mjs';
+import { fixDispatchClaimRoot, listFixDispatchClaims } from '../conveyor/fix-claim-store.mjs';
 
 const suspended = run => run?.op === 'review-pr'
   && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
@@ -21,8 +25,40 @@ const stamp = value => typeof value === 'number' ? value : Date.parse(value);
 const isRunBound = runId => execFileSync('ps', ['-axo', 'command'], {
   encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024,
 }).includes(runId);
-const defaultProbe = () => ({
-  isRunBound,
+const existingEntries = dir => {
+  try { return readdirSync(dir, { withFileTypes: true }); }
+  catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+};
+const isLeaseBound = run => {
+  const matches = entry => Object.values(entry).some(value => typeof value === 'string'
+    ? value.includes(run.id) || value === run.sessionId
+    : value != null && typeof value === 'object' && matches(value));
+  const root = defaultPoolRoot();
+  for (const pool of existingEntries(root).filter(entry => entry.isDirectory())) {
+    const poolDir = join(root, pool.name);
+    const lanes = /^lane-\d+$/.test(pool.name) ? [poolDir]
+      : existingEntries(poolDir).filter(entry => entry.isDirectory() && /^lane-\d+$/.test(entry.name))
+        .map(entry => join(poolDir, entry.name));
+    for (const lane of lanes) {
+      let lease;
+      try { lease = JSON.parse(readFileSync(join(lane, LEASE_FILENAME), 'utf8')); }
+      catch (error) {
+        if (error.code === 'ENOENT') continue;
+        throw error;
+      }
+      if (!isLeaseStale(lease, Date.now()) && matches(lease)) return true;
+    }
+  }
+  // Check directory readability ourselves: the shared claim reader tolerates scan errors.
+  const claimRoot = fixDispatchClaimRoot();
+  existingEntries(claimRoot);
+  return listFixDispatchClaims(claimRoot, { liveOnly: true }).some(matches);
+};
+export const defaultProbe = () => ({
+  isRunBound, isLeaseBound,
   host: hostname(), namespace: pidNamespace(), readPidStart: pidStartTime,
   isAlive: pid => {
     try { process.kill(pid, 0); return true; }
@@ -123,6 +159,11 @@ export function planReferralExpiry(observation, { now = Date.now(), deadlineMs, 
     if (bound === true) return hold('run bound to live process');
     if (bound !== false) return hold('run owner unreadable');
   } catch { return hold('run owner unreadable'); }
+  try {
+    const bound = probe?.isLeaseBound?.(run);
+    if (bound === true) return hold('run bound to a lease or claim');
+    if (bound !== false) return hold('run lease unreadable');
+  } catch { return hold('run lease unreadable'); }
   return { action: 'expire', why: `expired: no referral ruling within ${deadlineMs / 60000}m` };
 }
 
@@ -174,12 +215,10 @@ export function expireStuckReferralRuns({ repo, pr, head, setting, env = process
       if (expiredIds.has(id)) return false;
       // Missing identity (even on an unrecognized operation) cannot clear the human hold.
       // Exclude only records whose readable identity proves they concern another repo/PR.
-      const otherRepo = typeof run.input.repo === 'string' && run.input.repo.trim() !== ''
-        && run.input.repo !== repo;
-      const otherPr = typeof run.input.pr === 'number' && Number.isFinite(run.input.pr)
-        && run.input.pr !== Number(pr);
-      if (otherRepo || otherPr) return false;
-      const abandoned = run.verdict == null && run.resumeOf == null && isRunRecordTerminal(run)
+      const readableRepo = typeof run.input.repo === 'string' && run.input.repo.trim() !== '';
+      const readablePr = typeof run.input.pr === 'number' && Number.isFinite(run.input.pr);
+      if (readableRepo && readablePr && (run.input.repo !== repo || run.input.pr !== Number(pr))) return false;
+      const abandoned = run.verdict == null && run.resumeOf == null && run.resumedAt == null && isRunRecordTerminal(run)
         && now - mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
       return !abandoned && (run.verdict == null || run.pending != null
         || run.effects.some(effect => ['pending', 'in-flight'].includes(effect.status)));
