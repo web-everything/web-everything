@@ -165,6 +165,7 @@ process.stdout.write('dispatched mode=' + MODE + '\\n');
     copyFileSync(join(dirname(MODULE), 'daemon-last-good.mjs'), join(pusher, 'scripts', 'lib', 'daemon-last-good.mjs'));
     // The operator-cli fresh fallback settings knob adds this import; missing settings files are fail-soft.
     copyFileSync(join(dirname(MODULE), 'settings-files.mjs'), join(pusher, 'scripts', 'lib', 'settings-files.mjs'));
+    for (const f of ['daemon-events.mjs', 'handoff-path.mjs']) copyFileSync(join(dirname(MODULE), f), join(pusher, 'scripts', 'lib', f));
     writeFileSync(join(pusher, 'cli.mjs'), cli('session'));
     git(pusher, 'add', '.'); git(pusher, 'commit', '-qm', 'old: session mode');
     git(pusher, 'push', '-q', 'origin', 'main');
