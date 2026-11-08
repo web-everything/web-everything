@@ -865,7 +865,14 @@ export function canonicalCommand(segment) {
   const words = headWords(c);
   const k = wrapperPrefixLength(words.map((w) => w.text));
   if (k >= words.length) return '';
-  const prog = words[k].text.replace(/^\\+/, '').replace(/^.*\//, '');
+  // A COMMAND LINE the peel stopped at (`npx -c "<line>"`, `--call=<line>`, `flock f -c "<line>"`, `watch
+  // "<line>"`, self-review of #6461 round 5) keeps its words: only its first word's directory is dropped, so a
+  // slash later in the line (`npx vitest run scripts/a.test.mjs`) cannot reduce it to its last path segment.
+  const text = words[k].text.replace(/^\\+/, '');
+  const prev = words[k - 1]?.text;
+  const line = /\s/.test(text) && (/^--call=/.test(text) || /^(?:-c|--call|--command)$/.test(prev || '')
+    || words.slice(0, k).some((word) => word.text.replace(/^.*\//, '') === 'watch'));
+  const prog = line ? text.replace(/^\S*\//, '') : text.replace(/^.*\//, '');
   if (!prog) return '';
   return (prog + c.slice(words[k].end)).trim();
 }
@@ -3591,7 +3598,11 @@ export function envSplitString(segment) {
   };
   // env runs the split words FOLLOWED BY the words after the string (`env -S "-u X" npx vitest run a`, review
   // #6461 r4), so the remaining raw text is appended. `next` is the index of the first word after the string.
-  const split = (text, next) => envSplitText(text, words[next] ? src.slice(words[next].start) : '');
+  // The string's word is `words[next - 1]`. A `"…"` word reaches env with the shell's `\"`, `\\`, `\$`, `` \` ``
+  // already resolved, while the word scanner keeps them verbatim, so resolve them first (round 5).
+  const split = (text, next) => envSplitText(
+    words[next - 1]?.dq && text != null ? String(text).replace(/\\(["\\$`])/g, '$1') : text,
+    words[next] ? src.slice(words[next].start) : '');
   let at = nextEnv(0);
   if (at < 0) return null;
   for (let i = at + 1; i < w.length; i += 1) {
@@ -3628,7 +3639,13 @@ function envSplitText(text, tail = '') {
   let quote = '';
   for (let k = 0; k < s.length; k += 1) {
     const ch = s[k];
-    if (quote === "'") { out += ch; if (ch === "'") quote = ''; continue; }
+    if (quote === "'") {
+      // env reads `\'` and `\\` inside single quotes (the shell does not): re-quote them for the word scanner.
+      if (ch === '\\' && (s[k + 1] === "'" || s[k + 1] === '\\')) { out += s[k + 1] === "'" ? "'\\''" : '\\'; k += 1; continue; }
+      out += ch;
+      if (ch === "'") quote = '';
+      continue;
+    }
     if (ch === "'" || ch === '"') { if (!quote) quote = ch; else if (quote === ch) quote = ''; out += ch; continue; }
     if (ch === '\\') {
       const e = s[k + 1];

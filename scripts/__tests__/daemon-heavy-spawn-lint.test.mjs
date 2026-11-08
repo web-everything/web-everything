@@ -156,6 +156,8 @@ describe('daemon heavy spawn admission lint', () => {
     "spawnSync('timeout', ['--sig', 'KILL', '5', 'npx', 'vitest', 'run']);",
     "spawnSync('caffeinate', ['-it', '5', 'npx', 'playwright', 'test']);",
     "spawnSync('/usr/bin/time', ['-ao', 'f', 'npx', 'vitest', 'run']);",
+    "spawnSync('npx', ['-c', 'vitest run scripts/a.test.mjs']);",
+    "spawnSync('flock', ['/tmp/l', '-c', 'npx vitest run scripts/a.test.mjs']);",
   ])('rejects the round-5 wrapper spellings: %s', call => {
     expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
   });

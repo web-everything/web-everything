@@ -229,6 +229,13 @@ describe('summarize + formatTable', () => {
     expect(s.diffCount).toBe(2);
   });
 
+  it('does not pass a replay in which no diff ran (every run deferred or errored)', () => {
+    const s = summarize([{ sha: 'a', subject: 's', error: 'full check-standards run produced no result (exit 75): no JSON on stdout' }]);
+    expect(s.okCount).toBe(0);
+    expect(s.pass).toBe(false);
+    expect(summarize([]).pass).toBe(false);
+  });
+
   it('formatTable renders one line per row plus a summary footer, and marks an errored row', () => {
     const rows = [row()];
     const s = summarize(rows);

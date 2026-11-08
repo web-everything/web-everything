@@ -247,7 +247,9 @@ export function summarize(rows) {
     fullCpuAvg, scopedCpuAvg,
     realSavingsPct: fullRealAvg ? (1 - scopedRealAvg / fullRealAvg) * 100 : null,
     cpuSavingsPct: fullCpuAvg ? (1 - scopedCpuAvg / fullCpuAvg) * 100 : null,
-    pass: totalMissed === 0,
+    // A replay where no diff ran (every row errored, e.g. every run deferred by the admission queue) checked
+    // nothing, so it cannot pass (self-review of #6461 round 5).
+    pass: totalMissed === 0 && n > 0,
   };
 }
 
@@ -430,6 +432,10 @@ function runCli(argv) {
       const linked = linkedFilesFor(diff.changedFiles, { gitGrep: gitGrepIn(worktreePath) });
       const laneFiles = Array.from(new Set([...diff.changedFiles, ...linked])).sort();
       const scoped = runCheckStandards(worktreePath, ['--local', `--files=${diff.changedFiles.join(',')}`]);
+      // A run that produced no JSON (the admission queue deferred it with exit 75, or it crashed) did not check
+      // anything, so its empty error list must not read as a clean pass (self-review of #6461 round 5).
+      const unrun = [['full', full], ['scoped', scoped]].find(([, r]) => r.parseError);
+      if (unrun) throw new Error(`${unrun[0]} check-standards run produced no result (exit ${unrun[1].status}): ${unrun[1].parseError}`);
       const cmp = compareFindings({ fullErrors: full.errors, scopedErrors: scoped.errors, laneFiles });
 
       results.push({

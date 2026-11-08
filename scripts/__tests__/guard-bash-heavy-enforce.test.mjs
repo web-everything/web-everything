@@ -185,6 +185,19 @@ describe('heavy-enforce — every direct test run requires admission', () => {
   it.each(['bun x vitest run a', 'pnpx vitest run a', "env -S 'npx vitest\\c junk' run a"])('denies `%s`', cmd => {
     expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
   });
+  // Second self-review of round 5: a slash later in a command-line value must not cut the line to its last path
+  // segment, and env -S reads `\'` inside single quotes.
+  it.each(['npx -c "npx vitest run scripts/__tests__/a.test.mjs"', 'npx -c "vitest run scripts/a.test.mjs"',
+    'npx --call="npx vitest run scripts/a.test.mjs"', 'npx --call "npx vitest run scripts/a.test.mjs"',
+    'npx -c "node scripts/check-standards.mjs"', 'npx -c "npx playwright test e2e/a.spec.ts"',
+    'npx -c "./node_modules/.bin/vitest run scripts/a.test.mjs"', 'flock /tmp/l -c "npx vitest run scripts/a.test.mjs"',
+    'flock -w 5 /tmp/l -c "npx vitest run scripts/a.test.mjs"', 'watch "npx vitest run scripts/a.test.mjs"',
+    'watch "npm test -- scripts/a.test.mjs"', `env -S "X='\\\\' #' npx vitest run a"`])('denies the command line `%s`', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  it('still guards a push inside a command-line value', () => {
+    expect(decide("npx -c 'git push --force origin refs/heads/main'", {})).not.toBeNull();
+  });
   it.each(['env -i env -S "echo hi"', 'npx -c "echo hi"', 'flock /tmp/l echo hi', 'env -S "echo \\c npx vitest run a"',
     "env -S 'echo #npx vitest run a'", 'npm exec -c "echo vitest"', 'bun x eslint .', 'timeout --sig KILL 5 echo hi'])('still allows `%s`', cmd => {
     expect(decide(cmd, {})).toBeNull();
