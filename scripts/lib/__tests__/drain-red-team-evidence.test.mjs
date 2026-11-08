@@ -356,6 +356,31 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'original-start' }).inFlight).toBe(true);
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'reused-start' }).inFlight).toBe(false);
   });
+  describe('foreign host name with a stale record (host renamed after a crash)', () => {
+    const run = (f, ageMs, extra = {}) => {
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, host: 'old-name', readPidStart: () => 'start' });
+      const at = new Date(Date.now() - ageMs);
+      utimesSync(join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`), at, at);
+      return readDrainRedTeamEvidence({ ...f, host: 'new-name', isAlive: () => true, ...extra });
+    };
+    it('counts a foreign-host run with a stale record as dead', () => {
+      expect(run(fixture(), 31 * 60_000)).toMatchObject({ inFlight: false, scheduled: true });
+    });
+    it('keeps a foreign-host run with a fresh record live', () => {
+      expect(run(fixture(), 5 * 60_000).inFlight).toBe(true);
+    });
+    it('honors the stale-window setting', () => {
+      const f = fixture();
+      expect(run(f, 5 * 60_000, { env: { ...f.env, WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '60000' } }).inFlight).toBe(false);
+    });
+    it('keeps same-host behaviour: a stale record with a live pid stays live', () => {
+      const f = fixture();
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, host: 'same', readPidStart: () => 'start' });
+      const at = new Date(Date.now() - 3_600_000);
+      utimesSync(join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`), at, at);
+      expect(readDrainRedTeamEvidence({ ...f, host: 'same', isAlive: () => true, readPidStart: () => 'start' }).inFlight).toBe(true);
+    });
+  });
   it.each([
     [{ host: 'review-host' }, { host: 'drain-host' }],
     [{ host: 'same-host', namespace: 'pid:[review]' }, { host: 'same-host', namespace: 'pid:[drain]' }],

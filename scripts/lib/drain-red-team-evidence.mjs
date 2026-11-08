@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
+import { foreignHostDead } from './red-team-foreign-host-stale.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
@@ -534,7 +535,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
     let live = false;
     if (['queued', 'running'].includes(status.status)) {
-      if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
+      if (foreignHostDead(status, { host, statusAt, now, env })) live = false;
+      else if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
       else if (isAlive(status.pid)) {
         const start = status.pidStart ? readPidStart(status.pid) : null;
         live = !start || !status.pidStart || start === status.pidStart;
