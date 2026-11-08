@@ -147,6 +147,18 @@ describe('daemon heavy spawn admission lint', () => {
     const [file, args] = launchers[launcher](run);
     expect(findUngatedHeavySpawns(withFork + `spawnSync(${JSON.stringify(file)}, ${JSON.stringify(args)});`)).toHaveLength(1);
   });
+  it.each([
+    "spawnSync('env', ['--s', 'npx playwright test a']);",
+    "spawnSync('env', ['-i', 'env', '-S', 'npx playwright test a']);",
+    "spawnSync('env', ['-S', 'npx vitest\\\\c junk', 'run', 'a']);",
+    "spawnSync('npx', ['-c', 'vitest run a']);",
+    "spawnSync('npm', ['exec', '-c', 'playwright test']);",
+    "spawnSync('timeout', ['--sig', 'KILL', '5', 'npx', 'vitest', 'run']);",
+    "spawnSync('caffeinate', ['-it', '5', 'npx', 'playwright', 'test']);",
+    "spawnSync('/usr/bin/time', ['-ao', 'f', 'npx', 'vitest', 'run']);",
+  ])('rejects the round-5 wrapper spellings: %s', call => {
+    expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
+  });
   it('rejects Playwright behind launchers', () => {
     expect(findUngatedHeavySpawns(withFork + "spawnSync('nohup', ['npx', 'playwright', 'test', 'a']);")).toHaveLength(1);
     expect(findUngatedHeavySpawns(withFork + "execSync('nohup npx playwright test a');")).toHaveLength(1);

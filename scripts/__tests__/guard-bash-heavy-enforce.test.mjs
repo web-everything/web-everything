@@ -168,6 +168,27 @@ describe('heavy-enforce — every direct test run requires admission', () => {
       expect(decide(cmd, {}), cmd).toMatch(/heavy-enforce|heavy-command admission queue/);
     }
   });
+  // Self-review of round 5: the env -S prefix, a nested env carrying -S, env -S's own escapes and comments, every
+  // other peeled wrapper's value options and path-qualified names, npx's command-line option and new launchers.
+  const round5Variants = ["env --s '@'", "env --s='@'", 'env -i env -S "@"', 'env -u X env -S "@"', 'env FOO=1 env -S "@"',
+    'env env -S "@"', 'env -i nice env -S "@"', "env -S '@\\c junk'", "env -S '#x' @", "env -S '${NOPE}@'",
+    'exec -la x @', 'caffeinate -it 5 @', 'timeout --sig KILL 5 @', 'timeout --k 5 10 @', 'stdbuf --output L @',
+    'ionice --class 3 @', 'time --f x @', '/usr/bin/time @', '/usr/bin/time -ao f @', '/usr/bin/caffeinate -i @',
+    'command -pp @', 'doas -u x @', 'flock /tmp/l @', 'flock -w 5 /tmp/l -c "@"', 'watch -n 5 @', 'chrt -T 1 -P 2 -D 3 -d 0 @',
+    'npx -c "@"', 'npx --call "@"', 'npx --call="@"', 'npm exec -c "@"'];
+  it.each(round5Variants)('denies a heavy run behind `%s`', template => {
+    for (const run of ['npx vitest run a', 'npx playwright test a']) {
+      const cmd = template.replace('@', run);
+      expect(decide(cmd, {}), cmd).toMatch(/heavy-enforce|heavy-command admission queue/);
+    }
+  });
+  it.each(['bun x vitest run a', 'pnpx vitest run a', "env -S 'npx vitest\\c junk' run a"])('denies `%s`', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  it.each(['env -i env -S "echo hi"', 'npx -c "echo hi"', 'flock /tmp/l echo hi', 'env -S "echo \\c npx vitest run a"',
+    "env -S 'echo #npx vitest run a'", 'npm exec -c "echo vitest"', 'bun x eslint .', 'timeout --sig KILL 5 echo hi'])('still allows `%s`', cmd => {
+    expect(decide(cmd, {})).toBeNull();
+  });
   it.each(['env -S "-i git push --force origin main"', 'sudo -p x git push --force origin main',
     'xargs -n 1 git push --force origin main', 'nice -n 5 git push --force origin main',
     'env -S "-u X" git push --force origin main'])('the shared peel also reaches the push guard: `%s`', cmd => {

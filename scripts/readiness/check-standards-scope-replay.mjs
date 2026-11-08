@@ -47,6 +47,7 @@ import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync, lstatSync, c
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { admittedArgv } from './heavy-admission.mjs';
 import {
   findingFiles,
   GENERIC_STEM, idsForPath, MAX_LINKED_HITS_PER_ID, linkedFilesFor,
@@ -301,7 +302,11 @@ function gitGrepIn(cwd) {
  *  `/usr/bin/time -l`. Never throws — a non-zero exit is a normal "errors found" result, not a harness failure;
  *  only an unparseable/absent JSON payload is reported as an error string. */
 function runCheckStandards(worktreePath, extraArgs) {
-  const res = spawnSync('/usr/bin/time', ['-l', 'node', 'scripts/check-standards.mjs', '--json', ...extraArgs], {
+  // A full check-standards run is a heavy run: it takes a host admission slot like every other (review #6461
+  // round 5 — the spawn lint now sees through the path-qualified `/usr/bin/time`). `time` wraps only the child,
+  // so the queue wait is not in the measured time.
+  const run = admittedArgv('/usr/bin/time', ['-l', 'node', 'scripts/check-standards.mjs', '--json', ...extraArgs]);
+  const res = spawnSync(run.file, run.args, {
     cwd: worktreePath, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
   });
   const time = parseBsdTime(res.stderr);
