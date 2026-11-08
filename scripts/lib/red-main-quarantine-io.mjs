@@ -573,7 +573,7 @@ export const RERUN_MARKER_PREFIX = 'red-main-quarantine-rerun-';
  * broken sha: the claim is a per-sha marker file created exclusively BEFORE the request, so concurrent adds cannot both
  * rerun, and an unwritable claim means no rerun (fail closed). Only when the latest main CI run for that sha is
  * completed+failed. It never touches the freeze itself: a rerun that still fails leaves the freeze in place. Never
- * throws; a failed request is reported (`error`, with the manual fallback command) and the claim kept: at most one request per sha.
+ * throws; a failed request is reported (`error`, with the manual fallback command) and the claim kept: at most one logical request per sha (the shared gh throttle may retry a rate-limited call, bounded).
  * @returns {{rerun:boolean, runId?:number, reason?:string, error?:string}}
  */
 export function rerunRedMainFailedJobs({ brokenSha, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug, dir = join(tmpdir(), 'we-red-main-quarantine') } = {}) {
