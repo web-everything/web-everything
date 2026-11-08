@@ -22,6 +22,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -564,6 +565,38 @@ export function runSafetyNet({
   }
 }
 
+export const RERUN_LEDGER = 'red-main-quarantine-reruns.json';
+
+/**
+ * After a quarantine add, re-run the FAILED jobs of main's CI run for the broken sha so the merge-gate red-main-freeze
+ * can lift without a human (the freeze only lifts on a new green main run, and nothing can merge to make one). Once per
+ * broken sha (recorded in `dir`), and only when the latest main CI run for that sha is completed+failed. It never
+ * touches the freeze itself: a rerun that still fails leaves the freeze in place. Never throws; a failure is reported
+ * (`error`) and not recorded, so the next add retries.
+ * @returns {{rerun:boolean, runId?:number, reason?:string, error?:string}}
+ */
+export function rerunRedMainFailedJobs({ brokenSha, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug, dir = join(tmpdir(), 'we-red-main-quarantine') } = {}) {
+  if (!/^[0-9a-f]{7,40}$/i.test(String(brokenSha ?? ''))) return { rerun: false, reason: 'no-broken-sha' };
+  const ledgerPath = join(dir, RERUN_LEDGER);
+  const ledger = readJson(ledgerPath) ?? { version: 1, reruns: {} };
+  ledger.reruns ??= {};
+  if (ledger.reruns[brokenSha]) return { rerun: false, reason: 'already-rerun', runId: ledger.reruns[brokenSha].runId };
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' };
+  try {
+    const runs = JSON.parse(String(exec('gh', ['run', 'list', '--repo', repoSlug, '--workflow', 'ci.yml', '--branch', 'main', '--limit', '30', '--json', 'databaseId,headSha,status,conclusion,createdAt'], opts) || '[]'));
+    const mine = (Array.isArray(runs) ? runs : []).filter((r) => r?.headSha === brokenSha || String(r?.headSha ?? '').startsWith(brokenSha));
+    const latest = mine.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.databaseId - a.databaseId)[0];
+    if (!latest) return { rerun: false, reason: 'no-run-for-sha' };
+    if (latest.status !== 'completed' || latest.conclusion !== 'failure') return { rerun: false, reason: 'latest-run-not-failed', runId: latest.databaseId };
+    exec('gh', ['run', 'rerun', String(latest.databaseId), '--repo', repoSlug, '--failed'], opts);
+    ledger.reruns[brokenSha] = { runId: latest.databaseId, at: new Date().toISOString() };
+    try { mkdirSync(dir, { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort: a lost record only risks one more rerun request */ }
+    return { rerun: true, runId: latest.databaseId };
+  } catch (e) {
+    return { rerun: false, error: String(e?.message || e).split('\n')[0] };
+  }
+}
+
 function flagsOf(argv) {
   const f = {};
   for (const a of argv) { if (!a.startsWith('--')) continue; const i = a.indexOf('='); if (i < 0) f[a.slice(2)] = true; else f[a.slice(2, i)] = a.slice(i + 1); }
@@ -604,7 +637,8 @@ function cli(argv) {
       actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(f['broken-sha']).slice(0, 9)}, by ${f.actor})`,
       change: (cur) => addEntries(cur, { tests, brokenSha: f['broken-sha'], owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
     });
-    writeAllSync(1, JSON.stringify(out) + '\n');
+    const rerun = out?.ok === false ? undefined : rerunRedMainFailedJobs({ brokenSha: f['broken-sha'], ...(f.dir ? { dir: f.dir } : {}) });
+    writeAllSync(1, JSON.stringify(rerun ? { ...out, rerun } : out) + '\n');
     return;
   }
   if (cmd === 'prune') {
