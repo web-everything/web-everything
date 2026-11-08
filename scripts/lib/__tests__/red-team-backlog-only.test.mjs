@@ -24,6 +24,9 @@ describe('backlog-only prep', () => {
     ['uppercase marker name', marker().replace('prep-review-verdict', 'PREP-REVIEW-VERDICT')],
     ['malformed other head', marker('b'.repeat(40)).replace(' head=', '  head=')],
     ['bare marker name', 'prep-review-verdict'],
+    ['HTML closing token and findings on one line', '<!-- quoted\n--> ' + marker().replace('verdict=clean', 'verdict=findings')],
+    ['multiline backtick closing token and findings on one line', '`quoted\n` ' + marker().replace('verdict=clean', 'verdict=findings')],
+    ['inline backticks around an exact marker', '`' + marker() + '`'],
   ])('R752: holds after older clean evidence followed by trusted %s evidence', (_name, malformed) => {
     for (const body of [malformed, marker() + '\n' + malformed, malformed + '\n' + marker()]) {
       const comments = [note(), { ...note(), body }];
@@ -57,12 +60,12 @@ describe('backlog-only prep', () => {
     ['enclosing HTML comment', '<!-- quoted example\n' + marker() + '\n-->'],
     ['HTML comment opened mid-line', 'Example: <!--\n' + marker() + '\n-->'],
     ['unclosed enclosing HTML comment', '<!-- quoted example\n' + marker()],
-  ])('quoted markers cannot clear the gate: %s', (_name, body) => {
+  ])('reads exact marker lines without inline-code or HTML-comment parsing: %s', (_name, body) => {
     const comments = [{ ...note(), body }];
-    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(false);
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(true);
     const f = fixture({ readComments: () => comments });
-    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
-    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('clear');
+    expect(f.post).toHaveBeenCalledOnce(); expect(f.syncLabels).toHaveBeenCalledOnce();
   });
   it.each([
     ['inline code', '`\n' + marker() + '\n`'],
@@ -257,11 +260,12 @@ describe('backlog-only prep', () => {
     expect(runBacklogOnlyPrep(f)[0].action).not.toBe('clear');
     expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
   });
-  it.each(['```', '~~~'])('accepts real prep proof after a %s fenced fake marker for another head', fence => {
+  it.each(['```', '~~~'])('holds despite real prep proof after a %s fenced marker for another head', fence => {
     const comments = [{ ...note(), body: `${fence}\n${note('b'.repeat(40), true).body}\n${fence}\n${note().body}` }];
-    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(true);
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(false);
     const f = fixture({ readComments: () => comments });
-    expect(runBacklogOnlyPrep(f)[0].action).toBe('clear');
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
   });
   it.each([
     ['moved head', { headRefOid: 'b'.repeat(40), labels: evidence().labels }],

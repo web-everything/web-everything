@@ -282,43 +282,27 @@ export function latestPrepVerdict(comments, head) {
   for (const comment of comments) {
     if (!isTrustedMarkerAuthor(comment)) continue;
     if (typeof comment?.body !== 'string') return null;
-    let fence = null, malformed = false, inlineTicks = null, inComment = false;
+    let fence = null, malformed = false;
     const markers = new Set();
     let verdict = null;
     for (const line of comment.body.split(/\r?\n/)) {
+      const mentionsVerdict = /prep-review-verdict/i.test(line);
+      if (mentionsVerdict) {
+        const match = /^<!-- prep-review-verdict head=([0-9a-f]{40}) verdict=(clean|findings) v=1 -->$/.exec(line);
+        if (!match || fence) malformed = true;
+        if (match) {
+          markers.add(line);
+          if (match[1] === head) verdict = match[2];
+        }
+      }
       const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
       if (fence) {
         if (delimiter && delimiter[1][0] === fence.ch && delimiter[1].length >= fence.len
           && delimiter[2].trim() === '') fence = null;
-        continue;
-      }
-      if (delimiter && inlineTicks === null && !inComment) {
-        // A backtick in a backtick fence's info string is ambiguous: refuse the comment.
-        if (delimiter[1][0] === '`' && delimiter[2].includes('`')) { malformed = true; break; }
-        fence = { ch: delimiter[1][0], len: delimiter[1].length };
-        continue;
-      }
-      // Only a line starting outside quoted contexts can supply evidence. Track spans
-      // across lines, using equal-length backtick runs; HTML delimiters inside code
-      // (and backticks inside HTML comments) do not change the enclosing context.
-      if (inlineTicks === null && !inComment) {
-        const match = /^<!-- prep-review-verdict head=([0-9a-f]{40}) verdict=(clean|findings) v=1 -->$/.exec(line);
-        if (match) {
-          markers.add(line);
-          if (match[1] === head) verdict = match[2];
-        } else if (/prep-review-verdict/i.test(line)) malformed = true;
-      }
-      for (const [token] of line.matchAll(/<!--|-->|`+/g)) {
-        if (inComment) {
-          if (token === '-->') inComment = false;
-        } else if (inlineTicks !== null) {
-          if (token[0] === '`' && token.length === inlineTicks) inlineTicks = null;
-        } else if (token === '<!--') inComment = true;
-        else if (token[0] === '`') inlineTicks = token.length;
-      }
+      } else if (delimiter) fence = { ch: delimiter[1][0], len: delimiter[1].length };
     }
-    if (malformed || fence || inlineTicks !== null || inComment) latest = null;
-    else if (verdict !== null) latest = markers.size === 1 ? verdict : null;
+    if (malformed || markers.size > 1 || (fence && /prep-review-verdict/i.test(comment.body))) latest = null;
+    else if (verdict !== null) latest = verdict;
   }
   return latest;
 }
