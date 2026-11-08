@@ -149,6 +149,31 @@ describe('egress table readiness', () => {
     probeResult = result;
     await expect(makeRunner().prepare({nonce, label: 'abcdef-1'})).rejects.toMatchObject({code: 'egress-table-absent'});
   });
+  // The fixed warmer invokes warm-install directly (no prepare/run), and npm ci there launches as the slot user.
+  it.each([
+    ['absent table', () => ({code: 1})],
+    ['hung (timeout)', () => ({code: null, timedOut: true})],
+    ['unexecutable nft', () => { throw Object.assign(new Error('spawn'), {code: 'ENOENT'}); }],
+  ])('egress readiness: warm-install refuses with egress-table-absent on %s before npm ci or any slot work', async (_name, result) => {
+    probeResult = result;
+    const source = join(root, 'warm-source');
+    await mkdir(source);
+    await writeFile(join(source, 'package-lock.json'), 'lock');
+    const manifest = manifestAPI.manifestWire({entries: [{path: Buffer.from('package-lock.json'), sha256: hash('lock'), executable: false}], excluded: []});
+    await expect(makeRunner().warmInstall(source, manifest)).rejects.toMatchObject({code: 'egress-table-absent'});
+    expect(probeCalls).toBe(1);
+    expect(await ran()).toBe(false);
+    await expect(readFile(join(root, 'runs'), 'utf8')).rejects.toMatchObject({code: expect.stringMatching(/ENOENT|EISDIR/)});
+    await expect(readFile(join(root, 'cache'), 'utf8')).rejects.toMatchObject({code: expect.stringMatching(/ENOENT|EISDIR/)});
+  });
+  it('egress readiness: warm-install ignores test probes without testRoot and uses the production nft probe', async () => {
+    const injected = {testEgressProbe: vi.fn(() => ({code: 0})), testExecute: vi.fn(() => ({code: 0}))};
+    nftStub.code = 1;
+    const before = children.length;
+    await expect(createRunner(injected).warmInstall(join(root, 'none'), {})).rejects.toMatchObject({code: 'egress-table-absent'});
+    for (const callback of Object.values(injected)) expect(callback).not.toHaveBeenCalled();
+    expect(children.slice(before).filter(c => c.file === '/usr/sbin/nft')).toHaveLength(1);
+  });
   it('egress readiness: a zero exit lets the run proceed', async () => {
     const runner = makeRunner(), request = await requestFor(runner);
     expect((await runner.run(request)).code).toBe(0);

@@ -1241,6 +1241,8 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     },
     // Called by the fixed warmer; the privileged CLI restricts its source root.
     async warmInstall(source,manifest) {
+      // npm ci below runs as the slot user, so the firewall must be present; checked before any side effect.
+      await requireEgressTable();
       await init();
       const run='warm-'+randomBytes(16).toString('hex'),nonce=randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce),record={run,nonce,...(worker.active?{slot:worker.user}:{})};
