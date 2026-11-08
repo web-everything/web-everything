@@ -129,6 +129,7 @@ describe('the model part is schema-checked and cannot invent', () => {
       findingsAddressed: [{ ref: 'fail-closed', disposition: 'deferred', note: 'line1\n```x```' }, { ref: 'made-up', disposition: 'deferred', note: 'n' }],
     });
     expect(r.ok).toBe(true);
+    expect(r).toMatchObject({ modelOutcome: 'blocked', modelBlocker: { kind: 'spec-defect' }, droppedFindings: true });
     expect(r.findings).toEqual([{ ref: 'fail-closed', note: 'line1 x' }]);
   });
   it('the final result validates as a review worker-result: clean = done, any finding = blocked spec-defect', () => {
@@ -873,6 +874,50 @@ describe('structured prep verdicts', () => {
     await reviewPreparePr(prepPr(), deps);
     expect(latestPrepVerdict([{ ...bot, body: calls.comments[0].b }], head)).toBe(findings ? 'findings' : 'clean');
   });
+  const blockedModel = refs => ({
+    ...cleanModel, outcome: 'blocked',
+    blocker: { kind: 'spec-defect', component: 'prepared card', evidence: { text: 'incomplete', refs: [] },
+      proposedFix: null, ruling: null, deniedCommand: null, retryable: true },
+    findingsAddressed: refs.map(ref => ({ ref, disposition: 'deferred', note: 'missing handling' })),
+  });
+  it.each([
+    ['blocked model with an unknown ref', blockedModel(['made-up']), false],
+    ['blocked model with zero findings', blockedModel([]), false],
+    ['unreadable already-on-main check with a clean model', cleanModel, true],
+    ['unknown ref alongside a known finding', blockedModel(['made-up', 'fail-closed']), false],
+    ['done model with a dropped ref', { ...cleanModel, findingsAddressed: blockedModel(['made-up']).findingsAddressed }, false],
+  ])('R752: %s never clears backlog-only admission', async (_name, value, unreadableHistory) => {
+    expect(validateWorkerResult(value, { role: 'review' }).ok).toBe(true);
+    const { deps, calls } = mkDeps({ judge: async () => ({ value }),
+      ...(unreadableHistory ? { checkAlreadyDone: async () => { throw new Error('history unavailable'); } } : {}),
+    });
+    const out = await reviewPreparePr(prepPr(), deps);
+    expect(out).toMatchObject({ reviewed: true, posted: true, round: 1, addLabels: ['review:prep'] });
+    expect(calls.comments).toHaveLength(1);
+    const body = calls.comments[0].b;
+    expect(body).not.toContain(marker('clean'));
+    if (unreadableHistory) expect(body).toContain('Not checked: already on main');
+    const comments = [{ ...bot, body }];
+    expect(latestPrepVerdict(comments, head)).toBe(value.findingsAddressed.some(f => f.ref === 'fail-closed') ? 'findings' : null);
+    expect(backlogOnlyPrepClear({ enabled: true, head, comments,
+      files: [{ filename: 'backlog/4382-some-card.md', status: 'modified' }],
+      labels: ['review:prep', 'red-team:pending'],
+    })).toEqual({ ok: false, why: 'no unambiguous clean newest trusted prep marker for head' });
+  });
+  const healthyEvidence = { modelUsable: true, modelOutcome: 'done', modelBlocker: null, droppedFindings: false };
+  it.each([
+    ['model outcome missing', { modelOutcome: undefined }],
+    ['model outcome blocked', { modelOutcome: 'blocked' }],
+    ['model blocker present', { modelBlocker: { kind: 'spec-defect' } }],
+    ['model blocker unreadable', { modelBlocker: undefined }],
+    ['dropped refs', { droppedFindings: true }],
+    ['dropped-ref evidence missing', { droppedFindings: undefined }],
+    ['deterministic check incomplete', { notChecked: ['already on main'] }],
+    ['deterministic outcome blocked', { result: { ...cleanModel, outcome: 'blocked' } }],
+  ])('R752: planner refuses clean with %s', (_name, incomplete) => {
+    expect(planPrepReview({ mode: 'advise', head, result: cleanModel, ...healthyEvidence, ...incomplete }).body)
+      .not.toContain('prep-review-verdict');
+  });
   it('R752: the label-repair stub never creates verdict evidence for a legacy note', async () => {
     const body = `<!-- prep-review: head=${head} round=1 -->\nLegacy note without a structured verdict`;
     const judge = vi.fn();
@@ -885,11 +930,11 @@ describe('structured prep verdicts', () => {
     expect(latestPrepVerdict([{ ...bot, body }], head)).toBeNull();
   });
   it.each([false, undefined])('R752: planner requires explicit usable model evidence (%s)', modelUsable => {
-    expect(planPrepReview({ mode: 'advise', head, result: cleanModel, modelUsable }).body).not.toContain('prep-review-verdict');
+    expect(planPrepReview({ mode: 'advise', head, result: cleanModel, ...healthyEvidence, modelUsable }).body).not.toContain('prep-review-verdict');
   });
   it.each(['clean', 'findings'])('writes and reads the %s marker immediately after the unchanged round marker', verdict => {
-    const result = { ...cleanModel, outcome: verdict === 'clean' ? 'done' : 'blocked' };
-    const plan = planPrepReview({ mode: 'advise', head, result, modelUsable: true });
+    const result = verdict === 'clean' ? cleanModel : blockedModel(['fail-closed']);
+    const plan = planPrepReview({ mode: 'advise', head, result, ...healthyEvidence });
     expect(prepVerdictMarker({ head, verdict })).toBe(marker(verdict));
     expect(plan.body.split('\n').slice(0, 2)).toEqual([
       `<!-- prep-review: head=${head} round=1 -->`, marker(verdict),
@@ -898,7 +943,7 @@ describe('structured prep verdicts', () => {
   });
   it.each(['a'.repeat(7), 'a'.repeat(12), 'a'.repeat(39), 'a'.repeat(41), 'A'.repeat(40), head + '\n'])('omits the verdict stamp for invalid full head %j', head => {
     expect(prepVerdictMarker({ head, verdict: 'clean' })).toBeNull();
-    expect(planPrepReview({ mode: 'advise', head, result: cleanModel, modelUsable: true }).body).not.toContain('prep-review-verdict');
+    expect(planPrepReview({ mode: 'advise', head, result: cleanModel, ...healthyEvidence }).body).not.toContain('prep-review-verdict');
     expect(latestPrepVerdict([{ ...bot, body: marker('clean') }], head)).toBeNull();
   });
   it('rejects invalid verdicts and unreadable evidence', () => {

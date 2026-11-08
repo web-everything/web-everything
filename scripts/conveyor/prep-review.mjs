@@ -225,7 +225,8 @@ export function buildPrepReviewInput({ raw }) {
 
 /**
  * Read the model's answer as a worker-result. Fail closed: a bad shape gives `{ok:false, problems}` and no findings
- * are taken from it. A finding whose ref is not one of the seven class ids is dropped (the model may not invent refs).
+ * are taken from it. Unknown refs are dropped and recorded; the model's own outcome and blocker remain evidence
+ * for the structured verdict even when none of its findings can be used.
  */
 export function readModelFindings(value) {
   const checked = validateWorkerResult(value, { role: 'review' });
@@ -234,7 +235,9 @@ export function readModelFindings(value) {
   const findings = checked.result.findingsAddressed
     .filter((f) => known.has(f.ref))
     .map((f) => ({ ref: f.ref, note: foldOneLine(f.note, 300) }));
-  return { ok: true, problems: [], findings };
+  return { ok: true, problems: [], findings,
+    modelOutcome: checked.result.outcome, modelBlocker: checked.result.blocker,
+    droppedFindings: findings.length !== checked.result.findingsAddressed.length };
 }
 
 /**
@@ -358,7 +361,8 @@ export function lostBlockHold({ mode, names, prior, head }) {
  * Decide what to write. Pure. `null` when this head is already reviewed, carries its label and holds nothing stale.
  * @returns {null | {round:number, body:string|null, addLabels:string[], removeLabels:string[]}}
  */
-export function planPrepReview({ mode, head, result, notChecked = [], modelNote = null, modelUsable = false, comments = [], labels = [] }) {
+export function planPrepReview({ mode, head, result, notChecked = [], modelNote = null, modelUsable = false,
+  modelOutcome, modelBlocker, droppedFindings, comments = [], labels = [] }) {
   if (!PREP_REVIEW_MODES.includes(mode) || mode === 'off') return null;
   const names = labelNames(labels);
   const prior = priorPrepReviews(comments);
@@ -376,9 +380,13 @@ export function planPrepReview({ mode, head, result, notChecked = [], modelNote 
   // Round two never inherits round one's hold: it is advice only, so the hold the stage applied earlier is lifted.
   const removeLabels = staleBlockHold({ names, prior, head }) ? ['review:changes'] : [];
   if (sameHead) return addLabels.length || removeLabels.length ? { round, body: null, addLabels, removeLabels } : null; // label repair only
+  // Clean is an allow-list: a reconstructed done result alone cannot prove that every check completed.
+  const clean = modelUsable === true && modelOutcome === 'done' && modelBlocker === null
+    && droppedFindings === false && notChecked.length === 0 && result.outcome === 'done' && findings.length === 0;
+  const verdict = findings.length > 0 ? 'findings' : clean ? 'clean' : null;
   const lines = [
     markerLine({ head, round, blocked: addLabels.includes('review:changes') }),
-    ...(modelUsable === true ? [prepVerdictMarker({ head, verdict: result.outcome === 'done' ? 'clean' : 'findings' })].filter(Boolean) : []),
+    ...[prepVerdictMarker({ head, verdict })].filter(Boolean),
     PREP_REVIEW_HEADLINE, '',
     `Mode: **${mode}**${mode === 'advise' ? ' (advice only; this never blocks the merge)' : round <= PREP_REVIEW_MAX_BLOCK_ROUNDS ? ' (one fix round for the preparer)' : ' (the one fix round is spent; advice only)'}. Round ${round}. Card head \`${head.slice(0, 12)}\`.`,
     '', `**Verdict: ${result.outcome === 'done' ? 'clean' : 'findings'}** - ${result.summary}`, '',
@@ -457,7 +465,9 @@ export async function reviewPreparePr(pr, deps) {
     }
   }
   const result = buildPrepReviewResult({ deterministic, model });
-  const plan = planPrepReview({ mode, head, result, notChecked: deterministic.notChecked, modelNote, modelUsable, comments: pr.comments, labels });
+  const plan = planPrepReview({ mode, head, result, notChecked: deterministic.notChecked, modelNote, modelUsable,
+    modelOutcome: model.modelOutcome, modelBlocker: model.modelBlocker, droppedFindings: model.droppedFindings,
+    comments: pr.comments, labels });
   if (!plan) return { skipped: 'already-reviewed' };
   const out = { reviewed: true, outcome: result.outcome, findings: result.findingsAddressed.map((f) => f.ref), addLabels: plan.addLabels, removeLabels: [...(lifted ? ['review:changes'] : []), ...plan.removeLabels], posted: plan.body !== null, round: plan.round, body: plan.body ?? undefined };
   if (dryRun) return out;
