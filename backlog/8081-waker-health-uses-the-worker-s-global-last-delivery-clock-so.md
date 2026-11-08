@@ -3,6 +3,7 @@ bornAs: xbx8fn2
 kind: story
 size: 3
 status: open
+related: ["4282"]
 scope: ["we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/lib/pr-events.mjs"]
 dateOpened: "2026-11-07"
 tags: []

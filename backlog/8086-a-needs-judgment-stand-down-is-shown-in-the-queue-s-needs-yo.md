@@ -3,6 +3,7 @@ bornAs: xqku0oj
 kind: story
 size: 3
 status: open
+related: ["6291"]
 scope: ["we:scripts/operations/operator-queue.mjs", "we:scripts/operations/needs-you-feed.mjs"]
 dateOpened: "2026-11-07"
 tags: []

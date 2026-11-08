@@ -3,6 +3,7 @@ bornAs: x1ty8wp
 kind: story
 size: 3
 status: open
+related: ["4392"]
 scope: ["we:scripts/operations/needs-you-feed.mjs", "we:scripts/conveyor/reconcile-note-comment.mjs"]
 dateOpened: "2026-11-07"
 tags: []
