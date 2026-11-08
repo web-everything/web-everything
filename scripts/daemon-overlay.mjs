@@ -114,7 +114,7 @@ import {
   addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
   readOverrideViewerLogin, registrationIdentity,
 } from './lib/daemon-overlays.mjs';
-import { planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
+import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
@@ -230,7 +230,7 @@ export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
 }
 
 /** Run `fn(git, scratch)` in a scratch bare repo that borrows root's objects and fetches `refspecs` from root's origin. */
-function withScratchFetch({ root, refspecs, env, run, prefix }, fn) {
+function withScratchFetch({ root, refspecs, optionalRefspecs = [], env, run, prefix }, fn) {
   const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } });
   const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts(root));
   const common = run('git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'], opts(root));
@@ -242,6 +242,9 @@ function withScratchFetch({ root, refspecs, env, run, prefix }, fn) {
     writeFileSync(join(scratch, 'objects', 'info', 'alternates'), `${join(String(common.stdout).trim(), 'objects')}\n`, 'utf8');
     const fetched = run('git', ['fetch', '--no-tags', '-q', String(url.stdout).trim(), ...refspecs], opts(scratch));
     if (fetched?.status !== 0) return { ok: false, reason: 'fetch-failed' };
+    // Optional refs are fetched one at a time and their absence is tolerated: a missing optional ref must never turn a
+    // fetch that would have succeeded into `fetch-failed`. Callers see the ref as unresolved and fall back.
+    for (const spec of optionalRefspecs) run('git', ['fetch', '--no-tags', '-q', String(url.stdout).trim(), spec], opts(scratch));
     const git = (args) => { const r = run('git', args, opts(scratch)); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
     return fn(git);
   } finally {
@@ -287,12 +290,17 @@ function retirementGitHub({ root, env, run }) {
  * @returns {{ref:string, action:'retire'|'keep', reason:string, tip?:string, evidence?:object}}
  */
 export function proveRetirement({ root, entry, env = process.env, run = spawnSync }) {
+  const base = mergeRefBase(entry.ref);
+  const baseEntry = base ? readOverlays(root, { env }).find((row) => row.ref === base) : null;
+  const rows = baseEntry ? [entry, baseEntry] : [entry];
   const result = withScratchFetch({
     root, env, run, prefix: 'we-daemon-overlay-retire-',
     refspecs: ['+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`],
+    // The base is likely merged and deleted on origin; its absence must not fail the entry's own proof.
+    optionalRefspecs: baseEntry ? [`+refs/heads/${baseEntry.ref}:refs/remotes/origin/${baseEntry.ref}`] : [],
   }, (git) => {
     const { gh, repo } = retirementGitHub({ root, env, run });
-    return planRetirements({ rows: [entry], git, gh, repo })[0];
+    return planRetirements({ rows, git, gh, repo })[0];
   });
   if (result?.action === 'retire') return result;
   // Only a branch that is GONE from origin can have been squash-merged and deleted; anything else stays as proved above.
