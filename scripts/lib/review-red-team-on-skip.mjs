@@ -4,6 +4,7 @@ import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
+import { expireStuckReferralRuns as expireReferralRuns } from './stuck-referral-expiry.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
@@ -253,14 +254,17 @@ export function cardOnlySkipSettlementCandidate(evidence, head) {
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/review-red-team-on-skip.json') } = {}) {
   let tool;
-  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin }; } catch { /* lower layers */ }
+  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin, referralRunExpiryHours: data.referralRunExpiryHours }; } catch { /* lower layers */ }
   const raw = env.WE_REVIEW_RED_TEAM_ON_SKIP;
   const cooldown = env.WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN;
+  const expiry = env.WE_REVIEW_RED_TEAM_ON_SKIP_REFERRAL_RUN_EXPIRY_HOURS;
   return cascadePolicy('reviewRedTeamOnSkip', tool, {
-    env, log, standard: { enabled: true, retryCooldownMin: 30 },
+    env, log, standard: { enabled: true, retryCooldownMin: 30, referralRunExpiryHours: 4 },
     envValues: { enabled: raw === '0' ? false : raw === '1' ? true : raw || undefined,
-      retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined },
-    valid: { enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0 },
+      retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined,
+      referralRunExpiryHours: typeof expiry === 'string' && /^\d+$/.test(expiry) ? Number(expiry) : expiry || undefined },
+    valid: { enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0,
+      referralRunExpiryHours: v => Number.isSafeInteger(v) && v >= 0 },
   });
 }
 
@@ -643,13 +647,16 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     if (error) throw Error(error);
     return result;
   },
+  expireStuckReferralRuns = options => isUnderTest() || isUnderTest(env) ? { expired: false } : expireReferralRuns(options),
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels } = {}) {
   const rows = [], dispatched = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
     const at = now();
-    const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
+    const resolvedSetting = setting ? { value: setting, sources: { referralRunExpiryHours: 'injected' } }
+      : resolveReviewRedTeamOnSkip({ env, log: note });
+    const resolved = resolvedSetting.value;
     const refusals = plan?.refusals ?? [];
     // Reconcile rows omit formal reviews. Read recovery candidates, including unaccepted not-owed heads,
     // once per PR, without mutating the daemon's shared snapshot. Failed/oversized
@@ -692,6 +699,14 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       } catch (error) { row.settleError = safeErrorText(error); }
     };
     const holdUnfinishedReview = row => {
+      try {
+        const result = expireStuckReferralRuns({ repo, pr: row.prNumber, head: row.head, setting: resolvedSetting, env, now: now(), log: note });
+        if (result?.expired) {
+          row.action = 'skip'; row.why = 'referral-run-expired';
+          delete row.escalate; delete row.escalationContext; delete row.settle;
+          return;
+        }
+      } catch { /* Unknown evidence retains the human escalation. */ }
       row.action = 'skip'; row.why = 'review-unfinished'; row.escalate = true;
       row.escalationContext = UNFINISHED_REVIEW_CONTEXT;
       delete row.settle;
@@ -737,7 +752,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         try {
           const key = { repo, pr: row.prNumber, head: row.head };
           if (row.escalate) {
-            escalateRow(row);
+            if (row.why === 'review-unfinished') holdUnfinishedReview(row);
+            else escalateRow(row);
           } else if (row.settle === 'not-owed') {
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {

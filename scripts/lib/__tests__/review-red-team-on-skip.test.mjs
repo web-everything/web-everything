@@ -734,7 +734,7 @@ describe('planRedTeamOnSkip', () => {
 describe('settings cascade', () => {
   it('loads the default tool settings from the filesystem under Vite', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' } });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30 });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, referralRunExpiryHours: 4 });
     expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool' });
   });
   it('environment disables recovery and logs its source', () => {
@@ -748,7 +748,7 @@ describe('settings cascade', () => {
   it('malformed tool and environment values retain lower layers', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_REVIEW_RED_TEAM_ON_SKIP: 'garbage', WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN: '-1', WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' },
       readFile: () => '{"enabled":"bad","retryCooldownMin":-1}' });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30 });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, referralRunExpiryHours: 4 });
   });
 });
 

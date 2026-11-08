@@ -1,4 +1,5 @@
 /** GitHub/file observations for judge-sweep-facts. No GitHub mutations or agent dispatches. */
+import { findSuspendedReferralRuns } from '../lib/stuck-referral-expiry.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -178,6 +179,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
   readLedgerRows = readRows, readFixRows = readFixLoopRows,
   readJobs = () => parseLiveJobs(exec('ps', ['-axo', 'pid,etime,command'], {
     encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024 })),
+  findSuspendedRuns = findSuspendedReferralRuns,
   readComments = defaultListPrComments, cache = createShapeCache(),
   shape = (files, humanSurfaces) => JSON.parse(exec(process.execPath, [join(rootDir(), 'scripts/review-core-cli.mjs'), 'shape', '--json'], {
     // JSON stdin preserves commas, whitespace and shell syntax in filenames.
@@ -280,6 +282,12 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         fixerRunning: errors.includes('live jobs unreadable') || unscopedWorker ? null : fixerRunning,
         owner: (errors.includes('live jobs unreadable') || unscopedWorker) && !owner ? 'unknown' : owner,
         inCi, evidenceErrors, verdictHistory: [] };
+      result.suspendedReferralRun = null;
+      try {
+        const runs = findSuspendedRuns({ repo, pr: p.number, head: headSha, now: start });
+        const run = runs.sort((a, b) => b.ageMs - a.ageMs)[0];
+        if (run) result.suspendedReferralRun = { runId: run.id, ageHours: run.ageMs / 3600000 };
+      } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
       // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
       const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));
       try {
