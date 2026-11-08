@@ -1828,11 +1828,11 @@ export async function speculateRedTeam({
     if (record && post) {
       // Publish-first (#6535): the round starts only once its in_progress check is posted, so CI can never pass
       // an older success while this round runs unseen. Fail closed; the next tick retries.
-      let published = { published: true };
-      try { published = io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }) ?? published; }
+      let published;
+      try { published = io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
       catch (e) { published = { published: false, reason: String(e?.message ?? e) }; }
-      if (published?.published === false) {
-        const reason = `red-team round not started: in_progress check not posted (${String(published.reason ?? 'publication failed').slice(0, 300)}); retried next tick`;
+      if (published?.published !== true) {
+        const reason = `red-team round not started: in_progress check not posted (${String(published?.reason ?? 'publication not confirmed').slice(0, 300)}); retried next tick`;
         io.log(reason);
         try { io.releaseCalls?.({ provider, callIds: [callId] }); } catch (e) { io.log(`red-team reservation release failed: ${e.message}`); }
         return { status: 'skipped', deferredByGuard: true, reason };
@@ -2077,6 +2077,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
         evidence: { scheduled: true, inFlight: input.status === 'running', recorded: input.result === 'ran' }, env, log: base.log }); }
       catch (e) { base.log(`red-team status labels: ${e.message}`); }
+      return outcome;
     },
     readHeadMessage: (dir) => {
       const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B'], { encoding: 'utf8', timeout: 20_000 });

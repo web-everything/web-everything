@@ -1730,6 +1730,20 @@ describe('#6535 publish-first: a red-team round starts only after its in_progres
     expect(pass.status).toBe('skipped');
     expect(pass.reason).toMatch(/disk full/);
   });
+  it('does not start the round when the writer returns nothing (unconfirmed publication fails closed)', async () => {
+    const { io, order } = rig(() => undefined);
+    const pass = await spec(io);
+    expect(order).toEqual([['status', 'running']]);
+    expect(pass.status).toBe('skipped');
+    expect(pass.reason).toMatch(/publication not confirmed/);
+  });
+  it('releases the reserved call when the writer throws', async () => {
+    const released = [];
+    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex', redTeamStatus: () => { throw new Error('boom'); },
+      releaseCalls: o => released.push(o) });
+    await spec(io);
+    expect(released).toHaveLength(1);
+  });
   it('the real io wrapper refuses a running status whose publication failed', () => {
     const recordStatus = vi.fn(() => ({ published: false, reason: 'outage' }));
     const io = createRedTeamIo({ env: {}, recordStatus });
