@@ -31,7 +31,7 @@
  * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
  * Actions integration-id restriction (`--print-ruleset`).
  */
-import { readRedTeamCheckFact, readRedTeamGateSource } from './lib/red-team-check-run.mjs';
+import { readRedTeamCheckFact, readRedTeamGateSource, readRedTeamPublicationHoldFact } from './lib/red-team-check-run.mjs';
 import { readRedTeamPublicationHold } from './lib/drain-red-team-evidence.mjs';
 import { runGhSync } from './lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
@@ -182,10 +182,19 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
     : readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID,
       gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
-  // A durable local publication hold outranks any published check: a failed publication can leave an older
-  // success on GitHub. Read it AFTER the check, so a writer that starts mid-read is still seen. Writers store
-  // the canonical lowercase slug, while `--repo` is case-insensitive to gh, so both spellings are read.
-  // On a host without the drain's status store (CI) the hold is absent and this is a no-op.
+  // A failed publication can leave an older success on GitHub. Two holds outrank it, both read AFTER the check, so
+  // a writer that sets one mid-read is still seen:
+  // 1. The GitHub-visible hold: a head-bound `red-team/publication` commit status the writer posts when its check
+  //    post and failure supersede both fail. Every host reads it, including the GitHub-hosted PR and merge_group
+  //    legs. Unreadable or incomplete fails closed.
+  // 2. The drain-local `.unpublished` marker, which also covers a total GitHub write outage (when nothing remote can
+  //    be written). Only the drain host has it; elsewhere it is absent. Writers store the canonical lowercase slug,
+  //    while `--repo` is case-insensitive to gh, so both spellings are read.
+  if (facts.redTeamGateSource !== 'drain-scan' && !pin.error && facts.redTeamCheck.ok) {
+    const remoteHold = readRedTeamPublicationHoldFact({ repo, headSha: pin.sha,
+      gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
+    if (!remoteHold.ok) facts.redTeamCheck = remoteHold;
+  }
   if (facts.redTeamGateSource !== 'drain-scan' && !pin.error) {
     const hold = [...new Set([repo, String(repo).toLowerCase()])]
       .map(slug => readRedTeamPublicationHold({ repo: slug, pr: num, head: pin.sha, env })).find(Boolean);

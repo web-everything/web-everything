@@ -68,6 +68,43 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
   } catch (error) { return failure(`red-team check publication failed: ${message(error)}`); }
 }
 
+/** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a
+ * second channel beside the check-runs API. The drain posts it when a red-team transition AND its failure supersede
+ * both fail to publish, and posts `success` on the same context once publication is confirmed. Any CI host reads it,
+ * so an older red-team success never passes there while the hold is set. A head-bound status cannot wedge a later
+ * head. If every GitHub write fails, nothing remote can be written: only the drain-local hold binds then. */
+export const RED_TEAM_PUBLICATION_CONTEXT = 'red-team/publication';
+
+export function postRedTeamPublicationHold({ repo, headSha, held, reason = '', gh = runGhSync } = {}) {
+  try {
+    if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid red-team publication hold identity');
+    const description = String(held ? `held: ${reason || 'red-team round not confirmed published'}` : 'red-team publication confirmed')
+      .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 140);
+    gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
+      { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context: RED_TEAM_PUBLICATION_CONTEXT, description }) });
+    return { ok: true };
+  } catch (error) { return failure(`red-team publication hold not posted: ${message(error)}`); }
+}
+
+/** The combined status carries the newest status per context. Absent = no hold; any other state, or an
+ * incomplete or unreadable read, holds. */
+export function evaluateRedTeamPublicationHold({ combined } = {}) {
+  const statuses = combined?.statuses;
+  if (!Array.isArray(statuses) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== statuses.length)
+    return failure('red-team publication hold unreadable or incomplete; operator must inspect commit statuses');
+  const hold = statuses.find(status => status?.context === RED_TEAM_PUBLICATION_CONTEXT);
+  if (!hold) return { ok: true, reason: 'no red-team publication hold on head' };
+  if (hold.state === 'success') return { ok: true, reason: 'red-team publication hold cleared on head' };
+  return failure(`red-team round not confirmed published (GitHub-visible hold, ${message(hold.state)}); retry check publication before enqueue`);
+}
+
+export function readRedTeamPublicationHoldFact({ repo, headSha, gh = runGhSync } = {}) {
+  if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) return failure('invalid red-team publication hold identity');
+  try {
+    return evaluateRedTeamPublicationHold({ combined: JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/status?per_page=100`], ioOptions)) });
+  } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
+}
+
 /** One bounded read; incomplete evidence needs operator inspection rather than a guessed pass. */
 export function readRedTeamCheckFact({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
   if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');

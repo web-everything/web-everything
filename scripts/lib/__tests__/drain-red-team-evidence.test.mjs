@@ -102,6 +102,26 @@ describe('status persistence and check publication share one claim', () => {
     expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }).ok).toBe(false);
   });
 
+  it('a status write that throws before publication leaves no publication hold of its own (no wedge)', () => {
+    const f = fixture(), checks = [];
+    const options = { env: f.env, gh: () => '', log: () => {}, postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; } };
+    // An invalid retry count makes writeRedTeamStatus throw after the marker would have been written.
+    expect(() => recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running', retryCount: -1 }, options))
+      .toThrow(/invalid red-team retry count/);
+    expect(checks).toHaveLength(0);
+    expect(readRedTeamPublicationHold(f)).toBeNull();
+  });
+
+  it('a status write that throws keeps an earlier, still-unconfirmed publication hold', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env: f.env, gh: () => '', log: () => {},
+      postCheckRun: () => ({ ok: false, reason: 'fixture publication failure' }) });
+    expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+    expect(() => recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running', retryCount: -1 }, { env: f.env,
+      gh: () => '', log: () => {}, postCheckRun: () => ({ ok: true }) })).toThrow(/invalid red-team retry count/);
+    expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+  });
+
   it('publication holds are isolated by head and fail closed on unreadable marker paths', () => {
     const f = fixture();
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env: f.env, gh: () => '',
@@ -149,15 +169,43 @@ describe('status persistence and check publication share one claim', () => {
   });
 
   it('bounds retries and preserves the local write when pending and failure supersede publications both fail', () => {
-    const f = fixture(), attempts = [];
+    const f = fixture(), attempts = [], holds = [];
     const result = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, {
       env: f.env, gh: () => '', log: () => { throw Error('logger unavailable'); },
       postCheckRun: ({ payload: check }) => { attempts.push(check); throw Error('GitHub unavailable'); },
+      postPublicationHold: hold => { holds.push(hold); throw Error('statuses API unavailable'); },
     });
     expect(result).toMatchObject({ published: false,
-      reason: expect.stringMatching(/failure supersede also failed.*operator must inspect/) });
+      reason: expect.stringMatching(/failure supersede also failed.*GitHub-visible hold also failed.*operator must inspect/) });
     expect(attempts.map(check => check.status)).toEqual(['in_progress', 'in_progress', 'in_progress', 'completed']);
+    expect(holds).toMatchObject([{ repo: f.repo, headSha: f.head, held: true }]);
     expect(readRedTeamStatus(f).status).toBe('running');
+    expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+  });
+
+  it('sets a GitHub-visible hold when both check posts fail, keeps it across later failures, and clears it only on confirmation', () => {
+    const f = fixture(), holds = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'running' };
+    const options = postCheckRun => ({ env: f.env, gh: () => '', log: () => {}, postCheckRun,
+      postPublicationHold: hold => { holds.push(hold.held); return { ok: true }; } });
+    expect(recordRedTeamStatus(input, options(() => ({ ok: false, reason: 'checks API down' }))))
+      .toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible publication hold set') });
+    expect(holds).toEqual([true]);
+    // A later attempt whose failure supersede does post must not drop the set hold.
+    let calls = 0;
+    expect(recordRedTeamStatus(input, options(() => (++calls > 3 ? { ok: true } : { ok: false, reason: 'flaky' }))))
+      .toMatchObject({ published: false, reason: expect.stringContaining('failure check superseded prior success') });
+    expect(holds).toEqual([true]);
+    // Clearing that fails keeps both holds; the next confirmed publication clears them.
+    expect(recordRedTeamStatus(input, { ...options(() => ({ ok: true })), postPublicationHold: () => ({ ok: false, reason: 'statuses API down' }) }))
+      .toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible hold was not cleared') });
+    expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+    expect(recordRedTeamStatus(input, options(() => ({ ok: true })))).toEqual({ published: true });
+    expect(holds).toEqual([true, false]);
+    expect(readRedTeamPublicationHold(f)).toBeNull();
+    // With no hold set, a confirmed publication writes no status at all.
+    expect(recordRedTeamStatus(input, options(() => ({ ok: true })))).toEqual({ published: true });
+    expect(holds).toEqual([true, false]);
   });
 
   it('stops pending publication retries at the first success without posting a failure supersede', () => {

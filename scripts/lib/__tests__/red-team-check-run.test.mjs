@@ -177,3 +177,34 @@ describe('red-team check run contract', () => {
       .toMatchObject({ ok: false, reason: expect.any(String) });
   });
 });
+
+describe('GitHub-visible red-team publication hold (commit status)', () => {
+  const head = 'd'.repeat(40);
+  it('posts a head-bound failure or success status on its own context, with a bounded single-line description', async () => {
+    const { postRedTeamPublicationHold, RED_TEAM_PUBLICATION_CONTEXT } = await import('../red-team-check-run.mjs');
+    const calls = [];
+    const gh = (args, opts) => { calls.push({ args, body: JSON.parse(opts.input) }); return ''; };
+    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, reason: `x\n${'y'.repeat(300)}`, gh })).toEqual({ ok: true });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: false, gh })).toEqual({ ok: true });
+    expect(calls.map(c => c.args.slice(0, 4))).toEqual([['api', `repos/o/r/statuses/${head}`, '--method', 'POST'], ['api', `repos/o/r/statuses/${head}`, '--method', 'POST']]);
+    expect(calls.map(c => [c.body.state, c.body.context])).toEqual([['failure', RED_TEAM_PUBLICATION_CONTEXT], ['success', RED_TEAM_PUBLICATION_CONTEXT]]);
+    expect(calls[0].body.description).toHaveLength(140);
+    expect(calls[0].body.description).not.toMatch(/\n/);
+  });
+  it('refuses an invalid identity and reports a failed post', async () => {
+    const { postRedTeamPublicationHold } = await import('../red-team-check-run.mjs');
+    const gh = vi.fn(() => { throw Error('HTTP 503'); });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: 'nope', held: true, gh })).toMatchObject({ ok: false });
+    expect(gh).not.toHaveBeenCalled();
+    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, gh })).toMatchObject({ ok: false, reason: expect.stringContaining('HTTP 503') });
+  });
+  it('evaluates absent, cleared, held, and incomplete combined status', async () => {
+    const { evaluateRedTeamPublicationHold: evaluate, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');
+    expect(evaluate({ combined: { total_count: 1, statuses: [{ context: 'ci', state: 'failure' }] } })).toMatchObject({ ok: true });
+    expect(evaluate({ combined: { total_count: 1, statuses: [{ context, state: 'success' }] } })).toMatchObject({ ok: true });
+    for (const state of ['failure', 'pending', 'error', undefined])
+      expect(evaluate({ combined: { total_count: 1, statuses: [{ context, state }] } })).toMatchObject({ ok: false });
+    expect(evaluate({ combined: { total_count: 2, statuses: [] } })).toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete/) });
+    expect(evaluate({ combined: null })).toMatchObject({ ok: false });
+  });
+});

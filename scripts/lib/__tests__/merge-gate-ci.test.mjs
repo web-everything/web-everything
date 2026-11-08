@@ -13,7 +13,8 @@ import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from 
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
 import { findDuplicateIds } from '../duplicate-id-tripwire.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
-import { readRedTeamCheckFact } from '../red-team-check-run.mjs';
+import { readRedTeamCheckFact, RED_TEAM_PUBLICATION_CONTEXT } from '../red-team-check-run.mjs';
+import { recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
@@ -380,8 +381,94 @@ describe('gatherPrFacts red-team publication hold', () => {
     return { WE_SHARED_RUNS_DIR: runs, WE_APP_ID: '5037855', WE_RED_TEAM_GATE_SOURCE: source };
   };
 
+  const GH_NO_HOLD = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 0, statuses: [] })];
+  const GH_REMOTE_HOLD = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 1, statuses: [{ id: 3,
+    context: RED_TEAM_PUBLICATION_CONTEXT, state: 'failure' }] })];
+
+  it.each(['check-run', 'both'])('a GitHub-visible hold outranks an older published success on a host with no drain store (%s)', source => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD], { env: holdEnv(source) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+    expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
+  });
+
+  it('an unreadable or incomplete GitHub-visible hold fails closed', () => {
+    expect(gather([GH_PR, GH_SUCCESS, [/commits\/a{40}\/status\?/, failure('HTTP 502')]], { env: holdEnv('check-run') }).redTeamCheck)
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold unreadable/) });
+    expect(gather([GH_PR, GH_SUCCESS, [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 101, statuses: [] })]],
+      { env: holdEnv('check-run') }).redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete/) });
+  });
+
+  it('a cleared GitHub-visible hold (success on the context) passes', () => {
+    const facts = gather([GH_PR, GH_SUCCESS, [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 1,
+      statuses: [{ id: 4, context: RED_TEAM_PUBLICATION_CONTEXT, state: 'success' }] })]], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: true, reason: 'red-team check run succeeded on head' });
+  });
+
+  it('a local hold created during the check read outranks the success that read returned', () => {
+    const env = holdEnv('check-run');
+    const marker = join(env.WE_SHARED_RUNS_DIR, '..', 'red-team-status', `${encodeURIComponent('o/r')}-7-${HEAD}.json.unpublished`);
+    const facts = gather([GH_PR, [GH_SUCCESS[0], () => { writeFileSync(marker, '{"status":"running"}'); return GH_SUCCESS[1]; }], GH_NO_HOLD], { env });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/not confirmed published/) });
+  });
+
+  it('a GitHub-visible hold set during the check read outranks the success that read returned', () => {
+    let held = false;
+    const facts = gather([GH_PR, [GH_SUCCESS[0], () => { held = true; return GH_SUCCESS[1]; }],
+      [GH_NO_HOLD[0], () => (held ? GH_REMOTE_HOLD : GH_NO_HOLD)[1]]], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+  });
+
+  it('drain-scan (rollback) ignores both holds and reads no check or status', () => {
+    const exec = fakeExec([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD, GH_FILES]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },
+      exec, env: holdEnv('drain-scan', { hold: true }) });
+    expect(facts.redTeamCheck).toEqual({ ok: true, reason: 'redTeamGate.source=drain-scan' });
+    expect(exec.calls.some(call => /check-runs|\/status\?/.test(call))).toBe(false);
+  });
+
+  it('an unpinned head holds on the pin error and reads no hold', () => {
+    const exec = fakeExec([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD, GH_FILES]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },
+      exec, env: holdEnv('check-run', { hold: true }), expectedHeadSha: 'c'.repeat(40) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/red-team head not pinned: head moved/) });
+    expect(exec.calls.some(call => /check-runs|\/status\?/.test(call))).toBe(false);
+  });
+
+  // The writer (drain host) and CI do NOT share a filesystem: only GitHub carries the hold between them.
+  it('already queued member rejects an unpublished newer round (separate CI storage)', () => {
+    const github = { checkRuns: [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: 5037855 },
+      status: 'completed', conclusion: 'success' }], statuses: [] };
+    const writerGh = args => {
+      const statusPost = /^repos\/o\/r\/statuses\/(a{40})$/.exec(args[1]);
+      if (!statusPost) throw Error(`unexpected writer call ${args.join(' ')}`);
+      return '';
+    };
+    const writerEnv = holdEnv('check-run');
+    const status = { repo: 'o/r', pr: 7, loopPayload: { findings: { read: { netBasis: { rev: HEAD } } } }, status: 'running' };
+    const outage = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
+      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, ...JSON.parse(opts.input) }); return ''; },
+      postCheckRun: () => ({ ok: false, reason: 'checks API unavailable' }) });
+    expect(outage).toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible publication hold set') });
+    const ciRules = () => [GH_PR,
+      [/commits\/a{40}\/check-runs/, () => JSON.stringify({ total_count: github.checkRuns.length, check_runs: github.checkRuns })],
+      [/commits\/a{40}\/status\?/, () => {
+        const latest = [...new Map([...github.statuses].reverse().map(s => [s.context, s])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }]];
+    // CI has its own, empty status store.
+    const ci = () => gather(ciRules(), { env: holdEnv('check-run') });
+    expect(ci().redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+    // Publication recovers: the running check posts, the hold clears, and the in-progress check still holds.
+    const recovered = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
+      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, ...JSON.parse(opts.input) }); return ''; },
+      postCheckRun: ({ payload: check }) => { github.checkRuns.push({ ...check, id: github.checkRuns.length + 1, app: { id: 5037855 } }); return { ok: true }; } });
+    expect(recovered).toEqual({ published: true });
+    expect(github.statuses[0]).toMatchObject({ context: RED_TEAM_PUBLICATION_CONTEXT, state: 'success' });
+    expect(ci().redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/in progress/) });
+  });
+
   it.each(['check-run', 'both'])('a durable local hold outranks an older published success (%s)', source => {
-    const facts = gather([GH_PR, GH_SUCCESS], { env: holdEnv(source, { hold: true }) });
+    const facts = gather([GH_PR, GH_SUCCESS, GH_NO_HOLD], { env: holdEnv(source, { hold: true }) });
     expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/not confirmed published/) });
     expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
   });
@@ -395,7 +482,7 @@ describe('gatherPrFacts red-team publication hold', () => {
   });
 
   it('a published success with no local hold passes', () => {
-    const facts = gather([GH_PR, GH_SUCCESS], { env: holdEnv('check-run') });
+    const facts = gather([GH_PR, GH_SUCCESS, GH_NO_HOLD], { env: holdEnv('check-run') });
     expect(facts.redTeamCheck).toMatchObject({ ok: true });
   });
 
@@ -404,8 +491,8 @@ describe('gatherPrFacts red-team publication hold', () => {
     // A file where the status directory should be makes stat fail with ENOTDIR, not ENOENT.
     const blocker = join(env.WE_SHARED_RUNS_DIR, '..', 'blocker');
     writeFileSync(blocker, '');
-    const facts = gather([GH_PR, GH_SUCCESS], { env: { ...env, WE_SHARED_RUNS_DIR: join(blocker, 'x', 'runs') } });
-    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/unreadable/) });
+    const facts = gather([GH_PR, GH_SUCCESS, GH_NO_HOLD], { env: { ...env, WE_SHARED_RUNS_DIR: join(blocker, 'x', 'runs') } });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/hold unreadable; operator must inspect/) });
   });
 });
 
@@ -687,6 +774,12 @@ describe('merge-gate workflow structure', () => {
   const wf = workflowOf('merge-gate.yml');
   const job = wf.jobs['merge-gate'];
   const evaluate = job.steps.find((s) => /merge-gate-check\.mjs/.test(s.run || ''));
+
+  it('wires the red-team gate inputs into the evaluate step and can read the GitHub-visible publication hold', () => {
+    expect(evaluate.env).toMatchObject({ WE_APP_ID: '${{ vars.WE_APP_ID }}', WE_RED_TEAM_GATE_SOURCE: '${{ vars.WE_RED_TEAM_GATE_SOURCE }}' });
+    // The hold is a commit status; without this permission every read fails closed on every PR.
+    expect(wf.permissions).toMatchObject({ checks: 'read', statuses: 'read' });
+  });
 
   it('runs on pull_request_target, merge_group and workflow_dispatch', () => {
     expect(Object.keys(triggersOf(wf))).toEqual(expect.arrayContaining(['pull_request_target', 'merge_group', 'workflow_dispatch']));

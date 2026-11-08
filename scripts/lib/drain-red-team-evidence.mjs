@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold, sendBackReason } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -397,8 +397,30 @@ export function recordRedTeamStatus(input, options = {}) {
     if (Object.hasOwn(options, 'expectedSha256') && digest(optionalBytes(path)) !== options.expectedSha256) throw Error('raw recovery writer changed');
     // Every transition may invalidate a prior success, including a terminal
     // failure. Keep its hold durable until publication is confirmed.
-    if (publish) writeJsonAtomic(`${path}.unpublished`, { status: input.status });
-    const written = writeRedTeamStatus(input, options);
+    // A write that throws persisted nothing and attempts no publication, so it must not leave a hold of its
+    // own behind (nothing would ever clear it). An earlier writer's unconfirmed hold is kept.
+    // Only a proven absence (ENOENT) counts as "no earlier hold"; an unreadable probe keeps the hold.
+    let heldBefore = false;
+    // A GitHub-visible hold (commit status) set by an earlier writer must survive until a confirmed publication
+    // clears it. A marker that does not say otherwise (unreadable, or written before the flag) counts as set:
+    // clearing a status that was never posted costs one harmless write.
+    let remoteHold = false;
+    if (publish) {
+      try { statSync(`${path}.unpublished`); heldBefore = true; }
+      catch (error) { heldBefore = error.code !== 'ENOENT'; }
+      if (heldBefore) {
+        try { remoteHold = JSON.parse(readFileSync(`${path}.unpublished`, 'utf8'))?.remoteHold !== false; }
+        catch { remoteHold = true; }
+      }
+    }
+    const writeHold = () => writeJsonAtomic(`${path}.unpublished`, { status: input.status, remoteHold });
+    if (publish) writeHold();
+    let written;
+    try { written = writeRedTeamStatus(input, options); }
+    catch (error) {
+      if (publish && !heldBefore) rmSync(`${path}.unpublished`, { force: true });
+      throw error;
+    }
     // Keep synchronous publication inside the claim: a newer writer must not persist or
     // publish a hold before this writer's check has been posted. Local persistence
     // still happens first and survives every publication failure.
@@ -439,12 +461,23 @@ export function recordRedTeamStatus(input, options = {}) {
             return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
           } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
         };
+        const postHold = ({ held, reason }) => {
+          try {
+            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, headSha: head, held, reason, gh });
+            return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
+          } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
+        };
         const inProgress = payload.status === 'in_progress';
         const maxAttempts = inProgress ? 3 : 1;
         let posted;
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
           posted = post(payload);
           if (posted.ok) {
+            // Confirmed only once the GitHub-visible hold is cleared too; otherwise the hold stays and is retried.
+            if (remoteHold) {
+              const cleared = postHold({ held: false });
+              if (!cleared.ok) return report({ published: false, reason: `${input.status} red-team check published for PR #${input.pr} on ${head}, but its GitHub-visible hold was not cleared: ${cleared.reason}` });
+            }
             rmSync(`${path}.unpublished`, { force: true });
             return { published: true };
           }
@@ -452,8 +485,16 @@ export function recordRedTeamStatus(input, options = {}) {
         let reason = `Unpublished ${input.status} red-team round for PR #${input.pr} on ${head}: ${posted.reason}`;
         {
           const supersede = post(redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: 'finished', hold: reason, sendBack: true }));
-          reason += supersede.ok ? '; failure check superseded prior success'
-            : `; failure supersede also failed: ${supersede.reason}; operator must inspect GitHub check history before merging`;
+          if (supersede.ok) reason += '; failure check superseded prior success';
+          else {
+            // Second channel: a head-bound commit status every CI host reads. Record the intent first, so a crash
+            // after the post still clears it on the next confirmed publication.
+            remoteHold = true;
+            writeHold();
+            const held = postHold({ held: true, reason: `${input.status} round not confirmed published` });
+            reason += held.ok ? `; failure supersede also failed: ${supersede.reason}; GitHub-visible publication hold set`
+              : `; failure supersede also failed: ${supersede.reason}; GitHub-visible hold also failed: ${held.reason}; operator must inspect GitHub check history before merging`;
+          }
         }
         return report({ published: false, reason });
       } catch (error) {
