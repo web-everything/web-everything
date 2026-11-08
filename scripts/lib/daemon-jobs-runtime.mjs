@@ -477,7 +477,9 @@ export function reapDeadGroup(handle, {
 export function confirmHandleAbsent(handle, { readStart = readProcStart, kill = (pid, sig) => process.kill(pid, sig) } = {}) {
   const h = parseJobHandle(handle);
   if (!h?.pid) return false;
-  try { if (readStart(h.pid) === h.procStart) return false; } catch { return false; } // the recorded process is still alive
+  // Any process at the pid is unconfirmed: `ps lstart` is local-time with no zone, so a differing start string
+  // can be the same live owner read under another TZ, not a reused pid.
+  try { if (readStart(h.pid)) return false; } catch { return false; }
   try { kill(-h.pid, 0); return false; } catch (error) { return error?.code === 'ESRCH'; } // a member of its group lives
 }
 

@@ -811,7 +811,7 @@ describe('confirmHandleAbsent', () => {
   const esrch = () => { throw Object.assign(new Error('x'), { code: 'ESRCH' }); };
   it.each([
     ['pid and group gone', () => null, esrch, true],
-    ['pid reused by another process, group gone', () => 'other', esrch, true],
+    ['pid present with a differently formatted start (TZ drift), group gone', () => 'other', esrch, false],
     ['recorded process still alive', () => 'S', esrch, false],
     ['group still has a member', () => null, () => true, false],
     ['group check denied (EPERM)', () => null, () => { throw Object.assign(new Error('x'), { code: 'EPERM' }); }, false],
