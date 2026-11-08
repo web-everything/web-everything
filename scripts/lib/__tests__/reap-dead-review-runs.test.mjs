@@ -4,11 +4,16 @@ import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
 import { newJobBlock } from '../../operations/job-record.mjs';
-import { writeRun, tryReadRun, runPath, isRunRecordTerminal } from '../../operations/run-store.mjs';
+import { writeRun, tryReadRun, runPath, isRunRecordTerminal, resolveRunsDir, migrateLegacyRuns } from '../../operations/run-store.mjs';
 import { writeJobRecord } from '../../operations/review-job-store.mjs';
 import { abandonedPath, isRunAbandoned, isRunTerminalOrAbandoned, markRunAbandoned } from '../run-abandoned.mjs';
 import { reapDeadReviewRuns } from '../reap-dead-review-runs.mjs';
 
+// Pass-through spies: they observe whether the migrating resolver is reached, without changing behaviour.
+vi.mock('../../operations/run-store.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, resolveRunsDir: vi.fn(actual.resolveRunsDir), migrateLegacyRuns: vi.fn(actual.migrateLegacyRuns) };
+});
 const HOUR = 3600000, now = Date.parse('2026-11-08T12:00:00Z');
 let dir, env, probes;
 beforeEach(() => {
@@ -355,8 +360,42 @@ it('keeps a record when a writer lock appears after the sweep decided (live pid 
   probes.sessions = () => { writeFileSync(join(dir, 'review-dead.json.lock'), '4242'); locked = true; return '[]'; };
   const r = sweep(); expect(r.kept).toEqual({ 'live-writer': ['review-dead'] }); expect(calls).toBe(0);
 });
-it('does not run the legacy runs migration for a dry-run default dir', () => {
-  expect(() => reapDeadReviewRuns({ dir, now, env, probes, log: () => {} })).not.toThrow();
+it.each([['dry-run', false], ['apply', true]])('resolves the default dir without the legacy runs migration (%s)', (_mode, apply) => {
+  // No `dir`, no OPERATION_RUNS_DIR: the shared folder is derived from the coordination root (a temp "home").
+  const shared = join(dir, 'ws', 'runs');
+  const home = { ...env, WE_COORDINATION_ROOT: join(dir, 'ws', 'coordination') };
+  expect(home.OPERATION_RUNS_DIR).toBeUndefined();
+  mkdirSync(shared, { recursive: true });
+  const r = { ...newRunRecord({ id: 'review-dead', op: 'review-pr', input: { pr: 123, repo: 'owner/repo' } }),
+    pending: { kind: 'effect', step: 'review', stepIndex: 0 } };
+  writeRun(r, shared); utimesSync(runPath('review-dead', shared), new Date(now - 8 * HOUR), new Date(now - 8 * HOUR));
+  vi.mocked(resolveRunsDir).mockClear(); vi.mocked(migrateLegacyRuns).mockClear();
+  const result = reapDeadReviewRuns({ now, env: home, probes, log: () => {}, apply });
+  expect(result[apply ? 'reaped' : 'wouldReap']).toEqual(['review-dead']); // the default dir was really used
+  expect(resolveRunsDir).not.toHaveBeenCalled(); // the only resolver that migrates legacy per-clone runs
+  expect(migrateLegacyRuns).not.toHaveBeenCalled();
+  expect(readdirSync(shared).filter(f => f.endsWith('.abandoned.json'))).toEqual(apply ? ['review-dead.abandoned.json'] : []);
+});
+it('re-abandons a resumed run that dies again: stale tombstone is replaced, not reported already-abandoned', () => {
+  record();
+  expect(sweep().reaped).toEqual(['review-dead']);
+  // The run resumes: a writer lands (new inode/ctime/mtime), so the old tombstone no longer abandons it.
+  const w = tryReadRun('review-dead', dir); w.findings.resumed = 'again'; writeRun(w, dir);
+  expect(isRunAbandoned('review-dead', dir)).toBe(false);
+  // It then dies for real: no progress for > threshold.
+  const old = new Date(now - 8 * HOUR); utimesSync(runPath('review-dead', dir), old, old);
+  const second = sweep({ now: now + HOUR });
+  expect(second.kept['already-abandoned']).toBeUndefined();
+  expect(second.reaped).toEqual(['review-dead']);
+  const fresh = new Date(now + 2 * HOUR); utimesSync(abandonedPath('review-dead', dir), fresh, fresh);
+  expect(isRunAbandoned('review-dead', dir)).toBe(true);
+  expect(readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
+});
+it.each([['zero-byte', ''], ['partial', '{"at":']])('a crash-left %s tombstone does not make the run permanently un-reapable', (_n, body) => {
+  record(); writeFileSync(abandonedPath('review-dead', dir), body);
+  const r = sweep();
+  expect(r.reaped).toEqual(['review-dead']); expect(r.kept['already-abandoned']).toBeUndefined();
+  expect(JSON.parse(readFileSync(abandonedPath('review-dead', dir), 'utf8')).by).toBe('reap-dead-review-runs');
 });
 it.each([
   ['unreadable lease marker', { lanes: [{ lane: 3, lease: null, readError: 'EACCES' }] }],

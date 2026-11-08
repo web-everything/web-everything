@@ -74,6 +74,44 @@ it.each([null, [], 1, 'garbage'])('invalid record-version binding %j fails close
   markRunAbandoned({ ...options(), probes: { recordVersion } });
   expect(isRunAbandoned(id, dir)).toBe(false);
 });
+const bound = () => ({ ...options(), probes: { recordVersion: runRecordVersion(fs.statSync(join(dir, `${id}.json`))) } });
+const touchRecord = () => { // a writer landing: new content, new ctime/ino, newer mtime than any tombstone
+  const path = join(dir, `${id}.json`), tmp = join(dir, 'rewrite');
+  fs.writeFileSync(tmp, '{"resumed":true}');
+  const later = new Date(fs.statSync(abandonedPath(id, dir)).mtimeMs + 5000);
+  fs.utimesSync(tmp, later, later); fs.renameSync(tmp, path);
+};
+it('re-abandons after a stale (record-version-mismatched) tombstone: resume, die again, fresh tombstone', () => {
+  markRunAbandoned(bound()); expect(isRunAbandoned(id, dir)).toBe(true);
+  touchRecord(); expect(isRunAbandoned(id, dir)).toBe(false); // resumed -> alive again
+  const dead = new Date(fs.statSync(join(dir, `${id}.json`)).mtimeMs);
+  expect(markRunAbandoned({ ...bound(), reason: 'dead again', now: 1800000001000 }))
+    .toEqual({ written: true, alreadyAbandoned: false, replacedStale: true });
+  expect(JSON.parse(fs.readFileSync(abandonedPath(id, dir))).reason).toBe('dead again');
+  fs.utimesSync(abandonedPath(id, dir), new Date(dead.getTime() + 1000), new Date(dead.getTime() + 1000));
+  expect(isRunAbandoned(id, dir)).toBe(true);
+  expect(fs.readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]); // no temp left behind
+});
+it.each([['zero-byte (crash between open and write)', ''], ['partial JSON', '{"at":'], ['unbound mtime-stale older than record', null]])(
+  'replaces an unreadable or stale tombstone: %s', (_name, body) => {
+    if (body === null) { markRunAbandoned(options()); touchRecord(); } else fs.writeFileSync(abandonedPath(id, dir), body);
+    expect(isRunAbandoned(id, dir)).toBe(false);
+    expect(markRunAbandoned({ ...bound(), reason: 'fresh' })).toMatchObject({ written: true, alreadyAbandoned: false, replacedStale: true });
+    expect(JSON.parse(fs.readFileSync(abandonedPath(id, dir))).reason).toBe('fresh');
+  });
+it('never replaces a valid tombstone, even one a concurrent reaper just wrote', () => {
+  markRunAbandoned(bound()); const before = fs.readFileSync(abandonedPath(id, dir));
+  expect(markRunAbandoned({ ...bound(), reason: 'racing' })).toEqual({ written: false, alreadyAbandoned: true });
+  expect(fs.readFileSync(abandonedPath(id, dir))).toEqual(before);
+});
+it('stale replacement is atomic (temp + rename) and a failed rename leaves the old tombstone and no temp', () => {
+  fs.writeFileSync(abandonedPath(id, dir), '');
+  const renameSync = vi.fn(() => { throw Object.assign(Error('denied'), { code: 'EACCES' }); });
+  expect(() => markRunAbandoned({ ...bound(), fs: { ...fs, renameSync } })).toThrow('denied');
+  expect(renameSync).toHaveBeenCalledTimes(1);
+  expect(fs.readFileSync(abandonedPath(id, dir), 'utf8')).toBe('');
+  expect(fs.readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
+});
 it('unreadable stat identity on a bound tombstone fails closed toward alive', () => {
   markRunAbandoned({ ...options(), probes: { recordVersion: runRecordVersion(fs.statSync(join(dir, `${id}.json`))) } });
   expect(isRunAbandoned(id, dir, { fs: { ...fs, statSync: () => ({ mtimeMs: 0 }) } })).toBe(false);
