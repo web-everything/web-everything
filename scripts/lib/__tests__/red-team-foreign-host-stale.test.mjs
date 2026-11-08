@@ -10,6 +10,7 @@ it('unreadable timestamp holds', () => {
   for (const statusAt of [0, NaN, undefined]) expect(foreignHostDead(st, { host: 'new', statusAt, now })).toBe(false);
 });
 it('setting parses, bad value falls back to 30 min', () => {
-  expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '5000' })).toBe(5000);
+  expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '900000' })).toBe(900000);
+  expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '0' })).toBe(600000);
   expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: 'x' })).toBe(1_800_000);
 });

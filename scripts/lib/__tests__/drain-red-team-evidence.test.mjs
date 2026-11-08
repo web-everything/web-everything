@@ -371,7 +371,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     });
     it('honors the stale-window setting', () => {
       const f = fixture();
-      expect(run(f, 5 * 60_000, { env: { ...f.env, WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '60000' } }).inFlight).toBe(false);
+      expect(run(f, 12 * 60_000, { env: { ...f.env, WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '600000' } }).inFlight).toBe(false);
     });
     it('keeps same-host behaviour: a stale record with a live pid stays live', () => {
       const f = fixture();
