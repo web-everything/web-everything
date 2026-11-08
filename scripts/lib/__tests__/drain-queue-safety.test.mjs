@@ -1408,14 +1408,18 @@ describe('operator ruling at the round cap', () => {
     expect(hold({ comments: [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), upperName, restamp(head)] }))
       .toMatch(/requiring send-back/);
   });
-  it('an abbreviated plain accept of an unrelated head does not supersede a ruling', () => {
-    const comments = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept('f'.repeat(12)), restamp(head)];
-    expect(hold({ comments })).toBeNull();
+  // PR #6526 block ruling: a trusted plain accept of ANY head ends the human clearance, so a later bot restamp
+  // (a carrier citing the old clearance) cannot revive it and the ruling it backed no longer approves the head.
+  it('an abbreviated plain accept of an unrelated head ends the clearance; a later restamp cannot revive the ruling', () => {
+    const ruled = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true)];
+    expect(hold({ comments: [...ruled, restamp(head)] })).toBeNull();
+    expect(hold({ comments: [...ruled, accept('f'.repeat(12)), restamp(head)] })).toMatch(/requiring send-back/);
   });
-  it('a plain accept on an unrelated head does not supersede a carried ruling', () => {
-    const comments = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true),
-      accept('f'.repeat(40)), restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
-    expect(hold({ comments })).toBeNull();
+  it('a plain accept on an unrelated head ends the clearance; a later carried ruling cannot revive it', () => {
+    const ruled = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
+    const carried = [restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
+    expect(hold({ comments: [...ruled, ...carried] })).toBeNull();
+    expect(hold({ comments: [...ruled, accept('f'.repeat(40)), ...carried] })).toMatch(/requiring send-back/);
   });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);

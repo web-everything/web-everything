@@ -608,7 +608,8 @@ function operatorRuled(records, pr, head, index) {
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it.
+    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it. (One of an unrelated
+    // head already ended the clearance in the shared parser, so this function returned false above.)
     // Scan the whole thread: accepts before or after a carry must survive its historical truncation.
     // The marker may name a head abbreviated (7–40 hex, any case), as its builder and parser allow: a prefix match supersedes.
     const reviewed = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)]
