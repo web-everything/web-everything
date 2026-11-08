@@ -2732,6 +2732,133 @@ describe('catch-up miss backoff', () => {
 });
 
 
+describe('catch-up landable-first regression contracts', () => {
+  const head = { ...READY_PR, headRefOid: 'same-failed-head' };
+  const miss = (num, reason = 'same head previously failed required checks', kind = 'mq-same-head-failed') => ({
+    enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind, reason }],
+  });
+  const fixture = (extra = {}) => catchUpSetup({
+    readPr: async () => head,
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0)] }),
+    drainResult: num => miss(num),
+    ...extra,
+  });
+  const attempts = f => f.calls.map(c => c.args[1]);
+  const nextRound = async f => { f.advance(600_000); return f.handle.catchUp(); };
+  const expectHeld = (f, ran) => {
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(ran).toMatchObject([{ num: 42, catchUp: true, outcome: 'skipped',
+      what: expect.stringMatching(/backed off:|miss-backoff: skipped/) }]);
+    expect(f.lines.some(line => line.includes('#42') && /backed off:|miss-backoff: skipped/.test(line))).toBe(true);
+  };
+
+  it.each(['priority-then-first-accept', 'oldest-ready'])('planCatchUp partitions deprioritized candidates after landable candidates in run and later (%s)', order => {
+    const input = { queued: 0, capacity: 3, order, buildPriority: ['42'], prs: [
+      candidate(42, 0, { itemIds: ['42'] }), candidate(43, 100), candidate(44, 200),
+      candidate(45, 300), candidate(46, 400),
+    ] };
+    const baseline = planCatchUp(input);
+    const existingOrder = [...baseline.run.map(p => p.num), ...baseline.later];
+    // Exercise both an array and a generic iterable; preserve the existing order in each group.
+    for (const deprioritize of [[42, 44], new Set([44, 42])]) {
+      const plan = planCatchUp({ ...input, deprioritize });
+      const expected = [...existingOrder.filter(n => ![42, 44].includes(n)),
+        ...existingOrder.filter(n => [42, 44].includes(n))];
+      expect(plan.run.map(p => p.num)).toEqual(expected.slice(0, 3));
+      expect(plan.later).toEqual(expected.slice(3));
+      expect([...plan.run.map(p => p.num), ...plan.later].sort((a, b) => a - b)).toEqual([42, 43, 44, 45, 46]);
+      expect(plan.skipped).toEqual([]);
+    }
+  });
+
+  it('backs off an unchanged mq-same-head-failed miss without spawning or marking it enqueued', async () => {
+    const readMembership = vi.fn(async () => ({ ok: true, inQueue: true }));
+    const f = fixture({ readMembership });
+    const first = await f.handle.catchUp();
+    expect(first).toMatchObject([{ num: 42, outcome: 'not-enqueued', verified: null }]);
+    expectHeld(f, await nextRound(f));
+    expect(readMembership).not.toHaveBeenCalled();
+    expect(f.lines.some(line => line.includes('[outcome=enqueued]'))).toBe(false);
+  });
+
+  it.each(['head', 'labels', 'checks'])('retries an mq-same-head-failed hold after %s changes', async change => {
+    let pr = head;
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp();
+    expectHeld(f, await nextRound(f));
+    if (change === 'head') pr = { ...head, headRefOid: 'replacement-head' };
+    if (change === 'labels') pr = { ...head, labels: [...head.labels, { name: 'review:accepted' }] };
+    if (change === 'checks') pr = { ...head, statusCheckRollup: [...head.statusCheckRollup,
+      { __typename: 'CheckRun', name: 'retry-evidence', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    const ran = await nextRound(f);
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+    expect(ran).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+    await nextRound(f);
+    expect(attempts(f)).toHaveLength(2);
+  });
+
+  it.each(['retry evidence unreadable', 'retry evidence incomplete', 'timeline unreadable'])(
+    'retries %s next round while complete mq-same-head-failed evidence backs off', async reason => {
+      let pr = head;
+      let evidence = 'same head previously failed required checks';
+      const f = fixture({ readPr: async () => pr, drainResult: num => miss(num, evidence) });
+      await f.handle.catchUp();
+      expectHeld(f, await nextRound(f));
+      pr = { ...head, headRefOid: 'head-with-unreadable-evidence' };
+      evidence = reason;
+      expect(await nextRound(f)).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+      expect(await nextRound(f)).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+      expect(attempts(f)).toEqual(['--only=42', '--only=42', '--only=42']);
+    });
+
+  it('retries unchanged mq-same-head-failed evidence after the backoff bound expires', async () => {
+    const f = fixture({ resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, blockedBackoffRounds: 2,
+        missBackoff: { enabled: true, ttlMinutes: 30 } } }) });
+    await f.handle.catchUp();
+    expectHeld(f, await nextRound(f));
+    expectHeld(f, await nextRound(f));
+    const ran = await nextRound(f);
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+    expect(ran).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+  });
+
+  it('starts never-missed landable PRs before a higher-priority PR with a recorded recent miss', async () => {
+    let prs = [candidate(42, 0, { itemIds: ['42'] })];
+    const f = fixture({
+      readPriorities: () => ({ buildPriority: ['42'] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs }),
+      // A transient miss must remain a candidate, even though it has no hold-eligible kind.
+      drainResult: num => num === 42 ? miss(num, 'lock held', 'merge-lock-held') : { toMerge: [{ num }] },
+    });
+    await f.handle.catchUp();
+    expect(f.handle.misses().get(42)).toBe(1);
+    prs = [...prs, candidate(43, 100), candidate(44, 200)];
+    await nextRound(f);
+    expect(attempts(f)).toEqual(['--only=42', '--only=43', '--only=44', '--only=42']);
+  });
+
+  it('expires old event-marked pending work into this round while fresh event work stays already pending', async () => {
+    const f = fixture({
+      resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+        catchUp: { ...CATCH_UP_SETTING.catchUp, pendingExpiryMinutes: 15 } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0), candidate(43, 100)] }),
+    });
+    f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    expect(f.handle.pending()).toMatchObject([{ num: 42, causes: ['check_suite.completed=success'] }]);
+    expect(f.handle.pending()[0].catchUp).toBeUndefined();
+    f.advance(16 * 60_000);
+    f.handle.notePoll({ ok: true, marked: [mark(43)] });
+    const ran = await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(ran).toMatchObject([{ num: 42, catchUp: true, outcome: 'not-enqueued' }]);
+    expect(f.handle.pending().map(p => p.num)).toEqual([43]);
+    expect(f.lines.some(line => line.includes('expired pending #42'))).toBe(true);
+    expect(f.lines.some(line => line.includes('#43') && line.includes('already pending'))).toBe(true);
+    expect(f.lines.some(line => line.includes('expired pending #43'))).toBe(false);
+  });
+});
+
 it('catch-up miss backoff uses a nondefault TTL from the resolved setting', async () => {
   const f = catchUpSetup({
     resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
