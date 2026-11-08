@@ -28,6 +28,7 @@ import {
   CODEX_EFFORT_MAP,
   CODEX_MODEL,
   CODEX_TIER_EFFORT,
+  cleanupScratchClone, createScratchGuard,
   resolveCodexEffort,
   resolveCodexHome,
   findRolloutFile,
@@ -3231,5 +3232,109 @@ describe('detached jobs', () => {
     expect(fsDeps.renameSync).toHaveBeenCalledWith(temp, join(jobsDir, 'atomic.json'));
     writeJobRecord(record, { jobsDir });
     expect(readJobRecord('atomic', { jobsDir })).toEqual(record);
+  });
+});
+
+describe('R731 slice 1 — a scratch clone is deleted only when it is clean', () => {
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const roots = [];
+  function makeClone() {
+    const root = mkdtempSync(join(tmpdir(), 'we-r731-'));
+    roots.push(root);
+    const dir = join(root, 'clone');
+    mkdirSync(dir);
+    git(dir, 'init', '-q');
+    git(dir, 'config', 'user.email', 't@example.com');
+    git(dir, 'config', 'user.name', 't');
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    git(dir, 'add', 'a.txt');
+    git(dir, 'commit', '-q', '-m', 'init');
+    return { root, dir, sha: git(dir, 'rev-parse', 'HEAD').trim() };
+  }
+  afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+
+  it('a clean clone is deleted', () => {
+    const { dir, sha } = makeClone();
+    const r = cleanupScratchClone({ dir, startSha: sha });
+    expect(r.removed).toBe(true);
+    expect(() => statSync(dir)).toThrow();
+  });
+
+  it('an untracked file keeps the clone and reports its path', () => {
+    const { dir, sha } = makeClone();
+    writeFileSync(join(dir, 'new.bin'), Buffer.from([0, 1, 2, 255]));
+    const r = cleanupScratchClone({ dir, startSha: sha });
+    expect(r.removed).toBe(false);
+    expect(r.path).toBe(dir);
+    expect(statSync(join(dir, 'new.bin')).isFile()).toBe(true);
+  });
+
+  it('a modified tracked file keeps the clone', () => {
+    const { dir, sha } = makeClone();
+    writeFileSync(join(dir, 'a.txt'), 'two\n');
+    expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('two\n');
+  });
+
+  it('a mode-only change keeps the clone', () => {
+    const { dir, sha } = makeClone();
+    git(dir, 'config', 'core.fileMode', 'true');
+    execFileSync('chmod', ['+x', join(dir, 'a.txt')]);
+    expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+  });
+
+  it('a commit made after the start sha keeps the clone even though status is empty', () => {
+    const { dir, sha } = makeClone();
+    writeFileSync(join(dir, 'a.txt'), 'three\n');
+    git(dir, 'commit', '-q', '-am', 'extra');
+    expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+  });
+
+  it('fails closed: an unreadable status keeps the clone', () => {
+    const rm = vi.fn();
+    const r = cleanupScratchClone({ dir: '/nonexistent/clone', startSha: 'x', execFn: () => { throw new Error('boom'); }, rmFn: rm });
+    expect(r.removed).toBe(false);
+    expect(rm).not.toHaveBeenCalled();
+  });
+
+  it('writes no patch file anywhere for a dirty clone', () => {
+    const { root, dir, sha } = makeClone();
+    writeFileSync(join(dir, 'a.txt'), 'two\n');
+    cleanupScratchClone({ dir, startSha: sha });
+    const leftovers = execFileSync('find', [root, '-name', '*.patch', '-o', '-name', '*.diff'], { encoding: 'utf8' }).trim();
+    expect(leftovers).toBe('');
+  });
+
+  it('a signal during the run applies the same rule synchronously (clean deleted)', () => {
+    const { dir, sha } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir, sha);
+    proc.emit('SIGTERM');
+    expect(() => statSync(dir)).toThrow();
+    expect(proc.listenerCount('SIGTERM')).toBe(0);
+    expect(proc.listenerCount('SIGINT')).toBe(0);
+  });
+
+  it('a signal during the run keeps a dirty clone', () => {
+    const { dir, sha } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir, sha);
+    writeFileSync(join(dir, 'a.txt'), 'edited\n');
+    proc.emit('SIGINT');
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('edited\n');
+  });
+
+  it('finish() removes the listeners and applies the rule once', () => {
+    const { dir, sha } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir, sha);
+    writeFileSync(join(dir, 'u.txt'), 'x');
+    const r = guard.finish();
+    expect(r.removed).toBe(false);
+    expect(proc.listenerCount('SIGTERM')).toBe(0);
+    expect(guard.finish()).toEqual(r);
   });
 });
