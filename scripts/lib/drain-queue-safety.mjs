@@ -38,7 +38,7 @@ function validMqInfraSignatures(value) {
       } else if (source[i] === '\\') {
         const escaped = source[i + 1];
         if (['S', 'd', 's'].includes(escaped) && source[i + 2] === '+') {
-          if (previousWildcard || ++wildcards > 2) return false;
+          if (previousWildcard || ++wildcards > 1) return false;
           const next = source[i + 3];
           // Require a delimiter after each greedy class; escaped punctuation
           // is allowed by the grammar below. End-of-source is also safe.

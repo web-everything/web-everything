@@ -230,6 +230,7 @@ describe('MQ signature audit bounds', () => {
     'outage \\S+ on \\d+ at \\s+ during checkout',
     'aaaaaaaaaaa\\S+a\\S+a\\S+b',
     'aaaaaaaaaaa\\S+a\\S+b',
+    'aaaaaaaaaaa\\S+\\.\\S+ Z', 'outage \\S+ on \\d+ remote',
     'outage during \\s+ checkout', 'outage during \\d+7',
   ])('rejects insufficient literals or unsafe wildcards %j with a platform fallback', source => {
     const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] },
@@ -239,7 +240,7 @@ describe('MQ signature audit bounds', () => {
     expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
   });
 
-  it.each(['tool outage', ...standard, 'outage \\S+ on \\d+ remote',
+  it.each(['tool outage', ...standard,
     'outage during \\S+\\. checkout', 'outage during \\s+checkout',
     'outage during \\d+remote', 'outage during \\S+'])('accepts safe boundary source %j', source => {
     const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] }, platform: {} });
