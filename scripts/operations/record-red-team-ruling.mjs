@@ -1,4 +1,4 @@
-import { assertCardFiling, cardFilingBinding, buildRulingCardInput, cardFilingVerdict, rulingCardSteps, judgeRulingInput, landedRulingCard } from './record-referral-ruling.mjs';
+import { assertJudgeReason, assertCardFiling, cardFilingBinding, buildRulingCardInput, cardFilingVerdict, rulingCardSteps, judgeRulingInput, landedRulingCard } from './record-referral-ruling.mjs';
 import { classAction, allClasses } from '../lib/finding-class-policy.mjs';
 import { breakClass } from '../lib/red-team-gate.mjs';
 /**
@@ -18,8 +18,8 @@ import { actionResource } from './action-record.mjs';
 import { buildRedTeamCardInput, buildSendBackBody } from './red-team-gate-apply.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
-import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
+import { assertRulingIdentity, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
 import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
@@ -91,6 +91,7 @@ export function selectBreaks(held, spec, noun = 'held for the operator') {
 
 /** The reason comment: the operator's words, quoted, with no way to forge a marker. PURE. */
 export function buildRuleReasonComment({ head, ruling, actor, channel, at, reason, findings, cardNote = '', cause = null }) {
+  assertJudgeReason(actor, reason);
   // Escape HTML text rather than matching comment delimiters, including alternate and partial forms.
   // Normalize every line boundary before quoting, including JS multiline-regex boundaries and control separators.
   const quote = String(reason).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -99,6 +100,7 @@ export function buildRuleReasonComment({ head, ruling, actor, channel, at, reaso
     `**Operator ruling on the post-accept red team: ${ruling}** (head \`${String(head).slice(0, 12)}\`)`,
     '',
     `Ruled by \`${sanitizeCardField(actor, 80)}\` via ${sanitizeCardField(channel, 120)} at ${at}, on the confirmed break(s):`,
+    ...(actor === JUDGE_ACTOR ? [JUDGE_ATTRIBUTION] : []),
     ...(cause ? [`False-finding cause: \`${sanitizeCardField(cause, 60)}\``] : []),
     ...findings.map((f) => `- #${f.index} \`${sanitizeCardField(where(f), 200)}\` — ${sanitizeCardField(f.summary, 300)}`),
     ...(cardNote ? ['', cardNote] : []),
@@ -192,9 +194,11 @@ export function hasPendingCardIntent(comments, { pr, head, resultId, jobKey }) {
 }
 
 function validateRedTeamRulingInput(read, input) {
+  assertJudgeReason(input.actor, input.reason);
+  assertJudgeAuthority(read, input);
   const { pr, ruling, actor, channel, reason } = input;
   if (!RED_TEAM_RULINGS.includes(ruling)) throw new Error(`--ruling must be one of ${RED_TEAM_RULINGS.join('|')}`);
-  if (!OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
+  if (actor !== JUDGE_ACTOR && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
     throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this ruling is the operator's`);
   }
   if (!String(reason ?? '').trim()) throw new Error("--reason is required: the operator's words, verbatim");
@@ -212,7 +216,7 @@ function validateRedTeamRulingInput(read, input) {
 function selectRedTeamRulingFindings(read, input) {
   const { pr, ruling, actor } = input;
   // Bind to who actually posts: the authenticated gh identity must be a human operator and equal --actor.
-  assertHumanOperator(read.identity, actor);
+  assertRulingIdentity(read.identity, actor);
   const head = String(read.head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error('the PR head could not be read; nothing to rule on');
   const comments = operatorBoundComments(read.comments);
@@ -230,7 +234,7 @@ export function planRedTeamRuling(read, input) {
   const { pr, ruling, actor, channel, reason } = input;
   const { head, comments, scope, state, atCap, selected } = selectRedTeamRulingFindings(read, input);
   const base = { repo: input.repo, pr: Number(pr), head, ruling, actor: String(actor).toLowerCase(), channel: String(channel).trim(),
-    reason: String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
+    reason: actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}\n${reason}` : String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
     indices: selected.map((f) => f.index), scope, scopeSources: read.scope?.sources ?? {}, atCap,
     underChanges: labelNames(read.labels).includes('review:changes') };
   if (ruling === 'card' && read.card) {
@@ -294,7 +298,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
     verdictFrom: 'plan',
     read: compute({
       reads: ['input'],
-      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card,
+      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, actor: view.input.actor, card: view.input.card,
         ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, break: view.input.break } : {}) }),
     }),
     ...rulingCardSteps(readRulingContext, planRedTeamCard, 'github.red-team-ruling-file-card', (read, input) => {

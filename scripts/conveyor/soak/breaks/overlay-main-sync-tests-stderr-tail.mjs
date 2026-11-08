@@ -1,10 +1,12 @@
 /** A long tmp-leak footer must not displace the failed test's stdout identity. */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { addOverlay } from '../../../lib/daemon-overlays.mjs';
-import { runOverlayMainSync } from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
+import * as sync from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
+// Absent on trees from before the marked-inventory protocol, which the replay must still be able to load.
+const { runOverlayMainSync, VITEST_INVENTORY_MARK = '' } = sync;
 
 const SOURCE = 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs';
 const FILE = 'worker.test.mjs', TITLE = 'worker > preserves the failing test identity';
@@ -60,6 +62,9 @@ export default {
             return git(args, opts);
           },
           appendDaemonEvent: event => { events.push(event); },
+          // Vitest inventory: the committed overlay test is runnable, so selection reaches the runner below.
+          testListRunner: (_command, _args, { cwd }) => ({ status: 0,
+            stdout: `\n${VITEST_INVENTORY_MARK}${JSON.stringify([join(realpathSync(cwd), FILE)])}\n`, stderr: '' }),
           testRunner: async () => {
             testCalls++;
             return { status: 1,
