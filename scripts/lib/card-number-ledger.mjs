@@ -165,6 +165,9 @@ export function readCardLedger(o = {}) {
       if (!sha(commit)) throw new Error('missing introducing history');
       const next = String(run(['show', `${commit}:${path}`], opts));
       if (!next.startsWith(previous)) throw new Error('append-only violation: ledger row removal/replacement');
+      // Per-commit parsing must see the same physical lines as the checkpoint/whole-file reader:
+      // an append onto a partial line would be judged apart from the bytes it completes.
+      if (previous && !previous.endsWith('\n')) throw new Error('ledger commit boundary splits a row; rebuild reviewed checkpoint from earlier history');
       const firstLine = previous.split('\n').length;
       const added = next.slice(previous.length); previous = next;
       const parsed = decode(added, maxBytes);

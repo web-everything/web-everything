@@ -503,6 +503,26 @@ it('quarantine never makes a partial final row readable', () => {
   expect(fixture({ auth: 'signed', text, history: [[a, text]], trust }).read().readable).toBe(false);
 });
 
+it.each([
+  { name: 'quarantined partial then trusted append', bad: [] },
+  { name: 'trusted partial then trusted append', quarantine: [] },
+  { name: 'quarantined partial then quarantined append', both: true },
+])('commitBoundarySplittingAPhysicalLineRefusesReadAndCheckpoint: $name', ({ quarantine, both }) => {
+  const partial = 'invalid quarantined row';
+  const text = partial + lines(row('xabc123', 11, 'shadow'));
+  const trust = { allowedSigners: [{ key: 'ssh-ed25519 AAAA', fingerprint: 'SHA256:trusted' }],
+    quarantine: quarantine ?? [{ commit: a, reason: 'forged', approval: 'reviewed' },
+      ...(both ? [{ commit: b, reason: 'forged', approval: 'reviewed' }] : [])] };
+  const f = fixture({ auth: 'signed', text, trust, history: [[a, partial], [b, text]] });
+  const state = f.read();
+  expect(state.readable).toBe(false);
+  expect(state.errors.join(';')).toMatch(/boundary/);
+  expect(() => cardLedgerCheckpoint({ ...f.options, commit: b,
+    env: { ...f.options.env, WE_CARD_LEDGER_AUTH: 'signed' } })).toThrow(/checkpoint refused/);
+  // The physical-line reader (used once a checkpoint is adopted) agrees: the same bytes are unreadable.
+  expect(parseCardLedger(text).readable).toBe(false);
+});
+
 it('real SSH introducing commits reject an unsigned row beneath a signed tip', async () => {
   const { execFileSync } = await import('node:child_process');
   const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
