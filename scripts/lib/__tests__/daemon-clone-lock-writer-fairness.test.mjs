@@ -4,7 +4,7 @@
  *   ticked back-to-back holding its read slot, the review daemon's rebuild waited 900s, gave up, and found the
  *   sibling mid-tick again on every retry — the shared clone did not move for 5.5 h). Fake clocks only, mkdtemp
  *   lock roots only. Proves: the writer starvation reproduces with writer priority off and resolves with it on;
- *   reader and writer priority never both back off (the older claim wins); the #4039 reader fairness still holds.
+ *   effective writer claims override older reader claims (subject to the reader skip cap); the #4039 reader fairness still holds.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -84,9 +84,9 @@ describe('writer fairness — a writer that gave up blocks NEW reads until a wri
     expect(r.movedAt).toBeNull();
   });
 
-  it('resolves it with writer priority on: the writer moves on its next attempt, readers yield meanwhile', async () => {
+  it('resolves it at the default threshold: the writer moves on cycle four after three refusals', async () => {
     const r = await simulateWriter({ cycles: 8, writerPriorityAfter: DEFAULT_WRITER_PRIORITY_AFTER });
-    expect(r.movedAt).toBe(2);
+    expect(r.movedAt).toBe(4);
     expect(r.fRefusals).toContain('writer-priority');
     // The claim was cleared by the move, and writer-priority refusals never counted as reader starvation.
     const snap = inspectCloneLock(r.clone, { lockRoot: r.lockRoot, probe: alive, leaseMinutes: LEASE });
@@ -125,8 +125,8 @@ describe('writer fairness — a writer that gave up blocks NEW reads until a wri
   });
 });
 
-describe('reader and writer priority never both back off — the older claim wins', () => {
-  it('a reader starved BEFORE the writer claim gets in first; then the writer claim wins the next gap', async () => {
+describe('effective writer priority overrides reader claim age', () => {
+  it('an effective writer claim beats an older reader claim for exactly the default skip cap, then admits it and drains existing readers', async () => {
     const lockRoot = mkTmp('dcwf-root-');
     const clone = mkTmp('dcwf-clone-');
     let t = 0;
@@ -144,20 +144,32 @@ describe('reader and writer priority never both back off — the older claim win
         }
       },
     });
-    // The reader starved first, so W yields to it (the #4039 behaviour, intact).
+    // W initially yields to the starved reader, then its effective claim overrides R's older claim.
     expect(w1).toMatchObject({ ok: false, reason: 'reader-priority' });
-    expect(acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t }).ok).toBe(true);
-    releaseRead(clone, { lockRoot, owner: 'R' });
-    // W now starves on L (gave up) → claim. R's starvation was cleared by its read, so the claim is older.
+    // Model a persisted older starvation claim without a skip ledger. The setup's writer-active
+    // refusals would otherwise already exhaust the default budget before claim precedence is tested.
+    const { starvedRoot } = cloneLockDirs(clone, lockRoot);
+    rmSync(join(starvedRoot, '..', 'writer-priority-skips.json'), { force: true });
+    const priorityRefusals = [];
+    const firstRefusal = acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t });
+    expect(firstRefusal)
+      .toMatchObject({ ok: false, reason: 'writer-priority', heldBy: 'W' });
+    priorityRefusals.push(firstRefusal);
+    // R's older starvation claim remains; W overrides it and waits for L's existing read slot.
     const w2 = await acquireWrite(clone, {
       ...base, owner: 'W', waitMs: 3000, pollMs: 1000, now: () => t, sleep: async (ms) => { t += ms; },
     });
-    expect(w2).toMatchObject({ ok: false, reason: 'tick-in-progress', writerStarved: 1 });
+    expect(w2).toMatchObject({ ok: false, reason: 'tick-in-progress', writerStarved: 2 });
     const refused = acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t });
     expect(refused).toMatchObject({ ok: false, reason: 'writer-priority' });
     expect(refused.starved).toBeUndefined();
-    // R keeps retrying (event wakes) while W drains: every refusal is uncounted, so R can never re-trigger
-    // reader priority against the older writer claim — W is not made to back off, and gets the clone.
+    priorityRefusals.push(refused);
+    expect(priorityRefusals).toHaveLength(DEFAULT_WRITER_PRIORITY_MAX_SKIPS);
+    expect(acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t }))
+      .toEqual({ ok: true });
+    releaseRead(clone, { lockRoot, owner: 'R' });
+    // R keeps retrying while W actually drains: writer-active still refuses admission,
+    // even after the claim skip cap is reached. W gets the clone when L's tick ends.
     let rCount = 0;
     const w3 = await acquireWrite(clone, {
       ...base, owner: 'W', waitMs: 60_000, pollMs: 1000, now: () => t,
