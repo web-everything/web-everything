@@ -522,6 +522,20 @@ it.each([
   // The physical-line reader (used once a checkpoint is adopted) agrees: the same bytes are unreadable.
   expect(parseCardLedger(text).readable).toBe(false);
 });
+it('splitRowRecoveryNamedInTheBoundaryErrorReadsOnceTheJoinedLineIsQuarantined', () => {
+  // The boundary refusal names its recovery: a reviewed checkpoint at the completing commit that
+  // quarantines the joined physical line. Pin that this recovery really yields a readable ledger.
+  const text = 'invalid quarantined row' + lines(row('xabc123', 11, 'shadow'));
+  const trust = { allowedSigners: [{ key: 'ssh-ed25519 AAAA', fingerprint: 'SHA256:trusted' }],
+    quarantine: [{ commit: a, reason: 'forged', approval: 'reviewed' }],
+    checkpoint: { commit: b, fileSha256: hash(text), quarantinedLines: [1], quarantinedCommits: [a] } };
+  const f = fixture({ auth: 'signed', text, trust, history: [[b, text]] });
+  const native = f.run.getMockImplementation();
+  f.run.mockImplementation((args, opts) => args[0] === 'rev-list' ? '' : native(args, opts));
+  const state = f.read();
+  expect(state).toMatchObject({ readable: true, errors: [], quarantinedLines: [1], quarantinedCommits: [a] });
+  expect(state.byId.size).toBe(0);
+});
 
 it('real SSH introducing commits reject an unsigned row beneath a signed tip', async () => {
   const { execFileSync } = await import('node:child_process');
