@@ -45,6 +45,12 @@ export default {
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
     const check = (ok, message) => { if (!ok) violations.push(message); };
+    // R711: #5773's carry is a drain NUMBERING carry (the reviewed diff changed), which counts as a clearance only under
+    // the explicit humanClearance.mechanicalCarry=trust-drain-record policy; the default (refuse) is unit-tested.
+    const POLICY_ENV = 'WE_HUMAN_CLEARANCE_MECHANICAL_CARRY';
+    const hadPolicy = Object.hasOwn(process.env, POLICY_ENV);
+    const priorPolicy = process.env[POLICY_ENV];
+    process.env[POLICY_ENV] = 'trust-drain-record';
     try {
       const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
       const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
@@ -56,7 +62,17 @@ export default {
         const path = join(fixtures, `pr-${n}-stale-referral-hold.json`);
         // A pre-fix tree has no fixtures either: replay the captured threads from this file's own tree.
         const raw = JSON.parse(readFileSync(existsSync(path) ? path : join(ROOT, 'scripts/conveyor/__tests__/fixtures', `pr-${n}-stale-referral-hold.json`), 'utf8'));
-        return { ...raw, comments: raw.comments.map(c => (BOTS.has(c.author?.login) ? { ...c, author: { login: 'web-everything' } } : c)) };
+        // R706: a drain carry record counts only when it cites the human clearance comment by id. The captured thread
+        // predates the `cleared-from` marker and has no comment ids, so add both to the SAME two comments (the human
+        // clear-human ceremony and the drain's carry record); every other byte of the capture is untouched.
+        const sourceIndex = raw.comments.findIndex(c => c.author?.login === 'chalbert' && c.body.includes('cleared via the sanctioned path'));
+        const carryIndex = raw.comments.findIndex(c => c.body.includes('human clearance carried forward'));
+        return { ...raw, comments: raw.comments.map((c, i) => {
+          const comment = BOTS.has(c.author?.login) ? { ...c, author: { login: 'web-everything' } } : c;
+          if (i === sourceIndex) return { ...comment, id: 'IC_clearance' };
+          if (i === carryIndex) return { ...comment, body: `${comment.body}\n<!-- cleared-from: IC_clearance -->` };
+          return comment;
+        }) };
       };
       const asPr = f => ({ number: f.number, headRefOid: f.headRefOid, body: f.body, createdAt: f.createdAt, isDraft: false,
         baseRefName: 'main', labels: f.labels.map(name => ({ name })), comments: f.comments,
@@ -97,6 +113,8 @@ export default {
       }
     } catch (error) {
       violations.push(`scenario failed: ${error.stack ?? error}`);
+    } finally {
+      if (hadPolicy) process.env[POLICY_ENV] = priorPolicy; else delete process.env[POLICY_ENV];
     }
     return { violations };
   },
