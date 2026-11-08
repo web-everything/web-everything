@@ -23,6 +23,7 @@ import {
   cloneLockDirs,
   HEARTBEAT_INTERVAL_MS,
   defaultProbePidLiveness,
+  resolveWriterPriorityAfter,
 } from '../daemon-clone-lock.mjs';
 
 import { heartbeat } from '../../readiness/file-locks.mjs';
@@ -45,6 +46,161 @@ afterEach(() => {
 
 const alwaysAlive = () => 'alive';
 const alwaysDead = () => 'dead';
+
+describe('symmetric reader/writer fairness', () => {
+  // Build real reader starvation records, then rotate through three different priority readers.
+  // The fourth stays queued: clearing one reader's claim must not erase the writer's own refusals.
+  async function rotatingReaders({ existingReader = false } = {}) {
+    const lockRoot = mkTmp('dcl-lockroot-');
+    const clone = mkTmp('dcl-clone-');
+    let clock = 1000;
+    const common = {
+      lockRoot, probe: alwaysAlive, writerPriorityAfter: 3, writerClaimTtlMs: 1000,
+      writerPriorityMaxSkips: 2,
+    };
+    const read = (owner, overrides = {}) => acquireRead(clone, {
+      ...common, owner, pid: 222, nowMs: clock, ...overrides,
+    });
+    const write = (overrides = {}) => acquireWrite(clone, {
+      ...common, owner: 'writer-a', pid: 111, readerPriorityAfter: 3,
+      writerWaitPriorityMs: 0, waitMs: 0, now: () => clock,
+      sleep: async (ms) => { clock += ms; }, ...overrides,
+    });
+    expect(await write()).toEqual({ ok: true });
+    const readers = ['reader-a', 'reader-b', 'reader-c', 'reader-d'];
+    for (const owner of readers) {
+      for (let refusal = 1; refusal <= 3; refusal += 1) {
+        expect(read(owner)).toMatchObject({ ok: false, reason: 'writer-active', starved: refusal });
+      }
+    }
+    releaseWrite(clone, { owner: 'writer-a', lockRoot });
+    if (existingReader) expect(read('existing-reader')).toEqual({ ok: true });
+    const pending = new Set(readers);
+    const train = async (count = 3) => {
+      for (let turn = 0; turn < count; turn += 1) {
+        clock += 1;
+        const result = await write();
+        expect(result).toMatchObject({ ok: false, reason: 'reader-priority' });
+        const owner = result.heldBy;
+        expect(pending.delete(owner)).toBe(true);
+        // Exercise the existing skip-cap bypass to let the reader that won take its turn.
+        expect(read(owner, { writerPriorityMaxSkips: 0 })).toEqual({ ok: true });
+        releaseRead(clone, { owner, lockRoot });
+      }
+    };
+    return { clone, lockRoot, read, write, train, pending, advance: (ms) => { clock += ms; }, now: () => clock };
+  }
+
+  it('acquires after three writer refusals even when distinct priority readers rotate', async () => {
+    const f = await rotatingReaders();
+    await f.train();
+    expect(await f.write()).toEqual({ ok: true });
+  });
+
+  it('refuses new readers with writer-priority while preserving an existing reader until it drains', async () => {
+    const f = await rotatingReaders({ existingReader: true });
+    await f.train();
+    expect(f.read('new-reader')).toMatchObject({ ok: false, reason: 'writer-priority', heldBy: 'writer-a' });
+    expect(inspectCloneLock(f.clone, {
+      lockRoot: f.lockRoot, nowMs: f.now(), probe: alwaysAlive,
+    }).readers).toEqual([expect.objectContaining({ owner: 'existing-reader', live: true })]);
+    let drained = false;
+    const result = await f.write({
+      waitMs: 100, pollMs: 10,
+      sleep: async (ms) => {
+        f.advance(ms);
+        const snapshot = inspectCloneLock(f.clone, {
+          lockRoot: f.lockRoot, nowMs: f.now(), probe: alwaysAlive,
+        });
+        expect(snapshot.writerLive).toBe(true);
+        expect(snapshot.readers).toEqual([expect.objectContaining({ owner: 'existing-reader', live: true })]);
+        expect(f.read('another-new-reader')).toMatchObject({ ok: false, reason: 'writer-priority' });
+        releaseRead(f.clone, { owner: 'existing-reader', lockRoot: f.lockRoot });
+        drained = true;
+      },
+    });
+    expect(drained).toBe(true);
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('still admits a reader after the writer-priority skip cap, and waits for its slot', async () => {
+    const f = await rotatingReaders();
+    await f.train();
+    for (let skip = 0; skip < 2; skip += 1) {
+      expect(f.read('capped-reader')).toMatchObject({ ok: false, reason: 'writer-priority' });
+    }
+    expect(f.read('capped-reader')).toEqual({ ok: true });
+    expect(await f.write()).toMatchObject({ ok: false, reason: 'tick-in-progress', heldBy: 'capped-reader' });
+    releaseRead(f.clone, { owner: 'capped-reader', lockRoot: f.lockRoot });
+    expect(await f.write()).toEqual({ ok: true });
+  });
+
+  it('resets its consecutive refusal counter after a successful write acquire', async () => {
+    const f = await rotatingReaders();
+    await f.train();
+    expect(await f.write()).toEqual({ ok: true });
+    releaseWrite(f.clone, { owner: 'writer-a', lockRoot: f.lockRoot });
+    // The last reader still has its original priority claim; the successful writer must start counting anew.
+    for (let refusal = 1; refusal <= 3; refusal += 1) {
+      expect(await f.write()).toMatchObject({ ok: false, reason: 'reader-priority', heldBy: [...f.pending][0] });
+      if (refusal < 3) {
+        expect(f.read('fresh-reader')).toEqual({ ok: true });
+        releaseRead(f.clone, { owner: 'fresh-reader', lockRoot: f.lockRoot });
+      }
+    }
+    expect(f.read('fresh-reader')).toMatchObject({ ok: false, reason: 'writer-priority' });
+    expect(await f.write()).toEqual({ ok: true });
+  });
+
+  it('counts tick-in-progress and reader-priority refusals toward the same writer threshold', async () => {
+    const f = await rotatingReaders({ existingReader: true });
+    await f.train(2);
+    expect(await f.write({ readerPriorityAfter: 0 })).toMatchObject({
+      ok: false, reason: 'tick-in-progress', heldBy: 'existing-reader',
+    });
+    expect(f.read('new-reader')).toMatchObject({ ok: false, reason: 'writer-priority' });
+    releaseRead(f.clone, { owner: 'existing-reader', lockRoot: f.lockRoot });
+    expect(await f.write()).toEqual({ ok: true });
+  });
+
+  it('expires an effective writer claim so a new reader can enter without a writer retry', async () => {
+    const f = await rotatingReaders();
+    await f.train();
+    expect(f.read('new-reader')).toMatchObject({ ok: false, reason: 'writer-priority' });
+    f.advance(1001);
+    expect(f.read('new-reader')).toEqual({ ok: true });
+    expect(await f.write()).toMatchObject({ ok: false, reason: 'reader-priority' });
+  });
+
+  it('expires partial refusal counts rather than accumulating them across the claim TTL', async () => {
+    const f = await rotatingReaders();
+    await f.train(2);
+    f.advance(1001);
+    expect(await f.write()).toMatchObject({ ok: false, reason: 'reader-priority' });
+    expect(f.read('new-reader')).toEqual({ ok: true });
+    releaseRead(f.clone, { owner: 'new-reader', lockRoot: f.lockRoot });
+    expect(await f.write()).toMatchObject({ ok: false, reason: 'reader-priority' });
+    expect(await f.write()).toMatchObject({ ok: false, reason: 'reader-priority' });
+    expect(f.read('new-reader')).toMatchObject({ ok: false, reason: 'writer-priority' });
+  });
+
+  it('keeps yielding to priority readers when writer priority is explicitly disabled', async () => {
+    const f = await rotatingReaders();
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect(await f.write({ writerPriorityAfter: 0 })).toMatchObject({ ok: false, reason: 'reader-priority' });
+    }
+    expect(f.read('new-reader')).toEqual({ ok: true });
+  });
+
+  it('resolves the default writer threshold to three, supports an env override and zero, and rejects invalid values', () => {
+    expect(resolveWriterPriorityAfter({})).toBe(3);
+    for (const value of ['', 'invalid', '-1', '1.5', 'Infinity']) {
+      expect(resolveWriterPriorityAfter({ WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER: value })).toBe(3);
+    }
+    expect(resolveWriterPriorityAfter({ WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER: '5' })).toBe(5);
+    expect(resolveWriterPriorityAfter({ WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER: '0' })).toBe(0);
+  });
+});
 
 describe('acquireRead / acquireWrite — basic handshake', () => {
   it('reader is blocked by a live foreign writer', async () => {
