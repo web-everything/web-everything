@@ -1,5 +1,7 @@
 /** Settle backlog-only prep independently of acceptance-based red-team recovery. */
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 import { priorPrepReviews } from '../conveyor/prep-review.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -8,7 +10,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 
 export const RULE = 'backlog-only-prep';
 export const REASON = `Red team not required on this head: backlog-only prep (rule ${RULE})`;
-const settingPath = new URL('../settings/red-team.json', import.meta.url);
+const settingPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/red-team.json');
 const clean = value => String(value?.message ?? value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 const names = labels => Array.isArray(labels) ? labels.map(l => typeof l === 'string' ? l : l?.name) : null;
 const candidate = labels => labels?.includes('review:prep') && labels.includes('red-team:pending');
@@ -31,9 +33,9 @@ export function resolveBacklogOnlyPrepSetting({ env = process.env, log = () => {
     });
     return { enabled: resolved.value.skipBacklogOnlyPrep };
   } catch (error) {
-    const enabled = envValue ?? false;
-    safeLog(log)(`red-team: backlog-only prep enabled=${enabled} (${envValue === undefined ? 'fail-closed' : 'env'}): ${clean(error)}`);
-    return { enabled };
+    // Unreadable settings evidence is never overridden by env: an exemption cannot turn on from partial evidence.
+    safeLog(log)(`red-team: backlog-only prep enabled=false (fail-closed): ${clean(error)}`);
+    return { enabled: false };
   }
 }
 
@@ -84,11 +86,13 @@ function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, re
     const files = readFiles(key);
     const proof = backlogOnlyPrepClear({ enabled: true, head, files, comments, labels: raw.labels });
     if (!proof.ok) return { ...row, why: proof.why };
+    if (dryRun) return { ...row, why: 'dry run (backlog-only prep)' };
+    const freshComments = readComments(key);
+    if (!Array.isArray(freshComments)) throw Error('comments unreadable');
+    // The live head and labels are read LAST, right before the post, so a late block label is seen.
     const live = readLive(key), before = names(raw.labels), after = names(live?.labels);
     if (live?.headRefOid !== head || !after || after.some(n => typeof n !== 'string')
       || JSON.stringify([...before].sort()) !== JSON.stringify([...after].sort())) throw Error('head or labels changed before post');
-    if (dryRun) return { ...row, why: 'dry run (backlog-only prep)' };
-    const freshComments = readComments(key);
     const freshProof = backlogOnlyPrepClear({ enabled: true, head, files, comments: freshComments, labels: live.labels });
     if (!freshProof.ok) return { ...row, why: freshProof.why };
     if (redTeamForHead(freshComments, pr, head)) return { ...row, why: 'already' };

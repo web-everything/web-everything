@@ -17,6 +17,13 @@ function fixture(over = {}) {
 }
 
 describe('backlog-only prep', () => {
+  it('holds when a block label arrives during the final comment read', () => {
+    let blocked = false;
+    const f = fixture({ readComments: vi.fn(() => { const was = blocked; blocked = true; return was ? [note()] : [note()]; }),
+      readLive: () => ({ headRefOid: head, labels: blocked ? ['review:prep', 'red-team:pending', 'red-team:blocked'] : ['review:prep', 'red-team:pending'] }) });
+    expect(runBacklogOnlyPrep(f)[0].action).not.toBe('clear');
+    expect(f.post).not.toHaveBeenCalled();
+  });
   it('settles exact-head clean prep, posts the bound marker and synchronizes labels', () => {
     const f = fixture();
     expect(runBacklogOnlyPrep(f)).toMatchObject([{ action: 'clear', rule: 'backlog-only-prep' }]);
@@ -120,7 +127,7 @@ describe('backlog-only prep', () => {
   it('defaults true when optional settings files are missing', () => {
     expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile: () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); } })).toEqual({ enabled: true });
   });
-  it.each(['tool read', 'tool parse', 'platform read', 'platform parse'])('fails closed on %s failure unless env is a valid boolean', failure => {
+  it.each(['tool read', 'tool parse', 'platform read', 'platform parse'])('fails closed on %s failure whatever the env says', failure => {
     const readFile = path => {
       const tool = String(path).endsWith('red-team.json');
       if (tool === failure.startsWith('tool')) {
@@ -129,11 +136,11 @@ describe('backlog-only prep', () => {
       }
       return JSON.stringify({ redTeam: { skipBacklogOnlyPrep: true } });
     };
-    for (const [value, enabled] of [[undefined, false], ['invalid', false], ['1', true], ['true', true], ['0', false], ['false', false]]) {
+    for (const [value, enabled] of [[undefined, false], ['invalid', false], ['1', false], ['true', false], ['0', false], ['false', false]]) {
       expect(resolveBacklogOnlyPrepSetting({ env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: value }, readFile })).toEqual({ enabled });
     }
   });
-  it.each([[undefined, false], ['invalid', false], ['true', true], ['false', false]])('fails closed on cascade throw with env %s', (value, enabled) => {
+  it.each([[undefined, false], ['invalid', false], ['true', false], ['false', false]])('fails closed on cascade throw with env %s', (value, enabled) => {
     const spy = vi.spyOn(policyCascade, 'cascadePolicy').mockImplementationOnce(() => { throw Error('cascade failed'); });
     try {
       expect(resolveBacklogOnlyPrepSetting({ env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: value }, readFile: () => JSON.stringify({ redTeam: { skipBacklogOnlyPrep: true } }) })).toEqual({ enabled });
