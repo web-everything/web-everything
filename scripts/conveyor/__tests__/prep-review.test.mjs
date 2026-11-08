@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  prepVerdictMarker, latestPrepVerdict, resolvePrepReviewMode, readPrepReviewModel, prepareCardOnly, readScopeEntries, readDoneWhen, executableCommands,
+  prepVerdictMarker, latestPrepVerdict, priorPrepReviews, resolvePrepReviewMode, readPrepReviewModel, prepareCardOnly, readScopeEntries, readDoneWhen, executableCommands,
   deterministicChecks, readModelFindings, buildPrepReviewResult, planPrepReview, reviewPreparePr, runPrepReviewTick,
   buildPrepReviewMandate, buildPrepReviewInput, foldOneLine, PREP_REVIEW_HEADLINE, PREP_REVIEW_LABEL, DEFAULT_PREP_REVIEW_MODEL,
 } from '../prep-review.mjs';
@@ -214,6 +214,91 @@ describe('advise mode: a note and a label, never a block', () => {
     expect(await reviewPreparePr(prepPr(), { ...deps, mode: 'off' })).toEqual({ skipped: 'mode-off' });
     expect(calls.comments).toHaveLength(0);
     expect(calls.labels).toHaveLength(0);
+  });
+});
+
+describe('one-time re-prep of legacy reviewed heads', () => {
+  const head = 'a'.repeat(40);
+  const note = (sha = head, suffix = '') => ({ ...bot, body: `<!-- prep-review: head=${sha} round=1${suffix} -->` });
+  const legacy = (comments = [note()], sha = head) => prepPr({ headRefOid: sha, labels: [{ name: 'review:prep' }], comments });
+
+  it('runs the full review once, posts both markers, then skips the next tick', async () => {
+    const judge = vi.fn(async () => ({ value: cleanModel }));
+    const readCard = vi.fn(() => card({ scope: '["we:scripts/nope.mjs"]' }));
+    const { deps, calls } = mkDeps({ judge, readCard });
+    expect(await reviewPreparePr(legacy(), deps)).toMatchObject({ reviewed: true, round: 2, posted: true, findings: ['scope-not-real'] });
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(readCard).toHaveBeenCalledTimes(1);
+    expect(calls.comments).toHaveLength(1);
+    const body = calls.comments[0].b;
+    expect(body.split('\n').slice(0, 2)).toEqual([
+      `<!-- prep-review: head=${head} round=2 reprep=1 -->`,
+      prepVerdictMarker({ head, verdict: 'findings' }),
+    ]);
+    expect(priorPrepReviews([{ ...bot, body }])).toEqual([{ head, round: 2, blocked: false, reprep: true }]);
+    expect(calls.labels).toEqual([]);
+    expect(await reviewPreparePr(legacy([note(), { ...bot, body }]), deps)).toEqual({ skipped: 'already-reviewed' });
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(calls.comments).toHaveLength(1);
+  });
+
+  it.each(['', '\n<!-- prep-review-verdict unreadable -->'])('never loops when a trusted re-prep has no readable verdict (%s)', async extra => {
+    const judge = vi.fn();
+    const { deps, calls } = mkDeps({ judge });
+    const reprepped = note(head, ' reprep=1');
+    reprepped.body += extra;
+    // Any trusted re-prep counts, even when a later legacy note is present.
+    expect(await reviewPreparePr(legacy([reprepped, note()]), deps)).toEqual({ skipped: 'already-reviewed' });
+    expect(judge).not.toHaveBeenCalled();
+    expect(calls.comments).toEqual([]);
+  });
+
+  it.each(['clean', 'findings'])('skips a head with an existing %s verdict', async verdict => {
+    const judge = vi.fn();
+    const { deps, calls } = mkDeps({ judge });
+    expect(await reviewPreparePr(legacy([note(), { ...bot, body: prepVerdictMarker({ head, verdict }) }]), deps)).toEqual({ skipped: 'already-reviewed' });
+    expect(judge).not.toHaveBeenCalled();
+    expect(calls.comments).toEqual([]);
+  });
+
+  it.each([7, 12])('skips legacy heads with only %i hex characters', async length => {
+    const sha = head.slice(0, length);
+    const judge = vi.fn();
+    const { deps } = mkDeps({ judge });
+    expect(await reviewPreparePr(legacy([note(sha)], sha), deps)).toEqual({ skipped: 'already-reviewed' });
+    expect(judge).not.toHaveBeenCalled();
+  });
+
+  it('an untrusted round is a fresh review, never a re-prep', async () => {
+    const { deps, calls } = mkDeps();
+    expect(await reviewPreparePr(legacy([{ ...note(head, ' reprep=1'), author: { login: 'stranger' } }]), deps)).toMatchObject({ reviewed: true, round: 1 });
+    expect(calls.comments[0].b).not.toContain('reprep=1');
+  });
+
+  it('checks author trust before re-prepping', async () => {
+    const judge = vi.fn();
+    const { deps, calls } = mkDeps({ judge, readPrAuthor: () => ({ author: { login: 'stranger' }, isCrossRepository: false }) });
+    expect(await reviewPreparePr(legacy(), deps)).toEqual({ skipped: 'untrusted-author' });
+    expect(judge).not.toHaveBeenCalled();
+    expect(calls.comments).toEqual([]);
+  });
+
+  it('advances past all prior rounds and cannot add a new blocking hold after the fix round', async () => {
+    const { deps, calls } = mkDeps({ mode: 'block', readCard: () => card({ scope: '[]' }) });
+    const older = { ...bot, body: `<!-- prep-review: head=${'b'.repeat(40)} round=3 -->` };
+    expect(await reviewPreparePr(legacy([older, note()]), deps)).toMatchObject({ reviewed: true, round: 4, addLabels: [] });
+    expect(calls.comments[0].b).toContain('round=4 reprep=1');
+    expect(calls.labels).toEqual([]);
+  });
+
+  it('parses legacy and blocked re-prep markers with strict optional tokens', () => {
+    expect(priorPrepReviews([note(), note(head, ' blocked=1 reprep=1')])).toEqual([
+      { head, round: 1, blocked: false, reprep: false },
+      { head, round: 1, blocked: true, reprep: true },
+    ]);
+    for (const suffix of [' reprep=0', ' reprep=11', ' reprep=1 reprep=1', ' reprep=1 blocked=1', ' unknown=1']) {
+      expect(priorPrepReviews([note(head, suffix)])).toEqual([]);
+    }
   });
 });
 

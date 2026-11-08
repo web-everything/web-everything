@@ -266,7 +266,7 @@ export function buildPrepReviewResult({ deterministic, model }) {
 
 // ---- the note, the label, the idempotence -----------------------------------------------------------------------
 
-const markerLine = ({ head, round, blocked = false }) => `<!-- ${PREP_REVIEW_MARKER}: head=${head} round=${round}${blocked ? ' blocked=1' : ''} -->`;
+const markerLine = ({ head, round, blocked = false, reprep = false }) => `<!-- ${PREP_REVIEW_MARKER}: head=${head} round=${round}${blocked ? ' blocked=1' : ''}${reprep ? ' reprep=1' : ''} -->`;
 
 /** Structured verdicts require the exact lowercase full head; never stamp partial evidence. */
 export function prepVerdictMarker({ head, verdict }) {
@@ -307,13 +307,13 @@ export function latestPrepVerdict(comments, head) {
   return latest;
 }
 
-/** Prep-review rounds already recorded on this PR by a TRUSTED author: `[{head, round, blocked}]` (`blocked`: that round applied `review:changes`). */
+/** Trusted rounds: `[{head, round, blocked, reprep}]` (`blocked`: applied `review:changes`; `reprep`: one-time legacy re-review). */
 export function priorPrepReviews(comments) {
   const out = [];
   for (const c of Array.isArray(comments) ? comments : []) {
     if (!isTrustedMarkerAuthor(c)) continue;
-    const m = new RegExp(`^<!-- ${PREP_REVIEW_MARKER}: head=([0-9a-f]{7,40}) round=(\\d+)( blocked=1)? -->`, 'm').exec(String(c?.body ?? ''));
-    if (m) out.push({ head: m[1], round: Number(m[2]), blocked: m[3] !== undefined });
+    const m = new RegExp(`^<!-- ${PREP_REVIEW_MARKER}: head=([0-9a-f]{7,40}) round=(\\d+)( blocked=1)?( reprep=1)? -->(?=\\r?$)`, 'm').exec(String(c?.body ?? ''));
+    if (m) out.push({ head: m[1], round: Number(m[2]), blocked: m[3] !== undefined, reprep: m[4] !== undefined });
   }
   return out;
 }
@@ -358,13 +358,13 @@ export function lostBlockHold({ mode, names, prior, head }) {
  * Decide what to write. Pure. `null` when this head is already reviewed, carries its label and holds nothing stale.
  * @returns {null | {round:number, body:string|null, addLabels:string[], removeLabels:string[]}}
  */
-export function planPrepReview({ mode, head, result, notChecked = [], modelNote = null, comments = [], labels = [] }) {
+export function planPrepReview({ mode, head, result, notChecked = [], modelNote = null, comments = [], labels = [], reprep = false }) {
   if (!PREP_REVIEW_MODES.includes(mode) || mode === 'off') return null;
   const names = labelNames(labels);
   const prior = priorPrepReviews(comments);
   // With more than one note for this head, a note that recorded the hold wins: `lostBlockHold` reads "any note", so must this.
   const priorSame = prior.find((p) => p.head === head && p.blocked) ?? prior.find((p) => p.head === head);
-  const sameHead = priorSame !== undefined;
+  const sameHead = priorSame !== undefined && !reprep;
   const round = sameHead ? priorSame.round : (prior.reduce((n, p) => Math.max(n, p.round), 0) + 1);
   const hasReviewLabel = names.some((n) => n.startsWith('review:'));
   const addLabels = [];
@@ -377,7 +377,7 @@ export function planPrepReview({ mode, head, result, notChecked = [], modelNote 
   const removeLabels = staleBlockHold({ names, prior, head }) ? ['review:changes'] : [];
   if (sameHead) return addLabels.length || removeLabels.length ? { round, body: null, addLabels, removeLabels } : null; // label repair only
   const lines = [
-    markerLine({ head, round, blocked: addLabels.includes('review:changes') }),
+    markerLine({ head, round, blocked: addLabels.includes('review:changes'), reprep }),
     ...[prepVerdictMarker({ head, verdict: result.outcome === 'done' ? 'clean' : 'findings' })].filter(Boolean),
     PREP_REVIEW_HEADLINE, '',
     `Mode: **${mode}**${mode === 'advise' ? ' (advice only; this never blocks the merge)' : round <= PREP_REVIEW_MAX_BLOCK_ROUNDS ? ' (one fix round for the preparer)' : ' (the one fix round is spent; advice only)'}. Round ${round}. Card head \`${head.slice(0, 12)}\`.`,
@@ -423,7 +423,12 @@ export async function reviewPreparePr(pr, deps) {
   const prior = priorPrepReviews(pr.comments);
   // Any review label means "labelled", but not "finished": a stale hold to lift, or a recorded hold (`blocked=1`) whose
   // `review:changes` never landed, still owes a label write. Those fall through to the planner, which owns that repair.
-  if (prior.some((p) => p.head === head) && names.some((n) => n.startsWith('review:')) && !staleBlockHold({ names, prior, head }) && !lostBlockHold({ mode, names, prior, head })) return { skipped: 'already-reviewed' };
+  const alreadyReviewed = prior.some((p) => p.head === head) && names.some((n) => n.startsWith('review:')) && !staleBlockHold({ names, prior, head }) && !lostBlockHold({ mode, names, prior, head });
+  // Legacy reviewed heads get one full pass to acquire a structured verdict. Persist the attempt even if that verdict
+  // later becomes unreadable; label repairs retain their existing path and never spend this migration pass.
+  const reprep = alreadyReviewed && prepVerdictMarker({ head, verdict: 'clean' }) !== null
+    && latestPrepVerdict(pr.comments, head) === null && !prior.some((p) => p.head === head && p.reprep);
+  if (alreadyReviewed && !reprep) return { skipped: 'already-reviewed' };
   // Only a PR the repo's own automation or operator opened, from this repo's own branch, earns a model call and a trusted note.
   if (!(await trustedPrAuthor(pr, deps.readPrAuthor, repo))) return { skipped: 'untrusted-author' };
   // Lift the hold the stage applied for an older head BEFORE anything is recorded: the lift is judged by the `blocked=1` note
@@ -443,7 +448,7 @@ export async function reviewPreparePr(pr, deps) {
   const deterministic = deterministicChecks({ raw, exists, alreadyDone });
   let model = { ok: false, findings: [], problems: [] };
   let modelNote = null;
-  if (prior.some((p) => p.head === head)) {
+  if (!reprep && prior.some((p) => p.head === head)) {
     model = { ok: true, findings: [], problems: [] }; // label repair only; no second model spend
   } else {
     try {
@@ -455,7 +460,7 @@ export async function reviewPreparePr(pr, deps) {
     }
   }
   const result = buildPrepReviewResult({ deterministic, model });
-  const plan = planPrepReview({ mode, head, result, notChecked: deterministic.notChecked, modelNote, comments: pr.comments, labels });
+  const plan = planPrepReview({ mode, head, result, notChecked: deterministic.notChecked, modelNote, comments: pr.comments, labels, reprep });
   if (!plan) return { skipped: 'already-reviewed' };
   const out = { reviewed: true, outcome: result.outcome, findings: result.findingsAddressed.map((f) => f.ref), addLabels: plan.addLabels, removeLabels: [...(lifted ? ['review:changes'] : []), ...plan.removeLabels], posted: plan.body !== null, round: plan.round, body: plan.body ?? undefined };
   if (dryRun) return out;
