@@ -2,9 +2,11 @@
 bornAs: xvv50ek
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/settings/merge-queue.json"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: 12962acb855409e36c592eb1c010a2225938dd5f
 tags: []
 ---
 
