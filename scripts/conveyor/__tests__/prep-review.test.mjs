@@ -865,6 +865,23 @@ describe('structured prep verdicts', () => {
     expect(latestPrepVerdict(null, head)).toBeNull();
     expect(latestPrepVerdict([{ ...bot, body: null }], head)).toBeNull();
   });
+  it.each([
+    ['double space', marker('clean').replace(' head=', '  head=')],
+    ['uppercase HEAD', marker('clean').replace('head=', 'HEAD=')],
+    ['uppercase marker name', marker('clean').replace('prep-review-verdict', 'PREP-REVIEW-VERDICT')],
+    ['malformed other head', marker('clean').replace(head, 'b'.repeat(40)).replace(' head=', '  head=')],
+    ['bare marker name', 'prep-review-verdict'],
+  ])('R752: newer trusted %s evidence invalidates an older clean verdict', (_name, malformed) => {
+    const clean = { ...bot, body: marker('clean') };
+    expect(latestPrepVerdict([clean, { ...bot, body: malformed }], head)).toBeNull();
+    for (const body of [marker('clean') + '\n' + malformed, malformed + '\n' + marker('clean')]) {
+      expect(latestPrepVerdict([clean, { ...bot, body }], head)).toBeNull();
+    }
+    expect(latestPrepVerdict([clean, { author: { login: 'stranger' }, body: malformed }], head)).toBe('clean');
+    for (const body of ['```\n' + malformed + '\n```', '`\n' + malformed + '\n`', '<!-- quoted\n' + malformed + '\n-->']) {
+      expect(latestPrepVerdict([clean, { ...bot, body }], head)).toBe('clean');
+    }
+  });
   it('uses array order, ignores untrusted markers and other heads, and rejects conflicting markers', () => {
     const clean = { ...bot, body: marker('clean') }, findings = { ...bot, body: marker('findings') };
     expect(latestPrepVerdict([clean, findings], head)).toBe('findings');

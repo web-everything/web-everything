@@ -19,6 +19,21 @@ function fixture(over = {}) {
 describe('backlog-only prep', () => {
   const marker = (sha = head) => `<!-- prep-review-verdict head=${sha} verdict=clean v=1 -->`;
   it.each([
+    ['double space', marker().replace(' head=', '  head=')],
+    ['uppercase HEAD', marker().replace('head=', 'HEAD=')],
+    ['uppercase marker name', marker().replace('prep-review-verdict', 'PREP-REVIEW-VERDICT')],
+    ['malformed other head', marker('b'.repeat(40)).replace(' head=', '  head=')],
+    ['bare marker name', 'prep-review-verdict'],
+  ])('R752: holds after older clean evidence followed by trusted %s evidence', (_name, malformed) => {
+    for (const body of [malformed, marker() + '\n' + malformed, malformed + '\n' + marker()]) {
+      const comments = [note(), { ...note(), body }];
+      expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(false);
+      const f = fixture({ readComments: () => comments });
+      expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+      expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+    }
+  });
+  it.each([
     ['prefix 7', marker(head.slice(0, 7))],
     ['prefix 12', marker(head.slice(0, 12))],
     ['uppercase head', marker(head.toUpperCase())],

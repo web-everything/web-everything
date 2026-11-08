@@ -306,7 +306,7 @@ export function latestPrepVerdict(comments, head) {
         if (match) {
           markers.add(line);
           if (match[1] === head) verdict = match[2];
-        } else if (line.includes(`<!-- prep-review-verdict head=${head}`)) malformed = true;
+        } else if (/prep-review-verdict/i.test(line)) malformed = true;
       }
       for (const [token] of line.matchAll(/<!--|-->|`+/g)) {
         if (inComment) {
