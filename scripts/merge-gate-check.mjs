@@ -31,6 +31,8 @@
  * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
  * Actions integration-id restriction (`--print-ruleset`).
  */
+import { readRedTeamCheckFact, readRedTeamGateSource } from './lib/red-team-check-run.mjs';
+import { runGhSync } from './lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -160,7 +162,7 @@ export function readLedgerConfig(read = readDeclaredSettings) {
 }
 
 /** Gather every fact `evaluatePrGates` needs for one PR. Never throws; each failure is recorded on its fact. */
-export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, mainCi = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
+export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, mainCi = null, expectedHeadSha = null, requireExpectedHead = false, env = process.env, exec = execFileSync }) {
   const facts = { repo, num };
   // Ledger authority: gathered FIRST, so even a PR-read failure below carries the configured authority. A caller
   // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. Ledger evidence
@@ -175,6 +177,10 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   // THE JUDGED COMMIT: every git read below is pinned to this exact sha, never to pr.headRefName.
   const pin = pinnedHeadOf(pr, { expected: expectedHeadSha, requireExpected: requireExpectedHead });
   facts.pinnedHead = pin;
+  facts.redTeamGateSource = readRedTeamGateSource({ env, log: line => process.stderr.write(`${line}\n`) }).value.source;
+  facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
+    : readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID,
+      gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
 
   if (!facts.ledger.error && ['ledger', 'both'].includes(facts.ledger.authority)) {
     try {

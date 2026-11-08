@@ -5,7 +5,7 @@ import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 
 const HEAD = '7d20124ecb8bb052bf1d1dabb8215a54ba6262df';
 // Real job 114754411476, lines 517–542, extended with the current enqueue-owned
-// card-group row. Preserve timestamps and spacing for the replay.
+// card-group and red-team rows. Preserve timestamps and spacing for the replay.
 const LOG = `2026-10-12T09:49:30.3867808Z merge-gate: workflow self-check — ok: running workflow .github/workflows/merge-gate.yml matches main
 2026-10-12T09:49:30.3934091Z merge-gate mode: enforce (source: env)
 2026-10-12T09:49:30.3934630Z #4965: HOLD
@@ -18,6 +18,7 @@ const LOG = `2026-10-12T09:49:30.3867808Z merge-gate: workflow self-check — ok
 2026-10-12T09:49:30.3943077Z   queue             mergeable              queue-owned
 2026-10-12T09:49:30.3943966Z   queue             landable-state         queue-owned
 2026-10-12T09:49:30.3944817Z   pass              non-empty-body         body present
+2026-10-12T09:49:30.3945500Z   pass              red-team               red-team check run succeeded for this PR on head
 2026-10-12T09:49:30.3946148Z   hold              review-hold-labels     unsatisfied review hold label without review:accepted
 2026-10-12T09:49:30.3950221Z   hold              review-acceptance      park: human-gated (review:human) — only a human may clear it [blast-radius (scripts/__tests__/drain-workflow-edit-cli.test.mjs, scripts/__tests__/drain-workflow-edit-replay.test.mjs, scripts/__tests__/gate-entrypoint-integration.test.mjs, …); gate-self (scripts/lib/gate-config.mjs) — declarative leash, human review required; size (731 ≥ 400 changed lines)]
 2026-10-12T09:49:30.3952684Z   pass              manifest-baseline      no weakening across 1 historical bodies

@@ -13,6 +13,7 @@ import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from 
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
 import { findDuplicateIds } from '../duplicate-id-tripwire.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
+import { readRedTeamCheckFact } from '../red-team-check-run.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
@@ -28,6 +29,7 @@ const base = () => ({
   duplicateIds: { main: [] },
   redMain: { source: 'ops/red-main', frozen: false },
   enqueueClearance: null,
+  redTeamCheck: { ok: true, reason: 'red-team check run succeeded on head' },
   ledger: { authority: 'labels', folded: null, derived: null },
   pinnedHead: { sha: HEAD },
   gatePaths: { files: ['docs/a.md'] },
@@ -51,6 +53,71 @@ function check(input, id, status, ok = false, options) {
 const labels = (...names) => names.map((name) => ({ name }));
 const codeql = [{ name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-01-01T00:00:00Z' }];
 const manifestBody = `${MANIFEST_BODY_BEGIN}\n${JSON.stringify({ item: '123', blockedBy: ['9'], dismissedFindings: 2 })}\n${MANIFEST_BODY_END}`;
+
+describe('red-team check run merge gate', () => {
+  it('merge-group members sharing a head require their own PR-bound red-team check', () => {
+    const gh = () => JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team', head_sha: HEAD,
+      external_id: 'o/r#7', app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] });
+    const members = [7, 8].map(num => evaluatePrGates(facts({ num, pr: { number: num },
+      duplicateIds: { main: [], group: [] }, redTeamCheck: readRedTeamCheckFact({ repo: 'o/r', pr: num,
+        headSha: HEAD, appId: 5037855, gh }) }), { mergeEvent: 'merge_group' }));
+    expect(members[0].ok).toBe(true);
+    expect(members[1].results).toContainEqual(expect.objectContaining({ id: 'red-team', status: 'hold',
+      reason: expect.stringMatching(/o\/r#8.*external_id/) }));
+    expect(evaluateGroup(members, { nums: [7, 8], complete: true, reasons: [], heads: { 7: HEAD, 8: HEAD } }).ok).toBe(false);
+  });
+  it.each(['both', 'check-run', 'drain-scan'])('applies the check-run gate according to mode %s', source => {
+    const result = evaluatePrGates(facts({ redTeamGateSource: source,
+      redTeamCheck: { ok: false, reason: 'no red-team check run on head' } }));
+    expect(result.results.find(gate => gate.id === 'red-team')).toMatchObject(source === 'drain-scan'
+      ? { status: 'pass', reason: 'redTeamGate.source=drain-scan' } : { status: 'hold' });
+    expect(result.ok).toBe(source === 'drain-scan');
+  });
+  it('passes a successful red-team fact on the PR leg', () => {
+    check(facts(), 'red-team', 'pass', true, { mergeEvent: 'pull_request' });
+  });
+
+  it.each(['no red-team check run on head', 'red-team check run failed'])('holds the PR leg with the fact reason: %s', reason => {
+    const result = check(facts({ redTeamCheck: { ok: false, reason } }), 'red-team', 'hold', false, { mergeEvent: 'pull_request' });
+    expect(result.blocking).toContainEqual(expect.objectContaining({ id: 'red-team', reason }));
+  });
+
+  it('fails closed when the red-team fact is absent', () => {
+    const input = facts();
+    delete input.redTeamCheck;
+    const result = check(input, 'red-team', 'fail-closed', false, { mergeEvent: 'pull_request' });
+    expect(result.blocking.find(g => g.id === 'red-team').reason).toMatch(/red-team|unreadable|missing/i);
+  });
+
+  it.each([false, true])('merge_group requires success for both member heads (second succeeds=%s)', secondOk => {
+    const other = 'b'.repeat(40);
+    const groupHead = 'c'.repeat(40);
+    const firstGroup = 'd'.repeat(40);
+    const membership = readGroupPrs({ repo: 'o/r', headSha: groupHead, baseSha: 'e'.repeat(40), headRef: '', cwd: '.',
+      exec: (cmd, args) => {
+        if (cmd === 'git' && args[0] === 'log') return [
+          `${firstGroup}\t${'e'.repeat(40)} ${HEAD}\tMerge pull request #7 from o/first`,
+          `${groupHead}\t${firstGroup} ${other}\tMerge pull request #8 from o/second`,
+        ].join('\n');
+        throw new Error('supplemental queue API unavailable');
+      } });
+    expect(membership).toMatchObject({ complete: true, heads: { 7: HEAD, 8: other } });
+    const prs = membership.nums.map(num => {
+      const sha = membership.heads[num];
+      return evaluatePrGates(facts({ num, pr: { number: num, headRefOid: sha }, pinnedHead: { sha },
+        acceptance: { headSha: sha, acceptedSha: sha }, duplicateIds: { main: [], group: [] },
+        redTeamCheck: { ok: num === 7 || secondOk, reason: num === 8 && !secondOk ? 'no red-team check run on head' : 'success' },
+      }), { mergeEvent: 'merge_group' });
+    });
+    const result = evaluateGroup(prs, membership);
+    expect(result.ok, JSON.stringify(result)).toBe(secondOk);
+    expect(prs.find(pr => pr.num === 7).ok).toBe(true);
+    expect(prs.find(pr => pr.num === 8).results).toContainEqual(expect.objectContaining({
+      id: 'red-team', status: secondOk ? 'pass' : 'hold',
+    }));
+    if (!secondOk) expect(result.reason).toContain('#8');
+  });
+});
 
 describe('evaluatePrGates', () => {
   it('passes the accepted baseline', () => {
@@ -1205,7 +1272,13 @@ describe('merge-gate workflow: mode wiring and trigger hygiene', () => {
   const wf = workflowOf('merge-gate.yml');
   const job = wf.jobs['merge-gate'];
   const evaluate = job.steps.find((s) => /merge-gate-check\.mjs/.test(s.run || ''));
-  const UNWATCHED = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:')";
+  const UNWATCHED = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')";
+
+  it('watches red-team: label changes in job execution, check naming and cancellation', () => {
+    for (const expression of [job.if, job.name, wf.concurrency.group]) {
+      expect(expression).toContain("!startsWith(github.event.label.name, 'red-team:')");
+    }
+  });
 
   it('every merge-gate-check.mjs call goes through the mode wrapper, and the env layer comes from a repo variable', () => {
     const calls = evaluate.run.split('\n').filter((l) => /node [^\n]*merge-gate-check\.mjs/.test(l));
