@@ -217,6 +217,12 @@ export function reserveSeatCalls({ ledger, records, want, dailyCap, now, newId, 
   return { callIds, used: ids.size, ledger: { version: 1, reservations: [...otherProviders, ...kept, ...fresh] } };
 }
 
+/** Drop unspent reservations (a round that never started must not burn the day's budget). PURE. */
+export function releaseSeatCalls({ ledger, callIds }) {
+  const drop = new Set(callIds ?? []);
+  return { version: 1, reservations: (Array.isArray(ledger?.reservations) ? ledger.reservations : []).filter((r) => r && !drop.has(r.callId)) };
+}
+
 /**
  * Is `provider` sitting out a quota hit? Reads its MOST RECENT seat row only: a later clean row ends the hold.
  * @returns {string|null} the reason, or null when usable. PURE.
@@ -1061,6 +1067,15 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
         return r;
       }, { timeoutMs: lockTimeoutMs });
     },
+    releaseCalls: ({ provider, callIds }) => {
+      const ledgerPath = ledgerPathFor(provider);
+      return withLedgerLock(ledgerPath, () => {
+        if (!existsSync(ledgerPath)) return;
+        const tmp = `${ledgerPath}.${process.pid}.tmp`;
+        writeFileSync(tmp, `${JSON.stringify(releaseSeatCalls({ ledger: JSON.parse(readFileSync(ledgerPath, 'utf8')), callIds }), null, 2)}\n`);
+        renameSync(tmp, ledgerPath);
+      }, { timeoutMs: lockTimeoutMs });
+    },
     cliAvailable: (provider) => {
       const r = spawnSync(CLI_BIN[provider], ['--version'], { env, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] });
       return r.status === 0;
@@ -1819,6 +1834,7 @@ export async function speculateRedTeam({
       if (published?.published === false) {
         const reason = `red-team round not started: in_progress check not posted (${String(published.reason ?? 'publication failed').slice(0, 300)}); retried next tick`;
         io.log(reason);
+        try { io.releaseCalls?.({ provider, callIds: [callId] }); } catch (e) { io.log(`red-team reservation release failed: ${e.message}`); }
         return { status: 'skipped', reason };
       }
     }

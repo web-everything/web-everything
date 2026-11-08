@@ -22,7 +22,7 @@ import {
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
   resolveProviderCap, reviewSeatCapUsage, toIsoInstant, extractAnswerJson, reserveSeatCalls, createExtraSeatsIo,
   withLedgerLock, isPinnedRev, repoRelativeFindings, readSeatCapUsage,
-  applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow, createRedTeamIo,
+  applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow, createRedTeamIo, releaseSeatCalls,
 } from '../review-extra-seats.mjs';
 import { runReviewJob, summarizeExtraSeats } from '../review-job.mjs';
 import { ADVISORY_JUDGE_LENS, JUDGE_SEATS } from '../review-pr.mjs';
@@ -1710,6 +1710,16 @@ describe('#6535 publish-first: a red-team round starts only after its in_progres
     expect(order).toEqual([['status', 'running']]);
     expect(pass.status).toBe('skipped');
     expect(pass.reason).toMatch(/not started.*GitHub write failed/s);
+  });
+  it('gives the reserved daily-budget call back when the round is not started', async () => {
+    const released = [];
+    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex', redTeamStatus: () => ({ published: false, reason: 'down' }),
+      releaseCalls: o => released.push(o) });
+    const pass = await spec(io);
+    expect(pass.status).toBe('skipped');
+    expect(released).toEqual([{ provider: 'codex', callIds: [expect.any(String)] }]);
+    const ledger = { version: 1, reservations: [{ callId: 'a', at: 'x' }, { callId: 'b', at: 'x' }] };
+    expect(releaseSeatCalls({ ledger, callIds: ['a'] }).reservations).toEqual([{ callId: 'b', at: 'x' }]);
   });
   it('does not start the round when the status writer throws', async () => {
     const { io, order } = rig(() => { throw new Error('disk full'); });
