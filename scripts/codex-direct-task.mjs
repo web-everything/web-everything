@@ -902,27 +902,38 @@ const nfc = (name) => name.normalize('NFC');
  *  rebuild the old name. Names compare in NFC: macOS git lists precomposed names (`core.precomposeUnicode`) while
  *  the disk may store them decomposed, which is the same name, not a rename. A missing path is a deletion git does
  *  see; a listing failure other than a missing directory is doubt (thrown). Each directory is listed once. */
-function caseOnlyRename(dir, paths) {
+export function caseOnlyRename(dir, paths, readdirFn = readdirSync) {
   const listings = new Map();
   const listing = (rel) => {
     if (!listings.has(rel)) {
       let names = null;
       try {
-        const raw = readdirSync(rel ? join(dir, rel) : dir).map(nfc);
-        names = { exact: new Set(raw), folded: new Set(raw.map(name => name.toLowerCase())) };
+        const raw = readdirFn(rel ? join(dir, rel) : dir).map(nfc);
+        names = { exact: new Set(raw), folded: new Map() };
+        for (const name of raw) {
+          const key = name.toLowerCase();
+          names.folded.set(key, [...(names.folded.get(key) ?? []), name]);
+        }
       } catch (error) { if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error; }
       listings.set(rel, names);
     }
     return listings.get(rel);
   };
+  // On a case-sensitive filesystem the old name is gone and the new case is a separate path git DOES see (tracked
+  // here after intent-to-add): that is a genuine rename the patch carries, not one hidden by case folding.
+  const trackedNames = new Set(paths.map(path => path.replace(/\/$/, '').split('/').map(nfc).join('/')));
+  const seenAsTracked = (candidate) => trackedNames.has(candidate) || [...trackedNames].some(name => name.startsWith(`${candidate}/`));
   for (const path of paths) {
     const parts = path.replace(/\/$/, '').split('/').map(nfc);
     for (let i = 0; i < parts.length; i += 1) {
       const names = listing(parts.slice(0, i).join('/'));
       if (!names) break;
       if (names.exact.has(parts[i])) continue;
-      if (names.folded.has(parts[i].toLowerCase())) return path;
-      break;
+      const folded = names.folded.get(parts[i].toLowerCase());
+      if (!folded) break;
+      const prefix = parts.slice(0, i);
+      if (folded.every(name => seenAsTracked([...prefix, name].join('/')))) break;
+      return path;
     }
   }
   return null;

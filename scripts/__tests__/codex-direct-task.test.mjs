@@ -46,6 +46,7 @@ import {
   detachedGateExecFn,
   setupScratchClone,
   captureDiff,
+  caseOnlyRename,
   diffProvesNoEdits,
   runGate,
   runCodexDirectExec,
@@ -989,6 +990,20 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('caseOnlyRename: a rename whose new case is itself tracked is carried (case-sensitive fs); an untracked fold is refused', () => {
+    const lsDir = (names) => () => names;
+    // Case-sensitive fs: tool.sh is gone, TOOL.sh sits on disk AND in the tracked list → git sees the rename.
+    expect(caseOnlyRename('/d', ['tool.sh', 'TOOL.sh'], lsDir(['TOOL.sh']))).toBe(null);
+    // Case-insensitive fs: only the old name is tracked, the disk holds the new case → hidden from git, refused.
+    expect(caseOnlyRename('/d', ['tool.sh'], lsDir(['TOOL.sh']))).toBe('tool.sh');
+    // A renamed parent directory: its files tracked under the new case are carried; untracked are refused.
+    const lsNested = (p) => (p === '/d' ? ['SRC'] : ['a.js']);
+    expect(caseOnlyRename('/d', ['src/a.js', 'SRC/a.js'], lsNested)).toBe(null);
+    expect(caseOnlyRename('/d', ['src/a.js'], lsNested)).toBe('src/a.js');
+    // Doubt (a listing failure other than a missing dir) throws rather than counting as clear.
+    expect(() => caseOnlyRename('/d', ['tool.sh'], () => { throw Object.assign(new Error('boom'), { code: 'EIO' }); })).toThrow('boom');
   });
 
   it('binarySafe: a case-only rename is carried by the patch, or refused where the filesystem folds case', () => {
