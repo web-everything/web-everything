@@ -442,7 +442,9 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
   runSetLabel = execFileSync,
   post = (repo, pr, body) => execFileSyncThrottled('gh',
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }) } = {}) {
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }),
+  removeComment = (repo, id) => execFileSyncThrottled('gh', ['api', '--method', 'DELETE', `repos/${repo}/issues/comments/${id}`],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }) } = {}) {
   return {
     ['github.referral-ruling-file-card']: rulingCardFilingSink(landCard),
     ['github.referral-ruling-file-card-judge']: judgeRulingSink({ confirm, land: landCard, planCard: planReferralCard }),
@@ -567,17 +569,41 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         }
         if (miss) throw new Error(`ledger-write-miss: the ruling was not recorded in the verdict ledger, so it does not clear and nothing was posted (${miss}); retry once the ledger is writable`);
       }
-      const already = before.comments.some((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
+      const sameBody = (c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body;
+      const already = before.comments.some(sameBody);
+      // PR #6529: the identity check and the post are separate `gh` calls, so a per-call credential fallback (the App
+      // shim's personal fallback on a token-cache miss) can still split them. A human-actor ruling must be AUTHORED by
+      // the login that passed the check (both sides lower-cased); anything else is refused and compensated below.
+      const strayOf = (comments) => actor === JUDGE_ACTOR || !checkedLogin ? []
+        : comments.filter((c) => sameBody(c) && String(c?.author?.login ?? '').toLowerCase() !== checkedLogin);
+      // Round 2: the gate reader trusts an automation author too, so a wrong-author CLEARING comment left on the thread
+      // still clears the comment gate after the ledger revert. Re-read the thread (the post may have thrown after it
+      // landed), delete each wrong-author copy by its own id, and confirm on a fresh read that it is gone. Never throws:
+      // returns the note for the error, naming any copy that may still be LIVE.
+      const STRAY_DELETE_CAP = 5;
+      const removeStrays = () => {
+        let strays;
+        try { strays = strayOf(readPrThread(repo, pr, { readJson }).comments); } catch (e) {
+          return `could not re-read the thread to check for a wrong-author ruling comment (${String(e?.message ?? e).split('\n')[0]}); one may be LIVE and clear the comment gate — inspect the thread before retrying`;
+        }
+        if (!strays.length) return '';
+        const ids = strays.map((c) => /#issuecomment-(\d+)$/.exec(String(c?.url ?? ''))?.[1] ?? null);
+        ids.forEach((id, i) => {
+          if (!id || i >= STRAY_DELETE_CAP) return;
+          try { removeComment(repo, id); } catch (e) { warn(`could not delete wrong-author ruling comment ${strays[i].url}: ${String(e?.message ?? e).split('\n')[0]}`); }
+        });
+        let left;
+        try { left = strayOf(readPrThread(repo, pr, { readJson }).comments); } catch { left = strays; }
+        if (!left.length) return `removed the wrong-author ruling comment${strays.length === 1 ? '' : 's'} ${strays.map((c) => c.url).join(', ')} from the thread`;
+        return `${left.map((c) => c.url || `(a comment by ${String(c?.author?.login ?? '')} with no id)`).join(', ')} is LIVE and clears the comment gate `
+          + '(its delete failed or could not be confirmed) — delete it before retrying';
+      };
       let seen;
       try {
         if (!already) post(repo, pr, body);
         const after = readPrThread(repo, pr, { readJson });
-        seen = after.comments.filter((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
-        // PR #6529: the identity check and the post are separate `gh` calls, so a per-call credential fallback (the App
-        // shim's personal fallback on a token-cache miss) can still split them. A human-actor ruling must be AUTHORED by
-        // the login that passed the check; anything else is refused and its clearing rows reverted below.
-        const strays = actor === JUDGE_ACTOR || !checkedLogin ? []
-          : seen.filter((c) => String(c?.author?.login ?? '').toLowerCase() !== checkedLogin);
+        seen = after.comments.filter(sameBody);
+        const strays = strayOf(seen);
         if (strays.length) {
           throw new Error(`the ruling comment is not readable by the gate after posting: it is authored by ${JSON.stringify(String(strays[0]?.author?.login ?? ''))}, not the checked poster ${checkedLogin}; the hold remains — inspect the thread before retrying`);
         }
@@ -590,8 +616,11 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         }
       } catch (error) {
         // Clearing rows are already recorded (the F4 order) but the comment did not land readable: they must not stay live.
+        // A holding-only ruling is left alone: a wrong-author block comment can only hold, so deleting it would drop a hold.
         if (!clearing.length) throw error;
-        throw new Error(`${String(error?.message ?? error)} [${revertNote(clearing, await revertToHold(clearing))}; ${RERUN}]`);
+        // Both compensations run, each independently: the thread (the comment gate) and the ledger (the ledger gate).
+        const removal = removeStrays();
+        throw new Error(`${String(error?.message ?? error)} [${removal ? `${removal}; ` : ''}${revertNote(clearing, await revertToHold(clearing))}; ${RERUN}]`);
       }
       const holding = events.filter((e) => !clearsHold(e.ruling));
       const holdMiss = holding.length ? await tryAppend(holding) : null;

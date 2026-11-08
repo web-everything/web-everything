@@ -9,7 +9,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const transport = vi.hoisted(() => ({ calls: [], thread: null, identityFallback: false }));
+const transport = vi.hoisted(() => ({ calls: [], thread: null, identityFallback: false, postAs: null, deleteFails: false, nextId: 100 }));
 
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const orig = await importOriginal();
@@ -29,7 +29,15 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
       }
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(transport.thread);
       if (args[0] === 'pr' && args[1] === 'comment') {
-        transport.thread.comments.push({ body: args[args.indexOf('--body') + 1], author: { login: as } });
+        transport.thread.comments.push({ body: args[args.indexOf('--body') + 1], author: { login: transport.postAs ?? as },
+          url: `https://github.com/${repo}/pull/7#issuecomment-${transport.nextId++}` });
+        return '';
+      }
+      // The compensating delete of a wrong-author ruling comment (`gh api --method DELETE repos/<repo>/issues/comments/<id>`).
+      if (args[0] === 'api' && args.includes('DELETE')) {
+        if (transport.deleteFails) throw new Error('HTTP 403: Resource not accessible');
+        const id = /\/issues\/comments\/(\d+)$/.exec(args.at(-1))?.[1];
+        transport.thread.comments = transport.thread.comments.filter((c) => !String(c.url ?? '').endsWith(`#issuecomment-${id}`));
         return '';
       }
       throw new Error(`unexpected gh call: ${args.join(' ')}`);
@@ -37,7 +45,7 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   };
 });
 
-const { mandatoryReferralReviewer, normalizeFinding, readOperatorRulings, referralFindingKey, renderReferralRecord } = await import('../../lib/jury-core.mjs');
+const { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, readOperatorRulings, referralFindingKey, renderReferralRecord } = await import('../../lib/jury-core.mjs');
 const { openReferralFindings, planOperatorRuling, OPERATOR_RULING_POST_EFFECT } = await import('../record-referral-ruling.mjs');
 const { createRecordReferralRulingReader, createRecordReferralRulingSinks } = await import('../record-referral-ruling-io.mjs');
 
@@ -54,9 +62,16 @@ const plan = () => planOperatorRuling({ head, ...openReferralFindings({ comments
   identity: { login: 'chalbert', type: 'User' }, card: null, now: '2026-11-08T06:00:00Z', clearerId: 's' },
 { repo, pr: 7, finding: 'all-open', ruling: 'not-real', actor: 'chalbert', channel: 'claude-code-chat', reason: 'not real' });
 
+const repo7 = { repo, pr: 7, head };
+const gatePending = () => mandatoryReferralState(transport.thread.comments, repo7).pending;
+const sinkArgs = (p) => ({ ...repo7, body: p.body, actor: 'chalbert', channel: 'claude-code-chat',
+  rulings: p.record.rulings.map((r) => ({ runId: r.runId, key: r.key, result: r.result })) });
+
 beforeEach(() => {
   transport.calls.length = 0;
   transport.identityFallback = false;
+  transport.postAs = null;
+  transport.deleteFails = false;
   transport.thread = { headRefOid: head, body: rec.authorBody, createdAt: '2026-11-08T00:00:00Z', comments: [gh(renderReferralRecord(rec))] };
 });
 
@@ -85,6 +100,43 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
       .rejects.toThrow(/authored by "web-everything", not the checked poster chalbert/);
     // The not-real row was recorded first (F4 order), then reverted by a holding block row: the finding stays held.
     expect(events.map((e) => e.ruling)).toEqual(['not-real', 'block']);
+    // Round 2 red team: the COMMENT-based gate must stay held too. The App-authored ruling comment is trusted by the
+    // gate reader, so the sink deletes it and confirms it is gone; the finding is still pending.
+    expect(readOperatorRulings(transport.thread.comments).rulings).toEqual([]);
+    expect(gatePending()).toEqual([rec.referrals[0].key]);
+    expect(transport.calls.filter((c) => c.args[0] === 'api' && c.args.includes('DELETE'))).toHaveLength(1);
+  });
+
+  it('a post that throws after the comment landed (lost reply) still removes the wrong-author comment', async () => {
+    transport.identityFallback = true;
+    const events = [];
+    const post = (r, pr, body) => {
+      transport.thread.comments.push({ body, author: { login: 'web-everything' }, url: `https://github.com/${r}/pull/${pr}#issuecomment-${transport.nextId++}` });
+      throw new Error('gh: request timed out');
+    };
+    const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, post, appendEvents: async (list) => { events.push(...list); } })[OPERATOR_RULING_POST_EFFECT];
+    await expect(sink(sinkArgs(plan()))).rejects.toThrow(/request timed out[\s\S]*removed/);
+    expect(events.map((e) => e.ruling)).toEqual(['not-real', 'block']);
+    expect(readOperatorRulings(transport.thread.comments).rulings).toEqual([]);
+    expect(gatePending()).toEqual([rec.referrals[0].key]);
+  });
+
+  it('a wrong-author comment that cannot be deleted is named LIVE in the error, and the ledger is still reverted', async () => {
+    transport.identityFallback = true;
+    transport.deleteFails = true;
+    const events = [];
+    const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async (list) => { events.push(...list); } })[OPERATOR_RULING_POST_EFFECT];
+    await expect(sink(sinkArgs(plan()))).rejects.toThrow(/issuecomment-\d+ is LIVE and clears the comment gate/);
+    expect(events.map((e) => e.ruling)).toEqual(['not-real', 'block']);
+  });
+
+  it('a ruling authored by the checked operator in different letter case is kept, not deleted', async () => {
+    transport.identityFallback = true;
+    transport.postAs = 'Chalbert';
+    const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async () => {} })[OPERATOR_RULING_POST_EFFECT];
+    await expect(sink(sinkArgs(plan()))).resolves.toMatchObject({ posted: true });
+    expect(transport.calls.filter((c) => c.args.includes('DELETE'))).toEqual([]);
+    expect(readOperatorRulings(transport.thread.comments).rulings).toHaveLength(1);
   });
 
   it('the reader reads the planning identity with the same pinned poster credential', () => {
