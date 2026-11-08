@@ -12,6 +12,7 @@ import {cpus, loadavg, freemem, totalmem} from 'node:os';
 import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchStamp} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
+const FORGE_RUN_WALL_MS = 1_740_000;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const runName = value => typeof value === 'string' && /^r-[a-f0-9]{32}$/.test(value);
 const nonceOK = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
@@ -488,7 +489,44 @@ finally:
 // A root supervisor is a subreaper: children which call setsid/double-fork are
 // adopted here, and killed before the ops process publishes any evidence.
 export const supervisorSource = String.raw`
-import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat
+import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat, threading, select, traceback
+# Diagnostics are best-effort: a closed, broken or full-and-undrained stderr pipe
+# must never abort or block worker cleanup, status publication or the supervisor's
+# own exit. The write goes straight to the descriptor (never through sys.stderr,
+# whose pending buffer would make the interpreter's exit flush fail or block).
+# A pipe with no room is skipped without starting a thread (so a stalled sink
+# never adds a task to the run cgroup); otherwise the write runs on a daemon
+# thread that is waited for only briefly. One failed, partial or stalled write
+# disables the rest. Uncaught errors are reported through the same path.
+diag_off = False
+def diag(message):
+    global diag_off
+    if diag_off: return
+    def emit(fd):
+        global diag_off
+        try:
+            data = message.encode('utf-8', 'replace')
+            while data:
+                data = data[os.write(fd, data):]
+        except BaseException:
+            diag_off = True
+    try:
+        fd = sys.stderr.fileno()
+        probe = select.poll()
+        probe.register(fd, select.POLLOUT)
+        ready = probe.poll(0)
+        if not ready or ready[0][1] & (select.POLLERR | select.POLLHUP | select.POLLNVAL) or not ready[0][1] & select.POLLOUT:
+            diag_off = True
+            return
+        sender = threading.Thread(target=emit, args=(fd,), daemon=True)
+        sender.start()
+        sender.join(0.25)
+        if sender.is_alive(): diag_off = True
+    except BaseException:
+        diag_off = True
+def crash_hook(kind, error, trace):
+    diag(''.join(traceback.format_exception(kind, error, trace)))
+sys.excepthook = crash_hook
 PR_SET_CHILD_SUBREAPER = 36
 if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
     raise RuntimeError('subreaper unavailable')
@@ -536,6 +574,40 @@ else:
         finally: os.close(archive)
     else:
         child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
+    started = time.monotonic()
+    orphan_seen = {}
+    def supervision_expired():
+        now = time.monotonic()
+        processes = {}
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit(): continue
+            try:
+                with open('/proc/' + entry + '/stat', 'rb') as stream:
+                    data = stream.read()
+                fields = data[data.rfind(b')')+2:].split()
+                processes[int(entry)] = (fields[0], int(fields[1]))
+            except (FileNotFoundError, ProcessLookupError): pass
+        # Age only live, directly adopted orphans, never the main child.
+        orphans = {pid for pid, (state, ppid) in processes.items()
+                   if ppid == os.getpid() and pid != child.pid and state != b'Z'}
+        for pid in list(orphan_seen):
+            if pid not in orphans: del orphan_seen[pid]
+        for pid in orphans: orphan_seen.setdefault(pid, now)
+        expired = {pid for pid, first in orphan_seen.items()
+                   if (now - first) * 1000 >= cfg.get('orphanGraceMs', 60000)}
+        found, frontier = set(expired), set(expired)
+        while frontier:
+            frontier = {pid for pid, (_, ppid) in processes.items()
+                        if ppid in frontier and pid != child.pid} - found
+            found.update(frontier)
+        for pid in found:
+            if processes[pid][0] == b'Z': continue
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        if cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
+            diag('forge-exec-run: wall limit exceeded; killing child tree\n')
+            return True
+        return False
     if cfg.get('cancel'):
         while True:
             if cancelled():
@@ -545,12 +617,22 @@ else:
                 except ProcessLookupError: pass
                 code = 255
                 break
+            if supervision_expired():
+                code = 124
+                break
             try:
                 code = child.wait(timeout=0.1)
                 break
             except subprocess.TimeoutExpired: pass
     else:
-        code = child.wait()
+        while True:
+            if supervision_expired():
+                code = 124
+                break
+            try:
+                code = child.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired: pass
 # All descendants run as the dedicated uid. Include live descendants before
 # killing their parents, then reap orphans adopted by this subreaper.
 def children():
@@ -601,7 +683,7 @@ if cfg.get('usage') is not None:
         if samples: process_count = max(samples)
     except (OSError, StopIteration, ValueError): pass
     if process_count is None:
-        sys.stderr.write('forge-exec-run: task-pressure sample unavailable; near-limit status unknown; inspect the run cgroup\n')
+        diag('forge-exec-run: task-pressure sample unavailable; near-limit status unknown; inspect the run cgroup\n')
 deadline = time.monotonic() + 30
 while True:
     # Escaped sessions and externally reparented children still belong only to
@@ -979,7 +1061,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
       const launcher=elasticScopeArgv({limits,units,slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());

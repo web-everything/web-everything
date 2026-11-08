@@ -23,19 +23,32 @@
  * `claude --bg` spawn must put the marker in `--settings` — {@link workerMarkerSettingsEnv} — not only in the
  * spawn call's `env`.
  */
+import { loadAccountMap, resolveAccount, accountEnv, CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
+
 export const WORKER_MARKER_ENV = 'WE_CONVEYOR_WORKER';
 export const WORKER_MARKER_VALUE = '1';
 
-/** A copy of `env` with the worker marker set. Pass the result as a spawn's `env`. Never mutates `env`. */
-export function markWorkerEnv(env = process.env) {
-  return { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
+/** A copy of `env` with the worker marker set. Pass the result as a spawn's `env`. Never mutates `env`.
+ *  Auth split: when the launchd label in `env` maps to a Claude account, the account's token (read from the
+ *  Keychain in-process) replaces any inherited credential env; a refused label throws; otherwise `env` is unchanged. */
+export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain } = {}) {
+  const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
+  const res = resolveAccount(env, map);
+  if (res.kind === 'refuse') {
+    throw new Error(`claude-account: launchd job ${res.label} has no usable Claude account mapping and is refused (no fallback to /login); add it to scripts/settings/claude-accounts.json`);
+  }
+  if (res.kind !== 'account') return out;
+  for (const k of CREDENTIAL_ENV_VARS) delete out[k];
+  return { ...out, ...accountEnv(res.account, map, readKeychain ? { readKeychain } : {}) };
 }
 
 /** A copy of a `--settings` env object (or `null`) with the worker marker set — what every `claude --bg` spawn
  *  folds into `--settings '{"env":...}'` (see the header: the spawn's own `env` never reaches a `--bg` session).
- *  Never mutates its input. */
+ *  Never mutates its input. It NEVER carries a credential: the `--settings` text lands in argv and job state. */
 export function workerMarkerSettingsEnv(settingsEnv = null) {
-  return { ...(settingsEnv ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
+  const out = { ...(settingsEnv ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
+  for (const k of CREDENTIAL_ENV_VARS) delete out[k];
+  return out;
 }
 
 /** @returns {{ role: 'orchestrator'|'worker'|'unknown', reason: string }} */

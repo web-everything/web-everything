@@ -37,3 +37,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Note
+
+flow-sim A-C7 confirms this gap (2026-11-07 sim); see the report. Duplicate card 8050 was removed (R719 dedup).
