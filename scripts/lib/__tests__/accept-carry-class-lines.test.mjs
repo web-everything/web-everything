@@ -15,13 +15,13 @@ const advisory = (extra = '') => [
   '1. [not confirmed] (edge-case, broken) `scripts/lib/x.mjs:192` — a summary',
   '   - Class: live-reproduced → fix-now (basis: executed the module)',
   '   - Also class: theoretical-race',
-  extra,
+  ...(extra ? [extra] : []),
   '   - Scenario: a scenario',
   '   - Re-check: insufficient evidence',
   '   - Files read: scripts/lib/x.mjs',
   '',
   "A confirmed break is recorded as a miss for the accepting review and for the builder's model.",
-].filter(line => line !== null && !(line === '' && extra === '' && false)).join('\n').replace(/\n\n\n/g, '\n\n');
+].join('\n');
 
 describe('red-team advisory with Class / Also class lines is a machine note, not a later hold', () => {
   it('treats the rendered Class and Also class sublines as non-blocking for a trusted author', () => {
