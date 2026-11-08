@@ -1,4 +1,7 @@
 {
+  "redTeamGate": {
+    "$comment": "source: both (standard default), check-run (cutover), or drain-scan (rollback). Resolves standard -> platform -> tool -> WE_RED_TEAM_GATE_SOURCE; invalid values are ignored and logged. Check-run recovery waits drain.redTeamPendingMaxMin, then requests once per live head through requestRedTeam, durable before dispatch. Publication guarantee: a round starts only after its in_progress check posts; when a check post and its failure supersede both fail, the writer posts a head-bound red-team/publication commit status (failure) that every merge-gate host reads, cleared only by a confirmed publication. If every GitHub write fails, only the drain-local hold binds, so CI can still see an older success until writes recover."
+  },
   "redTeam": {
     "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
     "confirmedBreaks": {

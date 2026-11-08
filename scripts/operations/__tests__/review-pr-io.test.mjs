@@ -256,6 +256,61 @@ describe('the write-up sink', () => {
   });
 });
 
+describe('pending red-team check before acceptance', () => {
+  const head = 'b'.repeat(40);
+  const payload = { pr: 7, repo: 'o/n', to: 'accepted', outcome: 'accept', redTeamOwed: true,
+    reviewedHead: head, actor: 'operator', bodyFile: 'o-n-7-verdict.md', body: 'Accept', note: 'Accept held', marker: 'stack marker' };
+
+  for (const type of [REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD]) {
+    function setup({ result = { ok: true }, liveHead = head } = {}) {
+      const writes = [];
+      const post = vi.fn(async args => { writes.push('pending'); return result; });
+      const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post,
+        postComment: () => writes.push('comment'),
+        publishGate: () => ({ allowed: true, headSha: head }),
+        readPublishHead: () => liveHead,
+        runNode: () => { writes.push('script'); return '{"ok":true}'; },
+        labelProvider: { readPrState: () => ({ labels: ['review:human'], headRefOid: liveHead }),
+          ensureLabel: () => writes.push('ensure'), setLabels: () => writes.push('labels') },
+      });
+      return { apply: p => sinks[type](p, CTX), post, writes };
+    }
+
+    it(`${type}: posts in_progress on reviewedHead before acceptance writes`, async () => {
+      const { apply, post, writes } = setup();
+      await apply(payload);
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post).toHaveBeenCalledWith({ repo: 'o/n', pr: 7, headSha: head,
+        payload: expect.objectContaining({ name: 'red-team', head_sha: head, status: 'in_progress', external_id: 'o/n#7' }) });
+      expect(writes).toEqual(type === REVIEW_EFFECTS.LABEL ? ['pending', 'script']
+        : type === REVIEW_EFFECTS.ADVISORY_LABEL ? ['pending', 'ensure', 'labels'] : ['pending', 'comment']);
+    });
+
+    it.each([
+      ['not owed', { redTeamOwed: false }],
+      ['historical payload', { redTeamOwed: undefined }],
+      ['changes', { to: 'changes', outcome: 'changes', ...(type === REVIEW_EFFECTS.STACK_HOLD ? { redTeamOwed: false } : {}) }],
+    ])(`${type}: %s posts no check`, async (_name, patch) => {
+      const { apply, post } = setup();
+      await apply({ ...payload, ...patch });
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it(`${type}: publication failure is notApplied and performs no acceptance writes`, async () => {
+      const { apply, writes } = setup({ result: { ok: false, reason: 'permission denied' } });
+      await expect(apply(payload)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('permission denied') });
+      expect(writes).toEqual(['pending']);
+    });
+
+    it(`${type}: moved head never posts a check or writes acceptance`, async () => {
+      const { apply, post, writes } = setup({ liveHead: 'c'.repeat(40) });
+      await apply(payload).catch(() => {});
+      expect(post).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+    });
+  }
+});
+
 describe('the label sink', () => {
   const payload = {
     pr: 7, repo: 'o/n', to: 'accepted', actor: 'operator', bodyFile: 'o-n-7-verdict.md', reviewedHead: 'a'.repeat(40),
