@@ -284,3 +284,33 @@ describe('the publication hold is bound to its PR, not only its head (#6535 roun
     expect(gh).not.toHaveBeenCalled();
   });
 });
+
+describe('bounded reads (round-4 finding): every red-team GitHub read asks for one 100-item page within 4 MiB and 60 s', () => {
+  const head = 'f'.repeat(40);
+  it('bounds check-run reads to 100 results and 4 MiB', async () => {
+    const { readRedTeamCheckFact } = await import('../red-team-check-run.mjs');
+    const calls = [];
+    const gh = (args, opts) => { calls.push({ args, opts }); return JSON.stringify({ total_count: 0, check_runs: [] }); };
+    readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: head, appId: 5037855, gh });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual(['api', `repos/o/r/commits/${head}/check-runs?check_name=red-team&filter=all&per_page=100`]);
+    expect(calls[0].opts).toMatchObject({ maxBuffer: 4 * 1024 * 1024, timeout: 60_000 });
+  });
+  it('bounds both publication-hold reads the same way', async () => {
+    const { readRedTeamPublicationHoldFact, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
+    const calls = [];
+    const gh = (args, opts) => {
+      calls.push({ args, opts });
+      return /\/status\?/.test(args[1]) ? JSON.stringify({ total_count: 1, statuses: [{ context: redTeamPublicationContext(7), state: 'failure' }] }) : '[]';
+    };
+    readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh });
+    expect(calls.map(c => c.args[1])).toEqual([`repos/o/r/commits/${head}/status?per_page=100`, `repos/o/r/commits/${head}/statuses?per_page=100`]);
+    for (const c of calls) expect(c.opts).toMatchObject({ maxBuffer: 4 * 1024 * 1024, timeout: 60_000 });
+  });
+  it('a response over the 100-run bound fails closed', async () => {
+    const { readRedTeamCheckFact } = await import('../red-team-check-run.mjs');
+    const gh = () => JSON.stringify({ total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => ({ id: i + 1 })) });
+    expect(readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: head, appId: 5037855, gh }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/100-run bound/) });
+  });
+});

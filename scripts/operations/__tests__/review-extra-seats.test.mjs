@@ -1748,4 +1748,29 @@ describe('#6535 publish-first: a red-team round starts only after its in_progres
     expect(() => io.redTeamStatus({ ...input, status: 'running' })).toThrow(/outage/);
     expect(recordStatus).toHaveBeenCalledTimes(1);
   });
+
+  // Mode matrix (round-4 finding): publish-first binds only where the check run is evidence. In the drain-scan
+  // rollback the check is not read, so a failed publication must not stop the round (the pre-#6535 behaviour).
+  const specIn = (source, io) => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: LOOP_PAYLOAD.findings.read,
+    env: { WE_RED_TEAM_GATE_SOURCE: source }, post: true }, io);
+  it.each([['both', true], ['check-run', true], ['drain-scan', false]])('source=%s: a failed running publication blocks the round = %s', async (source, blocks) => {
+    for (const fail of [() => ({ published: false, reason: 'checks API down' }), () => { throw new Error('checks API down'); }]) {
+      const { io, order } = rig(fail);
+      const pass = await specIn(source, io);
+      if (blocks) {
+        expect(order).toEqual([['status', 'running']]);
+        expect(pass).toMatchObject({ status: 'skipped', deferredByGuard: true });
+      } else {
+        expect(order.slice(0, 2)).toEqual([['status', 'running'], ['seat']]);
+        expect(pass.deferredByGuard).toBeUndefined();
+      }
+    }
+  });
+  it.each([['both', true], ['check-run', true], ['drain-scan', false]])('source=%s: the real io wrapper refuses an unpublished running status = %s', (source, refuses) => {
+    // Status labels off: the wrapper's label sync after an accepted status is real GitHub IO.
+    const io = createRedTeamIo({ env: { WE_RED_TEAM_GATE_SOURCE: source, WE_RED_TEAM_STATUS_LABELS: 'false' }, recordStatus: () => ({ published: false, reason: 'outage' }) });
+    const call = () => io.redTeamStatus({ repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD, status: 'running' });
+    if (refuses) expect(call).toThrow(/outage/);
+    else expect(call()).toEqual({ published: false, reason: 'outage' });
+  });
 });

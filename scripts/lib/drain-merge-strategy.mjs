@@ -284,9 +284,21 @@ export function createDrainMergeStrategy({
     const fact = readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), pr: c.num, headSha: head })
       : readRedTeamCheckFact({ repo: slugOf(c.repo), pr: c.num, headSha: head, appId: env.WE_APP_ID,
         gh: (args, options) => exec('gh', args, options) });
-    if (fact?.ok === true && !unpublished) return null;
-    const reason = unpublished || fact?.reason || 'red-team check unreadable';
     const key = keyOf(c.repo, c.num);
+    if (fact?.ok === true && !unpublished) {
+      // A passing check ends the wait, as the legacy redTeamPending path does on admission, so a later round on the
+      // same head starts a fresh wait instead of inheriting this one's clock. The once-per-head request spend
+      // (attemptedHeads) is kept: ending a wait never refunds a request.
+      const wait = before.redTeamCheckRecovery?.[key];
+      if (wait && (wait.firstPendingAt != null || wait.headSha != null || wait.attemptedAt != null)) {
+        const attemptedHeads = { ...wait.attemptedHeads, ...(wait.attemptedAt != null && wait.headSha ? { [wait.headSha]: wait.attemptedAt } : {}) };
+        if (Object.keys(attemptedHeads).length) before.redTeamCheckRecovery[key] = { attemptedHeads };
+        else delete before.redTeamCheckRecovery[key];
+        writeState(statePath, before);
+      }
+      return null;
+    }
+    const reason = unpublished || fact?.reason || 'red-team check unreadable';
     before.redTeamCheckRecovery ??= {};
     let wait = before.redTeamCheckRecovery[key];
     if (wait?.headSha !== head) wait = before.redTeamCheckRecovery[key] = { headSha: head, firstPendingAt: now(),
