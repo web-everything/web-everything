@@ -1702,3 +1702,23 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
   });
 });
+
+
+describe('R742 independent backlog-only prep pass', () => {
+  it('settles without refusals even when on-skip is disabled; own setting off preserves behavior', () => {
+    const rawPrs = [{ number: pr, headRefOid: head, labels: ['ready-to-merge', 'review:prep', 'red-team:pending'],
+      files: [{ filename: 'backlog/742.md' }], comments: [{ author: { login: 'chalbert' },
+        body: `<!-- prep-review: head=${head} round=1 -->` }] }];
+    const syncLabels = vi.fn(); vi.mocked(runGhSync).mockClear();
+    const options = { repo, rawPrs, plan: { refusals: [] }, setting: { enabled: false }, syncLabels,
+      env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '1' } };
+    expect(runRedTeamOnSkip(options).rows).toMatchObject([{ action: 'clear', rule: 'backlog-only-prep' }]);
+    expect(runGhSync).toHaveBeenCalledWith(expect.arrayContaining(['comment']), expect.objectContaining({
+      input: expect.stringContaining(`${redTeamMarker(pr, head)}\n\nRed team not required on this head: backlog-only prep (rule backlog-only-prep)`),
+    }));
+    expect(syncLabels).toHaveBeenCalledTimes(1);
+    vi.mocked(runGhSync).mockClear(); syncLabels.mockClear();
+    expect(runRedTeamOnSkip({ ...options, env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '0' } }).rows).toEqual([]);
+    expect(runGhSync).not.toHaveBeenCalled(); expect(syncLabels).not.toHaveBeenCalled();
+  });
+});

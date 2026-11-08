@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
+import { runBacklogOnlyPrep, readHeadFiles as readBacklogHeadFiles } from './red-team-backlog-only.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
@@ -576,6 +577,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     ? rawPrs?.find(raw => Number(raw.number) === Number(pr))?.comments
     : readCompletePrComments(Number(pr), { repo,
       exec: (_file, args, options) => runGhSync(args, { ...options, env }) }),
+  readHeadFiles = key => isUnderTest() || isUnderTest(env)
+    ? rawPrs?.find(raw => Number(raw.number) === Number(key.pr))?.files
+    : readBacklogHeadFiles({ ...key, exec: (args, options) => runGhSync(args, { ...options, env }) }),
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
   readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus
@@ -777,6 +781,13 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — fresh review dispatched for unprovable head move ${String(row.head).slice(0, 12)}`);
       } else note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : ['clear', 'carry'].includes(row.action) && !dryRun ? 'cleared' : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);
     }
+    try {
+      rows.push(...runBacklogOnlyPrep({ repo, rawPrs, env, log: note, dryRun, readComments, readHeadFiles,
+        readLive: ({ repo, pr }) => provider.readPrState(repo, pr), syncLabels,
+        post: ({ pr, body }) => runGhSync(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'],
+          { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
+      }));
+    } catch (error) { note(`red-team: backlog-only prep held: ${safeErrorText(error)}`); }
   } catch {
     rows.push({ prNumber: null, head: null, action: 'skip', why: 'red-team recovery inputs unreadable' });
     note(`review-daemon: ${repo}#? already-reviewed-head — red team not dispatched for head unknown: red-team recovery inputs unreadable`);

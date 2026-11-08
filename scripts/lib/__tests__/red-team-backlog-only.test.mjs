@@ -1,0 +1,104 @@
+import { describe, it, expect, vi } from 'vitest';
+import { backlogOnlyPrepClear, readHeadFiles, resolveBacklogOnlyPrepSetting, runBacklogOnlyPrep } from '../red-team-backlog-only.mjs';
+import { redTeamMarker } from '../red-team-gate.mjs';
+import { resetCascadeLogForTest } from '../policy-cascade.mjs';
+
+const head = 'a'.repeat(40), pr = 742, repo = 'owner/repo';
+const note = (sha = head, blocked = false) => ({ author: { login: 'chalbert' },
+  body: `<!-- prep-review: head=${sha} round=1${blocked ? ' blocked=1' : ''} -->` });
+const evidence = () => ({ enabled: true, head, files: [{ filename: 'backlog/742.md' }],
+  comments: [note()], labels: ['review:prep', 'red-team:pending'] });
+function fixture(over = {}) {
+  const e = evidence();
+  return { repo, rawPrs: [{ number: pr, headRefOid: head, labels: e.labels }], enabled: true,
+    readComments: () => e.comments, readHeadFiles: () => e.files,
+    readLive: () => ({ headRefOid: head, labels: e.labels }), post: vi.fn(), syncLabels: vi.fn(), ...over };
+}
+
+describe('backlog-only prep', () => {
+  it('settles exact-head clean prep, posts the bound marker and synchronizes labels', () => {
+    const f = fixture();
+    expect(runBacklogOnlyPrep(f)).toMatchObject([{ action: 'clear', rule: 'backlog-only-prep' }]);
+    expect(f.post.mock.calls[0][0].body).toBe(`${redTeamMarker(pr, head)}\n\nRed team not required on this head: backlog-only prep (rule backlog-only-prep)`);
+    expect(f.syncLabels).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
+  });
+  it.each([
+    ['non-backlog', { files: [{ filename: 'scripts/a.mjs' }] }],
+    ['mixed code and backlog', { files: [{ filename: 'backlog/a.md' }, { filename: 'src/a.js' }] }],
+    ['rename out of code', { files: [{ filename: 'backlog/a.md', previous_filename: 'src/a.js' }] }],
+    ['older head', { comments: [note('b'.repeat(40))] }],
+    ['blocked note', { comments: [note(head, true)] }],
+    ['newest blocked note', { comments: [note(), note(head, true)] }],
+    ['untrusted note', { comments: [{ ...note(), author: { login: 'stranger' } }] }],
+    ['empty files', { files: [] }],
+    ['unknown files', { files: null }],
+    ['possibly truncated files; inspect full diff manually', { files: Array(3000).fill({ filename: 'backlog/a.md' }) }],
+    ['changes label', { labels: ['review:prep', 'red-team:pending', 'review:changes'] }],
+    ['human label', { labels: ['review:prep', 'red-team:pending', 'review:human'] }],
+    ['blocked red team', { labels: ['review:prep', 'red-team:pending', 'red-team:blocked'] }],
+    ['invalid head', { head: 'short' }],
+  ])('refuses %s', (_name, over) => {
+    const e = { ...evidence(), ...over };
+    expect(backlogOnlyPrepClear(e).ok).toBe(false);
+    const f = fixture({ readHeadFiles: () => e.files, readComments: () => e.comments,
+      rawPrs: [{ number: pr, headRefOid: e.head, labels: e.labels }] });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['backlog/../x', 'backlog/a..md', 'backlog/\\a', '/backlog/a', 'backlog/a\n', null])('refuses unsafe path %j', filename => {
+    expect(backlogOnlyPrepClear({ ...evidence(), files: [{ filename }] }).ok).toBe(false);
+  });
+  it.each(['files', 'comments', 'live', 'post', 'sync'])('holds on throwing %s IO with sanitized reason', kind => {
+    const key = { files: 'readHeadFiles', comments: 'readComments', live: 'readLive', post: 'post', sync: 'syncLabels' }[kind];
+    const f = fixture({ [key]: () => { throw Error('unreadable\n\u001b'); } });
+    expect(runBacklogOnlyPrep(f)[0]).toMatchObject({ action: 'skip' });
+    expect(runBacklogOnlyPrep(f)[0].why).not.toMatch(/[\n\u001b]/);
+  });
+  it.each([null, {}])('refuses incomplete comments %j', comments => {
+    const f = fixture({ readComments: () => comments }); runBacklogOnlyPrep(f);
+    expect(f.post).not.toHaveBeenCalled();
+  });
+  it.each([
+    { headRefOid: 'b'.repeat(40), labels: evidence().labels },
+    { headRefOid: head, labels: [...evidence().labels, 'review:changes'] },
+    { headRefOid: head, labels: null },
+  ])('does not post when live evidence changes %j', live => {
+    const f = fixture({ readLive: () => live });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip'); expect(f.post).not.toHaveBeenCalled();
+  });
+  it('does not repost an existing trusted marker', () => {
+    const f = fixture({ readComments: () => [note(), { author: { login: 'chalbert' }, body: redTeamMarker(pr, head) }] });
+    expect(runBacklogOnlyPrep(f)[0].why).toBe('already'); expect(f.post).not.toHaveBeenCalled();
+  });
+  it('setting env zero returns no rows and performs no IO', () => {
+    const f = fixture({ enabled: undefined, env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '0' } });
+    expect(runBacklogOnlyPrep(f)).toEqual([]); expect(f.post).not.toHaveBeenCalled();
+  });
+  it('dry run posts nothing', () => {
+    const f = fixture({ dryRun: true }); runBacklogOnlyPrep(f);
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+  });
+  it('defaults true with standard provenance logged', () => {
+    resetCascadeLogForTest(); const log = vi.fn();
+    expect(resolveBacklogOnlyPrepSetting({ env: { WE_POLICY_CASCADE_LOG: '1' }, log, readFile: () => '{}' })).toEqual({ enabled: true });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('skipBacklogOnlyPrep=true (standard)'));
+  });
+  it('invalid/unreadable tool preserves a platform false', () => {
+    const readFile = path => { if (String(path).endsWith('red-team.json')) throw Error('unreadable');
+      return JSON.stringify({ redTeam: { skipBacklogOnlyPrep: false } }); };
+    expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile })).toEqual({ enabled: false });
+  });
+  it('reads paginated files and verifies current head', () => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify([[{ filename: 'backlog/a' }], [{ filename: 'backlog/b', previous_filename: 'backlog/c' }]]))
+      .mockReturnValueOnce(JSON.stringify({ headRefOid: head }));
+    expect(readHeadFiles({ repo, pr, head, exec })).toHaveLength(2);
+    expect(exec.mock.calls[0][0]).toContain('--paginate');
+  });
+  it.each(['bad json', '{}', 'null'])('throws for malformed file response %s', value => {
+    expect(() => readHeadFiles({ repo, pr, head, exec: () => value })).toThrow();
+  });
+  it('throws when the files read belongs to a moved head', () => {
+    const exec = vi.fn().mockReturnValueOnce('[[{"filename":"backlog/a"}]]').mockReturnValueOnce('{"headRefOid":"moved"}');
+    expect(() => readHeadFiles({ repo, pr, head, exec })).toThrow();
+  });
+});
