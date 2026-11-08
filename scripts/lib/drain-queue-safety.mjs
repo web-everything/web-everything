@@ -20,23 +20,31 @@ const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 const MQ_INFRA_SCAN_BYTES = 256 * 1024;
+const MQ_INFRA_LINE_CHARS = 2000;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
 
 function validMqInfraSignatures(value) {
   return Array.isArray(value) && value.length > 0 && value.length <= 32 && value.every(source => {
     if (typeof source !== 'string' || source.length > 200) return false;
-    let literals = 0, wildcards = 0, previousWildcard = false;
+    let literals = 0, alphanumerics = 0, wildcards = 0, previousWildcard = false;
     // Consume only literal ASCII letters/digits/spaces, escaped punctuation,
     // and the three wildcard tokens. Unknown syntax fails closed.
     for (let i = 0; i < source.length;) {
       if (/^[A-Za-z0-9 ]$/.test(source[i])) {
         literals++;
+        if (source[i] !== ' ') alphanumerics++;
         previousWildcard = false;
         i++;
       } else if (source[i] === '\\') {
         const escaped = source[i + 1];
         if (['S', 'd', 's'].includes(escaped) && source[i + 2] === '+') {
-          if (previousWildcard || ++wildcards > 3) return false;
+          if (previousWildcard || ++wildcards > 2) return false;
+          const next = source[i + 3];
+          // Require a delimiter after each greedy class; escaped punctuation
+          // is allowed by the grammar below. End-of-source is also safe.
+          if (next !== undefined && (escaped === 'S' && next !== ' ' && next !== '\\'
+            || escaped === 's' && next === ' '
+            || escaped === 'd' && /[0-9]/.test(next))) return false;
           previousWildcard = true;
           i += 3;
         } else if (escaped && /[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/.test(escaped)) {
@@ -45,7 +53,7 @@ function validMqInfraSignatures(value) {
         } else return false;
       } else return false;
     }
-    if (literals < 11) return false;
+    if (literals < 11 || alphanumerics < 10) return false;
     try {
       const re = new RegExp(source);
       // Generic failure wording is not an infra signature, whatever the grammar admits.
@@ -487,7 +495,15 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, signa
           if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
           // Bound the scan as well as subprocess output. Injected readers may return oversized text.
           const tail = Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
-          logVerdicts.set(check.id, patterns.some(pattern => pattern.test(tail)));
+          let truncatedLine = false;
+          const matched = tail.split('\n').some(line => {
+            if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
+            const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
+            return patterns.some(pattern => pattern.test(boundedLine));
+          });
+          logVerdicts.set(check.id, matched);
+          if (!matched && truncatedLine)
+            logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
         } catch {
           logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
           logVerdicts.set(check.id, false);

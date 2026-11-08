@@ -204,7 +204,6 @@ describe('MQ signature whitelist grammar', () => {
 
   it.each([
     ...standard, 'disk full on \\S+ during checkout', 'a'.repeat(12), 'a'.repeat(200),
-    'outage \\S+ on \\d+ at \\s+ during checkout',
     'disk\\.full\\-on\\:checkout\\/remote\\_path',
     'a'.repeat(11) + '\\.',
   ])('accepts whitelist source %j within the literal, wildcard and length bounds', source => {
@@ -222,5 +221,54 @@ describe('MQ signature whitelist grammar', () => {
     expect(result.sources.mqInfraSignatures).toBe('standard');
     expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
     expect(log.mock.calls.flat().join('\n')).toContain('(standard)');
+  });
+});
+
+describe('MQ signature audit bounds', () => {
+  it.each([
+    ' '.repeat(11), 'a'.repeat(9) + '  ', 'a'.repeat(10),
+    'outage \\S+ on \\d+ at \\s+ during checkout',
+    'aaaaaaaaaaa\\S+a\\S+a\\S+b',
+    'aaaaaaaaaaa\\S+a\\S+b',
+    'outage during \\s+ checkout', 'outage during \\d+7',
+  ])('rejects insufficient literals or unsafe wildcards %j with a platform fallback', source => {
+    const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] },
+      platform: { mqInfraSignatures: ['platform outage'] } });
+    expect(result.value.mqInfraSignatures).toEqual(['platform outage']);
+    expect(result.sources.mqInfraSignatures).toBe('platform');
+    expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
+  });
+
+  it.each(['tool outage', ...standard, 'outage \\S+ on \\d+ remote',
+    'outage during \\S+\\. checkout', 'outage during \\s+checkout',
+    'outage during \\d+remote', 'outage during \\S+'])('accepts safe boundary source %j', source => {
+    const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] }, platform: {} });
+    expect(result.value.mqInfraSignatures).toEqual([source]);
+    expect(result.sources.mqInfraSignatures).toBe('tool');
+    expect(result.invalid).toEqual([]);
+  });
+
+  it('rejects the repeated-a attack before its 4096-character log is scanned', () => {
+    const source = 'aaaaaaaaaaa\\S+a\\S+a\\S+b';
+    vi.stubEnv('WE_DRAIN_MQ_INFRA_SIGNATURES', JSON.stringify([source]));
+    const result = readDrainQueueSafety({ tool: {}, platform: {} });
+    expect(result.value.mqInfraSignatures).toEqual(standard);
+    expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
+    expect(probe({ text: 'a'.repeat(4096) }).decision.hold).toBe(true);
+  });
+
+  it('cannot join separate log lines into infrastructure evidence', () => {
+    vi.stubEnv('WE_DRAIN_MQ_INFRA_SIGNATURES', JSON.stringify(['could not fetch \\S+ from\\s+promisor remote']));
+    expect(probe({ text: 'fatal: could not fetch deadbeef from\npromisor remote\n' }).decision.hold).toBe(true);
+    expect(probe({ text: 'unrelated failure\n' + signature }).decision.hold).toBe(false);
+  });
+
+  it('truncates every line to its last 2000 characters and holds for operator inspection without a match', () => {
+    const held = probe({ text: signature.trimEnd() + 'x'.repeat(2000) + '\nunrelated failure\n' });
+    expect(held.decision.hold).toBe(true);
+    expect(held.decision.reason).toMatch(/non-infrastructure.*operator must inspect/);
+    expect(probe({ text: 'x'.repeat(4096) + signature }).decision.hold).toBe(false);
+    expect(probe({ text: 'x'.repeat(4096) + '\n' + signature.trimEnd()
+      + 'x'.repeat(2000 - signature.trimEnd().length) }).decision.hold).toBe(false);
   });
 });
