@@ -3041,6 +3041,23 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
     // contract (present or null), never a truthiness guess, so a silent signature drift fails loudly here.
     expect(captured[0]).toHaveProperty('humanClearance');
   });
+
+  // R728: a clearance with no citable source cannot be carried; the restamp posts a plain accept (what readers would read
+  // an uncited carrier as), never a `cleared-human` record nobody proved. With a citable id the same restamp carries it.
+  it.each([[undefined, null], ['IC_human', 'IC_human']])('restamp of a human clearance with source id %s carries source %s', (id, want) => {
+    const DIFF = 'd'.repeat(64);
+    const human = { ...(id ? { id } : {}), author: { login: 'chalbert' }, body: [
+      buildReviewedShaMarker(STALE_HEAD), buildReviewedDiffMarker(DIFF), buildReviewedContributionMarker(DIFF),
+      buildClearedHumanMarker('chalbert'),
+    ].join('\n') };
+    const captured = [];
+    const { exitCode } = run({ provider: stubProvider({ comments: [human] }), captured,
+      argv: ['2572', '--repo=o/n', '--to=restamp', '--actor=drain'] });
+    expect(exitCode).toBe(0);
+    expect(captured[0].headSha).toBe(STALE_HEAD);
+    expect(captured[0].humanClearance?.sourceId ?? null).toBe(want);
+    expect(captured[0].humanClearance === null).toBe(want === null);
+  });
 });
 
 describe('decideSetLabel — rearm requireLive (#4333)', () => {

@@ -3080,7 +3080,8 @@ describe('R706 — proven human-clearance carriers', () => {
     const changed = { ...carrier(), body: carrier().body.replace(diff, 'e'.repeat(64)) + receipt };
     expect(parseLatestHumanClearedSha([source(), changed], policy)).toBe(mechanicalCarry === 'refuse' ? original : head);
     expect(headEverHumanCleared([source(), changed], head, policy)).toBe(mechanicalCarry !== 'refuse');
-    expect(latestHumanClearanceSourceId([source(), changed], policy)).toBe('IC_original');
+    // R728: under `refuse` the changed-diff carrier is unproven, so it ends the chain: no source is left to cite.
+    expect(latestHumanClearanceSourceId([source(), changed], policy)).toBe(mechanicalCarry === 'refuse' ? null : 'IC_original');
     expect(parseLatestHumanClearedSha([changed], policy)).toBeNull();
     expect(parseLatestHumanClearedSha([source({ body: buildReviewedShaMarker(original) }), changed], policy)).toBeNull();
     const missingFingerprint = { ...changed, body: changed.body.replace(buildReviewedDiffMarker('e'.repeat(64)), '') };
@@ -3198,6 +3199,35 @@ describe('R706 — proven human-clearance carriers', () => {
       expect(parseLatestHumanClearedSha(comments)).toBeNull();
       expect(latestHumanClearanceSourceId(comments)).toBeNull();
       expect(headEverHumanCleared(comments, head)).toBe(false);
+    }
+  });
+  it('an unproven restamp of an unrelated head ends the chain: a later valid carrier cannot revive the old clearance', () => {
+    // R728: any trusted accept-shaped comment that is not a proven carrier stamps another head without a human, like a
+    // plain accept. It must not mask the standing clearance of the original head, but no later carrier may cite past it.
+    const unrelated = '9'.repeat(40);
+    const restamp = body => ({ author: { login: 'web-everything' }, body });
+    const at = (over = {}) => carrier({ ...over, body: (over.body ?? carrier().body).replace(head, unrelated) });
+    const unproven = [
+      at({ body: carrier().body.replace('IC_original', 'IC_forged') }),
+      at({ body: carrier().body.replace(buildClearedFromMarker('IC_original'), '') }),
+      at({ body: carrier().body + '\n' + buildClearedFromMarker('IC_original') }),
+      at({ body: carrier().body.replace(diff, 'e'.repeat(64)) }),
+      at({ body: carrier().body.replace(buildReviewedDiffMarker(diff), '') }),
+      at({ author: undefined, viewerDidAuthor: true }),
+      // A placeholder login is trusted here only through viewer evidence; an untrusted 'ghost' cannot end anything.
+      at({ author: { login: 'ghost' }, viewerDidAuthor: true }),
+      restamp(at().body.replace(buildReviewedShaMarker(unrelated), `<!-- REVIEWED-SHA: ${unrelated.toUpperCase()} -->`).replace('IC_original', 'IC_forged')),
+    ];
+    for (const policy of [{ mechanicalCarry: 'refuse' }, { mechanicalCarry: 'trust-drain-record' }]) {
+      for (const bad of unproven) {
+        const comments = [source(), bad, carrier()];
+        const label = `${policy.mechanicalCarry} ${JSON.stringify(bad)}`;
+        expect(parseLatestHumanClearedSha(comments, policy), label).not.toBe(head);
+        expect(headEverHumanCleared(comments, head, policy), label).toBe(false);
+        expect(latestHumanClearanceSourceId(comments, policy), label).toBeNull();
+        // The rejected restamp still masks nothing: the original head keeps its own human clearance.
+        expect(headEverHumanCleared(comments, original, policy), label).toBe(true);
+      }
     }
   });
   it('refuses duplicate citations, missing ids, non-clearance sources and absent fingerprints', () => {

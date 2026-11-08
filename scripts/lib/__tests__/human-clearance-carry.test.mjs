@@ -900,7 +900,9 @@ describe('R711 writer and parser agree on mechanical carry policy', () => {
       expect(parseLatestHumanClearedSha([...thread, second])).toBe(nextHead);
       expect(latestHumanClearance([...thread, second])).toMatchObject({ sha: nextHead, sourceId: 'IC_clearance', diff: normalizeDiffFingerprint(nextDiff) });
       expect(parseLatestHumanClearedSha([f.comment, second])).toBe(CLEARED);
-      expect(parseLatestHumanClearedSha([f.comment, second, first])).toBe(HEAD);
+      // R728: out of order, `second` is unproven (its predecessor is not yet in the chain), so it ends the chain and
+      // `first` can no longer revive the clearance after it: only the human original stands.
+      expect(parseLatestHumanClearedSha([f.comment, second, first])).toBe(CLEARED);
       expect(parseLatestHumanClearedSha([...thread, second], { mechanicalCarry: 'refuse' })).toBe(CLEARED);
     } finally { vi.unstubAllEnvs(); }
   });

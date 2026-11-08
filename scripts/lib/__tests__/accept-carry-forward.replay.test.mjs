@@ -445,7 +445,8 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     // Without the id the carrier cannot cite its source, so the reader would refuse it: nothing clearing is written.
     const r = restamp({ comments: [fingerprinted()] });
     expect(r.exitCode).toBe(1);
-    expect(r.out).toMatch(/would not be readable by the gate/);
+    // PR #6526's chain-ending guard refuses this before the readability check: the uncitable source ends the chain.
+    expect(r.out).toMatch(/has no proven carry chain to this head/);
     expect(r.writes.setLabels.filter((s) => s.add === 'review:accepted')).toEqual([]);
     expect(r.writes.postComment.every((b) => !b.includes('cleared-human:'))).toBe(true);
   });
@@ -593,12 +594,20 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   });
 
   // Crash between writes: a lift posts its record (cleared-human naming the LIVE head) and then its label swap fails.
-  const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->\n${buildClearedFromMarker(clearComment().id)}\n${buildReviewedDiffMarker(clearedFp())}\n<!-- human-clearance-carried: from=${heads.cleared} to=${heads.head} diff=${clearedFp()} -->` });
-  it('ORPHANED LIFT: a clearance already naming the live head under the drain label is lifted (not handed off, not skipped)', () => {
-    const r = restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] });
+  const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->\n${buildClearedFromMarker(clearComment().id)}\n${buildReviewedDiffMarker('d'.repeat(64))}\n<!-- human-clearance-carried: from=${heads.cleared} to=${heads.head} diff=${'d'.repeat(64)} -->` });
+  it('ORPHANED LIFT: a PROVEN clearance already naming the live head under the drain label is lifted (not handed off, not skipped)', () => {
+    // The earlier lift carried the source's own reviewed-diff, so the shared scan proves it and keeps the source citable.
+    const source = { ...clearComment({ fingerprint: false }), body: `${clearComment({ fingerprint: false }).body}\n${buildReviewedDiffMarker('d'.repeat(64))}` };
+    const r = restamp({ comments: [source, { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] });
     expect(r.exitCode).toBe(0);
     expect(r.writes.setLabels).toEqual([{ add: 'review:accepted', remove: [MECH] }]);
     expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
+    expect(r.writes.postComment[0]).toContain(buildClearedFromMarker('IC_human_clearance'));
+  });
+
+  it('R728 ORPHANED LIFT of an UNPROVEN earlier lift (source has no matching diff) is handed off: no accept, no carrier', () => {
+    // The shared scan refuses the earlier lift, which ends the chain, so no source is left to cite: a human must re-clear.
+    expectHandedOff(restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] }));
   });
 
   it('ORPHANED LIFT with a later objection is handed off; with unreadable reviews it is a RETRYABLE miss', () => {
@@ -653,6 +662,14 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   // Truncated-read row: `gh pr view --json comments` stops at one page (100). A full page is re-read through the paginated
   // comments call; a hold past comment 100 must be seen, and a failed re-read is a retryable miss, never "no hold".
   const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: BOT, body: `🔒 conveyor fix-begin — fix claim held #${i}` }));
+  it('R728: an unproven carrier past comment 100 ends the chain even when page 1 still cites the source (handed off)', () => {
+    const source = { ...clearComment(), body: `${clearComment().body}\n${buildReviewedDiffMarker('d'.repeat(64))}` };
+    const page = [source, { author: BOT, body: parkBody(PARK_REASON) }, ...filler(98)];
+    const unproven = { author: BOT, body: clearedAtLive().body.replace(`${buildReviewedDiffMarker('d'.repeat(64))}\n`, `${buildReviewedDiffMarker('e'.repeat(64))}\n`) };
+    const r = restamp({ comments: page, fullComments: [...page, unproven, clearedAtLive()] });
+    expect(r.reads.comments).toBe(1);
+    expectHandedOff(r);
+  });
   it('a full 100-comment page is re-read in full: a hold past comment 100 refuses the carry (no accept)', () => {
     const page = [clearComment(), ...filler(99)];
     const r = restamp({ comments: page, fullComments: [...page, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
