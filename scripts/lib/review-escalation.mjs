@@ -2052,8 +2052,6 @@ function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCar
   const states = [];
   let sourceId = null;
   let chainShas = [];
-  let plainSince = [];
-  const related = (a, b) => !!a && !!b && (a.startsWith(b) || b.startsWith(a));
   for (const c of thread) {
     const login = c?.author?.login ?? c?.user?.login;
     const knownPoster = typeof login === 'string' && login.trim().length > 0;
@@ -2069,7 +2067,6 @@ function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCar
     if (human) {
       sourceId = cleared && safeClearanceId(c.id) && !!byId.get(c.id) && byId.get(c.id).body === c.body ? c.id : null;
       chainShas = [sha];
-      plainSince = [];
     } else if (hasMarker) {
       if (!knownPoster) continue; // Unknown poster (including viewer-only evidence) can never carry a clearance.
       if (/^(unknown|ghost|none|null|undefined)$/i.test(String(login).trim())) continue; // a placeholder login is an unreadable author
@@ -2093,12 +2090,12 @@ function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCar
         && chainShas.includes(receipt[1].toLowerCase())
         && receipt[2].toLowerCase() === sha;
       if (!sameDiff && !mechanical) continue;
-      // A trusted plain accept of the cleared head, any head already carried to, or the head being carried to, supersedes the clearance;
-      // one for an unrelated head does not (the same reading the drain's hold applies).
-      if (plainSince.some(p => related(p, sha) || chainShas.some(h => related(p, h)))) continue;
       chainShas.push(sha);
     } else {
-      plainSince.push(sha);
+      // A trusted plain accept of ANY head (related or not) ends the clearance chain: no later carrier may cite the
+      // old source, so a carrier can never revive a clearance a plain accept already superseded.
+      sourceId = null;
+      chainShas = [];
     }
     states.push({ sha, cleared, sourceId, c });
   }
