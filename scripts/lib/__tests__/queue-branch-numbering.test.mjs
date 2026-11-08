@@ -4,6 +4,7 @@ import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 
+vi.mock('../card-number-ledger.mjs', () => ({ appendCardLedgerRows: vi.fn(() => new Map()) }));
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
 
 describe('queue branch numbering', () => {
@@ -199,6 +200,26 @@ describe('queue branch numbering', () => {
     const args = { c: { repo: 'r', num: 4, headRef: 'topic' }, traceHeadSha: 'old', cwd: '/clone', statePath: '/state/reservations.json', exec, fs, number, lock, isOpen: () => true };
     return { args, exec, fs, number, lock };
   }
+  it('shadow preserves renames, pushed head and return value; ledger failure only warns', () => {
+    const run = (shadow, fails = false) => {
+      const x = setup();
+      const append = vi.fn(() => { if (fails) throw new Error('ledger offline'); });
+      const log = { write: vi.fn() };
+      const result = prepareBranchBeforeEnqueue({ ...x.args, shadow, appendLedger: append, log });
+      return { result, numbered: x.number.mock.calls, git: x.exec.mock.calls, append, log };
+    };
+    const off = run(false), on = run(true), failure = run(true, true);
+    for (const x of [on, failure]) {
+      expect(x.result).toEqual(off.result);
+      expect(x.numbered).toEqual(off.numbered);
+      expect(x.git).toEqual(off.git);
+      expect(x.append).toHaveBeenCalledWith(expect.objectContaining({
+        repo: 'r', rows: [expect.objectContaining({ id: 'xabc123', num: 41, kind: 'shadow', pr: 4 })],
+      }));
+    }
+    expect(off.append).not.toHaveBeenCalled();
+    expect(failure.log.write).toHaveBeenCalledWith(expect.stringMatching(/warning.*ledger offline/i));
+  });
   it.each(['card', 'parent'])('refuses a symlinked backlog %s before numbering or writing outside the worktree', kind => {
     const x = setup();
     x.fs.lstatSync = vi.fn(path => ({ isSymbolicLink: () => kind === 'card' ? path.endsWith('.md') : path.endsWith('/backlog'), isFile: () => path.endsWith('.md'), isDirectory: () => !path.endsWith('.md') }));

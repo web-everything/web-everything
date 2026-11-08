@@ -1,4 +1,6 @@
 /** Branch-only queue preparation. Number allocation and reservations share the drain numbering mutex. */
+import { appendCardLedgerRows } from './card-number-ledger.mjs';
+import { resolveCardNumbering } from './policy-cascade.mjs';
 import { isTransientReadFailure } from './drain-api-reads.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
@@ -248,7 +250,10 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
 export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(), isLocal = true,
   isOpen = () => undefined, statePath = numberingStatePath(),
   exec = execFileSync, fs = nodeFs, lock = withNumberingLock, number = numberPendingHashes,
-  now = () => new Date().toISOString() } = {}) {
+  now = () => new Date().toISOString(), shadow, appendLedger = appendCardLedgerRows,
+  env = process.env, log = process.stderr } = {}) {
+  const policy = resolveCardNumbering({ env });
+  shadow ??= policy.value.shadow;
   return withHooksDisabled(() => {
     let temporary, pushedHead;
     const git = safeGit(exec, cwd);
@@ -294,6 +299,17 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         pinned();
         git(['push', '--no-verify', 'origin', `HEAD:refs/heads/${c.headRef}`], worktree);
         pushedHead = newHead;
+        if (shadow && n.assigned?.length) {
+          try {
+            const name = String(c.repo || 'we').split('/').pop();
+            const repo = name === 'web-everything' ? 'we' : name;
+            appendLedger({ repo, board: cwd, lockHeld: true, ledgerAuth: policy.value.ledgerAuth, env,
+              ...(env.WE_CARD_LEDGER_SIGNING_KEY ? { sign: { keyPath: env.WE_CARD_LEDGER_SIGNING_KEY } } : {}),
+              rows: n.assigned.map(a => ({ id: a.hash, num: Number(a.nnn), pr: Number(c.num), at: now(), by: 'drain', kind: 'shadow' })) });
+          } catch (e) {
+            try { log.write(`  WARNING: shadow card ledger write failed: ${String(e.message || e).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500)}\n`); } catch { /* warning cannot block enqueue */ }
+          }
+        }
         return { action: 'numbered', newHead, assigned: n.assigned || [] };
       }, { runUnlockedOnContention: false });
       if (outcome.ran === false) throw new Error('numbering mutex refused — retry next pass');
