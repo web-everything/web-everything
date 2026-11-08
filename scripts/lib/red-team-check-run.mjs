@@ -84,7 +84,12 @@ export function postRedTeamPublicationHold({ repo, headSha, held, reason = '', g
     gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
       { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context: RED_TEAM_PUBLICATION_CONTEXT, description }) });
     return { ok: true };
-  } catch (error) { return failure(`red-team publication hold not posted: ${message(error)}`); }
+  } catch (error) {
+    // A definite rejection (HTTP 4xx) created or changed no status. Read it from the FULL error text, before the
+    // reason is truncated, so a long message never hides the code.
+    const text = `${error?.stderr ?? ''} ${error?.message ?? error}`;
+    return { ...failure(`red-team publication hold not posted: ${message(error)}`), definite: /HTTP 4\d\d/.test(text) };
+  }
 }
 
 /** Trust boundary: anyone with statuses:write can post on this context. A hold (any non-success state) counts

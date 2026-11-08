@@ -445,20 +445,25 @@ export function recordRedTeamStatus(input, options = {}) {
         const postHold = ({ held, reason }) => {
           try {
             const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, headSha: head, held, reason, gh });
-            return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
-          } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
+            if (result?.ok === true) return result;
+            // `definite` is computed by the poster from the untruncated error; an injected poster may only say it in its reason.
+            const why = String(result?.reason ?? '');
+            return { ok: false, reason: safeReason(why), definite: result?.definite === true || /HTTP 4\d\d/.test(why) };
+          } catch (error) {
+            return { ok: false, reason: safeReason(error?.message ?? error), definite: /HTTP 4\d\d/.test(`${error?.stderr ?? ''} ${error?.message ?? error}`) };
+          }
         };
         // Set the GitHub-visible hold BEFORE any check post, so no CI read during the retries below sees the older
         // success unheld. Record the intent first: a crash after the post still clears it on the next confirmation.
         // A definite rejection (HTTP 4xx: e.g. the token lacks statuses:write) created no status, so the intent is
         // withdrawn and nothing is left that a later clear would have to remove (no wedge).
-        let preHold = { ok: true };
+        let preHold = null; // confirmed only when posted by THIS call; an inherited flag proves nothing landed
         const setRemoteHold = why => {
           if (!statusChannel) return { ok: false, reason: 'no status IO in this test run' };
           remoteHold = true;
           writeHold();
           const result = postHold({ held: true, reason: why });
-          if (!result.ok && /HTTP 4\d\d/.test(result.reason)) { remoteHold = false; writeHold(); }
+          if (!result.ok && result.definite) { remoteHold = false; writeHold(); }
           return result;
         };
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
@@ -492,7 +497,15 @@ export function recordRedTeamStatus(input, options = {}) {
             // Confirmed only once the GitHub-visible hold is cleared too; otherwise the hold stays and is retried.
             if (remoteHold) {
               const cleared = postHold({ held: false });
-              if (!cleared.ok) return report({ published: false, reason: `${input.status} red-team check published for PR #${input.pr} on ${head}, but its GitHub-visible hold was not cleared: ${cleared.reason}` });
+              // A definite rejection means this credential cannot write statuses, so it cannot have set one either: the
+              // local hold is released (no wedge). A status another credential set stays on GitHub and keeps CI held
+              // (fail closed, named in the merge-gate reason). Any other failure keeps both holds for a retry.
+              if (!cleared.ok && !cleared.definite) return report({ published: false, reason: `${input.status} red-team check published for PR #${input.pr} on ${head}, but its GitHub-visible hold was not cleared: ${cleared.reason}` });
+              if (!cleared.ok) {
+                try { (options.log ?? (line => process.stderr.write(`${line}\n`)))(JSON.stringify({ published: true,
+                  warning: `GitHub-visible hold clear rejected (${cleared.reason}); a status left by another credential keeps CI held` })); }
+                catch { /* logging cannot fail a confirmed publication */ }
+              }
             }
             rmSync(`${path}.unpublished`, { force: true });
             return { published: true };
@@ -505,7 +518,7 @@ export function recordRedTeamStatus(input, options = {}) {
           else {
             // The second channel (a head-bound commit status every CI host reads) was set before the posts. Retry
             // it once only if that attempt did not confirm.
-            const held = preHold.ok && remoteHold ? preHold : setRemoteHold(`${input.status} round not confirmed published`);
+            const held = preHold?.ok === true ? preHold : setRemoteHold(`${input.status} round not confirmed published`);
             reason += held.ok ? `; failure supersede also failed: ${supersede.reason}; GitHub-visible publication hold set`
               : `; failure supersede also failed: ${supersede.reason}; GitHub-visible hold also failed: ${held.reason}; operator must inspect GitHub check history before merging`;
           }

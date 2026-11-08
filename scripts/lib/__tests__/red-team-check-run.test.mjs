@@ -196,7 +196,16 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
     const gh = vi.fn(() => { throw Error('HTTP 503'); });
     expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: 'nope', held: true, gh })).toMatchObject({ ok: false });
     expect(gh).not.toHaveBeenCalled();
-    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, gh })).toMatchObject({ ok: false, reason: expect.stringContaining('HTTP 503') });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, gh })).toMatchObject({ ok: false, definite: false, reason: expect.stringContaining('HTTP 503') });
+  });
+  it('detects a definite 4xx rejection from the full error text, even past the reason truncation', async () => {
+    const { postRedTeamPublicationHold } = await import('../red-team-check-run.mjs');
+    const long = Object.assign(Error(`${'x'.repeat(400)} Resource not accessible by integration (HTTP 403)`), { stderr: '' });
+    const result = postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, gh: () => { throw long; } });
+    expect(result).toMatchObject({ ok: false, definite: true });
+    expect(result.reason).not.toMatch(/HTTP 403/);
+    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true,
+      gh: () => { throw Object.assign(Error('gh failed'), { stderr: 'gh: Validation Failed (HTTP 422)' }); } })).toMatchObject({ definite: true });
   });
   it('evaluates absent, cleared, held, and incomplete combined status', async () => {
     const { evaluateRedTeamPublicationHold: evaluate, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');

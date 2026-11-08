@@ -235,6 +235,32 @@ describe('status persistence and check publication share one claim', () => {
     expect(calls).toEqual([true, false]);
   });
 
+  it('an inherited hold flag is not proof the hold landed: a failed supersede re-posts it before reporting it set', () => {
+    const f = fixture(), calls = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'running' };
+    // First writer: the hold post outcome is unknown (5xx), so the flag is kept but nothing may be on GitHub.
+    recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {}, postPublicationHold: () => ({ ok: false, reason: 'HTTP 502' }),
+      postCheckRun: () => ({ ok: false, reason: 'down' }) });
+    const result = recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {},
+      postPublicationHold: hold => { calls.push(hold.held); return { ok: false, reason: 'HTTP 502' }; },
+      postCheckRun: () => ({ ok: false, reason: 'down' }) });
+    expect(calls).toEqual([true]);
+    expect(result).toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible hold also failed') });
+  });
+
+  it('a clear the credential definitely cannot make (HTTP 4xx) releases the local hold (no wedge after an unknown pre-post)', () => {
+    const f = fixture(), logs = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'running' };
+    recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {}, postPublicationHold: () => ({ ok: false, reason: 'timeout' }),
+      postCheckRun: () => ({ ok: false, reason: 'down' }) });
+    expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+    expect(recordRedTeamStatus(input, { env: f.env, gh: () => '', log: line => logs.push(line),
+      postPublicationHold: () => ({ ok: false, reason: 'not accessible', definite: true }), postCheckRun: () => ({ ok: true }) }))
+      .toEqual({ published: true });
+    expect(readRedTeamPublicationHold(f)).toBeNull();
+    expect(logs.join('\n')).toMatch(/clear rejected.*keeps CI held/);
+  });
+
   it('a marker written before the remote-hold flag existed never asks for a clear', () => {
     const f = fixture(), calls = [];
     const input = { ...f, loopPayload: payload(f.head), status: 'running' };
