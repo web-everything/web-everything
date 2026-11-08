@@ -18,8 +18,8 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
 
 import { DEFAULT_CHILD_TIMEOUT_MS, NPM_INSTALL_TIMEOUT_MS } from './bounded-child.mjs';
 import { DEFAULT_SNAPSHOT_KEEP, selectEvictions } from './daemon-jobs.mjs';
@@ -122,6 +122,42 @@ export function storeStillValid(dir, sourceDir = null) {
   } catch { return false; }
 }
 
+/** 8 hex naming the pnpm inputs of `sourceDir` (the part of a store's validity the npm-lockfile key cannot see). */
+function pnpmInputsKey(sourceDir) {
+  const hash = lockHash(sourceDir, 'pnpm', resolvePnpmStoreDir()) ?? 'none';
+  return createHash('sha256').update(String(hash)).digest('hex').slice(0, 8);
+}
+
+const MAX_LINK_SCAN = 256;
+
+/**
+ * True when a code snapshot's `node_modules` symlink points into store `dir`. Fails closed: an unreadable snapshot
+ * directory, an unreadable link, or more snapshots than {@link MAX_LINK_SCAN} count as in use, so a store is never
+ * deleted on incomplete evidence.
+ */
+export function storeInUse(jobsDir, dir) {
+  const codeRoot = join(snapshotsRoot(jobsDir), 'code');
+  if (!existsSync(codeRoot)) return false;
+  const target = resolve(dir, 'node_modules');
+  try {
+    const snapshots = readdirSync(codeRoot);
+    if (snapshots.length > MAX_LINK_SCAN) return true;
+    for (const name of snapshots) {
+      const link = join(codeRoot, name, 'node_modules');
+      let isLink;
+      try { isLink = lstatSync(link).isSymbolicLink(); } catch (error) { if (error.code === 'ENOENT') continue; return true; }
+      if (!isLink) continue;
+      const to = resolve(join(codeRoot, name), readlinkSync(link));
+      if (to === target || to.startsWith(target + sep)) return true;
+    }
+    return false;
+  } catch { return true; }
+}
+
+function storeHasDanglingLink(dir) {
+  try { return hasDanglingTopLevelLink(join(dir, 'node_modules')); } catch { return false; }
+}
+
 /**
  * The `node_modules` store for the lockfile in `sourceDir`, built on first use.
  * @param {{jobsDir: string, sourceDir: string, install?: (into: string) => void}} o
@@ -129,11 +165,27 @@ export function storeStillValid(dir, sourceDir = null) {
  */
 export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInstaller() }) {
   const lock = readFileSync(join(sourceDir, 'package-lock.json'), 'utf8');
-  const key = lockfileKey(lock);
-  const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
+  const baseKey = lockfileKey(lock);
   mkdirSync(join(snapshotsRoot(jobsDir), 'node-modules'), { recursive: true });
+  let key = baseKey;
+  let dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
   if (existsSync(join(dir, COMPLETE_MARKER)) && !storeStillValid(dir, sourceDir)) {
-    rmSync(dir, { recursive: true, force: true });
+    // The npm lockfile is the key, so two sources can differ only in their pnpm inputs and ask for the same store.
+    // A store another snapshot still links to is never deleted under it: the replacement is built beside it, under a
+    // key that also names the source's pnpm inputs. Only a store nothing links to (or one whose links dangle, so
+    // nothing can use it) is removed and rebuilt in place.
+    if (storeInUse(jobsDir, dir) && !storeHasDanglingLink(dir)) {
+      key = `${baseKey}.p${pnpmInputsKey(sourceDir)}`;
+      dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
+      if (existsSync(join(dir, COMPLETE_MARKER)) && !storeStillValid(dir, sourceDir)) {
+        if (storeInUse(jobsDir, dir) && !storeHasDanglingLink(dir)) {
+          throw new Error(`node_modules store ${key} is in use and stale: refusing to delete it under a running snapshot`);
+        }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    } else {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
   buildOnce(dir, (into) => {
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));

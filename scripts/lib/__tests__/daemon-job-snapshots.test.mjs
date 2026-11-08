@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  codeRef, ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, linkNodeModules, lockfileKey, nodeModulesRef, snapshotsRoot, storeStillValid,
+  codeRef, ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, linkNodeModules, lockfileKey, nodeModulesRef, snapshotsRoot, storeInUse, storeStillValid,
 } from '../daemon-job-snapshots.mjs';
 
 import { ensureStoreGeneration, lockHash, markerMatches, hasDanglingTopLevelLink } from '../lane-deps-installer.mjs';
@@ -167,7 +167,7 @@ describe('node_modules stores', () => {
         symlinkSync(target, join(into, 'node_modules', 'esbuild'), 'dir');
         writeFileSync(join(into, '.we-deps-marker'), `pnpm:${lockHash(into, 'pnpm', storeDir)}`);
       });
-      return { sourceDir, install };
+      return { sourceDir, install, target };
     }
 
     it.each(['pnpm-lock.yaml', 'pnpm-workspace.yaml'])('changing only the source %s runs the installer again', (file) => {
@@ -202,6 +202,86 @@ describe('node_modules stores', () => {
       const f = build();
       const { dir } = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
       expect(storeStillValid(dir, join(jobsDir, 'no-such-source'))).toBe(false);
+    });
+
+    // Two sources can share one npm lockfile and differ only in pnpm inputs. A store another snapshot links to must
+    // survive the other source's request (the live break: it was deleted under a running job).
+    describe('a store another snapshot still links to is never deleted under it', () => {
+      const linkSnapshot = (sha, store) => {
+        const snap = join(snapshotsRoot(jobsDir), 'code', sha);
+        mkdirSync(snap, { recursive: true });
+        return linkNodeModules(snap, store.dir);
+      };
+      const edit = (f) => writeFileSync(join(f.sourceDir, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\nother: true\n');
+
+      it('builds the replacement beside the in-use store and leaves the in-use one intact', () => {
+        const f = build();
+        const first = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        const link = linkSnapshot('old-sha', first);
+        writeFileSync(join(first.dir, 'in-use-sentinel'), 'running job');
+        edit(f);
+        const second = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        expect(second.key).not.toBe(first.key);
+        expect(second.key.startsWith(`${first.key}.p`)).toBe(true);
+        expect(second.dir).not.toBe(first.dir);
+        expect(f.install).toHaveBeenCalledTimes(2);
+        expect(existsSync(join(first.dir, 'in-use-sentinel'))).toBe(true);
+        expect(existsSync(join(link, 'esbuild'))).toBe(true); // the running snapshot's links still resolve
+        expect(existsSync(join(second.dir, 'node_modules', 'esbuild'))).toBe(true);
+        // asking again for the same source reuses the replacement, and still leaves the in-use store alone
+        expect(ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install })).toEqual(second);
+        expect(f.install).toHaveBeenCalledTimes(2);
+        expect(existsSync(join(first.dir, 'in-use-sentinel'))).toBe(true);
+      });
+
+      it('alternating sources never delete one another’s store', () => {
+        const f = build();
+        const a = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        linkSnapshot('sha-a', a);
+        const original = readFileSync(join(f.sourceDir, 'pnpm-lock.yaml'), 'utf8');
+        edit(f);
+        const b = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        linkSnapshot('sha-b', b);
+        writeFileSync(join(f.sourceDir, 'pnpm-lock.yaml'), original);
+        const a2 = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        expect(a2).toEqual(a);
+        expect(f.install).toHaveBeenCalledTimes(2); // no third build: both stores survived the alternation
+        expect(existsSync(a.dir)).toBe(true);
+        expect(existsSync(b.dir)).toBe(true);
+      });
+
+      it('a store nothing links to is still rebuilt in place', () => {
+        const f = build();
+        const first = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        linkSnapshot('some-sha', { dir: join(jobsDir, 'a-different-store') }); // a link into ANOTHER store does not count
+        edit(f);
+        const second = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        expect(second).toEqual(first);
+        expect(f.install).toHaveBeenCalledTimes(2);
+      });
+
+      it('a store whose links dangle is removed even though a snapshot links to it', () => {
+        const f = build();
+        const first = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        linkSnapshot('old-sha', first);
+        rmSync(f.target, { recursive: true, force: true }); // the shared pnpm store vanished: nothing can use this tree
+        const second = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        expect(second).toEqual(first);
+        expect(f.install).toHaveBeenCalledTimes(2);
+      });
+
+      it('storeInUse: only a symlink into the store counts, and too many snapshots to scan fail closed', () => {
+        const f = build();
+        const first = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+        const snap = join(snapshotsRoot(jobsDir), 'code', 'odd-sha');
+        mkdirSync(snap, { recursive: true });
+        writeFileSync(join(snap, 'node_modules'), 'a file, not a link'); // not a symlink: skipped
+        expect(storeInUse(jobsDir, first.dir)).toBe(false);
+        linkSnapshot('real-sha', first);
+        expect(storeInUse(jobsDir, first.dir)).toBe(true);
+        for (let i = 0; i < 257; i += 1) mkdirSync(join(snapshotsRoot(jobsDir), 'code', `s${i}`), { recursive: true });
+        expect(storeInUse(jobsDir, join(jobsDir, 'unrelated'))).toBe(true); // too many snapshots to prove otherwise
+      });
     });
 
     it('an npm-marked store is not compared with the source pnpm inputs', () => {

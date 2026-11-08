@@ -122,12 +122,21 @@ function installedBuilds(into) {
   const names = [];
   const packages = installedPackages(into);
   let inBuilds = false;
+  let seenBuilds = false;
   for (const line of policy.split(/\r?\n/)) {
     if (/^\s*(?:#.*)?$/.test(line)) continue;
     if (/^allowBuilds\s*:/.test(line)) {
-      if (!/^allowBuilds\s*:\s*(?:#.*)?$/.test(line)) throw new Error('unsupported allowBuilds policy');
+      if (!/^allowBuilds\s*:\s*(?:#.*)?$/.test(line) || seenBuilds) throw new Error('unsupported allowBuilds policy');
       inBuilds = true;
+      seenBuilds = true;
       continue;
+    }
+    // A top-level key this reader cannot name exactly could still BE `allowBuilds` (quoted `"allowBuilds":`, an escaped
+    // spelling, `? allowBuilds`, a flow map, an anchor or tag): skipping it would silently skip the native-build check.
+    // Only a bare key, a list item of the previous key or a document marker may sit at the top level; anything else
+    // fails closed to the legacy installer, like every other unsupported policy syntax here.
+    if (/^\S/.test(line) && !/^(?:[A-Za-z_@][\w@.\/-]*\s*:(?:\s|$)|-(?:\s|$)|---\s*(?:#.*)?$)/.test(line)) {
+      throw new Error('unsupported pnpm-workspace.yaml syntax');
     }
     if (!inBuilds) continue;
     if (/^\S/.test(line)) { inBuilds = false; continue; }
