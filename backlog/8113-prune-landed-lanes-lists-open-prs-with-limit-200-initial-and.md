@@ -3,6 +3,7 @@ bornAs: x24kt1c
 kind: story
 size: 2
 status: open
+related: ["2885"]
 scope: ["we:scripts/prune-landed-lanes.mjs"]
 dateOpened: "2026-11-07"
 tags: []

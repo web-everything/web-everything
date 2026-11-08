@@ -3,6 +3,7 @@ bornAs: xuj1xr3
 kind: story
 size: 3
 status: open
+related: ["5586"]
 scope: ["we:scripts/conveyor/supersede-watch.mjs", "we:scripts/conveyor/supersede-rule.mjs"]
 dateOpened: "2026-11-07"
 tags: []

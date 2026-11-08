@@ -3,6 +3,7 @@ bornAs: x172as9
 kind: story
 size: 3
 status: open
+related: ["4282"]
 scope: ["we:scripts/conveyor/advisory-label-sweep.mjs", "we:scripts/conveyor/reconcile-pass.mjs"]
 dateOpened: "2026-11-07"
 tags: []
