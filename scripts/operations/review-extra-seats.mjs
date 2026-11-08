@@ -1835,7 +1835,7 @@ export async function speculateRedTeam({
         const reason = `red-team round not started: in_progress check not posted (${String(published.reason ?? 'publication failed').slice(0, 300)}); retried next tick`;
         io.log(reason);
         try { io.releaseCalls?.({ provider, callIds: [callId] }); } catch (e) { io.log(`red-team reservation release failed: ${e.message}`); }
-        return { status: 'skipped', reason };
+        return { status: 'skipped', deferredByGuard: true, reason };
       }
     }
     const timeoutMs = resolveSeatTimeoutMs(env);

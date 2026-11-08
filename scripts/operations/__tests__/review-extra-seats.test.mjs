@@ -1710,6 +1710,8 @@ describe('#6535 publish-first: a red-team round starts only after its in_progres
     expect(order).toEqual([['status', 'running']]);
     expect(pass.status).toBe('skipped');
     expect(pass.reason).toMatch(/not started.*GitHub write failed/s);
+    // A transient pre-model deferral, so review-job does not persist a final skip that recovery refuses to re-run.
+    expect(pass.deferredByGuard).toBe(true);
   });
   it('gives the reserved daily-budget call back when the round is not started', async () => {
     const released = [];
