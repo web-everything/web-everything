@@ -3,6 +3,7 @@ bornAs: xlv5uzx
 kind: story
 size: 5
 status: open
+related: ["7843"]
 scope: ["we:scripts/lib/drain-queue-safety.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/operations/pr-ownership.mjs"]
 dateOpened: "2026-11-07"
 tags: []

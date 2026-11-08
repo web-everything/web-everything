@@ -3,6 +3,7 @@ bornAs: x86hjr2
 kind: story
 size: 3
 status: open
+related: ["6260"]
 scope: ["we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/operations/pr-sweep-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
