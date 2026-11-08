@@ -27,7 +27,8 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
       if (args[0] === 'api' && args[1] === 'user') {
         return JSON.stringify(personal ? { login: 'chalbert', type: 'User' } : { login: 'web-everything', type: 'Bot' });
       }
-      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(transport.thread);
+      // `gh pr view --json comments` returns ONE page (100) of the thread, as the real one does.
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ ...transport.thread, comments: transport.thread.comments.slice(0, 100) });
       if (args[0] === 'pr' && args[1] === 'comment') {
         transport.thread.comments.push({ body: args[args.indexOf('--body') + 1], author: { login: transport.postAs ?? as },
           url: `https://github.com/${repo}/pull/7#issuecomment-${transport.nextId++}` });
@@ -128,6 +129,26 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
     const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async (list) => { events.push(...list); } })[OPERATOR_RULING_POST_EFFECT];
     await expect(sink(sinkArgs(plan()))).rejects.toThrow(/issuecomment-\d+ is LIVE and clears the comment gate/);
     expect(events.map((e) => e.ruling)).toEqual(['not-real', 'block']);
+  });
+
+  it('on a thread past one page the wrong-author comment is found through the complete reader and deleted', async () => {
+    transport.identityFallback = true;
+    for (let i = 0; i < 100; i++) transport.thread.comments.push(gh(`filler ${i}`, 'someone'));
+    const events = [];
+    const readAllComments = () => structuredClone(transport.thread.comments);
+    const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, readAllComments, appendEvents: async (list) => { events.push(...list); } })[OPERATOR_RULING_POST_EFFECT];
+    await expect(sink(sinkArgs(plan()))).rejects.toThrow(/removed the wrong-author ruling comment/);
+    expect(events.map((e) => e.ruling)).toEqual(['not-real', 'block']);
+    expect(readOperatorRulings(transport.thread.comments).rulings).toEqual([]);
+    expect(gatePending()).toEqual([rec.referrals[0].key]);
+  });
+
+  it('a long thread whose complete read fails is reported as possibly LIVE, never as "no stray"', async () => {
+    transport.identityFallback = true;
+    for (let i = 0; i < 100; i++) transport.thread.comments.push(gh(`filler ${i}`, 'someone'));
+    const readAllComments = () => { throw new Error('comment count proof failed'); };
+    const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, readAllComments, appendEvents: async () => {} })[OPERATOR_RULING_POST_EFFECT];
+    await expect(sink(sinkArgs(plan()))).rejects.toThrow(/could not re-read the thread[\s\S]*may be LIVE/);
   });
 
   it('a ruling authored by the checked operator in different letter case is kept, not deleted', async () => {

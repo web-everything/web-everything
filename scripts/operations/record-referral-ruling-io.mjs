@@ -37,6 +37,7 @@ import { idFromName, normalizeId } from '../backlog/id.mjs';
 import { selectFindings, openReferralFindings, automaticPolicyTargets, describePolicySkip, policyProtectionSnapshot,
   OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, planJudgeNotReal, finishJudgeRuling, planReferralCard } from './record-referral-ruling.mjs';
 import { createChangedLinesReader, changesTouchCitedLines, COMPARE_FILE_CAP } from './review-pr-io.mjs';
+import { readCompletePrComments, LIST_COMMENTS_PAGE_SIZE } from '../conveyor/pr-comments-complete.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -444,7 +445,9 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }),
   removeComment = (repo, id) => execFileSyncThrottled('gh', ['api', '--method', 'DELETE', `repos/${repo}/issues/comments/${id}`],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }) } = {}) {
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }),
+  // The complete, count-proved thread (paginated REST); `gh pr view --json comments` stops at one page of 100.
+  readAllComments = (repo, pr) => readCompletePrComments(Number(pr), { repo }) } = {}) {
   return {
     ['github.referral-ruling-file-card']: rulingCardFilingSink(landCard),
     ['github.referral-ruling-file-card-judge']: judgeRulingSink({ confirm, land: landCard, planCard: planReferralCard }),
@@ -581,9 +584,15 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
       // landed), delete each wrong-author copy by its own id, and confirm on a fresh read that it is gone. Never throws:
       // returns the note for the error, naming any copy that may still be LIVE.
       const STRAY_DELETE_CAP = 5;
+      // A page that reaches the list cap may be truncated, and the gate reads the whole thread: re-read it completely
+      // (a failed complete read throws, so it is never taken as "no stray").
+      const wholeThread = () => {
+        const listed = readPrThread(repo, pr, { readJson }).comments;
+        return listed.length >= LIST_COMMENTS_PAGE_SIZE ? readAllComments(repo, pr) : listed;
+      };
       const removeStrays = () => {
         let strays;
-        try { strays = strayOf(readPrThread(repo, pr, { readJson }).comments); } catch (e) {
+        try { strays = strayOf(wholeThread()); } catch (e) {
           return `could not re-read the thread to check for a wrong-author ruling comment (${String(e?.message ?? e).split('\n')[0]}); one may be LIVE and clear the comment gate — inspect the thread before retrying`;
         }
         if (!strays.length) return '';
@@ -593,7 +602,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
           try { removeComment(repo, id); } catch (e) { warn(`could not delete wrong-author ruling comment ${strays[i].url}: ${String(e?.message ?? e).split('\n')[0]}`); }
         });
         let left;
-        try { left = strayOf(readPrThread(repo, pr, { readJson }).comments); } catch { left = strays; }
+        try { left = strayOf(wholeThread()); } catch { left = strays; }
         if (!left.length) return `removed the wrong-author ruling comment${strays.length === 1 ? '' : 's'} ${strays.map((c) => c.url).join(', ')} from the thread`;
         return `${left.map((c) => c.url || `(a comment by ${String(c?.author?.login ?? '')} with no id)`).join(', ')} is LIVE and clears the comment gate `
           + '(its delete failed or could not be confirmed) — delete it before retrying';
