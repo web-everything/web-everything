@@ -85,8 +85,10 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
     expect(performance.now() - start).toBeLessThan(600);
   });
 
-  it('debounce/burst: five signals produce exactly one early wake and the following sleep(80) reaches interval', async () => {
-    const sleep = wakeSleep({ debounceMs: 80 });
+  it('debounce/burst: five signals produce exactly one early wake and the following sleep(250) reaches interval', async () => {
+    // Wide window: a loaded CI runner stretches the burst's timers (92ms was seen against 80), so the debounce
+    // must dwarf the burst's own wall-clock jitter for "one burst = one wake" to be a fair assertion.
+    const sleep = wakeSleep({ debounceMs: 250 });
     const reasons = [];
     const start = performance.now();
     const pending = sleep(5000).then(reason => { reasons.push(reason); return reason; });
@@ -95,13 +97,15 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
       expect(signalVerifyRequest({ dir, log: vi.fn() })).toBe(true);
       if (i < 4) await delay(5);
     }
-    expect(performance.now() - start).toBeLessThan(80);
-    expect(await Promise.race([pending, delay(600).then(() => 'timed-out')])).toBe('handoff');
+    expect(performance.now() - start).toBeLessThan(250);
+    // The burst itself must not have woken the sleep mid-burst (the real debounce invariant).
+    expect(reasons).toEqual([]);
+    expect(await Promise.race([pending, delay(1500).then(() => 'timed-out')])).toBe('handoff');
     const secondStart = performance.now();
-    reasons.push(await sleep(80));
+    reasons.push(await sleep(250));
     expect(reasons).toEqual(['handoff', 'interval']);
     expect(reasons.filter(reason => reason === 'handoff')).toHaveLength(1);
-    expect(performance.now() - secondStart).toBeGreaterThanOrEqual(65);
+    expect(performance.now() - secondStart).toBeGreaterThanOrEqual(200);
   });
 
   it.each(['throws', 'emits error'])('watcher failure (%s): logs, falls back to the timer without stat polling, and never spins or resolves twice', async failure => {
