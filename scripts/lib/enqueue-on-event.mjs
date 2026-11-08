@@ -723,6 +723,7 @@ export function createEnqueueOnEvent({
   };
   const greenEvent = p => p.causes.some(c => /^check_(suite|run)\.completed=success$/.test(c));
   const misses = new Map();
+  const missedAt = new Map(); // num -> time of the last miss: bounds the landable-first reorder (never a permanent demotion)
   const backoff = new Map();
   const missBackoff = new Map();
   let batchingRetry = null; // a global batching deferral must be rechecked before other admissions
@@ -898,7 +899,7 @@ export function createEnqueueOnEvent({
         const planAt = now();
         const priorities = await readPriorities();
         const inputs = { ...result, defaultBranch, ...priorities, repo: localSlug, now: planAt,
-          order: s.catchUp.order, deprioritize: new Set([...misses.keys(), ...missBackoff.keys(), ...backoff.keys()]),
+          order: s.catchUp.order, deprioritize: new Set([...[...missedAt].filter(([num, at]) => misses.has(num) && planAt - at < missSettings(s).ttlMinutes * 60_000).map(([num]) => num), ...missBackoff.keys(), ...backoff.keys()]),
           pendingNums: pendingEntries.map(p => p.num), pendingSince,
           pendingExpiryMinutes: s.catchUp.pendingExpiryMinutes };
         const expiryPlan = planCatchUp({ ...inputs, capacity });
@@ -1072,6 +1073,7 @@ export function createEnqueueOnEvent({
         if (missed) {
           const count = (misses.get(p.num) || 0) + 1;
           misses.set(p.num, count);
+          missedAt.set(p.num, now());
           const threshold = s.catchUp?.missSmellAfter ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missSmellAfter;
           if (count % threshold === 0) log(`enqueue-on-event: SMELL enqueue-not-entering — #${p.num} missed the merge queue ${count} catch-up(s) in a row (last: ${what}); check the fast drain's enqueueOutcomes / adaptive batching state`);
         }

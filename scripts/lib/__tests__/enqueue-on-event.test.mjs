@@ -2838,6 +2838,21 @@ describe('catch-up landable-first regression contracts', () => {
     expect(attempts(f)).toEqual(['--only=42', '--only=43', '--only=44', '--only=42']);
   });
 
+  it('restores priority order for a missed PR once the default missBackoff TTL expires without permanent demotion', async () => {
+    let prs = [candidate(42, 0, { itemIds: ['42'] })];
+    const f = fixture({
+      readPriorities: () => ({ buildPriority: ['42'] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs }),
+      drainResult: num => num === 42 ? miss(num, 'lock held', 'merge-lock-held') : { toMerge: [{ num }] },
+    });
+    await f.handle.catchUp();
+    expect(f.handle.misses().get(42)).toBe(1);
+    prs = [...prs, candidate(43, 100), candidate(44, 200)];
+    f.advance(30 * 60_000);
+    await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=42', '--only=43', '--only=44']);
+  });
+
   it('expires old event-marked pending work into this round while fresh event work stays already pending', async () => {
     const f = fixture({
       resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
