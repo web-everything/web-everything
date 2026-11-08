@@ -3283,6 +3283,26 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
     expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
   });
 
+  describe('clone config that would make `git status` blind to a real edit (the clone is writable by Codex)', () => {
+    it('a mode-only change keeps the clone when core.fileMode=false hides it from status', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'config', 'core.fileMode', 'false');
+      execFileSync('chmod', ['+x', join(dir, 'a.txt')]);
+      // the premise: status run with the clone's own config sees nothing
+      expect(git(dir, 'status', '--porcelain', '--untracked-files=all').trim()).toBe('');
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(r.reason).toBe('uncommitted changes');
+      expect(statSync(join(dir, 'a.txt')).mode & 0o111).not.toBe(0);
+    });
+
+    it('a clean clone is still deleted with core.fileMode=false (the pin does not over-keep)', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'config', 'core.fileMode', 'false');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(true);
+    });
+  });
+
   it('a commit made after the start sha keeps the clone even though status is empty', () => {
     const { dir, sha } = makeClone();
     writeFileSync(join(dir, 'a.txt'), 'three\n');

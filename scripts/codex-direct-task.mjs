@@ -607,7 +607,10 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
   // Codex can write this clone's git config and the CLI may inherit GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE: run every
   // read with the shared lane pins (`core.fsmonitor=false` — a hook could otherwise run on the host or report "clean"),
   // no replace refs, no optional index lock, and the repository-location env scrubbed so `-C dir` cannot inspect another repo.
-  const gitHardened = (args) => String(execFn('git', ['-C', dir, '--no-optional-locks', ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
+  // `core.fileMode=true` is pinned for cleanup only: Codex (or the host) can set `core.fileMode=false` in the clone's
+  // config, which hides an executable-bit change from `status`. Forcing it on can only keep more clones (a filesystem
+  // that cannot hold the bit reports a change), never delete one that holds a mode edit.
+  const gitHardened = (args) => String(execFn('git', ['-C', dir, '--no-optional-locks', ...laneGitConfigArgs(), '-c', 'core.fileMode=true', '--no-replace-objects', ...hardenLaneGitArgs(args)],
     { env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: GIT_STEP_TIMEOUT_MS }));
   const git = (...args) => gitHardened(args);
   try {
