@@ -25,6 +25,7 @@ import {
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
   standDownComments, standDownReason, WATCHER_STAND_DOWN_ACTOR, countTerminalStandDowns,
   SUPERSEDE_STAND_DOWN_MARKER, isStandDownSuperseded, isSelfAuthored, AUTOMATION_LOGINS,
+  isLoadOnlyRedStandDown, loadFlakeHolds, flattenTimeoutDetail,
 } from '../stand-down.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../ci-heal-mark.mjs';
@@ -643,4 +644,64 @@ it('lapses only trusted current-head exhaustion when the red-main predicate prov
     { ...options, onLapse: () => {} });
   expect(result.standDownLapses).toEqual([lapse]);
   expect(countTerminalStandDowns(result.comments)).toBe(0);
+});
+
+// #6469 live: the fixer stood down (gate-red) on an out-of-diff test timeout and nothing re-armed it, because the
+// classifier only read "red only on ... host load" wording. Pins the evidence shape that now counts as a load flake.
+describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)', () => {
+  const author = { login: AUTOMATION_LOGINS[0] };
+  const mk = (detail) => ({ body: buildStandDownComment({ reason: 'gate-red', detail }), createdAt: '2026-11-08T01:22:11Z', author });
+  const LIVE = "constellation-ownership.test.mjs 'runs classify --json against git ls-files' timed out at 15000ms (unrelated to this change; same timeout on 81ab808ef); all 515 other tests incl. review-red-team-on-skip pass";
+  it('the exact #6469 text reads as a redispatch load-flake hold, not a terminal stand-down', () => {
+    const c = mk(LIVE);
+    expect(isLoadOnlyRedStandDown(c)).toBe(true);
+    expect(standDownComments([c])).toEqual([]);
+    expect(loadFlakeHolds([c])).toHaveLength(1);
+  });
+  it('states-the-evidence form (outside the diff, passes alone) also counts', () => {
+    expect(isLoadOnlyRedStandDown(mk("red only on foo.test.mjs 'x' timed out at 15000ms, a file outside the PR diff; it passes alone"))).toBe(true);
+  });
+  it('a diff-touched or assertion failure stays terminal', () => {
+    expect(isLoadOnlyRedStandDown(mk("review-red-team-on-skip.test.mjs 'x' timed out at 15000ms in a file this PR touches; 3 other tests pass"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' failed: AssertionError expected 1 to be 2 (unrelated to this change); all 515 other tests pass"))).toBe(false);
+    expect(standDownComments([mk('foo.test.mjs timed out at 15000ms in a diff-touched file')])).toHaveLength(1);
+  });
+  it('mixed timeout plus a real failure, or negated corroboration, stays terminal (audit)', () => {
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out at 15000ms outside the diff; other tests pass; bar.test.mjs failed: received 2 instead of 1"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out at 15000ms (unrelated to this change); all 3 other tests fail"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs (changed by this PR) timed out; unrelated to this change; other tests pass"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out (unrelated to this change); other tests pass; bar.test.mjs comparison mismatch: 1 versus 2"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out at 15000ms (unrelated to this change); other tests do not pass"))).toBe(false);
+  });
+  it('unlisted wording stays terminal: whitelist, not blacklist (audit)', () => {
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out outside the diff; other tests pass; foo.test.mjs was modified in this PR"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out (unrelated to this change); other tests pass; equality check: 1 !== 2"))).toBe(false);
+  });
+  it('quoted text cannot hide a failure or a diff-touched claim (audit)', () => {
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out (unrelated to this change); other tests pass; 'bar assertion failed: 1 !== 2'"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out (unrelated to this change); other tests pass; 'this file is modified by the PR'"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'a' timed out (unrelated to this change); other tests pass; 'b'"))).toBe(false);
+  });
+  it('numbers and operators left over stay terminal; a diff-touched note stays terminal (audit)', () => {
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out outside the diff; other tests pass; 1 !== 2"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out at 15000ms (unrelated to this change); other tests pass (a file in this PR's diff)"))).toBe(false);
+  });
+  it('no named file, or a quoted comparison, stays terminal (audit)', () => {
+    expect(isLoadOnlyRedStandDown(mk("test timed out outside the diff; other tests pass"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out (unrelated to this change); other tests pass; 'comparison mismatch: 1 versus 2'"))).toBe(false);
+  });
+  it('a multi-line detail cannot hide a failure below the first line (audit)', () => {
+    const d = flattenTimeoutDetail('gate-red', "foo.test.mjs timed out outside the diff; other tests pass\nAssertionError: expected 1 to be 2");
+    expect(d).not.toContain('\n');
+    expect(isLoadOnlyRedStandDown(mk(d))).toBe(false);
+    expect(flattenTimeoutDetail('needs-judgment', 'a\nb')).toBe('a\nb');
+  });
+  it('a persisted multi-line comment with a failure below the reason line stays terminal (audit)', () => {
+    const c = mk("foo.test.mjs timed out outside the diff; other tests pass\nbar.test.mjs AssertionError: expected 1 to be 2");
+    expect(isLoadOnlyRedStandDown(c)).toBe(false);
+    expect(standDownComments([c])).toHaveLength(1);
+  });
+  it('a bare timeout with no unrelated/other-tests-pass evidence stays terminal', () => {
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
+  });
 });
