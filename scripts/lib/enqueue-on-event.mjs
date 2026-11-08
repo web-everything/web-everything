@@ -899,7 +899,7 @@ export function createEnqueueOnEvent({
         const planAt = now();
         const priorities = await readPriorities();
         const inputs = { ...result, defaultBranch, ...priorities, repo: localSlug, now: planAt,
-          order: s.catchUp.order, deprioritize: new Set([...[...missedAt].filter(([num, at]) => misses.has(num) && planAt - at < missSettings(s).ttlMinutes * 60_000).map(([num]) => num), ...missBackoff.keys(), ...backoff.keys()]),
+          order: s.catchUp.order, deprioritize: new Set([...[...missedAt].filter(([num, at]) => misses.has(num) && planAt - at < missSettings(s).ttlMinutes * 60_000).map(([num]) => num)]),
           pendingNums: pendingEntries.map(p => p.num), pendingSince,
           pendingExpiryMinutes: s.catchUp.pendingExpiryMinutes };
         const expiryPlan = planCatchUp({ ...inputs, capacity });
