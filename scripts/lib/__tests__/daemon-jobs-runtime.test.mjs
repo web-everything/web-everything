@@ -226,6 +226,45 @@ describe('reattachTick', () => {
   };
   const noLaunch = () => null;
 
+  it.each([
+    ['pid gone', 'h', null, 0, false, 1, 'dead', 'requeue', 'queued'],
+    ['procStart mismatch', 'h', 'new-start', 0, false, 1, 'dead', 'requeue', 'queued'],
+    ['live owner', 'h', 'x', 0, false, 1, 'live', null, 'running'],
+    ['stale foreign owner', 'Mac', null, 1001, false, 1, 'dead', 'requeue', 'queued'],
+    ['exhausted stale foreign owner', 'Mac', null, 1001, false, 3, 'dead', 'fail', 'failed'],
+    ['fresh foreign owner', 'Mac', null, 1000, false, 1, 'foreign', null, 'running'],
+    ['sleeping foreign owner', 'Mac', null, 1001, true, 1, 'foreign', null, 'running'],
+  ])('%s preserves recovery and process-group safety', async (_name, host, start, age, slept, attempts, state, action, status) => {
+    const now = Date.now();
+    claimed('owner', { heartbeatAt: new Date(now - age).toISOString(), attempts });
+    const handle = formatJobHandle({ host, pid: 99, procStart: 'x' });
+    store.update('owner', r => ({ ...r, job: { ...r.job, handle, host } }));
+    const readStart = vi.fn(() => start);
+    const reapGroup = vi.fn(() => false), stop = vi.fn();
+    const out = await reattachTick({ store, kinds, maxConcurrent: 1, launch: noLaunch,
+      observation: { now, slept, gapMs: 0 }, foreignStaleMs: 1000, reapGroup, stop,
+      probe: h => probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['h']), readStart }) });
+    expect(store.read('owner').job.status).toBe(status);
+    if (action) expect(out.actions).toEqual([expect.objectContaining({ id: 'owner', state, action })]);
+    else expect(out.actions).toEqual([]);
+    expect(stop).not.toHaveBeenCalled();
+    if (host === 'Mac') {
+      expect(readStart).not.toHaveBeenCalled();
+      expect(reapGroup).not.toHaveBeenCalled();
+    }
+  });
+
+  it('propagates a non-task probe error without recovering or releasing the slot', async () => {
+    claimed('uncertain');
+    const reapGroup = vi.fn(), stop = vi.fn(), launch = vi.fn();
+    await expect(reattachTick({ store, kinds, maxConcurrent: 1, reapGroup, stop, launch,
+      probe: () => { throw new Error('probe unavailable'); } })).rejects.toThrow('probe unavailable');
+    expect(store.read('uncertain').job.status).toBe('running');
+    expect(reapGroup).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  });
+
   it('leaves a live job alone, requeues a dead one keeping its checkpoint', async () => {
     claimed('live');
     claimed('dead');

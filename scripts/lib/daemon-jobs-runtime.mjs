@@ -29,7 +29,7 @@ import { performance } from 'node:perf_hooks';
 
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import {
-  DEFAULT_BACKOFF_BASE_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_LAUNCH_GRACE_MS,
+  DEFAULT_BACKOFF_BASE_MS, DEFAULT_FOREIGN_STALE_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_LAUNCH_GRACE_MS,
   SLEEP_GAP_THRESHOLD_MS, admitJobs, classifyJob, detectSleep, markClaimed, markCheckpoint, markFailed,
   markHeartbeat, markLaunching, markQueued, markRequeued, markSpawned, markStepError, markStopped, markSucceeded,
   planReattach, taskDeadlineDecision,
@@ -522,7 +522,7 @@ function completeTaskResult(r, { at, now, backoffBaseMs }) {
 /**
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
- *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, reapGroup?: Function,
+ *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, foreignStaleMs?: number, reapGroup?: Function,
  *   // reapGroup(handle, cutoff, { requireConfirmedDeath: true }) must return true only for confirmed absence.
  *   releaseTaskClaim?: (record: object) => void, // synchronous, attempt-scoped port; must throw on refusal
  *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
@@ -531,6 +531,7 @@ function completeTaskResult(r, { at, now, backoffBaseMs }) {
 export async function reattachTick({
   store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
+  foreignStaleMs = DEFAULT_FOREIGN_STALE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
   releaseTaskClaim = () => {},
   reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs }),
@@ -569,7 +570,7 @@ export async function reattachTick({
       }
     };
     const liveness = r.job.handle ? observeOwner() : null;
-    const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, sleepDetected: slept });
+    const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, foreignStaleMs, sleepDetected: slept });
     const taskDeadline = isTask ? taskDeadlineDecision(r, { now }) : null;
     const deadline = isTask ? taskDeadline?.deadlineAt : deadlineAt(r);
     const expired = Number.isFinite(deadline) && now >= deadline && state !== 'terminal' && (isTask || state !== 'foreign');
