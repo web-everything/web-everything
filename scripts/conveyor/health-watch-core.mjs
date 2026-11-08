@@ -916,6 +916,8 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
   // leaves the memory as it is (the smell is then skipped, not evaluated as empty).
   const operatorHolds = probes.operatorHolds ? foldOperatorHolds(state.operatorHolds, probes.operatorHolds, now, { episodes: state.episodes }) : (state.operatorHolds ?? undefined);
   const ctx = {
+    // Read-only view for smells that must close episodes of subjects they can no longer enumerate.
+    episodes: state.episodes ?? {},
     now, config: cfg, daemons, builder, probeErrors: errs, lastTick: state.lastTick, heavyHeldSince,
     operatorHolds: operatorHolds ? operatorHoldView(operatorHolds, state.episodes) : null,
   };
