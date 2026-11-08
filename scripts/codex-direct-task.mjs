@@ -591,7 +591,8 @@ export function collectAndClearRolloutQuota({
  * user's `status.showUntrackedFiles=no` cannot hide them), an ignored entry other than a `node_modules`
  * DIRECTORY exists (the installed dependencies are expected; a gitignored `.env`, `coverage/`, notes file, or a
  * file / symlink named `node_modules` is not), HEAD is not `startSha`, a stash exists, or a local branch holds a commit that `startSha` does not
- * reach. No patch is written: the clone itself is the preserved artifact. Fails closed: if any of those reads
+ * reach, or a submodule exists (its stashes and branches live in its own repository, invisible to every parent
+ * read). No patch is written: the clone itself is the preserved artifact. Fails closed: if any of those reads
  * fails, the clone is kept. Every read runs with the shared lane git hardening (config pins such as
  * `core.fsmonitor=false`, repository-location env scrubbed); a clone that defines a filter driver is kept; and
  * `-C dir` must be the clone's own top level, else the clone is kept. Synchronous, so a signal handler can call it.
@@ -635,6 +636,11 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
     }
     // Linked worktrees would be orphaned by the delete and may hold a detached-HEAD commit.
     if (git('worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length > 1) return keep('linked worktree present');
+    // A submodule is its own repository (its own stashes, branches, reflog, objects under `.git/modules`) that none
+    // of the parent reads above can see, so any submodule keeps the clone: a gitlink in the index, or a surviving
+    // `.git/modules` directory (a submodule removed from the index leaves its repository behind).
+    if (git('ls-files', '--stage').split('\n').some((l) => l.startsWith('160000 '))) return keep('submodule present');
+    if (existsSync(resolve(dir, git('rev-parse', '--git-path', 'modules').trim()))) return keep('submodule present');
     // `git status` cannot see edits to files marked assume-unchanged (lowercase tag) or skip-worktree (`S`).
     if (git('ls-files', '-v').split('\n').some((l) => /^[a-zS] /.test(l))) return keep('files hidden from status (assume-unchanged / skip-worktree)');
   } catch {

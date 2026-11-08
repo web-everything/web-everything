@@ -3519,6 +3519,57 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
       expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
     });
 
+    describe('submodules (their stashes, branches and objects live outside the parent repo reads)', () => {
+      function addSubmodule(root, dir) {
+        const lib = join(root, 'lib-src');
+        mkdirSync(lib);
+        git(lib, 'init', '-q');
+        git(lib, 'config', 'user.email', 't@example.com');
+        git(lib, 'config', 'user.name', 't');
+        writeFileSync(join(lib, 'l.txt'), 'lib\n');
+        git(lib, 'add', 'l.txt');
+        git(lib, 'commit', '-q', '-m', 'lib');
+        git(dir, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'lib');
+        git(dir, 'commit', '-q', '-m', 'add submodule');
+        return git(dir, 'rev-parse', 'HEAD').trim();
+      }
+
+      it('a submodule holding a stash keeps the clone even though every parent read is clean', () => {
+        const { root, dir } = makeClone();
+        const base = addSubmodule(root, dir);
+        const libDir = join(dir, 'lib');
+        git(libDir, 'config', 'user.email', 't@example.com');
+        git(libDir, 'config', 'user.name', 't');
+        writeFileSync(join(libDir, 'l.txt'), 'saved work in a submodule stash\n');
+        git(libDir, 'stash', 'push', '-q');
+        // the finding's premise: the parent sees nothing
+        expect(git(dir, 'status', '--porcelain', '--untracked-files=all').trim()).toBe('');
+        expect(git(dir, 'stash', 'list').trim()).toBe('');
+        expect(git(libDir, 'stash', 'list')).toContain('stash@{0}');
+        const r = cleanupScratchClone({ dir, startSha: base });
+        expect(r.removed).toBe(false);
+        expect(r.reason).toBe('submodule present');
+        expect(git(libDir, 'stash', 'list')).toContain('stash@{0}');
+      });
+
+      it('a submodule removed from the index but still holding .git/modules keeps the clone', () => {
+        const { root, dir } = makeClone();
+        addSubmodule(root, dir);
+        git(dir, 'rm', '-q', '-f', 'lib');
+        git(dir, 'commit', '-q', '-m', 'drop submodule');
+        const base = git(dir, 'rev-parse', 'HEAD').trim();
+        expect(statSync(join(dir, '.git', 'modules', 'lib')).isDirectory()).toBe(true);
+        const r = cleanupScratchClone({ dir, startSha: base });
+        expect(r.removed).toBe(false);
+        expect(r.reason).toBe('submodule present');
+      });
+
+      it('a clone with no submodule is still deleted (the guard does not over-keep)', () => {
+        const { dir, sha } = makeClone();
+        expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(true);
+      });
+    });
+
     it('an assume-unchanged edit keeps the clone', () => {
       const { dir, sha } = makeClone();
       git(dir, 'update-index', '--assume-unchanged', 'a.txt');
