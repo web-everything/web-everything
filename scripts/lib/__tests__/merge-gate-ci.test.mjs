@@ -386,6 +386,14 @@ describe('gatherPrFacts red-team publication hold', () => {
     expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
   });
 
+  it('a hold stored under the canonical lowercase slug holds a mixed-case --repo', () => {
+    const facts = gather([[/pr view 7 .*--json number,title/, () => prJson()], [/commits\/a{40}\/check-runs/,
+      JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: 'O/R#7',
+        app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] })]],
+    { repo: 'O/R', env: holdEnv('check-run', { hold: true }) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/not confirmed published/) });
+  });
+
   it('a published success with no local hold passes', () => {
     const facts = gather([GH_PR, GH_SUCCESS], { env: holdEnv('check-run') });
     expect(facts.redTeamCheck).toMatchObject({ ok: true });

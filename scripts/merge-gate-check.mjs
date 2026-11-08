@@ -179,14 +179,18 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   const pin = pinnedHeadOf(pr, { expected: expectedHeadSha, requireExpected: requireExpectedHead });
   facts.pinnedHead = pin;
   facts.redTeamGateSource = readRedTeamGateSource({ env, log: line => process.stderr.write(`${line}\n`) }).value.source;
-  // A durable local publication hold outranks any published check: a failed publication can leave an older
-  // success on GitHub. On a host without the drain's status store (CI) the hold is absent and this is a no-op.
-  const publicationHold = facts.redTeamGateSource === 'drain-scan' || pin.error ? null
-    : readRedTeamPublicationHold({ repo, pr: num, head: pin.sha, env });
   facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
-    : publicationHold ? { ok: false, reason: publicationHold }
     : readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID,
       gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
+  // A durable local publication hold outranks any published check: a failed publication can leave an older
+  // success on GitHub. Read it AFTER the check, so a writer that starts mid-read is still seen. Writers store
+  // the canonical lowercase slug, while `--repo` is case-insensitive to gh, so both spellings are read.
+  // On a host without the drain's status store (CI) the hold is absent and this is a no-op.
+  if (facts.redTeamGateSource !== 'drain-scan' && !pin.error) {
+    const hold = [...new Set([repo, String(repo).toLowerCase()])]
+      .map(slug => readRedTeamPublicationHold({ repo: slug, pr: num, head: pin.sha, env })).find(Boolean);
+    if (hold) facts.redTeamCheck = { ok: false, reason: hold };
+  }
 
   if (!facts.ledger.error && ['ledger', 'both'].includes(facts.ledger.authority)) {
     try {
