@@ -1,5 +1,6 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as ghThrottle from '../gh-throttle.mjs';
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +25,50 @@ function fixture() {
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
 describe('status persistence and check publication share one claim', () => {
+  it.each(['pending', 'running', 'finished'])('under-test %s writes without an injected publisher never call gh or create a publication hold', status => {
+    const f = fixture();
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(() => { throw Error('real gh forbidden'); });
+    try {
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status }, { env: f.env });
+      expect(readRedTeamStatus(f).status).toBe(status);
+      expect(readRedTeamPublicationHold(f)).toBeNull();
+      expect(gh).not.toHaveBeenCalled();
+    } finally { gh.mockRestore(); }
+  });
+
+  it('an explicit WE_UNDER_TEST environment suppresses publication without ambient test markers', () => {
+    const f = fixture(), env = { ...f.env, WE_UNDER_TEST: '1' };
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(() => { throw Error('real gh forbidden'); });
+    vi.stubEnv('VITEST', '');
+    vi.stubEnv('WE_UNDER_TEST', '');
+    try {
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env });
+      expect(readRedTeamStatus(f).status).toBe('running');
+      expect(readRedTeamPublicationHold(f)).toBeNull();
+      expect(gh).not.toHaveBeenCalled();
+    } finally { gh.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it.each(['running', 'finished'])('an injected %s publisher opts into markers without opting into real gh evidence reads', status => {
+    const f = fixture(), checks = [];
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(() => { throw Error('real gh forbidden'); });
+    try {
+      const result = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status }, {
+        env: f.env, postCheckRun: ({ payload: check }) => {
+          expect(readRedTeamPublicationHold(f)).toMatch(/not confirmed published/);
+          checks.push(check);
+          return { ok: true };
+        },
+      });
+      expect(result).toEqual({ published: true });
+      expect(checks).toHaveLength(1);
+      expect(checks[0].status).toBe(status === 'finished' ? 'completed' : 'in_progress');
+      if (status === 'finished') expect(checks[0].conclusion).toBe('failure');
+      expect(readRedTeamPublicationHold(f)).toBeNull();
+      expect(gh).not.toHaveBeenCalled();
+    } finally { gh.mockRestore(); }
+  });
+
   it('successful completion followed by failed publication of a terminal failure keeps the hold and attempts the failure supersede', () => {
     const f = fixture(), appId = 5037855, runs = [], attempts = [];
     const input = { ...f, loopPayload: payload(f.head), status: 'finished' };
@@ -59,7 +104,8 @@ describe('status persistence and check publication share one claim', () => {
 
   it('publication holds are isolated by head and fail closed on unreadable marker paths', () => {
     const f = fixture();
-    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env: f.env });
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env: f.env, gh: () => '',
+      postCheckRun: () => ({ ok: false, reason: 'fixture publication failure' }), log: () => {} });
     expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
     expect(readRedTeamPublicationHold({ ...f, head: 'c'.repeat(40) })).toBeNull();
     // A non-directory ancestor makes the probe unreadable, rather than absent.

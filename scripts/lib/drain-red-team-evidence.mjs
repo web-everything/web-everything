@@ -389,19 +389,21 @@ export function withRedTeamStatusClaim(path, write, { readPidStart = pidStartTim
 
 /** CAS and atomic rename share a reclaimable recovery claim; a loser never rolls back the winner. */
 export function recordRedTeamStatus(input, options = {}) {
+  const underTest = isUnderTest(options.env) || isUnderTest();
+  const publish = typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest;
   const path = statusPath({ ...input, head: input.loopPayload?.findings?.read?.netBasis?.rev }, options.env ?? process.env);
   mkdirSync(dirname(path), { recursive: true });
   return withRedTeamStatusClaim(path, () => {
     if (Object.hasOwn(options, 'expectedSha256') && digest(optionalBytes(path)) !== options.expectedSha256) throw Error('raw recovery writer changed');
     // Every transition may invalidate a prior success, including a terminal
     // failure. Keep its hold durable until publication is confirmed.
-    writeJsonAtomic(`${path}.unpublished`, { status: input.status });
+    if (publish) writeJsonAtomic(`${path}.unpublished`, { status: input.status });
     const written = writeRedTeamStatus(input, options);
     // Keep synchronous publication inside the claim: a newer writer must not persist or
     // publish a hold before this writer's check has been posted. Local persistence
     // still happens first and survives every publication failure.
     // Test runs need explicit IO.
-    if (options.gh || (!isUnderTest(options.env) && !isUnderTest())) {
+    if (publish) {
       const report = outcome => {
         if (!outcome.published) {
           try { (options.log ?? (line => process.stderr.write(`${line}\n`)))(JSON.stringify(outcome)); }
@@ -413,7 +415,9 @@ export function recordRedTeamStatus(input, options = {}) {
         .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
       try {
         const head = input.loopPayload?.findings?.read?.netBasis?.rev;
-        const gh = options.gh ?? ((args, opts) => runGhSync(args, { ...opts, env: options.env ?? process.env }));
+        // A publisher alone must not opt terminal evidence reads into real GitHub IO.
+        const gh = options.gh ?? (underTest ? () => { throw Error('test publication evidence requires injected gh'); }
+          : (args, opts) => runGhSync(args, { ...opts, env: options.env ?? process.env }));
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
         if (input.status === 'finished') {
