@@ -3352,4 +3352,191 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
     expect(proc.listenerCount('SIGTERM')).toBe(0);
     expect(guard.finish()).toEqual(r);
   });
+
+  it('finish() applies the cleanup rule exactly once: a second call runs no git commands', () => {
+    const { dir, sha } = makeClone();
+    const calls = [];
+    const execFn = (bin, args, opts) => { calls.push(args); return execFileSync(bin, args, { ...opts, encoding: 'utf8' }); };
+    const guard = createScratchGuard({ proc: new EventEmitter(), execFn });
+    guard.arm(dir, sha);
+    const first = guard.finish();
+    const seen = calls.length;
+    expect(seen).toBeGreaterThan(0);
+    expect(guard.finish()).toEqual(first);
+    expect(calls.length).toBe(seen);
+  });
+
+  it('an unreadable HEAD keeps a clean clone (status succeeds, rev-parse fails)', () => {
+    const rm = vi.fn();
+    const execFn = (bin, args) => {
+      if (args.includes('rev-parse')) throw new Error('HEAD unreadable');
+      return '';
+    };
+    const r = cleanupScratchClone({ dir: '/nonexistent/clone', startSha: 'x', execFn, rmFn: rm });
+    expect(r.removed).toBe(false);
+    expect(rm).not.toHaveBeenCalled();
+  });
+
+  it('preserves untracked files when status.showUntrackedFiles is disabled', () => {
+    const { dir, sha } = makeClone();
+    git(dir, 'config', 'status.showUntrackedFiles', 'no');
+    writeFileSync(join(dir, 'secret-work.txt'), 'precious\n');
+    expect(git(dir, 'status', '--porcelain').trim()).toBe(''); // the config really hides it from plain status
+    const r = cleanupScratchClone({ dir, startSha: sha });
+    expect(r.removed).toBe(false);
+    expect(readFileSync(join(dir, 'secret-work.txt'), 'utf8')).toBe('precious\n');
+  });
+
+  describe('things `git status --porcelain` cannot see', () => {
+    it('a gitignored file keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'notes.txt\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      writeFileSync(join(dir, 'notes.txt'), 'codex wrote this\n');
+      const r = cleanupScratchClone({ dir, startSha: base });
+      expect(base).not.toBe(sha);
+      expect(r.removed).toBe(false);
+      expect(readFileSync(join(dir, 'notes.txt'), 'utf8')).toBe('codex wrote this\n');
+    });
+
+    it('an ignored node_modules (the installed dependencies) does not keep an otherwise clean clone', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore deps');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(dir, 'node_modules', 'pkg'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', 'pkg', 'index.js'), '');
+      expect(cleanupScratchClone({ dir, startSha: base }).removed).toBe(true);
+    });
+
+    it('a stash keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      writeFileSync(join(dir, 'a.txt'), 'stashed work\n');
+      git(dir, 'stash', 'push', '-q');
+      expect(git(dir, 'status', '--porcelain').trim()).toBe('');
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(git(dir, 'stash', 'list')).toContain('stash@{0}');
+    });
+
+    it('a side branch holding a commit, with HEAD reset back to the start, keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'checkout', '-q', '-b', 'side');
+      writeFileSync(join(dir, 'a.txt'), 'side work\n');
+      git(dir, 'commit', '-q', '-am', 'side commit');
+      git(dir, 'checkout', '-q', '--detach', sha);
+      expect(git(dir, 'rev-parse', 'HEAD').trim()).toBe(sha);
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(git(dir, 'rev-parse', 'side').trim()).not.toBe(sha);
+    });
+  });
+
+  describe('createScratchGuard signal re-raise', () => {
+    it('re-raises the signal on the process when nobody else is listening, and restores the default action', () => {
+      const { dir, sha } = makeClone();
+      const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+      const guard = createScratchGuard({ proc });
+      guard.arm(dir, sha);
+      proc.emit('SIGTERM');
+      expect(proc.kill).toHaveBeenCalledWith(4242, 'SIGTERM');
+    });
+
+    it('does not re-raise when another listener owns the signal', () => {
+      const { dir, sha } = makeClone();
+      const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+      proc.on('SIGINT', () => {});
+      const guard = createScratchGuard({ proc });
+      guard.arm(dir, sha);
+      proc.emit('SIGINT');
+      expect(proc.kill).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('codexDirectTask wiring (a real tiny git repo + a stub spawnFn)', () => {
+    /** A stub `codex exec`: optionally mutates its cwd (the scratch clone), then closes cleanly. */
+    function stubSpawn({ mutate, throwInstead } = {}) {
+      const seen = { cwd: null };
+      const fn = (cli, argv, opts) => {
+        seen.cwd = opts.cwd;
+        mutate?.(opts.cwd);
+        if (throwInstead) throw throwInstead;
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.stdin = { on: () => {}, end: () => {} };
+        child.kill = () => {};
+        setTimeout(() => { child.stdout.emit('data', Buffer.from('{"type":"thread.started","thread_id":"t1"}\n')); child.emit('close', 0); }, 0);
+        return child;
+      };
+      return { fn, seen };
+    }
+    const baseOpts = (repoRoot, extra = {}) => ({
+      task: 'fixture', repoRoot, gate: 'none', selfReview: false, stream: false, installDeps: false,
+      ephemeral: true, readQuotaFn: () => ({ quota: null, rolloutFile: null }), ...extra,
+    });
+
+    it('a clean run with an explicit log outside the clone marks the clone gone but the log kept', async () => {
+      const { root, dir: source } = makeClone();
+      const logFile = join(root, 'logs', 'events.jsonl');
+      const { fn } = stubSpawn();
+      const report = await codexDirectTask(baseOpts(source, { spawnFn: fn, logFile }));
+      expect(report.scratch.cleanup.removed).toBe(true);
+      expect(report.dirRemoved).toBe(true);
+      expect(report.logFileRemoved).toBe(false);
+      expect(statSync(logFile).isFile()).toBe(true);
+    });
+
+    it('a clean run deletes the scratch clone, reports it, and marks the deleted paths as gone', async () => {
+      const { root, dir: source } = makeClone();
+      const { fn, seen } = stubSpawn();
+      const report = await codexDirectTask(baseOpts(source, { spawnFn: fn }));
+      expect(report.scratch.created).toBe(true);
+      expect(report.scratch.cleanup).toMatchObject({ removed: true, reason: 'clean' });
+      expect(() => statSync(seen.cwd)).toThrow();
+      expect(report.scratch.cleanup.path).toBe(seen.cwd);
+      expect(report.dirRemoved).toBe(true);
+      expect(report.logFileRemoved).toBe(true);
+      expect(statSync(root).isDirectory()).toBe(true); // the source repo is never touched
+    });
+
+    it('a run that leaves a file keeps the clone and reports its path', async () => {
+      const { dir: source } = makeClone();
+      const { fn, seen } = stubSpawn({ mutate: (cwd) => writeFileSync(join(cwd, 'out.txt'), 'work\n') });
+      const report = await codexDirectTask(baseOpts(source, { spawnFn: fn }));
+      try {
+        expect(report.scratch.cleanup).toMatchObject({ removed: false, reason: 'uncommitted changes', path: seen.cwd });
+        expect(readFileSync(join(seen.cwd, 'out.txt'), 'utf8')).toBe('work\n');
+        expect(report.dir).toBe(seen.cwd);
+        expect(report.dirRemoved).toBeUndefined();
+        expect(report.logFileRemoved).toBeUndefined();
+        expect(statSync(report.logFile).isFile()).toBe(true);
+      } finally { rmSync(seen.cwd, { recursive: true, force: true }); }
+    });
+
+    it('a caller-supplied dir is never armed: it survives a clean run and gets no cleanup record', async () => {
+      const { dir } = makeClone();
+      const { fn } = stubSpawn();
+      const report = await codexDirectTask({ ...baseOpts(undefined, { spawnFn: fn }), repoRoot: undefined, dir });
+      expect(report.scratch).toEqual({ created: false });
+      expect(statSync(dir).isDirectory()).toBe(true);
+      expect(report.dir).toBe(dir);
+    });
+
+    it('an error after the clone keeps a dirty clone and names it in the error message', async () => {
+      const { dir: source } = makeClone();
+      let cwd;
+      const { fn } = stubSpawn({ mutate: (c) => { cwd = c; writeFileSync(join(c, 'half.txt'), 'x'); }, throwInstead: new Error('spawn exploded') });
+      try {
+        const error = await codexDirectTask(baseOpts(source, { spawnFn: fn })).then(() => null, (e) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toContain(`scratch clone KEPT (uncommitted changes): ${cwd}`);
+        expect(error.scratchCleanup).toMatchObject({ removed: false, path: cwd });
+        expect(readFileSync(join(cwd, 'half.txt'), 'utf8')).toBe('x');
+      } finally { if (cwd) rmSync(cwd, { recursive: true, force: true }); }
+    });
+  });
 });

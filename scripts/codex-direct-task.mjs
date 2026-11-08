@@ -118,7 +118,7 @@ import {
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -585,19 +585,35 @@ export function collectAndClearRolloutQuota({
 
 // ── scratch-clone cleanup (R731 slice 1) ─────────────────────────────────────────────────────────
 /**
- * Delete a scratch clone ONLY when nothing in it could be lost: `git status --porcelain` is empty AND HEAD is
- * still `startSha`. Anything else (untracked, modified, mode change, binary, a commit Codex made) keeps the
- * clone and reports its path. No patch is written: the clone itself is the preserved artifact. Fails closed:
- * if status or HEAD cannot be read, the clone is kept. Synchronous, so a signal handler can call it.
+ * Delete a scratch clone ONLY when nothing in it could be lost. Kept (and the path reported) when any of these
+ * holds: `git status` shows anything (untracked files are forced visible with `--untracked-files=all`, so a
+ * user's `status.showUntrackedFiles=no` cannot hide them), an ignored entry other than a `node_modules`
+ * directory exists (the installed dependencies are expected; a gitignored `.env`, `coverage/`, notes file is
+ * not), HEAD is not `startSha`, a stash exists, or a local branch holds a commit that `startSha` does not
+ * reach. No patch is written: the clone itself is the preserved artifact. Fails closed: if any of those reads
+ * fails, the clone is kept. Synchronous, so a signal handler can call it.
+ *
+ * Accepted gaps (recorded, not hidden): an annotated or lightweight TAG on a commit outside `startSha`'s history
+ * is not checked, because the clone copies the source repo's tags and many of those legitimately sit off-history;
+ * ignored files inside a `node_modules`-named directory are treated as dependencies; reflog-only commits are
+ * not checked.
  */
 export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmFn = rmSync } = {}) {
   const keep = (reason) => ({ removed: false, path: dir, reason });
+  const git = (...args) => String(execFn('git', ['-C', dir, ...args], { timeout: GIT_STEP_TIMEOUT_MS }));
   try {
-    const status = String(execFn('git', ['-C', dir, 'status', '--porcelain'], { timeout: GIT_STEP_TIMEOUT_MS }));
-    if (status.trim() !== '') return keep('uncommitted changes');
+    // Two reads: `--untracked-files=all` lists every changed/untracked file; `--ignored=traditional` (with
+    // `--untracked-files=normal`) lists ignored paths collapsed to their top directory, so `node_modules/`
+    // stays one line instead of thousands.
+    if (git('status', '--porcelain', '--untracked-files=all').trim() !== '') return keep('uncommitted changes');
+    const ignored = git('status', '--porcelain', '--untracked-files=normal', '--ignored=traditional')
+      .split('\n').filter((line) => line.startsWith('!! '));
+    if (ignored.some((line) => line.slice(3).replace(/\/+$/, '').split('/').pop() !== 'node_modules')) return keep('ignored files present');
     if (!startSha) return keep('no baseline commit recorded');
-    const head = String(execFn('git', ['-C', dir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS })).trim();
+    const head = git('rev-parse', 'HEAD').trim();
     if (head !== startSha) return keep('HEAD moved');
+    if (git('stash', 'list').trim() !== '') return keep('stash present');
+    if (git('rev-list', '--max-count=1', '--branches', '--not', startSha).trim() !== '') return keep('branch holds commits outside the start');
   } catch {
     return keep('status unreadable');
   }
@@ -611,8 +627,10 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
 
 /**
  * Applies `cleanupScratchClone` on SIGINT/SIGTERM and when the run ends. Created before the clone exists;
- * `arm(dir, startSha)` binds it. `finish()` is idempotent and removes the listeners. The signal handler only
- * cleans up: it never exits (the CLI's own handler does that).
+ * `arm(dir, startSha)` binds it. `finish()` is idempotent and removes the listeners. The signal handler cleans
+ * up, removes its listeners, and — because listening swallowed the signal's default action — re-raises the same
+ * signal on `proc` when no other listener remains, so the process still terminates as it would have. When another
+ * listener (the CLI's own handler) exists, it is left to do the exiting.
  */
 export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmFn = rmSync } = {}) {
   let target = null;
@@ -633,7 +651,7 @@ export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmF
       try { report(run()); } catch { /* never throw from a signal handler */ }
       off();
       // We swallowed the default action by listening; restore it when nobody else is listening.
-      if (proc === process && proc.listenerCount(sig) === 0) process.kill(process.pid, sig);
+      if (typeof proc.kill === 'function' && proc.listenerCount(sig) === 0) proc.kill(proc.pid, sig);
     };
     proc.prependListener(sig, handlers[sig]);
   }
@@ -1163,7 +1181,17 @@ export async function codexDirectTask(opts = {}) {
     throw error;
   }
   const cleanup = guard.finish();
-  if (cleanup && report.scratch?.created) report.scratch.cleanup = cleanup;
+  if (cleanup && report.scratch?.created) {
+    report.scratch.cleanup = cleanup;
+    if (cleanup.removed) {
+      // The clone (and the default Codex event log inside its `.git`) no longer exists: keep the paths for
+      // provenance but mark them gone, so a consumer does not follow them. A caller-supplied `--log` outside
+      // the clone is untouched.
+      const inside = (p) => typeof p === 'string' && (p === cleanup.path || p.startsWith(cleanup.path + sep));
+      report.dirRemoved = true;
+      report.logFileRemoved = inside(report.logFile);
+    }
+  }
   return report;
 }
 
@@ -1758,8 +1786,11 @@ async function main() {
     console.log(JSON.stringify(report, null, 2));
   } else {
     console.log('\n──────────────────────────────────────────────────────────');
-    console.log(`codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
-    if (report.scratch.created && report.scratch.realOrigin) {
+    const removed = Boolean(report.scratch.cleanup?.removed);
+    console.log(removed
+      ? `codex-direct-task: scratch clone (deleted) → ${report.scratch.cleanup.path}`
+      : `codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
+    if (!removed && report.scratch.created && report.scratch.realOrigin) {
       console.log(report.scratch.originWired
         ? `  origin wired to the real remote (--wire-origin-to-remote): ${report.scratch.realOrigin}`
         : `  origin left at the local clone source (#3782, not push-capable). Real remote: ${report.scratch.realOrigin}\n`
@@ -1773,7 +1804,7 @@ async function main() {
     console.log(`  thread: ${report.events.threadId ?? '<none>'}  turns: ${report.events.turns}  terminal: ${report.events.terminal ?? '<none — timed out or killed>'}  timedOut: ${report.timedOut}  exit: ${report.exitCode}`);
     console.log(`  tool calls: ${report.events.commands.length}  files touched: ${report.events.filesChanged.length}`);
     for (const f of report.events.filesChanged) console.log(`    - ${f.kind} ${f.path}`);
-    console.log(`  log: ${report.logFile}`);
+    console.log(report.logFileRemoved ? `  log: ${report.logFile} (deleted with the clean scratch clone)` : `  log: ${report.logFile}`);
     if (report.quotaUsedPercent !== null) {
       console.log(`  quota: ${report.quotaUsedPercent}% used of a ${report.quotaWindowMinutes}min window (plan: ${report.quotaPlanType})${report.quotaRolloutCleared ? ' — rollout file cleared after read' : ''}`);
     }
@@ -1787,7 +1818,9 @@ async function main() {
       for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}${report.gate.unavailable ? ` — ${s.output}` : ''}`);
     }
     if (report.selfReview.notes.length) console.log(renderSelfReviewNotes(report.selfReview));
-    console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
+    console.log(removed
+      ? '\n  NOTHING WAS COMMITTED OR PUSHED. The scratch clone had no changes, so it was deleted.'
+      : '\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }
   if (flags.job) return jobExitCode(report);
