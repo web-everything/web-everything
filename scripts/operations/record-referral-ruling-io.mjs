@@ -608,12 +608,16 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
           + '(its delete failed or could not be confirmed); the gate ignores it (its actor did not author it), so it clears nothing — delete it to tidy the thread';
       };
       let seen;
+      // Set only when the comment LANDED but under another login: the thread then holds through the reader (a stamped
+      // copy keeps its block rows), so the ledger must hold too. A failed post records nothing (E1 wiring).
+      let strayLanded = false;
       try {
         if (!already) post(repo, pr, body);
         const after = readPrThread(repo, pr, { readJson });
         seen = after.comments.filter(sameBody);
         const strays = strayOf(seen);
         if (strays.length) {
+          strayLanded = true;
           throw new Error(`the ruling comment is not readable by the gate after posting: it is authored by ${JSON.stringify(String(strays[0]?.author?.login ?? ''))}, not the checked poster ${checkedLogin}; the hold remains — inspect the thread before retrying`);
         }
         // A judge row is read back through the gate-visible policy under this sink's env, as the gate will read it.
@@ -626,9 +630,10 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
       } catch (error) {
         // Clearing rows are already recorded (the F4 order) but the comment did not land readable: they must not stay live.
         // A holding-only ruling is left alone: a wrong-author block comment can only hold (the reader keeps a stamped
-        // copy's block rows), so deleting it would drop a hold. Its holding rows are still recorded, so the ledger holds too.
+        // copy's block rows), so deleting it would drop a hold. When such a copy landed, its holding rows are recorded so
+        // the ledger holds too; a post that never landed changes nothing in the ledger.
         if (!clearing.length) {
-          const holdingRows = events.filter((e) => !clearsHold(e.ruling));
+          const holdingRows = strayLanded ? events.filter((e) => !clearsHold(e.ruling)) : [];
           const holdMiss = holdingRows.length ? await tryAppend(holdingRows) : null;
           throw new Error(`${String(error?.message ?? error)}${holdMiss ? ` [ledger-write-miss: the block was not recorded in the verdict ledger either: ${holdMiss}]` : ''}`);
         }
