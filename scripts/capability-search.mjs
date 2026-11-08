@@ -38,7 +38,11 @@ import { writeLineSync } from './lib/write-all-sync.mjs';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const requireCjs = createRequire(import.meta.url);
 const matter = requireCjs('gray-matter');
-const { derive } = requireCjs(join(ROOT, 'src/_data/backlog.js'));
+// Loaded on first use, not at import: file-item's reader and the operator-task settings import this module's
+// constants and search, and a checkout without src/ (a bare-origin test fixture, an edge clone) must still
+// be able to import them. A missing loader surfaces per-file as a malformed card, which fails closed.
+let deriveFn;
+const derive = (body) => (deriveFn ??= requireCjs(join(ROOT, 'src/_data/backlog.js')).derive)(body);
 
 export const EXACT_THRESHOLD = 0.7;
 export const PARTIAL_THRESHOLD = 0.3;

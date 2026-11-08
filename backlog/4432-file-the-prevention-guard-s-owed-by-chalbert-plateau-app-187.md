@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["plateau:scripts/wip-publish.ts", "plateau:scripts/__tests__/wip-publish.test.mjs", "plateau:src/wip/wip-agent-options.ts", "plateau:src/wip/wip-agent-options.test.ts", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-05"
-preparedAgainstSha: "27e2ab3d9d75ad000ae8e4b99410dcf2135de56c"
+preparedDate: "2026-11-07"
+preparedAgainstSha: "f9a9e945e8cbccfc769dcee13c73ada3b58b0113"
 tags: []
 ---
 
@@ -32,6 +32,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/plateau-app#187@
 - Revalidation on 2026-11-03: the old inspected Plateau SHA was `8b1d997e441317d706ebc105cc4cd23210ce73b9`; the current checkout is `af64fef954a9c77bf3cfdf63c9f0bea7d228bc5e`. The five-file scope remains correct: the live call and override remain at `plateau:scripts/wip-publish.ts:188,199`, and the two proposed suites and assembler remain absent. The timing guideline is still absent from `we:docs/agent/testing.md:1458-1471`. This is outstanding prevention debt, not an already-delivered goal.
 - Fixture precision: the original slow-read plan required only “exceed two” after removing the override. `plateau:src/wip/wip-agent.ts:192-199` serializes each `sync` caller, while `plateau:src/wip/wip-agent.ts:368` invokes `sync` directly for each timer tick. Thus a read held until 25,000 ms queues socket-open plus the 10,000 and 20,000 ms ticks: four total reads after settlement under the missing-override mutation, versus two with publisher options. Watcher notifications use the distinct coalescing `kick` path. Pin these counts and the literal 120,000 ms value; no runtime/default change is needed.
 - Caller recheck still finds only the live call and the existing tests at `plateau:src/wip/wip-agent.test.ts:47` and `plateau:src/wip/wip-feeds.test.ts:38`. The source guard must allow the separate `fingerprint` import from the agent module at `plateau:scripts/wip-publish.ts:43`; count the named factory binding and its uses, not all imports from that module. Size remains 3 (old 3 → new 3), retaining the approximately 265 changed-line allocation above. Scope, dependency edges and preparation stamps remain unchanged.
+
+- Revalidation on 2026-11-07 (WE main `f9a9e945e8`): Plateau origin/main is still `af64fef`; the live call and override remain at `plateau:scripts/wip-publish.ts:188,199`, and the assembler and both suites are still absent. The WE guidance list in `we:docs/agent/testing.md` gained 14 lines since the earlier stamp (items 5-6 now end at line 1471; the new item 7 for the timing guideline goes after it), and the exact A4 sentence is still absent. Goal undelivered; scope, size 3 (old 3 → new 3) and design unchanged.
 
 ## Design
 

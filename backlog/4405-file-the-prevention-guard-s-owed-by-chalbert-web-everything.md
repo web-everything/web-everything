@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-06"
-preparedAgainstSha: "fae46eeff7277d28ef932f879198aaa4d68688df"
+preparedDate: "2026-11-07"
+preparedAgainstSha: "c35b3e8037b5840a87150a0f615ec970823b8f83"
 tags: []
 ---
 
@@ -32,6 +32,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Original broad scope retained: two production consumers as comment/test anchors, acquire and reducer tests, break and child report, their matching tests, existing soak wrapper, and we:docs/agent/testing.md. No runtime API or default changes are needed. Size remains 3: approximately 90 changed lines in the acquire suite, 100 in the reducer suite, 70 in the break, 15 in its child, 60 each in the two planned unit suites, and 25 across documentation/comments/wrapper (about 420 lines). This is a bounded prevention story; no `estimatedLoc` applies.
 
 - Re-stamp against `fae46eeff7`: `git diff c89ebfe..HEAD` over the scoped production files, both test suites, the target break and fixture, the vitest configs and the throttle helper is empty; only we:docs/agent/testing.md gained unrelated additions and other soak breaks were added. Premise, citations, scope and size 3 are unchanged; no body edit beyond this note.
+
+- Re-stamp against `c35b3e8037`: premise re-checked, nothing delivered. Only drift since `fae46eeff7` in scope is we:scripts/lane-pool.mjs (REST pulls call now ~we:scripts/lane-pool.mjs:1918–1924, `restPullToPrStateShape` map at :1924) and the reaper's REST map now at ~we:scripts/conveyor/lease-reaper.mjs:1356; acquire-suite config entries still at we:vitest.config.ts:205 and we:vitest.integration.config.ts:80. Scope, size 3 and all Acceptance lines unchanged.
 
 ## Design
 
