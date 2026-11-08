@@ -589,8 +589,8 @@ export function collectAndClearRolloutQuota({
  * Delete a scratch clone ONLY when nothing in it could be lost. Kept (and the path reported) when any of these
  * holds: `git status` shows anything (untracked files are forced visible with `--untracked-files=all`, so a
  * user's `status.showUntrackedFiles=no` cannot hide them), an ignored entry other than a `node_modules`
- * directory exists (the installed dependencies are expected; a gitignored `.env`, `coverage/`, notes file is
- * not), HEAD is not `startSha`, a stash exists, or a local branch holds a commit that `startSha` does not
+ * DIRECTORY exists (the installed dependencies are expected; a gitignored `.env`, `coverage/`, notes file, or a
+ * file / symlink named `node_modules` is not), HEAD is not `startSha`, a stash exists, or a local branch holds a commit that `startSha` does not
  * reach. No patch is written: the clone itself is the preserved artifact. Fails closed: if any of those reads
  * fails, the clone is kept. Every read runs with the shared lane git hardening (config pins such as
  * `core.fsmonitor=false`, repository-location env scrubbed); a clone that defines a filter driver is kept; and
@@ -620,7 +620,10 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
     if (git('status', '--porcelain', '--untracked-files=all').trim() !== '') return keep('uncommitted changes');
     const ignored = git('status', '--porcelain', '--untracked-files=normal', '--ignored=traditional')
       .split('\n').filter((line) => line.startsWith('!! '));
-    if (ignored.some((line) => line.slice(3).replace(/\/+$/, '').split('/').pop() !== 'node_modules')) return keep('ignored files present');
+    // Directory-only exception: git prints an ignored directory with a trailing `/` and an ignored file or symlink
+    // without one, so a regular file (or link) named `node_modules` is NOT the installed dependencies and keeps the clone.
+    const isDependencyDir = (line) => line.endsWith('/') && line.slice(3).replace(/\/+$/, '').split('/').pop() === 'node_modules';
+    if (ignored.some((line) => !isDependencyDir(line))) return keep('ignored files present');
     if (!startSha) return keep('no baseline commit recorded');
     const head = git('rev-parse', 'HEAD').trim();
     if (head !== startSha) return keep('HEAD moved');

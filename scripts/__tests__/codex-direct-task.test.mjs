@@ -8,7 +8,7 @@
 
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -3538,6 +3538,47 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
       const { root, dir, sha } = makeClone();
       git(dir, 'worktree', 'add', '-q', '--detach', join(root, 'linked'), sha);
       expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('an ignored REGULAR FILE named node_modules keeps the clone (the exception is directory-only)', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      writeFileSync(join(dir, 'node_modules'), 'codex notes, not dependencies\n');
+      expect(git(dir, 'status', '--porcelain', '--ignored=traditional')).toContain('!! node_modules\n');
+      const r = cleanupScratchClone({ dir, startSha: base });
+      expect(r.removed).toBe(false);
+      expect(r.reason).toBe('ignored files present');
+      expect(readFileSync(join(dir, 'node_modules'), 'utf8')).toBe('codex notes, not dependencies\n');
+    });
+
+    it('an ignored SYMLINK named node_modules keeps the clone (a link is not an installed dependency tree)', () => {
+      const { root, dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(root, 'elsewhere'));
+      symlinkSync(join(root, 'elsewhere'), join(dir, 'node_modules'));
+      const r = cleanupScratchClone({ dir, startSha: base });
+      expect(r.removed).toBe(false);
+      expect(r.reason).toBe('ignored files present');
+    });
+
+    it('a nested ignored node_modules DIRECTORY is still the accepted dependency exception', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore deps');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(dir, 'pkg', 'node_modules', 'x'), { recursive: true });
+      writeFileSync(join(dir, 'pkg', 'node_modules', 'x', 'index.js'), '');
+      writeFileSync(join(dir, 'pkg', 'index.js'), '');
+      git(dir, 'add', 'pkg/index.js');
+      git(dir, 'commit', '-q', '-m', 'pkg');
+      expect(cleanupScratchClone({ dir, startSha: git(dir, 'rev-parse', 'HEAD').trim() }).removed).toBe(true);
     });
 
     it('an ignored directory merely ending in node_modules still keeps the clone', () => {
