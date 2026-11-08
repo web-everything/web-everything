@@ -1629,7 +1629,7 @@ describe('R671 v1 acting judge referral blocks', () => {
     const plan = planOperatorRuling(snapshot(), request());
     await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true, head });
     expect(h.posted).toEqual([plan.body]);
-    expect(h.readJson).toHaveBeenCalledWith(['api', 'user']);
+    expect(h.readJson).toHaveBeenCalledWith(['api', 'user'], expect.objectContaining({ throttle: { personalRoute: false } }));
     expect(h.events).toHaveLength(1);
     expect(h.events[0].actor.declared).toBe('judge:r10');
     expect(JSON.stringify(h.events[0])).toContain(attribution);

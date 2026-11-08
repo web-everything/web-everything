@@ -40,8 +40,21 @@ import { createChangedLinesReader, changesTouchCitedLines, COMPARE_FILE_CAP } fr
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const ghJson = (args) => JSON.parse(execFileSyncThrottled('gh', args,
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024 }));
+const ghJson = (args, opts = {}) => JSON.parse(execFileSyncThrottled('gh', args,
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024, ...opts }));
+
+/**
+ * The ONE credential the ruling post AND its identity check use (PR #6529 red team). `gh api user` is a classified
+ * read, so with personal-read routing on the throttle swapped it onto the operator's login while `gh pr comment`
+ * kept the App token: the check passed as the operator and the App posted the ruling. Pin the route off at the
+ * outer throttle and the nested shim, and select the same repository App as the post
+ * (as `we:scripts/lib/review-label-provider.mjs#readPostingIdentity` does).
+ */
+export const posterCredential = (repo) => ({
+  env: { ...process.env, GH_REPO: repo, WE_GH_THROTTLE_PERSONAL_ROUTE: '0' },
+  throttle: { personalRoute: false },
+});
+const readPosterIdentity = (readJson, repo) => readJson(['api', 'user'], posterCredential(repo));
 
 /** The live PR fields the gate reads (`gh pr view` returns each comment's `author.login`). */
 export function readPrThread(repo, pr, { readJson = ghJson } = {}) {
@@ -379,7 +392,7 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
     return {
       head: thread.headRefOid, ...open,
       ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
-      ...(actor !== AUTO_POLICY_ACTOR ? { identity: readJson(['api', 'user']) } : {}),
+      ...(actor !== AUTO_POLICY_ACTOR ? { identity: readPosterIdentity(readJson, repo) } : {}),
       ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
         evidence: readJudgeEvidence(evidenceFile, readFile),
         disagreements: referralDisagreements(thread.comments, open, { repo, pr, finding }) } : {}),
@@ -429,7 +442,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
   runSetLabel = execFileSync,
   post = (repo, pr, body) => execFileSyncThrottled('gh',
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) } = {}) {
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }) } = {}) {
   return {
     ['github.referral-ruling-file-card']: rulingCardFilingSink(landCard),
     ['github.referral-ruling-file-card-judge']: judgeRulingSink({ confirm, land: landCard, planCard: planReferralCard }),
@@ -484,7 +497,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         const judgeActorPolicy = readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn });
         for (const row of rulings) assertJudgeAuthority({ judgeActorPolicy }, { actor, ruling: row.result, supersedes: row.supersedes });
       }
-      if (actor !== AUTO_POLICY_ACTOR) assertRulingIdentity(readJson(['api', 'user']), actor);
+      if (actor !== AUTO_POLICY_ACTOR) assertRulingIdentity(readPosterIdentity(readJson, repo), actor);
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
       if (actor === AUTO_POLICY_ACTOR) {
