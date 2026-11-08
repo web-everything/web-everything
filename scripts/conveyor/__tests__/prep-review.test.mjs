@@ -9,6 +9,7 @@ import { missingReviewLabel } from '../reconcile-core.mjs';
 import { labelConflicts } from '../health-smells/review-label-conflict.mjs';
 import { validateWorkerResult } from '../../operations/worker-result.mjs';
 import { EDGE_CASE_CLASSES, unansweredEdgeCaseClasses } from '../../backlog/edge-case-classes.mjs';
+import { backlogOnlyPrepClear } from '../../lib/red-team-backlog-only.mjs';
 
 const edge = EDGE_CASE_CLASSES.map((c, i) => `${i + 1}. **${c.label}** — handled by a fixed string.`).join('\n');
 const card = ({ scope = '["we:scripts/real.mjs"]', done = '1. **Executable** — `node scripts/x.test.mjs` fails before and passes after.', edgeBlock = `## Edge cases this change must handle\n\n${edge}\n` } = {}) =>
@@ -179,6 +180,7 @@ describe('advise mode: a note and a label, never a block', () => {
     const r = await reviewPreparePr(prepPr(), deps);
     expect(r.findings).toEqual(['who-wrote-it']);
     expect(calls.comments[0].b).toContain('preflight trusts a PR comment');
+    expect(latestPrepVerdict([{ ...bot, body: calls.comments[0].b }], prepPr().headRefOid)).toBe('findings');
   });
   it('is idempotent per head: a second pass on the same head with the label does nothing', async () => {
     const { deps, calls } = mkDeps();
@@ -846,9 +848,48 @@ describe('a reviewer\'s hold applied after the stage released its own is never r
 describe('structured prep verdicts', () => {
   const head = 'a'.repeat(40);
   const marker = verdict => `<!-- prep-review-verdict head=${head} verdict=${verdict} v=1 -->`;
+  it.each([
+    ['throwing judge', async () => { throw new Error('spawn ENOENT'); }],
+    ['schema-invalid answer', async () => ({ value: { outcome: 'done' } })],
+    ['undefined judged value', async () => ({ value: undefined })],
+    ['missing judge result', async () => undefined],
+  ])('R752: %s posts the first-review note without a verdict and holds backlog-only clearance', async (_name, judge) => {
+    const { deps, calls } = mkDeps({ judge });
+    const out = await reviewPreparePr(prepPr(), deps);
+    expect(out).toMatchObject({ reviewed: true, posted: true, outcome: 'done', round: 1 });
+    expect(calls.comments).toHaveLength(1);
+    const body = calls.comments[0].b;
+    expect(body).toContain('Model pass:');
+    expect(body).not.toContain('prep-review-verdict');
+    const comments = [{ ...bot, body }];
+    expect(latestPrepVerdict(comments, head)).toBeNull();
+    expect(backlogOnlyPrepClear({ enabled: true, head, comments,
+      files: [{ filename: 'backlog/4382-some-card.md', status: 'modified' }],
+      labels: ['review:prep', 'red-team:pending'],
+    })).toEqual({ ok: false, why: 'no unambiguous clean newest trusted prep marker for head' });
+  });
+  it.each([false, true])('a usable model preserves the verdict with deterministic findings=%s', async findings => {
+    const { deps, calls } = mkDeps(findings ? { readCard: () => card({ scope: '[]' }) } : {});
+    await reviewPreparePr(prepPr(), deps);
+    expect(latestPrepVerdict([{ ...bot, body: calls.comments[0].b }], head)).toBe(findings ? 'findings' : 'clean');
+  });
+  it('R752: the label-repair stub never creates verdict evidence for a legacy note', async () => {
+    const body = `<!-- prep-review: head=${head} round=1 -->\nLegacy note without a structured verdict`;
+    const judge = vi.fn();
+    const { deps, calls } = mkDeps({ judge });
+    const out = await reviewPreparePr(prepPr({ comments: [{ ...bot, body }] }), deps);
+    expect(out).toMatchObject({ posted: false, round: 1, addLabels: ['review:prep'] });
+    expect(out.body).toBeUndefined();
+    expect(judge).not.toHaveBeenCalled();
+    expect(calls.comments).toEqual([]);
+    expect(latestPrepVerdict([{ ...bot, body }], head)).toBeNull();
+  });
+  it.each([false, undefined])('R752: planner requires explicit usable model evidence (%s)', modelUsable => {
+    expect(planPrepReview({ mode: 'advise', head, result: cleanModel, modelUsable }).body).not.toContain('prep-review-verdict');
+  });
   it.each(['clean', 'findings'])('writes and reads the %s marker immediately after the unchanged round marker', verdict => {
     const result = { ...cleanModel, outcome: verdict === 'clean' ? 'done' : 'blocked' };
-    const plan = planPrepReview({ mode: 'advise', head, result });
+    const plan = planPrepReview({ mode: 'advise', head, result, modelUsable: true });
     expect(prepVerdictMarker({ head, verdict })).toBe(marker(verdict));
     expect(plan.body.split('\n').slice(0, 2)).toEqual([
       `<!-- prep-review: head=${head} round=1 -->`, marker(verdict),
@@ -857,7 +898,7 @@ describe('structured prep verdicts', () => {
   });
   it.each(['a'.repeat(7), 'a'.repeat(12), 'a'.repeat(39), 'a'.repeat(41), 'A'.repeat(40), head + '\n'])('omits the verdict stamp for invalid full head %j', head => {
     expect(prepVerdictMarker({ head, verdict: 'clean' })).toBeNull();
-    expect(planPrepReview({ mode: 'advise', head, result: cleanModel }).body).not.toContain('prep-review-verdict');
+    expect(planPrepReview({ mode: 'advise', head, result: cleanModel, modelUsable: true }).body).not.toContain('prep-review-verdict');
     expect(latestPrepVerdict([{ ...bot, body: marker('clean') }], head)).toBeNull();
   });
   it('rejects invalid verdicts and unreadable evidence', () => {
