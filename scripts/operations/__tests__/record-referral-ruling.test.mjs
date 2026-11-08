@@ -126,9 +126,10 @@ describe('#4979 the sanctioned writer', () => {
 
   it('persists optional not-real cause and finding lens through the marked comment', () => {
     const plan = planOperatorRuling(read({ card: null }), input({ ruling: 'not-real', cause: 'stale-head-reraise' }));
-    const parsed = parseOperatorRulingComment(gh(plan.body)).record;
+    // PR #6529: a planned ruling is stamped with its checked poster, so it is read as posted by that operator.
+    const parsed = parseOperatorRulingComment(gh(plan.body, 'chalbert')).record;
     expect(parsed.rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
-    expect(readOperatorRulings([gh(plan.body)]).rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
+    expect(readOperatorRulings([gh(plan.body, 'chalbert')]).rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
     expect(() => planOperatorRuling(read(), input({ cause: 'test-nit' }))).toThrow(/--cause/);
     expect(() => planOperatorRuling(read(), input({ ruling: 'not-real', cause: 'invented' }))).toThrow(/--cause/);
   });
@@ -142,9 +143,13 @@ describe('#4979 the sanctioned writer', () => {
   it('plans one record bound to PR, head, run and finding, carrying actor, channel, words and time', () => {
     const plan = planOperatorRuling(read(), input());
     expect(plan.record).toMatchObject({ repo, pr: 7, head, actor: 'chalbert', channel: 'claude-code-chat', reason: 'Accept',
-      at: '2026-10-04T14:30:00Z', clearerId: 's' });
+      at: '2026-10-04T14:30:00Z', clearerId: 's', poster: 'chalbert' });
     expect(plan.record.rulings).toEqual(rec.referrals.map((f) => ({ runId: rec.runId, key: f.key, result: 'card', card: CARD })));
-    expect(mandatoryReferralState([...comments, gh(plan.body)], ctx())).toMatchObject({ pending: [], blocked: [] });
+    expect(mandatoryReferralState([...comments, gh(plan.body, 'chalbert')], ctx())).toMatchObject({ pending: [], blocked: [] });
+    // PR #6529: the same stamped body authored by the App (a credential split) is not this operator's ruling.
+    const unruled = mandatoryReferralState(comments, ctx());
+    expect(unruled.pending.length).toBeGreaterThan(0);
+    expect(mandatoryReferralState([...comments, gh(plan.body)], ctx())).toMatchObject({ pending: unruled.pending, blocked: unruled.blocked });
   });
   it.each([
     ['a non-operator actor', {}, { actor: 'web-everything' }, /registered operator login/],
@@ -1485,7 +1490,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     // Strip the encoded record: evidence must also be visible to the operator.
     const text = stripComments(body);
     for (const value of [...Object.values(evidence()), 'evidence-required', 'agree']) expect(text).toContain(value);
-    expect(storedEvidence(parseOperatorRulingComment(gh(body)).record)).toMatchObject(evidence());
+    expect(storedEvidence(parseOperatorRulingComment(gh(body, 'chalbert')).record)).toMatchObject(evidence());
   });
   it('red-team record AND posted comment text store evidence, mode and confirm verdict', async () => {
     const [, rt] = await modules;

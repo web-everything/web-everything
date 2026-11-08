@@ -3846,6 +3846,9 @@ export function validateOperatorRuling(r) {
     if (r.actor.toLowerCase() === AUTO_POLICY_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
     else if (r.actor === JUDGE_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
     else if (!OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
+    // PR #6529: the optional `poster` binds who may author the comment. Only an operator ruling carries it, and it can
+    // only name that same operator (lower-case, as the identity check returns it).
+    if (r.poster !== undefined && (r.poster !== r.actor.toLowerCase() || !OPERATOR_LOGINS.includes(r.poster))) return false;
     if (typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel) || r.channel.length > 200) return false;
     if (typeof r.reason !== 'string' || !r.reason.trim() || r.reason.length > 4000) return false;
     if (typeof r.at !== 'string' || !Number.isFinite(Date.parse(r.at))) return false;
@@ -3912,6 +3915,13 @@ export function parseOperatorRulingComment(comment) {
   // hand-edited judge comment stays malformed (and holds) instead of being silently dropped.
   if (record.actor === JUDGE_ACTOR && (record.rulings.some(x => Array.isArray(x?.supersedes) && x.supersedes.length)
     || JUDGE_RESERVED_TOKEN_RE.test(normalized))) return null;
+  // PR #6529 red team (rounds 2-3, card x5dmuoa): a record stamped with `poster` names the ONE login that may author it
+  // (the writer stamps the identity it checked). Any other author — an automation copy posted after a per-call credential
+  // fallback split the check from the post, or another operator — is not that ruling at all: null, so the finding keeps
+  // whatever else decides it (pending by default). Not `malformed`, so a copy a failed cleanup left behind can never block
+  // the operator's own re-run. An unstamped (legacy) record keeps the trusted-author rule above (PR #5925: automation-
+  // posted operator rulings recorded before the stamp stay readable).
+  if (record.poster !== undefined && login !== record.poster) return null;
   return { record };
 }
 

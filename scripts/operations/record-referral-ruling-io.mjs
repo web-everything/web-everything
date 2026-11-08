@@ -579,10 +579,10 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
       // the login that passed the check (both sides lower-cased); anything else is refused and compensated below.
       const strayOf = (comments) => actor === JUDGE_ACTOR || !checkedLogin ? []
         : comments.filter((c) => sameBody(c) && String(c?.author?.login ?? '').toLowerCase() !== checkedLogin);
-      // Round 2: the gate reader trusts an automation author too, so a wrong-author CLEARING comment left on the thread
-      // still clears the comment gate after the ledger revert. Re-read the thread (the post may have thrown after it
-      // landed), delete each wrong-author copy by its own id, and confirm on a fresh read that it is gone. Never throws:
-      // returns the note for the error, naming any copy that may still be LIVE.
+      // Rounds 2-3: the gate reader ignores a human-actor ruling its actor did not author (`parseOperatorRulingComment`),
+      // so a wrong-author copy never clears; it is still removed so the thread does not show a ruling nobody made.
+      // Re-read the thread (the post may have thrown after it landed), delete each wrong-author copy by its own id, and
+      // confirm on a fresh read that it is gone. Never throws: returns the note for the error, naming any copy left.
       const STRAY_DELETE_CAP = 5;
       // A page that reaches the list cap may be truncated, and the gate reads the whole thread: re-read it completely
       // (a failed complete read throws, so it is never taken as "no stray").
@@ -593,7 +593,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
       const removeStrays = () => {
         let strays;
         try { strays = strayOf(wholeThread()); } catch (e) {
-          return `could not re-read the thread to check for a wrong-author ruling comment (${String(e?.message ?? e).split('\n')[0]}); one may be LIVE and clear the comment gate — inspect the thread before retrying`;
+          return `could not re-read the thread to check for a wrong-author ruling comment (${String(e?.message ?? e).split('\n')[0]}); one may still be on the thread (the gate ignores it: its actor did not author it) — inspect the thread before retrying`;
         }
         if (!strays.length) return '';
         const ids = strays.map((c) => /#issuecomment-(\d+)$/.exec(String(c?.url ?? ''))?.[1] ?? null);
@@ -604,8 +604,8 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         let left;
         try { left = strayOf(wholeThread()); } catch { left = strays; }
         if (!left.length) return `removed the wrong-author ruling comment${strays.length === 1 ? '' : 's'} ${strays.map((c) => c.url).join(', ')} from the thread`;
-        return `${left.map((c) => c.url || `(a comment by ${String(c?.author?.login ?? '')} with no id)`).join(', ')} is LIVE and clears the comment gate `
-          + '(its delete failed or could not be confirmed) — delete it before retrying';
+        return `${left.map((c) => c.url || `(a comment by ${String(c?.author?.login ?? '')} with no id)`).join(', ')} is still on the thread `
+          + '(its delete failed or could not be confirmed); the gate ignores it (its actor did not author it), so it clears nothing — delete it to tidy the thread';
       };
       let seen;
       try {

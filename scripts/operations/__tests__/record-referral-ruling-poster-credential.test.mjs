@@ -46,7 +46,7 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   };
 });
 
-const { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, readOperatorRulings, referralFindingKey, renderReferralRecord } = await import('../../lib/jury-core.mjs');
+const { buildOperatorRulingComment, validateOperatorRuling, mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, readOperatorRulings, referralFindingKey, renderReferralRecord } = await import('../../lib/jury-core.mjs');
 const { openReferralFindings, planOperatorRuling, OPERATOR_RULING_POST_EFFECT } = await import('../record-referral-ruling.mjs');
 const { createRecordReferralRulingReader, createRecordReferralRulingSinks } = await import('../record-referral-ruling-io.mjs');
 
@@ -127,8 +127,32 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
     transport.deleteFails = true;
     const events = [];
     const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async (list) => { events.push(...list); } })[OPERATOR_RULING_POST_EFFECT];
-    await expect(sink(sinkArgs(plan()))).rejects.toThrow(/issuecomment-\d+ is LIVE and clears the comment gate/);
+    const error = await sink(sinkArgs(plan())).then(() => null, (e) => e);
     expect(events.map((e) => e.ruling)).toEqual(['not-real', 'block']);
+    // Round 3 red team: a failed cleanup must not leave the unauthorized ruling effective. The App-authored copy of a
+    // human-actor ruling stays on the thread, and the gate reader ignores it, so the referral is still pending.
+    expect(transport.thread.comments.filter((c) => c.author.login === 'web-everything' && c.body.includes('Operator ruling'))).toHaveLength(1);
+    expect(readOperatorRulings(transport.thread.comments).rulings).toEqual([]);
+    expect(gatePending()).toEqual([rec.referrals[0].key]);
+    expect(String(error?.message)).toMatch(/issuecomment-\d+ is still on the thread/);
+  });
+
+  it('a stray left by a failed cleanup does not block the operator\'s own re-run: the re-posted ruling clears', async () => {
+    transport.identityFallback = true;
+    transport.deleteFails = true;
+    const first = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async () => {} })[OPERATOR_RULING_POST_EFFECT];
+    const p = plan();
+    await expect(first(sinkArgs(p))).rejects.toThrow(/still on the thread/);
+    // The operator re-runs with the credential fixed; the stray (same body) is still there, so the sink re-posts nothing
+    // and refuses again: the operator posts it under their own login (a fresh `at` makes a new body).
+    transport.postAs = 'chalbert';
+    transport.deleteFails = false;
+    const again = planOperatorRuling({ head, ...openReferralFindings({ comments: transport.thread.comments, repo, pr: 7, head, body: rec.authorBody, cardReadable: () => false }),
+      identity: { login: 'chalbert', type: 'User' }, card: null, now: '2026-11-08T07:00:00Z', clearerId: 's' },
+    { repo, pr: 7, finding: 'all-open', ruling: 'not-real', actor: 'chalbert', channel: 'claude-code-chat', reason: 'not real' });
+    const second = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async () => {} })[OPERATOR_RULING_POST_EFFECT];
+    await expect(second(sinkArgs(again))).resolves.toMatchObject({ posted: true });
+    expect(gatePending()).toEqual([]);
   });
 
   it('on a thread past one page the wrong-author comment is found through the complete reader and deleted', async () => {
@@ -148,7 +172,23 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
     for (let i = 0; i < 100; i++) transport.thread.comments.push(gh(`filler ${i}`, 'someone'));
     const readAllComments = () => { throw new Error('comment count proof failed'); };
     const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, readAllComments, appendEvents: async () => {} })[OPERATOR_RULING_POST_EFFECT];
-    await expect(sink(sinkArgs(plan()))).rejects.toThrow(/could not re-read the thread[\s\S]*may be LIVE/);
+    await expect(sink(sinkArgs(plan()))).rejects.toThrow(/could not re-read the thread[\s\S]*may still be on the thread/);
+  });
+
+  it('the poster stamp binds the author: only that operator may post it; it can name no one else', () => {
+    const p = plan();
+    expect(p.record.poster).toBe('chalbert');
+    expect(readOperatorRulings([gh(p.body, 'chalbert')]).rulings).toHaveLength(1);
+    expect(readOperatorRulings([gh(p.body, 'CHALBERT')]).rulings).toHaveLength(1);
+    // An automation copy is not a ruling at all (null), not a malformed hold that would block the operator's re-run.
+    expect(readOperatorRulings([gh(p.body, 'web-everything')])).toEqual({ rulings: [], malformed: false });
+    expect(validateOperatorRuling({ ...p.record, poster: 'web-everything' })).toBe(false);
+    expect(validateOperatorRuling({ ...p.record, poster: 'Chalbert' })).toBe(false);
+    expect(validateOperatorRuling({ ...p.record, actor: 'auto-policy', poster: 'auto-policy', rulings: p.record.rulings.map((r) => ({ ...r, result: 'block', lens: undefined })) })).toBe(false);
+    // A legacy (unstamped) record keeps the trusted-author rule (PR #5925: automation-posted operator rulings).
+    const { poster, ...legacy } = p.record;
+    expect(poster).toBe('chalbert');
+    expect(readOperatorRulings([gh(buildOperatorRulingComment(legacy), 'web-everything')]).rulings).toHaveLength(1);
   });
 
   it('a ruling authored by the checked operator in different letter case is kept, not deleted', async () => {
