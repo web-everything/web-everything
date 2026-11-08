@@ -570,11 +570,19 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
 
   // Crash between writes: a lift posts its record (cleared-human naming the LIVE head) and then its label swap fails.
   const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->\n${buildClearedFromMarker(clearComment().id)}\n${buildReviewedDiffMarker('d'.repeat(64))}\n<!-- human-clearance-carried: from=${heads.cleared} to=${heads.head} diff=${'d'.repeat(64)} -->` });
-  it('ORPHANED LIFT: a clearance already naming the live head under the drain label is lifted (not handed off, not skipped)', () => {
-    const r = restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] });
+  it('ORPHANED LIFT: a PROVEN clearance already naming the live head under the drain label is lifted (not handed off, not skipped)', () => {
+    // The earlier lift carried the source's own reviewed-diff, so the shared scan proves it and keeps the source citable.
+    const source = { ...clearComment(), body: `${clearComment().body}\n${buildReviewedDiffMarker('d'.repeat(64))}` };
+    const r = restamp({ comments: [source, { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] });
     expect(r.exitCode).toBe(0);
     expect(r.writes.setLabels).toEqual([{ add: 'review:accepted', remove: [MECH] }]);
     expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
+    expect(r.writes.postComment[0]).toContain(buildClearedFromMarker('IC_human_clearance'));
+  });
+
+  it('R728 ORPHANED LIFT of an UNPROVEN earlier lift (source has no matching diff) is handed off: no accept, no carrier', () => {
+    // The shared scan refuses the earlier lift, which ends the chain, so no source is left to cite: a human must re-clear.
+    expectHandedOff(restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] }));
   });
 
   it('ORPHANED LIFT with a later objection is handed off; with unreadable reviews it is a RETRYABLE miss', () => {

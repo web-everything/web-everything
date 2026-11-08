@@ -1753,6 +1753,15 @@ export function runReviewLabelCli({
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
     }
+    // R728: the label-level record (`latestAcceptRecord`) reads any `cleared-human` marker, but the shared scan is the
+    // proof. With no citable source (an unproven carrier ended the chain) the clearance cannot be carried, so the lift
+    // must not add `review:accepted` under a plain restamp: hand the hold to the operator, a human re-clear is owed.
+    if (clearance && !(latestHumanClearanceSourceId(prComments) ?? latestHumanClearanceSourceId(readCarryEvidence().comments))) {
+      const reason = 'the clearance has no proven carry chain to this head (an unproven carrier ended it), so a human must re-clear';
+      handMechanicalHoldToOperator(reason, { overridesLiveClearance: true });
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason, ...(handOffRetryable ? { retryable: true } : {}) } }))}\n`);
+      process.exit(1);
+    }
     carriedHumanClearance = clearance;
     clearReason = `carried from ${humanCarry.from} to ${humanCarry.to}: ${humanCarry.reason}. ${clearReason}`.trim();
   }
