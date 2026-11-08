@@ -1,15 +1,16 @@
 ---
+bornAs: xyfw7x1
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lane-drain.mjs", "we:scripts/lib/numbering-carry.mjs"]
+scope: ["we:scripts/operations/prototype-load-io.mjs", "we:scripts/lib/verify-lane-gate.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Numbering-carry proof allow-list is narrower than what numberPendingHashes rewrites, so a valid drain numberi…
+# Prototype-load combined-tree proof demands the WHOLE tracked test inventory but caps it at the 300 input-targ…
 
-Flow-sim gap R9c-G3, class K19 (proof or inventory check mismatch). Failing input: PR accepted on head A (plain agent accept, so needsAcceptanceRestamp is false, or the drain-path restamp failed). The PR adds a hash card xabc123 that is cited by agent-memory-src/*.md, a scripts/conveyor/flows/*we:.flow.json, a soak break file, or a relatedReport path (numberPendingHashes scopes #3100, #4075, #2400). Drain num… Cited: we:scripts/lane-drain.mjs:1143-1166, we:scripts/lib/numbering-carry.mjs:118-122, we:scripts/lib/numbering-carry.mjs:216-325, we:scripts/lib/numbering-carry.mjs:664-667, we:scripts/lib/numbering-carry.mjs:668. Soak-break sketch: Fixture: real git repo, accepted head A, hash card plus an agent-memory-src note citing it; run numberPendingHashes to make commit B. Action: proveNumberingOnlyMove({fromSha:A,toSha:B}). Assert (fails today): ok:true (id-only rewrite of a note citing the same…
+Flow-sim gap R6c-G1, class K19 (proof or inventory check mismatch). Failing input: Prototype load of a daemon fix whose registered overlay refs overlap the candidate (overlapping non-empty and every blocking ref overlapping). Repo has 2126 tracked test files (git ls-files, spec/test pattern). any prototype-load with overlapping stale registrations reaches the combined-tree test Cited: we:scripts/operations/prototype-load-io.mjs:507-516, we:scripts/operations/prototype-load-io.mjs:96-99, we:scripts/operations/prototype-load-io.mjs:100-104, we:scripts/lib/verify-lane-gate.mjs:102, we:scripts/operations/prototype-load-io.mjs:523-530. Soak-break sketch: Fixture: fake repo with 301 tracked *we:.test.mjs files and one overlapping stale registration whose tip is contained in the candidate. Action: run createPrototypeLoader load with the real defaultCombinedTest and stubbed exec. Assertion (fails today): reason …
 
 ## Acceptance
 

@@ -1,4 +1,5 @@
 ---
+bornAs: x608zbf
 kind: story
 size: 5
 status: open
