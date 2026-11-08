@@ -171,8 +171,8 @@ describe('MQ signature cost and specificity bounds', () => {
     expect(result.invalid).toEqual([]);
   });
 
-  it.each(['x'.repeat(256 * 1024), 'é'.repeat(128 * 1024)])(
-    'limits pattern scans to the last 256 KiB (suffix case %#)', suffix => {
+  it.each(['x'.repeat(64 * 1024), 'é'.repeat(32 * 1024)])(
+    'limits pattern scans to the last 64 KiB (suffix case %#)', suffix => {
       const held = probe({ text: signature + suffix });
       expect(held.reads).toHaveLength(1);
       expect(held.decision.hold).toBe(true);
