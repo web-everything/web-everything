@@ -1168,3 +1168,47 @@ describe('defaultFindResumableRun — the wiring from the PR thread to the hold 
     expect(find({ headRefOid: HEAD_1, comments: [ruling(t0 + 60_000), rearm] })).toBeNull();
   });
 });
+
+
+it('R746 resumes an effect-pending referral in place after the operator ruling, with no new panel', async () => {
+  const { declaration, registry } = setup(input => {
+    const view = stubReader()(input);
+    return { ...view, detail: { ...view.detail, humanRequired: false, labels: [], reviewClass: 'none' } };
+  }); const store = createMemoryRunStore();
+  const judge = vi.fn(async () => judgeOutcome(REFERRAL_ANSWER, {}));
+  const ruled = { value: true }, seen = [];
+  const sinks = sinksWith({ seen, ruled });
+  sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => { throw Error('interrupted at referrals'); };
+  const args = { declaration, registry, argv, store, makeJudge: () => judge, mintRunId: () => 'review-pr-effect' };
+  await runReviewLoopOnce({ ...args, sinks });
+  const saved = store.read('review-pr-effect');
+  expect(saved.pending).toMatchObject({ kind: 'effect', step: 'mandatoryReferrals' });
+  const count = judge.mock.calls.length;
+  const effectsBefore = structuredClone(saved.effects);
+  const at = new Date(Date.parse(saved.stepTimings[0].startedAt) + 60000).toISOString();
+  const comment = { author: { login: 'chalbert' }, createdAt: at, body: buildOperatorRulingComment({
+    version: 1, repo: 'o/n', pr: 4361, head: HEAD_1, rulings: [{ runId: saved.id, key: 'k1', result: 'not-real' }],
+    actor: 'chalbert', channel: 'claude-code-chat', reason: 'ruled', at, clearerId: 'session-1' }) };
+  const view = { number: 4361, headRefOid: HEAD_1, comments: [] };
+  const findResumableRun = input => defaultFindResumableRun(input, { readPr: () => view, readRuns: () => [reviewRunEvidence(store.read(saved.id))] });
+  expect(findResumableRun({ repo: 'o/n', pr: 4361 })).toBeNull();
+  view.comments = [comment];
+  expect(findResumableRun({ repo: 'o/n', pr: 4361 })).toBe(saved.id);
+  expect(defaultFindResumableRun({ repo: 'o/n', pr: 4361 }, { readPr: () => ({ ...view, headRefOid: HEAD_2 }), readRuns: () => [reviewRunEvidence(saved)] })).toBeNull();
+  const done = await runReviewLoopOnce({ ...args, sinks: sinksWith({ seen, ruled }), findResumableRun,
+    mintRunId: () => { throw Error('new run forbidden'); } });
+  expect(done.run.id).toBe(saved.id); expect(done.run.pending).toBeNull();
+  expect(judge).toHaveBeenCalledTimes(count); expect(done.run.verdict.pendingReferrals).toEqual([]);
+  expect(done.run.referralEffectResumeAttempts).toBe(1);
+  expect(done.run.resumeOf).toBeUndefined();
+  expect(done.run.effects.slice(0, effectsBefore.length).map(e => e.key)).toEqual(effectsBefore.map(e => e.key));
+  // Restore this interrupted effect to exercise every automatic retry against the SAME ruling.
+  store.write(saved);
+  for (let attempt = 1; attempt <= RESUME_MAX_ATTEMPTS; attempt++) {
+    await runReviewLoopOnce({ ...args, sinks, findResumableRun, mintRunId: () => { throw Error('new panel forbidden'); } });
+    expect(store.read(saved.id).referralEffectResumeAttempts).toBe(attempt);
+  }
+  const refused = await runReviewLoopOnce({ ...args, sinks, findResumableRun, mintRunId: () => { throw Error('new panel forbidden'); } });
+  expect(refused.stopped).toBe('refused'); expect(refused.lines.join(' ')).toContain('attempts spent');
+  expect(judge).toHaveBeenCalledTimes(count);
+});
