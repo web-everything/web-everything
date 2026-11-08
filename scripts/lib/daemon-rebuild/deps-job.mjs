@@ -130,9 +130,16 @@ function installedBuilds(into) {
     // Indentation is spaces. A line that starts with any other whitespace (a BOM, NBSP, ...) is not a shape this reader
     // understands, and `\S` / `^allowBuilds` would silently read it as "indented, so not top-level".
     if (/^[^\S \t]/.test(line)) throw new Error('unsupported pnpm-workspace.yaml syntax');
+    // A document marker opens the document; it is not itself a key. Content before a later marker would make a second
+    // document, which this reader never follows. Only a marker before any content (still the first document) is read.
+    if (/^---\s*(?:#.*)?$/.test(line)) {
+      if (sawTopLevel) throw new Error('unsupported pnpm-workspace.yaml syntax');
+      continue;
+    }
     if (/^[^ \t]/.test(line)) sawTopLevel = true;
     // A document whose first content line is indented is a uniformly indented mapping: `  allowBuilds:` is then a
-    // real top-level key this reader would never match.
+    // real top-level key this reader would never match. The marker above leaves sawTopLevel unset, so `---` followed by
+    // an indented mapping is refused the same way.
     else if (!sawTopLevel) throw new Error('unsupported pnpm-workspace.yaml syntax');
     if (/^allowBuilds\s*:/.test(line)) {
       if (!/^allowBuilds\s*:\s*(?:#.*)?$/.test(line) || seenBuilds) throw new Error('unsupported allowBuilds policy');

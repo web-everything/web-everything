@@ -190,6 +190,11 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     ['non-breaking space before the key', '\u00A0allowBuilds:\n  esbuild: true\n'],
     ['uniformly indented document', '  allowBuilds:\n    esbuild: true\n'],
     ['merge key', '<<: *base\nallowBuilds:\n  esbuild: true\n'],
+    ['document marker before a uniformly indented document', '---\n  allowBuilds:\n    esbuild: true\n'],
+    ['document marker with a comment before an indented document', '--- # policy\n  allowBuilds:\n    esbuild: true\n'],
+    ['repeated markers before an indented document', '---\n---\n  allowBuilds:\n    esbuild: true\n'],
+    ['comment and blank lines after the marker before an indented document', '---\n# note\n\n  allowBuilds:\n    esbuild: true\n'],
+    ['second document after content', 'packages:\n  - a\n---\nallowBuilds:\n  esbuild: true\n'],
   ])('an allowBuilds policy this reader cannot parse exactly fails closed to legacy: %s', (_name, policy) => {
     const f = setup();
     writeFileSync(join(f.sourceRoot, 'pnpm-workspace.yaml'), policy);
