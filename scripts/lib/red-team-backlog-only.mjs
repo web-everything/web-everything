@@ -1,15 +1,14 @@
-/** Settle backlog-only prep independently of acceptance-based red-team recovery. */
+/** Settle backlog-only heads independently of prep verdicts and acceptance-based recovery. */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
-import { latestPrepVerdict } from '../conveyor/prep-review.mjs';
-import { runGhSync } from './gh-throttle.mjs';
+import { readHumanSurfaceNetFiles } from './human-surface-net-diff.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 
-export const RULE = 'backlog-only-prep';
-export const REASON = `Red team not required on this head: backlog-only prep (rule ${RULE})`;
+export const RULE = 'backlog-only';
+export const REASON = 'Red team not required on this head: backlog-only';
 const settingPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/red-team.json');
 const clean = value => String(value?.message ?? value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 const names = labels => Array.isArray(labels) ? labels.map(l => typeof l === 'string' ? l : l?.name) : null;
@@ -39,42 +38,22 @@ export function resolveBacklogOnlyPrepSetting({ env = process.env, log = () => {
   }
 }
 
-const backlogPath = path => typeof path === 'string' && path.startsWith('backlog/')
+const backlogPath = path => typeof path === 'string' && path.startsWith('backlog/') && path.length > 'backlog/'.length
   && !path.includes('..') && !/[\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path);
 
-export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } = {}) {
+export function backlogOnlyPrepClear({ enabled, head, files, labels } = {}) {
   const refuse = why => ({ ok: false, why });
   if (enabled !== true) return refuse('disabled');
   if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) return refuse('invalid head');
   if (!Array.isArray(files) || !files.length) return refuse('files unreadable or empty; inspect full diff manually');
-  if (files.length >= 3000) return refuse('possibly truncated files; inspect full diff manually');
-  if (files.some(f => !backlogPath(f?.filename)
-    || Object.hasOwn(f, 'previous_filename') && !backlogPath(f.previous_filename))) return refuse('files outside backlog or unsafe paths');
-  if (files.some(f => !['added', 'modified', 'removed', 'changed', 'renamed', 'copied', 'unchanged'].includes(f.status)
-    || ['renamed', 'copied'].includes(f.status) && typeof f.previous_filename !== 'string'))
-    return refuse('file status or previous filename unreadable; inspect full diff manually');
+  for (const path of files) {
+    if (!backlogPath(path)) return refuse('files outside backlog or unsafe paths');
+  }
   const ns = names(labels);
   if (!ns || ns.some(n => typeof n !== 'string') || !candidate(ns)) return refuse('required labels missing or unreadable');
-  if (ns.some(n => ['review:changes', 'review:human', 'red-team:blocked'].includes(n))) return refuse('blocking label');
-  if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string')) return refuse('comments unreadable');
-  const verdict = latestPrepVerdict(comments, head);
-  if (verdict !== 'clean') return refuse('no unambiguous clean newest trusted prep marker for head');
+  if (ns.some(n => n.startsWith('red-team:') && n !== 'red-team:pending'
+    || ['review:changes', 'review:human'].includes(n))) return refuse('blocking label');
   return { ok: true, rule: RULE };
-}
-
-export function readHeadFiles({ repo, pr, head, exec = runGhSync }) {
-  const options = { encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 };
-  const pages = JSON.parse(exec(['api', '--paginate', '--slurp', `repos/${repo}/pulls/${pr}/files`], options));
-  if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p))) throw Error('files response unreadable');
-  const files = pages.flat().map(file => {
-    if (!file || typeof file.filename !== 'string') throw Error('file entry unreadable');
-    return { filename: file.filename, status: file.status, ...(Object.hasOwn(file, 'previous_filename') ? { previous_filename: file.previous_filename } : {}) };
-  });
-  const live = JSON.parse(exec(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,changedFiles'], options));
-  if (live?.headRefOid !== head) throw Error('head moved during files read');
-  if (!Number.isSafeInteger(live?.changedFiles) || live.changedFiles !== files.length || files.length >= 3000)
-    throw Error('files incomplete or possibly truncated; inspect full diff manually');
-  return files;
 }
 
 function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, readLive, post, syncLabels, env, log, dryRun }) {
@@ -83,22 +62,25 @@ function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, re
   try {
     if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) throw Error('invalid head');
     const key = { repo, pr, head }, comments = readComments(key);
-    if (!Array.isArray(comments)) throw Error('comments unreadable');
+    if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string')) throw Error('comments unreadable');
     if (redTeamForHead(comments, pr, head)) return { ...row, why: 'already' };
-    const files = readFiles(key);
-    const proof = backlogOnlyPrepClear({ enabled: true, head, files, comments, labels: raw.labels });
+    const net = readFiles({ repo, number: pr, headRefOid: head });
+    if (net?.ok !== true) throw Error('net files unreadable; inspect full diff manually');
+    const files = net.files;
+    const proof = backlogOnlyPrepClear({ enabled: true, head, files, labels: raw.labels });
     if (!proof.ok) return { ...row, why: proof.why };
     if (dryRun) return { ...row, why: 'dry run (backlog-only prep)' };
     const freshComments = readComments(key);
-    if (!Array.isArray(freshComments)) throw Error('comments unreadable');
+    if (!Array.isArray(freshComments) || freshComments.some(c => typeof c?.body !== 'string')) throw Error('comments unreadable');
     const live = readLive(key), before = names(raw.labels), after = names(live?.labels);
     if (live?.headRefOid !== head || !after || after.some(n => typeof n !== 'string')
       || JSON.stringify([...before].sort()) !== JSON.stringify([...after].sort())) throw Error('head or labels changed before post');
-    const freshProof = backlogOnlyPrepClear({ enabled: true, head, files, comments: freshComments, labels: live.labels });
+    const freshProof = backlogOnlyPrepClear({ enabled: true, head, files, labels: live.labels });
     if (!freshProof.ok) return { ...row, why: freshProof.why };
     if (redTeamForHead(freshComments, pr, head)) return { ...row, why: 'already' };
     const finalComments = readComments(key);
-    const finalProof = backlogOnlyPrepClear({ enabled: true, head, files, comments: finalComments, labels: live.labels });
+    if (!Array.isArray(finalComments) || finalComments.some(c => typeof c?.body !== 'string')) throw Error('comments unreadable');
+    const finalProof = backlogOnlyPrepClear({ enabled: true, head, files, labels: live.labels });
     if (!finalProof.ok) return { ...row, why: finalProof.why };
     if (redTeamForHead(finalComments, pr, head)) return { ...row, why: 'already' };
     const finalLive = readLive(key), finalLabels = names(finalLive?.labels);
@@ -113,7 +95,7 @@ function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, re
 }
 
 export function runBacklogOnlyPrep({ repo, rawPrs, env = process.env, log = () => {}, dryRun = false,
-  readComments, readHeadFiles: readFiles = readHeadFiles, readLive, post, syncLabels = syncRedTeamStatusLabels, enabled } = {}) {
+  readComments, readHeadFiles: readFiles = readHumanSurfaceNetFiles, readLive, post, syncLabels = syncRedTeamStatusLabels, enabled } = {}) {
   const note = safeLog(log);
   const candidates = (rawPrs ?? []).filter(raw => candidate(names(raw?.labels)));
   if (!candidates.length) return [];

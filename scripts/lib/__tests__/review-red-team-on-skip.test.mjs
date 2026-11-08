@@ -1704,21 +1704,43 @@ describe('unprovable accepted head move — fresh full review', () => {
 });
 
 
-describe('R742 independent backlog-only prep pass', () => {
-  it('settles without refusals even when on-skip is disabled; own setting off preserves behavior', () => {
-    const rawPrs = [{ number: pr, headRefOid: head, labels: ['ready-to-merge', 'review:prep', 'red-team:pending'],
-      files: [{ filename: 'backlog/742.md', status: 'modified' }], comments: [{ author: { login: 'chalbert' },
-        body: `<!-- prep-review: head=${head} round=1 -->\n<!-- prep-review-verdict head=${head} verdict=clean v=1 -->\n**Verdict: clean**` }] }];
-    const syncLabels = vi.fn(); vi.mocked(runGhSync).mockClear();
-    const options = { repo, rawPrs, plan: { refusals: [] }, setting: { enabled: false }, syncLabels,
-      env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '1' } };
-    expect(runRedTeamOnSkip(options).rows).toMatchObject([{ action: 'clear', rule: 'backlog-only-prep' }]);
+describe('R756 independent backlog-only pass', () => {
+  function backlogOptions(over = {}) {
+    return { repo, rawPrs: [{ number: pr, headRefOid: head,
+      labels: ['ready-to-merge', 'review:prep', 'red-team:pending'],
+      netFiles: { ok: true, files: ['backlog/742.md'] }, comments: [] }],
+      plan: { refusals: [] }, setting: { enabled: false }, syncLabels: vi.fn(),
+      env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '1' }, ...over };
+  }
+  it('settles without prep comments even when on-skip is disabled; own setting off preserves behavior', () => {
+    const options = backlogOptions(); vi.mocked(runGhSync).mockClear();
+    expect(runRedTeamOnSkip(options).rows).toMatchObject([{ action: 'clear', rule: 'backlog-only' }]);
     expect(runGhSync).toHaveBeenCalledWith(expect.arrayContaining(['comment']), expect.objectContaining({
-      input: expect.stringContaining(`${redTeamMarker(pr, head)}\n\nRed team not required on this head: backlog-only prep (rule backlog-only-prep)`),
+      input: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: backlog-only`,
     }));
-    expect(syncLabels).toHaveBeenCalledTimes(1);
-    vi.mocked(runGhSync).mockClear(); syncLabels.mockClear();
+    expect(options.syncLabels).toHaveBeenCalledTimes(1);
+    vi.mocked(runGhSync).mockClear(); options.syncLabels.mockClear();
     expect(runRedTeamOnSkip({ ...options, env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '0' } }).rows).toEqual([]);
-    expect(runGhSync).not.toHaveBeenCalled(); expect(syncLabels).not.toHaveBeenCalled();
+    expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
+  });
+  it('passes the pinned identity to an injected net reader', () => {
+    const readHeadFiles = vi.fn(() => ({ ok: true, files: ['backlog/742.md'] }));
+    const options = backlogOptions({ readHeadFiles });
+    expect(runRedTeamOnSkip(options).rows[0].action).toBe('clear');
+    expect(readHeadFiles).toHaveBeenCalledWith({ repo, number: pr, headRefOid: head });
+  });
+  it('holds a rename from outside backlog reported by the net reader', () => {
+    const options = backlogOptions({ readHeadFiles: () => ({ ok: true, files: ['src/old', 'backlog/new'] }) });
+    vi.mocked(runGhSync).mockClear();
+    expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
+  });
+  it('never falls back to GitHub files when the net read is unavailable', () => {
+    const options = backlogOptions();
+    delete options.rawPrs[0].netFiles;
+    options.rawPrs[0].files = [{ filename: 'backlog/a', status: 'modified' }];
+    vi.mocked(runGhSync).mockClear();
+    expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
   });
 });
