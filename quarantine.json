@@ -1,5 +1,14 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/lib/__tests__/delivery-policy.test.mjs::serializes two child-process appends with stale lock",
+      "brokenSha": "b61098f219912effa23af28b37bcd63fc0270796",
+      "owner": "flake-delivery-policy-stale-lock",
+      "reason": "R726: flake, 5/5 pass on 6499 head and 3/3 on main at load 17-27; failed only in 6499 merge-group",
+      "addedAt": 1794140249009,
+      "expiresAt": 1794226649009
+    }
+  ],
   "mode": "quarantine"
 }
