@@ -1,15 +1,16 @@
 ---
+bornAs: xt8xesx
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/conveyor/orphan-claim-release.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/operations/build-dispatch-hold-route-land.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# blockedBy edge clears by absence, so a dependent lands when its blocker PR was closed unmerged (stackParents …
+# A revert of a merged PR retracts nothing - delivery proof stays 'merged', the card stays resolved, and a re-o…
 
-Flow-sim gap R5c-G4, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: Dependent D (manifest blockedBy:[N], ready-to-merge, accepted, green). Blocker item N had an open PR that is then CLOSED without merging (abandoned, superseded, or never opened because the item is not built). 'Next drain cascade pass. Cited: we:scripts/merge-ai-prs.mjs:2622, we:scripts/merge-ai-prs.mjs:2688, we:scripts/merge-ai-prs.mjs:2714-2715. Soak-break sketch: Fixture: candidates [D{item:2,blockedBy:[1]}], no candidate/extra item 1, provenOnMain empty, item 1 not landed on main. Action: orderCascade/planLandings for a full sweep. Assertion that fails today: D is in `deferred` with a waitOn naming 1 (needs an 'absen…
+Flow-sim gap R8a-G6, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: PR #P (head lane/4459-foo) merged and card 4459 resolved. PR #R reverts it and merges. Operator re-opens card 4459 (status:open) and a session claims it (status:active), then dies; claim older than 48h. orphan-claim-release pass (and the stranded sweep) Cited: we:scripts/conveyor/orphan-claim-release.mjs:398, we:scripts/conveyor/orphan-claim-release.mjs:201, we:scripts/backlog-stranded-sweep.mjs:219-237, we:scripts/merge-ai-prs.mjs:7635, we:scripts/operations/build-dispatch-hold-route-land.mjs:151. Soak-break sketch: Fixture: mergedPrs = [#P matching card 4459], a later merged revert PR titled 'Revert 'WE #4459: foo'', card 4459 active and 3 days old, other signals empty. Action: classifyOrphan. Assert (fails today): verdict act:true (delivery retracted by the revert); to…
 
 ## Acceptance
 

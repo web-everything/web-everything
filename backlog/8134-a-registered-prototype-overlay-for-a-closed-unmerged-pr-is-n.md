@@ -1,15 +1,16 @@
 ---
+bornAs: xsbx3n1
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/supersede-watch.mjs", "we:scripts/conveyor/supersede-rule.mjs", "we:scripts/operations/prototype-retire.mjs", "we:scripts/conveyor/stand-down.mjs"]
+scope: ["we:scripts/operations/prototype-load-io.mjs", "we:scripts/daemon-overlay.mjs", "we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/daemon-rebuild/plan.mjs", "we:scripts/operations/prototype-retire.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# 'Merged' is read as 'landed on main': a PR merged into a non-main base, or later reverted, still stands down …
+# A registered prototype overlay for a CLOSED-unmerged PR is never retired: prototype-load registers with no --…
 
-Flow-sim gap R9b-G4, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: Trusted PR #B merged into base lane/stack-x (or release branch), or merged then reverted by a revert PR; body 'Supersedes: #A'; #A open.' 'supersede-watch tick. Cited: we:scripts/conveyor/supersede-watch.mjs:38-39, we:scripts/conveyor/supersede-rule.mjs:258, we:scripts/operations/prototype-retire.mjs:132-136, we:scripts/conveyor/stand-down.mjs:233. Soak-break sketch: fixture: merged row {number:B, baseRefName:'lane/stack-x', body:'Supersedes: #A'}, trusted author; open #A. action: planSupersedeHolds. assert no hold (superseder not on the default branch) - today a hold is planned.
+Flow-sim gap R5a-G4, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: Registration R of branch lane/x on a daemon clone added through prototype-load (no --pr). PR for lane/x is then CLOSED unmerged, with commits not on main and no merged PR declaring 'Supersedes #N'.' 'Any later daemon rebuild or prototype-load retire step. Cited: we:scripts/operations/prototype-load-io.mjs:573-577, we:scripts/daemon-overlay.mjs:737-745, we:scripts/lib/daemon-load-overlay.mjs:262, we:scripts/lib/daemon-rebuild/plan.mjs:526-532, we:scripts/operations/prototype-retire.mjs:109-117. Soak-break sketch: Fixture: clone overlay list with {ref:'lane/x',pr:null}; gh stub returns the PR list state CLOSED, unique commit not on main, no superseder. Action: run the rebuild plan and planRetirements. Assert: decision remove/retire (or an alert + owner). Fails today: k…
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xbeulcr
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/orphan-claim-release.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/operations/build-dispatch-hold-route-land.mjs"]
+scope: ["we:scripts/conveyor/supersede-watch.mjs", "we:scripts/conveyor/supersede-rule.mjs", "we:scripts/operations/prototype-retire.mjs", "we:scripts/conveyor/stand-down.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A revert of a merged PR retracts nothing - delivery proof stays 'merged', the card stays resolved, and a re-o…
+# 'Merged' is read as 'landed on main': a PR merged into a non-main base, or later reverted, still stands down …
 
-Flow-sim gap R8a-G6, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: PR #P (head lane/4459-foo) merged and card 4459 resolved. PR #R reverts it and merges. Operator re-opens card 4459 (status:open) and a session claims it (status:active), then dies; claim older than 48h. orphan-claim-release pass (and the stranded sweep) Cited: we:scripts/conveyor/orphan-claim-release.mjs:398, we:scripts/conveyor/orphan-claim-release.mjs:201, we:scripts/backlog-stranded-sweep.mjs:219-237, we:scripts/merge-ai-prs.mjs:7635, we:scripts/operations/build-dispatch-hold-route-land.mjs:151. Soak-break sketch: Fixture: mergedPrs = [#P matching card 4459], a later merged revert PR titled 'Revert 'WE #4459: foo'', card 4459 active and 3 days old, other signals empty. Action: classifyOrphan. Assert (fails today): verdict act:true (delivery retracted by the revert); to…
+Flow-sim gap R9b-G4, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: Trusted PR #B merged into base lane/stack-x (or release branch), or merged then reverted by a revert PR; body 'Supersedes: #A'; #A open.' 'supersede-watch tick. Cited: we:scripts/conveyor/supersede-watch.mjs:38-39, we:scripts/conveyor/supersede-rule.mjs:258, we:scripts/operations/prototype-retire.mjs:132-136, we:scripts/conveyor/stand-down.mjs:233. Soak-break sketch: fixture: merged row {number:B, baseRefName:'lane/stack-x', body:'Supersedes: #A'}, trusted author; open #A. action: planSupersedeHolds. assert no hold (superseder not on the default branch) - today a hold is planned.
 
 ## Acceptance
 

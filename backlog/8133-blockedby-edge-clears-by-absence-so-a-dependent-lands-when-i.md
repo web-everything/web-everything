@@ -1,15 +1,16 @@
 ---
+bornAs: xd9uqu3
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/operations/prototype-load-io.mjs", "we:scripts/daemon-overlay.mjs", "we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/daemon-rebuild/plan.mjs", "we:scripts/operations/prototype-retire.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A registered prototype overlay for a CLOSED-unmerged PR is never retired: prototype-load registers with no --…
+# blockedBy edge clears by absence, so a dependent lands when its blocker PR was closed unmerged (stackParents …
 
-Flow-sim gap R5a-G4, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: Registration R of branch lane/x on a daemon clone added through prototype-load (no --pr). PR for lane/x is then CLOSED unmerged, with commits not on main and no merged PR declaring 'Supersedes #N'.' 'Any later daemon rebuild or prototype-load retire step. Cited: we:scripts/operations/prototype-load-io.mjs:573-577, we:scripts/daemon-overlay.mjs:737-745, we:scripts/lib/daemon-load-overlay.mjs:262, we:scripts/lib/daemon-rebuild/plan.mjs:526-532, we:scripts/operations/prototype-retire.mjs:109-117. Soak-break sketch: Fixture: clone overlay list with {ref:'lane/x',pr:null}; gh stub returns the PR list state CLOSED, unique commit not on main, no superseder. Action: run the rebuild plan and planRetirements. Assert: decision remove/retire (or an alert + owner). Fails today: k…
+Flow-sim gap R5c-G4, class K18 (state keyed to an identity never checked for liveness or retraction). Failing input: Dependent D (manifest blockedBy:[N], ready-to-merge, accepted, green). Blocker item N had an open PR that is then CLOSED without merging (abandoned, superseded, or never opened because the item is not built). 'Next drain cascade pass. Cited: we:scripts/merge-ai-prs.mjs:2622, we:scripts/merge-ai-prs.mjs:2688, we:scripts/merge-ai-prs.mjs:2714-2715. Soak-break sketch: Fixture: candidates [D{item:2,blockedBy:[1]}], no candidate/extra item 1, provenOnMain empty, item 1 not landed on main. Action: orderCascade/planLandings for a full sweep. Assertion that fails today: D is in `deferred` with a waitOn naming 1 (needs an 'absen…
 
 ## Acceptance
 
