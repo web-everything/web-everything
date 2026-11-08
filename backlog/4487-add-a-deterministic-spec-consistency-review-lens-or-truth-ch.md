@@ -86,7 +86,7 @@ Before/after on a real surface: print `PANEL_LENSES` from we:scripts/lib/jury-co
 
 - Option (b): a red-team step in we:scripts/lib/converge-core.mjs that tries to construct a concrete counterexample input after the panel accepts.
 - Decide whether `REVIEW_PANEL_LENSES` (ledger default roster, we:scripts/lib/jury-ledger.mjs) should seat this lens (extra juror cost per review; see the #3035 note there).
-- Blocking-on-impact for contradiction findings (parallels `#x38ergj` for claim-accuracy).
+- Blocking-on-impact for contradiction findings (parallels `#3339` for claim-accuracy).
 - A deterministic extractor that pre-lists numbered rules for the juror, so the cap is enforced in code rather than by prompt.
 - Measure the lens's hit rate on the review replay corpus (we:scripts/review-corpus) before any promotion.
 

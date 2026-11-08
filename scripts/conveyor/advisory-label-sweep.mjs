@@ -111,7 +111,7 @@ export function commentsMayBeTruncated(pr) {
  * @param {{repo: string, number: number, exec?: Function, readComments?: Function}} o
  */
 export function defaultReadPr({ repo, number, exec = execFileSyncThrottled, readComments = readCompletePrComments }) {
-  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', 'number,state,labels,headRefOid'];
+  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', 'number,state,labels,headRefOid,reviews'];
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   const pr = JSON.parse(String(out || '{}'));
   const comments = readComments(number, { repo });
@@ -202,7 +202,7 @@ export function sweepAdvisoryLabels({
           log(`red-team publication #${pr.number}: ${publication.publishError}`);
         }
       }
-      evidence = settleUnknownEvidenceByComment(evidence, comments, pr.number, live.headRefOid);
+      evidence = settleUnknownEvidenceByComment(evidence, comments, pr.number, live.headRefOid, live.reviews);
       const plan = syncRedTeamStatusLabels({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid,
         evidence, live, comments, provider, dryRun, log });
       if (plan.add || plan.remove.length || Object.keys(publication).length) results.push({ num: pr.number, ...plan, ...publication });
