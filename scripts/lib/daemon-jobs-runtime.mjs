@@ -570,7 +570,7 @@ export async function reattachTick({
       try { gone = confirmForeignGone(record.job.handle) === true; } catch { /* unreadable evidence retains exclusion */ }
       if (gone) return true;
       actions.push({ id: record.id, state, action: 'stop-failed' });
-      log(`daemon-jobs: stale foreign task owner ${record.id} (${record.job.handle}) is not confirmed gone — retains claim and slot; inspect owner before recovery`);
+      log(`daemon-jobs: stale foreign owner ${record.id} (${record.job.handle}) is not confirmed gone — retains claim and slot; inspect owner before recovery`);
       return false;
     }
     const lastAliveMs = Date.parse(record.job.heartbeatAt ?? record.job.startedAt ?? '');
@@ -644,7 +644,8 @@ export async function reattachTick({
     }
     // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
     // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
-    if (isTask) {
+    if (isTask || staleForeignDead) {
+      // A stale foreign heartbeat is never proof of death, task or not: a still-alive local pid must not be relaunched.
       if (!confirmTaskGroupGone(r, state, { foreign: staleForeignDead })) continue;
     } else if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) {
       log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
