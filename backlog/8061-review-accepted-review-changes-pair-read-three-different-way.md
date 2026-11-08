@@ -3,6 +3,7 @@ bornAs: xnqoxtk
 kind: story
 size: 5
 status: open
+related: ["2750"]
 scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/progress-board.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
 dateOpened: "2026-11-07"
 tags: []
