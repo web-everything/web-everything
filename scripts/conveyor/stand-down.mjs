@@ -419,6 +419,11 @@ export function isLoadOnlyRedStandDown(c) {
  * diff), and the corroboration (other tests pass, passes alone, or the same timeout on base). A diff-touched failure
  * says none of that and stays terminal; the text is a keyword grammar (it cannot see the diff), so the re-dispatched fixer's own GREEN verify, not this classifier, is what stops a real failure from being pushed; the re-dispatch still needs a GREEN verify before any push.
  */
+/** A gate-red detail naming a timeout is flattened to one line, so a failure on a later line cannot hide below the one line the classifier reads. */
+export function flattenTimeoutDetail(reason, detail) {
+  return reason === 'gate-red' && typeof detail === 'string' && /\btimed out\b|\btimeout\b/i.test(detail) ? detail.replace(/\s+/g, ' ').trim() : detail;
+}
+
 export function statesOutOfDiffTimeoutEvidence(reason) {
   // WHITELIST, not a blacklist (the audit kept finding new failure wordings): drop the stock clause and the
   // recognized evidence phrases; if any other word remains, the report says something else and stays terminal.
@@ -809,6 +814,8 @@ if (IS_CLI) {
   }
   // The prose cannot see the diff, so the CLI can: a timeout in a file this PR changes is never out-of-diff, and the
   // note it adds names the diff so the evidence grammar rejects it (terminal stays terminal).
+  // standDownReason reads only the first body line, so a multi-line detail could hide a failure below it: flatten.
+  detail = flattenTimeoutDetail(flags.reason, detail);
   const diffTouched = (() => {
     if (flags.reason !== 'gate-red' || !/\btimed out\b|\btimeout\b/i.test(detail ?? '')) return false;
     const named = new Set((detail ?? '').match(/[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi) ?? []);

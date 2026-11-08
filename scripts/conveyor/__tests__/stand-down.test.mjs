@@ -25,7 +25,7 @@ import {
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
   standDownComments, standDownReason, WATCHER_STAND_DOWN_ACTOR, countTerminalStandDowns,
   SUPERSEDE_STAND_DOWN_MARKER, isStandDownSuperseded, isSelfAuthored, AUTOMATION_LOGINS,
-  isLoadOnlyRedStandDown, loadFlakeHolds,
+  isLoadOnlyRedStandDown, loadFlakeHolds, flattenTimeoutDetail,
 } from '../stand-down.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../ci-heal-mark.mjs';
@@ -689,6 +689,12 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
   it('no named file, or a quoted comparison, stays terminal (audit)', () => {
     expect(isLoadOnlyRedStandDown(mk("test timed out outside the diff; other tests pass"))).toBe(false);
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out (unrelated to this change); other tests pass; 'comparison mismatch: 1 versus 2'"))).toBe(false);
+  });
+  it('a multi-line detail cannot hide a failure below the first line (audit)', () => {
+    const d = flattenTimeoutDetail('gate-red', "foo.test.mjs timed out outside the diff; other tests pass\nAssertionError: expected 1 to be 2");
+    expect(d).not.toContain('\n');
+    expect(isLoadOnlyRedStandDown(mk(d))).toBe(false);
+    expect(flattenTimeoutDetail('needs-judgment', 'a\nb')).toBe('a\nb');
   });
   it('a bare timeout with no unrelated/other-tests-pass evidence stays terminal', () => {
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
