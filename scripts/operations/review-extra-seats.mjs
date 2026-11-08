@@ -2,6 +2,7 @@
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { readRedTeamGateSource } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -215,6 +216,12 @@ export function reserveSeatCalls({ ledger, records, want, dailyCap, now, newId, 
   // to the shared ledger file, never drops another provider's outstanding entries.
   const otherProviders = (Array.isArray(ledger?.reservations) ? ledger.reservations : []).filter((r) => r && capDay(r.at) === day && !sameProvider(r));
   return { callIds, used: ids.size, ledger: { version: 1, reservations: [...otherProviders, ...kept, ...fresh] } };
+}
+
+/** Is the red-team check run merge evidence in this mode? Publish-first binds only then (every mode but the
+ * drain-scan rollback). Logs the effective value and its source (policy cascade). */
+function checkRunIsEvidence(env, log = () => {}) {
+  return readRedTeamGateSource({ env, log: line => { try { log(line); } catch { /* logging is best effort */ } } }).value.source !== 'drain-scan';
 }
 
 /** Drop unspent reservations (a round that never started must not burn the day's budget). PURE. */
@@ -1829,10 +1836,13 @@ export async function speculateRedTeam({
       // Publish-first (#6535): the round starts only once its in_progress check is posted, so CI can never pass
       // an older success while this round runs unseen. Fail closed; the next tick retries.
       // The real io (createRedTeamIo) throws unless the post is confirmed; only an explicit false/throw is read here.
+      // Only where the check run is evidence: the drain-scan rollback never reads it, so there a failed publication
+      // is logged and the round starts, as before #6535 (a check outage must not stall the rollback).
       let published = { published: true };
       try { published = io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }) ?? published; }
       catch (e) { published = { published: false, reason: String(e?.message ?? e) }; }
-      if (published?.published === false) {
+      if (published?.published === false && !checkRunIsEvidence(env, io.log)) io.log(`red-team status: ${String(published?.reason ?? 'publication not confirmed').slice(0, 300)} (redTeamGate.source=drain-scan: round starts)`);
+      else if (published?.published === false) {
         const reason = `red-team round not started: in_progress check not posted (${String(published?.reason ?? 'publication not confirmed').slice(0, 300)}); retried next tick`;
         io.log(reason);
         try { io.releaseCalls?.({ provider, callIds: [callId] }); } catch (e) { io.log(`red-team reservation release failed: ${e.message}`); }
@@ -2073,7 +2083,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }),
     redTeamStatus: input => {
       const outcome = recordStatus(input, { env });
-      if (input.status === 'running' && outcome?.published !== true)
+      if (input.status === 'running' && outcome?.published !== true && checkRunIsEvidence(env, base.log))
         throw new Error(`red-team in_progress check not published: ${String(outcome?.reason ?? 'publication not confirmed').slice(0, 300)}`);
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
         evidence: { scheduled: true, inFlight: input.status === 'running', recorded: input.result === 'ran' }, env, log: base.log }); }

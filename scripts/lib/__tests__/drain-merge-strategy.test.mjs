@@ -212,6 +212,58 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     restored.s.enqueue({ num: 5283 }, HEAD);
     expect(requests).toBe(2);
   });
+  it('a passing check ends the recovery wait: a later round on the same head starts a fresh wait (round-4 finding)', () => {
+    const clock = { t: 1000 };
+    let fact = { ok: false, reason: 'no red-team check run on head' }, requests = 0;
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' };
+    const make = initial => harness({ strategy: 'github-merge-queue', env, now: () => clock.t, initial,
+      labels: ['ready-to-merge', 'review:accepted'], requestRedTeam: () => { requests++; },
+      strategyExtra: { readRedTeamCheck: () => fact } });
+    let h = make();
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    clock.t += 30_000;
+    fact = { ok: true, reason: 'red-team check run succeeded on head' };
+    h = make(h.state());
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(true);
+    expect(h.state().redTeamCheckRecovery?.['cwd#5283']?.firstPendingAt).toBeUndefined();
+    // A new round on the same head, 70 s after the FIRST wait began: not overdue, so no request is spent on it.
+    clock.t += 40_000;
+    fact = { ok: false, reason: 'red-team check run in progress or incomplete' };
+    h = make(h.state());
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: false });
+    expect(requests).toBe(0);
+    // Overdue on its OWN clock: the once-per-head request is still available.
+    clock.t += 60_001;
+    h = make(h.state());
+    h.s.enqueue({ num: 5283 }, HEAD);
+    expect(requests).toBe(1);
+  });
+
+  it('ending the wait keeps the once-per-head request spend', () => {
+    const clock = { t: 1000 };
+    let fact = { ok: false, reason: 'no red-team check run on head' }, requests = 0;
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' };
+    const make = initial => harness({ strategy: 'github-merge-queue', env, now: () => clock.t, initial,
+      labels: ['ready-to-merge', 'review:accepted'], requestRedTeam: () => { requests++; },
+      strategyExtra: { readRedTeamCheck: () => fact } });
+    let h = make();
+    h.s.enqueue({ num: 5283 }, HEAD);
+    clock.t += 60_001;
+    h = make(h.state());
+    h.s.enqueue({ num: 5283 }, HEAD);
+    expect(requests).toBe(1);
+    fact = { ok: true };
+    h = make(h.state());
+    h.s.enqueue({ num: 5283 }, HEAD);
+    fact = { ok: false, reason: 'no red-team check run on head' };
+    for (const step of [0, 60_001]) {
+      clock.t += step;
+      h = make(h.state());
+      h.s.enqueue({ num: 5283 }, HEAD);
+    }
+    expect(requests).toBe(1);
+  });
+
   const checkRunHarness = (options = {}) => harness({ ...options,
     env: { ...options.env, WE_RED_TEAM_GATE_SOURCE: 'check-run' },
     strategyExtra: { readRedTeamCheck: () => ({ ok: true }), ...options.strategyExtra } });

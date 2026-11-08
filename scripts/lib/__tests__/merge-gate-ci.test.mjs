@@ -431,6 +431,25 @@ describe('gatherPrFacts red-team publication hold', () => {
     expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
   });
 
+  it('a hold set, a new round posted and the hold cleared between the two reads still holds (check re-read)', () => {
+    let checkReads = 0;
+    const IN_PROGRESS = JSON.stringify({ total_count: 2, check_runs: [JSON.parse(GH_SUCCESS[1]).check_runs[0],
+      { id: 2, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: 5037855 }, status: 'in_progress', conclusion: null }] });
+    const facts = gather([GH_PR, [GH_SUCCESS[0], () => (++checkReads === 1 ? GH_SUCCESS[1] : IN_PROGRESS)], GH_LATEST_SUCCESS,
+      history({ state: 'success', creator: { login: 'web-everything[bot]' } }, { state: 'failure', creator: { login: 'web-everything[bot]' } })],
+    { env: holdEnv('check-run') });
+    expect(checkReads).toBe(2);
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/in progress/) });
+  });
+
+  it('a success that is still the newest run after the hold read passes, with exactly two check reads', () => {
+    const exec = fakeExec([GH_PR, GH_SUCCESS, GH_NO_HOLD, GH_FILES]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },
+      exec, env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: true });
+    expect(exec.calls.filter(call => /check-runs/.test(call))).toHaveLength(2);
+  });
+
   it('drain-scan (rollback) ignores both holds and reads no check or status', () => {
     const exec = fakeExec([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD, GH_FILES]);
     const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },

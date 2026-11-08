@@ -179,21 +179,24 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   const pin = pinnedHeadOf(pr, { expected: expectedHeadSha, requireExpected: requireExpectedHead });
   facts.pinnedHead = pin;
   facts.redTeamGateSource = readRedTeamGateSource({ env, log: line => process.stderr.write(`${line}\n`) }).value.source;
+  const redTeamGh = (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options);
+  const readCheck = () => readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID, gh: redTeamGh });
   facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
-    : readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID,
-      gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
+    : readCheck();
   // A failed publication can leave an older success on GitHub. Two holds outrank it, both read AFTER the check, so
   // a writer that sets one mid-read is still seen:
-  // 1. The GitHub-visible hold: a head-bound `red-team/publication` commit status the writer posts when its check
-  //    post and failure supersede both fail. Every host reads it, including the GitHub-hosted PR and merge_group
-  //    legs. Unreadable or incomplete fails closed.
+  // 1. The GitHub-visible hold: a head-bound commit status on this PR's own context (`red-team/publication #<pr>`),
+  //    set before the writer's first check post and cleared after a confirmed one. Every host reads it, including
+  //    the GitHub-hosted PR and merge_group legs. Unreadable or incomplete fails closed.
   // 2. The drain-local `.unpublished` marker, which also covers a total GitHub write outage (when nothing remote can
   //    be written). Only the drain host has it; elsewhere it is absent. Writers store the canonical lowercase slug,
   //    while `--repo` is case-insensitive to gh, so both spellings are read.
+  // A writer can also set, post and clear entirely between the check read and the hold read; the hold then reads
+  // clear while the first read still saw the older success. So the check is read AGAIN after a clear hold read:
+  // that new post is the newest run by then, and only a success that is still the newest passes.
   if (facts.redTeamGateSource !== 'drain-scan' && !pin.error && facts.redTeamCheck.ok) {
-    const remoteHold = readRedTeamPublicationHoldFact({ repo, pr: num, headSha: pin.sha,
-      gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
-    if (!remoteHold.ok) facts.redTeamCheck = remoteHold;
+    const remoteHold = readRedTeamPublicationHoldFact({ repo, pr: num, headSha: pin.sha, gh: redTeamGh });
+    facts.redTeamCheck = remoteHold.ok ? readCheck() : remoteHold;
   }
   if (facts.redTeamGateSource !== 'drain-scan' && !pin.error) {
     const hold = [...new Set([repo, String(repo).toLowerCase()])]
