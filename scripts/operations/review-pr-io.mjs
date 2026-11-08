@@ -1,4 +1,5 @@
 import { redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
+import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -60,7 +61,7 @@ import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-pro
 import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // The `advisory:accepted` / `advisory:changes` label the `advise` step's SECOND effect applies — the pure plan
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
-import { ADVISORY_OUTCOMES, ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
+import { ADVISORY_LABELS, ADVISORY_OUTCOMES, ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { ledgerFindingKey, REFERRAL_RETIRED_CHANNEL } from '../lib/pr-state/referrals.mjs';
@@ -1041,8 +1042,28 @@ export function createReviewPrSinks({
   };
   // Supersede any same-head success before acceptance can become visible. A failed publication is
   // provably before acceptance writes, so leave the effect retryable on resume.
-  const postPendingRedTeam = async payload => {
+  // Post only when a red-team pass will finish the check: the pass refuses a head that already carries a trusted
+  // result (`review-extra-seats.mjs`, the same `redTeamForHead` test), so a pending check there would never
+  // complete. That result is final for the head, so the barrier has nothing to supersede. An unreadable or
+  // incomplete thread proves nothing either way: refuse before any write and leave the effect retryable.
+  const postPendingRedTeam = async (payload, liveState) => {
     const { repo, pr, reviewedHead: headSha } = payload;
+    let comments;
+    try {
+      const state = liveState ?? labelProvider.readPrState(repo, pr);
+      comments = state?.comments;
+      if (Array.isArray(comments) && comments.length >= PR_COMMENTS_PAGE_SIZE) {
+        if (!labelProvider.readComments) throw new Error('complete comments reader unavailable');
+        comments = labelProvider.readComments(repo, pr);
+      }
+      if (!Array.isArray(comments)) throw new Error('comments missing');
+    } catch (error) {
+      throw notApplied(`red-team pending check not posted: PR thread unreadable (${String(error?.message ?? error).split('\n')[0].slice(0, 200)}); retry/resume review`);
+    }
+    if (redTeamForHead(comments, pr, headSha)) {
+      out(`review-pr: ${repo}#${pr} red-team result already on ${String(headSha).slice(0, 12)}; pending check not posted`);
+      return;
+    }
     const result = await postRedTeamCheckRun({ repo, pr, headSha,
       payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'in_progress' }) });
     if (result?.ok !== true) throw notApplied(`red-team pending check not posted: ${result?.reason ?? 'publication unconfirmed'}; retry/resume review`);
@@ -1836,11 +1857,15 @@ export function createReviewPrSinks({
       if (!advisoryCoversHead({ head: payload.reviewedHead }, state?.headRefOid)) {
         return { applied: false, reason: 'head-moved' };
       }
-      // Retain the barrier for saved runs resuming after an advisory note posted by an older version.
-      if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed) await postPendingRedTeam(payload);
       const plan = planAdvisoryLabels({ outcome: payload.outcome, currentLabels: labels });
       if (plan.reason) return { applied: false, reason: plan.reason };
       if (!plan.add && plan.remove.length === 0) return { applied: false, reason: 'already-current' };
+      // Retain the barrier for saved runs resuming after an advisory note posted by an older version, but only
+      // when this write makes the accept visible: a refused, already-current or removal-only plan adds no
+      // acceptance, and a check posted then would replace a finished result with one nothing completes.
+      if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed && plan.add === ADVISORY_LABELS.ACCEPTED) {
+        await postPendingRedTeam(payload, state);
+      }
       // `gh pr edit --add-label` refuses a label the repo has never had; ensure is create-or-update (`--force`).
       if (plan.add) labelProvider.ensureLabel(payload.repo, plan.add, ADVISORY_LABEL_META[plan.add]);
       labelProvider.setLabels(payload.repo, payload.pr, { add: plan.add ?? undefined, remove: plan.remove });
