@@ -87,7 +87,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
   const s = createDrainMergeStrategy({
     ...strategyExtra,
     writeFile: strategyExtra.writeFile ?? vi.fn(),
-    dryRun, env, labelProvider, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, labelProvider, readRedTeamEvidence: strategyExtra.readRedTeamEvidence ?? (() => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }), requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -98,6 +98,32 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
 
 const MERGED = { state: 'MERGED', mergedAt: '2026-10-09T22:00:00Z', mergeCommit: { oid: 'c'.repeat(40) } };
 const stampedBy = (login) => [{ author: { login }, body: buildClearanceComment(HEAD) }];
+
+describe('enqueue delegates red-team verdicts to merge-gate', () => {
+  it('enqueues without reading local status files or scanning review runs', () => {
+    const readRedTeamEvidence = vi.fn(() => { throw new Error('local status files and review scans must not be read'); });
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'true' },
+      strategyExtra: { readRedTeamEvidence } });
+    let result;
+    expect(() => { result = h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }); }).not.toThrow();
+    expect(readRedTeamEvidence).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ enqueued: true });
+    expect(h.calls.some(call => call.includes('run') && call.includes('list'))).toBe(false);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(true);
+  });
+
+  it.each(['review:changes', 'review:human', 'review:pending', 'red-team:blocked'])('keeps the send-back label check: %s', label => {
+    const readRedTeamEvidence = vi.fn(() => { throw new Error('local evidence must not be read'); });
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', label],
+      env: { WE_UNDER_TEST: '1' }, strategyExtra: { readRedTeamEvidence } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({
+      enqueued: false, deferred: true, kind: 'sent-back', reason: `state is ${label}`,
+    });
+    expect(readRedTeamEvidence).not.toHaveBeenCalled();
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+});
 
 describe('drain merge strategy — drain-direct (default) is unchanged', () => {
   it('never enqueues, never skips freshness, makes no gh call, and logs strategy + source once', () => {
