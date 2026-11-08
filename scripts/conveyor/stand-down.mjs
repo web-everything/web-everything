@@ -426,7 +426,7 @@ export function statesOutOfDiffTimeoutEvidence(reason) {
   const rest = r.replace(/\bnot in (?:the |this )?(?:pr'?s? )?diff\b/gi, '');
   const testFiles = new Set(r.match(/[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi) ?? []);
   return /\btimed out\b|\btimeout\b/i.test(r) && testFiles.size <= 1
-    && !/\bassert|\bexpected\b|\breceived\b|\berrors?\b|\bfail|\bnot\b|n't\b|\bno\b|\btouch(?:es|ed)\b|diff-touched|in-diff|in the diff\b/i.test(rest)
+    && !/\bassert|\bexpected\b|\breceived\b|\berrors?\b|\bfail|\bnot\b|n't\b|\bno\b|\bchang(?:e[sd]?|ing)\b|\bmismatch|\bversus\b|\bvs\b|\binstead\b|\bdiffers?\b|\btouch(?:es|ed)\b|diff-touched|in-diff|in the diff\b/i.test(rest)
     && /\bunrelated to this (?:change|pr)\b|\b(?:outside|not in) (?:the |this )?(?:pr'?s? )?diff\b/i.test(r)
     && /\b(?:all \d+ other tests? (?:\w+ )?pass(?:ed)?|every other test passe?s?|other tests? (?:all )?pass(?:ed)?|passes? (?:alone|in isolation)|same (?:timeout|failure) on (?:base|main|[0-9a-f]{7,40}))\b/i.test(r);
 }
