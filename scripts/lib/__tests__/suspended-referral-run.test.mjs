@@ -19,9 +19,9 @@ it('falls back to mtime, refuses oversized scans and propagates unreadable evide
 });
 it('resolves window with cascade provenance and rejects invalid env values', () => {
   const log = vi.fn();
-  const readFile = path => String(path).endsWith('referral-judge-window.json') ? '{"windowMinutes":60}' : '{"referralJudgeWindow":{"windowMinutes":20}}';
+  const readFile = path => String(path).endsWith('referral-judge-window.json') ? '{"referralWindowMinutes":60}' : '{"referralJudgeWindow":{"referralWindowMinutes":20}}';
   const setting = resolveReferralJudgeWindow({ env: { WE_REFERRAL_JUDGE_WINDOW_MIN: '7', WE_POLICY_CASCADE_LOG: '1' }, log, readFile });
-  expect(setting.value.windowMinutes).toBe(7); expect(setting.sources.windowMinutes).toBe('env');
-  expect(log.mock.calls.flat().join(' ')).toMatch(/windowMinutes=7.*env/);
-  for (const value of ['0', '1.5', '9007199254740992']) expect(resolveReferralJudgeWindow({ env: { WE_REFERRAL_JUDGE_WINDOW_MIN: value }, readFile }).value.windowMinutes).toBe(60);
+  expect(setting.value.referralWindowMinutes).toBe(7); expect(setting.sources.referralWindowMinutes).toBe('env');
+  expect(log.mock.calls.flat().join(' ')).toMatch(/referralWindowMinutes=7.*env/);
+  for (const value of ['0', '1.5', '9007199254740992']) expect(resolveReferralJudgeWindow({ env: { WE_REFERRAL_JUDGE_WINDOW_MIN: value }, readFile }).value.referralWindowMinutes).toBe(60);
 });

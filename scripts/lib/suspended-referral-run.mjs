@@ -10,8 +10,8 @@ export function resolveReferralJudgeWindow({ env = process.env, log, readFile = 
   try { tool = JSON.parse(readFile(new URL('../settings/referral-judge-window.json', import.meta.url), 'utf8')); } catch { /* lower layers */ }
   const raw = env.WE_REFERRAL_JUDGE_WINDOW_MIN;
   return cascadePolicy('referralJudgeWindow', tool, {
-    env, log, platform: platformPreference('referralJudgeWindow', { env, readFile }), standard: { windowMinutes: 60 },
-    envValues: { windowMinutes: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : raw },
+    env, log, platform: platformPreference('referralJudgeWindow', { env, readFile }), standard: { referralWindowMinutes: 60 },
+    envValues: { referralWindowMinutes: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : raw },
     valid: v => Number.isSafeInteger(v) && v >= 1,
   });
 }

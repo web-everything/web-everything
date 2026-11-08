@@ -355,7 +355,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
           const ruled = held.findings.length > 0 && held.findings.every(f =>
             result.openReferrals?.some(r => r.key === f.key && r.ruled === true));
           const window = resolveReferralJudgeWindow({ env, log, readFile });
-          if (!ruled && evidence.ageMinutes >= window.value.windowMinutes && (publishAlert || !isUnderTest(process.env))) {
+          if (!ruled && evidence.ageMinutes >= window.value.referralWindowMinutes && (publishAlert || !isUnderTest(process.env))) {
             const publish = publishAlert ?? publishAttention;
             // Reserve the run before publication, including across processes. No expiry or liveness probe:
             // an uncertain publication stays claimed for operator inspection rather than being sent twice.
@@ -372,7 +372,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
               from: 'intent', to: 'dispatching', patch: { dispatchingSince: start } });
             if (!sending.ok) throw Error('referral alert claim lost; inspect run store');
             rec = sending.record;
-            log(`${repo}#${p.number} NEEDS-YOU run ${held.id}: referral judge windowMinutes=${window.value.windowMinutes} source=${window.sources.windowMinutes}`);
+            log(`${repo}#${p.number} NEEDS-YOU run ${held.id}: referral judge referralWindowMinutes=${window.value.referralWindowMinutes} source=${window.sources.referralWindowMinutes}`);
             publish({ repo, pr: p.number, head: headSha, kind: 'suspended-referral-no-ruling',
               reason: `PR #${p.number} run ${held.id} awaits referral ruling: ${held.findings.map(f => `${f.key}: ${f.summary}`).join('; ') || 'inspect saved referral findings'}`,
               pick: `https://github.com/${repo}/pull/${p.number}` });
