@@ -35,7 +35,7 @@ export function cardLedgerBase({ env = process.env, base } = {}) {
 const readEvent = path => readFileSync(path, 'utf8');
 function defaultRun(args, opts = {}) {
   if (args.includes('verify-commit')) {
-    const r = spawnSync('git', args, { encoding: 'utf8', ...opts });
+    const r = spawnSync('git', args, { encoding: 'utf8', timeout: 15000, maxBuffer: 65536, ...opts });
     if (r.error || r.status !== 0) throw new Error('commit signature verification failed');
     return r.stdout + r.stderr;
   }

@@ -452,7 +452,7 @@ function coalescedReadFetch({ board, branch, run, now, env, log, fresh = false }
 
 function defaultGit(args, opts) {
   if (args.includes('verify-commit')) {
-    const r = spawnSync('git', args, { encoding: 'utf8', ...opts });
+    const r = spawnSync('git', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 1048576, ...opts });
     if (r.error || r.status !== 0) throw new Error('commit signature verification failed');
     return r.stdout + r.stderr;
   }
@@ -527,7 +527,7 @@ export function verifySignedTransportCommit({ run, cwd, commit, allowedSigners }
     const opts = { cwd, env: { ...laneGitEnv(cwd), GNUPGHOME: home }, maxBuffer: 65536, timeout: 10000 };
     // verify-commit writes its good-signature diagnostic to stderr.
     const output = run ? String(run(args, opts)) : (() => {
-      const r = spawnSync('git', args, { ...opts, encoding: 'utf8' });
+      const r = spawnSync('git', args, { timeout: 30000, maxBuffer: 1048576, ...opts, encoding: 'utf8' });
       if (r.error || r.status !== 0) throw new Error('commit signature verification failed');
       return r.stdout + r.stderr;
     })();
