@@ -3,6 +3,7 @@ bornAs: xe3web9
 kind: story
 size: 3
 status: open
+related: ["5053"]
 scope: ["we:scripts/lib/pr-state-core.mjs", "we:scripts/conveyor/pr-sweep-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []

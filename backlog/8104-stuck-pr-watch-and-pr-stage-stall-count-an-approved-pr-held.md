@@ -3,6 +3,7 @@ bornAs: x01yja3
 kind: story
 size: 3
 status: open
+related: ["7578"]
 scope: ["we:scripts/conveyor/stuck-pr-watch-core.mjs", "we:scripts/conveyor/health-smells/pr-stage-stall.mjs", "we:scripts/lib/drain-queue-safety.mjs"]
 dateOpened: "2026-11-07"
 tags: []
