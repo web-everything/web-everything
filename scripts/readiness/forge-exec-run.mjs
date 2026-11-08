@@ -489,20 +489,35 @@ finally:
 // A root supervisor is a subreaper: children which call setsid/double-fork are
 // adopted here, and killed before the ops process publishes any evidence.
 export const supervisorSource = String.raw`
-import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat
+import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat, threading
 PR_SET_CHILD_SUBREAPER = 36
 if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
     raise RuntimeError('subreaper unavailable')
-# Diagnostics are best-effort: a closed or broken stderr pipe must never abort
-# worker cleanup or status publication. After one failed write, drop sys.stderr
-# so the pending buffer cannot turn the interpreter's exit flush into a failure.
+# Diagnostics are best-effort: a closed, broken or full-and-undrained stderr pipe
+# must never abort or block worker cleanup or status publication. The write goes
+# straight to the descriptor (never through sys.stderr, whose pending buffer would
+# make the interpreter's exit flush fail or block) on a daemon thread that is
+# waited for only briefly. One failed, partial or stalled write disables the rest.
+diag_off = False
 def diag(message):
-    if sys.stderr is None: return
+    global diag_off
+    if diag_off: return
+    def emit():
+        global diag_off
+        try:
+            data = message.encode('utf-8', 'replace')
+            fd = sys.stderr.fileno()
+            while data:
+                data = data[os.write(fd, data):]
+        except BaseException:
+            diag_off = True
     try:
-        sys.stderr.write(message)
-        sys.stderr.flush()
-    except Exception:
-        sys.stderr = None
+        sender = threading.Thread(target=emit, daemon=True)
+        sender.start()
+        sender.join(0.25)
+        if sender.is_alive(): diag_off = True
+    except BaseException:
+        diag_off = True
 cfg = json.loads(sys.argv[1])
 uid, gid = cfg['uid'], cfg['gid']
 writer = cfg['writer']

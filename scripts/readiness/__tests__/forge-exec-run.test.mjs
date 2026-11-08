@@ -681,7 +681,10 @@ if mode == 'orphan sweep': assert set(swept) == {201, 202}, swept
     ['wall limit diagnostic', 'wall limit', 'false', []],
     ['wall limit diagnostic with cancel configured', 'wall limit', 'true', []],
     ['task-pressure diagnostic', 'normal exit', 'false', ['usage']],
-  ])('closed stderr pipe never aborts cleanup or status publication: %s', async (_name, mode, withCancel, extra) => {
+    ['wall limit diagnostic, full undrained pipe', 'wall limit', 'false', ['full']],
+    ['wall limit diagnostic with cancel configured, full undrained pipe', 'wall limit', 'true', ['full']],
+    ['task-pressure diagnostic, full undrained pipe', 'normal exit', 'false', ['usage', 'full']],
+  ])('broken or stalled stderr pipe never aborts or blocks cleanup or status publication: %s', async (_name, mode, withCancel, extra) => {
     const status=join(root,'closed-stderr-status');
     const probe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
 from unittest.mock import patch
@@ -711,7 +714,18 @@ cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, 
 if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
 if 'usage' in extra: cfg['usage'] = os.path.join(root, 'closed-usage')
 rd, wr = os.pipe()
-os.close(rd)
+if 'full' in extra:
+    # Keep the read end open but never drain it: fill the pipe so any blocking
+    # diagnostic write stalls, then restore blocking mode like an inherited pipe.
+    import fcntl
+    flags = fcntl.fcntl(wr, fcntl.F_GETFL)
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True: os.write(wr, b'x' * 4096)
+    except BlockingIOError: pass
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags)
+else:
+    os.close(rd)
 sys.stderr = os.fdopen(wr, 'w', buffering=1)
 real_open = builtins.open
 with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
