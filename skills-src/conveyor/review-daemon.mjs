@@ -664,10 +664,12 @@ export function runReviewTick({
     }
   }
   let redTeamOnSkipResult;
-  if (!paused && typeof redTeamOnSkip === 'function') {
-    const recoveryStarts = Math.min(1, hostLimit);
+  const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
+  const recoverRedTeam = (recoveryStarts) => {
+    if (paused || typeof redTeamOnSkip !== 'function') return;
+    const recoveryLanes = Math.max(0, acquirable - occupiedLanes);
     let taken = 0;
-    const capacity = { lanes: acquirable, budget: liveReviewBudget, remainingStarts: recoveryStarts,
+    const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
       take: () => { taken++; if (typeof host.take === 'function') host.take(1); } };
     try {
       // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
@@ -683,9 +685,13 @@ export function runReviewTick({
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
     finally {
       // Recovery reports the same start through multiple counters; count it only once, even on error.
-      occupiedLanes += Math.max(taken, recoveryStarts - capacity.remainingStarts, acquirable - capacity.lanes);
+      const spentStarts = recoveryStarts === Infinity && capacity.remainingStarts === Infinity
+        ? 0 : recoveryStarts - capacity.remainingStarts;
+      occupiedLanes += Math.max(taken, spentStarts, recoveryLanes - capacity.lanes);
     }
-  }
+  };
+  // Reserve recovery-first capacity only when ordinary reviews can still get a host start.
+  if (reservedRecoveryStarts > 0) recoverRedTeam(reservedRecoveryStarts);
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,
   // and `onTick` reads both shapes.
   const notStarted = [];
@@ -731,6 +737,7 @@ export function runReviewTick({
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
   }
+  if (reservedRecoveryStarts === 0) recoverRedTeam(Math.max(0, hostLimit - occupiedLanes));
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
