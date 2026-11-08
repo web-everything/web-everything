@@ -186,7 +186,7 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
+import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, numberLandedHashesOnMain, logPostMergeNumbering, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
@@ -7433,6 +7433,12 @@ async function runCli() {
     }
   }
   const queueFollowUps = mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
+  let numbered = { assigned: [], committed: false };
+  if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
+  const queuedHashOnMain = !!numbered.files?.length;
+  const postMergeNumbering = mergeStrategy.enqueues(null) ? logPostMergeNumbering() : null;
+  if (queuedHashOnMain && !DRY_RUN) numbered = numberLandedHashesOnMain({ cwd: process.cwd(),
+    settings: postMergeNumbering, queueIdle: mergeStrategy.queueIdle() });
 
   // Sync the LOCAL main checkout to the just-advanced origin/main (a merged PR moved origin, not local) — local
   // main is KEPT UP TO DATE after each merge (user request 2026-07-03). `--autostash` is what makes this
@@ -7451,7 +7457,7 @@ async function runCli() {
   // pass that landed a local PR records ONE detached `drain-followup` job (numbering, resolve-on-land, push,
   // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
   const followup = await handOffDrainFollowup({
-    landed: !DRY_RUN && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
+    landed: !DRY_RUN && !mergeStrategy.enqueues(null) && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
     buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
   });
   if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
@@ -7519,20 +7525,17 @@ async function runCli() {
   // couple lands on cwd's main, number every hash file now present (the couple's own item + any leftover
   // scaffolded in its lane) and push. Runs BEFORE the derived regen so the inventory reflects the final numbers.
   // Shares lane-drain's `numberPendingHashes` (single source, never a fork). Best-effort/non-fatal.
-  let numbered = { assigned: [], committed: false };
   // #2899 jury J2 — the resolve-on-land totality report: every id in `landedThisPass` ends in exactly one of
   // these buckets, and every bucket reaches the operator (stderr) AND `--json`. A withheld item that appears in
   // none of them is the silent skip this whole item was filed against.
   let resolveOnLandReport = { resolved: [], alreadyResolved: [], deferred: [], failed: [] };
-  if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
-  const queuedHashOnMain = !!numbered.files?.length;
-  if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain({ cwd: process.cwd() });
+  // Queue numbering is a separate best-effort writer, driven by follow-up passes even without new merges.
+  // Direct delivery retains its existing atomic numbering + resolve publication.
   if (landedLocal && !DRY_RUN) {
-    if (queuedHashOnMain) process.stderr.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     // #2391 — number+publish is the NUMBERING CRITICAL SECTION (sole-serial-writer, #2288/#2290). Guard it with
     // the TTL-bounded numbering mutex so a concurrent drain/land never mints the same NNN off the same base.
     const numLock = withNumberingLock(() => {
-      const n = __t.time('jitNumbering', () => numberPendingHashes(process.cwd(), (numberingOnBranch || queuedHashOnMain) ? { minNext: fallbackMinNext({ cwd: process.cwd() }) } : {}));
+      const n = mergeStrategy.enqueues(null) ? numbered : __t.time('jitNumbering', () => numberPendingHashes(process.cwd(), numberingOnBranch ? { minNext: fallbackMinNext({ cwd: process.cwd() }) } : {}));
       const __resolveOnLandT0 = __t.mark(); // x2e120n — everything from here through the resolve loop below
       // #2899 A5 — RESOLVE-ON-LAND for the LABEL lander. This drain single-sourced lane-drain's NUMBERING but
       // never its RESOLVING, so it assigned the NNN and left `status:` untouched — delivered work kept ranking
@@ -7611,7 +7614,7 @@ async function runCli() {
       __t.add('resolveOnLand', __t.mark() - __resolveOnLandT0);
       // #3379 — extracted + injectable (`pushNumberingOnLand`, mirrors `regenDerivedOnLand`): a failed push
       // now returns a `warning`, always (not just `if (!AS_JSON)`), so a --json caller sees it too.
-      const pushResult = __t.time('numberingPush', () => pushNumberingOnLand({ exec: execFileSync, shouldPush: n.committed || resolvedOnLand.length > 0 }));
+      const pushResult = __t.time('numberingPush', () => pushNumberingOnLand({ exec: execFileSync, shouldPush: (!mergeStrategy.enqueues(null) && n.committed) || resolvedOnLand.length > 0 }));
       if (pushResult.pushed) {
         if (!AS_JSON && n.committed) process.stderr.write(`  ✓ JIT-numbered ${n.assigned.map((a) => `${a.hash}→#${a.nnn}`).join(', ')} + pushed to main (#2288)\n`);
         if (!AS_JSON && resolvedOnLand.length) process.stderr.write(`  ✓ resolved on land ${resolvedOnLand.map((i) => `#${i}`).join(', ')} + pushed to main (#2899/#2748)\n`);

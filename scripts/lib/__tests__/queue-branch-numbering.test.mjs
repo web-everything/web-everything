@@ -12,7 +12,7 @@ describe('post-merge batch numbering on main', () => {
   // behavior must fail at its assertion, rather than hide behind a missing import.
   const numberMain = options => (queueNumbering.numberLandedHashesOnMain ?? queueNumbering.repairHashOnMain)(options);
   const hashes = ['xbbbbbb', 'xaaaaaa', 'xcccccc']; // first-parent merge order, deliberately not lexical
-  function mainFixture({ changedPaths = [], rejectPushes = 0, concurrentWinner = false } = {}) {
+  function mainFixture({ changedPaths = [], rejectPushes = 0, concurrentWinner = false, blobs = {}, landedAt } = {}) {
     let remoteNext = 101, fetchedNext = 101, pending = [...hashes], numbered = false;
     let pushes = 0;
     const remoteAssignments = [];
@@ -32,14 +32,14 @@ describe('post-merge batch numbering on main', () => {
         case 'log': {
           // Git's --reverse first-parent additions; do not confuse a later edit
           // of A with its first appearance. Support name-only and commit readers.
-          if (args.includes('--name-only')) return [...pending.map(h => `backlog/${h}-card.md`), 'backlog/xaaaaaa-card.md'].join('\n');
+          if (args.includes('--name-only')) return [...(landedAt === undefined ? [] : [`@${Math.floor(landedAt / 1000)}`]), ...pending.map(h => `backlog/${h}-card.md`), 'backlog/xaaaaaa-card.md'].join('\n');
           return ['b'.repeat(40), 'a'.repeat(40), 'c'.repeat(40)].join('\n');
         }
         case 'diff-tree': return `backlog/${hashes[['b', 'a', 'c'].indexOf(args.find(a => /^[abc]{40}$/.test(a))?.[0])]}-card.md\n`;
         case 'ls-files': return numbered ? '' : pending.map(h => `backlog/${h}-card.md`).join('\n');
         case 'diff': return args.includes('--name-status')
           ? changedPaths.map(p => `M\t${p}`).join('\n') : changedPaths.join(args.includes('-z') ? '\0' : '\n');
-        case 'show': return '';
+        case 'show': return blobs[args[1]] ?? '';
         case 'rev-parse': return 'd'.repeat(40);
         case 'worktree': return '';
         case 'push': {
@@ -95,6 +95,108 @@ describe('post-merge batch numbering on main', () => {
     expect(commands.filter(args => args[0] === 'push')).toHaveLength(2);
     expect(commands.filter(args => args[0] === 'push').every(args =>
       args.includes('HEAD:refs/heads/main') && !args.some(a => a.startsWith('--force') || a.startsWith('+')))).toBe(true);
+  });
+
+  it('rebuilds numbering in a fresh worktree after a stale push, using the refreshed floor and never force-pushing', () => {
+    const x = mainFixture({ rejectPushes: 1, concurrentWinner: true });
+    const result = queueNumbering.numberLandedHashesOnMain(x.options);
+    expect(result.pushed).toBe(true);
+    expect(x.number).toHaveBeenCalledTimes(2);
+    expect(x.number.mock.calls.map(([, options]) => options)).toEqual([
+      { minNext: 101, order: ['xbbbbbb', 'xaaaaaa', 'xcccccc'] },
+      { minNext: 102, order: ['xaaaaaa', 'xcccccc'] },
+    ]);
+    expect(x.number.mock.results.map(r => r.value.assigned.map(a => a.nnn))).toEqual([
+      ['101', '102', '103'], ['102', '103'],
+    ]);
+    const calls = x.exec.mock.calls.map(([, args]) => args);
+    const pushes = calls.flatMap((args, i) => args[0] === 'push' ? [i] : []);
+    expect(pushes).toHaveLength(2);
+    expect(calls.filter(args => args[0] === 'fetch')).toHaveLength(2);
+    expect(calls.filter(args => args[0] === 'worktree' && args[1] === 'add')).toHaveLength(2);
+    const between = calls.slice(pushes[0] + 1, pushes[1]);
+    const removed = between.findIndex(args => args[0] === 'worktree' && args[1] === 'remove');
+    const fetched = between.findIndex(args => args[0] === 'fetch');
+    const rebuilt = between.findIndex(args => args[0] === 'worktree' && args[1] === 'add');
+    expect(removed).toBeGreaterThanOrEqual(0);
+    expect(fetched).toBeGreaterThan(removed);
+    expect(rebuilt).toBeGreaterThan(fetched);
+    for (const i of pushes) expect(calls[i]).toEqual(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main']);
+    expect(x.remoteAssignments).toEqual([
+      { hash: 'xbbbbbb', nnn: '101' }, { hash: 'xaaaaaa', nnn: '102' }, { hash: 'xcccccc', nnn: '103' },
+    ]);
+  });
+
+  it.each(['docs/agent/numbering.md', 'backlog/100-existing.md'])(
+    'rejects unrelated content changes inside the allowed path %s before any push', path => {
+      const before = 'Keep this text. Reference #xbbbbbb.\n';
+      const after = 'UNRELATED CONTENT CHANGE. Reference #101.\n';
+      const x = mainFixture({ changedPaths: [path], blobs: {
+        [`origin/main:${path}`]: before, [`HEAD:${path}`]: after,
+      } });
+      expect(queueNumbering.numberLandedHashesOnMain(x.options)).toMatchObject({
+        pushed: false, warning: expect.stringContaining(`non-reference numbering change: ${path}`),
+      });
+      expect(x.number).toHaveBeenCalledTimes(1);
+      expect(x.exec.mock.calls.filter(([, args]) => args[0] === 'show').map(([, args]) => args[1]))
+        .toEqual([`origin/main:${path}`, `HEAD:${path}`]);
+      expect(x.exec.mock.calls.filter(([, args]) => args[0] === 'push')).toEqual([]);
+      expect(x.remoteAssignments).toEqual([]);
+      expect(x.remotePending()).toEqual(hashes);
+    });
+
+  it('publishes a reference-only rewrite in the allowed documentation home', () => {
+    const path = 'docs/agent/numbering.md';
+    const x = mainFixture({ changedPaths: [path], blobs: {
+      [`origin/main:${path}`]: 'Keep this text. Reference #xbbbbbb.\n',
+      [`HEAD:${path}`]: 'Keep this text. Reference #101.\n',
+    } });
+    expect(queueNumbering.numberLandedHashesOnMain(x.options)).toMatchObject({ pushed: true });
+    expect(x.exec.mock.calls.filter(([, args]) => args[0] === 'push')).toHaveLength(1);
+  });
+
+  it('refuses an oversized numbering diff before push and names the manual inspection fallback', () => {
+    const changedPaths = Array.from({ length: 1025 }, (_, i) => `backlog/${i + 1}-existing.md`);
+    const x = mainFixture({ changedPaths });
+    expect(queueNumbering.numberLandedHashesOnMain(x.options)).toMatchObject({
+      pushed: false, warning: expect.stringContaining('numbering diff exceeds 1024 paths; inspect the full batch manually'),
+    });
+    expect(x.exec.mock.calls.filter(([, args]) => args[0] === 'push')).toEqual([]);
+    expect(x.remoteAssignments).toEqual([]);
+  });
+
+  it.each([false, true])('uses shipped post-land defaults without enabling branch numbering (queue idle: %s)', queueIdle => {
+    const shipped = JSON.parse(realFs.readFileSync('scripts/settings/merge-queue-numbering.json', 'utf8'));
+    expect(shipped.mergeQueue.numberCardsBeforeEnqueue).toBe(false);
+    const numbering = resolveQueueNumbering({ env: {} });
+    expect(numbering, JSON.stringify(numbering)).toMatchObject({ value: false, invalid: [] });
+    const setting = queueNumbering.resolvePostMergeNumbering({ env: {}, platform: {} });
+    expect(setting.value).toEqual({ maxPending: 5, maxAgeMinutes: 10, whenQueueIdle: true });
+    expect(setting.sources).toEqual({ maxPending: 'tool', maxAgeMinutes: 'tool', whenQueueIdle: 'tool' });
+    expect(setting.invalid).toEqual([]);
+    const log = { write: vi.fn() };
+    const settings = queueNumbering.logPostMergeNumbering(setting, log);
+    expect(log.write).toHaveBeenCalledWith(expect.stringContaining('maxAgeMinutes=10 (tool)'));
+    expect(log.write).toHaveBeenCalledWith(expect.stringContaining('whenQueueIdle=true (tool)'));
+    const now = Date.parse('2026-11-07T12:00:00Z');
+    const x = mainFixture({ landedAt: now - 60_000 });
+    const result = queueNumbering.numberLandedHashesOnMain({ ...x.options, settings, queueIdle, now });
+    expect(result.pushed).toBe(queueIdle);
+    if (queueIdle) expect(x.number).toHaveBeenCalledTimes(1);
+    else {
+      expect(result.deferred).toBe(true);
+      expect(x.number).not.toHaveBeenCalled();
+    }
+    expect(x.exec.mock.calls.filter(([, args]) => args[0] === 'push')).toHaveLength(queueIdle ? 1 : 0);
+  });
+
+  it('flushes the shipped post-land default at ten minutes even while the queue is busy', () => {
+    const settings = queueNumbering.resolvePostMergeNumbering({ env: {}, platform: {} }).value;
+    const now = Date.parse('2026-11-07T12:00:00Z');
+    const x = mainFixture({ landedAt: now - 10 * 60_000 });
+    expect(queueNumbering.numberLandedHashesOnMain({ ...x.options, settings, queueIdle: false, now }))
+      .toMatchObject({ pushed: true });
+    expect(x.number).toHaveBeenCalledTimes(1);
   });
 
   it('keeps failed pushes nonfatal with legal hash cards unchanged on main and raises needs-you after K consecutive failures', async () => {
@@ -279,16 +381,20 @@ describe('queue branch numbering', () => {
       { id: '31-forged', num: '31', bornAs: 'xdef456' },
     ], { drainNumbered: pairs }), [])).toEqual([expect.stringContaining('31-forged')]);
   });
-  it('refuses hash cards in merge groups even when drain numbering is off', () => {
-    const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off' };
+  it('refuses hash cards in merge groups while branch numbering is on', () => {
+    const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'on' };
     expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md', 'backlog/5970-bar.md'] })).toEqual([
-      'Backlog file "backlog/xabc123-foo.md" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)',
+      'Backlog file "backlog/xabc123-foo.md" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue while the drain numbers cards on the PR branch before enqueue. This merge group is refused',
     ]);
   });
   it('does not refuse hash cards outside merge-group CI', () => {
     for (const env of [{}, { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'merge_group' }]) {
       expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md'] })).toEqual([]);
     }
+  });
+  it('refuses hash cards in merge groups unless the numbering setting is explicitly false (fail closed)', () => {
+    const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', };
+    expect(mergeGroupHashRefusals({ env, numberCardsBeforeEnqueue: null, files: ['backlog/xabc123-foo.md'] })).toHaveLength(1);
   });
   it('wires the merge-group refusal without a numbering setting condition', () => {
     const source = readFileSync('scripts/check-standards.mjs', 'utf8');
@@ -678,13 +784,12 @@ it('threads the queue flag into follow-up input', () => {
   expect(buildFollowupInput({})).not.toHaveProperty('numberingOnBranch');
 });
 
-it('reports stranded queue hashes with a read-only probe', () => {
-  const exec = vi.fn(() => 'backlog/xabc123-bad.md\n'); const write = vi.fn();
-  const result = probeQueuedLand('/clone', { exec, log: { write } });
-  expect(result.files).toEqual(['backlog/xabc123-bad.md']);
-  expect(result.warning).toContain('not pushed; the merge_group gate should have refused it');
+it('reports normal landed hash cards pending batch numbering without mutating main or warning', () => {
+  const exec = vi.fn(() => 'backlog/xabc123-card.md\n'); const write = vi.fn();
+  const result = probeQueuedLand('checkout', { exec, log: { write } });
+  expect(result).toEqual({ assigned: [], committed: false, files: ['backlog/xabc123-card.md'] });
   expect(exec.mock.calls.map(([, args]) => args[0])).toEqual(['fetch', 'ls-tree']);
-  expect(write).toHaveBeenCalledWith(expect.stringContaining('WARNING'));
+  expect(write.mock.calls).toEqual([['  · 1 landed hash card(s) pending batch numbering\n']]);
 });
 
 it.each([false, true])('numbers a hash card beside unchanged raised-by ledgers in a real PR branch, never main (human-only workflow edits=%s)', humanOnly => {
@@ -765,7 +870,7 @@ describe('sweepQueuedHashCards', () => {
       if (args[0] === 'diff') return 'src/example.mjs\0backlog/xabc123-card.md\0';
       return '{}';
     });
-    return { repo: 'owner/repo', cwd: '/clone', nodes, exec, emit: vi.fn(), log: { write: vi.fn() }, prepare: vi.fn(() => ({ action: 'numbered', newHead: 'new' })), isOpen: () => true };
+    return { numberCardsBeforeEnqueue: true, repo: 'owner/repo', cwd: '/clone', nodes, exec, emit: vi.fn(), log: { write: vi.fn() }, prepare: vi.fn(() => ({ action: 'numbered', newHead: 'new' })), isOpen: () => true };
   }
   it('dequeues hash-bearing PRs, prepares their branches, and leaves clean and cross-repo PRs alone', () => {
     const x = setup();
@@ -902,15 +1007,24 @@ it('fallback allocation retains queue reservations above main', () => {
   expect(fallbackMinNext({ cwd: '/clone', exec, fs, statePath: '/state' })).toBe(102);
 });
 
-it('probes on every live queue pass and repairs when inline numbering will not run', () => {
+it('probes each live queue pass and numbers landed hashes once through the debounced main writer before follow-up handoff', () => {
   const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
-  expect(source).toContain('if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());');
-  expect(source).toContain('if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain(');
-  expect(source).toContain('(numberingOnBranch || queuedHashOnMain) ? { minNext: fallbackMinNext(');
-  expect(source).toContain('if (landedLocal && !DRY_RUN) {\n    if (queuedHashOnMain)');
+  const probe = 'if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());';
+  const writer = 'if (queuedHashOnMain && !DRY_RUN) numbered = numberLandedHashesOnMain({ cwd: process.cwd(),\n    settings: postMergeNumbering, queueIdle: mergeStrategy.queueIdle() });';
+  expect(source).toContain(probe);
+  expect(source).toContain('const queuedHashOnMain = !!numbered.files?.length;');
+  expect(source).toContain('const postMergeNumbering = mergeStrategy.enqueues(null) ? logPostMergeNumbering() : null;');
+  expect(source).toContain(writer);
+  expect(source.match(/numberLandedHashesOnMain\(\{/g)).toHaveLength(1);
+  expect(source.indexOf(writer)).toBeGreaterThan(source.indexOf(probe));
+  expect(source.indexOf(writer)).toBeLessThan(source.indexOf('const followup = await handOffDrainFollowup({'));
+  expect(source).toContain('landed: !DRY_RUN && !mergeStrategy.enqueues(null) && merged.some((m) => isLocalRepo(m.repo))');
+  // Queue passes reuse the batch result; only direct delivery may invoke inline JIT numbering.
+  expect(source).toContain("const n = mergeStrategy.enqueues(null) ? numbered : __t.time('jitNumbering', () => numberPendingHashes(process.cwd(), numberingOnBranch ? { minNext: fallbackMinNext({ cwd: process.cwd() }) } : {}));");
+  expect(source).not.toContain('numbered = repairHashOnMain(');
 });
 
-it('repairs fresh remote main under the lock above reservations, leaving the checkout alone', () => {
+it('batch-numbers fresh remote main under the lock above legacy reservations, leaving the checkout alone', () => {
   const root = mkdtempSync(join(tmpdir(), 'queue-repair-'));
   const cwd = join(root, 'clone'), origin = join(root, 'origin.git');
   const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
@@ -933,10 +1047,10 @@ it('repairs fresh remote main under the lock above reservations, leaving the che
     const log = { write: vi.fn() };
     const lock = vi.fn((fn) => ({ ran: true, result: fn() }));
     const exec = vi.fn(execFileSync);
-    const refused = repairHashOnMain({ cwd, statePath, exec, log, lock: () => ({ ran: false }) });
+    const refused = queueNumbering.numberLandedHashesOnMain({ cwd, statePath, exec, log, lock: () => ({ ran: false }) });
     expect(refused.pushed).not.toBe(true);
     expect(git('ls-remote', 'origin', 'refs/heads/main').split(/\s/)[0]).toBe(landed);
-    const out = repairHashOnMain({ cwd, statePath, exec, log, lock });
+    const out = queueNumbering.numberLandedHashesOnMain({ cwd, statePath, exec, log, lock });
     expect(out).toMatchObject({ committed: true, pushed: true, assigned: [{ hash: 'xabc123', nnn: '102' }] });
     expect(lock).toHaveBeenCalledWith(expect.any(Function), { runUnlockedOnContention: false });
     const push = exec.mock.calls.find(([, args]) => args[0] === 'push');
@@ -946,6 +1060,7 @@ it('repairs fresh remote main under the lock above reservations, leaving the che
     expect(git('ls-tree', '-r', '--name-only', 'origin/main')).toContain('backlog/102-foo.md');
     expect(git('rev-parse', 'HEAD')).toBe(stale);
     expect(git('worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1);
-    expect(log.write).toHaveBeenCalledWith('  ⚠ FALLBACK: hash card(s) backlog/xabc123-foo.md on main — numbered and pushed to main so the queue is not blocked\n');
+    expect(log.write).toHaveBeenCalledWith('  ✓ numbered landed hash card(s) backlog/xabc123-foo.md and pushed to main\n');
+    expect(log.write.mock.calls.flat().join('')).not.toContain('FALLBACK');
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 30_000);

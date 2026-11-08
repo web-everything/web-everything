@@ -661,6 +661,12 @@ export function createDrainMergeStrategy({
      * @param {{merged:Array, landedThisPass:Set, landedIdsFor:Function}} o
      * @returns {Array} the pending entries whose follow-up this pass must confirm
      */
+    queueIdle() {
+      if (!enqueueMode) return false;
+      const facts = readQueueFacts({ repo: localSlug, exec });
+      return !facts.error && facts.inQueue.size === 0;
+    },
+
     collectQueueMerged({ merged, landedThisPass, landedIdsFor = () => [] }) {
       if (enqueueMode) {
         try { cancelObsoleteRuns({ repo: localSlug, exec, dryRun, log }); }

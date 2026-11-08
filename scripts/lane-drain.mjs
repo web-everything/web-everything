@@ -628,7 +628,7 @@ export function normalizeFlowAckCardRefs(content) {
  * and fixture paths must survive byte-for-byte. Unsupported forms remain subject to the citation
  * backstop. Load the existing TS parser only when a definition actually contains a hash.
  */
-function rewriteSoakCardCitation(content, visit) {
+export function rewriteSoakCardCitation(content, visit) {
   if (!/\bx[0-9a-z]{6}\b/.test(content)) return content;
   const ts = createRequire(import.meta.url)('typescript');
   const source = ts.createSourceFile('break.mjs', content, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -680,7 +680,7 @@ function rewriteSoakCardCitation(content, visit) {
  * Commits the rename+rewrites in ONE scoped commit; the caller publishes. Best-effort like the rest of the reconcile: a
  * failure is reported, the land stands.
  */
-export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile = execFileSync } = {}) {
+export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, order, execFile = execFileSync } = {}) {
   // Phase costs expose where the drain pass budget goes, including refused passes.
   const phaseMs = { read: 0, precheck: 0, resolve: 0, apply: 0, write: 0 };
   let readSource = 'worktree';
@@ -837,6 +837,15 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
     const i = remaining.findIndex((s) => blockersOf(s).every((h) => done.has(h)));
     const [stem] = i >= 0 ? remaining.splice(i, 1) : remaining.splice(0, 1); // cycle → break by taking the first
     ordered.push(stem); done.add(idFromName(stem));
+  }
+
+  // Explicit first-parent landing order takes precedence over the legacy dependency order.
+  if (order !== undefined) {
+    if (!Array.isArray(order) || new Set(order).size !== order.length ||
+        order.length !== pendingHashes.size || order.some(hash => !pendingHashes.has(hash)))
+      return finish({ assigned: [], committed: false, error: 'incomplete or invalid landing order' });
+    const byHash = new Map(pending.map(stem => [idFromName(stem), stem]));
+    ordered.splice(0, ordered.length, ...order.map(hash => byHash.get(hash)));
   }
 
   const ledgerAbs = join(CWD, LEDGER_REL);
