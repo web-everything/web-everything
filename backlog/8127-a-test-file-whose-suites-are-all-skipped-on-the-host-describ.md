@@ -3,6 +3,7 @@ bornAs: x608zbf
 kind: story
 size: 5
 status: open
+related: ["8000"]
 scope: ["we:scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs", "we:scripts/lib/verify-shard-run.mjs", "we:scripts/lib/__tests__/verify-shard-run.test.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/conveyor/await-verify-pass.mjs"]
 dateOpened: "2026-11-07"
 tags: []
