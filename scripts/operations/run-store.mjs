@@ -22,11 +22,11 @@
  * nothing above the seam changes.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
@@ -73,7 +73,7 @@ export function sharedRunsDir(env = process.env) {
 
 /**
  * ONE-TIME MOVE of records written before the shared folder existed. Moves every `*.json` run record in
- * `legacyDir` (a clone's old `.operations/runs`) into `sharedDir`: copy to a temp name, atomic rename into
+ * `legacyDir` (a clone's old `.operations/runs`) into `sharedDir`: copy to a temp name, atomic no-clobber link into
  * place, then remove the source. A record that already exists in the shared folder wins (it is newer by
  * construction) and the stale source is just removed. Best-effort per file; never throws. No hand migration.
  * @returns {{moved:string[], skipped:string[]}}
@@ -92,9 +92,13 @@ export function migrateLegacyRuns(legacyDir, sharedDir) {
     try {
       if (!existsSync(dest)) {
         const tmp = `${dest}.${process.pid}.${randomUUID()}.tmp`;
-        copyFileSync(src, tmp);
-        renameSync(tmp, dest);
-        moved.push(f.slice(0, -5));
+        try {
+          copyFileSync(src, tmp);
+          try {
+            linkSync(tmp, dest); // A destination created during the copy always wins.
+            moved.push(f.slice(0, -5));
+          } catch (error) { if (error.code !== 'EEXIST') throw error; }
+        } finally { rmSync(tmp, { force: true }); }
       }
       rmSync(src, { force: true });
     } catch { skipped.push(f.slice(0, -5)); }
@@ -186,12 +190,227 @@ export function readRun(id, dir = resolveRunsDir()) {
  * Persist a run. ATOMIC (temp file + rename), so a reader mid-write never sees partial JSON — which, given
  * the refusal policy above, would wedge the run rather than silently degrade.
  */
-export function writeRun(record, dir = resolveRunsDir()) {
+export function writeRun(record, dir = resolveRunsDir(), opts = {}) {
+  persistRun(record, dir, opts);
+  return runPath(record.id, dir);
+}
+
+// Return this write's stamped record directly; a later read could observe another writer.
+function persistRun(record, dir, opts = {}) {
   assertRunRecord(record, 'run record being written');
   const path = runPath(record.id, dir);
+  const persist = () => {
+    let diskRev = 0, generation;
+    try {
+      const disk = tryReadRun(record.id, dir);
+      diskRev = revision(disk);
+      generation = runGeneration(disk);
+    } catch { /* Plain writes intentionally recover corrupt records; CAS never does. */ }
+    const rev = nextRevision(Math.max(revision(record), diskRev));
+    // A new incarnation gets a fresh token, even if the caller supplies a deleted snapshot.
+    const persisted = { ...record, rev, generation: generation ?? randomUUID() };
+    writeJsonAtomic(path, persisted); // plain writes also invalidate earlier CAS snapshots
+    return persisted;
+  };
+  return withRecordLock(record.id, dir, opts, persist, () => {
+    throw new Error(`operations: run lock timed out for ${record.id}; retry later or inspect the retained lock`);
+  });
+}
+
+// Older records have no revision. Invalid present revisions must never pass a CAS comparison.
+function revision(record) {
+  const rev = record != null && Object.hasOwn(record, 'rev') ? record.rev : 0;
+  if (!Number.isSafeInteger(rev) || rev < 0 || rev > Number.MAX_SAFE_INTEGER) {
+    throw new TypeError('operations: invalid run revision');
+  }
+  return rev;
+}
+
+// Rev-less legacy writers can change content without advancing the CAS counters.
+function canonicalJson(record) {
+  return JSON.stringify(record, (_key, value) => value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value);
+}
+
+function matchesRunSnapshot(fresh, expected) {
+  return revision(fresh) === revision(expected) && runGeneration(fresh) === runGeneration(expected) &&
+    (Object.hasOwn(fresh, 'rev') || canonicalJson(fresh) === canonicalJson(expected));
+}
+
+// Refuse overflow before mutation or persistence on every write path.
+function nextRevision(rev) {
+  if (rev === Number.MAX_SAFE_INTEGER) throw new Error('operations: run revision exhausted; cannot increment past MAX_SAFE_INTEGER');
+  return rev + 1;
+}
+
+// Missing generation is the legacy incarnation; malformed evidence cannot authorize CAS.
+function runGeneration(record) {
+  if (record == null || !Object.hasOwn(record, 'generation')) return undefined;
+  if (typeof record.generation !== 'string' || !record.generation.length) {
+    throw new TypeError('operations: invalid run generation');
+  }
+  return record.generation;
+}
+
+function isPidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code !== 'ESRCH'; } // EPERM/unknown are not evidence of death
+}
+
+function readLock(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+}
+
+function createRunLock(path, owner) {
+  let fd;
+  try {
+    fd = openSync(path, 'wx');
+    writeFileSync(fd, JSON.stringify(owner));
+    return true;
+  } catch (error) {
+    if (fd === undefined && error.code === 'EEXIST') return false;
+    if (fd !== undefined) rmSync(path, { force: true }); // Remove only our own partial acquisition.
+    throw error;
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+// Atomically claim stale evidence, verifying it still belongs to the inspected owner.
+// A replacement must be restored without clobbering anyone who acquired in the meantime.
+function reclaimRunLock(path, owner, probe) {
+  const seen = readLock(path);
+  if (seen?.host !== owner.host || !Number.isSafeInteger(seen.pid) || seen.pid <= 0 ||
+      typeof seen.token !== 'string' || !seen.token.length || !Number.isFinite(seen.at)) return false;
+  try { if (probe(seen.pid) !== false) return false; } catch { return false; }
+  const claimed = `${path}.stale.${owner.token}`;
+  try { renameSync(path, claimed); }
+  catch { return false; }
+  const moved = readLock(claimed);
+  if (moved?.pid !== seen.pid || moved?.token !== seen.token || moved?.host !== seen.host) {
+    try { linkSync(claimed, path); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    rmSync(claimed);
+    return false;
+  }
+  rmSync(claimed);
+  return true;
+}
+
+// Lamport bakery admission protects guard recovery itself. Each contender owns a UUID path
+// that is never reused: deleting a proven-dead contender cannot displace a replacement.
+// Ticket 0 means choosing; readers wait until its ticket is atomically published.
+function runLockContenders(path, owner, probe) {
+  const prefix = `${basename(path)}.claim.waiter.`;
+  const contenders = [];
+  for (const name of readdirSync(dirname(path))) {
+    if (!name.startsWith(prefix)) continue;
+    const entry = join(dirname(path), name);
+    let other;
+    try { other = JSON.parse(readFileSync(entry, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') continue; return null; }
+    if (other?.host !== owner.host || !Number.isSafeInteger(other.pid) || other.pid <= 0 ||
+        typeof other.token !== 'string' || !other.token.length ||
+        other.token !== name.slice(prefix.length) || !Number.isFinite(other.at) ||
+        !Number.isSafeInteger(other.ticket) || other.ticket < 0) return null;
+    if (other.token === owner.token) continue;
+    let dead = false;
+    try { dead = probe(other.pid) === false; } catch { /* unknown liveness retains admission */ }
+    if (dead) rmSync(entry, { force: true });
+    else contenders.push(other);
+  }
+  return contenders;
+}
+
+/** Bounded synchronous acquisition; only a proven dead, same-host holder can be reclaimed. */
+function acquireRunLock(path, owner, { waitMs = 5000, pollMs = 15, isPidAlive: probe = isPidAlive }) {
+  if (!Number.isFinite(waitMs) || waitMs < 0 || !Number.isFinite(pollMs) || pollMs <= 0) {
+    throw new TypeError('operations: lock wait/poll must be finite non-negative/positive milliseconds');
+  }
+  const deadline = Date.now() + waitMs;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  // Hold bakery admission through guard recovery, record-lock recovery and guard release.
+  const claimPath = `${path}.claim`;
+  const waiterPath = `${claimPath}.waiter.${owner.token}`;
+  if (!createRunLock(waiterPath, { ...owner, ticket: 0 })) return false;
+  let ticket = 0;
+  try {
+    for (;;) {
+      const others = runLockContenders(path, owner, probe);
+      if (others && ticket === 0) {
+        let highest = 0;
+        for (const other of others) highest = Math.max(highest, other.ticket);
+        if (highest === Number.MAX_SAFE_INTEGER) return false;
+        ticket = highest + 1;
+        writeJsonAtomic(waiterPath, { ...owner, ticket });
+        continue; // Re-scan after publication; a concurrent chooser may have the same ticket.
+      }
+      const turn = others && ticket > 0 && others.every(other =>
+        other.ticket > ticket || (other.ticket === ticket && other.token > owner.token));
+      if (turn && (createRunLock(claimPath, owner) ||
+          (reclaimRunLock(claimPath, owner, probe) && createRunLock(claimPath, owner)))) {
+        try {
+          if (createRunLock(path, owner)) return true;
+          if (reclaimRunLock(path, owner, probe) && createRunLock(path, owner)) return true;
+        } finally {
+          if (readLock(claimPath)?.token === owner.token) rmSync(claimPath, { force: true });
+        }
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false; // caller can retry later or inspect the retained lock
+      Atomics.wait(sleeper, 0, 0, Math.min(remaining, Math.max(10, Math.min(25, pollMs))));
+    }
+  } finally {
+    rmSync(waiterPath, { force: true });
+  }
+}
+
+function withRecordLock(id, dir, opts, action, onLocked) {
+  const lockPath = join(dir, `${id}.lock`);
+  const owner = { pid: process.pid, host: hostname(), token: randomUUID(), at: Date.now() };
   mkdirSync(dir, { recursive: true });
-  writeJsonAtomic(path, record); // temp file + validate + same-fs rename: safe across daemon processes
-  return path;
+  if (!acquireRunLock(lockPath, owner, opts)) return onLocked();
+  try {
+    return action();
+  } finally {
+    if (readLock(lockPath)?.token === owner.token) rmSync(lockPath, { force: true });
+  }
+}
+
+// Shared by file and memory CAS; mutate receives a detached record and cannot change its id.
+function mutateRun(id, fresh, mutate) {
+  const rev = nextRevision(revision(fresh));
+  const next = mutate(structuredClone(fresh));
+  assertRunRecord(next, 'mutated run record');
+  if (next.id !== id) throw new TypeError('operations: mutation must keep the same run id');
+  const record = { ...next, rev, generation: runGeneration(fresh) };
+  if (record.generation === undefined) delete record.generation;
+  return record;
+}
+
+/**
+ * Compare and swap under a per-record lock. Missing means changed; unreadable evidence is never
+ * overwritten. Plain writeRun shares the lock and throws if its bounded wait expires.
+ * @returns {{applied:true, record:object}|{applied:false, reason:'changed'|'locked'|'unreadable'}}
+ */
+export function updateRunIf(id, expected, mutate, dir = resolveRunsDir(), opts = {}) {
+  const path = runPath(id, dir);
+  return withRecordLock(id, dir, opts, () => {
+    let fresh;
+    try {
+      // Read directly so ENOENT is distinct from corrupt JSON and other IO failures.
+      const parsed = parseRunRecord(readFileSync(path, 'utf8'));
+      if (!parsed.ok) return { applied: false, reason: 'unreadable' };
+      fresh = parsed.record;
+      revision(fresh);
+      runGeneration(fresh);
+      if (fresh.id !== id) return { applied: false, reason: 'unreadable' };
+    } catch (error) {
+      return { applied: false, reason: error.code === 'ENOENT' ? 'changed' : 'unreadable' };
+    }
+    if (!matchesRunSnapshot(fresh, expected)) return { applied: false, reason: 'changed' };
+    const record = mutateRun(id, fresh, mutate);
+    writeJsonAtomic(path, record); // do not call writeRun: CAS stamps exactly once
+    return { applied: true, record };
+  }, () => ({ applied: false, reason: 'locked' }));
 }
 
 /** Every run id currently on disk (sorted). Temp files and stray names are ignored. */
@@ -204,9 +423,14 @@ export function listRunIds(dir = resolveRunsDir()) {
     .sort();
 }
 
-/** Delete a run's record. A no-op when it is already gone. */
-export function deleteRun(id, dir = resolveRunsDir()) {
-  rmSync(runPath(id, dir), { force: true });
+/** Delete under the shared record lock; a missing record is a no-op, a lock timeout throws. */
+export function deleteRun(id, dir = resolveRunsDir(), opts = {}) {
+  const path = runPath(id, dir);
+  return withRecordLock(id, dir, opts, () => {
+    rmSync(path, { force: true });
+  }, () => {
+    throw new Error(`operations: run lock timed out deleting ${id}; retry later or inspect the retained lock`);
+  });
 }
 
 /**
@@ -286,23 +510,24 @@ export function pruneTerminalRuns({ dir = resolveRunsDir(), maxAgeMs, now = Date
 
 /**
  * THE STORE HANDLE the effect executor and every adapter take, so nothing above this line imports `fs`.
- * THIS is the #2626 swap point: a shared DO/D1-backed store implements the same four methods and no caller
+ * THIS is the #2626 swap point: a shared DO/D1-backed store implements the same methods and no caller
  * changes.
  *
  * @param {string} [dir]
- * @returns {{read(id: string): (object|null), write(record: object): object, delete(id: string): void, list(): string[]}}
+ * @returns {{read:Function, write:Function, updateIf:Function, delete:Function, list:Function}}
  */
 export function createFileRunStore(dir = resolveRunsDir()) {
   return {
     read: (id) => tryReadRun(id, dir),
-    write: (record) => { writeRun(record, dir); return record; },
-    delete: (id) => deleteRun(id, dir),
+    write: (record, opts) => persistRun(record, dir, opts),
+    updateIf: (id, expected, mutate, opts) => updateRunIf(id, expected, mutate, dir, opts),
+    delete: (id, opts) => deleteRun(id, dir, opts),
     list: () => listRunIds(dir),
   };
 }
 
 /**
- * An in-memory store with the same four methods — for tests, and for a caller that wants a run to live and
+ * An in-memory store with the same methods — for tests, and for a caller that wants a run to live and
  * die inside one process. It SERIALIZES on write and re-parses on read, so it catches the same shape bugs
  * the file store would instead of quietly sharing a mutable object.
  */
@@ -316,7 +541,26 @@ export function createMemoryRunStore() {
       if (!parsed.ok) throw new Error(`operations: refusing to read run ${id} — ${parsed.reason}`);
       return parsed.record;
     },
-    write: (record) => { assertRunRecord(record); map.set(record.id, serializeRunRecord(record)); return record; },
+    write: (record) => {
+      assertRunRecord(record);
+      const disk = map.has(record.id) ? JSON.parse(map.get(record.id)) : null;
+      const rev = nextRevision(Math.max(revision(record), revision(disk)));
+      const persisted = { ...record, rev, generation: runGeneration(disk) ?? randomUUID() };
+      map.set(record.id, serializeRunRecord(persisted));
+      return persisted;
+    },
+    updateIf: (id, expected, mutate) => {
+      const text = map.get(id);
+      if (text === undefined) return { applied: false, reason: 'changed' };
+      const parsed = parseRunRecord(text);
+      if (!parsed.ok) return { applied: false, reason: 'unreadable' };
+      if (!matchesRunSnapshot(parsed.record, expected)) {
+        return { applied: false, reason: 'changed' };
+      }
+      const record = mutateRun(id, parsed.record, mutate);
+      map.set(id, serializeRunRecord(record));
+      return { applied: true, record };
+    },
     delete: (id) => { map.delete(id); },
     list: () => [...map.keys()].sort(),
   };

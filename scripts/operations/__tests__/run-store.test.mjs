@@ -269,6 +269,12 @@ describe('a corrupt record is REFUSED, never read as absent', () => {
     expect(parsed.reason).toMatch(pattern);
   });
 
+  it('plain writeRun recovers an existing corrupt record', () => {
+    writeFileSync(runPath('run-sample', dir), '{corrupt');
+    writeRun(sample(), dir);
+    expect(readRun('run-sample', dir)).toMatchObject({ ...sample(), rev: 1 });
+  });
+
   it('tryReadRun THROWS on a corrupt file rather than returning null (which would restart the run)', () => {
     writeFileSync(join(dir, 'run-torn.json'), '{"v":1,"id":"run-torn"');
     expect(() => tryReadRun('run-torn', dir)).toThrow(/refusing to read run run-torn[\s\S]*never treated as a run that does not exist/);
@@ -289,13 +295,13 @@ describe('the fs shell', () => {
   it('writes atomically and leaves no temp file behind', () => {
     writeRun(sample(), dir);
     expect(readdirSync(dir)).toEqual(['run-sample.json']);
-    expect(JSON.parse(readFileSync(join(dir, 'run-sample.json'), 'utf8'))).toEqual(sample());
+    expect(JSON.parse(readFileSync(join(dir, 'run-sample.json'), 'utf8'))).toEqual({ ...sample(), rev: 1, generation: expect.any(String) });
   });
 
   it('round-trips through the file store handle', () => {
     const store = createFileRunStore(dir);
     store.write(sample());
-    expect(store.read('run-sample')).toEqual(sample());
+    expect(store.read('run-sample')).toEqual({ ...sample(), rev: 1, generation: expect.any(String) });
     expect(store.list()).toEqual(['run-sample']);
     store.delete('run-sample');
     expect(store.read('run-sample')).toBeNull();
