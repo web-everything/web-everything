@@ -5,7 +5,10 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { resolveWaitState } from '../../pr-sweep-core.mjs';
+
+const REPO = CONSTELLATION_REPOS.we.slug;
 
 export default {
   id: 'stall-sweep-informational-refusal',
@@ -17,7 +20,7 @@ export default {
     const now = Date.parse('2026-11-08T05:00:00Z');
     const at = new Date(now - 10 * 60000).toISOString();
     const pr = { number: 6531, headRefOid: 'abc', labels: ['review:accepted'], isDraft: false };
-    const line = (kind, tail) => `reconcile-fix-dispatch-daemon: reconcile-refused ${kind} web-everything/web-everything PR #6531 — ${tail}`;
+    const line = (kind, tail) => `reconcile-fix-dispatch-daemon: reconcile-refused ${kind} ${REPO} PR #6531 — ${tail}`;
     const wait = (reason) => resolveWaitState(pr, { daemons: [{ kind: 'refusal', at, name: 'fix-dispatch-daemon', reason }] }, { now });
     const informational = wait(line('nothing-owed', 'phase `queued` — reviewed and queued, or already landed; this pass has nothing to dispatch'));
     const real = wait(line('no-lane', 'no free lane'));
