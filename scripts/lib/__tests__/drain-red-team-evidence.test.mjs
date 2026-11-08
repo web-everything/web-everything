@@ -373,10 +373,17 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
       expect(run(fixture(), 31 * 60_000, { isAlive: () => true, readPidStart: () => 'reused-start' })).toMatchObject({ inFlight: false, scheduled: true });
     });
     it('stale foreign-host record in a different pid namespace stays live even with isAlive:false', () => {
-      expect(run(fixture(), 31 * 60_000, { isAlive: () => false }, { namespace: 'pid:[old-namespace]' }).inFlight).toBe(true);
+      // Both namespaces are pinned so the guard is exercised on every platform (pidNamespace() is null on macOS).
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false, namespace: 'pid:[new-namespace]' }, { namespace: 'pid:[old-namespace]' }).inFlight).toBe(true);
     });
     it('probes a stale foreign-host record that carries no pid namespace (legacy) and counts it dead when the pid is gone', () => {
-      expect(run(fixture(), 31 * 60_000, { isAlive: () => false }, { namespace: null }).inFlight).toBe(false);
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false, namespace: 'pid:[new-namespace]' }, { namespace: null }).inFlight).toBe(false);
+    });
+    it('probes a stale foreign-host record in the same pid namespace and counts it dead when the pid is gone', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false, namespace: 'pid:[same]' }, { namespace: 'pid:[same]' }).inFlight).toBe(false);
+    });
+    it('keeps a stale foreign-host run live while its birth time cannot be read here (unknown is never a kill)', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => true, readPidStart: () => null }).inFlight).toBe(true);
     });
     it('keeps a foreign-host run with a fresh record live', () => {
       expect(run(fixture(), 5 * 60_000).inFlight).toBe(true);
