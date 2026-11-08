@@ -1887,6 +1887,13 @@ describe('prototype-load', () => {
       expect(mutations(f, 'retire')).toEqual([]);
       expect(f.retirePlanner.mock.calls[0][0].rows.map((row) => row.ref)).not.toContain(BASE.branch);
     });
+    it('hands the planner the FULL registry as proof context while still never planning the candidate (R10)', async () => {
+      const f = fixture({ list: ['lane/old', BASE.branch], contained: ['lane/old'] });
+      await f.run({ dryRun: true });
+      const call = f.retirePlanner.mock.calls[0][0];
+      expect(call.rows.map((row) => row.ref)).toEqual(['lane/old']);
+      expect(call.proofRows.map((row) => row.ref)).toEqual(['lane/old', BASE.branch]);
+    });
     it('retire-only mode drops proved registrations with no candidate and no ready record', async () => {
       const f = fixture({ list: ['lane/old', 'lane/live'], ready: '', ...retireOld() });
       const r = await f.run({ branch: '', sha: '', retire: true });
