@@ -435,6 +435,8 @@ export function statesOutOfDiffTimeoutEvidence(reason) {
     .replace(/\btimed out(?: at \d+ ?ms)?\b|\btimeouts?\b/gi, ' ').replace(new RegExp(UNRELATED.source, 'gi'), ' ')
     .replace(/\bred only on\b/gi, ' ');
   const words = r.match(/[a-z][a-z-]*/gi) ?? [];
+  // Digits and operators left behind (`1 !== 2`) are assertion evidence too: only punctuation may remain beside words.
+  if (/[0-9=<>!~^&|+*\/\\]/.test(r)) return false;
   return words.every((w) => /^(?:a|the|in|of|at|on|and|but|test|file|it|ms|ran|run|file|is|its)$/i.test(w));
 }
 
@@ -790,7 +792,7 @@ if (IS_CLI) {
     fail(`usage: stand-down.mjs <pr> [--repo=<owner/name>] [--reason=<${Object.keys(STAND_DOWN_REASONS).join('|')}>] [--who=<session slug>] [--actor=<name>] [--detail=<text>] [--head=<sha> --alt=<lane/…-alt> --alt-sha=<sha>] [--superseded-by=<n> --merged-at=<iso>]  (pr must be a positive integer)`);
   }
   const actor = typeof flags.actor === 'string' ? flags.actor : undefined;
-  const detail = typeof flags.detail === 'string' ? flags.detail : undefined;
+  let detail = typeof flags.detail === 'string' ? flags.detail : undefined;
   let findingRefs;
   if (flags['finding-refs'] !== undefined) {
     try { findingRefs = JSON.parse(flags['finding-refs']); } catch { fail('--finding-refs must be JSON [{"runId":"…","key":"…"}]'); }
@@ -805,6 +807,18 @@ if (IS_CLI) {
   if (flags.reason === 'load-flake' && !loadHold) {
     process.stderr.write(redispatch ? '⚠ stand-down: recording a quiet-host re-dispatch hold (no saved fix)\n' : '⚠ stand-down: unknown repo; recording a terminal gate-red stand-down instead\n');
   }
+  // The prose cannot see the diff, so the CLI can: a timeout in a file this PR changes is never out-of-diff, and the
+  // note it adds names the diff so the evidence grammar rejects it (terminal stays terminal).
+  const diffTouched = (() => {
+    if (flags.reason !== 'gate-red' || !/\btimed out\b|\btimeout\b/i.test(detail ?? '')) return false;
+    const named = new Set((detail ?? '').match(/[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi) ?? []);
+    if (!named.size) return false;
+    try {
+      const out = execFileSync('gh', ['pr', 'diff', String(pr), '--name-only', ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : [])], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+      return out.split('\n').some((f) => named.has(f.split('/').pop()));
+    } catch { return true; } // unreadable diff: fail closed, stays terminal
+  })();
+  if (diffTouched) detail = `${detail} (a file in this PR's diff)`;
   if (flags.reason === 'gate-red' && /\btimed out\b|\btimeout\b/i.test(detail ?? '') && !statesOutOfDiffTimeoutEvidence(detail ?? '')) {
     process.stderr.write('⚠ stand-down: detail names a timeout. If the failing test is NOT in this PR\'s diff, state: the file, "unrelated to this change"/"outside the diff", and "passes alone" or "all N other tests pass" or "same timeout on <base sha>" so it becomes a re-armable load-flake hold; otherwise it stays terminal\n');
   }
