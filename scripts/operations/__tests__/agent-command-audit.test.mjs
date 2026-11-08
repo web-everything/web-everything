@@ -322,8 +322,18 @@ describe('agent command audit', () => {
     ["eval 'npx playwright test a'", 'playwright', false], ['nohup nohup pnpm exec playwright test a', 'playwright', false],
     ['nohup npm ci', 'install/ci', false], ['setsid git fetch origin', 'git fetch/clone/wt/gc', false],
     ['nohup rg needle .', 'repo-wide find/grep', false], ['nohup npm run test:unit', 'npm test/check', true],
+    // Self-review: the launched command goes through the whole classifier (sh -c, env -S, admission, heredocs).
+    ['nohup sh -c "npx vitest run a"', 'vitest', false], ['nohup sh -c "npm ci"', 'install/ci', false],
+    ["setsid bash -c 'git fetch'", 'git fetch/clone/wt/gc', false],
+    ["nohup env -S \"sh -c 'npx playwright test a'\"", 'playwright', false],
+    ['nohup node scripts/readiness/heavy-admission.mjs run -- npx playwright test a', 'playwright', true],
+    ['nohup bash <<EOF\nnpx vitest run a\nEOF', 'vitest', false], ["setsid -f sh -s <<'EOF'\nnpm test\nEOF", 'npm test/check', false],
   ])('classifies Playwright and other audited runs behind launchers: %s', (cmd, category, queued) => {
     expect(classifyCommand(cmd)).toEqual([expect.objectContaining({ category, queued })]);
+  });
+  it('classifies every segment of a launched command string', () => {
+    expect(classifyCommand("eval 'npm ci; npx playwright test a'").map(row => row.category)).toEqual(['install/ci', 'playwright']);
+    expect(classifyCommand('nohup cat <<EOF\nnpm test\nEOF')).toEqual([]);
   });
   it.each(['nohup echo hi', 'nohup npx playwright --version', 'eval echo playwright test', 'setsid ls'])('leaves a harmless launched command unaudited: %s', cmd => {
     expect(classifyCommand(cmd)).toEqual([]);
@@ -335,13 +345,17 @@ describe('agent command audit', () => {
     '/usr/bin/redis-cli -a Zq9vWm4Lp', '/opt/bin/sshpass -p Zq9vWm4Lp ssh h', '/usr/bin/zip -P Zq9vWm4Lp f.zip a',
     '/usr/local/bin/docker login -p Zq9vWm4Lp', '/usr/local/bin/gh secret set X --body Zq9vWm4Lp',
     'echo $(/usr/bin/mysql -pZq9vWm4Lp)', 'x=`/usr/bin/mysql -pZq9vWm4Lp`',
+    // Self-review: each word of a multi-word program may be quoted on its own.
+    "'/usr/local/bin/gh' secret set X --body Zq9vWm4Lp", "'gh' secret set X -b Zq9vWm4Lp", "'docker' login -p Zq9vWm4Lp",
+    '"/usr/bin/docker" login -p Zq9vWm4Lp', "'helm' 'registry' 'login' -p Zq9vWm4Lp r",
   ])('redacts path-qualified short-option passwords: %s', command => {
     const out = redact(command);
     expect(out).not.toContain('Zq9vWm4Lp');
     expect(out).toContain('[REDACTED]');
   });
-  it('keeps a hyphen- or dot-joined name that is not the program as data', () => {
+  it('keeps a hyphen- or dot-joined name, or a folder inside a path word, that is not the program as data', () => {
     expect(redact('my-mysql -pZq9vWm4Lp')).toContain('Zq9vWm4Lp');
+    expect(redact('docker run -v /data/mysql:/srv/db -p 3306:3306 img')).toContain('3306:3306');
   });
   it.each([
     'mkdir -p a/b', 'npm run build -- --page=2', 'curl https://x.test/?page=1&limit=2', 'docker run -p 80:80 img',

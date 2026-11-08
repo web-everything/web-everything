@@ -3702,6 +3702,17 @@ export function heavyRunHeads(segment) {
   return null;
 }
 
+/** Whether a heredoc's head runs a shell that reads its script from the heredoc: the head's last segment
+ *  (`cd x && bash <<EOF`, `set -e; bash -s <<'EOF'`) or the command a launcher in it runs (`nohup bash <<EOF`,
+ *  `setsid -f sh -s <<'EOF'`, review #6461 r5). Shared by the spawn lint and the transcript audit. Past the
+ *  unwrap bound it is true (fail closed: the body is classified). Pure. */
+export function heredocFeedsShell(docHead) {
+  const feeds = canonicalCommand(parseSegments(docHead).segments.at(-1) ?? docHead);
+  const heads = heavyRunHeads(feeds);
+  if (!heads) return true;
+  return [feeds, ...heads.map(({ raw }) => canonicalCommand(raw))].some((head) => /^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(head));
+}
+
 /** The kind of unqueued heavy run a segment's executable head starts ('vitest' | 'node-test' | 'standards' |
  *  'test'), or null. Shared with the static spawn lint and the transcript audit so all three classify the same
  *  heads (`npm test`, `npm --prefix . test`, `node --test`, …) instead of drifting copies. Pure. */

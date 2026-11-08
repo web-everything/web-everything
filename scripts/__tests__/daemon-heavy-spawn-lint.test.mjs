@@ -131,6 +131,9 @@ describe('daemon heavy spawn admission lint', () => {
     "execSync('bash <<EOF\\nnpm test\\nEOF');",
     "execSync('cd /x && bash <<EOF\\nnpm test\\nEOF');",
     "execSync(\"set -e; bash -s <<'EOF'\\nnpm test\\nEOF\");",
+    // Review #6461 round 5 self-review: a launcher in front of the heredoc-fed shell.
+    "execSync('nohup bash <<EOF\\nnpm test\\nEOF');",
+    "execSync(\"setsid -f sh -s <<'EOF'\\nnpm test\\nEOF\");",
   ])('detects launcher / joined / fork spellings: %s', call => {
     expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
   });

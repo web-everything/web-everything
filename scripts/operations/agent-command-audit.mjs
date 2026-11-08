@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, commandSubstitutionBodies, envSplitString, heavyRunHeads, heredocScan, parseSegments, shellCString, shellTokens, stripShellControl, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, envSplitString, heavyRunHeads, heredocFeedsShell, heredocScan, parseSegments, shellCString, shellTokens, stripShellControl, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -27,21 +27,24 @@ const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|jwt|(?:^|[
 const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|passphrase|pass(?:[_-]|$)|(?:^|[_-])pwd$|jwt|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
 // Programs whose own short options carry a password or secret, attached (`mysql -pv`, `7z a -pv`) or separate
 // (`docker login -p v`, `redis-cli -a v`, `zip -P v f`, `ssh-keygen -N v`, `gh secret set X -b v`, `curl -b c=v`).
+// A word of a multi-word program may be quoted on its own (`'docker' login`, `"/usr/bin/gh" secret set`).
 const SECRET_SHORT_OPTIONS = [
-  [/(?:(?:docker|podman|nerdctl|buildah|skopeo|helm\s+registry)\s+login|sshpass|mysql\w*|mariadb\w*|mongo(?:sh|dump|restore|import|export)?|7z[ar]?)/, 'p'],
+  [/(?:(?:docker|podman|nerdctl|buildah|skopeo|helm["']?\s+["']?registry)["']?\s+["']?login|sshpass|mysql\w*|mariadb\w*|mongo(?:sh|dump|restore|import|export)?|7z[ar]?)/, 'p'],
   [/redis-cli/, 'a'],
   [/(?:un)?zip|zipcloak/, 'P'],
   [/ssh-keygen/, 'NP'],
-  [/gh\s+secret\s+set/, 'b'],
+  [/gh["']?\s+["']?secret["']?\s+["']?set/, 'b'],
   [/smbclient/, 'U'],
   [/curl/, 'b'],
 ];
 // A `/` may precede the program: a path-qualified program (`/usr/bin/mysql -pv`, `./mysql -pv`) runs the same one
 // (review #6461 r5), as htpasswd's own match already allows.
-const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w.-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?![\w-])`, 'g');
-// The program whose `--body` long option carries a secret (`gh secret set X --body v`, `/usr/bin/gh secret set …`);
-// its segment end is found quote-aware by redactPositionalSecrets.
-const SECRET_LONG_OPTIONS = /(?<![\w.-])gh\s+secret\s+set\b/g;
+// The name ends its shell word (a space, a closing quote or the end), so a folder that shares a program's name
+// (`-v /data/mysql:/var/lib/mysql -p 3306:3306`) is not read as that program.
+const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w.-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?=["']?(?:\s|$))`, 'g');
+// The program whose `--body` long option carries a secret (`gh secret set X --body v`, `/usr/bin/gh secret set …`,
+// `'gh' secret set …`); its segment end is found quote-aware by redactPositionalSecrets.
+const SECRET_LONG_OPTIONS = /(?<![\w.-])gh["']?\s+["']?secret["']?\s+["']?set\b/g;
 // `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
 // `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key.
 const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:-[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
@@ -369,8 +372,7 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
   if (!heredocs.unterminated) {
     for (const doc of heredocs.heredocs) {
       // The heredoc feeds the head's last segment (`cd x && bash <<EOF`, `set -e; bash -s <<'EOF'`).
-      const feeds = canonicalCommand(parseSegments(doc.head).segments.at(-1) ?? doc.head);
-      if (/^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(feeds)) out.push(...classifyCommand(doc.body, depth + 1, false));
+      if (heredocFeedsShell(doc.head)) out.push(...classifyCommand(doc.body, depth + 1, false));
     }
   }
   for (const segment of parseSegments(heredocs.unterminated ? String(cmd) : heredocs.text).segments) {
@@ -392,11 +394,13 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
       for (const hit of classifyCommand(shellC.text, depth + 1, shellC.innerSubstitutions)) out.push({ ...hit, queued: queued || hit.queued });
       continue;
     }
-    // The audit's own patterns run on every command a launcher runs (`nohup npx playwright test a`, `setsid npm ci`,
-    // `eval 'git fetch'`), unwrapped by the Bash guard's shared walker, not only on the outer head (review #6461 r5).
-    const candidates = [head, ...(heavyRunHeads(head) ?? []).map(({ raw }) => canonicalCommand(raw))];
-    const ran = candidates.find(candidate => headCategory(candidate));
-    if (ran) out.push({ category: headCategory(ran), queued: queued || QUEUED_SCRIPT.test(ran), command: redact(segment.trim()) });
+    const category = headCategory(head);
+    if (category) { out.push({ category, queued: queued || QUEUED_SCRIPT.test(head), command: redact(segment.trim()) }); continue; }
+    // The command a launcher runs (`nohup …`, `setsid -f …`, `eval '…'`), unwrapped by the Bash guard's shared walker,
+    // goes through this whole classifier again: its own segments, `sh -c` bodies, `env -S`, the admission wrapper and
+    // heredocs, not only the head patterns (review #6461 r5). The depth bound reports a too-deep nest unparsed.
+    const launched = heavyRunHeads(head)?.[1]?.raw;
+    if (launched) for (const hit of classifyCommand(launched, depth + 1, false)) out.push({ ...hit, queued: queued || hit.queued });
   }
   return out;
 }
