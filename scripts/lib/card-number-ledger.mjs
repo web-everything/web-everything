@@ -167,7 +167,7 @@ export function readCardLedger(o = {}) {
       if (!next.startsWith(previous)) throw new Error('append-only violation: ledger row removal/replacement');
       // Per-commit parsing must see the same physical lines as the checkpoint/whole-file reader:
       // an append onto a partial line would be judged apart from the bytes it completes.
-      if (previous && !previous.endsWith('\n')) throw new Error('ledger commit boundary splits a row; review a checkpoint at the commit completing that line with the line in quarantinedLines');
+      if (previous && !previous.endsWith('\n')) throw new Error('ledger commit boundary splits a row; review a checkpoint at the commit completing that line with the line in quarantinedLines, then re-append that commit\'s valid rows in a new signed commit (the quarantined line burns none of its numbers)');
       const firstLine = previous.split('\n').length;
       const added = next.slice(previous.length); previous = next;
       const parsed = decode(added, maxBytes);

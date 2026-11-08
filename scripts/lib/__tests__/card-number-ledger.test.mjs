@@ -517,6 +517,8 @@ it.each([
   const state = f.read();
   expect(state.readable).toBe(false);
   expect(state.errors.join(';')).toMatch(/boundary/);
+  // The joined line's valid row is dropped by the named recovery, so the error must say to re-append it.
+  expect(state.errors.join(';')).toMatch(/re-append that commit's valid rows in a new signed commit/);
   expect(() => cardLedgerCheckpoint({ ...f.options, commit: b,
     env: { ...f.options.env, WE_CARD_LEDGER_AUTH: 'signed' } })).toThrow(/checkpoint refused/);
   // The physical-line reader (used once a checkpoint is adopted) agrees: the same bytes are unreadable.
@@ -535,6 +537,9 @@ it('splitRowRecoveryNamedInTheBoundaryErrorReadsOnceTheJoinedLineIsQuarantined',
   const state = f.read();
   expect(state).toMatchObject({ readable: true, errors: [], quarantinedLines: [1], quarantinedCommits: [a] });
   expect(state.byId.size).toBe(0);
+  // Number 11 is neither indexed nor burned after this recovery: it must be re-appended, as the error says.
+  expect(state.burned.has(11)).toBe(false);
+  expect(state.byNum.has(11)).toBe(false);
 });
 
 it('real SSH introducing commits reject an unsigned row beneath a signed tip', async () => {
