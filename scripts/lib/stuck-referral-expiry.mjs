@@ -6,7 +6,7 @@
  */
 import { statSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { listRunIds, readRun, writeRun, runPath, sharedRunsDir, resolveRunsDir } from '../operations/run-store.mjs';
+import { listRunIds, readRun, writeRun, runPath, sharedRunsDir, resolveRunsDir, isRunRecordTerminal } from '../operations/run-store.mjs';
 import { validateRunRecord } from '../operations/run-record.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { resolveReviewRedTeamOnSkip } from './review-red-team-on-skip.mjs';
@@ -45,13 +45,16 @@ export function findSuspendedReferralRuns({ runsDir = resolveRunsDir(), repo, pr
   });
   return records.filter(({ run }) => suspended(run) && run.input.repo === repo && Number(run.input.pr) === Number(pr)
     && (head == null || (run.findings?.read?.netBasis?.rev ?? run.input.head) === head))
-    .map(item => ({ ...item, pending: item.run.pending, ageMs: now - item.at,
-      // A ruling can be saved before target selection. Conservatively protect all recent
-      // ruling work on this PR, including its saved verdict's run-specific rulings.
-      rulingAt: records.filter(({ run }) => ['record-referral-ruling', 'review-ruling-resume'].includes(run.op)
+    .map(item => {
+      // A ruling can be saved before target selection. Protect matching PR work as
+      // well as saved run-specific rulings, until terminal and past the quiet deadline.
+      const rulings = records.filter(({ run }) => ['record-referral-ruling', 'review-ruling-resume'].includes(run.op)
         && (run.input.repo === repo && Number(run.input.pr) === Number(pr)
-          || run.verdict?.record?.rulings?.some(r => r.runId === item.id)))
-        .reduce((latest, r) => Math.max(latest, r.at), -Infinity) }));
+          || run.verdict?.record?.rulings?.some(r => r.runId === item.id)));
+      return { ...item, pending: item.run.pending, ageMs: now - item.at,
+        rulingOpen: rulings.some(({ run }) => !isRunRecordTerminal(run)),
+        rulingAt: rulings.reduce((latest, r) => Math.max(latest, r.at), -Infinity) };
+    });
 }
 
 /** Pure policy over a scan observation; injected probes do not apply effects. */
@@ -61,6 +64,7 @@ export function planReferralExpiry(observation, { now = Date.now(), deadlineMs, 
   const ageMs = observation?.ageMs ?? now - (Number.isFinite(observation?.mtimeMs) ? observation.mtimeMs : finishedAt(run ?? {}));
   if (!Number.isFinite(now) || !Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) return hold('expiry disabled or invalid');
   if (!suspended(run) || run.verdict != null || !validateRunRecord(run).ok || !Number.isFinite(ageMs)) return hold('run evidence unreadable or no longer suspended');
+  if (observation.rulingOpen === true) return hold('referral ruling open');
   if (ageMs < deadlineMs || now - observation.mtimeMs < deadlineMs) return hold('run recently written');
   if (live === true) return hold('owner live');
   if (live === null) return hold('liveness unreadable');
@@ -69,19 +73,29 @@ export function planReferralExpiry(observation, { now = Date.now(), deadlineMs, 
   // for old resumes: an operator must settle them rather than strand a terminal resume.
   if (run.resumeOf != null || run.resumedAt != null) return hold('resumed review requires operator settlement');
   if (now - observation.rulingAt < deadlineMs) return hold('referral ruling in progress');
-  if (probe && run.host === probe.host && run.pidNamespace === probe.namespace && Number.isInteger(run.pid) && run.pid > 0) {
+  if ((run.host != null && run.host !== probe?.host)
+    || (run.pidNamespace != null && run.pidNamespace !== probe?.namespace)) return hold('owner on another host; unverifiable');
+  if (run.host != null || run.pidNamespace != null || run.pid != null) {
+    if (!probe || run.host !== probe.host || run.pidNamespace !== probe.namespace
+      || !Number.isInteger(run.pid) || run.pid <= 0 || typeof probe.isAlive !== 'function') return hold('owner liveness unreadable');
     try {
-      if (probe.isAlive(run.pid) === true) {
+      const alive = probe.isAlive(run.pid);
+      if (alive !== true && alive !== false) return hold('owner liveness unreadable');
+      if (alive) {
         let start;
         try { start = run.pidStart ? probe.readPidStart?.(run.pid) : null; }
         catch { return hold('owner live; start unreadable'); }
         if (!run.pidStart || start == null || start === run.pidStart) return hold('owner live');
       }
-    } catch { /* Unprobeable owner: use the explicit quiet deadline. */ }
+    } catch { return hold('owner liveness unreadable'); }
   }
-  if (run.sessionId && probe?.isSessionAlive) {
-    try { if (probe.isSessionAlive(run.sessionId) === true) return hold('session live'); }
-    catch { return hold('session probe unreadable'); }
+  if (run.sessionId != null) {
+    if (typeof probe?.isSessionAlive !== 'function') return hold('session liveness unverifiable');
+    try {
+      const alive = probe.isSessionAlive(run.sessionId);
+      if (alive === true) return hold('session live');
+      if (alive !== false) return hold('session probe unreadable');
+    } catch { return hold('session probe unreadable'); }
   }
   return { action: 'expire', why: `expired: no referral ruling within ${deadlineMs / 3600000}h` };
 }
@@ -116,13 +130,15 @@ export function expireStuckReferralRuns({ repo, pr, head, setting, env = process
   if (!Number.isSafeInteger(hours) || hours <= 0 || !Number.isSafeInteger(hours * 3600000)) return { expired: false, why: 'expiry disabled or invalid' };
   const source = resolved.sources?.referralRunExpiryHours ?? 'injected';
   const options = { runsDir: env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env), ...io, repo, pr, head, now };
-  let expired = false;
-  for (const run of findSuspendedReferralRuns(options)) {
+  const held = [];
+  let runs;
+  try { runs = findSuspendedReferralRuns(options); }
+  catch { return { expired: false, held: [{ why: 'run evidence unreadable; inspect run store' }] }; }
+  for (const run of runs) {
     const result = expireSuspendedReferralRun({ ...options, runId: run.id, deadlineMs: hours * 3600000, source });
     if (result.expired) {
-      expired = true;
       log(`stuck-referral-expiry: ${repo}#${pr} run=${run.id} expired deadline=${hours}h source=${source}`);
-    }
+    } else held.push(result);
   }
-  return { expired };
+  return runs.length > 0 && held.length === 0 ? { expired: true } : { expired: false, held };
 }

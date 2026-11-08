@@ -32,7 +32,10 @@ describe('stuck referral expiry', () => {
     expect(run.pending).toBeNull(); expect(run.verdict).toBeNull();
     expect(run.expired).toMatchObject({ reason: expect.stringContaining('no referral ruling'), deadlineMs });
     expect(run.effects.every(e => e.status === 'failed' && e.error.startsWith('expired: no referral ruling within'))).toBe(true);
-    expect(evidence(Date.now() + ABANDONED_REVIEW_AFTER_MS + 5000).reason).not.toBe('review-unfinished');
+    const abandoned = evidence(Date.now() + ABANDONED_REVIEW_AFTER_MS + 5000);
+    expect(abandoned.reason).not.toBe('review-unfinished');
+    expect(abandoned).toEqual({ loopPayload: null, inFlight: false, scheduled: false, recorded: false,
+      seatRecorded: false, completedRecorded: false, failedSeatCount: 0 });
   });
   it('planner only expires or holds, never clears or accepts', () => {
     const f = fixture(), run = findSuspendedReferralRuns(f)[0];
@@ -69,11 +72,34 @@ describe('stuck referral expiry', () => {
     const decided = fixture(5 * hour, { verdict: { verdict: 'changes' } }), decidedBefore = bytes(decided);
     expect(expireSuspendedReferralRun(decided).expired).toBe(false); expect(bytes(decided)).toBe(decidedBefore);
   });
-  it('uses the quiet deadline for an unprobeable owner and holds recent writes', () => {
-    const f = fixture(5 * hour, { host: 'elsewhere', pid: 123 });
-    expect(expireSuspendedReferralRun({ ...f, probe: { host: 'local' } }).expired).toBe(true);
-    const recent = fixture(1000), before = bytes(recent);
-    expect(expireSuspendedReferralRun(recent).expired).toBe(false); expect(bytes(recent)).toBe(before);
+  it.each([
+    [{ host: 'elsewhere', pid: 123 }, { host: 'local' }, 'owner on another host; unverifiable'],
+    [{ host: 'local', pidNamespace: 'foreign', pid: 123 }, { host: 'local', namespace: 'local' }, 'owner on another host; unverifiable'],
+    [{ host: 'local', pidNamespace: 'ns', pid: 123 }, { host: 'local', namespace: 'ns', isAlive: () => { throw Error('probe failed'); } }, 'owner liveness unreadable'],
+    [{ sessionId: 'session' }, {}, 'session liveness unverifiable'],
+  ])('holds unverifiable owner %j without writing', (owner, probe, why) => {
+    const f = fixture(5 * hour, owner), before = bytes(f);
+    expect(planReferralExpiry(findSuspendedReferralRuns(f)[0], { now, deadlineMs, probe })).toEqual({ action: 'hold', why });
+    expect(expireSuspendedReferralRun({ ...f, probe })).toMatchObject({ expired: false, why });
+    expect(bytes(f)).toBe(before);
+  });
+  it.each(['record-referral-ruling', 'review-ruling-resume'])('holds old open %s by PR or named run, but allows old terminal rulings', op => {
+    for (const named of [false, true]) {
+      const f = fixture(), before = bytes(f);
+      const ruling = newRunRecord({ id: 'ruling-old', op, input: named ? { repo: 'other/repo', pr: 99 } : { repo, pr } });
+      if (named) ruling.verdict = { record: { rulings: [{ runId: f.runId }] } };
+      // Both cursor-only and in-flight-only records are nonterminal.
+      if (named) ruling.effects = [{ key: 'ruling', type: 'ruling', stepIndex: 0, index: 0, status: 'in-flight' }];
+      else ruling.pending = { kind: 'effect', step: 'record', stepIndex: 0, count: 1 };
+      const save = () => { writeRun(ruling, f.runsDir); utimesSync(runPath(ruling.id, f.runsDir), (now - 8 * hour) / 1000, (now - 8 * hour) / 1000); };
+      save();
+      expect(findSuspendedReferralRuns(f)[0].rulingOpen).toBe(true);
+      expect(expireSuspendedReferralRun(f)).toMatchObject({ expired: false, why: 'referral ruling open' });
+      expect(bytes(f)).toBe(before);
+      ruling.pending = null; ruling.effects = []; save();
+      expect(findSuspendedReferralRuns(f)[0].rulingOpen).toBe(false);
+      expect(expireSuspendedReferralRun(f).expired).toBe(true);
+    }
   });
   it('holds unreadable evidence without writing', () => {
     const f = fixture(), write = vi.fn();
@@ -115,6 +141,27 @@ describe('stuck referral expiry', () => {
     const result = read({ repo }).prs[0];
     expect(result.suspendedReferralRun).toEqual(mode === 'suspended' ? { runId: 'stuck', ageHours: 5 } : null);
     if (mode === 'unreadable') expect(result.evidenceErrors.join(' ')).toContain('suspended referral run evidence unreadable');
+  });
+  it.each(['live', 'write-error'])('mixed expiry with a %s blocker keeps the daemon escalation', blocker => {
+    const f = fixture();
+    const blocked = { ...readRun(f.runId, f.runsDir), id: 'review-pr-blocked', host: 'local', pidNamespace: 'ns', pid: 123 };
+    writeRun(blocked, f.runsDir);
+    utimesSync(runPath(blocked.id, f.runsDir), (now - 5 * hour) / 1000, (now - 5 * hour) / 1000);
+    const before = readFileSync(runPath(blocked.id, f.runsDir), 'utf8');
+    const escalate = vi.fn(), expiry = vi.fn(options => expireStuckReferralRuns({ ...options, runsDir: f.runsDir,
+      probe: { host: 'local', namespace: 'ns', isAlive: () => blocker === 'live' },
+      write: (run, dir) => { if (run.id === blocked.id && blocker === 'write-error') throw Error('write failed'); writeRun(run, dir); } }));
+    const result = runRedTeamOnSkip({ repo, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+      rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }], capacity: { lanes: 1 },
+      readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => false, readStatus: () => null,
+      expireStuckReferralRuns: expiry, setting: { enabled: true, referralRunExpiryHours: 4 }, escalate, now: () => now });
+    expect(expiry).toHaveBeenCalledTimes(1);
+    expect(expiry.mock.results[0].value).toEqual({ expired: false, held: [{ expired: false, runId: blocked.id,
+      why: blocker === 'live' ? 'owner live' : 'run evidence unreadable; inspect run store' }] });
+    expect(readRun(f.runId, f.runsDir).pending).toBeNull();
+    expect(readFileSync(runPath(blocked.id, f.runsDir), 'utf8')).toBe(before);
+    expect(result.rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished' });
+    expect(escalate).toHaveBeenCalledWith(expect.objectContaining({ why: 'review-unfinished' }));
   });
   it.each([true, false, 'error'])('daemon expiry %s stays skip and only holds escalate', expired => {
     const escalate = vi.fn(), settle = vi.fn(), setLabels = vi.fn();
