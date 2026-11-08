@@ -407,8 +407,23 @@ export function isLoadOnlyRedStandDown(c) {
   return isTrustedMarkerAuthor(c) && body.trimStart().startsWith(STAND_DOWN_MARKER)
     && STAND_DOWN_TRAILER_RE.exec(body)?.[1] === 'gate-red'
     && !isLoadFlakeStandDown(c) && !parseAltBranch(body)?.sha
-    && /\bred only on\b/i.test(reason) && /\bhost[\s-]+load\b/i.test(reason)
-    && /\b(?:wall-clock|timing|timeouts?|latency)\b/i.test(reason);
+    && ((/\bred only on\b/i.test(reason) && /\bhost[\s-]+load\b/i.test(reason)
+      && /\b(?:wall-clock|timing|timeouts?|latency)\b/i.test(reason))
+      || statesOutOfDiffTimeoutEvidence(reason));
+}
+
+/**
+ * #6469 live: a fixer stood down (gate-red) on one test timeout in a file outside the PR diff and nothing re-armed
+ * it, because only the "red only on ... host load" wording was read. A reason now counts as load-only red when it
+ * states ALL of: a test TIMEOUT (never an assertion failure), that it is outside this change (unrelated / outside the
+ * diff), and the corroboration (other tests pass, passes alone, or the same timeout on base). A diff-touched failure
+ * says none of that and stays terminal; the re-dispatch still needs a GREEN verify before any push.
+ */
+export function statesOutOfDiffTimeoutEvidence(reason) {
+  const r = String(reason ?? '');
+  return /\btimed out\b|\btimeout\b/i.test(r) && !/\bassertion|\bexpected\b|\btouch(?:es|ed)\b|diff-touched|in-diff|in the diff\b/i.test(r)
+    && /\bunrelated to this (?:change|pr)\b|\b(?:outside|not in) (?:the |this )?(?:pr'?s? )?diff\b/i.test(r)
+    && /\b(?:all \d+ other tests?|every other test|other tests? (?:all )?pass|passes? (?:alone|in isolation)|same (?:timeout|failure) on (?:base|main|[0-9a-f]{7,40}))/i.test(r);
 }
 
 function loadTrailer(body, name) {
@@ -777,6 +792,9 @@ if (IS_CLI) {
   const redispatch = loadFlakeRedispatchRequest({ reason: flags.reason, alt: flags.alt, altSha: flags['alt-sha'], repoKey: repoKeyForSlug(flags.repo) });
   if (flags.reason === 'load-flake' && !loadHold) {
     process.stderr.write(redispatch ? '⚠ stand-down: recording a quiet-host re-dispatch hold (no saved fix)\n' : '⚠ stand-down: unknown repo; recording a terminal gate-red stand-down instead\n');
+  }
+  if (flags.reason === 'gate-red' && /\btimed out\b|\btimeout\b/i.test(detail ?? '') && !statesOutOfDiffTimeoutEvidence(detail ?? '')) {
+    process.stderr.write('⚠ stand-down: detail names a timeout. If the failing test is NOT in this PR\'s diff, state: the file, "unrelated to this change"/"outside the diff", and "passes alone" or "all N other tests pass" or "same timeout on <base sha>" so it becomes a re-armable load-flake hold; otherwise it stays terminal\n');
   }
   const supersededBy = flags.reason === 'superseded' && typeof flags['superseded-by'] === 'string' ? Number(flags['superseded-by']) : null;
   if (flags.reason === 'superseded' && !(Number.isInteger(supersededBy) && supersededBy > 0)) fail('--reason=superseded needs --superseded-by=<merged PR number>');
