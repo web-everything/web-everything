@@ -3,6 +3,7 @@ bornAs: xnz8ffr
 kind: story
 size: 3
 status: open
+related: ["6260"]
 scope: ["we:scripts/operations/operator-queue-needs-person.mjs", "we:scripts/operations/needs-you-feed.mjs", "we:scripts/lib/ruling-ledger.mjs"]
 dateOpened: "2026-11-07"
 tags: []
