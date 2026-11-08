@@ -102,6 +102,31 @@ const MERGED = { state: 'MERGED', mergedAt: '2026-10-09T22:00:00Z', mergeCommit:
 const stampedBy = (login) => [{ author: { login }, body: buildClearanceComment(HEAD) }];
 
 describe('enqueue delegates red-team verdicts to merge-gate', () => {
+  it.each([true, false])('check-run refuses a newer pending round after initial success (fresh pending label=%s)', withLabel => {
+    const appId = 5037855;
+    const runs = [{ id: 1, name: 'red-team', head_sha: HEAD, app: { id: appId }, status: 'completed', conclusion: 'success' }];
+    const readRedTeamEvidence = vi.fn(() => { throw Error('status scans are forbidden'); });
+    const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ headSha: HEAD, appId, checkRuns: runs }));
+    let liveReads = 0;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run' },
+      strategyExtra: { readRedTeamEvidence, readRedTeamCheck },
+      onView: { readLive: () => {
+        if (++liveReads === 2) {
+          expect(readRedTeamCheck.mock.results[0].value.ok).toBe(true);
+          runs.push({ id: 2, name: 'red-team', head_sha: HEAD, app: { id: appId }, status: 'in_progress', conclusion: null });
+        }
+        return { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted',
+          ...(liveReads >= 2 && withLabel ? ['red-team:pending'] : [])] };
+      } } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending',
+      reason: withLabel ? 'state is red-team:pending' : expect.stringMatching(/progress|incomplete/) });
+    expect(liveReads).toBe(2);
+    expect(readRedTeamCheck).toHaveBeenCalledTimes(withLabel ? 1 : 2);
+    expect(readRedTeamEvidence).not.toHaveBeenCalled();
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+
   it.each(['fresh state', 'legacy current-head spend'])('drain-scan A→B→A across restart dispatches each head at most once: %s', kind => {
     const clock = { t: 1000 }, requests = [];
     const otherHead = 'c'.repeat(40);

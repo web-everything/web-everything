@@ -582,7 +582,7 @@ export function createDrainMergeStrategy({
       }
       const freshHeld = sendBackReason(fresh.labels);
       const freshLabels = queueLabels(fresh.labels);
-      const freshLabelHold = checkRunOnly ? null : redTeamLabelHoldReason(deadlineOverride
+      const freshLabelHold = redTeamLabelHoldReason(deadlineOverride
         ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
       if (freshHeld) {
         removeSentBack(c.repo, c.num, fresh.labels);
@@ -619,8 +619,10 @@ export function createDrainMergeStrategy({
         } });
       if (poison) return poison;
       if (checkRunOnly) {
-        const unpublished = publicationHold(c, headSha);
-        if (unpublished) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: unpublished };
+        // One fresh check read closes the gap since the initial success observation.
+        // This also rechecks the publication marker without scanning status or runs.
+        const hold = checkRunAdmission(c, headSha, before);
+        if (hold) return hold;
       }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
         humanOnlyLicense: () => {
