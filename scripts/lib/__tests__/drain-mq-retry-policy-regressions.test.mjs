@@ -230,7 +230,7 @@ describe('MQ signature audit bounds', () => {
     'outage \\S+ on \\d+ at \\s+ during checkout',
     'aaaaaaaaaaa\\S+a\\S+a\\S+b',
     'aaaaaaaaaaa\\S+a\\S+b',
-    'aaaaaaaaaaa\\S+\\.\\S+ Z', 'outage \\S+ on \\d+ remote',
+    '\\S+\\.aaaaaaaaaaa', 'aaaaaaaaaaa\\S+\\.\\S+ Z', 'outage \\S+ on \\d+ remote',
     'outage during \\s+ checkout', 'outage during \\d+7',
   ])('rejects insufficient literals or unsafe wildcards %j with a platform fallback', source => {
     const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] },

@@ -25,7 +25,7 @@ const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
 
 function validMqInfraSignatures(value) {
   return Array.isArray(value) && value.length > 0 && value.length <= 32 && value.every(source => {
-    if (typeof source !== 'string' || source.length > 200) return false;
+    if (typeof source !== 'string' || source.length > 200 || !/^[A-Za-z0-9]/.test(source)) return false;
     let literals = 0, alphanumerics = 0, wildcards = 0, previousWildcard = false;
     // Consume only literal ASCII letters/digits/spaces, escaped punctuation,
     // and the three wildcard tokens. Unknown syntax fails closed.
