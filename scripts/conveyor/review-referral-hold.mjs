@@ -45,7 +45,8 @@ const hash = value => createHash('sha256').update(JSON.stringify(value)).digest(
 export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
-  const head = read?.netBasis?.rev;
+  const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
+  const head = read?.netBasis?.rev ?? (suspendedReferralEffect ? run.input?.head : undefined);
   // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
   // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
   const ownAdvise = run.stepTimings?.find(t => t?.step === 'advise')?.finishedAt;
@@ -61,7 +62,7 @@ export function reviewRunEvidence(run) {
   // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
   // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
   const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt),
-    resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
+    resuming || suspendedReferralEffect ? 0 : Date.parse(run.resumedAt ?? '') || 0);
   // An interrupted persist retry still spends a slot. Start its next backoff at the latest resume, rather than
   // the original parked pass: after an outage that old deadline could spend every remaining slot on adjacent ticks.
   const completedAt = Math.max(Date.parse(finish),
@@ -95,6 +96,7 @@ export function reviewRunEvidence(run) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
@@ -288,7 +290,7 @@ function latestReviewAttempt(history) {
 export function findResumableParkedRun(pr, runs, { repo, cardReadable } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
-  if ((!last?.parked && !last?.resumeAdvise) || last.head !== pr.headRefOid) return null;
+  if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect) || last.head !== pr.headRefOid) return null;
   // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
   // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
   // operator's Accept was refused until a person noticed). The hold decides WHEN (its 15/30/60 retry budget); once a
@@ -298,6 +300,7 @@ export function findResumableParkedRun(pr, runs, { repo, cardReadable } = {}) {
   if (last.persistenceFailed || last.resumeAdvise) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
   if (events.some(e => e.kind === 'fresh')) return null;
+  if (last.suspendedReferralEffect) return events.some(e => e.kind === 'ruling') ? { id: last.id, head: last.head } : null;
   if (last.referralStageRefused) return refusedReferralsAreRuled(pr, last, { repo, cardReadable })
     ? { id: last.id, head: last.head } : null;
   if (!last.attempted) return null;
