@@ -204,6 +204,18 @@ describe('the declaration end to end', () => {
       expect(() => begin(registry)).toThrow(/--not-duplicate-reason="\.\.\."/);
     });
 
+    it.each([undefined, {}, { backlog: [], malformed: [{ file: 'unreadable.md' }] },
+      { backlog: [{ id: '123', score: NaN }] }, { backlog: [{ score: 1 }] }])(
+      'fails closed on missing, malformed or invalid evidence: %j', (result) => {
+        expect(() => begin(buildRegistry({}, () => result))).toThrow(/--not-duplicate-reason/);
+      });
+
+    it('fails closed when the injected search binding is missing', () => {
+      const registry = createRegistry();
+      registry.register(fileItemOperation({ readScaffoldContext: () => read() }));
+      expect(() => begin(registry)).toThrow(/--not-duplicate-reason/);
+    });
+
     it('files when search is unavailable only with an explicit not-duplicate reason recorded in the body', async () => {
       const reason = 'Manually checked existing backlog cards while the search index is unavailable.';
       const card = await file(buildRegistry({}, () => { throw new Error('search index unreadable'); }), {

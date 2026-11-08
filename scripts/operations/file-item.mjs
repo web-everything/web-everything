@@ -84,6 +84,34 @@ export function planFileItem(read, input) {
   return verdict;
 }
 
+/** Refuse incomplete search evidence before declaring either effect. */
+function admitDuplicates(read, input) {
+  const related = input.relatedTo?.trim();
+  const relatedReason = input.relatedReason?.trim();
+  const reason = input.notDuplicateReason?.trim();
+  if (related && !relatedReason) throw new Error('file-item: --related-to requires --related-reason=...');
+  if (relatedReason && !related) throw new Error('file-item: --related-reason requires --related-to=<id>');
+  const fallback = '--related-to=<id> --related-reason=... or --not-duplicate-reason="..."';
+  // Same default as capability-search EXACT_THRESHOLD; production resolves it through operatorTask policy.
+  const threshold = read.operatorTask?.duplicateThreshold ?? 0.7;
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new Error('file-item: invalid duplicateThreshold; repair the operatorTask policy before filing');
+  }
+  const search = read.duplicateSearch;
+  const complete = search && Array.isArray(search.backlog)
+    && (search.malformed === undefined || (Array.isArray(search.malformed) && search.malformed.length === 0))
+    && search.backlog.every(hit => hit && typeof hit.id === 'string' && hit.id.trim()
+      && Number.isFinite(hit.score) && hit.score >= 0 && hit.score <= 1);
+  if (!complete && !reason) {
+    throw new Error('file-item: duplicate search unavailable or incomplete; manually check the backlog and use --not-duplicate-reason="..."');
+  }
+  const matches = complete ? search.backlog.filter(hit => hit.score >= threshold) : [];
+  if (matches.length && !reason && !(related && relatedReason)) {
+    throw new Error(`file-item: possible duplicate backlog cards ${matches.map(hit => hit.id).join(', ')}; use ${fallback}`);
+  }
+  return { related, reason: [relatedReason, reason].filter(Boolean).join('\n\n') };
+}
+
 export const FILE_ITEM_OP = 'file-item';
 
 /** The second effect this operation can declare, beside `scaffold`'s own `scaffold.write`. */
@@ -135,7 +163,7 @@ export function planQueueing(verdict, input = {}) {
  * Build the declaration. Both readers/sinks are injected — `./file-item-io.mjs` supplies the real bindings,
  * reusing `we:scripts/operations/scaffold-io.mjs`'s own reader + write sink rather than re-deriving either.
  */
-export function fileItemOperation({ readScaffoldContext } = {}) {
+export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}) {
   if (typeof readScaffoldContext !== 'function') {
     throw new TypeError(
       'file-item: needs a `readScaffoldContext()` reader — the io is INJECTED so the declaration stays '
@@ -154,6 +182,9 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       size: { type: 'string', required: false, default: '' },
       slug: { type: 'string', required: false, default: '' },
       digest: { type: 'string', required: false, default: '' },
+      relatedTo: { type: 'string', required: false, default: '' },
+      relatedReason: { type: 'string', required: false, default: '' },
+      notDuplicateReason: { type: 'string', required: false, default: '' },
       parent: { type: 'string', required: false, default: '' },
       blockedBy: { type: 'string', required: false, default: '' },
       scope: { type: 'string', required: false, default: '' },
@@ -169,10 +200,15 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     declaresOver: DECLARED_HOMES['file-item'],
 
     read: compute({
-      reads: ['input.operatorTask'],
+      reads: ['input.operatorTask', 'input.title', 'input.digest'],
       fn: (view) => {
         const raw = readScaffoldContext();
-        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
+        let duplicateSearch;
+        try {
+          const search = searchDuplicates ?? raw.searchDuplicates;
+          duplicateSearch = search(`${view.input.title}\n${view.input.digest}`);
+        } catch { duplicateSearch = null; }
+        return { duplicateSearch, ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
           originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
       },
     }),
@@ -183,9 +219,15 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     plan: compute({
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
-        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
+        ...OPERATOR_TASK_READS, 'input.relatedTo', 'input.relatedReason', 'input.notDuplicateReason', 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
       ],
-      fn: (view) => planFileItem(view.findings.read, view.input),
+      fn: (view) => {
+        const admission = admitDuplicates(view.findings.read, view.input);
+        const verdict = planFileItem(view.findings.read, view.input);
+        if (admission.related) verdict.content = setFrontmatterField(verdict.content, 'related', JSON.stringify([admission.related]));
+        if (admission.reason) verdict.content += `\n## Duplicate admission\n\n${admission.reason}\n`;
+        return verdict;
+      },
     }),
 
     // THE QUEUEING DECISION, kept OFF the verdict deliberately: `verdictFrom: 'plan'` means every existing

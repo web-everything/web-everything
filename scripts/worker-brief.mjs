@@ -103,6 +103,8 @@ Anything else is out of scope: stop and report.
 The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
 cannot collide, and free-scope never counts other PRs' new cards against \`backlog/\`. List an existing card only if you edit it.
 
+**Search first.** Search the backlog before designing or building: \`node scripts/capability-search.mjs "<concept>"\`.
+
 **Speed.** These four rules keep a worker fast:
 - For Forge/remote work, do a real live Forge run in the first 15 minutes.
 - Narrow tests while iterating; ONE full verify at the end (re-run only if code changed after it).
