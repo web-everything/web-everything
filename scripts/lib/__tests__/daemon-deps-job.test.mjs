@@ -185,6 +185,11 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     ['anchored key', '&a allowBuilds:\n  esbuild: true\n'],
     ['duplicate key', 'allowBuilds:\n  esbuild: true\nallowBuilds:\n  esbuild: false\n'],
     ['quoted key after other keys', 'packages:\n  - a\n"allowBuilds":\n  esbuild: true\n'],
+    ['byte-order mark before the key', '\uFEFFallowBuilds:\n  esbuild: true\n'],
+    ['byte-order mark before a quoted key', '\uFEFF"allowBuilds":\n  esbuild: true\n'],
+    ['non-breaking space before the key', '\u00A0allowBuilds:\n  esbuild: true\n'],
+    ['uniformly indented document', '  allowBuilds:\n    esbuild: true\n'],
+    ['merge key', '<<: *base\nallowBuilds:\n  esbuild: true\n'],
   ])('an allowBuilds policy this reader cannot parse exactly fails closed to legacy: %s', (_name, policy) => {
     const f = setup();
     writeFileSync(join(f.sourceRoot, 'pnpm-workspace.yaml'), policy);
@@ -200,9 +205,9 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     expectMarker(f, 'npm');
   });
 
-  it('bare top-level keys, list items and a document marker are still read as before', () => {
+  it.each([['LF', '\n'], ['CRLF', '\r\n'], ['lone CR (read as separate lines, never hiding allowBuilds)', '\r']])('bare top-level keys, list items and a document marker are still read as before (%s)', (_name, eol) => {
     const f = setup();
-    writeFileSync(join(f.sourceRoot, 'pnpm-workspace.yaml'), '---\npackages:\n- a\n# note\nshamefully-hoist: true\nallowBuilds:\n  esbuild: true\n');
+    writeFileSync(join(f.sourceRoot, 'pnpm-workspace.yaml'), ['---', 'packages:', '- a', '# note', 'shamefully-hoist: true', 'allowBuilds:', '  esbuild: true', ''].join(eol));
     f.exec.mockImplementation((cmd, args) => {
       if (args[0] === '--version') return '12.1.0';
       mkdirSync(join(f.into, 'node_modules', 'esbuild'), { recursive: true });

@@ -123,8 +123,17 @@ function installedBuilds(into) {
   const packages = installedPackages(into);
   let inBuilds = false;
   let seenBuilds = false;
-  for (const line of policy.split(/\r?\n/)) {
+  let sawTopLevel = false;
+  // Every YAML line break (CRLF, CR, LF) splits a line: a lone CR must not hide a key inside another line.
+  for (const line of policy.split(/\r\n|\r|\n/)) {
     if (/^\s*(?:#.*)?$/.test(line)) continue;
+    // Indentation is spaces. A line that starts with any other whitespace (a BOM, NBSP, ...) is not a shape this reader
+    // understands, and `\S` / `^allowBuilds` would silently read it as "indented, so not top-level".
+    if (/^[^\S \t]/.test(line)) throw new Error('unsupported pnpm-workspace.yaml syntax');
+    if (/^[^ \t]/.test(line)) sawTopLevel = true;
+    // A document whose first content line is indented is a uniformly indented mapping: `  allowBuilds:` is then a
+    // real top-level key this reader would never match.
+    else if (!sawTopLevel) throw new Error('unsupported pnpm-workspace.yaml syntax');
     if (/^allowBuilds\s*:/.test(line)) {
       if (!/^allowBuilds\s*:\s*(?:#.*)?$/.test(line) || seenBuilds) throw new Error('unsupported allowBuilds policy');
       inBuilds = true;
@@ -135,11 +144,11 @@ function installedBuilds(into) {
     // spelling, `? allowBuilds`, a flow map, an anchor or tag): skipping it would silently skip the native-build check.
     // Only a bare key, a list item of the previous key or a document marker may sit at the top level; anything else
     // fails closed to the legacy installer, like every other unsupported policy syntax here.
-    if (/^\S/.test(line) && !/^(?:[A-Za-z_@][\w@.\/-]*\s*:(?:\s|$)|-(?:\s|$)|---\s*(?:#.*)?$)/.test(line)) {
+    if (/^[^ \t]/.test(line) && !/^(?:[A-Za-z_@][\w@.\/-]*\s*:(?:\s|$)|-(?:\s|$)|---\s*(?:#.*)?$)/.test(line)) {
       throw new Error('unsupported pnpm-workspace.yaml syntax');
     }
     if (!inBuilds) continue;
-    if (/^\S/.test(line)) { inBuilds = false; continue; }
+    if (/^[^ \t]/.test(line)) { inBuilds = false; continue; }
     const entry = /^\s+(?:"([^"]+)"|'([^']+)'|([^\s:]+)):\s*(true|false)\s*(?:#.*)?$/.exec(line);
     if (!entry) throw new Error('unsupported allowBuilds entry');
     const name = entry[1] ?? entry[2] ?? entry[3];
