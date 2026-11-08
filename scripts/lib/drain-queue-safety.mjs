@@ -10,8 +10,8 @@ import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
-import { readQuarantine, readJobFailures } from './red-main-quarantine-io.mjs';
-import { activeEntries, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
+import { readQuarantine } from './red-main-quarantine-io.mjs';
+import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
@@ -310,32 +310,45 @@ const entryCoversJob = (entry, job) => entry.job === undefined
   ? /^test-shard \(\d+\)$/.test(localJob(job)) : localJob(entry.job) === localJob(job);
 
 /**
- * Are ALL failing checks explained by active quarantine entries? Unit jobs must have a complete vitest failure
- * list in their log and every failing test covered; aggregators (`test`, `coverage-merge`) only follow a unit job.
- * Anything unreadable, incomplete or uncovered returns null, so the historical hold stays.
+ * Are ALL failing checks explained by active quarantine entries? The list must be stamped `quarantine` (else CI
+ * skips nothing). Each failing job is bound to this merge-group commit, its log must give a complete vitest failure
+ * list (distinct failing tests == the summary's failed-test count, no truncated names), and every failing test must
+ * be covered. Aggregators (`test`, `coverage-merge`) must show no uncovered test failure of their own and only
+ * count after at least one unit job. Anything unreadable, incomplete or uncovered returns null: the hold stays.
  */
-function readQuarantineCover({ repo, failed, exec, quarantine }) {
+function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
   try {
     if (typeof quarantine?.readList !== 'function') return null;
     const read = quarantine.readList();
-    if (read?.ok !== true) return null;
-    const now = (quarantine.now ?? Date.now)();
-    const entries = activeEntries(read.list, { now });
+    if (read?.ok !== true || read.list?.mode !== 'quarantine') return null;
+    const entries = activeEntries(read.list, { now: (quarantine.now ?? Date.now)() });
     if (!entries.length) return null;
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
+    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
+      maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
     let units = 0;
     for (const check of failed) {
-      if (typeof check.name !== 'string') return null;
-      if (derived.has(localJob(check.name))) continue;
-      if (!unitRe.test(check.name) || !Number.isSafeInteger(check.id) || check.id <= 0) return null;
-      const failures = readJobFailures(check.id, { exec, repoSlug: repo });
-      if (failures?.complete !== true) return null;
+      if (typeof check.name !== 'string' || !Number.isSafeInteger(check.id) || check.id <= 0) return null;
+      const isDerived = derived.has(localJob(check.name));
+      if (!isDerived && !unitRe.test(check.name)) return null;
+      // The check-run id is the Actions job id only when the job really is this check on the failed commit.
+      const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
+      if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
+      const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
+      const failures = parseVitestFailures(text);
+      const plain = text.replace(/\x1b\[[0-9;]*m/g, '');
+      const summary = /^(?:\S+\s+)?\s*Tests\s+(\d+) failed\b/m.exec(plain);
+      const names = new Set(failures.tests.map(t => `${t.file}::${t.name}`));
+      if (isDerived) {
+        if (failures.tests.length) { if (!failures.complete) return null; } else continue;
+      } else if (failures.complete !== true || !summary || Number(summary[1]) !== names.size
+        || failures.tests.some(t => t.name !== null && t.name.length >= 200)) return null;
       for (const { file, name } of failures.tests) {
         if (!entries.some(e => entryCoversJob(e, check.name)
           && (e.test === file || (name !== null && e.test === `${file}::${name}`)))) return null;
       }
-      units++;
+      if (!isDerived) units++;
     }
     return units > 0 ? true : null;
   } catch { return null; }
@@ -388,7 +401,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine }) {
       return null;
     const failed = checks.filter(check => !passing.has(check.conclusion));
     if (!failed.length) return null;
-    if (readQuarantineCover({ repo, failed, exec, quarantine }))
+    if (readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
       return { mainGreen: false, infra: 'quarantined', failedNames: [], mergeState: readMqMergeState({ repo, pr, head, exec }) };
     // Runner terminology alone also appears in ordinary assertion failures.
     const runnerLoss = /\blost communication\b|\b(?:self-hosted[ \t]+)?runner[ \t]+(?:(?:has|was|is)[ \t]+)?(?:disconnected|went away|lost connection|stopped responding|failed to (?:start|connect))\b/i;

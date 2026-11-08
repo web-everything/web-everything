@@ -18,7 +18,7 @@ const removed = () => ({
 });
 const added = { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-07T23:00:00Z' };
 const entry = (test, extra = {}) => ({ test, brokenSha: prior, owner: 'o', reason: 'r', addedAt: NOW - 1000, expiresAt: NOW + 3_600_000, ...extra });
-const logOf = (...failures) => `${failures.map(([file, name]) => ` FAIL  ${file} > ${name}`).join('\n')}\n Test Files  ${failures.length} failed | 160 passed (161)\n`;
+const logOf = (...failures) => `${failures.map(([file, name]) => ` FAIL  ${file} > ${name}`).join('\n')}\n Test Files  ${new Set(failures.map(([file]) => file)).size} failed | 160 passed (161)\n      Tests  ${failures.length} failed | 7000 passed (7001)\n`;
 
 function fixture(test) {
   const f = {
@@ -30,7 +30,7 @@ function fixture(test) {
       { id: 33, name: 'coverage-merge', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' } },
       { id: 34, name: 'test-shard (1)', status: 'completed', conclusion: 'success', output: { title: '', summary: '' } },
     ],
-    logs: { 31: logOf([FILE, NAME]) }, log: vi.fn(),
+    logs: { 31: logOf([FILE, NAME]), 32: 'needs.test-shard failed\n', 33: 'needs.test-shard failed\n' }, log: vi.fn(),
   };
   f.exec = vi.fn((command, args) => {
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
@@ -41,6 +41,11 @@ function fixture(test) {
     if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.live);
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`)) ?? '';
     if (endpoint.includes('/check-runs')) return JSON.stringify({ total_count: f.checks.length, check_runs: f.checks });
+    const meta = /\/actions\/jobs\/(\d+)$/.exec(endpoint);
+    if (meta) {
+      const check = f.checks.find(c => String(c.id) === meta[1]);
+      return JSON.stringify({ name: f.jobName?.[meta[1]] ?? check?.name, head_sha: f.jobSha ?? mergeCommit });
+    }
     const job = /\/actions\/jobs\/(\d+)\/logs/.exec(endpoint);
     if (job) {
       if (f.logs[job[1]] === undefined) throw new Error('log unavailable');
@@ -87,7 +92,9 @@ describe('merge-queue same-head retry for quarantined failures', () => {
   }));
 
   it.each(['quarantine list unreadable', 'quarantine list throws', 'job log unavailable', 'job log incomplete',
-    'quarantine entry expired', 'entry for another job', 'PR not CLEAN'])('fails closed: %s', kind => fixture(f => {
+    'quarantine entry expired', 'entry for another job', 'PR not CLEAN', 'list not in quarantine mode',
+    'job bound to another commit', 'job name mismatch', 'summary counts an unlisted failing test',
+    'aggregator shows an uncovered failure', 'truncated test name'])('fails closed: %s', kind => fixture(f => {
     if (kind === 'quarantine list unreadable') f.list = { ok: false, error: 'offline' };
     if (kind === 'quarantine list throws') f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log,
       quarantine: { readList: () => { throw new Error('boom'); }, now: () => NOW } });
@@ -95,6 +102,16 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     if (kind === 'job log incomplete') f.logs[31] = ` FAIL  ${FILE} > ${NAME}\n`;
     if (kind === 'quarantine entry expired') f.list.list.entries = [entry(`${FILE}::${NAME}`, { expiresAt: NOW - 1 })];
     if (kind === 'entry for another job') f.list.list.entries = [entry(`${FILE}::${NAME}`, { job: 'integration' })];
+    if (kind === 'list not in quarantine mode') f.list.list.mode = 'stop';
+    if (kind === 'job bound to another commit') f.jobSha = prior;
+    if (kind === 'job name mismatch') f.jobName = { 31: 'test-shard (1)' };
+    if (kind === 'summary counts an unlisted failing test') f.logs[31] = f.logs[31].replace('Tests  1 failed', 'Tests  2 failed');
+    if (kind === 'aggregator shows an uncovered failure') f.logs[32] = logOf(['scripts/lib/__tests__/other.test.mjs', 'x']);
+    if (kind === 'truncated test name') {
+      const long = 'n'.repeat(200);
+      f.list.list.entries = [entry(`${FILE}::${long.slice(0, 200)}`)];
+      f.logs[31] = logOf([FILE, long]);
+    }
     if (kind === 'PR not CLEAN') f.live.mergeStateStatus = 'BEHIND';
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499 head \w+ — failed_checks/);
