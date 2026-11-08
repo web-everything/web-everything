@@ -595,10 +595,9 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
   try {
     const status = String(execFn('git', ['-C', dir, 'status', '--porcelain'], { timeout: GIT_STEP_TIMEOUT_MS }));
     if (status.trim() !== '') return keep('uncommitted changes');
-    if (startSha) {
-      const head = String(execFn('git', ['-C', dir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS })).trim();
-      if (head !== startSha) return keep('HEAD moved');
-    }
+    if (!startSha) return keep('no baseline commit recorded');
+    const head = String(execFn('git', ['-C', dir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS })).trim();
+    if (head !== startSha) return keep('HEAD moved');
   } catch {
     return keep('status unreadable');
   }
@@ -624,10 +623,20 @@ export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmF
     result = cleanupScratchClone({ ...target, execFn, rmFn });
     return result;
   };
-  const onSignal = () => { try { run(); } catch { /* never throw from a signal handler */ } off(); };
-  const off = () => { proc.removeListener('SIGINT', onSignal); proc.removeListener('SIGTERM', onSignal); };
-  proc.prependListener('SIGINT', onSignal);
-  proc.prependListener('SIGTERM', onSignal);
+  const report = (r) => {
+    if (r && !r.removed) { try { process.stderr.write(`codex-direct-task: scratch clone KEPT (${r.reason}): ${r.path}\n`); } catch { /* best-effort */ } }
+  };
+  const handlers = {};
+  const off = () => { for (const sig of Object.keys(handlers)) proc.removeListener(sig, handlers[sig]); };
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    handlers[sig] = () => {
+      try { report(run()); } catch { /* never throw from a signal handler */ }
+      off();
+      // We swallowed the default action by listening; restore it when nobody else is listening.
+      if (proc === process && proc.listenerCount(sig) === 0) process.kill(process.pid, sig);
+    };
+    proc.prependListener(sig, handlers[sig]);
+  }
   return {
     arm(dir, startSha) { target = { dir, startSha }; },
     setStart(startSha) { if (target) target.startSha = startSha; },
@@ -1147,7 +1156,10 @@ export async function codexDirectTask(opts = {}) {
   try {
     report = await runCodexDirectTask({ ...opts, scratchGuard: guard });
   } catch (error) {
-    guard.finish();
+    const cleanup = guard.finish();
+    if (cleanup && !cleanup.removed && error && typeof error === 'object') {
+      try { error.scratchCleanup = cleanup; error.message += ` [scratch clone KEPT (${cleanup.reason}): ${cleanup.path}]`; } catch { /* frozen error */ }
+    }
     throw error;
   }
   const cleanup = guard.finish();
@@ -1226,11 +1238,11 @@ async function runCodexDirectTask({
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
     scratch = await setupScratchClone({
-      repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
+      repoRoot, mkTempDir: (prefix) => { const d = mkTempDir(prefix); scratchGuard?.arm(d); return d; },
+      execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
-    scratchGuard?.arm(scratch.dest);
   } else if (!existsFn(targetDir)) {
     throw new Error(`codex-direct-task: --dir=${targetDir} does not exist`);
   }

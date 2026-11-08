@@ -3290,6 +3290,21 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
     expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
   });
 
+  it('fails closed: no recorded baseline commit keeps even a clean clone', () => {
+    const { dir } = makeClone();
+    expect(cleanupScratchClone({ dir }).removed).toBe(false);
+    expect(statSync(dir).isDirectory()).toBe(true);
+  });
+
+  it('a signal before the baseline is recorded keeps the clone (setup phase)', () => {
+    const { dir } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir);
+    proc.emit('SIGTERM');
+    expect(statSync(dir).isDirectory()).toBe(true);
+  });
+
   it('fails closed: an unreadable status keeps the clone', () => {
     const rm = vi.fn();
     const r = cleanupScratchClone({ dir: '/nonexistent/clone', startSha: 'x', execFn: () => { throw new Error('boom'); }, rmFn: rm });
