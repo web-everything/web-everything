@@ -369,6 +369,38 @@ const gather = (rules, extra = {}) => gatherPrFacts({
 });
 const evaluated = (facts, id) => evaluatePrGates(facts).results.find((row) => row.id === id);
 
+describe('gatherPrFacts red-team publication hold', () => {
+  const GH_SUCCESS = [/commits\/a{40}\/check-runs/, JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team',
+    head_sha: HEAD, external_id: 'o/r#7', app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] })];
+  const holdEnv = (source, { hold = false } = {}) => {
+    const root = checkout({ backlog: false });
+    const runs = join(root, 'runs');
+    mkdirSync(join(root, 'red-team-status'), { recursive: true });
+    if (hold) writeFileSync(join(root, 'red-team-status', `${encodeURIComponent('o/r')}-7-${HEAD}.json.unpublished`), '{"status":"finished"}');
+    return { WE_SHARED_RUNS_DIR: runs, WE_APP_ID: '5037855', WE_RED_TEAM_GATE_SOURCE: source };
+  };
+
+  it.each(['check-run', 'both'])('a durable local hold outranks an older published success (%s)', source => {
+    const facts = gather([GH_PR, GH_SUCCESS], { env: holdEnv(source, { hold: true }) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/not confirmed published/) });
+    expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
+  });
+
+  it('a published success with no local hold passes', () => {
+    const facts = gather([GH_PR, GH_SUCCESS], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: true });
+  });
+
+  it('an unreadable local hold fails closed', () => {
+    const env = holdEnv('check-run');
+    // A file where the status directory should be makes stat fail with ENOTDIR, not ENOENT.
+    const blocker = join(env.WE_SHARED_RUNS_DIR, '..', 'blocker');
+    writeFileSync(blocker, '');
+    const facts = gather([GH_PR, GH_SUCCESS], { env: { ...env, WE_SHARED_RUNS_DIR: join(blocker, 'x', 'runs') } });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/unreadable/) });
+  });
+});
+
 describe('gatherPrFacts (injected exec)', () => {
   it('turns a PR read error into fail-closed on every merge gate', () => {
     const facts = gather([[/pr view 7 .*--json number,title/, failure('HTTP 502')]]);

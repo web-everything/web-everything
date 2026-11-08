@@ -32,6 +32,7 @@
  * Actions integration-id restriction (`--print-ruleset`).
  */
 import { readRedTeamCheckFact, readRedTeamGateSource } from './lib/red-team-check-run.mjs';
+import { readRedTeamPublicationHold } from './lib/drain-red-team-evidence.mjs';
 import { runGhSync } from './lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -178,7 +179,12 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   const pin = pinnedHeadOf(pr, { expected: expectedHeadSha, requireExpected: requireExpectedHead });
   facts.pinnedHead = pin;
   facts.redTeamGateSource = readRedTeamGateSource({ env, log: line => process.stderr.write(`${line}\n`) }).value.source;
+  // A durable local publication hold outranks any published check: a failed publication can leave an older
+  // success on GitHub. On a host without the drain's status store (CI) the hold is absent and this is a no-op.
+  const publicationHold = facts.redTeamGateSource === 'drain-scan' || pin.error ? null
+    : readRedTeamPublicationHold({ repo, pr: num, head: pin.sha, env });
   facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
+    : publicationHold ? { ok: false, reason: publicationHold }
     : readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID,
       gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
 
