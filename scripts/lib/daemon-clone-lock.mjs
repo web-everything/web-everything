@@ -223,8 +223,8 @@ export function resolveWriterPriorityAfter(env = process.env) {
   return Number.isInteger(n) && n >= 0 ? n : DEFAULT_WRITER_PRIORITY_AFTER;
 }
 
-/** Setting: the most CONSECUTIVE ticks one reader may lose to a writer claim (`writer-priority`) before it ignores
- *  the claim and takes a normal read slot (live 2026-10-07: the review daemon skipped whole ticks, back-to-back,
+/** Setting: the most CONSECUTIVE refusals (`writer-priority` or `writer-active`) before a reader ignores
+ *  writer claims and attempts a normal read slot (live 2026-10-07: the review daemon skipped whole ticks, back-to-back,
  *  while the fix daemon's claim stood). The ordinary `writer-active` refusal is untouched, so a reader still never
  *  starts inside a move (#4044). Default 2; `0` = never skip for writer priority at all. */
 export const WRITER_PRIORITY_MAX_SKIPS_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS';
@@ -246,7 +246,7 @@ function readWriterSkips(starvedRoot) {
   } catch { return {}; }
 }
 
-/** Best-effort: set one reader's consecutive writer-priority skip count (0 removes it). Returns the new count. */
+/** Best-effort: set one reader's consecutive writer refusal count (0 removes it). Returns the new count. */
 function setWriterSkips(starvedRoot, readerKey, count) {
   const m = readWriterSkips(starvedRoot);
   if (count > 0) m[readerKey] = count; else if (!(readerKey in m)) return 0; else delete m[readerKey];
@@ -418,7 +418,8 @@ export function acquireRead(root, opts = {}) {
   const nowIso = new Date(nowMs).toISOString();
 
   // Writer fairness: an effective claim refuses NEW reads regardless of reader claim age. The skip cap
-  // still guarantees a reader a turn; already-held read slots are never removed by this check.
+  // bypasses writer CLAIMS only, bounding claim-induced skips; a live writer can still delay admission
+  // (#4044). Already-held read slots are never removed by this check.
   const claim = findPriorityWriter(starvedRoot, {
     owner, nowMs, ttlMs: writerClaimTtlMs, probe, after: writerPriorityAfter,
   });
@@ -439,6 +440,7 @@ export function acquireRead(root, opts = {}) {
   };
   const refuse = (r) => {
     if (!trackStarvation) return r;
+    setWriterSkips(starvedRoot, readerKey, (readWriterSkips(starvedRoot)[readerKey] ?? 0) + 1);
     return { ...r, starved: noteReaderRefused(starvedRoot, { readerKey, owner, pid, nowMs, heldBy: r.heldBy }) };
   };
 

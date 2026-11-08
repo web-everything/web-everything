@@ -107,11 +107,15 @@ describe('symmetric reader/writer fairness', () => {
       releaseRead(f.clone, { owner: 'before-threshold', lockRoot: f.lockRoot });
       await f.train(1);
       const olderReader = [...f.pending][0];
-      expect(f.read(olderReader)).toMatchObject({ ok: false, reason: 'writer-priority' });
-      expect(f.read(olderReader)).toMatchObject({ ok: false, reason: 'writer-priority' });
+      // Its earlier active-writer refusals already consumed the skip cap.
       expect(f.read(olderReader)).toEqual({ ok: true });
-      expect(await f.write()).toMatchObject({ ok: false, reason: 'tick-in-progress', heldBy: olderReader });
       releaseRead(f.clone, { owner: olderReader, lockRoot: f.lockRoot });
+      const freshReader = 'fresh-capped-reader';
+      expect(f.read(freshReader)).toMatchObject({ ok: false, reason: 'writer-priority' });
+      expect(f.read(freshReader)).toMatchObject({ ok: false, reason: 'writer-priority' });
+      expect(f.read(freshReader)).toEqual({ ok: true });
+      expect(await f.write()).toMatchObject({ ok: false, reason: 'tick-in-progress', heldBy: freshReader });
+      releaseRead(f.clone, { owner: freshReader, lockRoot: f.lockRoot });
       expect(await f.write()).toEqual({ ok: true });
     } finally {
       vi.unstubAllEnvs();
@@ -154,6 +158,43 @@ describe('symmetric reader/writer fairness', () => {
     expect(await f.write()).toMatchObject({ ok: false, reason: 'tick-in-progress', heldBy: 'capped-reader' });
     releaseRead(f.clone, { owner: 'capped-reader', lockRoot: f.lockRoot });
     expect(await f.write()).toEqual({ ok: true });
+  });
+
+  it.each([true, false])('counts active-writer refusals toward claim bypass only when trackStarvation=%s, never reads mid-move, and resets on admission', async (trackStarvation) => {
+    const lockRoot = mkTmp('dcl-lockroot-');
+    const clone = mkTmp('dcl-clone-');
+    const common = {
+      lockRoot, probe: alwaysAlive, writerPriorityAfter: 1, writerPriorityMaxSkips: 2,
+      writerClaimTtlMs: 1000, readerPriorityAfter: 0,
+    };
+    const read = (owner, overrides = {}) => acquireRead(clone, {
+      ...common, owner, readerKey: 'reader:stable', pid: 222, nowMs: 1000, ...overrides,
+    });
+    const write = () => acquireWrite(clone, {
+      ...common, owner: 'writer-a', pid: 111, waitMs: 0, now: () => 1000,
+    });
+    expect(await write()).toEqual({ ok: true });
+    // Different process owners retain the same readerKey across restarts. Even beyond the cap,
+    // an active writer must refuse every attempt without leaving a reader slot behind.
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const result = read(`reader-${attempt}`, { trackStarvation });
+      expect(result).toMatchObject({ ok: false, reason: 'writer-active' });
+      expect(result.starved).toBe(trackStarvation ? attempt : undefined);
+      expect(inspectCloneLock(clone, { ...common, nowMs: 1000 }).readers).toEqual([]);
+    }
+    releaseWrite(clone, { owner: 'writer-a', lockRoot });
+    expect(read('blocker', { readerKey: 'reader:blocker' })).toEqual({ ok: true });
+    expect(await write()).toMatchObject({ ok: false, reason: 'tick-in-progress' });
+    expect(read('unrelated', { readerKey: 'reader:unrelated' })).toMatchObject({ ok: false, reason: 'writer-priority' });
+    if (!trackStarvation) {
+      // Untracked same-tick retries did not consume any of the two claim skips.
+      expect(read('reader-restarted')).toMatchObject({ ok: false, reason: 'writer-priority' });
+      expect(read('reader-restarted')).toMatchObject({ ok: false, reason: 'writer-priority' });
+    }
+    expect(read('reader-restarted')).toEqual({ ok: true });
+    releaseRead(clone, { owner: 'reader-restarted', lockRoot });
+    // A successful read resets the skip counter even while the writer claim remains effective.
+    expect(read('reader-restarted')).toMatchObject({ ok: false, reason: 'writer-priority' });
   });
 
   it('resets its consecutive refusal counter after a successful write acquire', async () => {
