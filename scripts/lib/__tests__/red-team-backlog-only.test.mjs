@@ -17,12 +17,18 @@ function fixture(over = {}) {
 }
 
 describe('backlog-only prep', () => {
-  it('holds when a block label arrives during the final comment read', () => {
-    let blocked = false;
-    const f = fixture({ readComments: vi.fn(() => { const was = blocked; blocked = true; return was ? [note()] : [note()]; }),
-      readLive: () => ({ headRefOid: head, labels: blocked ? ['review:prep', 'red-team:pending', 'red-team:blocked'] : ['review:prep', 'red-team:pending'] }) });
+  it('holds when a block label arrives after the last comment read', () => {
+    const calls = [];
+    let liveReads = 0;
+    const f = fixture({ readComments: () => { calls.push('comments'); return [note()]; },
+      readLive: () => {
+        const blocked = ++liveReads === 2;
+        calls.push(blocked ? 'live:blocked' : 'live:benign');
+        return { headRefOid: head, labels: [...evidence().labels, ...(blocked ? ['red-team:blocked'] : [])] };
+      }, post: vi.fn(() => calls.push('post')) });
     expect(runBacklogOnlyPrep(f)[0].action).not.toBe('clear');
-    expect(f.post).not.toHaveBeenCalled();
+    expect(calls).toEqual(['comments', 'comments', 'live:benign', 'comments', 'live:blocked']);
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
   });
   it('settles exact-head clean prep, posts the bound marker and synchronizes labels', () => {
     const f = fixture();
@@ -171,13 +177,42 @@ describe('backlog-only prep', () => {
     expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
     expect(f.post).not.toHaveBeenCalled();
   });
-  it('reads final comments, live head and labels, comments again, then posts', () => {
+  it('reads final comments, live head and labels, comments again, live again, then posts', () => {
     const order = [];
     const f = fixture({ readComments: () => { order.push('comments'); return [note()]; },
       readLive: () => { order.push('live'); return { headRefOid: head, labels: evidence().labels }; },
       post: vi.fn(() => order.push('post')) });
     expect(runBacklogOnlyPrep(f)[0].action).toBe('clear');
-    expect(order).toEqual(['comments', 'comments', 'live', 'comments', 'post']);
+    expect(order).toEqual(['comments', 'comments', 'live', 'comments', 'live', 'post']);
+  });
+  it.each([
+    ['backtick fence', '```markdown\n' + note().body + '\n```'],
+    ['tilde fence', '~~~markdown\n' + note().body + '\n~~~'],
+    ['inline code', '`\n' + note().body.split('\n')[0] + '\n`\n**Verdict: clean**'],
+    ['fenced marker with plain verdict', '```\n' + note().body.split('\n')[0] + '\n```\n**Verdict: clean**'],
+  ])('refuses prep proof present only in %s', (_name, body) => {
+    const comments = [{ ...note(), body }];
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(false);
+    const f = fixture({ readComments: () => comments });
+    expect(runBacklogOnlyPrep(f)[0].action).not.toBe('clear');
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['```', '~~~'])('accepts real prep proof after a %s fenced fake marker for another head', fence => {
+    const comments = [{ ...note(), body: `${fence}\n${note('b'.repeat(40), true).body}\n${fence}\n${note().body}` }];
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(true);
+    const f = fixture({ readComments: () => comments });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('clear');
+  });
+  it.each([
+    ['moved head', { headRefOid: 'b'.repeat(40), labels: evidence().labels }],
+    ['unreadable labels', { headRefOid: head, labels: null }],
+    ['malformed label', { headRefOid: head, labels: [...evidence().labels, {}] }],
+    ...['red-team:clear', 'red-team:unknown', 'review:changes', 'review:human'].map(label =>
+      [label, { headRefOid: head, labels: [...evidence().labels, label] }]),
+  ])('holds on %s arriving at the last live read', (_name, live) => {
+    const f = fixture({ readLive: vi.fn().mockReturnValueOnce({ headRefOid: head, labels: evidence().labels }).mockReturnValueOnce(live) });
+    expect(runBacklogOnlyPrep(f)[0].action).not.toBe('clear');
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
   });
   it('holds when trusted findings arrive on the third comment read between live read and post', () => {
     const readComments = vi.fn().mockReturnValueOnce([note()]).mockReturnValueOnce([note()])

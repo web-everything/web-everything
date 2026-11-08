@@ -43,6 +43,31 @@ export function resolveBacklogOnlyPrepSetting({ env = process.env, log = () => {
 const backlogPath = path => typeof path === 'string' && path.startsWith('backlog/')
   && !path.includes('..') && !/[\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path);
 
+// Match indexOfUnfencedLine's fence rules locally: its fencedLines helper is private.
+function maskPrepCode(body) {
+  let open = null, inComment = false;
+  const plain = body.split(/\r?\n/).map(line => {
+    if (inComment) {
+      if (line.includes('-->')) inComment = false;
+      return '';
+    }
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (open) {
+      if (m && m[1][0] === open.ch && m[1].length >= open.len && m[2].trim() === '') open = null;
+      return '';
+    }
+    if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+      open = { ch: m[1][0], len: m[1].length };
+      return '';
+    }
+    if (line.lastIndexOf('<!--') > line.lastIndexOf('-->')) inComment = true;
+    return line;
+  }).join('\n');
+  // Inline spans may cross lines; delimiters must be backtick runs of equal length.
+  return plain.replace(/(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g,
+    span => span.replace(/[^\n]/g, ' '));
+}
+
 export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } = {}) {
   const refuse = why => ({ ok: false, why });
   if (enabled !== true) return refuse('disabled');
@@ -58,7 +83,8 @@ export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } 
   if (!ns || ns.some(n => typeof n !== 'string') || !candidate(ns)) return refuse('required labels missing or unreadable');
   if (ns.some(n => ['review:changes', 'review:human', 'red-team:blocked'].includes(n))) return refuse('blocking label');
   if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string')) return refuse('comments unreadable');
-  const prior = comments.flatMap(comment => priorPrepReviews([comment])
+  const prior = comments.map(comment => ({ ...comment, body: maskPrepCode(comment.body) }))
+    .flatMap(comment => priorPrepReviews([comment])
     .filter(n => n.head === head).map(n => ({ ...n, body: comment.body })));
   if (prior.some(n => n.blocked || n.body.includes('**Verdict: findings**')))
     return refuse('trusted prep findings or blocked note for head');
@@ -109,6 +135,10 @@ function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, re
     const finalProof = backlogOnlyPrepClear({ enabled: true, head, files, comments: finalComments, labels: live.labels });
     if (!finalProof.ok) return { ...row, why: finalProof.why };
     if (redTeamForHead(finalComments, pr, head)) return { ...row, why: 'already' };
+    const finalLive = readLive(key), finalLabels = names(finalLive?.labels);
+    if (finalLive?.headRefOid !== head || !finalLabels || finalLabels.some(n => typeof n !== 'string')
+      || !candidate(finalLabels) || finalLabels.some(n => n.startsWith('red-team:') && n !== 'red-team:pending'
+        || ['review:changes', 'review:human'].includes(n))) throw Error('head or labels unsafe before post');
     // A race window between the last read and the post is inherent.
     post({ ...key, body: `${redTeamMarker(pr, head)}\n\n${REASON}` });
     syncLabels({ ...key, env, log });
