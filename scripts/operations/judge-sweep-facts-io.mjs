@@ -286,7 +286,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       try {
         const runs = findSuspendedRuns({ repo, pr: p.number, head: headSha, now: start });
         const run = runs.sort((a, b) => b.ageMs - a.ageMs)[0];
-        if (run) result.suspendedReferralRun = { runId: run.id, ageHours: run.ageMs / 3600000 };
+        if (run) result.suspendedReferralRun = { runId: run.id, ageHours: run.ageMs / 3600000, ageMinutes: run.ageMs / 60000 };
       } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
       // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
       const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));

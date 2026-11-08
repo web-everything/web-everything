@@ -254,17 +254,17 @@ export function cardOnlySkipSettlementCandidate(evidence, head) {
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/review-red-team-on-skip.json') } = {}) {
   let tool;
-  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin, referralRunExpiryHours: data.referralRunExpiryHours }; } catch { /* lower layers */ }
+  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin, referralRunExpiryMinutes: data.referralRunExpiryMinutes }; } catch { /* lower layers */ }
   const raw = env.WE_REVIEW_RED_TEAM_ON_SKIP;
   const cooldown = env.WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN;
-  const expiry = env.WE_REVIEW_RED_TEAM_ON_SKIP_REFERRAL_RUN_EXPIRY_HOURS;
+  const expiry = env.WE_REVIEW_RED_TEAM_ON_SKIP_REFERRAL_RUN_EXPIRY_MIN;
   return cascadePolicy('reviewRedTeamOnSkip', tool, {
-    env, log, standard: { enabled: true, retryCooldownMin: 30, referralRunExpiryHours: 4 },
+    env, log, standard: { enabled: true, retryCooldownMin: 30, referralRunExpiryMinutes: 45 },
     envValues: { enabled: raw === '0' ? false : raw === '1' ? true : raw || undefined,
       retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined,
-      referralRunExpiryHours: typeof expiry === 'string' && /^\d+$/.test(expiry) ? Number(expiry) : expiry || undefined },
+      referralRunExpiryMinutes: typeof expiry === 'string' && /^\d+$/.test(expiry) ? Number(expiry) : expiry || undefined },
     valid: { enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0,
-      referralRunExpiryHours: v => Number.isSafeInteger(v) && v >= 0 },
+      referralRunExpiryMinutes: v => Number.isSafeInteger(v) && v >= 0 },
   });
 }
 
@@ -654,7 +654,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
     const at = now();
-    const resolvedSetting = setting ? { value: setting, sources: { referralRunExpiryHours: 'injected' } }
+    const resolvedSetting = setting ? { value: setting, sources: { referralRunExpiryMinutes: 'injected' } }
       : resolveReviewRedTeamOnSkip({ env, log: note });
     const resolved = resolvedSetting.value;
     const refusals = plan?.refusals ?? [];

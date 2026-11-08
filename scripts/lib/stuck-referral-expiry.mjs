@@ -1,10 +1,13 @@
 /**
  * Close only stale mandatory-referral suspensions, without deciding or applying anything.
+ * mandatoryReferrals writes pending and exits: suspension is idle by design until --resume.
+ * Without owner fields or a live process bound to the run id, a suspended run is provably idle.
  * A verdict-less terminal run becomes abandoned to drain-red-team-evidence after its
  * ABANDONED_REVIEW_AFTER_MS quiet horizon (60 minutes after this write). Until then it holds.
  * Unknown evidence holds for operator inspection; scans over 10,000 records also refuse.
  */
 import { statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { listRunIds, readRun, writeRun, runPath, sharedRunsDir, resolveRunsDir, isRunRecordTerminal } from '../operations/run-store.mjs';
 import { validateRunRecord } from '../operations/run-record.mjs';
@@ -15,7 +18,11 @@ import { resolveReviewRedTeamOnSkip } from './review-red-team-on-skip.mjs';
 const suspended = run => run?.op === 'review-pr'
   && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
 const stamp = value => typeof value === 'number' ? value : Date.parse(value);
+const isRunBound = runId => execFileSync('ps', ['-axo', 'command'], {
+  encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024,
+}).includes(runId);
 const defaultProbe = () => ({
+  isRunBound,
   host: hostname(), namespace: pidNamespace(), readPidStart: pidStartTime,
   isAlive: pid => {
     try { process.kill(pid, 0); return true; }
@@ -72,7 +79,7 @@ export function findSuspendedReferralRuns({ repo, pr, head, now = Date.now(), ..
 }
 
 /** Pure policy over a scan observation; injected probes do not apply effects. */
-export function planReferralExpiry(observation, { now = Date.now(), deadlineMs, live, probe } = {}) {
+export function planReferralExpiry(observation, { now = Date.now(), deadlineMs, live, probe = defaultProbe() } = {}) {
   const hold = why => ({ action: 'hold', why });
   const run = observation?.run ?? observation;
   const ageMs = observation?.ageMs ?? now - observation?.mtimeMs;
@@ -111,7 +118,12 @@ export function planReferralExpiry(observation, { now = Date.now(), deadlineMs, 
       if (alive !== false) return hold('session probe unreadable');
     } catch { return hold('session probe unreadable'); }
   }
-  return { action: 'expire', why: `expired: no referral ruling within ${deadlineMs / 3600000}h` };
+  try {
+    const bound = probe?.isRunBound?.(run.id);
+    if (bound === true) return hold('run bound to live process');
+    if (bound !== false) return hold('run owner unreadable');
+  } catch { return hold('run owner unreadable'); }
+  return { action: 'expire', why: `expired: no referral ruling within ${deadlineMs / 60000}m` };
 }
 
 /** Re-read the entire witness, then plan and write that same record synchronously. */
@@ -138,20 +150,20 @@ export function expireSuspendedReferralRun({ runId, deadlineMs, source = 'standa
 }
 
 export function expireStuckReferralRuns({ repo, pr, head, setting, env = process.env, now = Date.now(), log = () => {}, ...io } = {}) {
-  const resolved = setting?.value ? setting : setting ? { value: setting, sources: { referralRunExpiryHours: 'injected' } }
+  const resolved = setting?.value ? setting : setting ? { value: setting, sources: { referralRunExpiryMinutes: 'injected' } }
     : resolveReviewRedTeamOnSkip({ env, log });
-  const hours = resolved.value.referralRunExpiryHours;
-  if (!Number.isSafeInteger(hours) || hours <= 0 || !Number.isSafeInteger(hours * 3600000)) return { expired: false, why: 'expiry disabled or invalid' };
-  const source = resolved.sources?.referralRunExpiryHours ?? 'injected';
+  const minutes = resolved.value.referralRunExpiryMinutes;
+  if (!Number.isSafeInteger(minutes) || minutes <= 0 || !Number.isSafeInteger(minutes * 60000)) return { expired: false, why: 'expiry disabled or invalid' };
+  const source = resolved.sources?.referralRunExpiryMinutes ?? 'injected';
   const options = { runsDir: env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env), ...io, repo, pr, head, now };
   const held = [];
   let runs;
   try { runs = findSuspendedReferralRuns(options); }
   catch { return { expired: false, held: [{ why: 'run evidence unreadable; inspect run store' }] }; }
   for (const run of runs) {
-    const result = expireSuspendedReferralRun({ ...options, runId: run.id, deadlineMs: hours * 3600000, source });
+    const result = expireSuspendedReferralRun({ ...options, runId: run.id, deadlineMs: minutes * 60000, source });
     if (result.expired) {
-      log(`stuck-referral-expiry: ${repo}#${pr} run=${run.id} expired deadline=${hours}h source=${source}`);
+      log(`stuck-referral-expiry: ${repo}#${pr} run=${run.id} expired deadline=${minutes}m source=${source}`);
     } else held.push(result);
   }
   if (runs.length === 0 || held.length > 0) return { expired: false, held };
@@ -159,7 +171,7 @@ export function expireStuckReferralRuns({ repo, pr, head, setting, env = process
   let otherBlockers;
   try {
     otherBlockers = readRunRecords(options).filter(({ id, run, mtimeMs }) => {
-      if (expiredIds.has(id) || !matchesReview(run, { repo, pr, head })) return false;
+      if (expiredIds.has(id) || !matchesReview(run, { repo, pr, head: undefined })) return false;
       const abandoned = run.verdict == null && run.resumeOf == null && isRunRecordTerminal(run)
         && now - mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
       return !abandoned && (run.verdict == null || run.pending != null
