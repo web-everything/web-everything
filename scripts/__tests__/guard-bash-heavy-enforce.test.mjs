@@ -138,6 +138,11 @@ describe('heavy-enforce — every direct test run requires admission', () => {
       expect(decide(`${wrapper} ${run}`, {}), `${wrapper} ${run}`).toMatch(/heavy-enforce|heavy-command admission queue/);
     }
   });
+  // Self-review of review #6461 round 6: a leading `--` ends eval's options, so `eval -- <heavy>` runs the heavy run.
+  it.each(['npx vitest run a', 'npm test', 'npx playwright test a', 'node --test a.test.mjs'])('denies `eval -- %s`', run => {
+    expect(decide(`eval -- ${run}`, {})).not.toBeNull();
+    expect(decide(`eval -- '${run}'`, {})).not.toBeNull();
+  });
   it.each(execWrappers.filter(wrapper => !/^(?:nohup|setsid)$/.test(wrapper)))('allows the admitted run behind `%s`', wrapper => {
     expect(decide(`${wrapper} ${queue}npx vitest run a`, {})).toBeNull();
   });

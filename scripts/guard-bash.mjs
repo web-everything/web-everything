@@ -1613,8 +1613,8 @@ export function nestedCommandStrings(segment) {
   const words = headWords(cmd);
   const prog = words.length ? words[0].text : '';
   if (prog === 'eval') {
-    // bash concatenates eval's arguments with a space and executes the result.
-    reexec(words.slice(1).map(asShellSees).join(' '));
+    // bash concatenates eval's arguments with a space and executes the result; a leading `--` ends eval's options.
+    reexec(words.slice(words[1]?.text === '--' ? 2 : 1).map(asShellSees).join(' '));
   } else if (SHELL_PROGRAMS.has(prog)) {
     for (let i = 1; i < words.length; i++) {
       const w = words[i].text;
@@ -3736,7 +3736,8 @@ function heavyRunAlias(head) {
     while (w[i]?.startsWith('-')) { i += 1; if (w[i - 1] === '--') break; }
     return words[i] ? head.slice(words[i].start) : null;
   }
-  if (w[0] === 'eval' && words[1]) return w.slice(1).join(' ');
+  // A leading `--` ends eval's options (`eval -- npm test` runs `npm test`, self-review of review #6461 round 6).
+  if (w[0] === 'eval') { const k = w[1] === '--' ? 2 : 1; return words[k] ? w.slice(k).join(' ') : null; }
   // A case-insensitive filesystem (macOS) runs `NPM test` as npm.
   if (/^(?:npm|pnpm|yarn|bun|npx|node|vitest|corepack)$/i.test(w[0] || '') && w[0] !== w[0].toLowerCase()) return w[0].toLowerCase() + rest(1);
   // npm options that take a separate value (`npm --loglevel silent test`, `npm --tag x test`). Any non-flag word

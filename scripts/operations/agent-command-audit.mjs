@@ -29,15 +29,18 @@ const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|passphrase|pass(?:
 // (`docker login -p v`, `redis-cli -a v`, `zip -P v f`, `ssh-keygen -N v`, `gh secret set X -b v`, `curl -b c=v`).
 // A program or keyword word may be quoted whole or in part (`'docker' login`, `"/usr/bin/gh" secret set`,
 // `my"sql"`, `htpass'wd'`, `npm 'config' set`): the shell reads the same word, so each name is matched through
-// `quotedWord`, which allows up to 3 quote or escape characters between its letters (review #6461 r6).
-const QUOTES = String.raw`["'\\]{0,3}`;
+// `quotedWord`, which allows any run of quote or escape characters between its letters (review #6461 r6). Each run
+// sits between two literal letters (or a letter and a space), so it is matched one way only and stays linear.
+const QUOTES = String.raw`["'\\]*`;
 const quotedWord = (...names) => `(?:${names.map(name => [...name].map(c => c.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')).join(QUOTES)).join('|')})`;
 // The space between two words of one program (`docker login`); an escaped space would join them into one word.
-const NEXT_WORD = String.raw`["']{0,3}\s+${QUOTES}`;
+const NEXT_WORD = String.raw`["']*\s+${QUOTES}`;
 // A program name starts its word: no word character, `.` or `-` before it, even behind quotes (`x'htpasswd'`,
 // `my-'mysql'` are other words). It ends its word, past any closing quotes, so the match ends where the operands start.
-const WORD_START = String.raw`(?<![\w.-]${QUOTES})`;
-const WORD_END = String.raw`["']{0,3}(?=\s|$)`;
+// The look-behind checks at most 3 quotes, so it costs O(1) at every start position; a word with more quotes before
+// the name (`x''''mysql`) is read as the program, which only redacts more (fail closed).
+const WORD_START = String.raw`(?<![\w.-]["'\\]{0,3})`;
+const WORD_END = String.raw`["']*(?=\s|$)`;
 const GH_SECRET_SET = `${quotedWord('gh')}${NEXT_WORD}${quotedWord('secret')}${NEXT_WORD}${quotedWord('set')}`;
 const SECRET_SHORT_OPTIONS = [
   [`(?:${quotedWord('docker', 'podman', 'nerdctl', 'buildah', 'skopeo')}|${quotedWord('helm')}${NEXT_WORD}${quotedWord('registry')})${NEXT_WORD}${quotedWord('login')}`
@@ -63,8 +66,10 @@ const HTPASSWD_PROGRAM = new RegExp(`${WORD_START}${quotedWord('htpasswd')}${WOR
 // `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
 // `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key. The
 // keywords and options may be quoted (`npm 'config' set`, `aws configure 'set'`, `'--location=user'`).
-const CONFIG_KEY = new RegExp(String.raw`(?<![\w-]${QUOTES})${quotedWord('config')}(?:${QUOTES}${quotedWord('ure')})?${NEXT_WORD}`
-  + String.raw`(?:${quotedWord('set', 'add')}${NEXT_WORD})?(?:-[\w-]+(?:=\S*?)?["']{0,3}\s+["']{0,3})*([^\s=-][^\s=]*)()(?=\s)`, 'g');
+// Every quote run is followed by a literal (a keyword letter or `-`), never by another class that could take the
+// same quotes, so a failed match backtracks linearly (self-review: a shared run made `-a=''' ` ×14 take seconds).
+const CONFIG_KEY = new RegExp(String.raw`(?<![\w-]["'\\]{0,3})${quotedWord('config')}(?:${QUOTES}${quotedWord('ure')})?["']*\s+`
+  + String.raw`(?:${QUOTES}${quotedWord('set', 'add')}["']*\s+)?(?:["']*-[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)`, 'g');
 const configKeyIsCredential = key => CREDENTIAL_ASSIGNMENT.test(key.split(/[/:.]/).filter(Boolean).pop() || '');
 // JSON / object-literal members whose name is a credential (`{"password":"v"}`, `{\"api_key\": \"v\"}`, `pin: 1234`).
 // The name may be unquoted (`{password: "v"}`, `{ pin: 1234 }`); a name start is anchored, so it stays linear.
@@ -215,10 +220,38 @@ function redactShortPasswords(text) {
     // The program is read without its quotes and escapes (`my"sql"'` is mysql), as each name pattern allows.
     const program = m[0].replace(/["'\\]/g, '');
     const letters = SECRET_SHORT_OPTIONS.filter(([re]) => new RegExp(`^(?:${re.source})$`).test(program)).map(([, l]) => l).join('');
-    // The value is glued on when a non-space follows the letter (`-pv`, `-p=v`).
-    out += text.slice(last, from) + redactOptionValues(segment, new RegExp(`(?<!\\S)-([${letters}])(=?)`, 'g'), () => true,
-      { attached: (o, at) => !/^\s?$/.test(segment[at] ?? ''), replacement: o => `-${o[1]} [REDACTED]` });
+    // The value is glued on when the option word holds more than the letter (`-pv`, `-p=v`, `'-p'v`).
+    out += text.slice(last, from) + redactOptionWords(segment, new RegExp(`^-([${letters}])=?`), o => `-${o[1]} [REDACTED]`);
     last = SECRET_SHORT_PROGRAMS.lastIndex = end;
+  }
+  return out + text.slice(last);
+}
+
+/** Redact an option's value where the option word may be quoted whole or in part (`'-p'v`, `"-pv"`, `-'p'v`,
+ *  `\-pv`, `"--body" v`, self-review of review #6461 r6): `option` (anchored, not global) is tested on each shell
+ *  word with its quotes and escapes removed. A word holding more than the option is the option with its value
+ *  attached, redacted whole; otherwise the next word is the value (an empty quoted word takes one more). Linear. */
+function redactOptionWords(text, option, replacement) {
+  let out = '', last = 0;
+  for (let i = 0; i < text.length;) {
+    if (/\s/.test(text[i])) { i += 1; continue; }
+    let end = Math.max(shellWordEnd(text, i), i + 1); // a lone `(`, `)`, `<`, `>` is one character
+    const word = text.slice(i, end).replace(/["'\\]/g, '');
+    const m = option.exec(word);
+    if (m) {
+      for (let words = 0; words < 2 && word.length === m[0].length; words += 1) {
+        let at = end;
+        while (/\s/.test(text[at] || '')) at += 1;
+        if (at === end) break;
+        const wordEnd = shellWordEnd(text, at);
+        if (wordEnd === at) break;
+        end = wordEnd;
+        if (!EMPTY_WORD.test(text.slice(at, wordEnd))) break;
+      }
+      out += text.slice(last, i) + replacement(m);
+      last = end;
+    }
+    i = end;
   }
   return out + text.slice(last);
 }
@@ -258,8 +291,9 @@ function redactPositionalSecrets(text) {
   // `gh secret set X … --body v` up to the end of its segment, found quote-aware (`--repo 'a;b' --body v`).
   for (let m; (m = SECRET_LONG_OPTIONS.exec(configured));) {
     const from = SECRET_LONG_OPTIONS.lastIndex, end = shellSegmentEnd(configured, from);
-    body += configured.slice(last, from) + redactOptionValues(configured.slice(from, end), /(?<!\S)(--body)(?![\w-])(=?)/g,
-      () => true, { replacement: o => '--body [REDACTED]' });
+    // `--body v`, `--body=v`, `"--body" v`, `--'body'=v`; `--body-file f` is another option.
+    body += configured.slice(last, from) + redactOptionWords(configured.slice(from, end), /^--body(?:=|(?![\w-]))/,
+      () => '--body [REDACTED]');
     last = SECRET_LONG_OPTIONS.lastIndex = Math.max(end, from);
   }
   body += configured.slice(last);
