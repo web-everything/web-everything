@@ -1042,9 +1042,10 @@ export function createReviewPrSinks({
   };
   // Supersede any same-head success before acceptance can become visible. A failed publication is
   // provably before acceptance writes, so leave the effect retryable on resume.
-  // Post only when a red-team pass will finish the check: the pass refuses a head that already carries a trusted
-  // result (`review-extra-seats.mjs`, the same `redTeamForHead` test), so a pending check there would never
-  // complete. That result is final for the head, so the barrier has nothing to supersede. An unreadable or
+  // Post only when a red-team pass will finish the check. A head that already carries a trusted result keeps it:
+  // the pass's recovery guard refuses that head, and its duplicate check (`redTeamCommentPosted`, which reads the
+  // complete thread too) posts no second result, so a pending check there would never complete and the result is
+  // final for the head, leaving the barrier nothing to supersede. An unreadable or
   // incomplete thread proves nothing either way: refuse before any write and leave the effect retryable.
   const postPendingRedTeam = async (payload, liveState) => {
     const { repo, pr, reviewedHead: headSha } = payload;

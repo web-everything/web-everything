@@ -1741,6 +1741,40 @@ describe('#6535 publish-first: a red-team round starts only after its in_progres
     await spec(io);
     expect(released).toHaveLength(1);
   });
+  // Round 2 self-review: the review barrier skips its pending check when the COMPLETE thread holds this head's
+  // result, so the pass's duplicate check must see a result past the first 100 comments too.
+  function withFakeGhComments(count, check) {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-paged-comments-'));
+    try {
+      const page = Array.from({ length: count }, (_, i) => ({ author: { login: 'someone' }, body: `comment ${i}` }));
+      writeFileSync(join(dir, 'comments.json'), JSON.stringify({ comments: page }));
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+if (args[0] === 'pr' && args[1] === 'view' && args.includes('comments')) fs.writeFileSync(1, fs.readFileSync(path.join(__dirname, 'comments.json')));
+else process.exitCode = 1;
+`, { mode: 0o755 });
+      return check({ env: { PATH: dir }, page });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  it('the real listComments re-reads a full first page through the complete reader', () => withFakeGhComments(100, ({ env, page }) => {
+    const complete = [...page, { author: { login: 'web-everything' }, body: 'late result' }];
+    const readCompleteComments = vi.fn(() => complete);
+    const io = createRedTeamIo({ env, readCompleteComments });
+    expect(io.listComments({ pr: 5, repo: REPO })).toBe(complete);
+    expect(readCompleteComments).toHaveBeenCalledWith({ pr: 5, repo: REPO });
+    expect(io.readRecoveryComments).toBe(readCompleteComments);
+  }));
+  it('the real listComments keeps a short page and never pays the complete read', () => withFakeGhComments(99, ({ env, page }) => {
+    const readCompleteComments = vi.fn();
+    expect(createRedTeamIo({ env, readCompleteComments }).listComments({ pr: 5, repo: REPO })).toEqual(page);
+    expect(readCompleteComments).not.toHaveBeenCalled();
+  }));
+  it('the real listComments surfaces a failed complete read instead of a partial page', () => withFakeGhComments(100, ({ env }) => {
+    const io = createRedTeamIo({ env, readCompleteComments: () => { throw new Error('complete comments read did not match a valid GraphQL totalCount'); } });
+    expect(() => io.listComments({ pr: 5, repo: REPO })).toThrow(/totalCount/);
+  }));
   it('the real io wrapper refuses a running status whose publication failed', () => {
     const recordStatus = vi.fn(() => ({ published: false, reason: 'outage' }));
     const io = createRedTeamIo({ env: {}, recordStatus });
