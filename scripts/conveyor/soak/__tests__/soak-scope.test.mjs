@@ -107,4 +107,18 @@ describe('soak scope', () => {
     expect(closure.has('fixture/c.mjs')).toBe(true);
     expect(closure.has('fixture/d.mjs')).toBe(false);
   });
+  it('follows literal repo-path spawn/read targets and their imports', () => {
+    const root = fixtureRoot();
+    writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs',
+      "spawnSync('node', ['scripts/tools-lit/runner.mjs']);\n");
+    writeFixture(root, 'scripts/tools-lit/runner.mjs', "import './helper.mjs';\n");
+    writeFixture(root, 'scripts/tools-lit/helper.mjs', 'export const h = 1;\n');
+    writeFixture(root, 'scripts/tools-lit/other.mjs', 'export const o = 1;\n');
+
+    const closure = computeSoakClosure({ root });
+    expect(closure.has('scripts/tools-lit/runner.mjs')).toBe(true);
+    expect(closure.has('scripts/tools-lit/helper.mjs')).toBe(true);
+    expect(closure.has('scripts/tools-lit/other.mjs')).toBe(false);
+  });
 });

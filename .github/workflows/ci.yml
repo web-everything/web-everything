@@ -511,7 +511,7 @@ jobs:
   # 50-tick baseline PLUS all 18 break scenarios serially: 10-12min when daemon code changed — the slowest job in
   # CI (`test` runs 4-6min) — and growing by one scenario every time a new live daemon break gets a regression
   # test. Now three jobs:
-  #   job `daemon-soak-scope` — the path-touch check, run ONCE (not per-shard) so the ~10s no-daemon-code skip
+  #   job `daemon-soak-scope` — legacy paths OR derived soak import/literal-path closure, run ONCE (not per-shard) so the ~10s no-daemon-code skip
   #                 stays exactly as cheap as it was in the single-job version.
   #   job `soak-shard`  — an 8-way matrix (`scripts/conveyor/soak/shard-files.mjs`): shard 1 is ALWAYS the 50-tick
   #                 baseline alone (it dwarfs any one break scenario, so a blind file-count split would strand it
@@ -537,6 +537,9 @@ jobs:
       - name: Fetch main history (blobless)
         run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
 
+      - name: Check soak scope safeguards (Node builtins only)
+        run: node scripts/conveyor/soak/soak-scope.mjs --self-test
+
       - name: Does this PR touch daemon code?
         id: scope
         env:
@@ -548,7 +551,8 @@ jobs:
           # --no-renames preserves the source path when daemon code is moved outside the scope.
           changed="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
           hits="$(printf '%s\n' "$changed" | grep -E '^(skills-src/conveyor/|scripts/conveyor/|scripts/lib/daemon-|scripts/lib/gh-app-shim|scripts/lib/main-staleness|scripts/lane-pool|scripts/review-set-label\.mjs$|scripts/operations/[^/]*dispatch[^/]*$|vitest\.soak\.config\.ts$)' || true)"
-          if [ -n "$hits" ]; then
+          derived="$(printf '%s\n' "$changed" | node scripts/conveyor/soak/soak-scope.mjs)" || derived="run=true"
+          if [ -n "$hits" ] || [ "$derived" != "run=false" ]; then
             echo "Daemon code touched — running the soak:"; printf '  %s\n' $hits
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
