@@ -3,8 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
-import { runBacklogOnlyPrep } from './red-team-backlog-only.mjs';
-import { readHumanSurfaceNetFiles } from './human-surface-net-diff.mjs';
+import { runBacklogOnlyPrep, readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
@@ -580,7 +579,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       exec: (_file, args, options) => runGhSync(args, { ...options, env }) }),
   readHeadFiles = key => isUnderTest() || isUnderTest(env)
     ? rawPrs?.find(raw => Number(raw.number) === Number(key.number))?.netFiles
-    : readHumanSurfaceNetFiles(key),
+    : readBacklogOnlyNetFiles(key),
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
   readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus

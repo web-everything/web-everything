@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { backlogOnlyPrepClear, resolveBacklogOnlyPrepSetting, runBacklogOnlyPrep } from '../red-team-backlog-only.mjs';
-import { readHumanSurfaceNetFiles } from '../human-surface-net-diff.mjs';
+import { backlogOnlyPrepClear, parseNameStatusZ, readBacklogOnlyNetFiles, resolveBacklogOnlyPrepSetting, runBacklogOnlyPrep } from '../red-team-backlog-only.mjs';
+import { gitExec, defaultGitDirFor } from '../../operations/free-scope-io.mjs';
 import { redTeamMarker } from '../red-team-gate.mjs';
 import * as policy from '../policy-cascade.mjs';
 
-vi.mock('../human-surface-net-diff.mjs', () => ({ readHumanSurfaceNetFiles: vi.fn() }));
+vi.mock('../../operations/free-scope-io.mjs', () => ({
+  gitExec: vi.fn(() => () => { throw Error('unexpected git IO'); }), defaultGitDirFor: vi.fn(() => null),
+}));
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), runGhSync: vi.fn(() => { throw Error('unexpected GitHub IO'); }),
 }));
@@ -33,12 +35,15 @@ describe('R756 backlog-only exact-head exemption', () => {
     expect(f.syncLabels).toHaveBeenCalledOnce();
     expect(f.rawPrs[0].labels).toEqual(labels);
   });
-  it('defaults to the shared net-diff reader pinned to the exact head', () => {
-    vi.mocked(readHumanSurfaceNetFiles).mockReturnValue(net());
+  it('defaults to the strict reader pinned to the exact head', () => {
+    const io = gitFixture();
+    vi.mocked(gitExec).mockReturnValueOnce(io.git);
+    vi.mocked(defaultGitDirFor).mockReturnValueOnce('fixture-checkout');
     const f = fixture({ readHeadFiles: undefined });
     expect(runBacklogOnlyPrep(f)[0].action).toBe('clear');
-    expect(readHumanSurfaceNetFiles).toHaveBeenCalledWith({ repo, number: pr, headRefOid: head });
+    expect(io.git).toHaveBeenCalledWith('fixture-checkout', ['merge-base', '--end-of-options', 'origin/main', head]);
   });
+  it('holds without a local checkout', () => held(fixture({ readHeadFiles: undefined })));
   it('accepts a complete net list beyond the removed GitHub pagination limit', () => {
     const f = fixture({ readHeadFiles: () => ({ ok: true, files: Array(3001).fill('backlog/a') }) });
     expect(runBacklogOnlyPrep(f)[0].action).toBe('clear');
@@ -141,5 +146,77 @@ describe('backlog-only setting', () => {
     vi.spyOn(policy, 'readPlatformPreferences').mockReturnValue({ prefs: { redTeam: { skipBacklogOnlyPrep: false } }, errors: [] });
     expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile: () => '{}' })).toEqual({ enabled: false });
     expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile: () => '{"redTeam":{"skipBacklogOnlyPrep":true}}' })).toEqual({ enabled: true });
+  });
+});
+
+const base = 'b'.repeat(40);
+function gitFixture({ raw = 'M\0backlog/a.md\0', fails, missing = false } = {}) {
+  return { gitDirFor: () => 'fixture-checkout', git: vi.fn((_dir, args) => {
+    if (args[0] === fails || (missing && args[0] === 'cat-file')) throw Error('git failed');
+    if (args[0] === 'merge-base') return `${base}\n`;
+    if (args[0] === 'diff') return raw;
+    return '';
+  }) };
+}
+describe('strict backlog-only net evidence', () => {
+  it.each([
+    ['trailing status', 'M\0backlog/a\0M\0'],
+    ['unterminated path', 'M\0backlog/a'],
+    ['odd fields', 'M\0backlog/a\0A\0backlog/b\0D\0'],
+    ['empty path', 'M\0\0'], ['empty status', '\0backlog/a\0'],
+    ...['R', 'R100', 'C', 'U', 'X', 'B', 'MM', 'M\n'].map(status => [status, `${status}\0backlog/a\0`]),
+    ['empty stream', ''], ['non-string', null],
+  ])('rejects %s', (_name, raw) => expect(parseNameStatusZ(raw)).toEqual({ ok: false }));
+  it('accepts complete known status records without filtering fields', () => {
+    expect(parseNameStatusZ('M\0backlog/a.md\0A\0backlog/b.md\0')).toEqual({ ok: true, files: ['backlog/a.md', 'backlog/b.md'] });
+    expect(parseNameStatusZ('D\0backlog/a\0T\0backlog/b\0').ok).toBe(true);
+  });
+  it('fetches current main and diffs the exact head with strict git flags', () => {
+    const io = gitFixture({ missing: true });
+    expect(readBacklogOnlyNetFiles({ repo, number: pr, headRefOid: head }, io)).toEqual({ ok: true, files: ['backlog/a.md'] });
+    expect(io.git.mock.calls).toEqual([
+      ['fixture-checkout', ['cat-file', '-e', `${head}^{commit}`]],
+      ['fixture-checkout', ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', 'origin', '+refs/heads/main:refs/remotes/origin/main', `refs/pull/${pr}/head`]],
+      ['fixture-checkout', ['merge-base', '--end-of-options', 'origin/main', head]],
+      ['fixture-checkout', ['diff', '--no-ext-diff', '--no-renames', '--name-status', '-z', '--end-of-options', base, head]],
+    ]);
+  });
+  it.each(['fetch', 'merge-base', 'diff'])('holds on %s failure without cached-base fallback', fails => {
+    const io = gitFixture({ fails });
+    held(fixture({ readHeadFiles: key => readBacklogOnlyNetFiles(key, io) }));
+    if (fails === 'fetch') expect(io.git.mock.calls.some(([, args]) => args[0] === 'diff')).toBe(false);
+  });
+  it.each(['M\0backlog/a\0M\0', 'M\0backlog/a'])('never posts with truncated git stdout %j', raw => {
+    held(fixture({ readHeadFiles: key => readBacklogOnlyNetFiles(key, gitFixture({ raw })) }));
+  });
+  it('holds on invalid merge-base output', () => {
+    const io = gitFixture(); io.git.mockImplementation((_dir, args) => args[0] === 'merge-base' ? 'invalid' : '');
+    expect(readBacklogOnlyNetFiles({ repo, number: pr, headRefOid: head }, io).ok).toBe(false);
+  });
+});
+describe('strict backlog-only setting values', () => {
+  it.each(['tool', 'env'])('disables and sanitises logged invalid %s values even with another layer on', layer => {
+    vi.spyOn(policy, 'readPlatformPreferences').mockReturnValue({ prefs: {}, errors: [] });
+    for (const value of ['off', 2, null, {}, 'bad\n\u001bvalue']) {
+      const log = vi.fn();
+      const env = { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: layer === 'env' ? value : '1' };
+      const readFile = () => JSON.stringify({ redTeam: { skipBacklogOnlyPrep: layer === 'tool' ? value : true } });
+      expect(resolveBacklogOnlyPrepSetting({ env, readFile, log })).toEqual({ enabled: false });
+      expect(log).toHaveBeenCalledWith(expect.stringContaining(layer));
+      expect(log).toHaveBeenCalledWith(expect.stringContaining(`invalid ${layer} skipBacklogOnlyPrep=${JSON.stringify(value)}`));
+      expect(log.mock.calls.flat().join('')).not.toMatch(/[\n\u001b]/);
+    }
+  });
+  it.each([[true, true], [false, false], ['1', true], ['0', false]])('accepts tool value %j', (value, enabled) => {
+    vi.spyOn(policy, 'readPlatformPreferences').mockReturnValue({ prefs: {}, errors: [] });
+    expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile: () => JSON.stringify({ redTeam: { skipBacklogOnlyPrep: value } }) })).toEqual({ enabled });
+  });
+  it.each([true, false, 'TRUE', 'FaLsE'])('accepts env boolean %j', value => {
+    vi.spyOn(policy, 'readPlatformPreferences').mockReturnValue({ prefs: {}, errors: [] });
+    expect(resolveBacklogOnlyPrepSetting({ env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: value }, readFile: () => '{}' })).toEqual({ enabled: String(value).toLowerCase() === 'true' });
+  });
+  it('defaults true when the tool file is absent', () => {
+    vi.spyOn(policy, 'readPlatformPreferences').mockReturnValue({ prefs: {}, errors: [] });
+    expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile: () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); } })).toEqual({ enabled: true });
   });
 });

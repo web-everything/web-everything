@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
-import { readHumanSurfaceNetFiles } from './human-surface-net-diff.mjs';
+import { gitExec, defaultGitDirFor } from '../operations/free-scope-io.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 
@@ -13,20 +13,28 @@ const settingPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/r
 const clean = value => String(value?.message ?? value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 const names = labels => Array.isArray(labels) ? labels.map(l => typeof l === 'string' ? l : l?.name) : null;
 const candidate = labels => labels?.includes('review:prep') && labels.includes('red-team:pending');
-const booleanEnv = value => /^(1|true)$/i.test(value ?? '') ? true : /^(0|false)$/i.test(value ?? '') ? false : undefined;
+const settingBoolean = (value, source, allowWords = false) => {
+  if (value === undefined) return undefined;
+  if (typeof value === 'boolean') return value;
+  if (value === '1') return true;
+  if (value === '0') return false;
+  if (allowWords && typeof value === 'string' && /^(true|false)$/i.test(value)) return value.toLowerCase() === 'true';
+  throw Error(`invalid ${source} skipBacklogOnlyPrep=${JSON.stringify(value)}`);
+};
 const safeLog = log => line => { try { log(clean(line)); } catch { /* diagnostic only */ } };
 
 export function resolveBacklogOnlyPrepSetting({ env = process.env, log = () => {}, readFile = readFileSync } = {}) {
-  const envValue = booleanEnv(env?.WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP);
   try {
+    const envValue = settingBoolean(env?.WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP, 'env', true);
     let tool;
     try { tool = JSON.parse(readFile(settingPath, 'utf8'))?.redTeam?.skipBacklogOnlyPrep; }
     catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    tool = settingBoolean(tool, 'tool');
     // platformPreference discards read errors; this exemption needs the complete evidence.
     const { prefs, errors } = readPlatformPreferences({ env, readFile });
     if (errors.length) throw Error(`platform preferences unreadable: ${errors.join('; ')}`);
     const resolved = cascadePolicy('redTeamSkipBacklogOnlyPrep', { skipBacklogOnlyPrep: tool }, {
-      standard: { skipBacklogOnlyPrep: true }, platform: { skipBacklogOnlyPrep: prefs.redTeam?.skipBacklogOnlyPrep },
+      standard: { skipBacklogOnlyPrep: true }, platform: { skipBacklogOnlyPrep: settingBoolean(prefs.redTeam?.skipBacklogOnlyPrep, 'platform') },
       envValues: { skipBacklogOnlyPrep: envValue },
       valid: v => typeof v === 'boolean', env, log: safeLog(log),
     });
@@ -36,6 +44,38 @@ export function resolveBacklogOnlyPrepSetting({ env = process.env, log = () => {
     safeLog(log)(`red-team: backlog-only prep enabled=false (fail-closed): ${clean(error)}`);
     return { enabled: false };
   }
+}
+
+/** Parse raw --no-renames --name-status -z output without repairing incomplete evidence. */
+export function parseNameStatusZ(raw) {
+  if (typeof raw !== 'string' || !raw.endsWith('\0')) return { ok: false };
+  const fields = raw.slice(0, -1).split('\0');
+  if (fields.length % 2 || fields.some(field => field === '')) return { ok: false };
+  const files = [];
+  for (let i = 0; i < fields.length; i += 2) {
+    if (fields[i].length !== 1 || !/^[AMDT]$/.test(fields[i])) return { ok: false };
+    files.push(fields[i + 1]);
+  }
+  return { ok: true, files };
+}
+
+/** Fetch current main; a failed fetch or incomplete net list always retains manual review. */
+export function readBacklogOnlyNetFiles({ repo, number, headRefOid }, {
+  git = gitExec(), gitDirFor = defaultGitDirFor,
+} = {}) {
+  try {
+    const dir = gitDirFor(repo);
+    if (!dir || !Number.isInteger(number) || number <= 0
+      || typeof headRefOid !== 'string' || !/^[0-9a-f]{40}$/i.test(headRefOid)) return { ok: false };
+    let missing = false;
+    try { git(dir, ['cat-file', '-e', `${headRefOid}^{commit}`]); } catch { missing = true; }
+    git(dir, ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', 'origin',
+      '+refs/heads/main:refs/remotes/origin/main', ...(missing ? [`refs/pull/${number}/head`] : [])]);
+    const mergeBase = String(git(dir, ['merge-base', '--end-of-options', 'origin/main', headRefOid])).trim();
+    if (!/^[0-9a-f]{40}$/i.test(mergeBase)) return { ok: false };
+    const raw = git(dir, ['diff', '--no-ext-diff', '--no-renames', '--name-status', '-z', '--end-of-options', mergeBase, headRefOid]);
+    return parseNameStatusZ(raw);
+  } catch { return { ok: false }; }
 }
 
 const backlogPath = path => typeof path === 'string' && path.startsWith('backlog/') && path.length > 'backlog/'.length
@@ -95,7 +135,7 @@ function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, re
 }
 
 export function runBacklogOnlyPrep({ repo, rawPrs, env = process.env, log = () => {}, dryRun = false,
-  readComments, readHeadFiles: readFiles = readHumanSurfaceNetFiles, readLive, post, syncLabels = syncRedTeamStatusLabels, enabled } = {}) {
+  readComments, readHeadFiles: readFiles = readBacklogOnlyNetFiles, readLive, post, syncLabels = syncRedTeamStatusLabels, enabled } = {}) {
   const note = safeLog(log);
   const candidates = (rawPrs ?? []).filter(raw => candidate(names(raw?.labels)));
   if (!candidates.length) return [];
