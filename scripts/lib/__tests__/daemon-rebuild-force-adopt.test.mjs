@@ -671,8 +671,12 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     arm();
     let moved = false;
     const run = (args, opts) => {
-      // Simulate an exception after the reset landed, with git unavailable for the recovery reset too.
-      if (moved) throw new Error('git unavailable after forced reset');
+      // Simulate an exception after the reset landed. HEAD stays READABLE (abort reads it and sees the forced sha, so it must
+      // keep the watch via the `head === plan.finalSha` branch); every other git call fails, recovery reset included.
+      if (moved) {
+        if (args[0] === 'rev-parse' && args.some((a) => String(a).startsWith('HEAD'))) return gitRun(args, opts);
+        throw new Error('git unavailable after forced reset');
+      }
       const result = gitRun(args, opts);
       if (opts?.cwd === cloneDir && args[0] === 'reset' && args.includes('--hard') && args.includes(target)) {
         expect(result.status).toBe(0);
