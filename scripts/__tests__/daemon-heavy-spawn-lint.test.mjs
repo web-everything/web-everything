@@ -136,9 +136,12 @@ describe('daemon heavy spawn admission lint', () => {
   });
   // Review #6461 round 4: every lint-only check (Playwright, `sh -c` bodies, package scripts) also applies behind
   // each launcher the shared classifier unwraps.
-  // `env -S` takes the run as one string; the other launchers take it as argv.
+  // `env -S` takes the run as one string, so a word holding spaces (an `sh -c` body) is single-quoted the way a real
+  // `env -S` caller must (unquoted, `sh -c npx playwright test a` runs a bare `npx` — not a heavy run); the other
+  // launchers take it as argv.
+  const quoteWord = word => (/\s/.test(word) ? `'${word}'` : word);
   const launchers = { nohup: run => ['nohup', run], setsid: run => ['setsid', run], 'setsid -f': run => ['setsid', ['-f', ...run]],
-    'env -S': run => ['env', ['-S', run.join(' ')]], 'nohup nohup': run => ['nohup', ['nohup', ...run]] };
+    'env -S': run => ['env', ['-S', run.map(quoteWord).join(' ')]], 'nohup nohup': run => ['nohup', ['nohup', ...run]] };
   const lintOnlyRuns = [['npx', 'playwright', 'test', 'a'], ['playwright', 'test'], ['sh', '-c', 'npx playwright test a']];
   it.each(Object.keys(launchers).flatMap(l => lintOnlyRuns.map(r => [l, r])))('rejects `%s` + %j', (launcher, run) => {
     const [file, args] = launchers[launcher](run);
