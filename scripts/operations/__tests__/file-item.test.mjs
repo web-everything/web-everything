@@ -136,8 +136,8 @@ describe('the declaration end to end', () => {
       expect(refusal).toBeInstanceOf(Error);
       expect(refusal.message).toContain('123');
       expect(refusal.message).toContain('456');
-      expect(refusal.message).toContain('--related-to=<id> --related-reason=...');
-      expect(refusal.message).toContain('--not-duplicate-reason="..."');
+      expect(refusal.message).toContain('--relatedTo=<id> --relatedReason=...');
+      expect(refusal.message).toContain('--notDuplicateReason="..."');
       expect(search).toHaveBeenCalledTimes(2);
     });
 
@@ -227,7 +227,7 @@ describe('the declaration end to end', () => {
         () => hits([hit('123', EXACT_THRESHOLD)])));
     });
 
-    it('files --related-to with a reason, adding the related frontmatter and recording the reason in the body', async () => {
+    it('files --relatedTo with a reason, adding the related frontmatter and recording the reason in the body', async () => {
       const reason = 'This card covers the follow-up migration, while 123 covers the search core.';
       const card = await file(buildRegistry({}, () => hits([hit('123', EXACT_THRESHOLD)])), {
         relatedTo: '123', relatedReason: reason,
@@ -236,13 +236,13 @@ describe('the declaration end to end', () => {
       expect(card.content).toContain(reason);
     });
 
-    it.each([undefined, '', '   '])('refuses --related-to without a substantive reason (%j)', (relatedReason) => {
+    it.each([undefined, '', '   '])('refuses --relatedTo without a substantive reason (%j)', (relatedReason) => {
       const registry = buildRegistry({}, () => hits([hit('123', EXACT_THRESHOLD)]));
       expect(() => begin(registry, { relatedTo: '123', ...(relatedReason === undefined ? {} : { relatedReason }) }))
-        .toThrow(/--related-reason/);
+        .toThrow(/--relatedReason/);
     });
 
-    it('files --not-duplicate-reason and records the reason in the card body', async () => {
+    it('files --notDuplicateReason and records the reason in the card body', async () => {
       const reason = 'The existing card targets a different runtime and cannot cover this work.';
       const card = await file(buildRegistry({}, () => hits([hit('123', EXACT_THRESHOLD)])), {
         notDuplicateReason: reason,
@@ -252,19 +252,19 @@ describe('the declaration end to end', () => {
 
     it('fails closed when search is unavailable and names the explicit override', () => {
       const registry = buildRegistry({}, () => { throw new Error('search index unreadable'); });
-      expect(() => begin(registry)).toThrow(/--not-duplicate-reason="\.\.\."/);
+      expect(() => begin(registry)).toThrow(/--notDuplicateReason="\.\.\."/);
     });
 
     it.each([undefined, {}, { backlog: [], malformed: [{ file: 'unreadable.md' }] },
       { backlog: [{ id: '123', score: NaN }] }, { backlog: [{ score: 1 }] }])(
       'fails closed on missing, malformed or invalid evidence: %j', (result) => {
-        expect(() => begin(buildRegistry({}, () => result))).toThrow(/--not-duplicate-reason/);
+        expect(() => begin(buildRegistry({}, () => result))).toThrow(/--notDuplicateReason/);
       });
 
     it('fails closed when the injected search binding is missing', () => {
       const registry = createRegistry();
       registry.register(fileItemOperation({ readScaffoldContext: () => read() }));
-      expect(() => begin(registry)).toThrow(/--not-duplicate-reason/);
+      expect(() => begin(registry)).toThrow(/--notDuplicateReason/);
     });
 
     it('files when search is unavailable only with an explicit not-duplicate reason recorded in the body', async () => {

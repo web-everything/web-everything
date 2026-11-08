@@ -96,9 +96,10 @@ function admitDuplicates(read, input) {
   const related = input.relatedTo?.trim();
   const relatedReason = input.relatedReason?.trim();
   const reason = input.notDuplicateReason?.trim();
-  if (related && !relatedReason) throw new Error('file-item: --related-to requires --related-reason=...');
-  if (relatedReason && !related) throw new Error('file-item: --related-reason requires --related-to=<id>');
-  const fallback = '--related-to=<id> --related-reason=... or --not-duplicate-reason="..."';
+  // Flag spellings are the CLI's own (camelCase, like --workItem); a kebab hint would be rejected as unknown.
+  if (related && !relatedReason) throw new Error('file-item: --relatedTo requires --relatedReason=...');
+  if (relatedReason && !related) throw new Error('file-item: --relatedReason requires --relatedTo=<id>');
+  const fallback = '--relatedTo=<id> --relatedReason=... or --notDuplicateReason="..."';
   // Same default as capability-search EXACT_THRESHOLD; production resolves it through operatorTask policy.
   const threshold = read.operatorTask?.duplicateThreshold ?? 0.7;
   if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
@@ -107,7 +108,7 @@ function admitDuplicates(read, input) {
   const search = read.duplicateSearch;
   const complete = completeDuplicateSearch(search);
   if (!complete && !reason) {
-    throw new Error('file-item: duplicate search unavailable or incomplete; manually check the backlog and use --not-duplicate-reason="..."');
+    throw new Error('file-item: duplicate search unavailable or incomplete; manually check the backlog and use --notDuplicateReason="..."');
   }
   const matches = complete ? search.backlog.filter(hit => hit.score >= threshold) : [];
   if (matches.length && !reason && !(related && relatedReason)) {
