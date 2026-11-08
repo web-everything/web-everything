@@ -44,7 +44,7 @@ async function drive({ ruling = 'block', card = null, appendEvents, thread = { h
   const effects = op.steps.find((x) => x.name === 'write').step.effects({ verdict: plan, input: {} });
   const sinks = createRecordReferralRulingSinks({
     readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
-    post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+    post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, 'chalbert')); },
     readPr: () => ({ headRefOid: head, labels: labels.map((name) => ({ name })) }),
     runSetLabel: () => '{"ok":true}',
     setLabels: () => {},
@@ -116,7 +116,7 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     let failOn = ledgerFindingKey(key2);
     const sinks = createRecordReferralRulingSinks({
       readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
-      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, 'chalbert')); },
       readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
       appendEvents: (list) => {
         for (const e of list) {
@@ -191,7 +191,7 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     const posts = [];
     const sinks = createRecordReferralRulingSinks({
       readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
-      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, 'chalbert')); },
       readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
       appendEvents: (list) => {
         for (const e of list) {

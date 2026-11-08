@@ -163,7 +163,7 @@ describe('#4979 the sanctioned writer', () => {
     const payload = { repo, pr: 7, head, body: plan.body, actor: 'chalbert' };
     let thread = { headRefOid: head, comments: [...comments] };
     const posts = [];
-    const sinks = (login = 'web-everything') => createRecordReferralRulingSinks({
+    const sinks = (login = 'chalbert') => createRecordReferralRulingSinks({
       readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
       post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, login)); },
     })[OPERATOR_RULING_POST_EFFECT];

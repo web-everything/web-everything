@@ -497,7 +497,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         const judgeActorPolicy = readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn });
         for (const row of rulings) assertJudgeAuthority({ judgeActorPolicy }, { actor, ruling: row.result, supersedes: row.supersedes });
       }
-      if (actor !== AUTO_POLICY_ACTOR) assertRulingIdentity(readPosterIdentity(readJson, repo), actor);
+      const checkedLogin = actor !== AUTO_POLICY_ACTOR ? assertRulingIdentity(readPosterIdentity(readJson, repo), actor) : null;
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
       if (actor === AUTO_POLICY_ACTOR) {
@@ -573,6 +573,14 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         if (!already) post(repo, pr, body);
         const after = readPrThread(repo, pr, { readJson });
         seen = after.comments.filter((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
+        // PR #6529: the identity check and the post are separate `gh` calls, so a per-call credential fallback (the App
+        // shim's personal fallback on a token-cache miss) can still split them. A human-actor ruling must be AUTHORED by
+        // the login that passed the check; anything else is refused and its clearing rows reverted below.
+        const strays = actor === JUDGE_ACTOR || !checkedLogin ? []
+          : seen.filter((c) => String(c?.author?.login ?? '').toLowerCase() !== checkedLogin);
+        if (strays.length) {
+          throw new Error(`the ruling comment is not readable by the gate after posting: it is authored by ${JSON.stringify(String(strays[0]?.author?.login ?? ''))}, not the checked poster ${checkedLogin}; the hold remains — inspect the thread before retrying`);
+        }
         // A judge row is read back through the gate-visible policy under this sink's env, as the gate will read it.
         const counted = readOperatorRulings(actor === JUDGE_ACTOR ? after.comments : seen,
           { head, ...(actor === JUDGE_ACTOR ? { judgePolicy: () => readJudgeActorPolicy({ env, log: warn }).value } : {}) }).rulings;

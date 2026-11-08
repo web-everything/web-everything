@@ -9,7 +9,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const transport = vi.hoisted(() => ({ calls: [], thread: null }));
+const transport = vi.hoisted(() => ({ calls: [], thread: null, identityFallback: false }));
 
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const orig = await importOriginal();
@@ -18,8 +18,10 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
     // The routing `resolveGhPersonalRoute` applies with the opt-in on: a classified read is swapped onto the personal
     // token unless the call pins `personalRoute: false`; a write always keeps the caller's (App) credential.
     execFileSyncThrottled: (bin, args, opts = {}) => {
-      const personal = orig.classifyGhRead(args) && (opts.throttle?.personalRoute ?? true)
-        && String(opts.env?.WE_GH_THROTTLE_PERSONAL_ROUTE ?? '1') !== '0';
+      // `identityFallback`: the App shim's per-call personal fallback on a token-cache miss hits ONLY the identity read.
+      const personal = (transport.identityFallback && args[0] === 'api')
+        || (orig.classifyGhRead(args) && (opts.throttle?.personalRoute ?? true)
+          && String(opts.env?.WE_GH_THROTTLE_PERSONAL_ROUTE ?? '1') !== '0');
       const as = personal ? 'chalbert' : 'web-everything';
       transport.calls.push({ args, as });
       if (args[0] === 'api' && args[1] === 'user') {
@@ -54,6 +56,7 @@ const plan = () => planOperatorRuling({ head, ...openReferralFindings({ comments
 
 beforeEach(() => {
   transport.calls.length = 0;
+  transport.identityFallback = false;
   transport.thread = { headRefOid: head, body: rec.authorBody, createdAt: '2026-11-08T00:00:00Z', comments: [gh(renderReferralRecord(rec))] };
 });
 
@@ -70,6 +73,18 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
     expect(readOperatorRulings(transport.thread.comments).rulings).toEqual([]);
     // The check and the post share one credential: the identity read never took the personal route.
     expect(transport.calls.find((c) => c.args[0] === 'api')).toMatchObject({ as: 'web-everything' });
+  });
+
+  it('a per-call fallback that splits the check from the post is caught on read-back and the clearing row reverted', async () => {
+    transport.identityFallback = true; // the check authenticates as the operator; the post still lands as the App
+    const events = [];
+    const sink = createRecordReferralRulingSinks({ env: {}, warn: () => {}, appendEvents: async (list) => { events.push(...list); } })[OPERATOR_RULING_POST_EFFECT];
+    const p = plan();
+    await expect(sink({ repo, pr: 7, head, body: p.body, actor: 'chalbert', channel: 'claude-code-chat',
+      rulings: p.record.rulings.map((r) => ({ runId: r.runId, key: r.key, result: r.result })) }))
+      .rejects.toThrow(/authored by "web-everything", not the checked poster chalbert/);
+    // The not-real row was recorded first (F4 order), then reverted by a holding block row: the finding stays held.
+    expect(events.map((e) => e.ruling)).toEqual(['not-real', 'block']);
   });
 
   it('the reader reads the planning identity with the same pinned poster credential', () => {
