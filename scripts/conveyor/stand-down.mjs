@@ -417,14 +417,15 @@ export function isLoadOnlyRedStandDown(c) {
  * it, because only the "red only on ... host load" wording was read. A reason now counts as load-only red when it
  * states ALL of: a test TIMEOUT (never an assertion failure), that it is outside this change (unrelated / outside the
  * diff), and the corroboration (other tests pass, passes alone, or the same timeout on base). A diff-touched failure
- * says none of that and stays terminal; the re-dispatch still needs a GREEN verify before any push.
+ * says none of that and stays terminal; the text is a keyword grammar (it cannot see the diff), so the re-dispatched fixer's own GREEN verify, not this classifier, is what stops a real failure from being pushed; the re-dispatch still needs a GREEN verify before any push.
  */
 export function statesOutOfDiffTimeoutEvidence(reason) {
   const r = String(reason ?? '');
   // Any other failure word (assertion, received/expected, "failed", negation, a diff-touched file) keeps it terminal:
   // the evidence must describe the timeout and nothing else red. "not in the diff" is the one allowed negation.
   const rest = r.replace(/\bnot in (?:the |this )?(?:pr'?s? )?diff\b/gi, '');
-  return /\btimed out\b|\btimeout\b/i.test(r)
+  const testFiles = new Set(r.match(/[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi) ?? []);
+  return /\btimed out\b|\btimeout\b/i.test(r) && testFiles.size <= 1
     && !/\bassert|\bexpected\b|\breceived\b|\berrors?\b|\bfail|\bnot\b|n't\b|\bno\b|\btouch(?:es|ed)\b|diff-touched|in-diff|in the diff\b/i.test(rest)
     && /\bunrelated to this (?:change|pr)\b|\b(?:outside|not in) (?:the |this )?(?:pr'?s? )?diff\b/i.test(r)
     && /\b(?:all \d+ other tests? (?:\w+ )?pass(?:ed)?|every other test passe?s?|other tests? (?:all )?pass(?:ed)?|passes? (?:alone|in isolation)|same (?:timeout|failure) on (?:base|main|[0-9a-f]{7,40}))\b/i.test(r);
