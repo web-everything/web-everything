@@ -47,12 +47,12 @@ const SEP = path.sep;
  *   - `wev-fix-daemon`       — com.we.fix-dispatch-daemon (its OWN clone since 2026-10-07: sharing
  *                              `wev-review-daemon` made the two daemons' self-sync rebuilds starve each other
  *                              on the one clone lock; see skills-src/conveyor/launchd/com.we.fix-dispatch-daemon.plist.example)
- *   - `wev-review-daemon`    — com.we.review-daemon, lease-reaper,
- *                              lane-pool-health-watch-{we,frontierui,plateau-app}, parked-pr-conflict-watch-*
+ *   - `wev-review-daemon`    — com.we.review-daemon
  *   - `wev-merge-daemon`     — com.we.conveyor-pass-daemon.merge-orphan-sweep
  *   - `wev-health-watch`     — com.we.health-watch
  *   - `wev-host-sampler`     — com.webeverything.host-sampler, com.webeverything.claude-otel-collector
- *   - `wev-pass-readers`     — the 12 reader pass daemons (R418)
+ *   - `wev-pass-readers`     — helper pass daemons, lane-pool-health-watch-{we,frontierui,plateau-app},
+ *                              parked-pr-conflict-watch-{we,frontierui,plateau-app}, lease-reaper (R418)
  *   - `plateau-drain-daemon` — com.plateau.drain-daemon
  *   - `.lanes/we-drain-daemon/lane-1` — the WE drain's own dedicated clone (docs/agent/platform-decisions.md
  *     #resident-daemon-reload-lifecycle) — NOT a pool lane: never leased/refreshed like one, rebuilt the same
@@ -73,6 +73,29 @@ export const DAEMON_CLONE_SEED = [
   `.lanes${SEP}we-drain-daemon${SEP}lane-1`,
   `.lanes${SEP}we-drain-daemon${SEP}code`,
 ];
+
+/** Launchd label → dedicated clone basename. Pure data; no launchd or filesystem discovery. */
+export const DAEMON_CLONE_BY_LABEL = Object.freeze({
+  'com.we.conveyor-pass-daemon.advisory-label-sweep-we': 'wev-pass-readers',
+  'com.we.conveyor-pass-daemon.ci-red-recovery-watch-we': 'wev-pass-readers',
+  'com.we.conveyor-pass-daemon.load-flake-reverify': 'wev-pass-readers',
+  'com.we.conveyor-pass-daemon.pr-merge-watch': 'wev-pass-readers',
+  'com.we.lane-pool-health-watch-we': 'wev-pass-readers',
+  'com.we.lane-pool-health-watch-frontierui': 'wev-pass-readers',
+  'com.we.lane-pool-health-watch-plateau-app': 'wev-pass-readers',
+  'com.we.parked-pr-conflict-watch-we': 'wev-pass-readers',
+  'com.we.parked-pr-conflict-watch-frontierui': 'wev-pass-readers',
+  'com.we.parked-pr-conflict-watch-plateau-app': 'wev-pass-readers',
+  'com.we.lease-reaper': 'wev-pass-readers',
+  'com.we.conveyor-pass-daemon.merge-orphan-sweep': 'wev-merge-daemon',
+  'com.we.review-daemon': 'wev-review-daemon',
+});
+
+/** PURE: unknown labels, including inherited object properties, have no registered clone. */
+export function daemonCloneForLabel(label) {
+  return typeof label === 'string' && Object.hasOwn(DAEMON_CLONE_BY_LABEL, label)
+    ? DAEMON_CLONE_BY_LABEL[label] : null;
+}
 
 /**
  * PURE: is `real` a POOL LANE (or inside one), or a pool PARENT dir that contains lanes? Refused: a numbered lane

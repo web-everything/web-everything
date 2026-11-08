@@ -41,8 +41,17 @@ describe('daemonCloneForLabel', () => {
     expect(registry.daemonCloneForLabel(label)).toBe(clone);
   });
 
-  it.each(['com.we.unknown-daemon', 'com.we.conveyor-pass-daemon.unknown', '', 'toString', '__proto__'])('returns null for unknown label %j', (label) => {
+  it.each(['com.we.unknown-daemon', 'com.we.conveyor-pass-daemon.unknown', '', 'constructor', 'toString', '__proto__'])('returns null for unknown label %j', (label) => {
     expect(registry.daemonCloneForLabel).toBeTypeOf('function');
+    expect(registry.daemonCloneForLabel(label)).toBeNull();
+  });
+
+  it.each([null, undefined, 0, true, [], {}, new String('com.we.review-daemon')])('returns null for non-string label %j without coercion', (label) => {
+    expect(registry.daemonCloneForLabel(label)).toBeNull();
+  });
+
+  it('rejects a non-string label without invoking its property-key coercion', () => {
+    const label = { [Symbol.toPrimitive]() { throw new Error('label must not be coerced'); } };
     expect(registry.daemonCloneForLabel(label)).toBeNull();
   });
 });

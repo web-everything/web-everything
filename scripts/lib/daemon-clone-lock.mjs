@@ -180,18 +180,18 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
 // each tick holds its read slot for minutes; the review daemon only tries to move the clone once per ITS tick
 // start, waits up to 900s for that read slot, gives up, ticks itself, and tries again — finding the sibling
 // mid-tick every time. Between attempts no writer key exists, so the sibling's next tick always got straight in:
-// the clone did not move for 5.5 h. Now a writer that gave up `tick-in-progress` WRITER_PRIORITY_AFTER times in a
+// the clone did not move for 5.5 h. A writer refused `tick-in-progress` or `reader-priority` WRITER_PRIORITY_AFTER times in a
 // row leaves a writer-priority claim; while it is live, NEW reads by anyone else are refused `writer-priority`
 // (ticks already in flight are never touched, so #4044 never-read-mid-move holds trivially), so the in-flight ticks
 // drain and the next writer gets the clone. Any writer that gets the clone clears the claim (the clone is moving).
-// No mutual back-off: the OLDER claim wins — a writer only yields to a starved reader whose starvation began
-// before the writer's claim, and a reader only ignores a writer claim younger than its own starvation. Refusals
-// by a writer claim never count toward reader starvation, so they can never re-trigger reader priority.
+// Once effective, the writer claim overrides reader starvation, including older claims: rotating readers must
+// not keep a writer yielding forever. Readers still bypass it after writerPriorityMaxSkips refusals, and the
+// claim expires on its TTL. Refusals by a writer claim never count toward reader starvation.
 
-/** Setting: consecutive `tick-in-progress` give-ups after which a writer's claim blocks NEW reads. Default 1;
+/** Setting: consecutive `tick-in-progress` or `reader-priority` refusals after which a writer's claim blocks NEW reads. Default 3;
  *  `0` turns writer priority off (the pre-fix behaviour). */
 export const WRITER_PRIORITY_AFTER_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER';
-export const DEFAULT_WRITER_PRIORITY_AFTER = 1;
+export const DEFAULT_WRITER_PRIORITY_AFTER = 3;
 /** Setting: how long a writer claim stays live without being refreshed by another attempt (its owner's next tick
  *  start re-tries; a claim never outlives a dead owner pid). Default 30 min — longer than one sibling tick. */
 export const WRITER_CLAIM_TTL_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_CLAIM_TTL_MS';
@@ -278,15 +278,16 @@ function readWriterClaim(starvedRoot) {
   } catch { return null; }
 }
 
-/** Record one more consecutive `tick-in-progress` give-up by `owner`. A claim by a DIFFERENT live owner is kept
+/** Record one more consecutive `tick-in-progress` or `reader-priority` refusal by `owner`. A claim by a DIFFERENT live owner is kept
  *  (first come keeps its age); our own is bumped. Best-effort. */
 function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe }) {
   const prev = readWriterClaim(starvedRoot);
   if (prev && prev.owner !== owner && writerClaimIsLive(prev, nowMs, ttlMs, probe)) return prev;
-  const same = prev && prev.owner === owner;
+  const same = prev && prev.owner === owner && writerClaimIsLive(prev, nowMs, ttlMs, probe);
   const nowIso = new Date(nowMs).toISOString();
   const rec = {
-    owner, pid, count: (same ? prev.count : 0) + 1, heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
+    owner, pid, count: Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, same ? prev.count : 0) + 1),
+    heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
   };
   try {
     const file = writerClaimFile(starvedRoot);
@@ -416,15 +417,14 @@ export function acquireRead(root, opts = {}) {
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
   const nowIso = new Date(nowMs).toISOString();
 
-  // Writer fairness: a starved writer's claim refuses NEW reads (never counted as reader starvation) — unless
-  // this reader's own starvation is OLDER than the claim (older claim wins, so the two never both back off).
+  // Writer fairness: an effective claim refuses NEW reads regardless of reader claim age. The skip cap
+  // still guarantees a reader a turn; already-held read slots are never removed by this check.
   const claim = findPriorityWriter(starvedRoot, {
     owner, nowMs, ttlMs: writerClaimTtlMs, probe, after: writerPriorityAfter,
   });
   if (claim) {
-    const mine = readStarvedRecords(starvedRoot).find((r) => r.readerKey === readerKey);
     const skips = readWriterSkips(starvedRoot)[readerKey] ?? 0;
-    if (!(mine && isoMs(mine.firstRefusedAt) < isoMs(claim.since)) && skips < writerPriorityMaxSkips) {
+    if (skips < writerPriorityMaxSkips) {
       if (trackStarvation) setWriterSkips(starvedRoot, readerKey, skips + 1);
       return { ok: false, reason: 'writer-priority', heldBy: claim.owner, writerStarved: claim.count, claimSince: claim.since };
     }
@@ -521,16 +521,18 @@ export async function acquireWrite(root, opts = {}) {
     ? Math.min(Number(writerWaitPriorityWindowMsOpt), WRITER_WAIT_PRIORITY_WINDOW_MS) : WRITER_WAIT_PRIORITY_WINDOW_MS;
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
-  // Writer fairness: our own live, effective claim (we already starved). Older claim wins — we only yield to a
-  // starved reader whose starvation began BEFORE our claim (see "writer fairness" above).
+  // Use the same live-claim lookup as readers, including expiry of partial counts.
   const ownClaim = () => {
-    if (!(writerPriorityAfter > 0)) return null;
-    const c = readWriterClaim(starvedRoot);
-    return c && c.owner === owner && c.count >= writerPriorityAfter
-      && writerClaimIsLive(c, now(), writerClaimTtlMs, probe) ? c : null;
+    const c = findPriorityWriter(starvedRoot, {
+      owner: null, nowMs: now(), ttlMs: writerClaimTtlMs, probe, after: writerPriorityAfter,
+    });
+    return c?.owner === owner ? c : null;
   };
+  const noteRefusal = (nowMs, heldBy) => writerPriorityAfter > 0
+    ? noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs: writerClaimTtlMs, probe }) : null;
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
   const priorityFor = (nowMsN) => {
+    if (ownClaim()) return null;
     const waited = nowMsN - startMs;
     const waitedPast = writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
       && waited < writerWaitPriorityMs + windowMs;
@@ -538,12 +540,13 @@ export async function acquireWrite(root, opts = {}) {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
       startedBeforeMs: waitedPast ? startMs : null,
     });
-    if (!r) return null;
-    const mine = ownClaim();
-    return mine && isoMs(mine.since) <= isoMs(r.firstRefusedAt) ? null : r;
+    return r;
   };
   const yieldTo = priorityFor(startMs);
-  if (yieldTo) return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
+  if (yieldTo) {
+    noteRefusal(startMs, yieldTo.owner);
+    return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
+  }
   const currentWriter = readLockEntry(writerRoot, WRITER_KEY);
   const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe(currentWriter), leaseMinutes);
   if (!writerReserve.ok) {
@@ -581,6 +584,7 @@ export async function acquireWrite(root, opts = {}) {
     const starvedReader = priorityFor(nowMsN);
     if (starvedReader) {
       releaseLockDir(writerRoot, WRITER_KEY);
+      noteRefusal(nowMsN, starvedReader.owner);
       return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
     }
     if (blockers.length === 0) {
@@ -595,11 +599,7 @@ export async function acquireWrite(root, opts = {}) {
     if (nowMsN >= deadline) {
       releaseLockDir(writerRoot, WRITER_KEY);
       // Writer fairness: leave (or bump) a claim so NEW reads yield until a writer gets the clone.
-      const claim = writerPriorityAfter > 0
-        ? noteWriterGaveUp(starvedRoot, {
-          owner, pid, nowMs: nowMsN, heldBy: lastBlockers[0] || null, ttlMs: writerClaimTtlMs, probe,
-        })
-        : null;
+      const claim = noteRefusal(nowMsN, lastBlockers[0] || null);
       return {
         ok: false, reason: 'tick-in-progress', heldBy: lastBlockers[0] || null,
         ...(claim && claim.owner === owner ? { writerStarved: claim.count } : {}),

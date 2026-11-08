@@ -50,13 +50,13 @@ const alwaysDead = () => 'dead';
 describe('symmetric reader/writer fairness', () => {
   // Build real reader starvation records, then rotate through three different priority readers.
   // The fourth stays queued: clearing one reader's claim must not erase the writer's own refusals.
-  async function rotatingReaders({ existingReader = false } = {}) {
+  async function rotatingReaders({ existingReader = false, useDefaults = false } = {}) {
     const lockRoot = mkTmp('dcl-lockroot-');
     const clone = mkTmp('dcl-clone-');
     let clock = 1000;
     const common = {
-      lockRoot, probe: alwaysAlive, writerPriorityAfter: 3, writerClaimTtlMs: 1000,
-      writerPriorityMaxSkips: 2,
+      lockRoot, probe: alwaysAlive, writerClaimTtlMs: 1000,
+      ...(useDefaults ? {} : { writerPriorityAfter: 3, writerPriorityMaxSkips: 2 }),
     };
     const read = (owner, overrides = {}) => acquireRead(clone, {
       ...common, owner, pid: 222, nowMs: clock, ...overrides,
@@ -95,6 +95,27 @@ describe('symmetric reader/writer fairness', () => {
     const f = await rotatingReaders();
     await f.train();
     expect(await f.write()).toEqual({ ok: true });
+  });
+
+  it('uses omitted-option defaults: three writer refusals override older reader claims, with reader admission after two skips', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER', undefined);
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS', undefined);
+    try {
+      const f = await rotatingReaders({ useDefaults: true });
+      await f.train(2);
+      expect(f.read('before-threshold')).toEqual({ ok: true });
+      releaseRead(f.clone, { owner: 'before-threshold', lockRoot: f.lockRoot });
+      await f.train(1);
+      const olderReader = [...f.pending][0];
+      expect(f.read(olderReader)).toMatchObject({ ok: false, reason: 'writer-priority' });
+      expect(f.read(olderReader)).toMatchObject({ ok: false, reason: 'writer-priority' });
+      expect(f.read(olderReader)).toEqual({ ok: true });
+      expect(await f.write()).toMatchObject({ ok: false, reason: 'tick-in-progress', heldBy: olderReader });
+      releaseRead(f.clone, { owner: olderReader, lockRoot: f.lockRoot });
+      expect(await f.write()).toEqual({ ok: true });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('refuses new readers with writer-priority while preserving an existing reader until it drains', async () => {
