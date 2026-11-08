@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { decide, fullSuiteEscapeUsed } from '../guard-bash.mjs';
+import { decide, fullSuiteEscapeUsed, heavyRunHeads, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const queue = 'node scripts/readiness/heavy-admission.mjs run -- ';
 const execVitestRuns = [
@@ -209,6 +209,20 @@ describe('heavy-enforce — every direct test run requires admission', () => {
   });
   it.each(['command -v npx', 'command -V vitest', 'sudo -p x ls', 'xargs -n 1 echo', 'env -S "-i ls"', 'sudo -h'])('still allows `%s`', cmd => {
     expect(decide(cmd, {})).toBeNull();
+  });
+  // Review #6461 round 5: heavyRunHeads walks at most 16 launcher/env -S hops; past that it fails closed.
+  it.each(['nohup ', 'eval ', 'nohup eval '])('fails closed when wrapper unwrapping exhausts its hop budget (`%s`)', wrapper => {
+    const nest = n => wrapper.repeat(n).split(' ').filter(Boolean).slice(0, n).join(' ') + ' echo hi';
+    // 15 launchers + the command itself is 16 heads: within the bound, a harmless command stays harmless.
+    expect(heavyRunHeads(nest(15))).toHaveLength(16);
+    expect(ungatedHeavyRunKind(nest(15))).toBeNull();
+    expect(decide(nest(15), {})).toBeNull();
+    // One more launcher exhausts the budget: the walker gives up and every caller classifies the run as heavy.
+    for (const n of [16, 17, 40]) {
+      expect(heavyRunHeads(nest(n))).toBeNull();
+      expect(ungatedHeavyRunKind(nest(n))).toBe('test');
+      expect(decide(nest(n), {})).toContain('heavy-enforce');
+    }
   });
   it('names the command env -S and a launcher actually run in the replacement', () => {
     for (const cmd of ["env -S 'npx vitest run a'", 'nohup npx vitest run a', 'case x in x) npx vitest run a;; esac']) {

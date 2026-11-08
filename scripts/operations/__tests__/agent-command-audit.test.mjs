@@ -315,6 +315,34 @@ describe('agent command audit', () => {
   ])('classifies long plain text, heredocs, npm value options and launchers: %s', (command, categories) => {
     expect(classifyCommand(command).map(row => row.category)).toEqual(categories);
   });
+  // Review #6461 round 5: the audit's own patterns (Playwright, installs, git fetch, repo-wide search) apply to every
+  // command a launcher runs, not only to the outer head.
+  it.each([
+    ['nohup npx playwright test a', 'playwright', false], ['setsid -f npx playwright test a', 'playwright', false],
+    ["eval 'npx playwright test a'", 'playwright', false], ['nohup nohup pnpm exec playwright test a', 'playwright', false],
+    ['nohup npm ci', 'install/ci', false], ['setsid git fetch origin', 'git fetch/clone/wt/gc', false],
+    ['nohup rg needle .', 'repo-wide find/grep', false], ['nohup npm run test:unit', 'npm test/check', true],
+  ])('classifies Playwright and other audited runs behind launchers: %s', (cmd, category, queued) => {
+    expect(classifyCommand(cmd)).toEqual([expect.objectContaining({ category, queued })]);
+  });
+  it.each(['nohup echo hi', 'nohup npx playwright --version', 'eval echo playwright test', 'setsid ls'])('leaves a harmless launched command unaudited: %s', cmd => {
+    expect(classifyCommand(cmd)).toEqual([]);
+  });
+  // Review #6461 round 5: a path-qualified program (`/usr/bin/mysql`, `./mysql`, a quoted path) runs the same program,
+  // so its short-option and `--body` secrets are redacted too, including inside a command substitution.
+  it.each([
+    '/usr/bin/mysql -pZq9vWm4Lp', './mysql -pZq9vWm4Lp', '../bin/mariadb -p Zq9vWm4Lp', "'/usr/bin/mysql' -pZq9vWm4Lp",
+    '/usr/bin/redis-cli -a Zq9vWm4Lp', '/opt/bin/sshpass -p Zq9vWm4Lp ssh h', '/usr/bin/zip -P Zq9vWm4Lp f.zip a',
+    '/usr/local/bin/docker login -p Zq9vWm4Lp', '/usr/local/bin/gh secret set X --body Zq9vWm4Lp',
+    'echo $(/usr/bin/mysql -pZq9vWm4Lp)', 'x=`/usr/bin/mysql -pZq9vWm4Lp`',
+  ])('redacts path-qualified short-option passwords: %s', command => {
+    const out = redact(command);
+    expect(out).not.toContain('Zq9vWm4Lp');
+    expect(out).toContain('[REDACTED]');
+  });
+  it('keeps a hyphen- or dot-joined name that is not the program as data', () => {
+    expect(redact('my-mysql -pZq9vWm4Lp')).toContain('Zq9vWm4Lp');
+  });
   it.each([
     'mkdir -p a/b', 'npm run build -- --page=2', 'curl https://x.test/?page=1&limit=2', 'docker run -p 80:80 img',
     'ls; mysql -h host -P 3306', 'echo a=b c=d',

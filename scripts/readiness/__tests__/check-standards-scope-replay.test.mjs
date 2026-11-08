@@ -18,6 +18,7 @@ import {
   parseBsdTime,
   summarize,
   formatTable,
+  replayRow,
 } from '../check-standards-scope-replay.mjs';
 
 describe('isLaneMergeSubject', () => {
@@ -234,6 +235,32 @@ describe('summarize + formatTable', () => {
     expect(s.okCount).toBe(0);
     expect(s.pass).toBe(false);
     expect(summarize([]).pass).toBe(false);
+  });
+
+  describe('replayRow', () => {
+    const diff = { sha: 'abc1234567', subject: 's', head: 'h', changedFiles: ['scripts/a.mjs'] };
+    const ran = (errors = []) => ({ realSec: 1, userSec: 1, sysSec: 0, status: 1, errors, warnings: [], parseError: null });
+    const unrun = { realSec: null, status: 75, errors: [], warnings: [], parseError: 'no JSON on stdout' };
+
+    it.each([
+      ['full', { full: unrun, scoped: ran() }],
+      ['scoped', { full: ran(), scoped: unrun }],
+      ['full', { full: undefined, scoped: ran() }],
+    ])('rejects absent JSON from the %s replay runner as an error row, never a completed comparison', (name, runs) => {
+      const r = replayRow({ diff, ...runs });
+      expect(r.error).toMatch(new RegExp(`^${name} check-standards run produced no result`));
+      expect(r).not.toHaveProperty('missedCount');
+      expect(summarize([r]).pass).toBe(false);
+    });
+
+    it('compares both runs when each produced JSON', () => {
+      const finding = { message: 'm', descriptor: { kind: 'k', file: 'scripts/a.mjs' } };
+      const r = replayRow({ diff, full: ran([finding]), scoped: ran() });
+      expect(r.error).toBeUndefined();
+      expect(r.missedCount).toBe(1);
+      expect(summarize([r]).pass).toBe(false);
+      expect(summarize([replayRow({ diff, full: ran([finding]), scoped: ran([finding]) })]).pass).toBe(true);
+    });
   });
 
   it('formatTable renders one line per row plus a summary footer, and marks an errored row', () => {

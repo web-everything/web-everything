@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, commandSubstitutionBodies, envSplitString, heredocScan, parseSegments, shellCString, shellTokens, stripShellControl, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, envSplitString, heavyRunHeads, heredocScan, parseSegments, shellCString, shellTokens, stripShellControl, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -36,10 +36,12 @@ const SECRET_SHORT_OPTIONS = [
   [/smbclient/, 'U'],
   [/curl/, 'b'],
 ];
-const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w./-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?![\w-])`, 'g');
-// The program whose `--body` long option carries a secret (`gh secret set X --body v`); its segment end is found
-// quote-aware by redactPositionalSecrets.
-const SECRET_LONG_OPTIONS = /(?<![\w./-])gh\s+secret\s+set\b/g;
+// A `/` may precede the program: a path-qualified program (`/usr/bin/mysql -pv`, `./mysql -pv`) runs the same one
+// (review #6461 r5), as htpasswd's own match already allows.
+const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w.-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?![\w-])`, 'g');
+// The program whose `--body` long option carries a secret (`gh secret set X --body v`, `/usr/bin/gh secret set …`);
+// its segment end is found quote-aware by redactPositionalSecrets.
+const SECRET_LONG_OPTIONS = /(?<![\w.-])gh\s+secret\s+set\b/g;
 // `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
 // `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key.
 const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:-[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
@@ -383,7 +385,6 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
       for (const hit of classifyCommand(split, depth + 1, false)) out.push({ ...hit, queued: queued || hit.queued });
       continue;
     }
-    const words = shellTokens(head).filter(word => !word.op).map(word => word.text);
     // `sh -c "…"` as the inner shell receives it. Substitutions the outer shell already ran (an unquoted or
     // double-quoted word) were counted by the outer extraction above, so only a single-quoted body re-extracts.
     const shellC = shellCString(head);
@@ -391,23 +392,33 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
       for (const hit of classifyCommand(shellC.text, depth + 1, shellC.innerSubstitutions)) out.push({ ...hit, queued: queued || hit.queued });
       continue;
     }
-    if (/^(?:npm|pnpm|yarn|bun)\s+run\s+(?:test:unit|check:standards)(?:\s|$)/.test(head)) queued = true;
-    let category;
-    // A `node` head is classified only by the Bash guard's executable-position parser below: `--test` or a vitest /
-    // check-standards path after the script operand is that script's own argument (`node light.mjs --test`).
-    if (/^(?:vitest(?:@\S*)?\b|(?:pnpm|yarn|bun)\s+(?:exec\s+)?vitest\b)/.test(head)
-      && !/\s(?:--version|-v|--help|-h)(?:\s|$)/.test(head)) category = 'vitest';
-    else if (/^(?:(?:pnpm|yarn|bun)\s+(?:exec\s+)?|npm\s+(?:exec|x)\s+(?:--\s+)?)?playwright(?:@\S*)?\s+test\b/.test(head)) category = 'playwright';
-    else if (/^(?:npm|pnpm)\s+run\s+check:standards(?:\s|$)/.test(head)) category = 'check:standards';
-    else if (/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test\b|t\b|tst\b|check:(?:visual|render)\b)/.test(head)) category = 'npm test/check';
-    // The Bash guard's classifier catches spellings the patterns above miss (`npm --prefix . test`, `npm -s test`).
-    else if (HEAVY_KIND_CATEGORY[ungatedHeavyRunKind(head)]) category = HEAVY_KIND_CATEGORY[ungatedHeavyRunKind(head)];
-    else if (/^(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci)\b/.test(head)) category = 'install/ci';
-    else if (/^git\s+(?:-C\s+\S+\s+)?(?:fetch|clone|worktree\s+add|gc|repack)\b/.test(head)) category = 'git fetch/clone/wt/gc';
-    else if (repoWideSearch(words)) category = 'repo-wide find/grep';
-    if (category) out.push({ category, queued, command: redact(segment.trim()) });
+    // The audit's own patterns run on every command a launcher runs (`nohup npx playwright test a`, `setsid npm ci`,
+    // `eval 'git fetch'`), unwrapped by the Bash guard's shared walker, not only on the outer head (review #6461 r5).
+    const candidates = [head, ...(heavyRunHeads(head) ?? []).map(({ raw }) => canonicalCommand(raw))];
+    const ran = candidates.find(candidate => headCategory(candidate));
+    if (ran) out.push({ category: headCategory(ran), queued: queued || QUEUED_SCRIPT.test(ran), command: redact(segment.trim()) });
   }
   return out;
+}
+
+const QUEUED_SCRIPT = /^(?:npm|pnpm|yarn|bun)\s+run\s+(?:test:unit|check:standards)(?:\s|$)/;
+
+/** The audit category one canonical command head starts, or undefined. */
+function headCategory(head) {
+  // A `node` head is classified only by the Bash guard's executable-position parser below: `--test` or a vitest /
+  // check-standards path after the script operand is that script's own argument (`node light.mjs --test`).
+  if (/^(?:vitest(?:@\S*)?\b|(?:pnpm|yarn|bun)\s+(?:exec\s+)?vitest\b)/.test(head)
+    && !/\s(?:--version|-v|--help|-h)(?:\s|$)/.test(head)) return 'vitest';
+  if (/^(?:(?:pnpm|yarn|bun)\s+(?:exec\s+)?|npm\s+(?:exec|x)\s+(?:--\s+)?)?playwright(?:@\S*)?\s+test\b/.test(head)) return 'playwright';
+  if (/^(?:npm|pnpm)\s+run\s+check:standards(?:\s|$)/.test(head)) return 'check:standards';
+  if (/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test\b|t\b|tst\b|check:(?:visual|render)\b)/.test(head)) return 'npm test/check';
+  // The Bash guard's classifier catches spellings the patterns above miss (`npm --prefix . test`, `npm -s test`).
+  const kind = HEAVY_KIND_CATEGORY[ungatedHeavyRunKind(head)];
+  if (kind) return kind;
+  if (/^(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci)\b/.test(head)) return 'install/ci';
+  if (/^git\s+(?:-C\s+\S+\s+)?(?:fetch|clone|worktree\s+add|gc|repack)\b/.test(head)) return 'git fetch/clone/wt/gc';
+  if (repoWideSearch(shellTokens(head).filter(word => !word.op).map(word => word.text))) return 'repo-wide find/grep';
+  return undefined;
 }
 
 function toolCommands(record) {

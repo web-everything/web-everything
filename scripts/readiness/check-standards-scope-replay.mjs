@@ -253,6 +253,30 @@ export function summarize(rows) {
   };
 }
 
+/**
+ * One diff's {@link ReplayRow} from its full and scoped runner results. A run that produced no JSON (the admission
+ * queue deferred it with exit 75, or it crashed) checked nothing, so its empty error list must not read as a clean
+ * comparison: the row is an error row naming that run (review #6461 round 5). Pure.
+ */
+export function replayRow({ diff, linked = [], full, scoped }) {
+  const unrun = [['full', full], ['scoped', scoped]].find(([, r]) => !r || r.parseError);
+  if (unrun) {
+    const [name, r] = unrun;
+    return { sha: diff.sha, subject: diff.subject, error: `${name} check-standards run produced no result (exit ${r?.status ?? 'none'}): ${r?.parseError ?? 'no runner result'}` };
+  }
+  const laneFiles = Array.from(new Set([...diff.changedFiles, ...linked])).sort();
+  const cmp = compareFindings({ fullErrors: full.errors, scopedErrors: scoped.errors, laneFiles });
+  return {
+    sha: diff.sha, subject: diff.subject, head: diff.head,
+    changedCount: diff.changedFiles.length, linkedCount: linked.length,
+    full: { realSec: full.realSec, userSec: full.userSec, sysSec: full.sysSec, maxRssBytes: full.maxRssBytes, errors: full.errors.length, warnings: full.warnings.length },
+    scoped: { realSec: scoped.realSec, userSec: scoped.userSec, sysSec: scoped.sysSec, maxRssBytes: scoped.maxRssBytes, errors: scoped.errors.length, warnings: scoped.warnings.length },
+    missedCount: cmp.missedCount,
+    laneRelevantCount: cmp.laneRelevantCount,
+    missed: cmp.missed.slice(0, 20).map((f) => ({ message: f.message, descriptor: f.descriptor })),
+  };
+}
+
 /** Render the summary + per-diff rows as a fixed-width ASCII table (stdout + committed report). Pure. */
 export function formatTable(rows, summary) {
   const lines = [];
@@ -430,23 +454,8 @@ function runCli(argv) {
 
       const full = runCheckStandards(worktreePath, []);
       const linked = linkedFilesFor(diff.changedFiles, { gitGrep: gitGrepIn(worktreePath) });
-      const laneFiles = Array.from(new Set([...diff.changedFiles, ...linked])).sort();
       const scoped = runCheckStandards(worktreePath, ['--local', `--files=${diff.changedFiles.join(',')}`]);
-      // A run that produced no JSON (the admission queue deferred it with exit 75, or it crashed) did not check
-      // anything, so its empty error list must not read as a clean pass (self-review of #6461 round 5).
-      const unrun = [['full', full], ['scoped', scoped]].find(([, r]) => r.parseError);
-      if (unrun) throw new Error(`${unrun[0]} check-standards run produced no result (exit ${unrun[1].status}): ${unrun[1].parseError}`);
-      const cmp = compareFindings({ fullErrors: full.errors, scopedErrors: scoped.errors, laneFiles });
-
-      results.push({
-        sha: diff.sha, subject: diff.subject, head: diff.head,
-        changedCount: diff.changedFiles.length, linkedCount: linked.length,
-        full: { realSec: full.realSec, userSec: full.userSec, sysSec: full.sysSec, maxRssBytes: full.maxRssBytes, errors: full.errors.length, warnings: full.warnings.length },
-        scoped: { realSec: scoped.realSec, userSec: scoped.userSec, sysSec: scoped.sysSec, maxRssBytes: scoped.maxRssBytes, errors: scoped.errors.length, warnings: scoped.warnings.length },
-        missedCount: cmp.missedCount,
-        laneRelevantCount: cmp.laneRelevantCount,
-        missed: cmp.missed.slice(0, 20).map((f) => ({ message: f.message, descriptor: f.descriptor })),
-      });
+      results.push(replayRow({ diff, linked, full, scoped }));
     } catch (e) {
       results.push({ sha: diff.sha, subject: diff.subject, error: String(e?.message || e) });
     }
