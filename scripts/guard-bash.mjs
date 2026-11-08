@@ -868,10 +868,14 @@ export function canonicalCommand(segment) {
   // A COMMAND LINE the peel stopped at (`npx -c "<line>"`, `--call=<line>`, `flock f -c "<line>"`, `watch
   // "<line>"`, self-review of #6461 round 5) keeps its words: only its first word's directory is dropped, so a
   // slash later in the line (`npx vitest run scripts/a.test.mjs`) cannot reduce it to its last path segment.
-  const text = words[k].text.replace(/^\\+/, '');
+  let text = words[k].text.replace(/^\\+/, '');
   const prev = words[k - 1]?.text;
   const line = /\s/.test(text) && (/^--call=/.test(text) || /^(?:-c|--call|--command)$/.test(prev || '')
     || words.slice(0, k).some((word) => word.text.replace(/^.*\//, '') === 'watch'));
+  // The line as the inner shell RECEIVES it: a `"…"` word has `\"`, `\\`, `\$`, `` \` `` resolved, so an escaped
+  // quote inside it (`npx -c "echo \"x; y\""`) quotes its `;` instead of splitting the line there (self-review of
+  // the #6461 round 7 send-back).
+  if (line && words[k].dq) text = text.replace(/\\(["\\$`])/g, '$1');
   const prog = line ? text.replace(/^\S*\//, '') : text.replace(/^.*\//, '');
   if (!prog) return '';
   return (prog + c.slice(words[k].end)).trim();
@@ -1438,7 +1442,8 @@ export function unparseableReason(command) {
 // position. That is strictly more coverage than base had (base only ever saw a nested command that
 // happened to contain a SEPARATOR; `bash -c "npm run build"` walked through it), and it is structural
 // rather than accidental, so it does not depend on where the separators fall.
-const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'busybox']);
+// mksh/yash/fish/tcsh/csh run a `-c` string the same way (self-review of the #6461 round 7 send-back).
+const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'busybox', 'mksh', 'yash', 'fish', 'tcsh', 'csh']);
 // Bounded so a pathological nest can never wedge the guard (the deep-`exec` RangeError is a known,
 // separately-filed follow-up; this expansion must not add a second one).
 const NESTED_DEPTH_CAP = 4;
@@ -1612,6 +1617,10 @@ export function nestedCommandStrings(segment) {
   // is what canonicalCommand returns, kept whole; with more than one command in it, every command is re-executed
   // (operator send-back on #6461 round 7: `npx --call "echo ok; npx vitest run a"` hid the vitest run).
   if (parseSegments(cmd).segments.length > 1) reexec(cmd);
+  // The command a launcher runs (`nohup bash -c "…"`, `setsid -f npx -c "…"`), unwrapped by the shared walker, goes
+  // through every arm and this re-execution again (self-review of the #6461 round 7 send-back).
+  const launched = heavyRunHeads(stripped)?.[1]?.raw;
+  if (launched) reexec(launched);
 
   const words = headWords(cmd);
   const prog = words.length ? words[0].text : '';

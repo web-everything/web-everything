@@ -154,6 +154,20 @@ describe('heavy-enforce — every direct test run requires admission', () => {
   it('allows an admitted run inside a wrapper command string', () => {
     expect(decide(`npx -c "echo ok; ${queue}npx vitest run a"`, {})).toBeNull();
   });
+  // Self-review of the round 7 send-back: an escaped quote in the string quotes its `;` (the inner shell sees
+  // `echo "x; …"`), and a shell `-c` or wrapper string behind a launcher, or in another shell, is read too.
+  it('allows a wrapper command string whose second command is only quoted text', () => {
+    expect(decide('npx -c "echo \\"x; npx vitest run b\\""', {})).toBeNull();
+  });
+  it.each([
+    'nohup bash -c "npx vitest run a"', 'setsid bash -c "npx vitest run a"', 'nohup npx -c "echo ok; npx vitest run a"',
+    'setsid -f sh -ec "npx vitest run a"', 'fish -c "npx vitest run a"', 'mksh -c "npx vitest run a"', 'tcsh -c "npx vitest run a"',
+  ])('denies a heavy run in a launched or other-shell command string `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it('allows an admitted run in a launched shell command string', () => {
+    expect(decide(`nohup bash -c "${queue}npx vitest run a"`, {})).toBeNull();
+  });
   // Operator send-back on #6461 round 7: the shell's `-c` is read by the shared shellCString reader, so `-c` in any
   // option cluster and options that take a value before it hide nothing.
   it.each([

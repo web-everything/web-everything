@@ -360,6 +360,11 @@ describe('agent command audit', () => {
   ])('classifies the nested run of a wrapper command string: %s', command => {
     expect(classifyCommand(command).map(({ category, queued }) => [category, queued])).toEqual([['vitest', false]]);
   });
+  it('reads an escaped quote in a wrapper command string as the inner shell does, and a launched wrapper', () => {
+    expect(classifyCommand('npx -c "echo \\"x; npx vitest run b\\""')).toEqual([]);
+    expect(classifyCommand('nohup npx -c "echo ok; npx vitest run a"').map(row => row.category)).toEqual(['vitest']);
+    expect(classifyCommand('fish -c "npx vitest run a"').map(row => row.category)).toEqual(['vitest']);
+  });
   it('classifies every command of a wrapper command string, admitted or not', () => {
     expect(classifyCommand('npx -c "echo ok && npx playwright test a"').map(row => row.category)).toEqual(['playwright']);
     expect(classifyCommand(`npx -c "echo ok; ${queue}npx vitest run a"`).map(({ category, queued }) => [category, queued]))
@@ -425,6 +430,22 @@ describe('agent command audit', () => {
     const out = redact(command);
     expect(out).not.toContain('Zq9vWm4Lp');
     expect(out).toContain('[REDACTED]');
+  });
+  // Self-review of the round 7 send-back: the value ends with the header's own quoted run, prose keeps its words,
+  // a value in the next word and `…-Key` / `X-Authentication` headers are redacted too.
+  it.each([
+    "curl -H 'Cookie:' 'a=1; sid=Zq9vWm4Lp' u", 'curl -H Cookie: "a=1; sid=Zq9vWm4Lp" u',
+    "curl -H 'Ocp-Apim-Subscription-Key: a; Zq9vWm4Lp' u", "curl -H 'X-Authentication: a; Zq9vWm4Lp' u",
+    "curl -H 'Cookie: a; b' -H 'Authorization: Digest r=\"x\", response=\"Zq9vWm4Lp\"' u",
+    "bash -c 'curl -H \"Cookie: a=1; sid=Zq9vWm4Lp\" u; curl -H \"X-Api-Key: b c Zq9vWm4Lp\" v'", "curl -H 'Cookie: a=1; sid='Zq9vWm4Lp u",
+  ])('redacts a credential header value given in its own quoted run or the next word: %s', command => {
+    expect(redact(command)).not.toContain('Zq9vWm4Lp');
+  });
+  it('keeps the rest of a command string and prose around a credential header', () => {
+    expect(redact("bash -c 'curl -H \"Cookie: a=1; sid=Zq9vWm4Lp\" https://e.com/p; npm test'"))
+      .toBe("bash -c 'curl -H \"[REDACTED]\" https://e.com/p; npm test'");
+    expect(redact('git commit -m "docs: rotate token: see README for steps"')).toContain('README for steps');
+    expect(redact("curl -H 'Cookie:' 'a=1; sid=Zq9vWm4Lp' -o out u")).toBe("curl -H '[REDACTED]' [REDACTED] -o out u");
   });
   it('keeps a harmless header value and the arguments after a credential header', () => {
     expect(redact("curl -H 'Accept: a; q=Zq9vWm4Lp' u")).toBe("curl -H 'Accept: a; q=Zq9vWm4Lp' u");

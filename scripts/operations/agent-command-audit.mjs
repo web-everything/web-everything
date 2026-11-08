@@ -23,7 +23,8 @@ const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|passphrase|^pass$|^pw$|^pw
 const EMPTY_WORD = /^(?:""|'')+$/;
 // Header names (`Authorization:`, `PRIVATE-TOKEN:`, `x-api-key:`, `X-Auth:`, `token:`) and assignment names
 // (`API_KEY=`, `MY_PASS=`, `GITLAB_AUTH=`, `MYSQL_PWD=`) whose value is a credential. Tested on one captured name.
-const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|jwt|(?:^|[-_])auth$|(?:api|access|private|secret|auth)[-_]?key/i;
+// `X-Authentication:` and any `…-Key:` header (`Ocp-Apim-Subscription-Key:`) too (self-review of the #6461 r7 send-back).
+const CREDENTIAL_HEADER = /authorization|authenticat|token|secret|password|cookie|jwt|(?:^|[-_])auth$|(?:api|access|private|secret|auth)[-_]?key|[-_]key$/i;
 const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|passphrase|pass(?:[_-]|$)|(?:^|[_-])pwd$|jwt|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
 // Programs whose own short options carry a password or secret, attached (`mysql -pv`, `7z a -pv`) or separate
 // (`docker login -p v`, `redis-cli -a v`, `zip -P v f`, `ssh-keygen -N v`, `gh secret set X -b v`, `curl -b c=v`).
@@ -348,27 +349,64 @@ function redactLine(text) {
   return redactLineRules(clean) + (cut ? ' …[truncated]' : '');
 }
 
-// A credential header name and its colon inside one shell word, with a value after it in that word.
-const HEADER_IN_WORD = /(?<![\w-])([\w-]+)\s*:\s*(?=\S)/g;
+// A header name and its colon inside one shell word.
+const HEADER_IN_WORD = /(?<![\w-])([\w-]+)\s*:/g;
+// A real header name (hyphenated, `Cookie`, `Authorization`) has a value that may hold `;`, spaces and quotes; a
+// bare prose word (`token:`, `password:` in a commit message) keeps the one-value rule in redactLineRules.
+const HEADER_VALUE_NAME = /[-_]|^(?:cookie|authorization)$/i;
 
 /** A credential header inside one shell word (`'Cookie: a=1; sid=v'`, `-c 'http.extraHeader=Cookie: …'`,
- *  `Cookie:\ a=1\;\ sid=v`, `'Authorization: Digest u="x", response="v"'`): its value runs to the END of that word,
- *  past the `;`, spaces and quotes inside it, so a later cookie or Digest field is redacted too (operator
- *  send-back on #6461 round 7). The word's closing quote is kept. One pass over the words; linear. */
+ *  `Cookie:\ a=1\;\ sid=v`, `'Authorization: Digest u="x", response="v"'`): its value runs to the end of the quoted
+ *  run it sits in, past the `;`, spaces and other quotes inside it, so a later cookie or Digest field is redacted
+ *  too (operator send-back on #6461 round 7). That run is the innermost open quote, so a header inside a `-c`
+ *  string (`bash -c 'curl -H "Cookie: …" u; npm test'`) leaves the rest of the string readable; at the outermost
+ *  level a concatenated tail (`'Cookie: a'b`) is part of the value. A header that ends its word with no value
+ *  (`-H 'Cookie:' 'a=1; sid=v'`) takes the next word. The closing quote is kept. Linear: each word is scanned
+ *  once and each value's quote search starts where the last one ended. */
 function redactHeaderWords(text) {
   let out = '', last = 0;
   for (let i = 0; i < text.length;) {
     if (/[\s;|&()<>]/.test(text[i])) { i += 1; continue; }
-    const end = Math.max(shellWordEnd(text, i), i + 1);
+    let end = Math.max(shellWordEnd(text, i), i + 1);
     const word = text.slice(i, end);
-    const close = /["']$/.test(word) && word.length > 1 ? word.slice(-1) : '';
+    const stack = [];
+    let scanned = 0, wordOut = '', wordLast = 0, nextWord = false;
     HEADER_IN_WORD.lastIndex = 0;
     for (let m; (m = HEADER_IN_WORD.exec(word));) {
-      if (HEADER_IN_WORD.lastIndex >= word.length - close.length) break; // no value left in this word
-      if (!CREDENTIAL_HEADER.test(m[1])) continue;
-      out += text.slice(last, i + m.index) + '[REDACTED]' + close;
+      if (!CREDENTIAL_HEADER.test(m[1]) || !HEADER_VALUE_NAME.test(m[1])) continue;
+      for (; scanned < m.index; scanned += 1) { // the quotes open at the header (an escaped character is skipped)
+        const c = word[scanned];
+        if (c === '\\') scanned += 1;
+        else if (c === '"' || c === "'") { if (stack.at(-1) === c) stack.pop(); else stack.push(c); }
+      }
+      const from = HEADER_IN_WORD.lastIndex;
+      let valueEnd = word.length;
+      if (stack.length) {
+        let k = from;
+        while (k < word.length && word[k] !== stack.at(-1)) k += word[k] === '\\' ? 2 : 1;
+        if (k < word.length && !(stack.length === 1 && k + 1 < word.length)) valueEnd = k;
+      }
+      if (!word.slice(from, valueEnd).trim()) {
+        nextWord = stack.length <= 1 && valueEnd >= word.length - 1;
+        if (nextWord) { wordOut += word.slice(wordLast, m.index) + '[REDACTED]'; wordLast = valueEnd; break; }
+        continue;
+      }
+      wordOut += word.slice(wordLast, m.index) + '[REDACTED]';
+      wordLast = scanned = valueEnd;
+      HEADER_IN_WORD.lastIndex = Math.max(valueEnd, from);
+    }
+    if (wordOut) {
+      out += text.slice(last, i) + wordOut + word.slice(wordLast);
+      if (nextWord) {
+        let at = end;
+        while (/[^\S\n]/.test(text[at] || '')) at += 1;
+        if (at > end && at < text.length && !/[;|&()<>\n]/.test(text[at])) {
+          const valueEnd = Math.max(shellWordEnd(text, at), at + 1);
+          out += text.slice(end, at) + '[REDACTED]';
+          end = valueEnd;
+        }
+      }
       last = end;
-      break;
     }
     i = end;
   }
