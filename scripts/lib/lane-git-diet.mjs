@@ -45,6 +45,7 @@ export const OPS_REF_READERS = Object.freeze([
   { file: 'scripts/ci/quarantine-skip.mjs', refs: 'ops/quarantine', how: '+refs/heads/${base}:refs/remotes/origin/${base} (CI job)' },
   // Delegators: they never name a tracking ref themselves; every read goes through readFromTransportBranch.
   { file: 'scripts/lib/verdict-ledger-io.mjs', refs: 'ops/review-requests', how: 'readFromTransportBranch' },
+  { file: 'scripts/lib/card-number-ledger.mjs', refs: 'ops/card-numbers', how: 'readFromTransportBranch' },
   { file: 'scripts/lib/review-precedents-io.mjs', refs: 'ops/review-requests', how: 'readFromTransportBranch' },
   { file: 'scripts/lib/red-main-quarantine-io.mjs', refs: 'ops/quarantine', how: 'readFromTransportBranch' },
   { file: 'scripts/lib/red-main-freeze-shared.mjs', refs: 'ops/red-main-freeze', how: 'readFromTransportBranch' },
