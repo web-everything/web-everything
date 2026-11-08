@@ -264,12 +264,12 @@ describe('MQ signature audit bounds', () => {
     expect(probe({ text: 'unrelated failure\n' + signature }).decision.hold).toBe(false);
   });
 
-  it('truncates every line to its last 2000 characters and holds for operator inspection without a match', () => {
-    const held = probe({ text: signature.trimEnd() + 'x'.repeat(2000) + '\nunrelated failure\n' });
+  it('truncates every line to its last 512 characters and holds for operator inspection without a match', () => {
+    const held = probe({ text: signature.trimEnd() + 'x'.repeat(512) + '\nunrelated failure\n' });
     expect(held.decision.hold).toBe(true);
     expect(held.decision.reason).toMatch(/non-infrastructure.*operator must inspect/);
     expect(probe({ text: 'x'.repeat(4096) + signature }).decision.hold).toBe(false);
     expect(probe({ text: 'x'.repeat(4096) + '\n' + signature.trimEnd()
-      + 'x'.repeat(2000 - signature.trimEnd().length) }).decision.hold).toBe(false);
+      + 'x'.repeat(512 - signature.trimEnd().length) }).decision.hold).toBe(false);
   });
 });

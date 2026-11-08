@@ -20,7 +20,7 @@ const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 const MQ_INFRA_SCAN_BYTES = 256 * 1024;
-const MQ_INFRA_LINE_CHARS = 2000;
+const MQ_INFRA_LINE_CHARS = 512;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
 
 function validMqInfraSignatures(value) {
