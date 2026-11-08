@@ -29,7 +29,8 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   // The matching env (`GIT_ASKPASS`, `SSH_ASKPASS`) is dropped in laneGitHardeningEnv, which also disables terminal
   // prompts. Only a git call that runs in the operator's VALIDATED primary checkout (never a lane) may leave these two
   // out — `laneGitHardeningEnv(env, { credentialPins: false })` — so its own helper (osxkeychain, `gh auth
-  // git-credential`) authenticates (PR #6319 operator ruling, R674 route a).
+  // git-credential`) authenticates (PR #6319 operator ruling, R674 route a). That helper comes from the account's
+  // global / system config only: the caller refuses local / worktree credential keys in the primary (salvage-push).
   ['credential.helper', ''],
   ['core.askPass', ''],
   ['commit.gpgsign', 'false'],

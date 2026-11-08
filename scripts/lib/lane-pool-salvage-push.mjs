@@ -125,11 +125,15 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       // agent-writable lane) may carry ordinary extra remotes (upstream, a fork): the transport names the canonical
       // URL explicitly, so only a remote aliasing that URL can redirect it, and that alias is refused for every key.
       const unsafeRemote = aliasesOrigin || (!primary && remoteName !== null && remoteName !== 'origin');
-      // `primary`: its auth/signing keys (credential helper, commit.gpgsign, …) are not lane control either.
-      // URL rewrites (insteadOf / pushInsteadOf, above) and origin aliases are still refused there.
+      // `primary`: its signing keys (commit.gpgsign, …) and hooks are not lane control. Its local/worktree credential,
+      // askpass, proxy, TLS and protocol keys ARE refused, like a lane's: the primary listing runs without the credential
+      // resets, and "primary" is only a checkout outside the pool roots (any `~/workspace/*` clone with the right origin
+      // qualifies), which an agent can create. The operator's helper is trusted from global/system scope only — the
+      // send-back's "never --local / --worktree" (PR #6319 self-review). URL rewrites and origin aliases are refused too.
       // `hook.*`: config-defined hooks (`hook.<name>.command` + `.event`) run even with the core.hooksPath pin.
       if (['local', 'worktree'].includes(scope)
-        && (unsafeRemote || !primary && /^(?:hook\.|credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
+        && (unsafeRemote || /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.)/i.test(key)
+          || !primary && /^(?:hook\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
       }
     }

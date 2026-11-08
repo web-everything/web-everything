@@ -231,17 +231,18 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       }
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
-  // PR #6319 operator ruling (R674 route a): the validated primary's own credential helper (local or global scope)
-  // authenticates the canonical-origin listing; a lane-set helper never runs on a lane transport.
-  it.each(['local', 'global'])('the primary listing authenticates with a %s dummy helper while a lane-set helper stays blocked', scope => {
+  // PR #6319 operator ruling (R674 route a): the operator's own credential helper (account-home global scope)
+  // authenticates the canonical-origin listing run in the validated primary; a lane-set helper never runs on a lane
+  // transport. A helper in the primary's LOCAL config is refused instead (next test): the send-back trusts
+  // global/system scope only, and any non-pool clone with the right origin can be the "primary".
+  it('the primary listing authenticates with a global dummy helper while a lane-set helper stays blocked', () => {
     const { dir, primary } = setup();
     try {
       const home = join(dir, 'home');
       mkdirSync(home);
       const primaryRan = join(dir, 'primary-helper-ran'), evilRan = join(dir, 'lane-helper-ran');
       const helper = `!f() { touch '${primaryRan}'; [ "$1" = get ] && printf 'username=operator\\npassword=primary-pass\\n'; }; f`;
-      if (scope === 'local') execFileSync('git', ['config', 'credential.helper', helper], { cwd: primary });
-      else execFileSync('git', ['config', '--file', join(home, '.gitconfig'), 'credential.helper', helper]);
+      execFileSync('git', ['config', '--file', join(home, '.gitconfig'), 'credential.helper', helper]);
       // The caller (a release run inside a lane) points HOME / XDG_CONFIG_HOME at a lane-written config with its own
       // helper: the primary listing reads global config from the account home (`accountHome`) instead.
       const callerHome = join(dir, 'caller-home');
@@ -294,13 +295,39 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       for (const [, args, options] of runGit.mock.calls.filter(([, args]) => args.includes('config'))) expect(options.env.HOME, args.join(' ')).toBe(home);
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
-  it('accepts operator auth/signing keys in the primary and excludes ops/* heads', () => {
-    const { dir, primary, sha, io } = setup();
+  it('accepts operator signing keys in the primary, a global credential helper, and excludes ops/* heads', () => {
+    const { dir, primary, sha } = setup();
     try {
       // An agent-writable lane may not carry these; the operator's primary legitimately can.
       execFileSync('git', ['config', 'commit.gpgSign', 'false'], { cwd: primary });
-      execFileSync('git', ['config', 'credential.helper', 'store'], { cwd: primary });
+      const home = join(dir, 'home');
+      mkdirSync(home);
+      execFileSync('git', ['config', '--file', join(home, '.gitconfig'), 'credential.helper', 'store']);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), accountHome: home });
       expect(io.remoteHeads()).toEqual([sha]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // PR #6319 self-review: the primary listing drops the credential resets, and "validated primary" means only a clone
+  // outside the pool roots with the right origin — an agent can `git init` one under the workspace. So a credential
+  // helper, askpass, proxy, TLS or gitProxy key in the primary's LOCAL (or worktree) config is refused, never run.
+  it.each([
+    ['credential.helper', marker => `!touch '${marker}'`],
+    ['credential.https://example.invalid.helper', marker => `!touch '${marker}'`],
+    ['core.askPass', marker => marker],
+    ['core.gitProxy', marker => `!touch '${marker}'`],
+    ['http.proxy', () => 'http://127.0.0.1:9'],
+    ['http.sslVerify', () => 'false'],
+  ])('refuses a planted primary whose local config sets %s, and runs nothing', (key, value) => {
+    const { dir, primary } = setup();
+    try {
+      const marker = join(dir, 'planted-ran');
+      execFileSync('git', ['config', key, value(marker)], { cwd: primary });
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: join(dir, 'home') });
+      expect(() => io.remoteHeads()).toThrow(/lane-controlled transport/);
+      expect(() => io.remoteSha('main')).toThrow(/lane-controlled transport/);
+      expect(runGit.mock.calls.some(([, args]) => args.includes('ls-remote'))).toBe(false);
+      expect(existsSync(marker), 'a planted primary helper ran').toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   // The primary is the operator's own checkout: an upstream or fork remote there is normal, and the transport names
