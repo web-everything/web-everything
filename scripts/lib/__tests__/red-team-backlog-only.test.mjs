@@ -2,10 +2,11 @@ import { describe, it, expect, vi } from 'vitest';
 import { backlogOnlyPrepClear, readHeadFiles, resolveBacklogOnlyPrepSetting, runBacklogOnlyPrep } from '../red-team-backlog-only.mjs';
 import { redTeamMarker } from '../red-team-gate.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
+import * as policyCascade from '../policy-cascade.mjs';
 
 const head = 'a'.repeat(40), pr = 742, repo = 'owner/repo';
-const note = (sha = head, blocked = false) => ({ author: { login: 'chalbert' },
-  body: `<!-- prep-review: head=${sha} round=1${blocked ? ' blocked=1' : ''} -->` });
+const note = (sha = head, blocked = false, verdict = blocked ? 'findings' : 'clean') => ({ author: { login: 'chalbert' },
+  body: `<!-- prep-review: head=${sha} round=1${blocked ? ' blocked=1' : ''} -->\n**Verdict: ${verdict}**` });
 const evidence = () => ({ enabled: true, head, files: [{ filename: 'backlog/742.md' }],
   comments: [note()], labels: ['review:prep', 'red-team:pending'] });
 function fixture(over = {}) {
@@ -29,6 +30,13 @@ describe('backlog-only prep', () => {
     ['older head', { comments: [note('b'.repeat(40))] }],
     ['blocked note', { comments: [note(head, true)] }],
     ['newest blocked note', { comments: [note(), note(head, true)] }],
+    ['marker without verdict', { comments: [note(head, false, 'unknown')] }],
+    ['advise findings without blocked marker', { comments: [note(head, false, 'findings')] }],
+    ['older findings followed by clean', { comments: [note(head, false, 'findings'), note()] }],
+    ['older blocked followed by clean', { comments: [note(head, true), note()] }],
+    ['newest note without clean verdict', { comments: [note(), note(head, false, 'unknown')] }],
+    ['both verdicts in one trusted note', { comments: [{ ...note(), body: note().body + '\n**Verdict: findings**' }] }],
+    ['untrusted clean cannot settle trusted findings', { comments: [note(head, false, 'findings'), { ...note(), author: { login: 'stranger' } }] }],
     ['untrusted note', { comments: [{ ...note(), author: { login: 'stranger' } }] }],
     ['empty files', { files: [] }],
     ['unknown files', { files: null }],
@@ -70,6 +78,27 @@ describe('backlog-only prep', () => {
     const f = fixture({ readComments: () => [note(), { author: { login: 'chalbert' }, body: redTeamMarker(pr, head) }] });
     expect(runBacklogOnlyPrep(f)[0].why).toBe('already'); expect(f.post).not.toHaveBeenCalled();
   });
+  it('ignores findings for another head and untrusted findings', () => {
+    const comments = [note('b'.repeat(40), true), note(), { ...note(head, true), author: { login: 'stranger' } }];
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(true);
+  });
+  it.each([
+    ['blocked', note(head, true)],
+    ['advise findings', note(head, false, 'findings')],
+    ['unknown verdict', note(head, false, 'unknown')],
+  ])('holds when fresh comments contain a newer %s note', (_name, newer) => {
+    const readComments = vi.fn().mockReturnValueOnce([note()]).mockReturnValueOnce([note(), newer]);
+    const f = fixture({ readComments });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+  });
+  it('holds when the final comment read fails', () => {
+    const readComments = vi.fn().mockReturnValueOnce([note()]).mockImplementationOnce(() => { throw Error('unreadable'); });
+    const f = fixture({ readComments });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+  });
   it('setting env zero returns no rows and performs no IO', () => {
     const f = fixture({ enabled: undefined, env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '0' } });
     expect(runBacklogOnlyPrep(f)).toEqual([]); expect(f.post).not.toHaveBeenCalled();
@@ -87,6 +116,28 @@ describe('backlog-only prep', () => {
     const readFile = path => { if (String(path).endsWith('red-team.json')) throw Error('unreadable');
       return JSON.stringify({ redTeam: { skipBacklogOnlyPrep: false } }); };
     expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile })).toEqual({ enabled: false });
+  });
+  it('defaults true when optional settings files are missing', () => {
+    expect(resolveBacklogOnlyPrepSetting({ env: {}, readFile: () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); } })).toEqual({ enabled: true });
+  });
+  it.each(['tool read', 'tool parse', 'platform read', 'platform parse'])('fails closed on %s failure unless env is a valid boolean', failure => {
+    const readFile = path => {
+      const tool = String(path).endsWith('red-team.json');
+      if (tool === failure.startsWith('tool')) {
+        if (failure.endsWith('parse')) return '{';
+        throw Object.assign(Error('denied'), { code: 'EACCES' });
+      }
+      return JSON.stringify({ redTeam: { skipBacklogOnlyPrep: true } });
+    };
+    for (const [value, enabled] of [[undefined, false], ['invalid', false], ['1', true], ['true', true], ['0', false], ['false', false]]) {
+      expect(resolveBacklogOnlyPrepSetting({ env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: value }, readFile })).toEqual({ enabled });
+    }
+  });
+  it.each([[undefined, false], ['invalid', false], ['true', true], ['false', false]])('fails closed on cascade throw with env %s', (value, enabled) => {
+    const spy = vi.spyOn(policyCascade, 'cascadePolicy').mockImplementationOnce(() => { throw Error('cascade failed'); });
+    try {
+      expect(resolveBacklogOnlyPrepSetting({ env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: value }, readFile: () => JSON.stringify({ redTeam: { skipBacklogOnlyPrep: true } }) })).toEqual({ enabled });
+    } finally { spy.mockRestore(); }
   });
   it('reads paginated files and verifies current head', () => {
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify([[{ filename: 'backlog/a' }], [{ filename: 'backlog/b', previous_filename: 'backlog/c' }]]))

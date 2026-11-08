@@ -1,6 +1,6 @@
 /** Settle backlog-only prep independently of acceptance-based red-team recovery. */
 import { readFileSync } from 'node:fs';
-import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
+import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 import { priorPrepReviews } from '../conveyor/prep-review.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
@@ -16,20 +16,27 @@ const booleanEnv = value => /^(1|true)$/i.test(value ?? '') ? true : /^(0|false)
 const safeLog = log => line => { try { log(clean(line)); } catch { /* diagnostic only */ } };
 
 export function resolveBacklogOnlyPrepSetting({ env = process.env, log = () => {}, readFile = readFileSync } = {}) {
-  let tool, platform;
-  try { tool = JSON.parse(readFile(settingPath, 'utf8'))?.redTeam?.skipBacklogOnlyPrep; } catch { /* optional */ }
-  try { platform = platformPreference('redTeam', { env, readFile })?.skipBacklogOnlyPrep; } catch { /* optional */ }
+  const envValue = booleanEnv(env?.WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP);
   try {
+    let tool;
+    try { tool = JSON.parse(readFile(settingPath, 'utf8'))?.redTeam?.skipBacklogOnlyPrep; }
+    catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    // platformPreference discards read errors; this exemption needs the complete evidence.
+    const { prefs, errors } = readPlatformPreferences({ env, readFile });
+    if (errors.length) throw Error(`platform preferences unreadable: ${errors.join('; ')}`);
     const resolved = cascadePolicy('redTeamSkipBacklogOnlyPrep', { skipBacklogOnlyPrep: tool }, {
-      standard: { skipBacklogOnlyPrep: true }, platform: { skipBacklogOnlyPrep: platform },
-      envValues: { skipBacklogOnlyPrep: booleanEnv(env.WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP) },
+      standard: { skipBacklogOnlyPrep: true }, platform: { skipBacklogOnlyPrep: prefs.redTeam?.skipBacklogOnlyPrep },
+      envValues: { skipBacklogOnlyPrep: envValue },
       valid: v => typeof v === 'boolean', env, log: safeLog(log),
     });
     return { enabled: resolved.value.skipBacklogOnlyPrep };
-  } catch { return { enabled: booleanEnv(env?.WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP) ?? falseIfConfigured(tool, platform) }; }
+  } catch (error) {
+    const enabled = envValue ?? false;
+    safeLog(log)(`red-team: backlog-only prep enabled=${enabled} (${envValue === undefined ? 'fail-closed' : 'env'}): ${clean(error)}`);
+    return { enabled };
+  }
 }
 
-const falseIfConfigured = (tool, platform) => typeof tool === 'boolean' ? tool : typeof platform === 'boolean' ? platform : true;
 const backlogPath = path => typeof path === 'string' && path.startsWith('backlog/')
   && !path.includes('..') && !/[\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path);
 
@@ -45,8 +52,11 @@ export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } 
   if (!ns || ns.some(n => typeof n !== 'string') || !candidate(ns)) return refuse('required labels missing or unreadable');
   if (ns.some(n => ['review:changes', 'review:human', 'red-team:blocked'].includes(n))) return refuse('blocking label');
   if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string')) return refuse('comments unreadable');
-  const newest = priorPrepReviews(comments).filter(n => n.head === head).at(-1);
-  if (!newest || newest.blocked) return refuse('no clean newest trusted prep note for head');
+  const prior = comments.flatMap(comment => priorPrepReviews([comment])
+    .filter(n => n.head === head).map(n => ({ ...n, body: comment.body })));
+  if (prior.some(n => n.blocked || n.body.includes('**Verdict: findings**')))
+    return refuse('trusted prep findings or blocked note for head');
+  if (!prior.at(-1)?.body.includes('**Verdict: clean**')) return refuse('no clean newest trusted prep note for head');
   return { ok: true, rule: RULE };
 }
 
@@ -78,6 +88,10 @@ function settleCandidate({ repo, raw, readComments, readHeadFiles: readFiles, re
     if (live?.headRefOid !== head || !after || after.some(n => typeof n !== 'string')
       || JSON.stringify([...before].sort()) !== JSON.stringify([...after].sort())) throw Error('head or labels changed before post');
     if (dryRun) return { ...row, why: 'dry run (backlog-only prep)' };
+    const freshComments = readComments(key);
+    const freshProof = backlogOnlyPrepClear({ enabled: true, head, files, comments: freshComments, labels: live.labels });
+    if (!freshProof.ok) return { ...row, why: freshProof.why };
+    if (redTeamForHead(freshComments, pr, head)) return { ...row, why: 'already' };
     post({ ...key, body: `${redTeamMarker(pr, head)}\n\n${REASON}` });
     syncLabels({ ...key, env, log });
     return { ...row, action: 'clear', why: REASON };
