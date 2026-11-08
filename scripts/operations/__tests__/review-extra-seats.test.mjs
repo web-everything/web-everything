@@ -1730,12 +1730,9 @@ describe('#6535 publish-first: a red-team round starts only after its in_progres
     expect(pass.status).toBe('skipped');
     expect(pass.reason).toMatch(/disk full/);
   });
-  it('does not start the round when the writer returns nothing (unconfirmed publication fails closed)', async () => {
-    const { io, order } = rig(() => undefined);
-    const pass = await spec(io);
-    expect(order).toEqual([['status', 'running']]);
-    expect(pass.status).toBe('skipped');
-    expect(pass.reason).toMatch(/publication not confirmed/);
+  it('the real io wrapper refuses a running status with no confirmed publication', () => {
+    const io = createRedTeamIo({ env: {}, recordStatus: () => undefined });
+    expect(() => io.redTeamStatus({ repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD, status: 'running' })).toThrow(/not confirmed/);
   });
   it('releases the reserved call when the writer throws', async () => {
     const released = [];

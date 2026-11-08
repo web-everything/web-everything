@@ -1828,10 +1828,11 @@ export async function speculateRedTeam({
     if (record && post) {
       // Publish-first (#6535): the round starts only once its in_progress check is posted, so CI can never pass
       // an older success while this round runs unseen. Fail closed; the next tick retries.
-      let published;
-      try { published = io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
+      // The real io (createRedTeamIo) throws unless the post is confirmed; only an explicit false/throw is read here.
+      let published = { published: true };
+      try { published = io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }) ?? published; }
       catch (e) { published = { published: false, reason: String(e?.message ?? e) }; }
-      if (published?.published !== true) {
+      if (published?.published === false) {
         const reason = `red-team round not started: in_progress check not posted (${String(published?.reason ?? 'publication not confirmed').slice(0, 300)}); retried next tick`;
         io.log(reason);
         try { io.releaseCalls?.({ provider, callIds: [callId] }); } catch (e) { io.log(`red-team reservation release failed: ${e.message}`); }
@@ -2072,8 +2073,8 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }),
     redTeamStatus: input => {
       const outcome = recordStatus(input, { env });
-      if (input.status === 'running' && outcome?.published === false)
-        throw new Error(`red-team in_progress check not published: ${String(outcome.reason ?? 'publication failed').slice(0, 300)}`);
+      if (input.status === 'running' && outcome?.published !== true)
+        throw new Error(`red-team in_progress check not published: ${String(outcome?.reason ?? 'publication not confirmed').slice(0, 300)}`);
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
         evidence: { scheduled: true, inFlight: input.status === 'running', recorded: input.result === 'ran' }, env, log: base.log }); }
       catch (e) { base.log(`red-team status labels: ${e.message}`); }
