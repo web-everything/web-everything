@@ -19,10 +19,12 @@ const DIFF = 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -1 +1 @@\
 const FP = normalizeDiffFingerprint(DIFF);
 const CLEARED = 'e125ac99929f8d0f210d253b0969d1f6017ffd4a';
 const HEAD = 'de961efb57a31b31c7fb9ae65833880260e6e205';
+const TRUST_DRAIN = { value: 'trust-drain-record', source: 'test' };
 const ON = { value: true, source: 'default' };
 const quiet = () => {};
 
 const clearHumanComment = (sha, fp = FP) => ({
+  id: 'IC_clearance',
   author: { login: 'chalbert' },
   body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${sha} -->\n${fp ? `<!-- reviewed-diff: ${fp} -->\n` : ''}<!-- cleared-human: chalbert -->`,
 });
@@ -60,7 +62,12 @@ describe('decideHumanClearanceCarry (pure)', () => {
 
 describe('latestHumanClearance', () => {
   it('reads the sha and diff from the SAME latest human comment', () => {
-    expect(latestHumanClearance([clearHumanComment(CLEARED)])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert' });
+    expect(latestHumanClearance([clearHumanComment(CLEARED)])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert', sourceId: 'IC_clearance' });
+  });
+  it('R706: an uncited automation comment with a changed fingerprint never supplies the clearance metadata', () => {
+    const rejected = { author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${HEAD} -->\n<!-- reviewed-diff: ${'e'.repeat(64)} -->\n<!-- cleared-human: mallory -->` };
+    // The rejected carrier is invisible: the original human clearance still stands, with ITS fingerprint and actor.
+    expect(latestHumanClearance([clearHumanComment(CLEARED), rejected])).toMatchObject({ sha: CLEARED, diff: FP, actor: 'chalbert' });
   });
   it('a later plain accept means no clearance to carry', () => {
     expect(latestHumanClearance([clearHumanComment(CLEARED), plainAccept(HEAD)])).toBe(null);
@@ -69,7 +76,7 @@ describe('latestHumanClearance', () => {
     expect(latestHumanClearance([{ author: { login: 'mallory' }, body: clearHumanComment(CLEARED).body }])).toBe(null);
   });
   it('a diff-less clearance does NOT inherit an older accept\'s reviewed-diff', () => {
-    expect(latestHumanClearance([plainAccept(PR4722.r1), clearHumanComment(CLEARED, null)])).toEqual({ sha: CLEARED, diff: null, contribution: null, actor: 'chalbert' });
+    expect(latestHumanClearance([plainAccept(PR4722.r1), clearHumanComment(CLEARED, null)])).toEqual({ sha: CLEARED, diff: null, contribution: null, actor: 'chalbert', sourceId: 'IC_clearance' });
   });
   it('a clearance with an empty actor is not an attributed clearance', () => {
     const c = { author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${CLEARED} -->\n<!-- reviewed-diff: ${FP} -->\n<!-- cleared-human: -->` };
@@ -78,7 +85,7 @@ describe('latestHumanClearance', () => {
   it('a short or mixed-case sha is not compared or fed to git', () => {
     const short = clearHumanComment(CLEARED.slice(0, 12));
     expect(latestHumanClearance([short])).toBe(null);
-    expect(latestHumanClearance([clearHumanComment(CLEARED.toUpperCase())])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert' });
+    expect(latestHumanClearance([clearHumanComment(CLEARED.toUpperCase())])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert', sourceId: 'IC_clearance' });
   });
   it('the actor comes from the clearance comment, never from an untrusted later forgery', () => {
     const forged = { author: { login: 'mallory' }, body: '<!-- cleared-human: evil -->' };
@@ -301,7 +308,7 @@ const pr4722Graph = {
   [PR4722.r1]: [PR4722.main1, PR4722.e125], [PR4722.head]: [PR4722.main2, PR4722.r1],
   [PR4722.main2]: [PR4722.main1], [PR4722.e125]: ['c67450aff'], [PR4722.main1]: ['c67450aff'],
 };
-const restampComment = { author: { login: 'web-everything' }, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${PR4722.r1} -->\n<!-- reviewed-diff: ${PR4722.fp} -->\n<!-- cleared-human: chalbert -->` };
+const restampComment = { author: { login: 'web-everything' }, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${PR4722.r1} -->\n<!-- reviewed-diff: ${PR4722.fp} -->\n<!-- cleared-human: chalbert -->\n<!-- cleared-from: IC_clearance -->` };
 
 describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
   for (const [name, comments, from] of [
@@ -320,7 +327,7 @@ describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
       expect(posted).toHaveLength(1);
       expect(posted[0]).toContain(`<!-- ${HUMAN_CLEARANCE_CARRIED_MARKER}: from=${from} to=${PR4722.head} diff=${PR4722.fp} -->`);
       // Every reader of the binding (drain, review-hold reconcile, operator queue) now sees the live head cleared.
-      expect(parseLatestHumanClearedSha([...comments, { viewerDidAuthor: true, body: posted[0] }])).toBe(PR4722.head);
+      expect(parseLatestHumanClearedSha([...comments, { viewerDidAuthor: true, author: { login: 'web-everything' }, body: posted[0] }])).toBe(PR4722.head);
     });
   }
 
@@ -385,7 +392,7 @@ describe('drain gate: what does NOT carry', () => {
     expect(posted).toHaveLength(0);
   });
   it('a failed record write defers without a label change', () => {
-    const r = applyHumanClearanceCarry({ evidence: { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert' }, headSha: PR4722.head, headDiff: PR4722.fp, headDiffSha: PR4722.head },
+    const r = applyHumanClearanceCarry({ evidence: { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert', sourceId: 'IC_clearance' }, headSha: PR4722.head, headDiff: PR4722.fp, headDiffSha: PR4722.head },
       pr: 1, exec: graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: () => { throw new Error('gh 502'); } }), setting: ON, log: quiet });
     expect(r).toMatchObject({ action: 'defer', applyLabel: null });
   });
@@ -426,7 +433,7 @@ describe('drain gate: what does NOT carry', () => {
   it('logs the setting once per distinct value, and every carry and refused carry', () => {
     const lines = [];
     const log = (l) => lines.push(l);
-    const evidence = { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert' }, headSha: PR4722.head, headDiff: PR4722.fp, headDiffSha: PR4722.head };
+    const evidence = { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert', sourceId: 'IC_clearance' }, headSha: PR4722.head, headDiff: PR4722.fp, headDiffSha: PR4722.head };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2] });
     const setting = { value: true, source: 'env' };
     applyHumanClearanceCarry({ evidence, pr: 7, exec, setting, log });
@@ -437,7 +444,7 @@ describe('drain gate: what does NOT carry', () => {
   });
   it('dry run carries without writing', () => {
     const onComment = vi.fn();
-    const r = applyHumanClearanceCarry({ evidence: { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert' }, headSha: PR4722.head, headDiff: PR4722.fp, headDiffSha: PR4722.head },
+    const r = applyHumanClearanceCarry({ evidence: { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert', sourceId: 'IC_clearance' }, headSha: PR4722.head, headDiff: PR4722.fp, headDiffSha: PR4722.head },
       pr: 1, dryRun: true, exec: graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment }), setting: ON, log: quiet });
     expect(r.carried.recorded).toBe(false);
     expect(onComment).not.toHaveBeenCalled();
@@ -465,13 +472,13 @@ describe('buildCarryRecordBody', () => {
     expect(body).toContain('<!-- cleared-human: chalbert -->');
   });
   it('neutralises newlines, markup, mentions and links in the actor wherever it is rendered', () => {
-    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, tier: 'strict', actor: 'ev\nil <b>@victim</b> [x](http://e) `c`', headDiffText: DIFF });
+    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, tier: 'strict', actor: 'ev\nil <b>@victim</b> [x](http://e) `c`', headDiffText: DIFF, sourceId: 'IC_clearance' });
     const prose = body.split('\n').find((l) => l.startsWith('Recorded by drain'));
     expect(prose).toContain('ev il');
     expect(prose).not.toMatch(/@|<|>|\]\(|`c`/);
     expect(body).not.toContain('@victim');
     expect(body.split('\n').filter((l) => l.includes('cleared-human:'))).toHaveLength(1);
-    expect(parseLatestHumanClearedSha([{ viewerDidAuthor: true, body }])).toBe(HEAD);
+    expect(parseLatestHumanClearedSha([clearHumanComment(CLEARED), { viewerDidAuthor: true, author: { login: 'web-everything' }, body }])).toBe(HEAD);
   });
 });
 
@@ -588,7 +595,7 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
         expect([cmd, ...args.slice(0, 2)]).toEqual(['gh', 'pr', 'comment']);
         posted.push(args[args.indexOf('--body') + 1]); return '';
       };
-      const result = applyHumanClearanceCarry({ evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, netPatchSetting: { value: netPatch, source: 'test' }, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
+      const result = applyHumanClearanceCarry({ mechanicalCarry: TRUST_DRAIN, evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, netPatchSetting: { value: netPatch, source: 'test' }, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
       if (mode === 'default' || mode === 'contribution') {
         expect(result).toMatchObject({ carried: { recorded: true, tier: 'contribution', fromSha: cleared, toSha: headSha } });
         expect(posted).toHaveLength(1);
@@ -616,7 +623,7 @@ describe('tamper-park callback through the durable human carry writer', () => {
       throw Error('unexpected gh read');
     };
     const callback = createTamperParkCarryCallback({ pr: 5463, repo, exec,
-      setting: ON, numberingSetting: ON, log: quiet, proveNumbering: () => ({ ok: true, reason: 'exact numbering' }) });
+      setting: ON, mechanicalCarry: TRUST_DRAIN, numberingSetting: ON, log: quiet, proveNumbering: () => ({ ok: true, reason: 'exact numbering' }) });
     const result = callback({ humanClearance: latestHumanClearance([comment]), headSha: HEAD,
       headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') });
     expect(result).toMatchObject({ carried: { recorded: true, tier: 'numbering' } });
@@ -634,7 +641,7 @@ describe('tamper-park callback through the durable human carry writer', () => {
       humanClearedSha: CLEARED, headSha: HEAD, pinnedHeadSha: shape === 'unpinned' ? CLEARED : HEAD,
       readHeadDiff: () => ({ scored: true, text: headDiff, rev: HEAD }),
       applyNumberingCarry: createTamperParkCarryCallback({ pr: 5463, repo: 'owner/repo',
-        setting: { value: shape !== 'master off', source: 'test' }, numberingSetting: { value: shape !== 'numbering off', source: 'test' }, log: quiet,
+        mechanicalCarry: TRUST_DRAIN, setting: { value: shape !== 'master off', source: 'test' }, numberingSetting: { value: shape !== 'numbering off', source: 'test' }, log: quiet,
         exec: (cmd, args) => { if (cmd === 'git') throw Error('no general git proof in fixture'); posted.push(args); return ''; },
         proveNumbering: () => ({ ok: shape !== 'mixed change', reason: shape === 'mixed change' ? 'unrelated byte' : 'exact numbering' }),
         readNumberingLiveEvidence: () => ({ headSha: HEAD, comments: shape === 'live hold'
@@ -648,7 +655,7 @@ describe('tamper-park callback through the durable human carry writer', () => {
 });
 
 describe('human clearance numbering tier', () => {
-  const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' },
+  const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert', sourceId: 'IC_clearance' },
     headSha: HEAD, headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') };
   it.each(['off', 'unread live diff'])('refuses %s before attempting numbering', (kind) => {
     let calls = 0;
@@ -676,7 +683,7 @@ describe('human clearance numbering tier', () => {
     const apply = (over = {}) => {
       const posted = [];
       const exec = (cmd, args) => { if (cmd === 'gh') posted.push(args); return ''; };
-      const result = applyHumanClearanceCarry({ evidence, pr: 5233, exec, setting: ON, log: () => {},
+      const result = applyHumanClearanceCarry({ mechanicalCarry: TRUST_DRAIN, evidence, pr: 5233, exec, setting: ON, log: () => {},
         proveNumbering: () => ({ ok: true, reason: 'verified renames' }), ...over });
       return { result, posted };
     };
@@ -732,7 +739,7 @@ it('#5414 recorded heads: carries chalbert and updates acceptance as well as cle
     pr: 5414, repo: 'web-everything/web-everything', local: true, exec,
     files: ['scripts/conveyor/reconcile-core.mjs'], filesComplete: true, listedHeadSha: head,
     netDiff: () => ({ scored: true, text: after, rev: head, revSha: head }),
-    carry: { setting: ON, numberingSetting: { value: true, source: 'platform' }, log: line => logs.push(line),
+    carry: { mechanicalCarry: TRUST_DRAIN, setting: ON, numberingSetting: { value: true, source: 'platform' }, log: line => logs.push(line),
       proveNumbering: o => { proofs.push([o.fromSha, o.toSha]); return { ok: true, reason: 'verified x3o0ohn→#6178' }; } },
   });
   expect(gate.action).toBe('merge');
@@ -786,9 +793,9 @@ describe('#5403 clearance → prevention notice → numbering-only move', () => 
     const posted = [];
     const result = applyHumanClearanceCarry({
       evidence: { humanClearance: { sha: '1847d5a95180c890b12066d321c86492f69b800f',
-        diff: '4cefa20412e79463ce05cd4952f23182f35ed300261a0c486756f1e05f8b4cf5', actor: 'chalbert' },
+        diff: '4cefa20412e79463ce05cd4952f23182f35ed300261a0c486756f1e05f8b4cf5', actor: 'chalbert', sourceId: comments[0].id },
         headSha: head, headDiffSha: head, headDiff: DIFF },
-      pr: 5403, setting: ON, log: quiet,
+      pr: 5403, mechanicalCarry: TRUST_DRAIN, setting: ON, log: quiet,
       exec: (cmd, args) => { if (cmd === 'gh') posted.push([cmd, args]); return ''; },
       proveNumbering: () => ({ ok: true, reason: 'numbering-only move' }),
       readLiveEvidence: () => ({ headSha: head, reviews: [], comments: [comments[0],
@@ -797,5 +804,111 @@ describe('#5403 clearance → prevention notice → numbering-only move', () => 
     if (carries) expect(result).toMatchObject({ carried: { tier: 'numbering', recorded: true } });
     else expect(result).toMatchObject({ action: 'defer', reason: expect.stringContaining('later verdict or unknown comment') });
     expect(posted).toHaveLength(carries ? 1 : 0);
+  });
+});
+
+
+describe('R711 writer and parser agree on mechanical carry policy', () => {
+  function fixture(tier, sourceId = 'IC_clearance') {
+    const old = DIFF;
+    const live = tier === 'strict' ? old : old.replace('@@ -1 +1 @@', '@@ -2 +2 @@');
+    const comment = clearHumanComment(CLEARED);
+    comment.body += `\n<!-- reviewed-contribution: ${normalizeContributionFingerprint(old)} -->`;
+    const evidence = { humanClearance: { ...latestHumanClearance([comment]), sourceId }, headSha: HEAD, headDiffSha: HEAD, headDiff: live };
+    const oldBase = '1'.repeat(40), newBase = '2'.repeat(40), tree = '3'.repeat(40);
+    const posted = [], logs = [];
+    const exec = (cmd, args) => {
+      if (cmd === 'gh') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
+      if (args[0] === 'rev-parse') {
+        if (tier === 'tree') return tree;
+        throw Error('different trees');
+      }
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'merge-base') {
+        if (args[1] === '--is-ancestor') throw Object.assign(Error('rewritten'), { status: 1 });
+        return args.includes(CLEARED) ? oldBase : newBase;
+      }
+      if (args[0] === 'merge-tree') return tree;
+      if (args[0] === 'patch-id') return `${'4'.repeat(40)} ${'0'.repeat(40)}`;
+      if (args[0] === 'diff') {
+        if (args.includes('--name-only')) return '';
+        if ((args.includes(oldBase) && args.includes(newBase)) || (args.includes(CLEARED) && args.includes(HEAD))) return 'positioned upstream movement';
+        return args.includes(CLEARED) ? old : live;
+      }
+      throw Error(`unexpected git ${args.join(' ')}`);
+    };
+    const options = { evidence, pr: 711, exec, setting: ON, log: s => logs.push(s),
+      netPatchSetting: { value: tier === 'net-patch', source: 'test' }, numberingSetting: ON,
+      proveNumbering: () => ({ ok: tier === 'numbering', reason: 'numbering proof' }),
+      readLiveEvidence: () => ({ headSha: HEAD, comments: [comment], reviews: [] }) };
+    if (tier === 'numbering') options.numberingOnly = true;
+    expect(proveHumanClearanceCarry({ ...options, enabled: true })).toMatchObject({ carry: true, tier });
+    return { options, comment, posted, logs };
+  }
+
+  it.each(['tree', 'net-patch', 'contribution', 'numbering'])('default refuse does not post a changed reviewed diff at tier %s', tier => {
+    const f = fixture(tier);
+    expect(applyHumanClearanceCarry(f.options)).toBeNull();
+    expect(f.posted).toEqual([]);
+    expect(f.logs.some(s => s.includes('NOT carried (humanClearance.mechanicalCarry=refuse)'))).toBe(true);
+  });
+  it('default refuse still posts a strict unchanged carry which the parser accepts', () => {
+    const f = fixture('strict');
+    expect(applyHumanClearanceCarry(f.options)).toMatchObject({ carried: { tier: 'strict', recorded: true } });
+    expect(f.posted).toHaveLength(1);
+    expect(parseLatestHumanClearedSha([f.comment, { author: { login: 'web-everything' }, body: f.posted[0] }])).toBe(HEAD);
+  });
+  it.each(['tree', 'net-patch', 'contribution', 'numbering'])('trust-drain-record posts tier %s and parser requires the cited human source and exact endpoints', tier => {
+    const f = fixture(tier);
+    expect(applyHumanClearanceCarry({ ...f.options, mechanicalCarry: TRUST_DRAIN })).toMatchObject({ carried: { tier, recorded: true } });
+    expect(f.posted).toHaveLength(1);
+    const carrier = { author: { login: 'web-everything' }, body: f.posted[0] };
+    const policy = { mechanicalCarry: 'trust-drain-record' };
+    expect(parseLatestHumanClearedSha([f.comment, carrier], policy)).toBe(HEAD);
+    expect(parseLatestHumanClearedSha([f.comment, carrier])).toBe(CLEARED);
+    expect(parseLatestHumanClearedSha([carrier], policy)).toBeNull();
+    expect(parseLatestHumanClearedSha([{ ...f.comment, author: carrier.author }, carrier], policy)).toBeNull();
+    for (const body of [carrier.body.replace('<!-- cleared-from: IC_clearance -->', ''),
+      carrier.body.replace(`from=${CLEARED}`, `from=${'f'.repeat(40)}`),
+      carrier.body.replace(`to=${HEAD}`, `to=${'f'.repeat(40)}`)]) {
+      expect(parseLatestHumanClearedSha([f.comment, { ...carrier, body }], policy)).toBe(CLEARED);
+    }
+  });
+  it('trust-drain-record writer/parser round-trip retains clearance through two consecutive changed-diff mechanical carries', () => {
+    vi.stubEnv('WE_HUMAN_CLEARANCE_MECHANICAL_CARRY', 'trust-drain-record');
+    try {
+      const f = fixture('numbering');
+      expect(applyHumanClearanceCarry({ ...f.options, mechanicalCarry: TRUST_DRAIN }))
+        .toMatchObject({ carried: { tier: 'numbering', fromSha: CLEARED, toSha: HEAD, recorded: true } });
+      expect(f.posted).toHaveLength(1);
+      const first = { id: 'IC_first_carry', author: { login: 'web-everything' }, body: f.posted[0] };
+      const thread = [f.comment, first];
+      const carriedClearance = latestHumanClearance(thread);
+      expect(carriedClearance).toMatchObject({ sha: HEAD, sourceId: 'IC_clearance', diff: normalizeDiffFingerprint(f.options.evidence.headDiff) });
+      expect(carriedClearance.diff).not.toBe(FP);
+      const nextHead = 'a'.repeat(40);
+      const nextDiff = DIFF.replace('@@ -1 +1 @@', '@@ -3 +3 @@');
+      expect(normalizeDiffFingerprint(nextDiff)).not.toBe(carriedClearance.diff);
+      const evidence = { humanClearance: carriedClearance, headSha: nextHead, headDiffSha: nextHead, headDiff: nextDiff };
+      expect(applyHumanClearanceCarry({ ...f.options, evidence, mechanicalCarry: TRUST_DRAIN,
+        readLiveEvidence: () => ({ headSha: nextHead, comments: thread, reviews: [] }) }))
+        .toMatchObject({ carried: { tier: 'numbering', fromSha: HEAD, toSha: nextHead, recorded: true } });
+      expect(f.posted).toHaveLength(2);
+      const second = { id: 'IC_second_carry', author: { login: 'web-everything' }, body: f.posted[1] };
+      expect(second.body).toContain(`human-clearance-carried: from=${HEAD} to=${nextHead}`);
+      expect(second.body).toContain('<!-- cleared-from: IC_clearance -->');
+      expect(parseLatestHumanClearedSha([...thread, second])).toBe(nextHead);
+      expect(latestHumanClearance([...thread, second])).toMatchObject({ sha: nextHead, sourceId: 'IC_clearance', diff: normalizeDiffFingerprint(nextDiff) });
+      expect(parseLatestHumanClearedSha([f.comment, second])).toBe(CLEARED);
+      expect(parseLatestHumanClearedSha([f.comment, second, first])).toBe(HEAD);
+      expect(parseLatestHumanClearedSha([...thread, second], { mechanicalCarry: 'refuse' })).toBe(CLEARED);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(['refuse', 'trust-drain-record'].flatMap(value => [undefined, '', 'unsafe id', 'IC_ok\n'].map(sourceId => [value, sourceId])))('%s never posts or records with missing/unsafe sourceId %s', (value, sourceId) => {
+    const f = fixture('strict'); f.options.evidence.humanClearance.sourceId = sourceId;
+    expect(applyHumanClearanceCarry({ ...f.options, mechanicalCarry: { value, source: 'test' } })).toBeNull();
+    expect(f.posted).toEqual([]);
+    expect(f.logs.some(s => s.includes('NOT carried') && s.includes('source id'))).toBe(true);
   });
 });

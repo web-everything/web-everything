@@ -8,7 +8,7 @@ import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReas
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
-import { buildReviewedShaMarker, buildClearedHumanMarker, parseLatestHumanClearedSha } from '../review-escalation.mjs';
+import { buildReviewedShaMarker, buildReviewedDiffMarker, buildClearedHumanMarker, buildClearedFromMarker, parseLatestHumanClearedSha } from '../review-escalation.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds } from '../../conveyor/standing-ruling-io.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { proveHumanOnlyLicense } from '../human-only-enqueue-license.mjs';
@@ -1265,10 +1265,10 @@ const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'bro
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 // The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.
 const human = { author: { login: 'chalbert' } };
-const accept = (sha, cleared = false, who = cleared ? human : bot) => ({ ...who, body: cleared
-  ? ['✅ review — `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n')
+const accept = (sha, cleared = false, who = cleared ? human : bot) => ({ ...who, ...(cleared ? { id: 'IC_clearance' } : {}), body: cleared
+  ? ['✅ review — `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildReviewedDiffMarker('d'.repeat(64)), buildClearedHumanMarker('operator')].join('\n')
   : ['✅ review — accepted', '', buildReviewedShaMarker(sha)].join('\n') });
-const restamp = sha => ({ ...bot, body: ['📌 review — acceptance re-stamped after a rebase (no new review)', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n') });
+const restamp = sha => ({ ...bot, body: ['📌 review — acceptance re-stamped after a rebase (no new review)', '', buildReviewedShaMarker(sha), buildReviewedDiffMarker('d'.repeat(64)), buildClearedHumanMarker('operator'), buildClearedFromMarker('IC_clearance')].join('\n') });
 // The exact body review-job.mjs posts when carryAcrossRebase moves a verdict from `from` to `to`.
 const carry = ({ from = prior, to = head, findings = [], gates = [], author = bot.author } = {}) => ({ author, body: [
   ...gates.map(o => redTeamGateMarker(5283, to, o)),
@@ -1408,14 +1408,18 @@ describe('operator ruling at the round cap', () => {
     expect(hold({ comments: [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), upperName, restamp(head)] }))
       .toMatch(/requiring send-back/);
   });
-  it('an abbreviated plain accept of an unrelated head does not supersede a ruling', () => {
-    const comments = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept('f'.repeat(12)), restamp(head)];
-    expect(hold({ comments })).toBeNull();
+  // PR #6526 block ruling: a trusted plain accept of ANY head ends the human clearance, so a later bot restamp
+  // (a carrier citing the old clearance) cannot revive it and the ruling it backed no longer approves the head.
+  it('an abbreviated plain accept of an unrelated head ends the clearance; a later restamp cannot revive the ruling', () => {
+    const ruled = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true)];
+    expect(hold({ comments: [...ruled, restamp(head)] })).toBeNull();
+    expect(hold({ comments: [...ruled, accept('f'.repeat(12)), restamp(head)] })).toMatch(/requiring send-back/);
   });
-  it('a plain accept on an unrelated head does not supersede a carried ruling', () => {
-    const comments = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true),
-      accept('f'.repeat(40)), restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
-    expect(hold({ comments })).toBeNull();
+  it('a plain accept on an unrelated head ends the clearance; a later carried ruling cannot revive it', () => {
+    const ruled = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
+    const carried = [restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
+    expect(hold({ comments: [...ruled, ...carried] })).toBeNull();
+    expect(hold({ comments: [...ruled, accept('f'.repeat(40)), ...carried] })).toMatch(/requiring send-back/);
   });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);

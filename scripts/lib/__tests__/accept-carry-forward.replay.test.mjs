@@ -19,7 +19,7 @@ import * as redTeamGate from '../red-team-gate.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import {
-  parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
+  buildClearedFromMarker, buildReviewedDiffMarker, parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
 } from '../review-escalation.mjs';
 import {
   readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND,
@@ -366,7 +366,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   afterAll(() => { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } } });
 
   const BOT = { login: 'web-everything' };
-  const clearComment = () => ({ author: BOT, body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
+  const clearComment = () => ({ id: 'IC_human_clearance', author: { login: 'chalbert' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
 
   // PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): the drain's mechanical park is its OWN label. Its presence
   // is the whole proof the hold is mechanical — no ledger row, no label timeline, no event count is read.
@@ -417,7 +417,9 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(body).toContain(`reviewed-sha: ${heads.head}`);
     expect(body).toContain('cleared-human: chalbert');
     // The next hold check binds reviewed-sha and cleared-human to one comment: it must now name the NEW head.
-    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.head);
+    // R706 - unproven automation clearance is refused: the cleared comment has no reviewed-diff fingerprint, so the
+    // carrier cannot prove an unchanged diff and readers keep the clearance on the old head (fail closed).
+    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.cleared);
     expect(parseOperatorClearance([{ author: BOT, body }])).toEqual({ actor: 'chalbert' });
   });
 
@@ -470,14 +472,15 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     const body = r.writes.postComment[0];
     expect(body).toContain(`reviewed-sha: ${heads.head}`);
     expect(body).toContain('cleared-human: chalbert');
-    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.head);
+    // R706 - unproven automation clearance is refused (diff-less source cannot prove an unchanged diff)
+    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.cleared);
   });
 
   // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the PLAIN restamp's own clearance carry
   // (`decideRestampHumanClearance`, a clearance whose markers already cover the head) read no formal review at all, so it
   // re-dated the `cleared-human` record past a standing CHANGES_REQUESTED review — after which the carry rule saw that
   // review as "before the accept". Every carry of a clearance now checks the latest formal review state first.
-  const coveringClear = () => ({ author: BOT, createdAt: '2026-10-09T12:00:00Z',
+  const coveringClear = () => ({ id: 'IC_covering_clearance', author: { login: 'chalbert' }, createdAt: '2026-10-09T12:00:00Z',
     body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.head} -->\n<!-- reviewed-diff: ${'d'.repeat(64)} -->\n<!-- cleared-human: chalbert -->` });
   const botChanges = (submitted_at = '2026-10-09T13:00:00Z') => ({ state: 'CHANGES_REQUESTED', submitted_at, user: { login: 'plateau-reviewer[bot]' } });
   it('ROUND 11: a plain restamp refuses to carry a clearance past a standing CHANGES_REQUESTED review (bot or operator): NO write', () => {
@@ -566,7 +569,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   });
 
   // Crash between writes: a lift posts its record (cleared-human naming the LIVE head) and then its label swap fails.
-  const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->` });
+  const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->\n${buildClearedFromMarker(clearComment().id)}\n${buildReviewedDiffMarker('d'.repeat(64))}\n<!-- human-clearance-carried: from=${heads.cleared} to=${heads.head} diff=${'d'.repeat(64)} -->` });
   it('ORPHANED LIFT: a clearance already naming the live head under the drain label is lifted (not handed off, not skipped)', () => {
     const r = restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] });
     expect(r.exitCode).toBe(0);
@@ -868,7 +871,7 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
   const TEXT = 'diff --git a/a.txt b/a.txt\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+feature\n';
   const FP = normalizeDiffFingerprint(TEXT);
   const BOT = { login: 'web-everything' };
-  const clear = (over = '') => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z',
+  const clear = (over = '') => ({ id: 'IC_human_clearance', author: { login: 'chalbert' }, createdAt: '2026-10-09T13:58:47Z',
     body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->${over}\n<!-- cleared-human: chalbert -->` });
   const agentAccept = () => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->` });
   const base = () => ({ setting: 'on', comments: [clear()], reviews: [], humanClearedSha: OLD, headSha: NEW, pinnedHeadSha: NEW, netDiffText: { scored: true, text: TEXT, rev: NEW } });
@@ -879,6 +882,7 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
     const posted = [];
     const result = run({ comments, netDiffText: { scored: true, text: `${TEXT}+numbered\n`, rev: NEW },
       applyNumberingCarry: evidence => applyHumanClearanceCarry({ evidence, pr: 5414, numberingOnly: true,
+        mechanicalCarry: { value: 'trust-drain-record', source: 'test' },
         setting: { value: true, source: 'standard' }, numberingSetting: { value: true, source: 'standard' }, log: () => {},
         exec: (cmd, args) => { posted.push([cmd, args]); return ''; },
         proveNumbering: () => ({ ok, reason: ok ? 'exact numbering' : 'unrelated byte' }),
@@ -1107,7 +1111,7 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
   const NEW217 = '4339cf573915' + '0'.repeat(28);
   const DIFF = 'diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1 +1 @@\n-a\n+b\n';
   const view = { headRefOid: NEW217, headRefName: 'lane/xadunn9-wip-deeplinks',
-    comments: [{ author: { login: 'web-everything[bot]' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD217} -->\n<!-- cleared-human: chalbert -->` }] };
+    comments: [{ id: 'IC_human_clearance', author: { login: 'chalbert' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD217} -->\n<!-- cleared-human: chalbert -->` }] };
   const exec = (cmd) => { if (cmd === 'gh') return JSON.stringify(view); throw new Error('unexpected'); };
   const read = (texts, carrySetting = 'on', { comments = view.comments, readReviews = () => [] } = {}) => readDrainAcceptance({
     pr: 217, repo: 'plateauapp/plateau-app', cwd: '/clone', carrySetting, readReviews,
