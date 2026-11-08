@@ -2034,8 +2034,36 @@ export function buildClearedFromMarker(id) {
     ? `<!-- ${CLEARED_FROM_MARKER}: ${id} -->` : '';
 }
 
+// Whether a trusted automation comment carrying `cleared-human` is a PROVEN carrier of the ACTIVE human source:
+// a readable poster, exactly one citation of that source, and the same reviewed-diff (or, under R711's explicit
+// trust-drain-record setting, a drain receipt bound to an established chain SHA and this carrier's SHA).
+function provenCarrier(c, { body, sha, login, knownPoster, sourceId, chainShas, byId, mechanicalCarry }) {
+  if (!knownPoster) return false; // Unknown poster (including viewer-only evidence) can never carry a clearance.
+  if (/^(unknown|ghost|none|null|undefined)$/i.test(String(login).trim())) return false; // a placeholder login is an unreadable author
+  const citations = [...body.matchAll(new RegExp(CLEARED_FROM_RE.source, 'g'))];
+  if (citations.length !== 1) return false;
+  const citedId = citations[0][1].trim();
+  const source = byId.get(citedId);
+  if (!sourceId || sourceId !== citedId || !source || !isHumanOperatorComment(source)) return false;
+  const sourceBody = typeof source.body === 'string' ? source.body : '';
+  if (!parseReviewedShaMarker(sourceBody)
+    || !(new RegExp(CLEARED_HUMAN_RE.source).test(sourceBody)
+      || new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(sourceBody))) return false;
+  const fingerprint = parseReviewedDiff([c]);
+  if (fingerprint && fingerprint === parseReviewedDiff([source])) return true;
+  // R711: only the explicit operator setting trusts a drain's mechanical receipt.
+  // Its predecessor must already belong to this human source's proven chain.
+  const receipts = [...body.matchAll(/<!--\s*human-clearance-carried:\s*from=([0-9a-f]{7,40}) to=([0-9a-f]{7,40}) diff=([0-9a-f]{64})\s*-->/gi)];
+  const receipt = receipts.length === 1 ? receipts[0] : null;
+  return mechanicalCarry === 'trust-drain-record' && !!receipt && !!fingerprint
+    && receipt[3].toLowerCase() === fingerprint
+    && chainShas.includes(receipt[1].toLowerCase())
+    && receipt[2].toLowerCase() === sha;
+}
+
 // One ordered state machine for latest coverage, historical coverage, and original-source resolution.
-// Invalid carriers are invisible; trusted plain accepts reset the active source, even on another head.
+// Invalid carriers mask no coverage but end the chain; trusted plain accepts reset the active source, even on another head.
+// `states.activeSourceId` is the source a NEXT carrier could still cite (null once anything ended the chain).
 // `mechanicalCarry` is an optional test override; production resolves the R711 policy from the shared cascade.
 function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCarrySetting().value } = {}) {
   const thread = Array.isArray(comments) ? comments : [];
@@ -2070,28 +2098,13 @@ function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCar
       sourceId = cleared && safeClearanceId(c.id) && !!byId.get(c.id) && byId.get(c.id).body === c.body ? c.id : null;
       chainShas = [sha];
     } else if (hasMarker) {
-      if (!knownPoster) continue; // Unknown poster (including viewer-only evidence) can never carry a clearance.
-      if (/^(unknown|ghost|none|null|undefined)$/i.test(String(login).trim())) continue; // a placeholder login is an unreadable author
-      const citations = [...body.matchAll(new RegExp(CLEARED_FROM_RE.source, 'g'))];
-      if (citations.length !== 1) continue;
-      const citedId = citations[0][1].trim();
-      const source = byId.get(citedId);
-      if (!sourceId || sourceId !== citedId || !source || !isHumanOperatorComment(source)) continue;
-      const sourceBody = typeof source.body === 'string' ? source.body : '';
-      if (!parseReviewedShaMarker(sourceBody)
-        || !(new RegExp(CLEARED_HUMAN_RE.source).test(sourceBody)
-          || new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(sourceBody))) continue;
-      const fingerprint = parseReviewedDiff([c]);
-      const sameDiff = !!fingerprint && fingerprint === parseReviewedDiff([source]);
-      // R711: only the explicit operator setting trusts a drain's mechanical receipt.
-      // Its predecessor must already belong to this human source's proven chain.
-      const receipts = [...body.matchAll(/<!--\s*human-clearance-carried:\s*from=([0-9a-f]{7,40}) to=([0-9a-f]{7,40}) diff=([0-9a-f]{64})\s*-->/gi)];
-      const receipt = receipts.length === 1 ? receipts[0] : null;
-      const mechanical = mechanicalCarry === 'trust-drain-record' && receipt && !!fingerprint
-        && receipt[3].toLowerCase() === fingerprint
-        && chainShas.includes(receipt[1].toLowerCase())
-        && receipt[2].toLowerCase() === sha;
-      if (!sameDiff && !mechanical) continue;
+      // R728: an unproven carrier stamps a head no human cleared, like a plain accept. It masks nothing (no state is
+      // pushed, so the original head keeps its clearance), but it ENDS the chain: no later carrier may cite past it.
+      if (!provenCarrier(c, { body, sha, login, knownPoster, sourceId, chainShas, byId, mechanicalCarry })) {
+        sourceId = null;
+        chainShas = [];
+        continue;
+      }
       chainShas.push(sha);
     } else {
       // A trusted plain accept of ANY head (related or not) ends the clearance chain: no later carrier may cite the
@@ -2101,6 +2114,7 @@ function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCar
     }
     states.push({ sha, cleared, sourceId, c });
   }
+  states.activeSourceId = sourceId;
   return states;
 }
 
@@ -2144,8 +2158,10 @@ export function latestHumanClearanceComment(comments, options) {
 
 /** Original human comment id of the active clearance; absent or superseded evidence → null. */
 export function latestHumanClearanceSourceId(comments, options) {
-  const latest = humanClearanceStates(comments, options).at(-1);
-  return latest?.cleared ? latest.sourceId : null;
+  // A chain ended after the latest clearance (an unproven carrier) leaves no source a new carrier may cite.
+  const states = humanClearanceStates(comments, options);
+  const latest = states.at(-1);
+  return latest?.cleared ? states.activeSourceId : null;
 }
 
 /**
