@@ -596,7 +596,7 @@ export function collectAndClearRolloutQuota({
  * Accepted gaps (recorded, not hidden): an annotated or lightweight TAG on a commit outside `startSha`'s history
  * is not checked, because the clone copies the source repo's tags and many of those legitimately sit off-history;
  * ignored files inside a `node_modules`-named directory are treated as dependencies; reflog-only commits are
- * not checked.
+ * not checked. Refs checked: every ref except `refs/remotes/*` and `refs/tags/*` (plus the stash).
  */
 export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmFn = rmSync } = {}) {
   const keep = (reason) => ({ removed: false, path: dir, reason });
@@ -613,7 +613,15 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
     const head = git('rev-parse', 'HEAD').trim();
     if (head !== startSha) return keep('HEAD moved');
     if (git('stash', 'list').trim() !== '') return keep('stash present');
-    if (git('rev-list', '--max-count=1', '--branches', '--not', startSha).trim() !== '') return keep('branch holds commits outside the start');
+    // Any ref except the source's remote-tracking refs and tags (see the accepted gaps above): local branches,
+    // custom refs such as `refs/codex/*`, notes, the stash.
+    if (git('rev-list', '--max-count=1', '--exclude=refs/remotes/*', '--exclude=refs/tags/*', '--all', '--not', startSha).trim() !== '') {
+      return keep('a ref holds commits outside the start');
+    }
+    // Linked worktrees would be orphaned by the delete and may hold a detached-HEAD commit.
+    if (git('worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length > 1) return keep('linked worktree present');
+    // `git status` cannot see edits to files marked assume-unchanged (lowercase tag) or skip-worktree (`S`).
+    if (git('ls-files', '-v').split('\n').some((l) => /^[a-zS] /.test(l))) return keep('files hidden from status (assume-unchanged / skip-worktree)');
   } catch {
     return keep('status unreadable');
   }
@@ -1189,7 +1197,9 @@ export async function codexDirectTask(opts = {}) {
       // the clone is untouched.
       const inside = (p) => typeof p === 'string' && (p === cleanup.path || p.startsWith(cleanup.path + sep));
       report.dirRemoved = true;
-      report.logFileRemoved = inside(report.logFile);
+      // No caller `--log` → the log is the default one inside the clone's `.git`, gone by construction. (A
+      // path-prefix test alone is wrong on macOS: `tmpdir()` is `/var/...` but git reports `/private/var/...`.)
+      report.logFileRemoved = !opts.logFile || inside(report.logFile);
     }
   }
   return report;

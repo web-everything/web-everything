@@ -3435,6 +3435,51 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
     });
   });
 
+  describe('more things `git status` cannot see', () => {
+    it('a commit on a custom ref (refs/codex/*) keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'checkout', '-q', '--detach', sha);
+      writeFileSync(join(dir, 'a.txt'), 'hidden commit\n');
+      git(dir, 'commit', '-q', '-am', 'on custom ref');
+      git(dir, 'update-ref', 'refs/codex/work', 'HEAD');
+      git(dir, 'checkout', '-q', '--detach', sha);
+      expect(git(dir, 'branch', '--contains', git(dir, 'rev-parse', 'refs/codex/work').trim()).trim()).toBe('');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('an assume-unchanged edit keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'update-index', '--assume-unchanged', 'a.txt');
+      writeFileSync(join(dir, 'a.txt'), 'edited behind status\n');
+      expect(git(dir, 'status', '--porcelain').trim()).toBe('');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('a skip-worktree edit keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'update-index', '--skip-worktree', 'a.txt');
+      writeFileSync(join(dir, 'a.txt'), 'edited behind status\n');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('a linked worktree keeps the clone', () => {
+      const { root, dir, sha } = makeClone();
+      git(dir, 'worktree', 'add', '-q', '--detach', join(root, 'linked'), sha);
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('an ignored directory merely ending in node_modules still keeps the clone', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'foo_node_modules/\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(dir, 'foo_node_modules'));
+      writeFileSync(join(dir, 'foo_node_modules', 'x'), '1');
+      expect(cleanupScratchClone({ dir, startSha: base }).removed).toBe(false);
+    });
+  });
+
   describe('createScratchGuard signal re-raise', () => {
     it('re-raises the signal on the process when nobody else is listening, and restores the default action', () => {
       const { dir, sha } = makeClone();
