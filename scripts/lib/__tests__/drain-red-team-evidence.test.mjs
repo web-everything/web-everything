@@ -357,8 +357,8 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'reused-start' }).inFlight).toBe(false);
   });
   describe('foreign host name with a stale record (host renamed after a crash)', () => {
-    const run = (f, ageMs, extra = {}) => {
-      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, host: 'old-name', readPidStart: () => 'start' });
+    const run = (f, ageMs, extra = {}, writer = {}) => {
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, host: 'old-name', readPidStart: () => 'start', ...writer });
       const at = new Date(Date.now() - ageMs);
       utimesSync(join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`), at, at);
       return readDrainRedTeamEvidence({ ...f, host: 'new-name', isAlive: () => true, ...extra });
@@ -368,6 +368,15 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     });
     it('keeps a stale foreign-host run live while its pid is alive here with the same birth time', () => {
       expect(run(fixture(), 31 * 60_000, { isAlive: () => true, readPidStart: () => 'start' }).inFlight).toBe(true);
+    });
+    it('counts a stale foreign-host run as dead when its pid is alive here with a different birth time (reused pid)', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => true, readPidStart: () => 'reused-start' })).toMatchObject({ inFlight: false, scheduled: true });
+    });
+    it('stale foreign-host record in a different pid namespace stays live even with isAlive:false', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false }, { namespace: 'pid:[old-namespace]' }).inFlight).toBe(true);
+    });
+    it('probes a stale foreign-host record that carries no pid namespace (legacy) and counts it dead when the pid is gone', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false }, { namespace: null }).inFlight).toBe(false);
     });
     it('keeps a foreign-host run with a fresh record live', () => {
       expect(run(fixture(), 5 * 60_000).inFlight).toBe(true);
