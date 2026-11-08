@@ -337,12 +337,19 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
       const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
       const failures = parseVitestFailures(text);
-      const plain = text.replace(/\x1b\[[0-9;]*m/g, '');
-      const summary = /^(?:\S+\s+)?\s*Tests\s+(\d+) failed\b/m.exec(plain);
+      const plain = text.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+      const summary = /^\s*Tests\s+(\d+) failed\b/m.exec(plain);
       const names = new Set(failures.tests.map(t => `${t.file}::${t.name}`));
+      // Unhandled errors/rejections fail a run without being a listed test failure: never covered by a quarantine.
+      if (/\bUnhandled (?:Rejection|Error)s?\b|^\s*Errors\s+\d+ errors?\b/mi.test(plain)) return null;
       if (isDerived) {
-        if (failures.tests.length) { if (!failures.complete) return null; } else continue;
-      } else if (failures.complete !== true || !summary || Number(summary[1]) !== names.size
+        // An aggregator must positively say a unit/coverage job failed, and nothing else.
+        const errors = plain.split('\n').filter(l => l.startsWith('##[error]'));
+        if (failures.tests.length || !errors.some(l => /^##\[error\](?:Unit shards|Coverage merge) did not succeed/.test(l))
+          || errors.some(l => !/^##\[error\](?:(?:Unit shards|Coverage merge) did not succeed[^\n]*|Process completed with exit code 1\.)$/.test(l))) return null;
+        continue;
+      }
+      if (failures.complete !== true || !summary || !/^##\[error\]Process completed with exit code 1\.\s*$/m.test(plain) || Number(summary[1]) !== names.size
         || failures.tests.some(t => t.name !== null && t.name.length >= 200)) return null;
       for (const { file, name } of failures.tests) {
         if (!entries.some(e => entryCoversJob(e, check.name)

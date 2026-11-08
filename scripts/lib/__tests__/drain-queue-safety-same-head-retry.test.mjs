@@ -11,6 +11,7 @@ const pr = 6499, repo = 'fixture/drain';
 const NOW = 1_800_000_000_000;
 const FILE = 'scripts/lib/__tests__/flaky.test.mjs';
 const NAME = 'suite > case';
+const AGG = '##[error]Unit shards did not succeed.\n##[error]Process completed with exit code 1.\n';
 
 const removed = () => ({
   __typename: 'RemovedFromMergeQueueEvent', reason: 'failed_checks', createdAt: '2026-11-07T22:21:51Z',
@@ -18,7 +19,7 @@ const removed = () => ({
 });
 const added = { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-07T23:00:00Z' };
 const entry = (test, extra = {}) => ({ test, brokenSha: prior, owner: 'o', reason: 'r', addedAt: NOW - 1000, expiresAt: NOW + 3_600_000, ...extra });
-const logOf = (...failures) => `${failures.map(([file, name]) => ` FAIL  ${file} > ${name}`).join('\n')}\n Test Files  ${new Set(failures.map(([file]) => file)).size} failed | 160 passed (161)\n      Tests  ${failures.length} failed | 7000 passed (7001)\n`;
+const logOf = (...failures) => `${failures.map(([file, name]) => ` FAIL  ${file} > ${name}`).join('\n')}\n Test Files  ${new Set(failures.map(([file]) => file)).size} failed | 160 passed (161)\n      Tests  ${failures.length} failed | 7000 passed (7001)\n##[error]Process completed with exit code 1.\n`;
 
 function fixture(test) {
   const f = {
@@ -30,7 +31,7 @@ function fixture(test) {
       { id: 33, name: 'coverage-merge', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' } },
       { id: 34, name: 'test-shard (1)', status: 'completed', conclusion: 'success', output: { title: '', summary: '' } },
     ],
-    logs: { 31: logOf([FILE, NAME]), 32: 'needs.test-shard failed\n', 33: 'needs.test-shard failed\n' }, log: vi.fn(),
+    logs: { 31: logOf([FILE, NAME]), 32: AGG, 33: AGG }, log: vi.fn(),
   };
   f.exec = vi.fn((command, args) => {
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
@@ -94,7 +95,8 @@ describe('merge-queue same-head retry for quarantined failures', () => {
   it.each(['quarantine list unreadable', 'quarantine list throws', 'job log unavailable', 'job log incomplete',
     'quarantine entry expired', 'entry for another job', 'PR not CLEAN', 'list not in quarantine mode',
     'job bound to another commit', 'job name mismatch', 'summary counts an unlisted failing test',
-    'aggregator shows an uncovered failure', 'truncated test name'])('fails closed: %s', kind => fixture(f => {
+    'aggregator shows an uncovered failure', 'truncated test name', 'aggregator log has no dependency failure',
+    'aggregator has an independent error', 'unhandled error alongside the listed failure'])('fails closed: %s', kind => fixture(f => {
     if (kind === 'quarantine list unreadable') f.list = { ok: false, error: 'offline' };
     if (kind === 'quarantine list throws') f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log,
       quarantine: { readList: () => { throw new Error('boom'); }, now: () => NOW } });
@@ -107,6 +109,9 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     if (kind === 'job name mismatch') f.jobName = { 31: 'test-shard (1)' };
     if (kind === 'summary counts an unlisted failing test') f.logs[31] = f.logs[31].replace('Tests  1 failed', 'Tests  2 failed');
     if (kind === 'aggregator shows an uncovered failure') f.logs[32] = logOf(['scripts/lib/__tests__/other.test.mjs', 'x']);
+    if (kind === 'aggregator log has no dependency failure') f.logs[32] = '';
+    if (kind === 'aggregator has an independent error') f.logs[32] = `${AGG}##[error]ReferenceError: x is not defined\n`;
+    if (kind === 'unhandled error alongside the listed failure') f.logs[31] += ' Errors  1 error\n Unhandled Rejection\n';
     if (kind === 'truncated test name') {
       const long = 'n'.repeat(200);
       f.list.list.entries = [entry(`${FILE}::${long.slice(0, 200)}`)];
