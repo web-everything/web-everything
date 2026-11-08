@@ -780,7 +780,7 @@ describe('merge-queue same-head failure admission', () => {
     const retryDecision = (retryEvidence = perfect, events = [removed()]) =>
       decideMqSameHead({ pr, head, timeline: timeline(...events), retryEvidence });
     const holdLine = `mq-same-head-failed: #${pr} head ${head} — failed_checks`;
-    const retryLine = why => `mq-same-head-retry: #${pr} head ${head} — failed_checks infra retry 1/1 (main green, PR CLEAN, ${why})`;
+    const retryLine = why => `mq-same-head-retry: #${pr} head ${head} — failed_checks infra retry 1/1 (main green, PR CLEAN, ${why}); main run 12; failed check(s): unnamed`;
 
     it.each(['infra', 'main-red'])('releases one same-head failed_checks removal with main green, CLEAN and %s evidence', infra => {
       expect(retryDecision({ ...perfect, infra }).hold).toBe(false);
@@ -815,7 +815,7 @@ describe('merge-queue same-head failure admission', () => {
     function fixture(test) {
       const run = (id, conclusion, created_at) => ({ id, conclusion, created_at, updated_at: created_at, status: 'completed',
         path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push' });
-      const f = { log: vi.fn(), events: [removed()], live: { headRefOid: head, mergeStateStatus: 'CLEAN' },
+      const f = { now: Date.parse('2026-11-01T14:00:00Z'), log: vi.fn(), events: [removed()], live: { headRefOid: head, mergeStateStatus: 'CLEAN' },
         runs: [run(12, 'success', '2026-11-01T13:00:00Z'), run(11, 'success', '2026-11-01T11:00:00Z')],
         checks: [{ id: 21, status: 'completed', conclusion: 'timed_out', output: { title: '', summary: '' } }] };
       f.exec = vi.fn((command, args) => {
@@ -851,7 +851,7 @@ describe('merge-queue same-head failure admission', () => {
         }
         throw new Error(`unexpected GitHub read: ${args.join(' ')}`);
       });
-      f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log });
+      f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: f.now });
       f.expectHeld = () => {
         expect(f.guard()).toEqual({ hold: true, line: holdLine });
         expect(f.log.mock.calls[0]).toEqual([holdLine]);
@@ -934,17 +934,17 @@ describe('merge-queue same-head failure admission', () => {
       f.checks = [{ id: 21, status: 'completed', conclusion: 'cancelled', name: 'test', output: {} },
         { id: 22, status: 'completed', conclusion: 'failure', name: 'merge-gate', output: { title: '', summary: '' } }];
       f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — non-infrastructure failed check(s): merge-gate; main was not red at removal`);
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — non-infrastructure failed check(s): test, merge-gate; main was not red at removal; failed check(s): test, merge-gate`);
     }));
     it('logs why the retry was declined: main CI not green', () => fixture(f => {
       f.runs[0].conclusion = 'failure';
       f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — main CI is not green`);
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — main CI is not green (newest completed run 12 concluded failure); failed check(s): unnamed`);
     }));
     it('logs why the retry was declined: PR not CLEAN', () => fixture(f => {
       f.live.mergeStateStatus = 'BEHIND';
       f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — PR is not CLEAN (BEHIND)`);
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — PR is not CLEAN (BEHIND); failed check(s): unnamed`);
     }));
     it('logs why the retry was declined: unreadable evidence', () => fixture(f => {
       f.checkError = true;
@@ -968,6 +968,8 @@ describe('merge-queue same-head failure admission', () => {
     }));
     it.each(['queued', 'in_progress'])('guard holds for a newer %s main push despite older successful CI', status => fixture(f => {
       f.runs.push({ ...f.runs[0], id: 13, created_at: '2026-11-01T14:00:00Z', status, conclusion: null });
+      // The older completed success is stale; pending runs do not refresh it.
+      f.now = Date.parse('2026-11-01T15:01:00Z');
       f.expectHeld();
       const mainArgs = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.includes('/actions/')))[1];
       expect(mainArgs.join(' ')).not.toContain('status=completed');
@@ -988,10 +990,12 @@ describe('merge-queue same-head failure admission', () => {
       f.mainTotal = 501;
       f.mainPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
         ({ ...f.runs[0], id: page * 100 + index + 1 })));
+      // The bounded main lookups are readable; their completed successes are stale.
+      f.now = Date.parse('2026-11-01T15:01:00Z');
       f.expectHeld();
       expect(f.checkReads).toBe(5);
-      expect(f.mainReads).toBe(1); // Targeted main lookup: the first oversized page fails closed.
-      expect(f.exec).toHaveBeenCalledTimes(8); // Queue, timeline, five check pages, one main read.
+      expect(f.mainReads).toBe(2); // Newest-run and historical main lookups share the REST budget.
+      expect(f.exec).toHaveBeenCalledTimes(10); // Queue, timeline, five check pages, two main reads, merge state.
       const endpoints = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => arg.includes('/check-runs')));
       expect(endpoints.map(endpoint => new URLSearchParams(endpoint.split('?')[1]).get('page')))
         .toEqual(['1', '2', '3', '4', '5']);
