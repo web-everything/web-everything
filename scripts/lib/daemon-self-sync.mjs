@@ -111,6 +111,8 @@
  * gate would defeat the whole point of gating rebuilds in the first place).
  */
 
+import { workspaceFor } from './lane-pool-paths.mjs';
+import { daemonCloneRoots } from './daemon-clone-registry.mjs';
 import { gitRun, isCodePath } from './main-staleness.mjs';
 import { collectImportClosure, closureHits } from './import-closure.mjs';
 
@@ -121,10 +123,10 @@ import { readReadyCandidate } from './daemon-rebuild/state.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
-  acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter,
+  acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter, withWriteLock,
 } from './daemon-clone-lock.mjs';
-import { basename, dirname, join } from 'node:path';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
@@ -134,7 +136,74 @@ import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-
 import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
-import { maybeMaintainClone, cloneHasRebuildJob } from './clone-maintenance.mjs';
+import { maybeMaintainClone, cloneHasRebuildJob, runMaintenanceGit, maintenanceGitDir, cloneGitIsBusy } from './clone-maintenance.mjs';
+
+export { cloneGitIsBusy };
+
+function maintenanceObjectsDir(gitDir) {
+  let common = gitDir;
+  try { common = resolve(gitDir, readFileSync(join(gitDir, 'commondir'), 'utf8').trim()); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  return realpathSync(join(common, 'objects'));
+}
+
+/** Scan known daemon clones, workspace checkouts and numbered pool lanes for borrowers. */
+export function cloneHasObjectBorrowers(root, { roots, workspace = workspaceFor(root) } = {}) {
+  const children = (dir) => {
+    try { return readdirSync(dir, { withFileTypes: true }).filter(e => e.isDirectory() || e.isSymbolicLink()).map(e => join(dir, e.name)); }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  };
+  roots ??= [...daemonCloneRoots(workspace), ...children(workspace),
+    ...children(join(workspace, '.daemon-clones')),
+    ...children(join(workspace, '.lanes')).flatMap(children)];
+  if (roots.length > 4096) throw new Error('borrower scan exceeds 4096 roots; inspect clone borrowers manually');
+  const objects = maintenanceObjectsDir(maintenanceGitDir(root));
+  for (const clone of new Set(roots)) {
+    let gitDir;
+    try { gitDir = maintenanceGitDir(clone); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    const cloneObjects = maintenanceObjectsDir(gitDir);
+    let text;
+    try { text = readFileSync(join(cloneObjects, 'info/alternates'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (text.split(/\r?\n/).filter(line => line.trim()).some(line =>
+      realpathSync(resolve(cloneObjects, line.trim())) === objects)) return true;
+  }
+  return false;
+}
+
+/** Async so the clone lock heartbeat stays live while packing. Best effort, bounded, local packing only. Never expire unreachable objects. */
+export async function maintainCloneObjects({ root, run = runMaintenanceGit, hasBorrowers = cloneHasObjectBorrowers,
+  isBusy = cloneGitIsBusy, timeoutMs = 60_000, log = console, env = process.env } = {}) {
+  try {
+    if (hasBorrowers(root) !== false || isBusy(root) !== false) return { skipped: true };
+    const childEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+    for (const args of [['config', '--local', 'fetch.unpackLimit', '1'],
+      ['config', '--local', 'transfer.unpackLimit', '1'], ['prune-packed'], ['repack', '-d', '-l']]) {
+      const result = await run(args, { cwd: root, env: childEnv, timeout: timeoutMs, killSignal: 'SIGKILL' });
+      if (result.status !== 0) throw new Error(`git ${args[0]} failed`);
+    }
+    return { skipped: false };
+  } catch (error) {
+    try { log.error?.(`daemon-self-sync: object maintenance skipped/failed: ${error.message}; inspect clone before retrying`); } catch { /* diagnostic only */ }
+    return { skipped: true, reason: 'maintenance-failed' };
+  }
+}
+
+/** All merge/adoption entry points share the same best-effort maintenance guard. */
+async function maintainObjectsUnderWriteLock({ root, env = process.env, log = console,
+  maintainObjects = maintainCloneObjects, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
+  ...options } = {}) {
+  try {
+    await withWriteLock(root, async () => {
+      if (await hasMaintenanceRebuildJob() !== false) return;
+      await (maintainObjects ?? maintainCloneObjects)({ root, env, log, ...options });
+    }, { ...(env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {}),
+      waitMs: 0, owner: `clone-object-maintenance:${process.pid}` });
+  } catch (error) {
+    try { log.error?.(`daemon-self-sync: object maintenance failed: ${error.message}; inspect clone before retrying`); } catch { /* diagnostic only */ }
+  }
+}
 
 /** PURE: env → rebuild.maxAdoptWaitTicks → default, with the effective policy source. */
 export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
@@ -223,11 +292,16 @@ export function decideSelfSync({ fetched, behind, dirty, onBase }) {
  * timed-out merge → aborted (itself under the same timeout) and reported as `conflict`; a failed/timed-out
  * `status` → `status-failed` (fail closed — an uninspected tree is never treated as clean); a failed/timed-out
  * (or non-numeric) `rev-list --count` → `count-failed` (never coerced to 0 / `up-to-date`); a failed/timed-out
- * `symbolic-ref` → `head-failed`.
- * @param {{root:string, base?:string, run?:typeof gitRun, timeoutMs?:number}} o
- * @returns {{merged:boolean, commits:number, reason:string}}
+ * `symbolic-ref` → `head-failed`. Successful merges attempt object maintenance under a fresh WRITE lock,
+ * checking rebuild evidence under that lock. Unavailable locks/evidence or failed maintenance leave the
+ * successful merge result intact; maintenance errors log an operator inspection hint.
+ * @param {{root:string, base?:string, run?:typeof gitRun, timeoutMs?:number,
+ *   env?:NodeJS.ProcessEnv, log?:Console, maintainObjects?:typeof maintainCloneObjects,
+ *   hasMaintenanceRebuildJob?:()=>boolean|Promise<boolean>}} o
+ * @returns {Promise<{merged:boolean, commits:number, reason:string}>}
  */
-export function selfSyncCheckout({ root, base = 'main', run = gitRun, timeoutMs = 60_000 }) {
+export async function selfSyncCheckout({ root, base = 'main', run = gitRun, timeoutMs = 60_000,
+  maintainObjects = maintainCloneObjects, env = process.env, log = console, hasMaintenanceRebuildJob }) {
   const git = (args) => run(args, { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
   repairCloneRefs(root, { log: (m) => console.error(m) }); // prune dangling remote-tracking refs before any fetch (no re-clone: this tick does not hold the clone write lock)
   const fetched = git(['fetch', 'origin', base, '--quiet']).status === 0;
@@ -250,6 +324,8 @@ export function selfSyncCheckout({ root, base = 'main', run = gitRun, timeoutMs 
     git(['merge', '--abort']);
     return { merged: false, commits: 0, reason: 'conflict' };
   }
+  await maintainObjectsUnderWriteLock({ root, env, log, maintainObjects, hasMaintenanceRebuildJob,
+    ...(run === gitRun ? {} : { run }), timeoutMs });
   return { merged: true, commits: behind, reason: 'merged' };
 }
 
@@ -374,9 +450,10 @@ export function decidePocSelfSync({ dirty, onBranch, main, poc }) {
  * is reported as `reason: 'merged-partial'` so the caller still restarts onto it while logging that the other
  * source needs a hand merge.
  * @param {{root:string, base?:string, pocBranch:string, run?:typeof gitRun, timeoutMs?:number}} o
- * @returns {{merged:boolean, commits:number, reason:string}}
+ * @returns {Promise<{merged:boolean, commits:number, reason:string}>}
  */
-export function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitRun, timeoutMs = 60_000 }) {
+export async function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitRun, timeoutMs = 60_000,
+  maintainObjects = maintainCloneObjects, env = process.env, log = console, hasMaintenanceRebuildJob }) {
   if (!pocBranch) throw new TypeError('selfSyncCheckoutPoc requires a pocBranch');
   assertSafeBranchName(pocBranch, 'pocBranch');
   assertSafeBranchName(base, 'base');
@@ -421,7 +498,11 @@ export function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitR
   if (decision.mergeMain) mergeRef(`origin/${base}`, behindMain);
   if (!conflicted && decision.mergePoc) mergeRef(`origin/${pocBranch}`, behindPoc);
 
-  if (mergedAny) return { merged: true, commits, reason: conflicted ? 'merged-partial' : 'merged' };
+  if (mergedAny) {
+    await maintainObjectsUnderWriteLock({ root, env, log, maintainObjects, hasMaintenanceRebuildJob,
+      ...(run === gitRun ? {} : { run }), timeoutMs });
+    return { merged: true, commits, reason: conflicted ? 'merged-partial' : 'merged' };
+  }
   return { merged: false, commits: 0, reason: 'conflict' };
 }
 
@@ -689,7 +770,7 @@ export function withSelfSync(effects, {
   background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity, rebuildJobIds,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
-  maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
+  maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
   const realIo = rebuildOpt === undefined;
@@ -699,9 +780,16 @@ export function withSelfSync(effects, {
   let readyIdentity = null;
   let adoptWaitTicks = 0;
   const rebuildAsJob = rebuildAsJobOpt === undefined ? resolveSelfSyncRebuildAsJob({ entries, env }) : !!rebuildAsJobOpt;
-  const rebuild = rebuildOpt ?? ((o = {}) => rebuildClone({
+  const rebuildFn = rebuildOpt ?? ((o = {}) => rebuildClone({
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
+  const rebuild = async (...args) => {
+    const result = await rebuildFn(...args);
+    if (result?.moved && result.adopted && (maintainObjects || realIo)) {
+      await maintainObjectsUnderWriteLock({ root, log, env, maintainObjects, hasMaintenanceRebuildJob });
+    }
+    return result;
+  };
   const bg = background === undefined
     ? resolveBackgroundBuild({ entry: entries?.[0], settings: loadBackgroundBuildSettings(), env })
     : (background ? { ...BUILT_IN_BACKGROUND_BUILD_SETTINGS, ...background, enabled: !!background.enabled } : null);
@@ -896,7 +984,9 @@ export function withSelfSync(effects, {
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
       if (resolvedPocBranch) {
-        const r = syncPoc({ root, base, pocBranch: resolvedPocBranch, ...(timeoutMs != null ? { timeoutMs } : {}) });
+        const r = await syncPoc({ root, base, pocBranch: resolvedPocBranch, env, log,
+          hasMaintenanceRebuildJob, ...(maintainObjects ? { maintainObjects } : {}),
+          ...(timeoutMs != null ? { timeoutMs } : {}) });
         if (r.merged) {
           const partial = r.reason === 'merged-partial';
           log.error?.(
