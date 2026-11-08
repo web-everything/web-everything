@@ -13,6 +13,7 @@ import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from 
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
 import { findDuplicateIds } from '../duplicate-id-tripwire.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
+import { readRedTeamCheckFact } from '../red-team-check-run.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
@@ -54,6 +55,17 @@ const codeql = [{ name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', co
 const manifestBody = `${MANIFEST_BODY_BEGIN}\n${JSON.stringify({ item: '123', blockedBy: ['9'], dismissedFindings: 2 })}\n${MANIFEST_BODY_END}`;
 
 describe('red-team check run merge gate', () => {
+  it('merge-group members sharing a head require their own PR-bound red-team check', () => {
+    const gh = () => JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team', head_sha: HEAD,
+      external_id: 'o/r#7', app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] });
+    const members = [7, 8].map(num => evaluatePrGates(facts({ num, pr: { number: num },
+      duplicateIds: { main: [], group: [] }, redTeamCheck: readRedTeamCheckFact({ repo: 'o/r', pr: num,
+        headSha: HEAD, appId: 5037855, gh }) }), { mergeEvent: 'merge_group' }));
+    expect(members[0].ok).toBe(true);
+    expect(members[1].results).toContainEqual(expect.objectContaining({ id: 'red-team', status: 'hold',
+      reason: expect.stringMatching(/o\/r#8.*external_id/) }));
+    expect(evaluateGroup(members, { nums: [7, 8], complete: true, reasons: [], heads: { 7: HEAD, 8: HEAD } }).ok).toBe(false);
+  });
   it.each(['both', 'check-run', 'drain-scan'])('applies the check-run gate according to mode %s', source => {
     const result = evaluatePrGates(facts({ redTeamGateSource: source,
       redTeamCheck: { ok: false, reason: 'no red-team check run on head' } }));

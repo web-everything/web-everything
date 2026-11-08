@@ -37,7 +37,7 @@ describe('status persistence and check publication share one claim', () => {
       } };
     expect(recordRedTeamStatus({ ...input, result: 'ran' }, options)).toEqual({ published: true });
     expect(readRedTeamPublicationHold(f)).toBeNull();
-    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
+    expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
     const result = recordRedTeamStatus({ ...input, result: 'failed', sendBack: true }, {
       ...options, comments: [], postCheckRun: ({ payload: check }) => {
         expect(readRedTeamPublicationHold(f)).toMatch(/not confirmed published/);
@@ -54,7 +54,7 @@ describe('status persistence and check publication share one claim', () => {
     // Only a confirmed publication can release this terminal-transition hold.
     expect(recordRedTeamStatus({ ...input, result: 'failed', sendBack: true }, options)).toEqual({ published: true });
     expect(readRedTeamPublicationHold(f)).toBeNull();
-    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }).ok).toBe(false);
+    expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }).ok).toBe(false);
   });
 
   it('publication holds are isolated by head and fail closed on unreadable marker paths', () => {
@@ -89,7 +89,7 @@ describe('status persistence and check publication share one claim', () => {
       },
     };
     expect(recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, options)).toEqual({ published: true });
-    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
+    expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
     const result = recordRedTeamStatus({ ...input, status }, options);
     expect(result).toMatchObject({ published: false, reason: expect.stringContaining(`Unpublished ${status} red-team round`) });
     expect(logs).toEqual([result]);
@@ -98,7 +98,7 @@ describe('status persistence and check publication share one claim', () => {
     expect(attempts.slice(1, 4).every(check => check.status === 'in_progress')).toBe(true);
     expect(attempts[4]).toMatchObject({ head_sha: f.head, status: 'completed', conclusion: 'failure',
       output: { summary: expect.stringContaining(`Unpublished ${status} red-team round for PR #${f.pr} on ${f.head}`) } });
-    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }))
+    expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }))
       .toMatchObject({ ok: false, reason: expect.stringMatching(/failed/) });
   });
 
@@ -159,7 +159,7 @@ describe('status persistence and check publication share one claim', () => {
     expect(readRedTeamStatus(f).status).toBe('running');
     expect(runs).toHaveLength(2);
     expect(runs[1].status).toBe('in_progress');
-    expect(evaluateRedTeamCheckFact({ headSha: f.head, appId, checkRuns: runs }))
+    expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }))
       .toMatchObject({ ok: false, reason: expect.stringMatching(/progress|incomplete/) });
   });
 

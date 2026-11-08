@@ -428,10 +428,10 @@ export function recordRedTeamStatus(input, options = {}) {
               recorded: input.result === 'ran', env: options.env ?? process.env });
           } catch { /* unreadable evidence retains the hold */ }
         }
-        const payload = redTeamCheckRunPayload({ headSha: head, status: input.status, hold, sendBack });
+        const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: input.status, hold, sendBack });
         const post = payload => {
           try {
-            const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, headSha: head, payload, gh });
+            const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, pr: input.pr, headSha: head, payload, gh });
             return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
           } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
         };
@@ -447,7 +447,7 @@ export function recordRedTeamStatus(input, options = {}) {
         }
         let reason = `Unpublished ${input.status} red-team round for PR #${input.pr} on ${head}: ${posted.reason}`;
         {
-          const supersede = post(redTeamCheckRunPayload({ headSha: head, status: 'finished', hold: reason, sendBack: true }));
+          const supersede = post(redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: 'finished', hold: reason, sendBack: true }));
           reason += supersede.ok ? '; failure check superseded prior success'
             : `; failure supersede also failed: ${supersede.reason}; operator must inspect GitHub check history before merging`;
         }

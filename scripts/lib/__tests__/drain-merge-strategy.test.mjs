@@ -104,9 +104,9 @@ const stampedBy = (login) => [{ author: { login }, body: buildClearanceComment(H
 describe('enqueue delegates red-team verdicts to merge-gate', () => {
   it.each([true, false])('check-run refuses a newer pending round after initial success (fresh pending label=%s)', withLabel => {
     const appId = 5037855;
-    const runs = [{ id: 1, name: 'red-team', head_sha: HEAD, app: { id: appId }, status: 'completed', conclusion: 'success' }];
+    const runs = [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: `${LOCAL}#5283`, app: { id: appId }, status: 'completed', conclusion: 'success' }];
     const readRedTeamEvidence = vi.fn(() => { throw Error('status scans are forbidden'); });
-    const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ headSha: HEAD, appId, checkRuns: runs }));
+    const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }));
     let liveReads = 0;
     const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
       env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run' },
@@ -114,7 +114,7 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
       onView: { readLive: () => {
         if (++liveReads === 2) {
           expect(readRedTeamCheck.mock.results[0].value.ok).toBe(true);
-          runs.push({ id: 2, name: 'red-team', head_sha: HEAD, app: { id: appId }, status: 'in_progress', conclusion: null });
+          runs.push({ id: 2, name: 'red-team', head_sha: HEAD, external_id: `${LOCAL}#5283`, app: { id: appId }, status: 'in_progress', conclusion: null });
         }
         return { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted',
           ...(liveReads >= 2 && withLabel ? ['red-team:pending'] : [])] };
@@ -251,14 +251,14 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
           return { ok: true };
         } };
       recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, options);
-      expect(evaluateRedTeamCheckFact({ headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
+      expect(evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
       expect(readRedTeamPublicationHold(key)).toBeNull();
       const result = recordRedTeamStatus({ ...input, status }, { ...options,
         postCheckRun: ({ payload }) => { attempts.push(payload); return { ok: false, reason: 'checks publication outage' }; } });
       expect(result.published).toBe(false);
       expect(attempts.map(check => check.status)).toEqual(['in_progress', 'in_progress', 'in_progress', 'completed']);
       // GitHub still has the old success; the durable publication hold closes this gap.
-      expect(evaluateRedTeamCheckFact({ headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
+      expect(evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
       const makeDrain = () => checkRunHarness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'] });
       const first = makeDrain();
       expect(first.s.prestage({ num: 5283 }, HEAD)).toMatchObject({ allowed: false });

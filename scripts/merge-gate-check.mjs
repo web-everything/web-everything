@@ -179,7 +179,7 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   facts.pinnedHead = pin;
   facts.redTeamGateSource = readRedTeamGateSource({ env, log: line => process.stderr.write(`${line}\n`) }).value.source;
   facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
-    : readRedTeamCheckFact({ repo, headSha: pin.sha, appId: env.WE_APP_ID,
+    : readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID,
       gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
 
   if (!facts.ledger.error && ['ledger', 'both'].includes(facts.ledger.authority)) {

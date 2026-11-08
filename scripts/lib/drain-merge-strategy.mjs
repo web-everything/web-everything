@@ -281,8 +281,8 @@ export function createDrainMergeStrategy({
     ? readRedTeamPublicationHold({ repo: slugOf(c.repo), pr: c.num, head, env }) : null;
   const checkRunAdmission = (c, head, before) => {
     const unpublished = publicationHold(c, head);
-    const fact = readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), headSha: head })
-      : readRedTeamCheckFact({ repo: slugOf(c.repo), headSha: head, appId: env.WE_APP_ID,
+    const fact = readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), pr: c.num, headSha: head })
+      : readRedTeamCheckFact({ repo: slugOf(c.repo), pr: c.num, headSha: head, appId: env.WE_APP_ID,
         gh: (args, options) => exec('gh', args, options) });
     if (fact?.ok === true && !unpublished) return null;
     const reason = unpublished || fact?.reason || 'red-team check unreadable';
