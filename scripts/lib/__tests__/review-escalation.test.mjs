@@ -3084,6 +3084,11 @@ describe('R706 — proven human-clearance carriers', () => {
     const plain = { author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
     expect(parseLatestHumanClearedSha([source(), first, plain, second], policy)).toBeNull();
     expect(headEverHumanCleared([source(), first, plain, second], next, policy)).toBe(false);
+    // A plain accept of an UNRELATED head between two carriers also ends the chain: the second carrier cannot revive it.
+    const unrelatedPlain = { author: { login: 'web-everything' }, body: buildReviewedShaMarker('9'.repeat(40)) };
+    expect(parseLatestHumanClearedSha([source(), first, unrelatedPlain, second], policy)).toBeNull();
+    expect(headEverHumanCleared([source(), first, unrelatedPlain, second], next, policy)).toBe(false);
+    expect(latestHumanClearanceSourceId([source(), first, unrelatedPlain, second], policy)).toBeNull();
     expect(parseLatestHumanClearedSha([source({ author: first.author }), first, second], policy)).toBeNull();
     expect(parseLatestHumanClearedSha([source(), first, { ...second, body: second.body.replace('IC_original', 'IC_first_carry') }], policy)).toBe(head);
     expect(parseLatestHumanClearedSha([source(), first, { ...second, body: second.body.replace(`to=${next}`, `to=${original}`) }], policy)).toBe(head);
@@ -3135,7 +3140,8 @@ describe('R706 — proven human-clearance carriers', () => {
     expect(parseLatestHumanClearedSha([...comments, carrier({ body: carrier().body.replace('IC_original', 'IC_carrier') })])).toBe(next);
   });
   it('a plain accept supersedes and a later bot restamp cannot revive the old clearance', () => {
-    for (const sha of [original, head]) {
+    // `next` and the abbreviated `ffffff1` are unrelated to every clearance-chain head: a trusted plain accept of ANY head resets the source.
+    for (const sha of [original, head, next, 'ffffff1']) {
       const comments = [source(), { author: { login: 'web-everything' }, body: buildReviewedShaMarker(sha) }, carrier()];
       expect(parseLatestHumanClearedSha(comments)).toBeNull();
       expect(latestHumanClearanceSourceId(comments)).toBeNull();
