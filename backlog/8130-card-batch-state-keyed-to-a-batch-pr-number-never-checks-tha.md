@@ -3,6 +3,7 @@ bornAs: x0jknsk
 kind: story
 size: 3
 status: open
+related: ["6941"]
 scope: ["we:scripts/operations/card-batch-io.mjs", "we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/pr-land.mjs"]
 dateOpened: "2026-11-07"
 tags: []

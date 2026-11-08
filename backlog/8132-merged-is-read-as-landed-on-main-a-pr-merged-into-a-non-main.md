@@ -3,6 +3,7 @@ bornAs: xbeulcr
 kind: story
 size: 5
 status: open
+related: ["5586"]
 scope: ["we:scripts/conveyor/supersede-watch.mjs", "we:scripts/conveyor/supersede-rule.mjs", "we:scripts/operations/prototype-retire.mjs", "we:scripts/conveyor/stand-down.mjs"]
 dateOpened: "2026-11-07"
 tags: []

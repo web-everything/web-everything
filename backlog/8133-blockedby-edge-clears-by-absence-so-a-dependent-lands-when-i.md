@@ -3,6 +3,7 @@ bornAs: xd9uqu3
 kind: story
 size: 2
 status: open
+related: ["2393"]
 scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-07"
 tags: []
