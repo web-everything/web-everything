@@ -1,35 +1,49 @@
 {
   "daemons": {
     "review": {
-      "label": "com.we.review-daemon"
+      "label": "com.we.review-daemon",
+      "runs": "review daemon (PR reviews, lease-reaper, lane-pool health, parked-PR conflict watch)"
     },
     "fix": {
-      "label": "com.we.fix-dispatch-daemon"
+      "label": "com.we.fix-dispatch-daemon",
+      "runs": "fix-dispatch daemon (fixers for red or blocked PRs)"
     },
     "build": {
-      "label": "com.we.build-dispatch-daemon"
+      "label": "com.we.build-dispatch-daemon",
+      "runs": "build-dispatch daemon (builders for ready backlog items)"
     },
     "verify": {
-      "label": "com.we.verify-daemon"
+      "label": "com.we.verify-daemon",
+      "runs": "verify daemon (PR verification runs)"
     },
     "health-watch": {
-      "label": "com.we.health-watch"
+      "label": "com.we.health-watch",
+      "runs": "health-watch (daemon and queue smell detection)"
     },
     "lease-reaper": {
-      "label": "com.we.lease-reaper"
+      "label": "com.we.lease-reaper",
+      "runs": "lease-reaper (expires stale lane and scope leases)"
     },
     "pass-readers": {
       "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
-      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code."
+      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code.",
+      "runs": "reader pass daemons (ci-red-recovery-watch and the other read-only passes)"
     },
     "control": {
       "label": "com.we.control",
-      "clone": "wev-control"
+      "clone": "wev-control",
+      "runs": "control daemon (operator control surface)"
     },
     "drain": {
       "label": "com.plateau.drain-daemon",
       "clone": ".lanes/we-drain-daemon/code",
-      "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs."
+      "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs.",
+      "runs": "merge-queue drain (drain-queue-safety, enqueue)"
+    },
+    "merge-watch": {
+      "label": "com.we.conveyor-pass-daemon.merge-orphan-sweep",
+      "clone": "wev-merge-daemon",
+      "runs": "merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that"
     }
   },
   "daemonAliases": {
