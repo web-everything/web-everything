@@ -64,6 +64,7 @@ import {
   readConvertedAdvisoryOutcome,
 } from '../review-escalation.mjs';
 import { parseAdvisories, advisoryCoversHead } from '../advisory-labels.mjs';
+import { isHumanOperatorComment as isHumanOperatorCommentShared } from '../operator-identity.mjs';
 // PR #2781 review — the REAL park-comment builder + audit line, so the reasonText/auditLine split is pinned
 // against the shape the drain actually posts, never a hand-written fixture that could drift from it.
 import { buildDrainReasonComment } from '../../merge-ai-prs.mjs';
@@ -2362,8 +2363,20 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
       // An is_bot comment on a NEWER head is not a human clearance of that head.
       const newer = '9'.repeat(40);
       const botNewer = { body: `${buildReviewedShaMarker(newer)}\n${buildClearedHumanMarker('Ada')}`, author: { login: 'chalbert', is_bot: true } };
-      expect(parseLatestHumanClearedSha([operatorClear, botNewer])).not.toBe(newer);
+      expect(parseLatestHumanClearedSha([operatorClear, botNewer])).toBe(head);
       expect(headEverHumanCleared([operatorClear, botNewer], newer)).toBe(false);
+    });
+
+    it('the clearance reader judges author identity exactly as operator-identity#isHumanOperatorComment (the restated copy stays in step)', () => {
+      const authors = [
+        { author: { login: 'chalbert' } }, { author: { login: 'ChAlBeRt', type: 'User', is_bot: false } }, { user: { login: 'chalbert' } },
+        { author: { login: 'chalbert', is_bot: true } }, { user: { login: 'chalbert', is_bot: true } }, { author: { login: 'chalbert', type: 'Bot' } },
+        { author: { login: 'chalbert[bot]' } }, { author: { login: 'web-everything' } }, { author: { login: 'mallory' } }, { author: {} }, {},
+      ];
+      for (const who of authors) {
+        const c = { body: clearBody, ...who };
+        expect(parseLatestHumanClearedSha([c]) === head, JSON.stringify(who)).toBe(isHumanOperatorCommentShared(c));
+      }
     });
 
     it('accepts an operator-login clearance, from the author or user shape', () => {
@@ -3143,6 +3156,16 @@ describe('R706 — proven human-clearance carriers', () => {
     const viaUser = [source({ author: undefined, user: { login: 'chalbert', is_bot: true } }), carrier()];
     expect(parseLatestHumanClearedSha(viaUser)).toBeNull();
     expect(headEverHumanCleared(viaUser, head)).toBe(false);
+  });
+  it('two copies of the cited source that disagree on bot identity are ambiguous, so the carrier is refused', () => {
+    expect(parseLatestHumanClearedSha([source(), source(), carrier()])).toBe(head); // an identical copy is one comment
+    for (const author of [{ login: 'chalbert', is_bot: true }, { login: 'chalbert', type: 'Bot' }]) {
+      for (const comments of [[source(), source({ author }), carrier()], [source({ author }), source(), carrier()]]) {
+        expect(headEverHumanCleared(comments, head), JSON.stringify(author)).toBe(false);
+        expect(parseLatestHumanClearedSha(comments), JSON.stringify(author)).not.toBe(head);
+        expect(latestHumanClearanceSourceId(comments), JSON.stringify(author)).toBeNull();
+      }
+    }
   });
   it('changed diff is refused', () => {
     const comments = [source(), carrier({ body: carrier().body.replace(diff, 'e'.repeat(64)) })];
