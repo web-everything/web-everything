@@ -571,15 +571,17 @@ export async function reattachTick({
     };
     const liveness = r.job.handle ? observeOwner() : null;
     const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, foreignStaleMs, sleepDetected: slept });
+    // A stale foreign heartbeat permits record recovery, never local PID/group cleanup.
+    const staleForeignDead = liveness === 'foreign' && state === 'dead';
     const taskDeadline = isTask ? taskDeadlineDecision(r, { now }) : null;
     const deadline = isTask ? taskDeadline?.deadlineAt : deadlineAt(r);
     const expired = Number.isFinite(deadline) && now >= deadline && state !== 'terminal' && (isTask || state !== 'foreign');
     const savedResult = r.job.task?.execution?.results?.[r.job.attempts];
-    if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || !expired)) {
-      if (liveness !== 'dead') continue; // publication does not revoke a live/unknown owner
-      if (!confirmTaskGroupGone(r, state)) continue;
+    if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || staleForeignDead || !expired)) {
+      if (liveness !== 'dead' && !staleForeignDead) continue; // publication does not revoke a live/unknown owner
+      if (!staleForeignDead && !confirmTaskGroupGone(r, state)) continue;
       store.update(r.id, f => {
-        if (!sameGeneration(f, r)) return null;
+        if (!sameGeneration(f, r) || (staleForeignDead && f.job.heartbeatAt !== r.job.heartbeatAt)) return null;
         if (!tryReleaseTaskClaim(f)) return null;
         return completeTaskResult(f, { at: iso(now), now, backoffBaseMs });
       });
@@ -593,8 +595,8 @@ export async function reattachTick({
       : expired ? { type: 'fail', stopFirst: liveness === 'alive',
         reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
         : planReattach(r, state, { kindDef });
-    // Unknown task ownership never enters the unclaimed-launch recovery path.
-    if (isTask && r.job.handle && state !== 'terminal' && liveness !== 'alive' && liveness !== 'dead') {
+    // Unknown ownership retains exclusion; classified stale foreign owners may recover.
+    if (isTask && r.job.handle && state !== 'terminal' && liveness !== 'alive' && liveness !== 'dead' && !staleForeignDead) {
       actions.push({ id: r.id, state, action: 'stop-failed' });
       log(`daemon-jobs: cannot confirm task owner ${r.id} (${r.job.handle}) — retains claim and slot; inspect owner before recovery`);
       continue;
@@ -602,7 +604,7 @@ export async function reattachTick({
     if (plan.type === 'none') continue;
     const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
     let stopped;
-    if (plan.stopFirst) {
+    if (plan.stopFirst && liveness !== 'foreign') {
       const res = await stop(r.job.handle, {
         ...(kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {}),
         ...(isTask ? { requireConfirmedDeath: true } : {}),
@@ -618,13 +620,13 @@ export async function reattachTick({
     // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
     // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
     if (isTask) {
-      if (!confirmTaskGroupGone(r, state)) continue;
+      if (!staleForeignDead && !confirmTaskGroupGone(r, state)) continue;
     } else if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) {
       log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     }
     const at = iso(Date.now());
     const written = store.update(r.id, (f) => {
-      if (!sameGeneration(f, r)) return null; // the child claimed or finished since we looked — re-judge next tick
+      if (!sameGeneration(f, r) || (staleForeignDead && f.job.heartbeatAt !== r.job.heartbeatAt)) return null; // the child claimed or finished since we looked — re-judge next tick
       if (isTask) {
         // Synchronous claim port under the record lock: a concurrent finish/new attempt wins.
         if (!tryReleaseTaskClaim(f)) return null;

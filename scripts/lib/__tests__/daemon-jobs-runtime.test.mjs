@@ -699,6 +699,71 @@ function runningTask(item, launchedAt, now) {
     { ...taskOwner, at: new Date(now).toISOString() }));
 }
 
+it.each([
+  ['stale', 1001, false, false, false, false, 'queued', 'requeue'],
+  ['exhausted stale', 1001, false, true, false, false, 'failed', 'fail'],
+  ['expired stale', 1001, false, false, true, false, 'queued', 'requeue'],
+  ['saved-result stale', 1001, false, false, false, true, 'succeeded', null],
+  ['saved-result expired stale', 1001, false, false, true, true, 'succeeded', null],
+  ['fresh', 1000, false, false, false, false, 'running', 'stop-failed'],
+  ['sleeping stale', 1001, true, false, false, false, 'running', 'stop-failed'],
+  ['unknown stale', 1001, false, false, false, false, 'running', 'stop-failed'],
+])('%s foreign TASK owner preserves recovery and process safety', async (mode, age, slept, exhausted, expired, saved, status, action) => {
+  const now = Date.now();
+  const owner = runningTask(950, now - (expired ? 2000 : 0), now - age);
+  const handle = formatJobHandle({ host: 'Mac', pid: 123, procStart: 'start' });
+  store.update(owner.id, r => {
+    r.job.handle = handle;
+    r.job.host = 'Mac';
+    if (exhausted) r.job.task.failureCount = r.job.maxAttempts - 1;
+    if (saved) r.job.task.execution = { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 },
+    } } };
+    return r;
+  });
+  const waiting = queuedTask(951);
+  const readStart = vi.fn(), reapGroup = vi.fn(), stop = vi.fn(), releaseTaskClaim = vi.fn(), launch = vi.fn();
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept, gapMs: 0 },
+    foreignStaleMs: 1000, reapGroup, stop, releaseTaskClaim, launch,
+    probe: h => {
+      if (mode === 'unknown stale') throw Error('probe unavailable');
+      return probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['MacBook-Pro']), readStart });
+    } });
+  expect(store.read(owner.id).job.status).toBe(status);
+  expect(readStart).not.toHaveBeenCalled();
+  expect(reapGroup).not.toHaveBeenCalled();
+  expect(stop).not.toHaveBeenCalled();
+  if (action) expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id,
+    state: status === 'running' ? mode === 'unknown stale' ? 'dead' : 'foreign' : 'dead', action }));
+  else expect(out.actions).toEqual([]);
+  if (status === 'running') {
+    expect(store.read(owner.id).job.task.failureCount).toBe(0);
+    expect(releaseTaskClaim).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  } else {
+    expect(releaseTaskClaim).toHaveBeenCalledTimes(1);
+    expect(releaseTaskClaim.mock.calls[0][0].id).toBe(owner.id);
+    expect(store.read(owner.id).job.task.failureCount).toBe(saved ? 0 : exhausted ? owner.job.maxAttempts : 1);
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch.mock.calls[0][0].id).toBe(waiting.id);
+  }
+});
+
+it('a foreign TASK owner that refreshes its heartbeat after classification keeps its claim', async () => {
+  const now = Date.now();
+  const owner = runningTask(960, now, now - 2000);
+  store.update(owner.id, r => { r.job.handle = formatJobHandle({ host: 'Mac', pid: 123, procStart: 'start' }); r.job.host = 'Mac'; return r; });
+  const releaseTaskClaim = vi.fn(), reapGroup = vi.fn(), stop = vi.fn();
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false, gapMs: 0 }, foreignStaleMs: 1000,
+    reapGroup, stop, releaseTaskClaim, launch: vi.fn(),
+    probe: h => {
+      store.update(owner.id, r => { r.job.heartbeatAt = new Date(now).toISOString(); return r; });
+      return probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['MacBook-Pro']), readStart: vi.fn() });
+    } });
+  expect(store.read(owner.id).job.status).toBe('running');
+  expect(releaseTaskClaim).not.toHaveBeenCalled();
+});
+
 it('task deadlines coexist with legacy absolute deadlines', async () => {
   const now = Date.now();
   const active = runningTask(1, now - 999, now);
