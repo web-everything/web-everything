@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -126,5 +126,40 @@ describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of
     const { exec, calls } = fake(red);
     expect(rerunRedMainFailedJobs({ brokenSha: undefined, exec, dir: dirOf(), repoSlug: 'o/r' }).rerun).toBe(false);
     expect(calls).toHaveLength(0);
+  });
+  it('the list call is scoped to the repo, the ci.yml workflow and branch main', () => {
+    const { exec, calls } = fake(red);
+    rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir: dirOf(), repoSlug: 'o/r' });
+    expect(calls[0]).toEqual(expect.arrayContaining(['--repo', 'o/r', '--workflow', 'ci.yml', '--branch', 'main']));
+  });
+  it('an unwritable claim (fail closed) or malformed run-list JSON never reruns and never throws', () => {
+    const { exec, calls } = fake(red);
+    const file = join(dirOf(), 'a-file'); writeFileSync(file, 'x');
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir: join(file, 'sub'), repoSlug: 'o/r' })).toMatchObject({ rerun: false, error: expect.stringContaining('claim') });
+    expect(reruns(calls)).toHaveLength(0);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: () => 'not json', dir: dirOf(), repoSlug: 'o/r' })).toMatchObject({ rerun: false, error: expect.any(String) });
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: () => '[null, 7, {"headSha": 5}]', dir: dirOf(), repoSlug: 'o/r' }).rerun).toBe(false);
+  });
+  it('a pre-existing malformed marker for the sha is treated as already claimed, no throw, no rerun', () => {
+    const dir = dirOf();
+    writeFileSync(join(dir, `red-main-quarantine-rerun-${SHA}.json`), '42');
+    const { exec, calls } = fake(red);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, reason: 'already-rerun' });
+    expect(reruns(calls)).toHaveLength(0);
+  });
+  it('two concurrent adds for one sha issue exactly one rerun (exclusive claim before the request)', () => {
+    const dir = dirOf();
+    let inner = null;
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push(args);
+      if (args[1] === 'list') return runs(red);
+      if (!inner) inner = rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' }); // second caller arrives mid-request
+      return '';
+    };
+    const first = rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' });
+    expect(first.rerun).toBe(true);
+    expect(inner).toMatchObject({ rerun: false, reason: 'already-rerun' });
+    expect(reruns(calls)).toHaveLength(1);
   });
 });

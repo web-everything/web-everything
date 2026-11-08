@@ -19,7 +19,7 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, realpathSync, writeFileSync, unlinkSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -565,32 +565,42 @@ export function runSafetyNet({
   }
 }
 
-export const RERUN_LEDGER = 'red-main-quarantine-reruns.json';
+export const RERUN_MARKER_PREFIX = 'red-main-quarantine-rerun-';
 
 /**
  * After a quarantine add, re-run the FAILED jobs of main's CI run for the broken sha so the merge-gate red-main-freeze
  * can lift without a human (the freeze only lifts on a new green main run, and nothing can merge to make one). Once per
- * broken sha (recorded in `dir`), and only when the latest main CI run for that sha is completed+failed. It never
- * touches the freeze itself: a rerun that still fails leaves the freeze in place. Never throws; a failure is reported
- * (`error`) and not recorded, so the next add retries.
+ * broken sha: the claim is a per-sha marker file created exclusively BEFORE the request, so concurrent adds cannot both
+ * rerun, and an unwritable claim means no rerun (fail closed). Only when the latest main CI run for that sha is
+ * completed+failed. It never touches the freeze itself: a rerun that still fails leaves the freeze in place. Never
+ * throws; a failure is reported (`error`) and the claim released, so the next add retries.
  * @returns {{rerun:boolean, runId?:number, reason?:string, error?:string}}
  */
 export function rerunRedMainFailedJobs({ brokenSha, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug, dir = join(tmpdir(), 'we-red-main-quarantine') } = {}) {
   if (!/^[0-9a-f]{7,40}$/i.test(String(brokenSha ?? ''))) return { rerun: false, reason: 'no-broken-sha' };
-  const ledgerPath = join(dir, RERUN_LEDGER);
-  const ledger = readJson(ledgerPath) ?? { version: 1, reruns: {} };
-  ledger.reruns ??= {};
-  if (ledger.reruns[brokenSha]) return { rerun: false, reason: 'already-rerun', runId: ledger.reruns[brokenSha].runId };
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' };
+  let marker = null;
   try {
     const runs = JSON.parse(String(exec('gh', ['run', 'list', '--repo', repoSlug, '--workflow', 'ci.yml', '--branch', 'main', '--limit', '30', '--json', 'databaseId,headSha,status,conclusion,createdAt'], opts) || '[]'));
-    const mine = (Array.isArray(runs) ? runs : []).filter((r) => r?.headSha === brokenSha || String(r?.headSha ?? '').startsWith(brokenSha));
-    const latest = mine.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.databaseId - a.databaseId)[0];
+    const mine = (Array.isArray(runs) ? runs : []).filter((r) => r && typeof r.headSha === 'string' && (r.headSha === brokenSha || r.headSha.startsWith(brokenSha)));
+    const latest = mine.sort((x, y) => Date.parse(y.createdAt) - Date.parse(x.createdAt) || y.databaseId - x.databaseId)[0];
     if (!latest) return { rerun: false, reason: 'no-run-for-sha' };
     if (latest.status !== 'completed' || latest.conclusion !== 'failure') return { rerun: false, reason: 'latest-run-not-failed', runId: latest.databaseId };
-    exec('gh', ['run', 'rerun', String(latest.databaseId), '--repo', repoSlug, '--failed'], opts);
-    ledger.reruns[brokenSha] = { runId: latest.databaseId, at: new Date().toISOString() };
-    try { mkdirSync(dir, { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort: a lost record only risks one more rerun request */ }
+    try {
+      mkdirSync(dir, { recursive: true });
+      marker = join(dir, `${RERUN_MARKER_PREFIX}${brokenSha.toLowerCase().slice(0, 40)}.json`);
+      writeFileSync(marker, JSON.stringify({ runId: latest.databaseId, at: new Date().toISOString() }), { flag: 'wx' });
+    } catch (e) {
+      const taken = marker && e?.code === 'EEXIST';
+      marker = null;
+      return taken ? { rerun: false, reason: 'already-rerun' } : { rerun: false, error: `rerun claim unwritable: ${String(e?.message || e).split('\n')[0]}` };
+    }
+    try {
+      exec('gh', ['run', 'rerun', String(latest.databaseId), '--repo', repoSlug, '--failed'], opts);
+    } catch (e) {
+      try { unlinkSync(marker); } catch { /* the marker stays: at worst one rerun is skipped, never repeated */ }
+      throw e;
+    }
     return { rerun: true, runId: latest.databaseId };
   } catch (e) {
     return { rerun: false, error: String(e?.message || e).split('\n')[0] };
