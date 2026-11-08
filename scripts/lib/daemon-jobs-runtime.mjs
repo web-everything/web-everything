@@ -469,6 +469,19 @@ export function reapDeadGroup(handle, {
 }
 
 /**
+ * READ-ONLY confirmation that a handle's process and process group are gone on this machine. For a handle whose
+ * host name is not recognised (a renamed host: the job store is per-machine, so its pid still lives here). Never
+ * signals anything except signal 0. True only on confirmed absence; a live or reused pid, an existing group,
+ * unreadable evidence or an unexpected error all return false so the caller retains its claim.
+ */
+export function confirmHandleAbsent(handle, { readStart = readProcStart, kill = (pid, sig) => process.kill(pid, sig) } = {}) {
+  const h = parseJobHandle(handle);
+  if (!h?.pid) return false;
+  try { if (readStart(h.pid) === h.procStart) return false; } catch { return false; } // the recorded process is still alive
+  try { kill(-h.pid, 0); return false; } catch (error) { return error?.code === 'ESRCH'; } // a member of its group lives
+}
+
+/**
  * Tick clock for the sleep rule: each `observe()` compares the wall and monotonic gaps since the last call.
  */
 export function createTickClock({ wallNow = Date.now, monoNow = () => performance.now(), thresholdMs = SLEEP_GAP_THRESHOLD_MS } = {}) {
@@ -535,6 +548,7 @@ export async function reattachTick({
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
   releaseTaskClaim = () => {},
   reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs }),
+  confirmForeignGone = (h) => confirmHandleAbsent(h), // read-only; true only on confirmed absence
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -546,8 +560,17 @@ export async function reattachTick({
   };
   if (slept) log(`daemon-jobs: host slept (wall-vs-monotonic gap ${Math.round(gapMs)}ms) — skipping the staleness check this tick`);
   const actions = [];
-  const confirmTaskGroupGone = (record, state) => {
+  const confirmTaskGroupGone = (record, state, { foreign = false } = {}) => {
     if (!record.job.handle) return true; // unclaimed launch; no process group was recorded
+    if (foreign) {
+      // Stale heartbeat alone is not death: confirm read-only (never signalling) before releasing exclusion.
+      let gone = false;
+      try { gone = confirmForeignGone(record.job.handle) === true; } catch { /* unreadable evidence retains exclusion */ }
+      if (gone) return true;
+      actions.push({ id: record.id, state, action: 'stop-failed' });
+      log(`daemon-jobs: stale foreign task owner ${record.id} (${record.job.handle}) is not confirmed gone — retains claim and slot; inspect owner before recovery`);
+      return false;
+    }
     const lastAliveMs = Date.parse(record.job.heartbeatAt ?? record.job.startedAt ?? '');
     try {
       if (reapGroup(record.job.handle, lastAliveMs + staleMs, { requireConfirmedDeath: true }) === true) return true;
@@ -579,7 +602,7 @@ export async function reattachTick({
     const savedResult = r.job.task?.execution?.results?.[r.job.attempts];
     if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || staleForeignDead || !expired)) {
       if (liveness !== 'dead' && !staleForeignDead) continue; // publication does not revoke a live/unknown owner
-      if (!staleForeignDead && !confirmTaskGroupGone(r, state)) continue;
+      if (!confirmTaskGroupGone(r, state, { foreign: staleForeignDead })) continue;
       store.update(r.id, f => {
         if (!sameGeneration(f, r) || (staleForeignDead && f.job.heartbeatAt !== r.job.heartbeatAt)) return null;
         if (!tryReleaseTaskClaim(f)) return null;
@@ -620,7 +643,7 @@ export async function reattachTick({
     // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
     // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
     if (isTask) {
-      if (!staleForeignDead && !confirmTaskGroupGone(r, state)) continue;
+      if (!confirmTaskGroupGone(r, state, { foreign: staleForeignDead })) continue;
     } else if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) {
       log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     }
