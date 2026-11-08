@@ -1756,7 +1756,8 @@ export function runReviewLabelCli({
     // R728: the label-level record (`latestAcceptRecord`) reads any `cleared-human` marker, but the shared scan is the
     // proof. With no citable source (an unproven carrier ended the chain) the clearance cannot be carried, so the lift
     // must not add `review:accepted` under a plain restamp: hand the hold to the operator, a human re-clear is owed.
-    if (clearance && !(latestHumanClearanceSourceId(prComments) ?? latestHumanClearanceSourceId(readCarryEvidence().comments))) {
+    // The full thread only: a full first page can still cite a source that a carrier past comment 100 has ended.
+    if (clearance && !latestHumanClearanceSourceId(readCarryEvidence().comments)) {
       const reason = 'the clearance has no proven carry chain to this head (an unproven carrier ended it), so a human must re-clear';
       handMechanicalHoldToOperator(reason, { overridesLiveClearance: true });
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason, ...(handOffRetryable ? { retryable: true } : {}) } }))}\n`);
@@ -1842,8 +1843,9 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — render the durable comment ONCE, here, so the bytes
   // that are size-checked, written and posted are the same bytes.
   if (to === 'restamp' && humanClearance) {
-    const sourceId = latestHumanClearanceSourceId(prComments)
-      ?? latestHumanClearanceSourceId(readCarryEvidence().comments);
+    // The full thread only (re-read when the page is full; a short page IS the thread): a page-first answer could cite a
+    // source that a later carrier past comment 100 already ended.
+    const sourceId = latestHumanClearanceSourceId(readCarryEvidence().comments);
     // R728: with no citable source the clearance cannot be carried. Readers would treat an uncited carrier as a plain
     // accept that ends the chain, so post exactly that: a plain restamp, never a `cleared-human` record nobody proved.
     humanClearance = sourceId ? { ...humanClearance, sourceId } : null;

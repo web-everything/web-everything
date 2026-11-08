@@ -637,6 +637,14 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   // Truncated-read row: `gh pr view --json comments` stops at one page (100). A full page is re-read through the paginated
   // comments call; a hold past comment 100 must be seen, and a failed re-read is a retryable miss, never "no hold".
   const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: BOT, body: `🔒 conveyor fix-begin — fix claim held #${i}` }));
+  it('R728: an unproven carrier past comment 100 ends the chain even when page 1 still cites the source (handed off)', () => {
+    const source = { ...clearComment(), body: `${clearComment().body}\n${buildReviewedDiffMarker('d'.repeat(64))}` };
+    const page = [source, { author: BOT, body: parkBody(PARK_REASON) }, ...filler(98)];
+    const unproven = { author: BOT, body: clearedAtLive().body.replace(`${buildReviewedDiffMarker('d'.repeat(64))}\n`, `${buildReviewedDiffMarker('e'.repeat(64))}\n`) };
+    const r = restamp({ comments: page, fullComments: [...page, unproven, clearedAtLive()] });
+    expect(r.reads.comments).toBe(1);
+    expectHandedOff(r);
+  });
   it('a full 100-comment page is re-read in full: a hold past comment 100 refuses the carry (no accept)', () => {
     const page = [clearComment(), ...filler(99)];
     const r = restamp({ comments: page, fullComments: [...page, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
