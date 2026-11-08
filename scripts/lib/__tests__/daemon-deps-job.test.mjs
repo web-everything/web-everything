@@ -6,17 +6,17 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync,
   symlinkSync, writeFileSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 import {
   nativeBuilt, refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, runDepsJob,
   DEPS_JOB_KIND, DEPS_JOB_KINDS, DEPS_AS_JOB_ENV, DEPS_JOB_NPM_ARGS, depsJobInstaller,
-  pnpmAwareInstaller, DEPS_MARKER_FILE,
+  pnpmAwareInstaller, DEPS_MARKER_FILE, rebaseNodeModulesLinks,
 } from '../daemon-rebuild/deps-job.mjs';
 import {
   lockHash, markerMatches, ensureStoreGeneration, readStoreGeneration,
@@ -750,6 +750,71 @@ describe('swapNodeModules — pnpm links survive the change of depth (real cp, n
     expect(err?.message).toMatch(/bin shim/);
     expect(readdirSync(join(f.clone, 'node_modules'))).toEqual(['old.txt']);
     expect(readdirSync(f.clone)).toEqual(['node_modules']);
+  });
+
+  // A clone's `node_modules` can itself be a symlink to a shared tree. `cp -R` keeps that symlink, so a rebase that
+  // walked the "copy" would rewrite the links of the ORIGINAL shared tree and leave the source clone's deps dangling.
+  describe('a symlinked node_modules root is materialized, never rebased through', () => {
+    function symlinkedSource() {
+      const f = pnpmLayout();
+      // The source clone's node_modules is a symlink to the real tree; the tree has relative global-store links.
+      const source = join(f.base, 'source-clone');
+      mkdirSync(source);
+      symlinkSync(f.modules, join(source, 'node_modules'));
+      return { ...f, source };
+    }
+    const intact = (f) => {
+      expect(readFileSync(join(f.modules, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+      expect(readFileSync(join(f.source, 'node_modules', 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+      expect(readFileSync(join(f.modules, '@esbuild', 'darwin-arm64', 'marker.txt'), 'utf8')).toBe('@esbuild/darwin-arm64');
+      expect(readlinkSync(join(f.modules, 'esbuild'))).toBe(relative(f.modules, join(f.global, 'esbuild')));
+      expect(readFileSync(join(f.modules, '.bin', 'esbuild'), 'utf8')).toContain(relative(join(f.modules, '.bin'), join(f.global, 'esbuild')));
+    };
+
+    it('the copy fallback (cp -R keeps the symlink) leaves the source tree untouched and the copy a real, working directory', () => {
+      const f = symlinkedSource();
+      const dest = join(f.base, 'snapshot', 'node_modules');
+      mkdirSync(join(f.base, 'snapshot'));
+      execFileSync('cp', ['-R', join(f.source, 'node_modules'), dest]);
+      expect(lstatSync(dest).isSymbolicLink()).toBe(true); // the break's precondition: the copy is still the symlink
+      rebaseNodeModulesLinks({ from: join(f.source, 'node_modules'), copy: dest, final: dest });
+      intact(f);
+      expect(lstatSync(dest).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(dest, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+      expect(readFileSync(join(dest, '@esbuild', 'darwin-arm64', 'marker.txt'), 'utf8')).toBe('@esbuild/darwin-arm64');
+      expect(readFileSync(join(dest, 'inner', 'inner.txt'), 'utf8')).toBe('inner');
+      expect(execFileSync('sh', [join(dest, '.bin', 'esbuild')], { encoding: 'utf8' })).toBe('esbuild');
+      expect(readdirSync(join(f.base, 'snapshot'))).toEqual(['node_modules']); // no materialize leftovers
+    });
+
+    it('swapNodeModules from a store whose node_modules is a symlink leaves that shared tree untouched', () => {
+      const f = pnpmLayout();
+      // The shared tree sits at the SAME depth as the store's node_modules, so its relative links resolve in place.
+      const shared = join(f.base, 'jobs', 'snapshots', 'node-modules', 'shared', 'node_modules');
+      mkdirSync(dirname(shared), { recursive: true });
+      renameSync(f.modules, shared);
+      symlinkSync(shared, f.modules);
+      swapNodeModules({ root: f.clone, storeDir: f.store });
+      const live = join(f.clone, 'node_modules');
+      expect(lstatSync(live).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(live, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+      expect(execFileSync('sh', [join(live, '.bin', 'esbuild')], { encoding: 'utf8' })).toBe('esbuild');
+      // The shared tree still resolves from where it is (its own links were not rewritten for the clone's depth).
+      expect(readlinkSync(join(shared, 'esbuild'))).toBe(relative(shared, join(f.global, 'esbuild')));
+      expect(readFileSync(join(shared, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+      expect(readFileSync(join(f.modules, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+    });
+
+    it('a symlinked root that resolves nowhere fails closed, leaving no copy behind', () => {
+      const f = pnpmLayout();
+      const dest = join(f.base, 'snapshot', 'node_modules');
+      mkdirSync(join(f.base, 'snapshot'));
+      symlinkSync(join(f.base, 'missing-tree'), dest);
+      expect(() => rebaseNodeModulesLinks({ from: f.modules, copy: dest, final: dest })).toThrow();
+      expect(readdirSync(join(f.base, 'snapshot'))).toEqual(['node_modules']);
+      expect(lstatSync(dest).isSymbolicLink()).toBe(true);
+      expect(readFileSync(join(f.modules, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild'); // the source tree is untouched
+    });
   });
 
   it('a symlinked clone root does not skew the rebased links (physical resolution)', () => {

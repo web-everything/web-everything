@@ -22,7 +22,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import {
-  closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync,
+  closeSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync,
   realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -376,6 +376,26 @@ const insideTree = (path, tree) => path === tree || path.startsWith(tree + sep);
  *   `final` where it will live.
  */
 export function rebaseNodeModulesLinks({ from, copy, final }) {
+  // `cp -R` keeps a symlinked `node_modules` root AS a symlink, so "the copy" would be the shared original and the
+  // rewrites below would corrupt it (dangling links for every other user of that tree). Make the copy an independent
+  // real directory first. A root that resolves nowhere throws here (fail closed) with the copy still just the symlink.
+  copy = resolve(copy);
+  if (lstatSync(copy).isSymbolicLink()) {
+    const target = realpathSync(copy);
+    const tmp = `${copy}.materialize.${process.pid}`;
+    rmSync(tmp, { recursive: true, force: true });
+    try {
+      cpSync(target, tmp, { recursive: true, verbatimSymlinks: true });
+      // rename(2) cannot put a directory over a symlink: unlink the symlink itself (rmSync never follows it, so the
+      // tree it points to is not touched), then move the real copy into its place. Both callers discard the copy
+      // when this throws, so a failure between the two steps leaves nothing live behind.
+      rmSync(copy, { force: true });
+      renameSync(tmp, copy);
+    } catch (e) {
+      rmSync(tmp, { recursive: true, force: true });
+      throw e;
+    }
+  }
   // Real paths on both ends: `..` in a link is resolved physically, so a symlinked parent (/tmp, a moved clone
   // root) must not skew the relative path.
   from = realpathSync(from); copy = resolve(copy); final = join(realpathSync(dirname(resolve(final))), basename(final));
