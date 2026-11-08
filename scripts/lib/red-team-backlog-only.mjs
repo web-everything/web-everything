@@ -3,8 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
-import { indexOfUnfencedLine } from '../backlog/edge-case-classes.mjs';
-import { priorPrepReviews } from '../conveyor/prep-review.mjs';
+import { latestPrepVerdict } from '../conveyor/prep-review.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
@@ -43,31 +42,6 @@ export function resolveBacklogOnlyPrepSetting({ env = process.env, log = () => {
 const backlogPath = path => typeof path === 'string' && path.startsWith('backlog/')
   && !path.includes('..') && !/[\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path);
 
-// Match indexOfUnfencedLine's fence rules locally: its fencedLines helper is private.
-function maskPrepCode(body) {
-  let open = null, inComment = false;
-  const plain = body.split(/\r?\n/).map(line => {
-    if (inComment) {
-      if (line.includes('-->')) inComment = false;
-      return '';
-    }
-    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (open) {
-      if (m && m[1][0] === open.ch && m[1].length >= open.len && m[2].trim() === '') open = null;
-      return '';
-    }
-    if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
-      open = { ch: m[1][0], len: m[1].length };
-      return '';
-    }
-    if (line.lastIndexOf('<!--') > line.lastIndexOf('-->')) inComment = true;
-    return line;
-  }).join('\n');
-  // Inline spans may cross lines; delimiters must be backtick runs of equal length.
-  return plain.replace(/(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g,
-    span => span.replace(/[^\n]/g, ' '));
-}
-
 export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } = {}) {
   const refuse = why => ({ ok: false, why });
   if (enabled !== true) return refuse('disabled');
@@ -83,16 +57,8 @@ export function backlogOnlyPrepClear({ enabled, head, files, comments, labels } 
   if (!ns || ns.some(n => typeof n !== 'string') || !candidate(ns)) return refuse('required labels missing or unreadable');
   if (ns.some(n => ['review:changes', 'review:human', 'red-team:blocked'].includes(n))) return refuse('blocking label');
   if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string')) return refuse('comments unreadable');
-  const prior = comments.map(comment => ({ ...comment, body: maskPrepCode(comment.body) }))
-    .flatMap(comment => priorPrepReviews([comment])
-    .filter(n => n.head === head).map(n => ({ ...n, body: comment.body })));
-  if (prior.some(n => n.blocked || n.body.includes('**Verdict: findings**')))
-    return refuse('trusted prep findings or blocked note for head');
-  const body = prior.at(-1)?.body ?? '';
-  const verdicts = body.match(/^\*\*Verdict:.*$/gm) ?? [];
-  if (verdicts.length !== 1 || !/^\*\*Verdict: clean\*\*/.test(verdicts[0])
-    || indexOfUnfencedLine(body, /^\*\*Verdict: (clean|findings)\*\*/) < 0)
-    return refuse('no unambiguous clean newest trusted prep note for head');
+  const verdict = latestPrepVerdict(comments, head);
+  if (verdict !== 'clean') return refuse('no unambiguous clean newest trusted prep marker for head');
   return { ok: true, rule: RULE };
 }
 

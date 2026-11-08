@@ -5,8 +5,8 @@ import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import * as policyCascade from '../policy-cascade.mjs';
 
 const head = 'a'.repeat(40), pr = 742, repo = 'owner/repo';
-const note = (sha = head, blocked = false, verdict = blocked ? 'findings' : 'clean') => ({ author: { login: 'chalbert' },
-  body: `<!-- prep-review: head=${sha} round=1${blocked ? ' blocked=1' : ''} -->\n**Verdict: ${verdict}**` });
+const note = (sha = head, blocked = false, verdict = blocked ? 'findings' : 'clean') => ({ author: { login: 'web-everything[bot]' },
+  body: `<!-- prep-review: head=${sha} round=1${blocked ? ' blocked=1' : ''} -->\n<!-- prep-review-verdict head=${sha} verdict=${verdict} v=1 -->\n**Verdict: ${verdict}**` });
 const evidence = () => ({ enabled: true, head, files: [{ filename: 'backlog/742.md', status: 'modified' }],
   comments: [note()], labels: ['review:prep', 'red-team:pending'] });
 function fixture(over = {}) {
@@ -17,6 +17,53 @@ function fixture(over = {}) {
 }
 
 describe('backlog-only prep', () => {
+  const marker = (sha = head) => `<!-- prep-review-verdict head=${sha} verdict=clean v=1 -->`;
+  it.each([
+    ['prefix 7', marker(head.slice(0, 7))],
+    ['prefix 12', marker(head.slice(0, 12))],
+    ['uppercase head', marker(head.toUpperCase())],
+    ['39 hex', marker(head.slice(1))],
+    ['41 hex', marker(head + 'a')],
+    ['missing version', marker().replace(' v=1', '')],
+    ['version 2', marker().replace('v=1', 'v=2')],
+    ['extra text', marker() + ' trailing'],
+    ['inline sentence', 'Here is ' + marker()],
+    ['trusted fenced marker', '```markdown\n' + marker() + '\n```'],
+    ['trusted tilde fence', '~~~\n' + marker() + '\n~~~'],
+    ['unclosed fence', '```\n' + marker()],
+    ['legacy free text', `<!-- prep-review: head=${head} round=1 -->\n**Verdict: clean**`],
+  ])('holds for %s', (_name, body) => {
+    expect(backlogOnlyPrepClear({ ...evidence(), comments: [{ ...note(), body }] }).ok).toBe(false);
+  });
+  it.each([
+    ['multiline inline-code span', '`\n' + marker() + '\n`'],
+    ['double-backtick inline-code span', '``quoted ` text\n' + marker() + '\n``'],
+    ['unclosed inline-code span', '`quoted\n' + marker()],
+    ['enclosing HTML comment', '<!-- quoted example\n' + marker() + '\n-->'],
+    ['HTML comment opened mid-line', 'Example: <!--\n' + marker() + '\n-->'],
+    ['unclosed enclosing HTML comment', '<!-- quoted example\n' + marker()],
+  ])('quoted markers cannot clear the gate: %s', (_name, body) => {
+    const comments = [{ ...note(), body }];
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(false);
+    const f = fixture({ readComments: () => comments });
+    expect(runBacklogOnlyPrep(f)[0].action).toBe('skip');
+    expect(f.post).not.toHaveBeenCalled(); expect(f.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['inline code', '`\n' + marker() + '\n`'],
+    ['HTML comment', '<!--\n' + marker() + '\n-->'],
+  ])('accepts a later real marker after a quoted %s example', (_name, quoted) => {
+    const comments = [{ ...note(), body: quoted + '\n' + marker() }];
+    expect(backlogOnlyPrepClear({ ...evidence(), comments }).ok).toBe(true);
+  });
+  it('holds for an untrusted fenced marker', () => {
+    expect(backlogOnlyPrepClear({ ...evidence(), comments: [{ author: { login: 'stranger' },
+      body: '```\n' + marker() + '\n```' }] }).ok).toBe(false);
+  });
+  it('uses the newest clean marker despite historical findings and free text', () => {
+    expect(backlogOnlyPrepClear({ ...evidence(), comments: [note(head, true),
+      { ...note(), body: marker() + '\n**Verdict: findings**' }] }).ok).toBe(true);
+  });
   it('holds when a block label arrives after the last comment read', () => {
     const calls = [];
     let liveReads = 0;
@@ -45,10 +92,8 @@ describe('backlog-only prep', () => {
     ['newest blocked note', { comments: [note(), note(head, true)] }],
     ['marker without verdict', { comments: [note(head, false, 'unknown')] }],
     ['advise findings without blocked marker', { comments: [note(head, false, 'findings')] }],
-    ['older findings followed by clean', { comments: [note(head, false, 'findings'), note()] }],
-    ['older blocked followed by clean', { comments: [note(head, true), note()] }],
     ['newest note without clean verdict', { comments: [note(), note(head, false, 'unknown')] }],
-    ['both verdicts in one trusted note', { comments: [{ ...note(), body: note().body + '\n**Verdict: findings**' }] }],
+    ['both verdicts in one trusted note', { comments: [{ ...note(), body: note().body + `\n<!-- prep-review-verdict head=${head} verdict=findings v=1 -->` }] }],
     ['untrusted clean cannot settle trusted findings', { comments: [note(head, false, 'findings'), { ...note(), author: { login: 'stranger' } }] }],
     ['untrusted note', { comments: [{ ...note(), author: { login: 'stranger' } }] }],
     ['empty files', { files: [] }],
