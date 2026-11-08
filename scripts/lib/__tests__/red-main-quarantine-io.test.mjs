@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings } from '../red-main-quarantine-io.mjs';
+import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs } from '../red-main-quarantine-io.mjs';
 import { addEntries, pruneOnGreen, testsToSkip } from '../red-main-quarantine.mjs';
 
 const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -66,5 +66,65 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
     const events = g(['show', 'refs/heads/ops/quarantine:events.jsonl'], origin).trim().split('\n').map(JSON.parse);
     expect(events.filter((e) => e.type === 'card-owed')).toEqual([expect.objectContaining(result.plan.cards[0])]);
     expect(g(['for-each-ref', '--format=%(refname)'], origin).trim().split('\n').sort()).toEqual(['refs/heads/main', 'refs/heads/ops/quarantine']);
+  });
+});
+
+describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of the broken main run, once per sha', () => {
+  const runs = (list) => JSON.stringify(list);
+  const fake = (list, { failRerun = false } = {}) => {
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push(args);
+      if (args[0] === 'run' && args[1] === 'list') return runs(list);
+      if (args[0] === 'run' && args[1] === 'rerun') { if (failRerun) throw new Error('boom'); return ''; }
+      throw new Error('unexpected ' + args.join(' '));
+    };
+    return { exec, calls };
+  };
+  const dirOf = () => mkdtempSync(join(tmpdir(), 'rmq-rr-'));
+  const red = [{ databaseId: 42, headSha: SHA, status: 'completed', conclusion: 'failure', createdAt: '2026-11-08T03:47:00Z' }];
+  const reruns = (calls) => calls.filter((a) => a[1] === 'rerun');
+
+  it('a completed+failed latest run for the broken sha gets exactly one --failed rerun', () => {
+    const { exec, calls } = fake(red);
+    const r = rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir: dirOf(), repoSlug: 'o/r' });
+    expect(r).toMatchObject({ rerun: true, runId: 42 });
+    expect(reruns(calls)).toHaveLength(1);
+    expect(reruns(calls)[0]).toEqual(expect.arrayContaining(['run', 'rerun', '42', '--failed']));
+  });
+  it('a second add for the same sha does not rerun again', () => {
+    const { exec, calls } = fake(red);
+    const dir = dirOf();
+    rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' });
+    const r = rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' });
+    expect(r).toMatchObject({ rerun: false, reason: 'already-rerun' });
+    expect(reruns(calls)).toHaveLength(1);
+  });
+  it('a latest run still in progress, green, or for another sha is never rerun', () => {
+    for (const list of [
+      [{ ...red[0], status: 'in_progress', conclusion: null }],
+      [{ ...red[0], conclusion: 'success' }],
+      [{ ...red[0], headSha: 'f'.repeat(40) }],
+      [red[0], { ...red[0], databaseId: 43, status: 'in_progress', conclusion: null, createdAt: '2026-11-08T05:00:00Z' }],
+      [],
+    ]) {
+      const { exec, calls } = fake(list);
+      expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir: dirOf(), repoSlug: 'o/r' }).rerun).toBe(false);
+      expect(reruns(calls)).toHaveLength(0);
+    }
+  });
+  it('a failed rerun request or unreadable run list is reported, never thrown, and is retried on the next add', () => {
+    const dir = dirOf();
+    const bad = fake(red, { failRerun: true });
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: bad.exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, error: expect.stringContaining('boom') });
+    const unreadable = rerunRedMainFailedJobs({ brokenSha: SHA, exec: () => { throw new Error('gh down'); }, dir, repoSlug: 'o/r' });
+    expect(unreadable).toMatchObject({ rerun: false, error: expect.stringContaining('gh down') });
+    const ok = fake(red);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: ok.exec, dir, repoSlug: 'o/r' }).rerun).toBe(true);
+  });
+  it('a missing broken sha reruns nothing', () => {
+    const { exec, calls } = fake(red);
+    expect(rerunRedMainFailedJobs({ brokenSha: undefined, exec, dir: dirOf(), repoSlug: 'o/r' }).rerun).toBe(false);
+    expect(calls).toHaveLength(0);
   });
 });
