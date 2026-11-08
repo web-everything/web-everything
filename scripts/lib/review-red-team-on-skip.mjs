@@ -701,7 +701,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const holdUnfinishedReview = row => {
       try {
         const result = expireStuckReferralRuns({ repo, pr: row.prNumber, head: row.head, setting: resolvedSetting, env, now: now(), log: note });
-        if (result?.expired === true && (!result.held || result.held.length === 0)) {
+        if (result?.expired === true && result.otherBlockers === 0) {
           row.action = 'skip'; row.why = 'referral-run-expired';
           delete row.escalate; delete row.escalationContext; delete row.settle;
           return;

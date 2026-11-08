@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
+import { pidNamespace } from '../pid-alive.mjs';
 import { newRunRecord, readRun, writeRun, runPath } from '../../operations/run-store.mjs';
 import { findSuspendedReferralRuns, planReferralExpiry, expireSuspendedReferralRun, expireStuckReferralRuns } from '../stuck-referral-expiry.mjs';
 import { readDrainRedTeamEvidence, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
@@ -60,7 +61,34 @@ describe('stuck referral expiry', () => {
   it('fails closed on unreadable evidence and oversized scans', () => {
     expect(() => findSuspendedReferralRuns({ repo, pr, list: () => ['bad'], read: () => { throw Error('unreadable'); } })).toThrow();
     expect(() => findSuspendedReferralRuns({ repo, pr, list: () => Array(10001).fill('id') })).toThrow();
-    expect(planReferralExpiry({}, { now, deadlineMs, live: null })).toMatchObject({ action: 'hold' });
+  });
+  it('holds null liveness on a valid suspended observation', () => {
+    const observation = findSuspendedReferralRuns(fixture())[0];
+    expect(planReferralExpiry(observation, { now, deadlineMs, live: false }).action).toBe('expire');
+    expect(planReferralExpiry(observation, { now, deadlineMs, live: null })).toEqual({ action: 'hold', why: 'liveness unreadable' });
+  });
+  it.each(['EIO', 'ESRCH', 'EPERM', null])('default pid probe handles %s without treating unknown errors as dead', code => {
+    const f = fixture(5 * hour, { host: hostname(), pidNamespace: pidNamespace(), pid: 123 }), before = bytes(f);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      if (code) throw Object.assign(Error(code), { code });
+      return true;
+    });
+    let result;
+    try {
+      result = expireSuspendedReferralRun(f);
+      expect(kill).toHaveBeenCalledWith(123, 0);
+    } finally { kill.mockRestore(); }
+    expect(result).toMatchObject(code === 'ESRCH' ? { expired: true }
+      : { expired: false, why: code === 'EIO' ? 'owner liveness unreadable' : 'owner live' });
+    if (code !== 'ESRCH') expect(bytes(f)).toBe(before);
+  });
+  it('holds non-finite mtime despite an old completed step without writing', () => {
+    const f = fixture(5 * hour, { stepTimings: [{ step: 'read', stepIndex: 0,
+      startedAt: new Date(now - 6 * hour).toISOString(), finishedAt: new Date(now - 5 * hour).toISOString(), durationMs: hour }] });
+    const before = bytes(f), write = vi.fn(), stat = () => ({ mtimeMs: NaN });
+    expect(() => findSuspendedReferralRuns({ ...f, stat })).toThrow('age unreadable');
+    expect(expireSuspendedReferralRun({ ...f, stat, write })).toMatchObject({ expired: false, why: 'run evidence unreadable; inspect run store' });
+    expect(write).not.toHaveBeenCalled(); expect(bytes(f)).toBe(before);
   });
   it.each([{ resumedAt: new Date(now - hour).toISOString() }, { resumeOf: 'prior' }])('holds recent or unknown resumes %j', extra => {
     const f = fixture(5 * hour, extra); expect(expireSuspendedReferralRun(f).expired).toBe(false);
@@ -163,12 +191,56 @@ describe('stuck referral expiry', () => {
     expect(result.rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished' });
     expect(escalate).toHaveBeenCalledWith(expect.objectContaining({ why: 'review-unfinished' }));
   });
+  it('expires a referral but escalates exactly once for a different review awaiting human confirmation', () => {
+    const f = fixture();
+    const blocked = { ...readRun(f.runId, f.runsDir), id: 'review-pr-confirm', effects: [],
+      pending: { kind: 'confirm', step: 'stageVerdict', stepIndex: 9 } };
+    writeRun(blocked, f.runsDir);
+    const before = readFileSync(runPath(blocked.id, f.runsDir), 'utf8');
+    const escalate = vi.fn(), expiry = vi.fn(options => expireStuckReferralRuns({ ...options, runsDir: f.runsDir }));
+    const result = runRedTeamOnSkip({ repo, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+      rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }], capacity: { lanes: 1 },
+      readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => false, readStatus: () => null,
+      expireStuckReferralRuns: expiry, setting: { enabled: true, referralRunExpiryHours: 4 }, escalate, now: () => now });
+    expect(escalate).toHaveBeenCalledTimes(1);
+    expect(expiry.mock.results[0].value).toEqual({ expired: true, otherBlockers: 1 });
+    expect(readRun(f.runId, f.runsDir).pending).toBeNull();
+    expect(readFileSync(runPath(blocked.id, f.runsDir), 'utf8')).toBe(before);
+    expect(result.rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished' });
+    expect(escalate).toHaveBeenCalledTimes(1);
+    expect(escalate).toHaveBeenCalledWith(expect.objectContaining({ why: 'review-unfinished' }));
+  });
+  it.each([
+    ['recent terminal', {}, 0, 1],
+    ['abandoned terminal', {}, 2 * hour, 0],
+    ['resumed terminal', { resumeOf: 'prior' }, 2 * hour, 1],
+    ['open effect with verdict', { verdict: { verdict: 'changes' }, effects: [{ key: 'open', type: 'test', stepIndex: 0, index: 0, status: 'pending' }] }, 2 * hour, 1],
+    ['finished verdict', { verdict: { verdict: 'changes' } }, 0, 0],
+    ['other head', { input: { repo, pr, head: 'b'.repeat(40) }, findings: {} }, 0, 0],
+    ['read rev overrides input head', { input: { repo, pr, head: 'b'.repeat(40) }, findings: { read: { netBasis: { rev: head } } } }, 0, 1],
+    ['input head fallback', { input: { repo, pr, head }, findings: {} }, 0, 1],
+    ['other repo', { input: { repo: 'elsewhere/repo', pr } }, 0, 0],
+    ['other PR', { input: { repo, pr: 2 } }, 0, 0],
+  ])('counts other blockers: %s', (_name, extra, age, count) => {
+    const f = fixture();
+    const other = { ...readRun(f.runId, f.runsDir), id: 'review-pr-other', pending: null, effects: [], ...extra };
+    writeRun(other, f.runsDir);
+    utimesSync(runPath(other.id, f.runsDir), (now - age) / 1000, (now - age) / 1000);
+    expect(expireStuckReferralRuns({ ...f, setting: { referralRunExpiryHours: 4 } })).toEqual({ expired: true, otherBlockers: count });
+  });
+  it('counts unreadable post-expiry evidence as a blocker', () => {
+    const f = fixture(); let expired = false;
+    const result = expireStuckReferralRuns({ ...f, setting: { referralRunExpiryHours: 4 },
+      read: (id, dir) => { if (expired) throw Error('unreadable'); return readRun(id, dir); },
+      write: (run, dir) => { writeRun(run, dir); expired = true; } });
+    expect(result).toEqual({ expired: true, otherBlockers: 1 });
+  });
   it.each([true, false, 'error'])('daemon expiry %s stays skip and only holds escalate', expired => {
     const escalate = vi.fn(), settle = vi.fn(), setLabels = vi.fn();
     const result = runRedTeamOnSkip({ repo, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
       rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }], capacity: { lanes: 1 },
       readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => false, readStatus: () => null,
-      expireStuckReferralRuns: () => { if (expired === 'error') throw Error('unreadable'); return { expired }; },
+      expireStuckReferralRuns: () => { if (expired === 'error') throw Error('unreadable'); return { expired, otherBlockers: 0 }; },
       setting: { enabled: true, referralRunExpiryHours: 4 }, escalate, settle, provider: { setLabels }, now: () => now });
     expect(result.rows[0]).toMatchObject({ action: 'skip', why: expired === true ? 'referral-run-expired' : 'review-unfinished' });
     expect(escalate).toHaveBeenCalledTimes(expired === true ? 0 : 1); expect(settle).not.toHaveBeenCalled(); expect(setLabels).not.toHaveBeenCalled();
