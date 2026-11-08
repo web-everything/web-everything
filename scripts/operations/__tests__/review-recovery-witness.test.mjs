@@ -640,6 +640,22 @@ describe('stale record owned by a foreign host name', () => {
     expect(stale(f)).toMatchObject({ mode: 'fresh', abandon: true });
     expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
   });
+  it('keeps a stale foreign-host record recoverable after its own abandonment rewrote the file (mtime reset)', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f)).toMatchObject({ mode: 'fresh', abandon: true });
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+    expect(Date.now() - statSync(f.path).mtimeMs).toBeLessThan(60_000);
+    expect(recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env }))
+      .toMatchObject({ mode: 'fresh', abandon: false });
+  });
+  it('does not treat an abandonment whose marker no longer binds the writer as proof of death', () => {
+    const f = fixture({ foreign: true });
+    stale(f);
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+    writeFileSync(`${f.path}.stale-redispatch-1`, JSON.stringify({ writer: 'x'.repeat(64), evidence: 'y', priorWriter: 'z', abandonedAt: new Date().toISOString() }));
+    expect(recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env }))
+      .toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
   it('holds a fresh foreign-host record', () => {
     expect(stale(fixture({ foreign: true }), { ageMs: 60_000 })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
   });

@@ -74,7 +74,11 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
       // A host rename after a crash leaves a record no local pid probe can settle: apply the same stale-record rule the
       // evidence reader uses, so recovery and the reader never disagree. An unprobeable owner stays held.
       try {
-        dead = foreignStaleOwnerDead(raw, { host: probe.host, namespace: probe.namespace, statusAt: w.statusAt, now, env, isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) });
+        // Our own abandonment rewrites the file and resets the mtime this rule reads, so a foreign-host abandonment whose
+        // marker still binds this exact writer and evidence stays proven dead (it was proven under the claim).
+        const m = w.markers.redispatch;
+        dead = Boolean(raw.staleAbandoned && raw.host && raw.host !== probe.host && m?.writer === w.rawWriter.sha256 && m?.evidence === w.evidenceSha256)
+          || foreignStaleOwnerDead(raw, { host: probe.host, namespace: probe.namespace, statusAt: w.statusAt, now, env, isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) });
       } catch { dead = false; }
     }
     if (!dead) {
