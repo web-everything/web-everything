@@ -18,4 +18,18 @@ describe('prototype-load daemon registry', () => {
   it('gives every daemon a launchd label', () => {
     for (const [key, d] of Object.entries(config.daemons)) expect(typeof d.label, key).toBe('string');
   });
+
+  it('declares merge-watch on the wev-merge-daemon clone with the merge-orphan-sweep label', () => {
+    expect(config.daemons['merge-watch']).toMatchObject({ label: 'com.we.conveyor-pass-daemon.merge-orphan-sweep', clone: 'wev-merge-daemon' });
+    expect(config.daemons).not.toHaveProperty('merge');
+  });
+
+  it('gives every daemon a runs description', () => {
+    for (const [key, d] of Object.entries(config.daemons)) expect(typeof d.runs, key).toBe('string');
+  });
+
+  it('describes drain as the merge-queue drain, not merge-watch', () => {
+    expect(config.daemons.drain.runs).toMatch(/merge-queue drain/);
+    expect(config.daemons['merge-watch'].runs).toMatch(/pr-merge-watch/);
+  });
 });

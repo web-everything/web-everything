@@ -246,6 +246,23 @@ describe('renderWorkerBrief', () => {
     expect(renderWorkerBrief(params)).toContain('If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.');
   });
 
+  it('lists every daemon with what it runs when an edge clone is given', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep)');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)');
+    expect(brief).toContain('matches daemon key merge-watch');
+    expect(brief).not.toContain('WARNING: --edge-clone');
+  });
+
+  it('warns when the edge clone matches no daemon clone', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
+    expect(brief).toContain('WARNING: --edge-clone /tmp/edge matches no daemon clone');
+  });
+
+  it('omits the daemon list without an edge clone', () => {
+    expect(renderWorkerBrief({ ...params })).not.toContain('merge-queue drain (drain-queue-safety');
+  });
+
   it('includes the optional edge section as the last numbered rule', () => {
     const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
     expect(brief).toContain('8. **Edge.**');
