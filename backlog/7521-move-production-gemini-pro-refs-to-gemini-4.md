@@ -2,9 +2,11 @@
 bornAs: xrw7q22
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/dispatch-routing-policy.json", "we:scripts/lib/dispatch-routing-policy.mjs", "we:scripts/lib/model-probation.json", "we:scripts/lib/antigravity-model-effort.mjs", "we:scripts/gemini-direct-task.mjs", "we:scripts/operations/review-dispatch.mjs", "we:docs/agent/agent-cli-capability-map.md"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: f18f8f6994b2389186a4069fbf65fbb328e0180f
 tags: []
 ---
 

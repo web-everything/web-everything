@@ -2,9 +2,11 @@
 bornAs: xb8z4kn
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/readiness/host-capacity.mjs", "we:scripts/operations/host-capacity.mjs", "we:scripts/lib/host-load.mjs", "we:scripts/lib/host-overload-settings.mjs", "we:scripts/settings/host-overload.json", "we:scripts/conveyor/health-investigate-dispatch.mjs"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: 33bcf43bde7f08a38ddad86eebd97ee5c6649040
 tags: []
 ---
 
