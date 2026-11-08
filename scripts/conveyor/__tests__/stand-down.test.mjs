@@ -422,7 +422,7 @@ describe('stand-down CLI releases only after a successful comment (#4897)', () =
 });
 
 // #3881: legacy local verify flakes must not request human judgment.
-import { loadFlakeHolds, loadFlakeHoldState, parseAltBranch, buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
+import { loadFlakeHoldState, parseAltBranch, buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
 import { loadFlakeLegacyBody, loadTimeoutLegacyBody } from './load-flake-fixture.mjs';
 const loadComment = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
 describe('load-flake holds', () => {
