@@ -11,7 +11,12 @@
  *      real `advance` loop, proving the two-effect shape actually reaches two sinks — not just that each
  *      helper function is individually correct.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import matter from 'gray-matter';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { searchCapabilities, classifyVerdict, EXACT_THRESHOLD, PARTIAL_THRESHOLD } from '../../capability-search.mjs';
 import { NON_DISPATCHABLE_KINDS as QUEUE_NON_DISPATCHABLE_KINDS } from '../../conveyor/queue.mjs';
 
 import { advanceWhileRunning, startRun, runStatus } from '../engine.mjs';
@@ -77,10 +82,11 @@ describe('planQueueing', () => {
 });
 
 describe('the declaration end to end', () => {
-  function buildRegistry(readerOverrides = {}) {
+  function buildRegistry(readerOverrides = {}, searchDuplicates = () => ({ backlog: [], scripts: [], skills: [] })) {
     const registry = createRegistry();
     registry.register(fileItemOperation({
       readScaffoldContext: () => ({ existingIds: ['001'], today: '2026-08-21', dir: '/repo/backlog', ...readerOverrides }),
+      searchDuplicates,
     }));
     return registry;
   }
@@ -97,6 +103,178 @@ describe('the declaration end to end', () => {
     }
     return run;
   }
+
+  describe('duplicate admission before writing', () => {
+    const input = { title: 'Prevent duplicate backlog cards', workItem: 'task', digest: 'Search before filing a card' };
+    const hits = (backlog = []) => ({ backlog, scripts: [], skills: [] });
+    const hit = (id, score) => ({ id, score, title: 'An existing backlog card' });
+    const begin = (registry, extra = {}) => advanceWhileRunning(startRun({
+      op: FILE_ITEM_OP, id: 'duplicate-admission', input: { ...input, ...extra }, registry,
+    }), { registry });
+
+    async function file(registry, extra = {}) {
+      const written = []; const queued = [];
+      const sinks = {
+        [SCAFFOLD_EFFECT]: async (p) => { written.push(p); return { written: true }; },
+        [FILE_ITEM_QUEUE_EFFECT]: async (p) => { queued.push(p); return { queued: true }; },
+      };
+      const run = await runToCompletion(begin(registry, extra), {
+        registry, sinks, store: createMemoryRunStore(),
+      });
+      expect(runStatus(run, { registry })).toBe('complete');
+      expect(written).toHaveLength(1);
+      expect(queued).toHaveLength(1);
+      return matter(written[0].content);
+    }
+
+    it('refuses an exact duplicate before declaring write/queue effects, naming matching ids and both overrides', () => {
+      expect(classifyVerdict(EXACT_THRESHOLD)).toBe('exact');
+      const search = vi.fn(() => hits([hit('123', EXACT_THRESHOLD), hit('456', 0.9)]));
+      const registry = buildRegistry({}, search);
+      let refusal;
+      try { begin(registry); } catch (error) { refusal = error; }
+      expect(refusal).toBeInstanceOf(Error);
+      expect(refusal.message).toContain('123');
+      expect(refusal.message).toContain('456');
+      expect(refusal.message).toContain('--relatedTo=<id> --relatedReason=...');
+      expect(refusal.message).toContain('--notDuplicateReason="..."');
+      expect(search).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([PARTIAL_THRESHOLD, EXACT_THRESHOLD - 0.01])('files a partial backlog match at score %s below the default exact threshold', async (score) => {
+      expect(classifyVerdict(score)).toBe('partial');
+      await file(buildRegistry({}, () => hits([hit('123', score)])));
+    });
+
+    it('searches the title alone and title plus digest lead separately before the write sink runs', () => {
+      const search = vi.fn(() => hits());
+      const registry = buildRegistry({}, search);
+      const run = begin(registry);
+      expect(search.mock.calls).toEqual([[input.title], [`${input.title}\n${input.digest}`]]);
+      expect(runStatus(run, { registry })).toBe('awaiting-effect');
+    });
+
+    it.each(['\n\n', '\r\n \r\n'])('bounds the lead to 500 characters and excludes later paragraphs (%j)', (separator) => {
+      const search = vi.fn(() => hits());
+      const lead = 'Detailed context '.repeat(100);
+      begin(buildRegistry({}, search), { digest: `  ${lead}${separator}Later paragraph must not enter the query.` });
+      expect(search.mock.calls).toEqual([[input.title], [`${input.title}\n${lead.slice(0, 500)}`]]);
+    });
+
+    it('excludes later paragraphs even when the first paragraph is short', () => {
+      const search = vi.fn(() => hits());
+      begin(buildRegistry({}, search), { digest: '  Brief lead.\n\nDifferent later context.' });
+      expect(search.mock.calls).toEqual([[input.title], [`${input.title}\nBrief lead.`]]);
+    });
+
+    it.each([0, 1])('retains the maximum score for a card when query %s is the stronger match', (stronger) => {
+      const search = vi.fn()
+        .mockReturnValueOnce(hits([hit('123', stronger === 0 ? 1 : PARTIAL_THRESHOLD)]))
+        .mockReturnValueOnce(hits([hit('123', stronger === 1 ? 1 : PARTIAL_THRESHOLD)]));
+      expect(() => begin(buildRegistry({}, search))).toThrow(/possible duplicate backlog cards 123;/);
+      expect(search).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([0, 1])('fails closed when query %s has incomplete evidence despite the other being clear', (incomplete) => {
+      const results = [hits(), hits()];
+      results[incomplete] = { backlog: [], malformed: [{ file: 'unreadable.md' }] };
+      const search = vi.fn().mockReturnValueOnce(results[0]).mockReturnValueOnce(results[1]);
+      expect(() => begin(buildRegistry({}, search))).toThrow(/unavailable or incomplete/);
+    });
+
+    it('refuses an existing corpus card with the same title despite a long different multi-paragraph digest', () => {
+      const root = mkdtempSync(join(tmpdir(), 'file-item-corpus-'));
+      const backlogDir = root;
+      const title = 'Preserve queue reservations during worker recovery';
+      const digest = 'Investigate distributed scheduling fairness and capacity allocation across independent executors.\n\n'
+        + 'Telemetry dashboards aggregate latency histograms, memory pressure, throughput estimates, and resource saturation.\n\n'
+        + 'Document ownership transitions, cancellation semantics, administrative overrides, monitoring alerts, and incident timelines.';
+      try {
+        writeFileSync(join(backlogDir, '123-preserve-reservations.md'),
+          `---\nkind: task\nstatus: open\n---\n\n# ${title}\n\nKeep pending claims intact when a runner restarts.\n`);
+        const search = query => searchCapabilities(query, { root, backlogDir, limit: Number.MAX_SAFE_INTEGER });
+        // Pin the dilution that let the former full-body query admit this duplicate.
+        expect(search(`${title}\n${digest}`).backlog[0].score).toBeLessThan(EXACT_THRESHOLD);
+        const registry = buildRegistry({}, search);
+        const run = startRun({ op: FILE_ITEM_OP, id: 'real-corpus-duplicate',
+          input: { ...input, title, digest }, registry });
+        expect(() => advanceWhileRunning(run, { registry })).toThrow(/possible duplicate backlog cards #123/);
+        expect(run.effects).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('files normally when only scripts and skills have exact hits', async () => {
+      await file(buildRegistry({}, () => ({
+        backlog: [], scripts: [hit('script', 1)], skills: [hit('skill', 1)], verdict: 'exact',
+      })));
+    });
+
+    it('uses the highest backlog score even when hits are not sorted', () => {
+      const registry = buildRegistry({}, () => hits([hit('123', PARTIAL_THRESHOLD), hit('456', EXACT_THRESHOLD)]));
+      expect(() => begin(registry)).toThrow(/456/);
+    });
+
+    it('uses the resolved operatorTask policy threshold to refuse a partial match', () => {
+      const registry = buildRegistry({ operatorTask: { duplicateThreshold: PARTIAL_THRESHOLD } },
+        () => hits([hit('123', PARTIAL_THRESHOLD)]));
+      expect(() => begin(registry)).toThrow(/123/);
+    });
+
+    it('files an exact-tier match below a higher resolved policy threshold', async () => {
+      await file(buildRegistry({ operatorTask: { duplicateThreshold: 0.9 } },
+        () => hits([hit('123', EXACT_THRESHOLD)])));
+    });
+
+    it('files --relatedTo with a reason, adding the related frontmatter and recording the reason in the body', async () => {
+      const reason = 'This card covers the follow-up migration, while 123 covers the search core.';
+      const card = await file(buildRegistry({}, () => hits([hit('123', EXACT_THRESHOLD)])), {
+        relatedTo: '123', relatedReason: reason,
+      });
+      expect(card.data.related.map(String)).toEqual(['123']);
+      expect(card.content).toContain(reason);
+    });
+
+    it.each([undefined, '', '   '])('refuses --relatedTo without a substantive reason (%j)', (relatedReason) => {
+      const registry = buildRegistry({}, () => hits([hit('123', EXACT_THRESHOLD)]));
+      expect(() => begin(registry, { relatedTo: '123', ...(relatedReason === undefined ? {} : { relatedReason }) }))
+        .toThrow(/--relatedReason/);
+    });
+
+    it('files --notDuplicateReason and records the reason in the card body', async () => {
+      const reason = 'The existing card targets a different runtime and cannot cover this work.';
+      const card = await file(buildRegistry({}, () => hits([hit('123', EXACT_THRESHOLD)])), {
+        notDuplicateReason: reason,
+      });
+      expect(card.content).toContain(reason);
+    });
+
+    it('fails closed when search is unavailable and names the explicit override', () => {
+      const registry = buildRegistry({}, () => { throw new Error('search index unreadable'); });
+      expect(() => begin(registry)).toThrow(/--notDuplicateReason="\.\.\."/);
+    });
+
+    it.each([undefined, {}, { backlog: [], malformed: [{ file: 'unreadable.md' }] },
+      { backlog: [{ id: '123', score: NaN }] }, { backlog: [{ score: 1 }] }])(
+      'fails closed on missing, malformed or invalid evidence: %j', (result) => {
+        expect(() => begin(buildRegistry({}, () => result))).toThrow(/--notDuplicateReason/);
+      });
+
+    it('fails closed when the injected search binding is missing', () => {
+      const registry = createRegistry();
+      registry.register(fileItemOperation({ readScaffoldContext: () => read() }));
+      expect(() => begin(registry)).toThrow(/--notDuplicateReason/);
+    });
+
+    it('files when search is unavailable only with an explicit not-duplicate reason recorded in the body', async () => {
+      const reason = 'Manually checked existing backlog cards while the search index is unavailable.';
+      const card = await file(buildRegistry({}, () => { throw new Error('search index unreadable'); }), {
+        notDuplicateReason: reason,
+      });
+      expect(card.content).toContain(reason);
+    });
+  });
 
   it('writes and queues the final number supplied by the reader', async () => {
     const registry = buildRegistry({ allocatedId: '123' });

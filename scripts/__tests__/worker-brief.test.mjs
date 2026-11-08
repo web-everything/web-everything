@@ -160,6 +160,7 @@ describe('renderWorkerBrief', () => {
 
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
     const brief = renderWorkerBrief(params);
+    expect(brief).toContain('Search the backlog before designing or building: `node scripts/capability-search.mjs "<concept>"`');
     const speed = brief.slice(brief.indexOf('**Speed.**'), brief.indexOf('1. **Free-scope pre-check.**'));
     for (const rule of [
       'For Forge/remote work, do a real live Forge run in the first 15 minutes.',
