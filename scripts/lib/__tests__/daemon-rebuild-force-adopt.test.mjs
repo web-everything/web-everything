@@ -471,12 +471,12 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     const blockers = {
       'watch-already-open': async ({ cloneDir, env, lastGood }) => {
         await recordForcedAdoption({ root: cloneDir, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
-          lastGood: { head: lastGood }, smoke: { verdict: 'code', failed: [] }, emit: async () => {} });
+          lastGood: { head: lastGood }, smoke: { verdict: 'code', failed: [] }, emit: async () => true });
       },
       'watch-unreadable': async ({ cloneDir, env }) => { writeFileSync(watchFileOf(cloneDir, env), '{corrupt'); },
       'rollback-owed': async ({ cloneDir, env, lastGood }) => {
         await recordForcedAdoption({ root: cloneDir, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
-          lastGood: { head: lastGood }, smoke: { verdict: 'code', failed: [] }, emit: async () => {} });
+          lastGood: { head: lastGood }, smoke: { verdict: 'code', failed: [] }, emit: async () => true });
         chmodSync(env.WE_DAEMON_STATE_DIR, 0o500); // the owed-rollback marker cannot be saved
         try { await runForceWatchTick({ root: cloneDir, env, currentHead: 'c'.repeat(40), probe: unhealthy, rollback: async () => ({ ok: false }) }); } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
         rmSync(watchFileOf(cloneDir, env), { force: true }); // the obligation now lives only in memory
@@ -689,6 +689,35 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect.soft(readForceWatch(cloneDir, env)).toMatchObject({ sha: target });
     expect.soft(handoffOf(env)).not.toContain('NOT adopted');
     expect(log.error.mock.calls.flat().join('\n')).not.toContain('NOT adopted');
+  });
+
+  it('failed forced finalization with throwing HEAD verification preserves the watch for a later tick', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    let resetFailed = false;
+    const unreadableHead = vi.fn(() => { throw new Error('HEAD temporarily unreadable'); });
+    const run = (args, opts) => {
+      if (opts?.cwd === cloneDir && args[0] === 'reset' && args.includes('--hard') && args.includes(target)) {
+        resetFailed = true;
+        return { status: 1, stdout: '', stderr: 'reset failed before moving HEAD' };
+      }
+      if (resetFailed && unreadableHead.mock.calls.length === 0 && opts?.cwd === cloneDir && args[0] === 'rev-parse' && args.includes('HEAD')) return unreadableHead();
+      return gitRun(args, opts);
+    };
+    const result = await tick(cloneDir, env, { runSmoke: failing(), run, forceWatchProbe: healthy });
+    expect(result).toMatchObject({ moved: false, reason: 'reset-failed' });
+    expect(unreadableHead).toHaveBeenCalledOnce(); // reaches abort's throwing HEAD read, independently of a moved HEAD
+    expect(headOf(cloneDir)).toBe(lastGood);
+    const watch = readForceWatch(cloneDir, env);
+    expect(watch).toMatchObject({ sha: target, lastGood: { head: lastGood }, ticksLeft: 5 });
+    expect(handoffOf(env)).not.toContain('NOT adopted');
+    const probe = vi.fn(healthy);
+    const rollback = vi.fn();
+    expect(await runForceWatchTick({ root: cloneDir, env, currentHead: () => headOf(cloneDir), probe, rollback }))
+      .toMatchObject({ action: 'waiting' });
+    expect(probe).not.toHaveBeenCalled();
+    expect(rollback).not.toHaveBeenCalled();
+    expect(readForceWatch(cloneDir, env)).toEqual(watch);
   });
 
   it('a finalization that throws clears the watch AND the ready candidate before the error propagates', async () => {

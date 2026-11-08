@@ -727,13 +727,18 @@ export async function smokeAndAdopt({
       return { moved: false, reason: 'force-adopt-refused', detail: opened.reason, plan, alerts: [...prepAlerts, ...alertsList] };
     }
     const abort = async () => {
+      // A reset can land before finalization throws. Retire only with evidence that this build is not running;
+      // an unreadable HEAD also keeps the rollback watch until a later tick can observe it.
+      let head;
+      try { head = verifyRev(git, 'HEAD'); } catch { return; }
+      if (!head || head === plan.finalSha) return;
       clearReadyCandidate(root, stEnv); // never leave the failed build adoptable unwatched
       await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
     };
     let forced;
     // `forced: true` pins the ready record to this exact sha: prepare never substitutes a same-tree or newer build for it, which
     // would run with no rollback watch (the watch is keyed to this sha).
-    try { forced = await finalize(plan, undefined, { kind: 'candidate', forced: true }, a.smokeResult); } catch (e) { await abort(); throw e; } // the log + watch must not outlive a finalize that threw
+    try { forced = await finalize(plan, undefined, { kind: 'candidate', forced: true }, a.smokeResult); } catch (e) { await abort(); throw e; }
     // finalize keeps the build as the ready candidate when a reader holds the clone (tick-in-progress / reader-priority):
     // the durable watch above already covers its later adoption. A sibling that adopted this exact build first
     // (`already-adopted`: adopted but not moved) is running it too, so the watch stays. Only a real failure to adopt aborts.

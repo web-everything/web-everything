@@ -209,8 +209,10 @@ export async function recordForcedAdoption({ root, env = process.env, request, s
   const at = new Date(now()).toISOString();
   // Check names come from the candidate's own smoke rows: keep them to printable ASCII and bounded, so they cannot forge audit lines.
   const smoke = rawSmoke ? { ...rawSmoke, failed: (rawSmoke.failed || []).slice(0, 20).map((n) => String(n).replace(/[^\x20-\x7e]/g, '?').slice(0, 80)) } : rawSmoke;
-  const detail = { ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null, watchTicks: FORCE_ADOPT_WATCH_TICKS };
-  const evented = (await emit?.({ kind: 'force-adopt', daemon: request.daemon, detail })) !== false;
+  const detail = { ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null, watchTicks: FORCE_ADOPT_WATCH_TICKS,
+    ...(env.WE_RULINGS_FILE ? { rulingsFile: rulingsPath(env) } : {}) };
+  let evented = false;
+  try { evented = (await emit?.({ kind: 'force-adopt', daemon: request.daemon, detail })) === true; } catch { /* a throwing sink failed too */ }
   const handed = appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: adopting ${sha} though smoke ${smoke?.verdict ?? 'unknown'} `
     + `(failed: ${(smoke?.failed || []).join(',') || 'none'}); operator quote: "${request.quote}"; auto-rollback watch ${FORCE_ADOPT_WATCH_TICKS} ticks\n`);
   const coroned = appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-review', at, daemon: request.daemon, ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null })}\n`);
@@ -219,7 +221,7 @@ export async function recordForcedAdoption({ root, env = process.env, request, s
   const retract = async (reason) => {
     appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: NOT adopted ${sha} (${reason}); request consumed\n`);
     appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-aborted', at, daemon: request.daemon, ruling: request.ruling, sha, reason })}\n`);
-    retireWatch(root, env, { sha, unlessRan: true });
+    // Every retract path precedes a successful open by this invocation. Any watch here belongs to a competing force.
     clearForceAdopt(root, env);
     try { await emit?.({ kind: 'force-adopt-aborted', daemon: request.daemon, detail: { ruling: request.ruling, sha, reason } }); } catch { /* best effort: the events sink may be the one that failed */ }
     return { ok: false, reason };

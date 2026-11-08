@@ -44,3 +44,18 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — the sha is compared lower-cased in the one matcher; a forced ready record is adopted only for its exact sha.
 6. **State over time** — the request expires after the TTL; a watch that never saw its build as head expires, and a discarded forced record closes its watch at once.
 7. **Who wrote it** — the request needs an operator ruling id and a quote verbatim in that ruling's own section.
+
+## Risks and test plan
+
+Each risk names the test that defends it (all in `we:scripts/lib/__tests__/daemon-rebuild-force-adopt.test.mjs` unless noted).
+
+- A request for build X force-adopts build Y: 'a request for build X never force-adopts build Y'.
+- A pending request skips the normal failed-smoke recovery: the sticky-rejection and harness-broken backoff cases.
+- A ready record is replaced by another build with no watch: 'a forced ready record is pinned to its sha'.
+- A sibling adopts first: the sibling-adopts-first case.
+- A losing concurrent force deletes the winner's watch: 'concurrent forces for the same SHA preserve the winning watch' (`we:daemon-force-adopt.test.mjs`).
+- An events sink that returns nothing counts as written: 'an emit that returns undefined, or throws, counts as a failed events sink' (`we:daemon-force-adopt.test.mjs`).
+- Finalization throws after HEAD already moved: 'failed forced finalization after HEAD already moved to the forced sha keeps the watch'.
+- HEAD verification throws during failed finalization: 'failed forced finalization with throwing HEAD verification preserves the watch for a later tick'.
+- The readyOnly job ticks the watch: 'readyOnly job process never ticks the force watch'.
+- A skip-unrelated hop launders unverified status: 'skip-unrelated falls back to build+smoke when the unverified status cannot be recorded'.
