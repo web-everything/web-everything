@@ -39,7 +39,7 @@ const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWrite
   && typeof w.markers.redispatch?.abandonedAt === 'string';
 
 /** Pure decision on a raw witness. Probes and time are supplied by the caller. */
-export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
+export function planRedTeamRecovery(w, { now, probe, deadlineMs, setting = resolveReviewRedTeamOnSkip().value } = {}) {
   if (w?.ok === false) return { mode: 'skip', why: w.reason };
   const raw = w.rawWriter.parsed;
   let executionPrior = raw;
@@ -73,9 +73,40 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
     if (!dead) return reject('owner live or age unknown');
   }
   const marker = w.markers.redispatch;
+  if (marker != null && (typeof marker !== 'object' || Array.isArray(marker))) return reject('stale re-dispatch marker malformed; inspect stored evidence');
   if (marker && !raw) return reject('stale marker without writer; inspect stored evidence');
   if (raw?.staleAbandoned && (!marker || marker.writer !== w.rawWriter.sha256 || marker.evidence !== w.evidenceSha256)) return reject('abandonment witness changed');
-  if (marker && active && !raw?.staleAbandoned && !pendingAbandonment(w)) return reject('stale re-dispatch already spent');
+  let refill = false;
+  let history;
+  // Legacy markers (no abandonments array) stay admissible unless a refill is being decided.
+  if (marker && (marker.abandonments !== undefined || active && !raw?.staleAbandoned && !pendingAbandonment(w))) {
+    history = marker.abandonments === undefined ? [marker.abandonedAt] : marker.abandonments;
+    const validTime = stamp => typeof stamp === 'string' && Number.isFinite(Date.parse(stamp))
+      && new Date(Date.parse(stamp)).toISOString() === stamp;
+    if (!Number.isFinite(now) || !['writer', 'evidence', 'priorWriter'].every(key =>
+      typeof marker[key] === 'string' && /^[a-f0-9]{64}$/.test(marker[key]))
+      || !validTime(marker.abandonedAt) || !Array.isArray(history) || !history.length
+      || history.at(-1) !== marker.abandonedAt
+      || history.some((stamp, index) => !validTime(stamp) || Date.parse(stamp) > now
+        || index > 0 && Date.parse(stamp) < Date.parse(history[index - 1]))
+      || !Number.isSafeInteger(setting.retryCooldownMin) || setting.retryCooldownMin < 0
+      || !Number.isSafeInteger(setting.staleRedispatchDailyCap ?? 3) || (setting.staleRedispatchDailyCap ?? 3) < 1) {
+      return reject('stale re-dispatch evidence unreadable; inspect stored evidence');
+    }
+  }
+  if (marker && active && !raw?.staleAbandoned && !pendingAbandonment(w)) {
+    const hasFindings = value => value != null && (typeof value !== 'object' || Object.keys(value).length > 0);
+    if (raw.result != null || w.seats.some(completedRedTeamSeat)
+      || hasFindings(raw.findings) || w.seats.some(seat => hasFindings(seat.findings))) {
+      return reject('stale re-dispatch already spent');
+    }
+    if (history.filter(stamp => now - Date.parse(stamp) < 86_400_000).length >= (setting.staleRedispatchDailyCap ?? 3)) {
+      return { ...reject('stale re-dispatch daily cap reached'), escalate: true,
+        escalationContext: 'stale red-team recovery exhausted its daily abandonment cap; inspect the writer before retrying' };
+    }
+    if (now - Date.parse(marker.abandonedAt) < setting.retryCooldownMin * 60_000) return reject('stale re-dispatch cooldown active');
+    refill = true;
+  }
   const completed = w.seats.some(completedRedTeamSeat);
   const resumable = ['ran', 'resumed'].includes(normalizeRedTeamResult(raw?.result).priorResult);
   const failedSeatCount = w.seats.filter(r => !completedRedTeamSeat(r)).length;
@@ -95,29 +126,32 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
   if (mode === 'fresh' && (w.markers.retry && !retry || w.seats.length && !retry
     || executionPrior && !retry && !redTeamStatusWithoutRun(executionPrior) && !redTeamSkipNeedsSettlement(executionPrior))) return reject('prior pass cannot restart');
   if (mode === 'fresh' && !retry) executionPrior = null;
-  return { rawWriter: w.rawWriter, executionPrior, mode, payload, retry, abandon: active && !raw.staleAbandoned };
+  return { rawWriter: w.rawWriter, executionPrior, mode, payload, retry, abandon: active && !raw.staleAbandoned, ...(refill ? { refill: true } : {}) };
 }
 
 export const recoveryProbe = () => ({ host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime });
 
 /** Spend one abandonment before spawning. The marker binds raw bytes, rows and newest review, never a plan. */
 export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,
-  probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env), writeJson = writeJsonAtomic } = {}) {
+  probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env), writeJson = writeJsonAtomic,
+  setting = resolveReviewRedTeamOnSkip({ env: key.env }).value } = {}) {
   const path = join(redTeamStatusDir(key.env), `${encodeURIComponent(key.repo)}-${Number(key.pr)}-${key.head}.json`);
   try {
     return withRedTeamStatusClaim(path, () => {
-      const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs });
+      const at = now();
+      const w = readWitness(), p = planRedTeamRecovery(w, { now: at, probe, deadlineMs, setting });
       if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
-      if (!p.abandon || p.mode === 'skip' || (w.markers.redispatch && !pendingAbandonment(w))) return { ok: false };
+      if (!p.abandon || p.mode === 'skip' || (w.markers.redispatch && !pendingAbandonment(w) && !p.refill)) return { ok: false };
       const marker = `${path}.stale-redispatch-1`;
-      const abandonedAt = w.markers.redispatch?.abandonedAt ?? new Date(now()).toISOString();
+      const abandonedAt = p.refill ? new Date(at).toISOString() : w.markers.redispatch?.abandonedAt ?? new Date(at).toISOString();
       const next = { ...w.rawWriter.parsed, staleAbandoned: { at: abandonedAt } };
       // Bind the exact writeJsonAtomic rendering before publishing either file. A crash
       // leaves either the old writer plus this complete intent, or the bound new writer.
       const writer = createHash('sha256').update(`${JSON.stringify(next, null, 2)}\n`).digest('hex');
-      if (w.markers.redispatch && w.markers.redispatch.writer !== writer) return { ok: false };
-      if (!w.markers.redispatch) writeJson(marker, { writer, evidence: w.evidenceSha256,
-        priorWriter: w.rawWriter.sha256, abandonedAt }, { mode: 0o600 });
+      if (w.markers.redispatch && !p.refill && w.markers.redispatch.writer !== writer) return { ok: false };
+      if (!w.markers.redispatch || p.refill) writeJson(marker, { writer, evidence: w.evidenceSha256,
+        priorWriter: w.rawWriter.sha256, abandonedAt, abandonments: [
+          ...(p.refill ? w.markers.redispatch.abandonments ?? [w.markers.redispatch.abandonedAt] : []), abandonedAt] }, { mode: 0o600 });
       writeJson(path, next);
       return { ok: true };
     }, { readPidStart: probe.readPidStart });
@@ -222,14 +256,17 @@ export function cardOnlySkipSettlementCandidate(evidence, head) {
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/review-red-team-on-skip.json') } = {}) {
   let tool;
-  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin }; } catch { /* lower layers */ }
+  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin, staleRedispatchDailyCap: data.staleRedispatchDailyCap }; } catch { /* lower layers */ }
   const raw = env.WE_REVIEW_RED_TEAM_ON_SKIP;
   const cooldown = env.WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN;
+  const dailyCap = env.WE_REVIEW_RED_TEAM_ON_SKIP_STALE_REDISPATCH_DAILY_CAP;
   return cascadePolicy('reviewRedTeamOnSkip', tool, {
-    env, log, standard: { enabled: true, retryCooldownMin: 30 },
+    env, log, standard: { enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 },
     envValues: { enabled: raw === '0' ? false : raw === '1' ? true : raw || undefined,
-      retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined },
-    valid: { enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0 },
+      retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined,
+      staleRedispatchDailyCap: typeof dailyCap === 'string' && /^\d+$/.test(dailyCap) ? Number(dailyCap) : dailyCap || undefined },
+    valid: { enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0,
+      staleRedispatchDailyCap: v => Number.isSafeInteger(v) && v >= 1 },
   });
 }
 
@@ -339,8 +376,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const w = readWitness({ repo, pr, head });
         if (w?.ok === false) return failedRead(w);
         if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
-          const recovery = planRedTeamRecovery(w, recoveryOptions);
-          return recovery.mode === 'skip' ? skip(recovery.why)
+          const recovery = planRedTeamRecovery(w, { ...recoveryOptions, setting });
+          return recovery.mode === 'skip' ? { ...skip(recovery.why),
+            ...(recovery.escalate ? { escalate: true, escalationContext: recovery.escalationContext } : {}) }
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
       }

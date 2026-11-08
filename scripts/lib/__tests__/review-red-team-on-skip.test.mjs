@@ -537,8 +537,8 @@ describe('planRedTeamOnSkip', () => {
 describe('settings cascade', () => {
   it('loads the default tool settings from the filesystem under Vite', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' } });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30 });
-    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool' });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
+    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool', staleRedispatchDailyCap: 'tool' });
   });
   it('environment disables recovery and logs its source', () => {
     resetCascadeLogForTest(); const log = vi.fn();
@@ -548,10 +548,25 @@ describe('settings cascade', () => {
     expect(resolved.sources.enabled).toBe('env');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('enabled=false (env)'));
   });
+  it.each(['0', '-1', '1.5', 'bad'])('rejects invalid stale daily cap %s', cap => {
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy',
+      WE_REVIEW_RED_TEAM_ON_SKIP_STALE_REDISPATCH_DAILY_CAP: cap },
+      readFile: () => '{"staleRedispatchDailyCap":0}' });
+    expect(resolved.value.staleRedispatchDailyCap).toBe(3);
+    expect(resolved.sources.staleRedispatchDailyCap).toBe('standard');
+  });
+  it('environment overrides the stale daily cap and logs provenance', () => {
+    resetCascadeLogForTest(); const log = vi.fn();
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_REVIEW_RED_TEAM_ON_SKIP_STALE_REDISPATCH_DAILY_CAP: '5',
+      WE_POLICY_CASCADE_LOG: '1' }, readFile: () => '{"staleRedispatchDailyCap":2}', log });
+    expect(resolved.value.staleRedispatchDailyCap).toBe(5);
+    expect(resolved.sources.staleRedispatchDailyCap).toBe('env');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('staleRedispatchDailyCap=5 (env)'));
+  });
   it('malformed tool and environment values retain lower layers', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_REVIEW_RED_TEAM_ON_SKIP: 'garbage', WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN: '-1', WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' },
       readFile: () => '{"enabled":"bad","retryCooldownMin":-1}' });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30 });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
   });
 });
 
