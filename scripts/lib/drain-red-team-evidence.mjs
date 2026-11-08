@@ -402,14 +402,14 @@ export function recordRedTeamStatus(input, options = {}) {
     // Only a proven absence (ENOENT) counts as "no earlier hold"; an unreadable probe keeps the hold.
     let heldBefore = false;
     // A GitHub-visible hold (commit status) set by an earlier writer must survive until a confirmed publication
-    // clears it. A marker that does not say otherwise (unreadable, or written before the flag) counts as set:
-    // clearing a status that was never posted costs one harmless write.
+    // clears it. An unreadable marker counts as set (clearing a status never posted costs one harmless write). A
+    // marker written before the flag existed counts as unset: no writer posted a status then.
     let remoteHold = false;
     if (publish) {
       try { statSync(`${path}.unpublished`); heldBefore = true; }
       catch (error) { heldBefore = error.code !== 'ENOENT'; }
       if (heldBefore) {
-        try { remoteHold = JSON.parse(readFileSync(`${path}.unpublished`, 'utf8'))?.remoteHold !== false; }
+        try { remoteHold = JSON.parse(readFileSync(`${path}.unpublished`, 'utf8'))?.remoteHold === true; }
         catch { remoteHold = true; }
       }
     }
@@ -440,6 +440,28 @@ export function recordRedTeamStatus(input, options = {}) {
         // A publisher alone must not opt terminal evidence reads into real GitHub IO.
         const gh = options.gh ?? (underTest ? () => { throw Error('test publication evidence requires injected gh'); }
           : (args, opts) => runGhSync(args, { ...opts, env: options.env ?? process.env }));
+        // Test runs need explicit IO for this channel too: a check publisher alone does not opt into status writes.
+        const statusChannel = typeof options.postPublicationHold === 'function' || typeof options.gh === 'function' || !underTest;
+        const postHold = ({ held, reason }) => {
+          try {
+            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, headSha: head, held, reason, gh });
+            return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
+          } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
+        };
+        // Set the GitHub-visible hold BEFORE any check post, so no CI read during the retries below sees the older
+        // success unheld. Record the intent first: a crash after the post still clears it on the next confirmation.
+        // A definite rejection (HTTP 4xx: e.g. the token lacks statuses:write) created no status, so the intent is
+        // withdrawn and nothing is left that a later clear would have to remove (no wedge).
+        let preHold = { ok: true };
+        const setRemoteHold = why => {
+          if (!statusChannel) return { ok: false, reason: 'no status IO in this test run' };
+          remoteHold = true;
+          writeHold();
+          const result = postHold({ held: true, reason: why });
+          if (!result.ok && /HTTP 4\d\d/.test(result.reason)) { remoteHold = false; writeHold(); }
+          return result;
+        };
+        if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
         if (input.status === 'finished') {
@@ -458,12 +480,6 @@ export function recordRedTeamStatus(input, options = {}) {
         const post = payload => {
           try {
             const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, pr: input.pr, headSha: head, payload, gh });
-            return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
-          } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
-        };
-        const postHold = ({ held, reason }) => {
-          try {
-            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, headSha: head, held, reason, gh });
             return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
           } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
         };
@@ -487,11 +503,9 @@ export function recordRedTeamStatus(input, options = {}) {
           const supersede = post(redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: 'finished', hold: reason, sendBack: true }));
           if (supersede.ok) reason += '; failure check superseded prior success';
           else {
-            // Second channel: a head-bound commit status every CI host reads. Record the intent first, so a crash
-            // after the post still clears it on the next confirmed publication.
-            remoteHold = true;
-            writeHold();
-            const held = postHold({ held: true, reason: `${input.status} round not confirmed published` });
+            // The second channel (a head-bound commit status every CI host reads) was set before the posts. Retry
+            // it once only if that attempt did not confirm.
+            const held = preHold.ok && remoteHold ? preHold : setRemoteHold(`${input.status} round not confirmed published`);
             reason += held.ok ? `; failure supersede also failed: ${supersede.reason}; GitHub-visible publication hold set`
               : `; failure supersede also failed: ${supersede.reason}; GitHub-visible hold also failed: ${held.reason}; operator must inspect GitHub check history before merging`;
           }

@@ -200,11 +200,37 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
   });
   it('evaluates absent, cleared, held, and incomplete combined status', async () => {
     const { evaluateRedTeamPublicationHold: evaluate, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');
+    const combined = { total_count: 1, statuses: [{ context, state: 'failure' }] };
+    const bot = { login: 'web-everything[bot]' }, stranger = { login: 'someone-else' };
     expect(evaluate({ combined: { total_count: 1, statuses: [{ context: 'ci', state: 'failure' }] } })).toMatchObject({ ok: true });
-    expect(evaluate({ combined: { total_count: 1, statuses: [{ context, state: 'success' }] } })).toMatchObject({ ok: true });
+    expect(evaluate({ combined, statuses: [{ id: 2, context, state: 'success', creator: bot }, { id: 1, context, state: 'failure', creator: bot }] }))
+      .toMatchObject({ ok: true, reason: expect.stringMatching(/cleared/) });
     for (const state of ['failure', 'pending', 'error', undefined])
-      expect(evaluate({ combined: { total_count: 1, statuses: [{ context, state }] } })).toMatchObject({ ok: false });
+      expect(evaluate({ combined, statuses: [{ id: 1, context, state, creator: stranger }] })).toMatchObject({ ok: false });
     expect(evaluate({ combined: { total_count: 2, statuses: [] } })).toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete/) });
     expect(evaluate({ combined: null })).toMatchObject({ ok: false });
+    expect(evaluate({ combined, statuses: null })).toMatchObject({ ok: false, reason: expect.stringMatching(/history unreadable/) });
+  });
+  it('an untrusted success never clears a hold, whatever its order in the response', async () => {
+    const { evaluateRedTeamPublicationHold: evaluate, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');
+    const combined = { total_count: 1, statuses: [{ context, state: 'success' }] };
+    const statuses = [{ id: 1, context, state: 'failure', creator: { login: 'web-everything[bot]' } },
+      { id: 9, context, state: 'success', creator: { login: 'github-actions[bot]' } }];
+    expect(evaluate({ combined, statuses })).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+    // Only untrusted successes and no hold: nothing to honour.
+    expect(evaluate({ combined, statuses: [statuses[1]] })).toMatchObject({ ok: true });
+    // A full page with no decision cannot rule out an older hold.
+    const page = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, context, state: 'success', creator: { login: 'x' } }));
+    expect(evaluate({ combined, statuses: page })).toMatchObject({ ok: false, reason: expect.stringMatching(/100-status bound/) });
+  });
+  it('reads the full history only when the context exists', async () => {
+    const { readRedTeamPublicationHoldFact, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');
+    const calls = [];
+    const gh = args => { calls.push(args[1]); return JSON.stringify({ total_count: 0, statuses: [] }); };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', headSha: head, gh })).toMatchObject({ ok: true });
+    expect(calls).toEqual([`repos/o/r/commits/${head}/status?per_page=100`]);
+    const gh2 = args => (/\/status\?/.test(args[1]) ? JSON.stringify({ total_count: 1, statuses: [{ context, state: 'failure' }] })
+      : JSON.stringify([{ id: 1, context, state: 'failure', creator: { login: 'web-everything[bot]' } }]));
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', headSha: head, gh: gh2 })).toMatchObject({ ok: false });
   });
 });

@@ -384,9 +384,12 @@ describe('gatherPrFacts red-team publication hold', () => {
   const GH_NO_HOLD = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 0, statuses: [] })];
   const GH_REMOTE_HOLD = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 1, statuses: [{ id: 3,
     context: RED_TEAM_PUBLICATION_CONTEXT, state: 'failure' }] })];
+  const history = (...statuses) => [/commits\/a{40}\/statuses\?/, JSON.stringify(statuses.map((s, i) => ({ id: statuses.length - i,
+    context: RED_TEAM_PUBLICATION_CONTEXT, ...s })))];
+  const GH_HOLD_HISTORY = history({ state: 'failure', creator: { login: 'web-everything[bot]' } });
 
   it.each(['check-run', 'both'])('a GitHub-visible hold outranks an older published success on a host with no drain store (%s)', source => {
-    const facts = gather([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD], { env: holdEnv(source) });
+    const facts = gather([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD, GH_HOLD_HISTORY], { env: holdEnv(source) });
     expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
     expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
   });
@@ -398,10 +401,18 @@ describe('gatherPrFacts red-team publication hold', () => {
       { env: holdEnv('check-run') }).redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete/) });
   });
 
-  it('a cleared GitHub-visible hold (success on the context) passes', () => {
-    const facts = gather([GH_PR, GH_SUCCESS, [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 1,
-      statuses: [{ id: 4, context: RED_TEAM_PUBLICATION_CONTEXT, state: 'success' }] })]], { env: holdEnv('check-run') });
+  const GH_LATEST_SUCCESS = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 1,
+    statuses: [{ id: 4, context: RED_TEAM_PUBLICATION_CONTEXT, state: 'success' }] })];
+  it('a hold cleared by the trusted writer passes', () => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_LATEST_SUCCESS, history({ state: 'success', creator: { login: 'web-everything[bot]' } },
+      { state: 'failure', creator: { login: 'web-everything[bot]' } })], { env: holdEnv('check-run') });
     expect(facts.redTeamCheck).toMatchObject({ ok: true, reason: 'red-team check run succeeded on head' });
+  });
+
+  it('a success posted by an untrusted token (e.g. a workflow) cannot clear the hold', () => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_LATEST_SUCCESS, history({ state: 'success', creator: { login: 'github-actions[bot]' } },
+      { state: 'failure', creator: { login: 'web-everything[bot]' } })], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
   });
 
   it('a local hold created during the check read outranks the success that read returned', () => {
@@ -414,7 +425,7 @@ describe('gatherPrFacts red-team publication hold', () => {
   it('a GitHub-visible hold set during the check read outranks the success that read returned', () => {
     let held = false;
     const facts = gather([GH_PR, [GH_SUCCESS[0], () => { held = true; return GH_SUCCESS[1]; }],
-      [GH_NO_HOLD[0], () => (held ? GH_REMOTE_HOLD : GH_NO_HOLD)[1]]], { env: holdEnv('check-run') });
+      [GH_NO_HOLD[0], () => (held ? GH_REMOTE_HOLD : GH_NO_HOLD)[1]], GH_HOLD_HISTORY], { env: holdEnv('check-run') });
     expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
   });
 
@@ -446,7 +457,7 @@ describe('gatherPrFacts red-team publication hold', () => {
     const writerEnv = holdEnv('check-run');
     const status = { repo: 'o/r', pr: 7, loopPayload: { findings: { read: { netBasis: { rev: HEAD } } } }, status: 'running' };
     const outage = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
-      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, ...JSON.parse(opts.input) }); return ''; },
+      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, creator: { login: 'web-everything[bot]' }, ...JSON.parse(opts.input) }); return ''; },
       postCheckRun: () => ({ ok: false, reason: 'checks API unavailable' }) });
     expect(outage).toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible publication hold set') });
     const ciRules = () => [GH_PR,
@@ -454,13 +465,14 @@ describe('gatherPrFacts red-team publication hold', () => {
       [/commits\/a{40}\/status\?/, () => {
         const latest = [...new Map([...github.statuses].reverse().map(s => [s.context, s])).values()];
         return JSON.stringify({ total_count: latest.length, statuses: latest });
-      }]];
+      }],
+      [/commits\/a{40}\/statuses\?/, () => JSON.stringify(github.statuses)]];
     // CI has its own, empty status store.
     const ci = () => gather(ciRules(), { env: holdEnv('check-run') });
     expect(ci().redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
     // Publication recovers: the running check posts, the hold clears, and the in-progress check still holds.
     const recovered = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
-      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, ...JSON.parse(opts.input) }); return ''; },
+      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, creator: { login: 'web-everything[bot]' }, ...JSON.parse(opts.input) }); return ''; },
       postCheckRun: ({ payload: check }) => { github.checkRuns.push({ ...check, id: github.checkRuns.length + 1, app: { id: 5037855 } }); return { ok: true }; } });
     expect(recovered).toEqual({ published: true });
     expect(github.statuses[0]).toMatchObject({ context: RED_TEAM_PUBLICATION_CONTEXT, state: 'success' });
