@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -113,14 +113,33 @@ describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of
       expect(reruns(calls)).toHaveLength(0);
     }
   });
-  it('a failed rerun request or unreadable run list is reported, never thrown, and is retried on the next add', () => {
+  it('a failed rerun request is reported with the manual fallback and is NOT retried (at most one request per sha)', () => {
     const dir = dirOf();
     const bad = fake(red, { failRerun: true });
-    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: bad.exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, error: expect.stringContaining('boom') });
-    const unreadable = rerunRedMainFailedJobs({ brokenSha: SHA, exec: () => { throw new Error('gh down'); }, dir, repoSlug: 'o/r' });
-    expect(unreadable).toMatchObject({ rerun: false, error: expect.stringContaining('gh down') });
-    const ok = fake(red);
-    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: ok.exec, dir, repoSlug: 'o/r' }).rerun).toBe(true);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: bad.exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, error: expect.stringContaining('gh run rerun 42 --failed') });
+    const again = fake(red);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: again.exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, reason: 'already-rerun' });
+    expect(reruns(again.calls)).toHaveLength(0);
+  });
+  it('an unreadable run list is reported, never thrown, and leaves no claim (a later add may still rerun)', () => {
+    const dir = dirOf();
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: () => { throw new Error('gh down'); }, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, error: expect.stringContaining('gh down') });
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: fake(red).exec, dir, repoSlug: 'o/r' }).rerun).toBe(true);
+  });
+  it('a short and a full spelling of the same sha share one claim (keyed by the resolved run sha)', () => {
+    const dir = dirOf();
+    const { exec, calls } = fake(red);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA.slice(0, 7), exec, dir, repoSlug: 'o/r' }).rerun).toBe(true);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, reason: 'already-rerun' });
+    expect(reruns(calls)).toHaveLength(1);
+  });
+  it('an exclusive-create failure that is not "already claimed" fails closed (claim path is a directory)', () => {
+    const dir = dirOf();
+    mkdirSync(join(dir, `red-main-quarantine-rerun-${SHA}.json`));
+    const { exec, calls } = fake(red);
+    const r = rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' });
+    expect(r.rerun).toBe(false);
+    expect(reruns(calls)).toHaveLength(0);
   });
   it('a missing broken sha reruns nothing', () => {
     const { exec, calls } = fake(red);

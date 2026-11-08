@@ -19,7 +19,7 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync, realpathSync, writeFileSync, unlinkSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -573,7 +573,7 @@ export const RERUN_MARKER_PREFIX = 'red-main-quarantine-rerun-';
  * broken sha: the claim is a per-sha marker file created exclusively BEFORE the request, so concurrent adds cannot both
  * rerun, and an unwritable claim means no rerun (fail closed). Only when the latest main CI run for that sha is
  * completed+failed. It never touches the freeze itself: a rerun that still fails leaves the freeze in place. Never
- * throws; a failure is reported (`error`) and the claim released, so the next add retries.
+ * throws; a failed request is reported (`error`, with the manual fallback command) and the claim kept: at most one request per sha.
  * @returns {{rerun:boolean, runId?:number, reason?:string, error?:string}}
  */
 export function rerunRedMainFailedJobs({ brokenSha, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug, dir = join(tmpdir(), 'we-red-main-quarantine') } = {}) {
@@ -588,7 +588,7 @@ export function rerunRedMainFailedJobs({ brokenSha, exec = execFileSyncThrottled
     if (latest.status !== 'completed' || latest.conclusion !== 'failure') return { rerun: false, reason: 'latest-run-not-failed', runId: latest.databaseId };
     try {
       mkdirSync(dir, { recursive: true });
-      marker = join(dir, `${RERUN_MARKER_PREFIX}${brokenSha.toLowerCase().slice(0, 40)}.json`);
+      marker = join(dir, `${RERUN_MARKER_PREFIX}${latest.headSha.toLowerCase()}.json`);
       writeFileSync(marker, JSON.stringify({ runId: latest.databaseId, at: new Date().toISOString() }), { flag: 'wx' });
     } catch (e) {
       const taken = marker && e?.code === 'EEXIST';
@@ -598,8 +598,9 @@ export function rerunRedMainFailedJobs({ brokenSha, exec = execFileSyncThrottled
     try {
       exec('gh', ['run', 'rerun', String(latest.databaseId), '--repo', repoSlug, '--failed'], opts);
     } catch (e) {
-      try { unlinkSync(marker); } catch { /* the marker stays: at worst one rerun is skipped, never repeated */ }
-      throw e;
+      // The claim STAYS: at most one request per sha, so a failing gh can never turn into a storm (a lost response may
+      // even have been accepted). The operator-visible fallback is the manual command named in the error.
+      return { rerun: false, runId: latest.databaseId, error: `${String(e?.message || e).split('\n')[0]} (claim kept; rerun by hand: gh run rerun ${latest.databaseId} --failed)` };
     }
     return { rerun: true, runId: latest.databaseId };
   } catch (e) {
