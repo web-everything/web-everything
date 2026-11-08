@@ -79,6 +79,13 @@ describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
     expect(rerun).toHaveBeenCalledWith({ brokenSha: SHA, dir: '/claims' });
     expect(out).toMatchObject({ ok: true, rerun: { rerun: true, runId: 42 } });
   });
+  it('an uppercase --broken-sha reaches the list write and the rerun lowercased (one spelling end to end)', () => {
+    const rerun = vi.fn(() => ({ rerun: false }));
+    let message = '';
+    runAddCommand({ ...flags, 'broken-sha': SHA.toUpperCase() }, { write: (w) => { message = w.message; return { ok: true }; }, rerun });
+    expect(rerun).toHaveBeenCalledWith({ brokenSha: SHA });
+    expect(message).toContain(`broken ${SHA.slice(0, 9)},`);
+  });
   it('without --dir the rerun gets no dir (its default applies)', () => {
     const rerun = vi.fn(() => ({ rerun: false, reason: 'already-rerun' }));
     runAddCommand(flags, { write: () => ({ ok: true }), rerun });

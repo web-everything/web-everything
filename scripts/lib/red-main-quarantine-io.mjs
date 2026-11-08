@@ -634,11 +634,14 @@ export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = fal
 export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChange, rerun = rerunRedMainFailedJobs } = {}) {
   const tests = String(f.tests ?? '').split(',').filter(Boolean);
   const ttlMs = f['ttl-min'] ? Number(f['ttl-min']) * 60_000 : undefined;
+  // One spelling end to end: the list validator is lowercase-only and git/GitHub shas are lowercase, so an uppercase
+  // --broken-sha is normalized here, before it reaches either the list write or the run match.
+  const brokenSha = typeof f['broken-sha'] === 'string' ? f['broken-sha'].toLowerCase() : f['broken-sha'];
   const out = write({
-    actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(f['broken-sha']).slice(0, 9)}, by ${f.actor})`,
-    change: (cur) => addEntries(cur, { tests, brokenSha: f['broken-sha'], owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
+    actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(brokenSha).slice(0, 9)}, by ${f.actor})`,
+    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
   });
-  const result = out?.ok === false ? undefined : rerun({ brokenSha: f['broken-sha'], ...(f.dir ? { dir: f.dir } : {}) });
+  const result = out?.ok === false ? undefined : rerun({ brokenSha, ...(f.dir ? { dir: f.dir } : {}) });
   return result ? { ...out, rerun: result } : out;
 }
 
