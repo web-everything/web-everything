@@ -1,3 +1,4 @@
+import { redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -59,7 +60,7 @@ import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-pro
 import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // The `advisory:accepted` / `advisory:changes` label the `advise` step's SECOND effect applies — the pure plan
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
-import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
+import { ADVISORY_OUTCOMES, ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { ledgerFindingKey, REFERRAL_RETIRED_CHANNEL } from '../lib/pr-state/referrals.mjs';
@@ -946,6 +947,7 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  postRedTeamCheckRun = defaultPostRedTeamCheckRun,
   sameGapJudge,
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
@@ -1036,6 +1038,14 @@ export function createReviewPrSinks({
         requiredChecks: ci?.requiredChecks, policy }))
       throw notApplied('review void: head moved or CI became red');
     await assertHead();
+  };
+  // Supersede any same-head success before acceptance can become visible. A failed publication is
+  // provably before acceptance writes, so leave the effect retryable on resume.
+  const postPendingRedTeam = async payload => {
+    const { repo, pr, reviewedHead: headSha } = payload;
+    const result = await postRedTeamCheckRun({ repo, pr, headSha,
+      payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'in_progress' }) });
+    if (result?.ok !== true) throw notApplied(`red-team pending check not posted: ${result?.reason ?? 'publication unconfirmed'}; retry/resume review`);
   };
   // Both publication steps must derive authority from a complete, pinned thread.
   const readReferralState = (repo, pr, head, { pinned = true } = {}) => {
@@ -1586,6 +1596,7 @@ export function createReviewPrSinks({
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
       await assertPublishable(payload);
+      if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
       // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
       // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
@@ -1777,6 +1788,7 @@ export function createReviewPrSinks({
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
       await assertPublishable(payload);
+      if (payload.redTeamOwed) await postPendingRedTeam(payload);
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
@@ -1802,6 +1814,7 @@ export function createReviewPrSinks({
     // reuses it directly rather than re-implementing a `gh pr comment` invocation a third time.
     [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload) => {
       await assertPublishable(payload);
+      if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed) await postPendingRedTeam(payload);
       postComment(payload.repo, payload.pr, String(payload.body));
       return { posted: true };
     },
@@ -1823,6 +1836,8 @@ export function createReviewPrSinks({
       if (!advisoryCoversHead({ head: payload.reviewedHead }, state?.headRefOid)) {
         return { applied: false, reason: 'head-moved' };
       }
+      // Retain the barrier for saved runs resuming after an advisory note posted by an older version.
+      if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed) await postPendingRedTeam(payload);
       const plan = planAdvisoryLabels({ outcome: payload.outcome, currentLabels: labels });
       if (plan.reason) return { applied: false, reason: plan.reason };
       if (!plan.add && plan.remove.length === 0) return { applied: false, reason: 'already-current' };
