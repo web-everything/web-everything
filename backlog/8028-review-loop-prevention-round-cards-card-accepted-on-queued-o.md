@@ -3,6 +3,7 @@ bornAs: xyhht5l
 kind: story
 size: 5
 status: open
+related: ["4399"]
 scope: ["we:scripts/lib/prevention-landing-job.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/review-set-label.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/land-prevention-card.mjs"]
 dateOpened: "2026-11-07"
 tags: []

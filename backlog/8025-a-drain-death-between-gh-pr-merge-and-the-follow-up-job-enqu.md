@@ -3,6 +3,7 @@ bornAs: xm7zlp6
 kind: story
 size: 5
 status: open
+related: ["4124"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/lib/pr-merge-gate.mjs", "we:scripts/conveyor/orphan-claim-release.mjs"]
 dateOpened: "2026-11-07"
 tags: []
