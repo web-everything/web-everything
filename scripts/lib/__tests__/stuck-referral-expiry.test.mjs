@@ -249,6 +249,30 @@ describe('stuck referral expiry', () => {
     utimesSync(runPath(other.id, f.runsDir), (now - age) / 1000, (now - age) / 1000);
     expect(expireStuckReferralRuns({ ...f, setting: { referralRunExpiryMinutes: 45 } })).toEqual({ expired: true, otherBlockers: count });
   });
+  it('fails closed on an unfinished stageVerdict review with missing input.repo after expiry', () => {
+    const f = fixture();
+    const blocked = { ...newRunRecord({ id: 'review-pr-missing-repo', op: 'review-pr', input: { pr } }),
+      pending: { kind: 'confirm', step: 'stageVerdict', stepIndex: 9 } };
+    writeRun(blocked, f.runsDir);
+    expect(expireStuckReferralRuns({ ...f, setting: { referralRunExpiryMinutes: 45 } }))
+      .toEqual({ expired: true, otherBlockers: 1 });
+    expect(readRun(f.runId, f.runsDir).pending).toBeNull();
+  });
+  it.each([
+    ['missing PR', 'review-pr', { repo }, 1],
+    ['unreadable repo', 'review-pr', { repo: 42, pr }, 1],
+    ['unreadable PR', 'review-pr', { repo, pr: String(pr) }, 1],
+    ['unknown operation and identity', 'legacy-review', {}, 1],
+    ['known other repo with missing PR', 'review-pr', { repo: 'elsewhere/repo' }, 0],
+    ['known other PR with missing repo', 'review-pr', { pr: 2 }, 0],
+  ])('post-expiry identity scan: %s', (_name, op, input, otherBlockers) => {
+    const f = fixture();
+    const blocked = { ...newRunRecord({ id: 'review-identity', op, input }),
+      pending: { kind: 'confirm', step: 'stageVerdict', stepIndex: 9 } };
+    writeRun(blocked, f.runsDir);
+    expect(expireStuckReferralRuns({ ...f, setting: { referralRunExpiryMinutes: 45 } }))
+      .toEqual({ expired: true, otherBlockers });
+  });
   it('counts unreadable post-expiry evidence as a blocker', () => {
     const f = fixture(); let expired = false;
     const result = expireStuckReferralRuns({ ...f, setting: { referralRunExpiryMinutes: 45 },

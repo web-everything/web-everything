@@ -171,7 +171,14 @@ export function expireStuckReferralRuns({ repo, pr, head, setting, env = process
   let otherBlockers;
   try {
     otherBlockers = readRunRecords(options).filter(({ id, run, mtimeMs }) => {
-      if (expiredIds.has(id) || !matchesReview(run, { repo, pr, head: undefined })) return false;
+      if (expiredIds.has(id)) return false;
+      // Missing identity (even on an unrecognized operation) cannot clear the human hold.
+      // Exclude only records whose readable identity proves they concern another repo/PR.
+      const otherRepo = typeof run.input.repo === 'string' && run.input.repo.trim() !== ''
+        && run.input.repo !== repo;
+      const otherPr = typeof run.input.pr === 'number' && Number.isFinite(run.input.pr)
+        && run.input.pr !== Number(pr);
+      if (otherRepo || otherPr) return false;
       const abandoned = run.verdict == null && run.resumeOf == null && isRunRecordTerminal(run)
         && now - mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
       return !abandoned && (run.verdict == null || run.pending != null
