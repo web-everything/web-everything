@@ -63,6 +63,7 @@ import {
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../../scripts/lib/github-app-auth-env.mjs';
+import { withPrEvents, ROLE_RELEVANCE } from '../../scripts/lib/pr-events.mjs';
 import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
 import { StringDecoder } from 'node:string_decoder';
 import { notifyDesktopChecked } from '../../scripts/conveyor/branch-sync.mjs';
@@ -233,6 +234,34 @@ export function alertConsecutiveFailures(passName, count, detail, { notify = not
 }
 
 export function realSleep(ms) { return new Promise((resolve) => { setTimeout(resolve, ms); }); }
+
+const NOT_GREEN = (c) => c != null && !['success', 'neutral', 'skipped'].includes(c);
+
+/** Pass-local event rules (R689), keyed by a manifest entry's `eventRole`. A role not listed here falls back to
+ *  the shared `ROLE_RELEVANCE` table (merge-orphan declares `drain`); an unknown role fails closed to the timer. */
+export const PASS_EVENT_RULES = Object.freeze({
+  'pr-merge-watch': (e) => e.type === 'pull_request' && e.action === 'closed' && e.merged === true,
+  'ci-red-recovery': (e) => (e.type === 'check_suite' || e.type === 'check_run') && NOT_GREEN(e.conclusion),
+  'advisory-label-sweep': (e) => e.type === 'pull_request' && e.action === 'synchronize',
+});
+
+/** The between-run wait for a pass (R689): a plain timer unless its manifest entry declares an `eventRole`,
+ *  then an event waker (the shared debounce, health fallback and timer backstop). The waker never stretches the
+ *  pass's interval (`healthyIntervalMs` = the interval), and its status file is keyed by the PASS name. */
+export function passSleepFor(passName, entry, { env = process.env, log = console, ...overrides } = {}) {
+  const role = entry?.eventRole;
+  if (!role) return realSleep;
+  const rule = PASS_EVENT_RULES[role] ?? ROLE_RELEVANCE[role];
+  if (typeof rule !== 'function') {
+    log.error(`pass-daemon: "${passName}" declares unknown eventRole "${role}" - keeping the plain timer`);
+    return realSleep;
+  }
+  const repoArg = (entry.args ?? []).find((a) => typeof a === 'string' && a.startsWith('--repo='));
+  const repos = repoArg ? [repoArg.slice('--repo='.length)] : null;
+  return withPrEvents({ sleep: realSleep }, {
+    role: passName, rule, repos, env, log, healthyIntervalMs: entry.intervalMs, ...overrides,
+  }).sleep;
+}
 
 /** #5129 — an older clone may not yet register a launchd job's pass. Stay resident before acquiring a
  *  lease or spawning anything; exiting would make KeepAlive crash-loop. The imported manifest is static:
@@ -669,7 +698,7 @@ async function main(argv) {
   console.error(`pass-daemon: started "${passName}" (${entry.script}) on interval ${intervalMs}ms, heartbeat every ${heartbeatIntervalMs}ms.`);
   const { stoppedReason } = await runPassDaemonLoop({
     runPass: () => (activePass = runPassSelfSynced()),
-    sleep: realSleep,
+    sleep: passSleepFor(passName, { ...entry, intervalMs }),
     isAlive: () => alive,
     intervalMs, tickWhileRunning: true,
     failureAlertAfter,

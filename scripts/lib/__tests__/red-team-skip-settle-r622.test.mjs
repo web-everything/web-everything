@@ -410,6 +410,36 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
   });
 });
 
+describe('R622 abandoned startable crashes after the result comment', () => {
+  const HOUR = 3600e3, now = T + 24 * HOUR;
+  it.each([
+    { name: 'quiet verdictless terminal crash settles without a head', extra: {}, mtime: T + 12 * HOUR, ok: true },
+    { name: 'crash quiet for less than the horizon stays held', extra: {}, mtime: now - HOUR + 1, ok: false },
+    { name: 'crash with a pending step stays held', extra: { pending: { kind: 'confirm' } }, ok: false },
+    { name: 'crash with resumeOf stays held', extra: { resumeOf: 'review-pr-original' }, ok: false },
+    { name: 'crash with resumedAt stays held', extra: { resumedAt: new Date(T + 11 * HOUR).toISOString() }, ok: false },
+    { name: 'crash with an open pending effect stays held', extra: { effects: [{ status: 'pending' }] }, ok: false },
+    { name: 'changes verdict after the comment stays held', extra: { verdict: 'changes' }, ok: false },
+    { name: 'needs-human after the comment stays held', extra: { verdict: 'needs-human' }, ok: false },
+  ])('$name', ({ extra, mtime = T + 12 * HOUR, ok }) => {
+    // The bounded scan sees only decoys; the complete read must classify the later, head-less crash.
+    const runs = {
+      'review-pr-decoy1': { mtime: now - 60e3, run: { op: 'review-pr', input: { repo: 'o/r', pr: pr + 1 } } },
+      'review-pr-decoy2': { mtime: now - 120e3, run: { op: 'review-pr', input: { repo: 'o/r', pr: pr + 1 } } },
+      'review-pr-crash': { mtime, run: { op: 'review-pr', input: { repo: 'o/r', pr }, pending: null, effects: [],
+        stepTimings: [{ step: 'read', startedAt: new Date(T + 10 * HOUR).toISOString() }], ...extra } },
+    };
+    const evidence = readDrainRedTeamEvidence({ repo: 'o/r', pr, head, now, runsDir: '/runs',
+      env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' }, warn: () => {}, readScorecards: () => [],
+      scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, platform: {}, env: {} },
+      list: () => Object.keys(runs), read: id => runs[id].run,
+      stat: path => ({ mtimeMs: runs[path.split('/').pop().replace('.json', '')].mtime }) });
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(evidence.settleBounds.completeHeadRead({ pr, head, at: T })).toEqual({ complete: true, blocked: !ok });
+    expect(settleUnknownEvidenceByComment(evidence, [comment()], pr, head)).toMatchObject({ ok });
+  });
+});
+
 describe('R622 review follow-ups: decided-run guard, liveness, id universe, cache size key, complete-read failures', () => {
   const HOUR = 3600e3;
   const rec = ({ rev = head, startedAt = T - 7200e3, ...extra } = {}) => ({ op: 'review-pr', input: { repo: 'o/r', pr },
