@@ -535,7 +535,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
     let live = false;
     if (['queued', 'running'].includes(status.status)) {
-      if (foreignHostDead(status, { host, statusAt, now, env })) live = false;
+      // The host name can change under a still-running job (rename mid-run), so a foreign record is dead only when it is
+      // stale AND its pid is not alive here with the recorded birth time. A cross-namespace record is never probed.
+      const localPidLive = () => isAlive(status.pid) && (!status.pidStart || (readPidStart(status.pid) ?? status.pidStart) === status.pidStart);
+      if (foreignHostDead(status, { host, statusAt, now, env }) && (status.pidNamespace == null || status.pidNamespace === namespace) && !localPidLive()) live = false;
       else if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
       else if (isAlive(status.pid)) {
         const start = status.pidStart ? readPidStart(status.pid) : null;
