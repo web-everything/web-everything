@@ -15,3 +15,13 @@ export function foreignHostDead(status, { host, statusAt, now = Date.now(), env 
   if (!Number.isFinite(statusAt) || statusAt <= 0 || !Number.isFinite(now)) return false;
   return now - statusAt > foreignHostStaleMs(env);
 }
+
+// The one stale-owner decision, shared by the evidence reader and the recovery planner so they cannot disagree. A foreign
+// record is dead only when it is stale, in this pid namespace (or one that was never recorded), and its pid is not alive
+// here with the recorded birth time. An unreadable birth time keeps the pid live (unknown is never a kill).
+export function foreignStaleOwnerDead(status, { host, namespace, statusAt, now = Date.now(), env = process.env, isAlive, readPidStart } = {}) {
+  if (!foreignHostDead(status, { host, statusAt, now, env })) return false;
+  if (status.pidNamespace != null && status.pidNamespace !== namespace) return false;
+  const localPidLive = isAlive(status.pid) && (!status.pidStart || (readPidStart(status.pid) ?? status.pidStart) === status.pidStart);
+  return !localPidLive;
+}

@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
@@ -43,7 +44,7 @@ const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWrite
   && typeof w.markers.redispatch?.abandonedAt === 'string';
 
 /** Pure decision on a raw witness. Probes and time are supplied by the caller. */
-export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
+export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.env } = {}) {
   if (w?.ok === false) return { mode: 'skip', why: w.reason };
   const raw = w.rawWriter.parsed;
   let executionPrior = raw;
@@ -68,6 +69,13 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
           dead = true;
         }
       } catch { /* Unprobeable owners use the explicit age deadline. */ }
+    }
+    if (!dead) {
+      // A host rename after a crash leaves a record no local pid probe can settle: apply the same stale-record rule the
+      // evidence reader uses, so recovery and the reader never disagree. An unprobeable owner stays held.
+      try {
+        dead = foreignStaleOwnerDead(raw, { host: probe.host, namespace: probe.namespace, statusAt: w.statusAt, now, env, isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) });
+      } catch { dead = false; }
     }
     if (!dead) {
       const stamp = raw.pidStart;
@@ -110,7 +118,7 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
   const path = join(redTeamStatusDir(key.env), `${encodeURIComponent(key.repo)}-${Number(key.pr)}-${key.head}.json`);
   try {
     return withRedTeamStatusClaim(path, () => {
-      const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs });
+      const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs, env: key.env });
       if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
       if (!p.abandon || p.mode === 'skip' || (w.markers.redispatch && !pendingAbandonment(w))) return { ok: false };
       const marker = `${path}.stale-redispatch-1`;
@@ -680,7 +688,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
       readEvidence, readStatus, readReviewRuns,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed,
-      recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } };
+      recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
     const escalateRow = row => {
       try {

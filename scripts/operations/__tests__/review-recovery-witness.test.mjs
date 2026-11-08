@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, utimesSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
@@ -624,4 +624,37 @@ it.each(['stale-recovery', 'failed-seat-retry'].flatMap(kind => [false, true].ma
     recoveryOptions: { now: Date.now(), probe: f.probe, deadlineMs: 1000 } });
   expect(next[0].action).toBe(superseded ? 'skip' : 'dispatch');
   if (!superseded) expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+});
+
+// A host rename after a crash leaves a record no local pid probe can settle. Recovery applies the same stale-record rule the
+// evidence reader uses; before this it returned 'owner live or age unknown' forever for a record with no birth time.
+describe('stale record owned by a foreign host name', () => {
+  const stale = (f, { ageMs = 3 * 3_600_000, ...patch } = {}) => {
+    writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, pidNamespace: null, pidStart: null, ...patch }));
+    const at = new Date(Date.now() - ageMs);
+    utimesSync(f.path, at, at);
+    return recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env });
+  };
+  it('recovers a stale foreign-host record with no birth time once its pid is gone', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f)).toMatchObject({ mode: 'fresh', abandon: true });
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+  });
+  it('holds a fresh foreign-host record', () => {
+    expect(stale(fixture({ foreign: true }), { ageMs: 60_000 })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('holds a stale foreign-host record whose pid is alive here', () => {
+    const f = fixture({ foreign: true });
+    f.probe.isAlive = () => true;
+    expect(stale(f)).toMatchObject({ mode: 'skip' });
+  });
+  it('holds a stale foreign-host record from a different pid namespace', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f, { pidNamespace: 'pid:[other-namespace]' })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('holds a stale foreign-host record when the pid probe throws', () => {
+    const f = fixture({ foreign: true });
+    f.probe.isAlive = () => { throw Error('probe failed'); };
+    expect(stale(f)).toMatchObject({ mode: 'skip' });
+  });
 });
