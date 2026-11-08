@@ -819,7 +819,7 @@ describe('swapNodeModules — pnpm links survive the change of depth (real cp, n
       mkdirSync(decoy, { recursive: true });
       writeFileSync(join(decoy, 'decoy.txt'), 'decoy');
       rebaseNodeModulesLinks({ from: join(source, 'node_modules'), copy: dest, final: dest });
-      intact(f);
+      intact({ ...f, source });
       expect(lstatSync(dest).isSymbolicLink()).toBe(false);
       expect(existsSync(join(dest, 'decoy.txt'))).toBe(false);
       expect(readFileSync(join(dest, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
