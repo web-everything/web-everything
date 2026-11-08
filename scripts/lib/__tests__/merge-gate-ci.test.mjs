@@ -54,6 +54,13 @@ const codeql = [{ name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', co
 const manifestBody = `${MANIFEST_BODY_BEGIN}\n${JSON.stringify({ item: '123', blockedBy: ['9'], dismissedFindings: 2 })}\n${MANIFEST_BODY_END}`;
 
 describe('red-team check run merge gate', () => {
+  it.each(['both', 'check-run', 'drain-scan'])('applies the check-run gate according to mode %s', source => {
+    const result = evaluatePrGates(facts({ redTeamGateSource: source,
+      redTeamCheck: { ok: false, reason: 'no red-team check run on head' } }));
+    expect(result.results.find(gate => gate.id === 'red-team')).toMatchObject(source === 'drain-scan'
+      ? { status: 'pass', reason: 'redTeamGate.source=drain-scan' } : { status: 'hold' });
+    expect(result.ok).toBe(source === 'drain-scan');
+  });
   it('passes a successful red-team fact on the PR leg', () => {
     check(facts(), 'red-team', 'pass', true, { mergeEvent: 'pull_request' });
   });

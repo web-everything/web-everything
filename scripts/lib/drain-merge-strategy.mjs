@@ -1,3 +1,5 @@
+import { createGhProvider } from './review-label-provider.mjs';
+import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 /**
  * @file scripts/lib/drain-merge-strategy.mjs
  * @description Card xtpxusq — the drain's side of the merge-delivery strategy (`./merge-delivery-policy.mjs`).
@@ -36,9 +38,15 @@ import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { labelSignature } from './drain-prestage.mjs';
-import { readDrainQueueSafety, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
-import { readRedTeamPublicationHold } from './drain-red-team-evidence.mjs';
+import { readRedTeamGateSource, readRedTeamCheckFact } from './red-team-check-run.mjs';
+import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
+import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { isUnderTest } from './under-test.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -187,14 +195,14 @@ const isEntry = (p) => !!p && typeof p === 'object' && p.num != null;
 export function readQueueState(path, readFile = readFileSync) {
   try {
     const s = JSON.parse(readFile(path, 'utf8'));
-    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], ...(s?.enqueueFailures ? { enqueueFailures: s.enqueueFailures } : {}), ...(s?.redTeamPending ? { redTeamPending: s.redTeamPending } : {}), followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
+    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], ...(s?.enqueueFailures ? { enqueueFailures: s.enqueueFailures } : {}), ...(s?.redTeamRequestAttempts ? { redTeamRequestAttempts: s.redTeamRequestAttempts } : {}), ...(s?.redTeamCheckRecovery ? { redTeamCheckRecovery: s.redTeamCheckRecovery } : {}), ...(s?.redTeamPending ? { redTeamPending: s.redTeamPending } : {}), followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
   } catch (e) { return { pending: [], followedUp: [], exists: false, unreadable: e?.code !== 'ENOENT' }; }
 }
 
 function writeQueueState(path, state) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify({ ...(state.enqueueFailures ? { enqueueFailures: state.enqueueFailures } : {}), ...(state.redTeamPending ? { redTeamPending: state.redTeamPending } : {}), pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
+  writeFileSync(tmp, `${JSON.stringify({ ...(state.enqueueFailures ? { enqueueFailures: state.enqueueFailures } : {}), ...(state.redTeamRequestAttempts ? { redTeamRequestAttempts: state.redTeamRequestAttempts } : {}), ...(state.redTeamCheckRecovery ? { redTeamCheckRecovery: state.redTeamCheckRecovery } : {}), ...(state.redTeamPending ? { redTeamPending: state.redTeamPending } : {}), pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
   renameSync(tmp, path);
 }
 
@@ -216,7 +224,7 @@ export function createDrainMergeStrategy({
   readFile = readFileSync, writeFile, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
-  env = process.env, queueSafety,
+  env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readRedTeamCheck = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   // The located primary checkout, if any. A corrupt `cwd` self-heals only when it is a different clone (never the
   // primary itself); unknown (null) never heals.
@@ -231,13 +239,17 @@ export function createDrainMergeStrategy({
     return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug,
       files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: isMainFix(c) === true });
   },
+  readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
+  redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
+  publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
 } = {}) {
   const { policy, note } = resolved;
-  const say = (line) => { if (!quiet) log.write(`${line}\n`); };
-  const publicationHold = (c, head) => {
-    const reason = readRedTeamPublicationHold({ repo: slugOf(c.repo), pr: c.num, head, env });
-    return reason ? { enqueued: false, deferred: true, kind: 'red-team-pending', reason } : null;
+  // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.
+  const grantScopeFor = (c, headSha, comments) => {
+    try { return readGrantScope({ repo: slugOf(c.repo), pr: { number: c.num, headRefOid: headSha, comments } }) ?? null; } catch { return null; }
   };
+  const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
+  const say = (line) => { if (!quiet) log.write(`${line}\n`); };
   /**
    * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by
    * another drain process that landed since this pass first read it is kept), apply `fn`, write. A refused lock
@@ -248,7 +260,7 @@ export function createDrainMergeStrategy({
     const lock = withLock(() => {
       const st = readQueueState(statePath, readFile);
       if (st.unreadable) { unreadable = true; return false; }
-      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp, ...(st.enqueueFailures ? { enqueueFailures: st.enqueueFailures } : {}), ...(st.redTeamPending ? { redTeamPending: st.redTeamPending } : {}) }); return true;
+      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp, ...(st.enqueueFailures ? { enqueueFailures: st.enqueueFailures } : {}), ...(st.redTeamRequestAttempts ? { redTeamRequestAttempts: st.redTeamRequestAttempts } : {}), ...(st.redTeamCheckRecovery ? { redTeamCheckRecovery: st.redTeamCheckRecovery } : {}), ...(st.redTeamPending ? { redTeamPending: st.redTeamPending } : {}) }); return true;
     });
     if (lock?.ran === false) { say(`  ⚠ merge-queue follow-up state lock not acquired — ${what} not recorded this pass; retried next pass`); return false; }
     if (unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — ${what} not recorded (file left untouched); fix or remove it`); return false; }
@@ -263,7 +275,48 @@ export function createDrainMergeStrategy({
   };
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
+  const gateSource = readRedTeamGateSource({ env, log: line => log.write(`  ${line}\n`) });
+  const checkRunOnly = gateSource.value.source === 'check-run';
+  const publicationHold = (c, head) => checkRunOnly
+    ? readRedTeamPublicationHold({ repo: slugOf(c.repo), pr: c.num, head, env }) : null;
+  const checkRunAdmission = (c, head, before) => {
+    const unpublished = publicationHold(c, head);
+    const fact = readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), headSha: head })
+      : readRedTeamCheckFact({ repo: slugOf(c.repo), headSha: head, appId: env.WE_APP_ID,
+        gh: (args, options) => exec('gh', args, options) });
+    if (fact?.ok === true && !unpublished) return null;
+    const reason = unpublished || fact?.reason || 'red-team check unreadable';
+    const key = keyOf(c.repo, c.num);
+    before.redTeamCheckRecovery ??= {};
+    let wait = before.redTeamCheckRecovery[key];
+    if (wait?.headSha !== head) wait = before.redTeamCheckRecovery[key] = { headSha: head, firstPendingAt: now(),
+      attemptedHeads: { ...wait?.attemptedHeads, ...(wait?.attemptedAt != null ? { [wait.headSha]: wait.attemptedAt } : {}) } };
+    const recoverable = unpublished || /no red-team check run on head|in progress|incomplete/.test(reason);
+    if (recoverable && now() - wait.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000
+      && wait.attemptedAt == null && wait.attemptedHeads?.[head] == null && typeof requestRedTeam === 'function') {
+      wait.attemptedAt = now();
+      wait.attemptedHeads ??= {};
+      wait.attemptedHeads[head] = wait.attemptedAt;
+      writeState(statePath, before); // durable before the request: a restart cannot repeat it
+      try { requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head }); }
+      catch (error) { say(`red-team check recovery #${c.num}: ${firstLine(error)}`); }
+    } else writeState(statePath, before);
+    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason,
+      healthSmell: now() - wait.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000 };
+  };
   const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
+  const deadline = redTeamDeadline ?? readRedTeamDeadlineAction({ env, log: line => log.write(`  ${line}\n`) });
+  const deadlineAction = deadline.value?.deadlineAction ?? 'requeue-then-hold';
+  // The real operator feed is never written from a test run unless the test injects its own publisher.
+  const publishNote = publishNeedsYou ?? (isUnderTest(env) || isUnderTest(process.env) ? null : item => publishAttention(item));
+  const pendingOutcome = (c, pending, quiet = false) => {
+    const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
+    const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
+    if (healthSmell && !quiet) log.write(`  health smell: ${slugOf(c.repo)}#${c.num} red-team-pending on ${pending.headSha} for ${Math.floor((now() - pending.firstPendingAt) / 60_000)} min (redTeamPendingMaxMin=${maxMin}, ${safety.sources?.redTeamPendingMaxMin ?? 'standard'})\n`);
+    if (!quiet) say(`  merge-queue: defer #${c.num}: ${pending.reason}`);
+    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell,
+      ...(pending.deadlineHeldAt != null ? { deadlineHeld: true } : {}) };
+  };
   const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels,reviews'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
   const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
@@ -327,10 +380,8 @@ export function createDrainMergeStrategy({
       try {
         const live = readLive(c.repo, c.num);
         if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { allowed: false, reason: 'live state unreadable' };
-        const held = sendBackReason(live.labels);
+        const held = sendBackReason(live.labels) ?? (checkRunOnly ? publicationHold(c, headSha) : redTeamLabelHoldReason(live.labels));
         if (held) return { allowed: false, reason: held };
-        const unpublished = publicationHold(c, headSha);
-        if (unpublished) return { allowed: false, reason: unpublished.reason };
         const base = c.baseRefName || 'main';
         const pinned = readPinnedChangedFiles({ headSha, base, cwd, exec, withBaseSha: true });
         const surface = workflowEditHold({ files: pinned.files, expectedCount: pinned.files?.length });
@@ -340,7 +391,11 @@ export function createDrainMergeStrategy({
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();
-        return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
+        if (checkRunOnly || !safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
+        const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha, live.reviews);
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
+          standingRuling: grantScopeFor(c, headSha, pages.flat()) });
+        return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
     enqueue(c, headSha, { comments = null, prepared = null, sameHeadAdmission } = {}) {
@@ -367,10 +422,143 @@ export function createDrainMergeStrategy({
         removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
-      // Red-team verdicts are enforced by merge-gate from head-bound GitHub checks.
-      const unpublished = publicationHold(c, headSha);
-      if (unpublished) return unpublished;
-      // Retire persisted local wait state without reading local review evidence.
+      if (checkRunOnly) {
+        const hold = checkRunAdmission(c, headSha, before);
+        if (hold) return hold;
+      }
+      let admissionLabels = queueLabels(live.labels);
+      let deadlineOverride = false;
+      // Head-bound file preparation is reusable; authorization evidence is always live.
+      if (!checkRunOnly && safety.value.waitForRedTeamBeforeEnqueue) {
+        let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        const pending = before.redTeamPending?.[key];
+        // Migrate legacy current-head spend before replacing transient wait state.
+        if (pending?.requestAttemptedAt != null || pending?.requestedAt != null) {
+          before.redTeamRequestAttempts ??= {};
+          before.redTeamRequestAttempts[key] ??= {};
+          before.redTeamRequestAttempts[key][pending.headSha] ??= {
+            attemptedAt: pending.requestAttemptedAt ?? pending.requestedAt,
+            ...(pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}) };
+        }
+        const priorAttempt = before.redTeamRequestAttempts?.[key]?.[headSha];
+        const sameHead = pending?.headSha === headSha;
+        const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
+        const observation = createHash('sha256').update(JSON.stringify({ comments, reviews: live.reviews ?? [], scheduled: !!evidence.scheduled, inFlight: !!evidence.inFlight, queued: !!evidence.queued, recorded: !!evidence.recorded })).digest('hex');
+        const newComment = pending?.observation ? observation !== pending.observation
+          : Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
+        // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
+        if (!preparedAdmission && sameHead && pending.retryAt > now() && !newComment
+          && !(overdue && pending.reason.includes('no recorded result')
+            && (pending.checkedAt ?? pending.firstPendingAt) < pending.firstPendingAt + (safety.value.redTeamPendingMaxMin ?? 45) * 60_000)) {
+          log.write(`  merge-queue: #${c.num} red-team-pending backoff until ${new Date(pending.retryAt).toISOString()} (head and review/comment evidence unchanged)\n`);
+          return pendingOutcome(c, pending, true);
+        }
+        const pages = readThreadPages(c.repo, c.num);
+        if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
+        const standingRuling = grantScopeFor(c, headSha, pages.flat());
+        evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha, live.reviews);
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
+        try {
+          const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
+            live, comments: pages.flat(), provider: statusProvider, log: say };
+          const plan = syncRedTeamStatusLabels({ ...statusInput, dryRun: true });
+          const syncedLabels = admissionLabels.filter(label => !plan.remove.includes(label));
+          if (plan.add) syncedLabels.push(plan.add);
+          // Cleanup without a result must preserve the hold on GitHub, too: the next attempt (or a
+          // restarted drain) reads those labels afresh and must not mistake our cleanup for clearance.
+          const dropsPendingHold = admissionLabels.includes('red-team:pending')
+            && plan.remove.includes('red-team:pending')
+            && !syncedLabels.includes('red-team:clear') && !syncedLabels.includes('red-team:blocked');
+          if (!dropsPendingHold) {
+            const published = syncRedTeamStatusLabels({ ...statusInput, dryRun });
+            const publishedLabels = admissionLabels.filter(label => !published.remove.includes(label));
+            if (published.add) publishedLabels.push(published.add);
+            // Release pending in this call only after the clear result was successfully published.
+            if (publishedLabels.includes('red-team:clear')) admissionLabels = publishedLabels;
+          }
+        }
+        catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
+        if (reason) {
+          before.redTeamPending ??= {};
+          const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
+            retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
+            commentCount: pages.flat().length, observation, checkedAt: now(), reason,
+            ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}),
+            ...(sameHead && pending.requestAttemptedAt != null ? { requestAttemptedAt: pending.requestAttemptedAt } : {}),
+            ...(sameHead && pending.deadlineHeldAt != null ? { deadlineHeldAt: pending.deadlineHeldAt } : {}),
+            ...(sameHead && pending.notifiedAt != null ? { notifiedAt: pending.notifiedAt } : {}) };
+          if (priorAttempt) {
+            wait.requestAttemptedAt = priorAttempt.attemptedAt;
+            if (priorAttempt.requestedAt != null) wait.requestedAt = priorAttempt.requestedAt;
+          }
+          before.redTeamPending[key] = wait;
+          writeState(statePath, before);
+          const outcome = pendingOutcome(c, wait);
+          // Before the deadline, and for a confirmed break (its own send-back routing), the hold is the whole answer.
+          if (!outcome.healthSmell || reason.includes('requiring send-back')) return outcome;
+          // Past the deadline with NO red-team result on this exact head. The PR stays HELD: it may move only on a
+          // result for this head, a proven-identical carry of one, an operator ruling through the red-team ruling path
+          // (all read by redTeamEnqueueHold above), or a card-only diff that owes no pass. Never a timed bypass.
+          const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
+          const source = deadline.sources?.deadlineAction ?? 'standard';
+          // Unknown run evidence (`ok:false`, e.g. a capped scan) is never "missing": a run may exist past the cap, so
+          // it neither re-requests nor reaches the operator override; it holds below with its reason named.
+          const unknown = evidence.ok === false;
+          const missing = !unknown && !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          if (missing && deadlineAction === 'requeue-then-hold') {
+            // The one re-request for this head gets its own full wait before the operator is asked.
+            if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
+            // One attempt per head, recorded whether or not the hook accepts it: a refused or failing hook is never re-called.
+            if (wait.requestedAt == null && wait.requestAttemptedAt == null && typeof requestRedTeam === 'function') {
+              wait.requestAttemptedAt = now();
+              before.redTeamRequestAttempts ??= {};
+              before.redTeamRequestAttempts[key] ??= {};
+              const attempt = before.redTeamRequestAttempts[key][headSha] = { attemptedAt: wait.requestAttemptedAt };
+              writeState(statePath, before); // durable before the side effect: a crash mid-request never re-requests
+              let requested = false;
+              try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
+              catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+              if (requested) {
+                wait.requestedAt = now();
+                attempt.requestedAt = wait.requestedAt;
+                writeState(statePath, before);
+                log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch (redTeam.deadlineAction=${deadlineAction}, ${source})\n`);
+                return { ...outcome, redTeamRequested: true };
+              }
+            }
+          }
+          if (missing && deadlineAction === RED_TEAM_DEADLINE_OVERRIDE && deadline.operatorOverride?.by) {
+            // The only path to merge-without-result: the operator's own env, named, logged on every use.
+            deadlineOverride = true;
+            log.write(`  ⚠ OPERATOR OVERRIDE: enqueuing ${slugOf(c.repo)}#${c.num} on ${headSha} with NO red-team result after ${maxMin} min (redTeam.deadlineAction=${RED_TEAM_DEADLINE_OVERRIDE}, env, by ${deadline.operatorOverride.by})\n`);
+          } else {
+            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
+              : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
+              : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
+              : unknown ? `run evidence unknown (${evidence.reason})` : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
+            const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
+            if (wait.deadlineHeldAt == null) {
+              wait.deadlineHeldAt = now();
+              log.write(`  merge-queue: HOLD ${slugOf(c.repo)}#${c.num} on ${headSha}: ${heldReason}; redTeamPendingMaxMin=${maxMin} (${safety.sources?.redTeamPendingMaxMin ?? 'standard'}), redTeam.deadlineAction=${deadlineAction} (${source}); never enqueued without a result\n`);
+            }
+            if (wait.notifiedAt == null && publishNote) {
+              try {
+                publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha, kind: 'red-team-deadline-held', reason: heldReason,
+                  pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });
+                wait.notifiedAt = now();
+              } catch (e) { log.write(`  ⚠ red-team deadline note for #${c.num} not published (${firstLine(e)}) — PR stays held; retried at the next recheck\n`); }
+            }
+            writeState(statePath, before);
+            return { ...outcome, deadlineHeld: true, reason: heldReason };
+          }
+        }
+      }
+      // Let pending evidence reach its retry/deadline path above. A live hold label still refuses admission
+      // when no pass is owed or the wait setting is off; it never becomes a dequeue reason on its own.
+      // The named deadline override waives only pending, never a blocked label or a confirmed break.
+      const labelHold = checkRunOnly ? null : redTeamLabelHoldReason(deadlineOverride
+        ? admissionLabels.filter(label => label !== 'red-team:pending') : admissionLabels);
+      if (labelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: labelHold };
       if (before.redTeamPending?.[key]) {
         delete before.redTeamPending[key];
         writeState(statePath, before);
@@ -393,10 +581,15 @@ export function createDrainMergeStrategy({
         return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'final live head or labels do not match the judged state' };
       }
       const freshHeld = sendBackReason(fresh.labels);
+      const freshLabels = queueLabels(fresh.labels);
+      const freshLabelHold = checkRunOnly ? null : redTeamLabelHoldReason(deadlineOverride
+        ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
       if (freshHeld) {
         removeSentBack(c.repo, c.num, fresh.labels);
-        return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
+        // Blocked labels still get send-back cleanup, with the admission hold's pending outcome.
+        if (freshHeld !== freshLabelHold) return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
       }
+      if (freshLabelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: freshLabelHold };
       // Prepared file lists do not substitute for fresh Git evidence at identity admission.
       // A corrupt clone cache heals once and retries (logged); unreadable evidence holds the enqueue and never
       // reaches `comment`, so only a proven collision can label the PR.
@@ -425,8 +618,10 @@ export function createDrainMergeStrategy({
           return commented && labelled;
         } });
       if (poison) return poison;
-      const freshPublicationHold = publicationHold(c, headSha);
-      if (freshPublicationHold) return freshPublicationHold;
+      if (checkRunOnly) {
+        const unpublished = publicationHold(c, headSha);
+        if (unpublished) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: unpublished };
+      }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
         humanOnlyLicense: () => {
           const setting = resolveApprovalLicensesEnqueue({ env, readFile });

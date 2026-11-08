@@ -1,5 +1,22 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
 import { runGhSync } from './gh-throttle.mjs';
+import { readFileSync } from 'node:fs';
+import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
+
+/** Cutover defaults to both authorities; invalid overrides retain the lower layer. */
+export function readRedTeamGateSource({ env = process.env,
+  path = new URL('../settings/red-team.json', import.meta.url), tool, platform, log = () => {} } = {}) {
+  let file = {};
+  try { file = tool ?? JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  const pick = value => value?.source === undefined ? {} : { source: value.source };
+  const raw = env.WE_RED_TEAM_GATE_SOURCE;
+  const resolved = resolveCascade({ standard: { source: 'both' },
+    platform: pick(platform ?? platformPreference('redTeamGate', { env })), tool: pick(file.redTeamGate),
+    envValues: { source: raw === '' ? undefined : raw },
+    valid: value => ['both', 'check-run', 'drain-scan'].includes(value) });
+  log(formatCascadeSourcesLine('redTeamGate', resolved));
+  return resolved;
+}
 
 const ioOptions = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] };
 const validHead = head => typeof head === 'string' && /^[a-f0-9]{40}$/i.test(head);

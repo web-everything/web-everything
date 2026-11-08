@@ -1,6 +1,31 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { readRedTeamGateSource } from '../red-team-check-run.mjs';
+
+describe('redTeamGate.source cutover cascade', () => {
+  it.each(['both', 'check-run', 'drain-scan'])('accepts mode %s from the environment', source => {
+    expect(readRedTeamGateSource({ env: { WE_RED_TEAM_GATE_SOURCE: source }, tool: {}, platform: {} }))
+      .toMatchObject({ value: { source }, sources: { source: 'env' } });
+  });
+  it('defaults to both and logs an invalid override with its fallback reason', () => {
+    const lines = [];
+    expect(readRedTeamGateSource({ env: {}, tool: {}, platform: {} }))
+      .toMatchObject({ value: { source: 'both' }, sources: { source: 'standard' } });
+    expect(readRedTeamGateSource({ env: { WE_RED_TEAM_GATE_SOURCE: 'unsafe' }, tool: {}, platform: {}, log: line => lines.push(line) }))
+      .toMatchObject({ value: { source: 'both' }, sources: { source: 'standard' } });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/source="both".*standard.*ignored invalid.*unsafe/);
+  });
+  it('resolves platform then tool then env, ignoring invalid higher layers', () => {
+    const layers = { platform: { source: 'drain-scan' }, tool: { redTeamGate: { source: 'both' } } };
+    expect(readRedTeamGateSource({ ...layers, env: {} }).sources.source).toBe('tool');
+    expect(readRedTeamGateSource({ ...layers, env: { WE_RED_TEAM_GATE_SOURCE: 'check-run' } }).value.source).toBe('check-run');
+    expect(readRedTeamGateSource({ platform: layers.platform, tool: {}, env: {} }))
+      .toMatchObject({ value: { source: 'drain-scan' }, sources: { source: 'platform' } });
+    expect(readRedTeamGateSource({ ...layers, env: { WE_RED_TEAM_GATE_SOURCE: 'invalid' } }).sources.source).toBe('tool');
+  });
+});
 
 const HEAD = 'a'.repeat(40);
 const OLD_HEAD = 'b'.repeat(40);

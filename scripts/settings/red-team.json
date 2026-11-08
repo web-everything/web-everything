@@ -1,4 +1,7 @@
 {
+  "redTeamGate": {
+    "$comment": "source: both (standard default), check-run (cutover), or drain-scan (rollback). Resolves standard -> platform -> tool -> WE_RED_TEAM_GATE_SOURCE; invalid values are ignored and logged. Check-run recovery waits drain.redTeamPendingMaxMin, then requests once per live head through requestRedTeam, durable before dispatch."
+  },
   "redTeam": {
     "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
     "confirmedBreaks": {
