@@ -84,6 +84,13 @@ export function planFileItem(read, input) {
   return verdict;
 }
 
+function completeDuplicateSearch(search) {
+  return search && Array.isArray(search.backlog)
+    && (search.malformed === undefined || (Array.isArray(search.malformed) && search.malformed.length === 0))
+    && search.backlog.every(hit => hit && typeof hit.id === 'string' && hit.id.trim()
+      && Number.isFinite(hit.score) && hit.score >= 0 && hit.score <= 1);
+}
+
 /** Refuse incomplete search evidence before declaring either effect. */
 function admitDuplicates(read, input) {
   const related = input.relatedTo?.trim();
@@ -98,10 +105,7 @@ function admitDuplicates(read, input) {
     throw new Error('file-item: invalid duplicateThreshold; repair the operatorTask policy before filing');
   }
   const search = read.duplicateSearch;
-  const complete = search && Array.isArray(search.backlog)
-    && (search.malformed === undefined || (Array.isArray(search.malformed) && search.malformed.length === 0))
-    && search.backlog.every(hit => hit && typeof hit.id === 'string' && hit.id.trim()
-      && Number.isFinite(hit.score) && hit.score >= 0 && hit.score <= 1);
+  const complete = completeDuplicateSearch(search);
   if (!complete && !reason) {
     throw new Error('file-item: duplicate search unavailable or incomplete; manually check the backlog and use --not-duplicate-reason="..."');
   }
@@ -206,7 +210,19 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}
         let duplicateSearch;
         try {
           const search = searchDuplicates ?? raw.searchDuplicates;
-          duplicateSearch = search(`${view.input.title}\n${view.input.digest}`);
+          // Scores measure query-token coverage: a long body must never dilute an identical title.
+          // The title-only query remains the fallback when even the bounded lead differs completely.
+          const lead = view.input.digest.trim().split(/\r?\n[\t ]*\r?\n/, 1)[0].slice(0, 500);
+          const results = [view.input.title, `${view.input.title}\n${lead}`].map(query => search(query));
+          if (results.every(completeDuplicateSearch)) {
+            const best = new Map();
+            for (const result of results) {
+              for (const hit of result.backlog) {
+                if (!best.has(hit.id) || hit.score > best.get(hit.id).score) best.set(hit.id, hit);
+              }
+            }
+            duplicateSearch = { backlog: [...best.values()] };
+          }
         } catch { duplicateSearch = null; }
         return { duplicateSearch, ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
           originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };

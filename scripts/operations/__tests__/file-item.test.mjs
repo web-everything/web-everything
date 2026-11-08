@@ -13,7 +13,10 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import matter from 'gray-matter';
-import { classifyVerdict, EXACT_THRESHOLD, PARTIAL_THRESHOLD } from '../../capability-search.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { searchCapabilities, classifyVerdict, EXACT_THRESHOLD, PARTIAL_THRESHOLD } from '../../capability-search.mjs';
 import { NON_DISPATCHABLE_KINDS as QUEUE_NON_DISPATCHABLE_KINDS } from '../../conveyor/queue.mjs';
 
 import { advanceWhileRunning, startRun, runStatus } from '../engine.mjs';
@@ -135,7 +138,7 @@ describe('the declaration end to end', () => {
       expect(refusal.message).toContain('456');
       expect(refusal.message).toContain('--related-to=<id> --related-reason=...');
       expect(refusal.message).toContain('--not-duplicate-reason="..."');
-      expect(search).toHaveBeenCalledTimes(1);
+      expect(search).toHaveBeenCalledTimes(2);
     });
 
     it.each([PARTIAL_THRESHOLD, EXACT_THRESHOLD - 0.01])('files a partial backlog match at score %s below the default exact threshold', async (score) => {
@@ -143,15 +146,63 @@ describe('the declaration end to end', () => {
       await file(buildRegistry({}, () => hits([hit('123', score)])));
     });
 
-    it('searches the title and digest before the write sink runs', async () => {
+    it('searches the title alone and title plus digest lead separately before the write sink runs', () => {
       const search = vi.fn(() => hits());
       const registry = buildRegistry({}, search);
       const run = begin(registry);
-      expect(search).toHaveBeenCalledTimes(1);
-      const [query] = search.mock.calls[0];
-      expect(query).toContain(input.title);
-      expect(query).toContain(input.digest);
+      expect(search.mock.calls).toEqual([[input.title], [`${input.title}\n${input.digest}`]]);
       expect(runStatus(run, { registry })).toBe('awaiting-effect');
+    });
+
+    it.each(['\n\n', '\r\n \r\n'])('bounds the lead to 500 characters and excludes later paragraphs (%j)', (separator) => {
+      const search = vi.fn(() => hits());
+      const lead = 'Detailed context '.repeat(100);
+      begin(buildRegistry({}, search), { digest: `  ${lead}${separator}Later paragraph must not enter the query.` });
+      expect(search.mock.calls).toEqual([[input.title], [`${input.title}\n${lead.slice(0, 500)}`]]);
+    });
+
+    it('excludes later paragraphs even when the first paragraph is short', () => {
+      const search = vi.fn(() => hits());
+      begin(buildRegistry({}, search), { digest: '  Brief lead.\n\nDifferent later context.' });
+      expect(search.mock.calls).toEqual([[input.title], [`${input.title}\nBrief lead.`]]);
+    });
+
+    it.each([0, 1])('retains the maximum score for a card when query %s is the stronger match', (stronger) => {
+      const search = vi.fn()
+        .mockReturnValueOnce(hits([hit('123', stronger === 0 ? 1 : PARTIAL_THRESHOLD)]))
+        .mockReturnValueOnce(hits([hit('123', stronger === 1 ? 1 : PARTIAL_THRESHOLD)]));
+      expect(() => begin(buildRegistry({}, search))).toThrow(/possible duplicate backlog cards 123;/);
+      expect(search).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([0, 1])('fails closed when query %s has incomplete evidence despite the other being clear', (incomplete) => {
+      const results = [hits(), hits()];
+      results[incomplete] = { backlog: [], malformed: [{ file: 'unreadable.md' }] };
+      const search = vi.fn().mockReturnValueOnce(results[0]).mockReturnValueOnce(results[1]);
+      expect(() => begin(buildRegistry({}, search))).toThrow(/unavailable or incomplete/);
+    });
+
+    it('refuses an existing corpus card with the same title despite a long different multi-paragraph digest', () => {
+      const root = mkdtempSync(join(tmpdir(), 'file-item-corpus-'));
+      const backlogDir = root;
+      const title = 'Preserve queue reservations during worker recovery';
+      const digest = 'Investigate distributed scheduling fairness and capacity allocation across independent executors.\n\n'
+        + 'Telemetry dashboards aggregate latency histograms, memory pressure, throughput estimates, and resource saturation.\n\n'
+        + 'Document ownership transitions, cancellation semantics, administrative overrides, monitoring alerts, and incident timelines.';
+      try {
+        writeFileSync(join(backlogDir, '123-preserve-reservations.md'),
+          `---\nkind: task\nstatus: open\n---\n\n# ${title}\n\nKeep pending claims intact when a runner restarts.\n`);
+        const search = query => searchCapabilities(query, { root, backlogDir, limit: Number.MAX_SAFE_INTEGER });
+        // Pin the dilution that let the former full-body query admit this duplicate.
+        expect(search(`${title}\n${digest}`).backlog[0].score).toBeLessThan(EXACT_THRESHOLD);
+        const registry = buildRegistry({}, search);
+        const run = startRun({ op: FILE_ITEM_OP, id: 'real-corpus-duplicate',
+          input: { ...input, title, digest }, registry });
+        expect(() => advanceWhileRunning(run, { registry })).toThrow(/possible duplicate backlog cards #123/);
+        expect(run.effects).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
 
     it('files normally when only scripts and skills have exact hits', async () => {
