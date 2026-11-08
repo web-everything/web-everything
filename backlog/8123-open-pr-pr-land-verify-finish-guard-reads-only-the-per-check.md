@@ -1,15 +1,16 @@
 ---
+bornAs: x5iv71i
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/lib/card-group.mjs"]
+scope: ["we:scripts/pr-land.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/verify-lane.mjs", "we:scripts/lib/review-ci-gate-io.mjs", "we:scripts/conveyor/reconcile-pass.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# sourceLanded is path-keyed, so a grouped source that adds a hash-keyed card is read as 'not on main' once JIT…
+# open-pr/pr-land verify finish-guard reads only the per-checkout marker, though a sha-keyed green ledger exist…
 
-Flow-sim gap R7c-G2, class K12 (identity keyed by location, not content). Failing input: Two ready-to-merge + review:accepted card-only PRs, #A and #B, share an existing card file. #A also adds a new `we:backlog/x9k2m1p-new-card.md` (card-only diff, no `item`, not a couple), so form() accepts it (we:card-group.mjs:1002-1011). Group G with combined PR C. C merges. The drain's post-land numbering (we:scripts/lane-dra… Cited: we:scripts/lib/card-group.mjs:836-861, we:scripts/lib/card-group.mjs:336-364, we:scripts/lib/card-group.mjs:434-438, we:scripts/lib/card-group.mjs:171-184, we:scripts/lib/card-group.mjs:908-913. Soak-break sketch: Fixture: main with we:123-new-card.md (bornAs: x9k2m1p) and NO x9k2m1p-*.md; a source head that adds we:backlog/x9k2m1p-new-card.md with the same body. Action: sourceLanded({ref: main, source, referenceMap: readReferenceMap(main).map}). Assert (fails today): …
+Flow-sim gap R5a-G3, class K12 (identity keyed by location, not content). Failing input: Sha S verified green in lane-A (marker .lane-verify in lane-A's git dir; also a ledger record <coordinationRoot>we:verify-green/S.json, recorded by verify-lane for a clean default-gate green). A fixer or an open-pr caller runs in lane-B checked out at S (or a descendant whose lane-relevant set is unchanged).' 'open-pr / pr-land -… Cited: we:scripts/pr-land.mjs:967, we:scripts/pr-land.mjs:973, we:scripts/lib/lane-verify.mjs:221-225, we:scripts/lib/lane-verify.mjs:591-640, we:scripts/lib/lane-verify.mjs:194. Soak-break sketch: Fixture: temp coordination root with verify-green/<S>.json status green; lane clone B at S with no .lane-verify. Action: resolveFinishGuardVerdict (or pr-land --dry-run) from B. Assert: ok:true (ledger vouches for S). Fails today: status 'absent', refused.
 
 ## Acceptance
 

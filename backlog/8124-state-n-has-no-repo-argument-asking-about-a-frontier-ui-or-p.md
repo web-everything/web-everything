@@ -1,15 +1,16 @@
 ---
+bornAs: x6fe4wm
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/state.mjs", "we:scripts/lib/pr-state-io.mjs", "we:scripts/lib/pr-state-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Baseline cache keyed by cwd: manifest-tamper baseline is per checkout
+# /state N has no repo argument: asking about a Frontier UI or plateau-app PR number reads the web-everything P…
 
-Flow-sim gap D-C10, class K12 (identity keyed by location, not content). Failing input: PR with a manifest first sighted by a full pass in checkout X (baseline file we:X/.claude/skills/drain/review-baseline-state.json); PR body manifest then weakened; next sighting is a fast drain run from checkout Y (a different lane clone or daemon clone)' 'tamper happens between the two sightings Cited: we:scripts/merge-ai-prs.mjs:260, we:scripts/merge-ai-prs.mjs:6073, we:scripts/merge-ai-prs.mjs:6575. Soak-break sketch: none
+Flow-sim gap R8b-G4, class K12 (identity keyed by location, not content). Failing input: plateau-app PR #412 exists and is held; web-everything PR #412 also exists (or not).' 'Operator (or the /state skill) runs `node we:scripts/state.mjs 412`. Cited: we:scripts/lib/daemon-rebuild/state.mjs:33, we:scripts/lib/pr-state-io.mjs:85, we:scripts/lib/daemon-rebuild/state.mjs:35, we:scripts/lib/pr-state-core.mjs:44. Soak-break sketch: Fixture: gh stub answering only repos/web-everything/web-everything for PR 412 (state OPEN, label review:human). Action: main(['412']) - there is no way to pass a plateau-app repo. Assert a --repo (or repo-qualified arg) is accepted and the output names the r…
 
 ## Acceptance
 
