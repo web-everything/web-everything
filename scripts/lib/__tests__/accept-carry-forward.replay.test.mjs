@@ -366,7 +366,14 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   afterAll(() => { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } } });
 
   const BOT = { login: 'web-everything' };
-  const clearComment = () => ({ id: 'IC_human_clearance', author: { login: 'chalbert' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
+  // PR #6529 round 3: the clearance carries its own reviewed-diff fingerprint (the cleared commit's real net diff), so a
+  // carry the CLI makes is one the R706 reader accepts. `{ fingerprint: false }` is the diff-less plateau-app #217 shape.
+  let clearedFpMemo = null;
+  const clearedFp = () => clearedFpMemo ??= normalizeDiffFingerprint(readNetDiffAtHead({
+    exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } }),
+    headSha: heads.cleared, headRef: heads.cleared }).text);
+  const clearComment = ({ fingerprint = true } = {}) => ({ id: 'IC_human_clearance', author: { login: 'chalbert' },
+    body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n${fingerprint ? `${buildReviewedDiffMarker(clearedFp())}\n` : ''}<!-- cleared-human: chalbert -->` });
 
   // PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): the drain's mechanical park is its OWN label. Its presence
   // is the whole proof the hold is mechanical — no ledger row, no label timeline, no event count is read.
@@ -409,18 +416,38 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     return { exitCode, writes, reads, out: chunks.join('') };
   };
 
-  it('F1: a clearance proven by re-derived git diff still stamps cleared-human on the NEW head', () => {
-    const r = restamp({ comments: [clearComment()] });
-    expect(r.exitCode).toBe(0);
+  // PR #6529 round 3: the git re-derived proof (plateau-app #217) is wider than the R706 reader, which needs the clearing
+  // comment's own reviewed-diff fingerprint. A restamp the reader would not read as clearing the new head is refused
+  // BEFORE any write: across the drain's mechanical park the hold goes to the operator, never lifted onto a carrier the
+  // next tampering check would repark.
+  it('F1: a clearance proven only by re-derived git diff is not lifted onto an unreadable carrier — the hold goes to the operator', () => {
+    const r = restamp({ comments: [clearComment({ fingerprint: false })] });
+    expect(r.exitCode).toBe(1);
+    expect(r.out).toMatch(/would not be readable by the gate/);
+    expect(r.writes.setLabels.filter((s) => s.add === 'review:accepted')).toEqual([]);
     expect(r.writes.postComment).toHaveLength(1);
-    const body = r.writes.postComment[0];
-    expect(body).toContain(`reviewed-sha: ${heads.head}`);
-    expect(body).toContain('cleared-human: chalbert');
-    // The next hold check binds reviewed-sha and cleared-human to one comment: it must now name the NEW head.
-    // R706 - unproven automation clearance is refused: the cleared comment has no reviewed-diff fingerprint, so the
-    // carrier cannot prove an unchanged diff and readers keep the clearance on the old head (fail closed).
-    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.cleared);
-    expect(parseOperatorClearance([{ author: BOT, body }])).toEqual({ actor: 'chalbert' });
+    expect(r.writes.postComment[0]).toMatch(/mechanical hold handed to the operator/);
+    expect(r.writes.postComment[0]).not.toContain('cleared-human:');
+    expect(r.writes.setLabels.at(-1)).toEqual({ add: 'review:human', remove: [MECH] });
+    // Nothing the reader would trust was posted: the clearance still names the old head, honestly.
+    expect(parseLatestHumanClearedSha([clearComment({ fingerprint: false }), { author: BOT, body: r.writes.postComment[0] }])).toBe(heads.cleared);
+  });
+
+  it('F1 variant: a fingerprinted clearance with no citable source comment (no id) is refused; with its id it carries', () => {
+    const exec = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } });
+    const fp = normalizeDiffFingerprint(readNetDiffAtHead({ exec, headSha: heads.cleared, headRef: heads.cleared }).text);
+    const fingerprinted = (extra = {}) => ({ author: { login: 'chalbert' }, ...extra,
+      body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- reviewed-diff: ${fp} -->\n<!-- cleared-human: chalbert -->` });
+    // Positive control: the same clearance WITH a citable id is lifted, and the reader reads the carrier on the new head.
+    const ok = restamp({ comments: [fingerprinted({ id: 'IC_human_clearance' })] });
+    expect(ok.exitCode).toBe(0);
+    expect(parseLatestHumanClearedSha([fingerprinted({ id: 'IC_human_clearance' }), { author: BOT, body: ok.writes.postComment[0] }])).toBe(heads.head);
+    // Without the id the carrier cannot cite its source, so the reader would refuse it: nothing clearing is written.
+    const r = restamp({ comments: [fingerprinted()] });
+    expect(r.exitCode).toBe(1);
+    expect(r.out).toMatch(/would not be readable by the gate/);
+    expect(r.writes.setLabels.filter((s) => s.add === 'review:accepted')).toEqual([]);
+    expect(r.writes.postComment.every((b) => !b.includes('cleared-human:'))).toBe(true);
   });
 
   const NO_WRITES = { setLabels: [], postComment: [] };
@@ -466,14 +493,11 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(r.writes.setLabels.filter(s => s.add === 'review:accepted')).toEqual([]);
   });
 
-  it('F1 (plain restamp, no live hold): a diff-less clearance on a review:accepted PR still keeps cleared-human', () => {
-    const r = restamp({ comments: [clearComment()], labels: ['review:accepted'] });
-    expect(r.exitCode).toBe(0);
-    const body = r.writes.postComment[0];
-    expect(body).toContain(`reviewed-sha: ${heads.head}`);
-    expect(body).toContain('cleared-human: chalbert');
-    // R706 - unproven automation clearance is refused (diff-less source cannot prove an unchanged diff)
-    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.cleared);
+  it('F1 (plain restamp, no live hold): a diff-less clearance on a review:accepted PR is refused with nothing written', () => {
+    const r = restamp({ comments: [clearComment({ fingerprint: false })], labels: ['review:accepted'] });
+    expect(r.exitCode).toBe(1);
+    expect(r.out).toMatch(/would not be readable by the gate/);
+    expect(r.writes).toEqual({ setLabels: [], postComment: [] });
   });
 
   // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the PLAIN restamp's own clearance carry
@@ -569,7 +593,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   });
 
   // Crash between writes: a lift posts its record (cleared-human naming the LIVE head) and then its label swap fails.
-  const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->\n${buildClearedFromMarker(clearComment().id)}\n${buildReviewedDiffMarker('d'.repeat(64))}\n<!-- human-clearance-carried: from=${heads.cleared} to=${heads.head} diff=${'d'.repeat(64)} -->` });
+  const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->\n${buildClearedFromMarker(clearComment().id)}\n${buildReviewedDiffMarker(clearedFp())}\n<!-- human-clearance-carried: from=${heads.cleared} to=${heads.head} diff=${clearedFp()} -->` });
   it('ORPHANED LIFT: a clearance already naming the live head under the drain label is lifted (not handed off, not skipped)', () => {
     const r = restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] });
     expect(r.exitCode).toBe(0);

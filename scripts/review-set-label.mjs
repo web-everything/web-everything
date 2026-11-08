@@ -98,7 +98,7 @@ import {
 } from './lib/review-escalation.mjs';
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
-import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
@@ -1859,6 +1859,27 @@ export function runReviewLabelCli({
   // argv projection stays as belt-and-braces only because it can name the offending flag before any gh call.
   if (commentBody.length > GH_COMMENT_MAX) {
     fail(`the rendered comment is ${commentBody.length} chars, over GitHub's ${GH_COMMENT_MAX} limit — trim the body/--reason/--actor (nothing was changed)`);
+  }
+
+  // PR #6529 round 3 — THE READER AGREES BEFORE ANY WRITE. A restamp that carries the operator's clearance must leave a
+  // record the gate reader (`parseLatestHumanClearedSha`) reads as clearing THIS head. The writer's own proof can be
+  // wider than the reader's (a fingerprint re-derived from git for a clearing comment that has none, a carrier with no
+  // resolvable `cleared-from` source): posting it would lift the hold, and the reader would then still name the old head,
+  // so the next tampering check reparks. So the rendered comment is read back through the reader, as an automation
+  // carrier appended to the COMPLETE thread, before the ledger, the label or the comment is written. A disagreement is a
+  // decided refusal: across the drain's mechanical park the hold goes to the operator; a plain restamp writes nothing.
+  if (to === 'restamp' && humanClearance) {
+    const thread = readCarryEvidence().comments;
+    const selfCheck = { id: 'IC_restamp_reader_self_check', author: { login: AUTOMATION_LOGINS[0] ?? 'web-everything' }, body: commentBody };
+    const readerSha = Array.isArray(thread) ? parseLatestHumanClearedSha([...thread, selfCheck]) : null;
+    if (String(readerSha ?? '') !== String(headSha).toLowerCase()) {
+      const why = `the restamped clearance would not be readable by the gate (it reads the clearance on ${readerSha ? String(readerSha).slice(0, 9) : 'no head'}, not ${String(headSha).slice(0, 9)}): `
+        + 'the operator clearance has no reviewed-diff fingerprint or no citable source comment, so a carrier cannot prove it (R706)';
+      if (restampAcrossHold) handMechanicalHoldToOperator(why);
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason: why,
+        ...(restampAcrossHold && handOffRetryable ? { retryable: true } : {}) } }))}\n`);
+      process.exit(1);
+    }
   }
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────────────
