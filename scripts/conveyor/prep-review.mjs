@@ -268,6 +268,45 @@ export function buildPrepReviewResult({ deterministic, model }) {
 
 const markerLine = ({ head, round, blocked = false }) => `<!-- ${PREP_REVIEW_MARKER}: head=${head} round=${round}${blocked ? ' blocked=1' : ''} -->`;
 
+/** Structured verdicts require the exact lowercase full head; never stamp partial evidence. */
+export function prepVerdictMarker({ head, verdict }) {
+  if (typeof head !== 'string' || head.length !== 40 || !/^[0-9a-f]{40}$/.test(head)
+    || !['clean', 'findings'].includes(verdict)) return null;
+  return `<!-- prep-review-verdict head=${head} verdict=${verdict} v=1 -->`;
+}
+
+/** Newest trusted structured verdict in array order. Uncertain fences and conflicting markers fail closed. */
+export function latestPrepVerdict(comments, head) {
+  if (!Array.isArray(comments) || !prepVerdictMarker({ head, verdict: 'clean' })) return null;
+  let latest = null;
+  for (const comment of comments) {
+    if (!isTrustedMarkerAuthor(comment)) continue;
+    if (typeof comment?.body !== 'string') return null;
+    let fence = null, malformed = false;
+    const markers = new Set();
+    let verdict = null;
+    for (const line of comment.body.split(/\r?\n/)) {
+      const mentionsVerdict = /prep-review-verdict/i.test(line);
+      if (mentionsVerdict) {
+        const match = /^<!-- prep-review-verdict head=([0-9a-f]{40}) verdict=(clean|findings) v=1 -->$/.exec(line);
+        if (!match || fence) malformed = true;
+        if (match) {
+          markers.add(line);
+          if (match[1] === head) verdict = match[2];
+        }
+      }
+      const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (fence) {
+        if (delimiter && delimiter[1][0] === fence.ch && delimiter[1].length >= fence.len
+          && delimiter[2].trim() === '') fence = null;
+      } else if (delimiter) fence = { ch: delimiter[1][0], len: delimiter[1].length };
+    }
+    if (malformed || markers.size > 1 || (fence && /prep-review-verdict/i.test(comment.body))) latest = null;
+    else if (verdict !== null) latest = verdict;
+  }
+  return latest;
+}
+
 /** Prep-review rounds already recorded on this PR by a TRUSTED author: `[{head, round, blocked}]` (`blocked`: that round applied `review:changes`). */
 export function priorPrepReviews(comments) {
   const out = [];
@@ -338,7 +377,9 @@ export function planPrepReview({ mode, head, result, notChecked = [], modelNote 
   const removeLabels = staleBlockHold({ names, prior, head }) ? ['review:changes'] : [];
   if (sameHead) return addLabels.length || removeLabels.length ? { round, body: null, addLabels, removeLabels } : null; // label repair only
   const lines = [
-    markerLine({ head, round, blocked: addLabels.includes('review:changes') }), PREP_REVIEW_HEADLINE, '',
+    markerLine({ head, round, blocked: addLabels.includes('review:changes') }),
+    ...[prepVerdictMarker({ head, verdict: result.outcome === 'done' ? 'clean' : 'findings' })].filter(Boolean),
+    PREP_REVIEW_HEADLINE, '',
     `Mode: **${mode}**${mode === 'advise' ? ' (advice only; this never blocks the merge)' : round <= PREP_REVIEW_MAX_BLOCK_ROUNDS ? ' (one fix round for the preparer)' : ' (the one fix round is spent; advice only)'}. Round ${round}. Card head \`${head.slice(0, 12)}\`.`,
     '', `**Verdict: ${result.outcome === 'done' ? 'clean' : 'findings'}** - ${result.summary}`, '',
     ...(findings.length ? ['Findings:', ...findings.map((f) => `- **${f.ref}** - ${f.note}`), ''] : []),
