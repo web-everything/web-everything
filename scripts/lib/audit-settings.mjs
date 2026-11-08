@@ -147,7 +147,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // Landed on main since: the lane dependency installer (a no-clobber link create).
   'scripts/lib/lane-deps-installer.mjs',
   // Landed on main since: the fetch-only mirror sync (an exclusive create, a lock directory and a lock file name).
-  'scripts/lib/mirror-sync.mjs']);
+  'scripts/lib/mirror-sync.mjs',
+  // Landed on main since: the red-main quarantine rerun marker (an exclusive `wx` create).
+  'scripts/lib/red-main-quarantine-io.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
