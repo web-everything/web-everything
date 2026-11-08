@@ -110,11 +110,12 @@ import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-transcript-policy.mjs';
 import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
-import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
+import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
+  realpathSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
@@ -591,7 +592,9 @@ export function collectAndClearRolloutQuota({
  * directory exists (the installed dependencies are expected; a gitignored `.env`, `coverage/`, notes file is
  * not), HEAD is not `startSha`, a stash exists, or a local branch holds a commit that `startSha` does not
  * reach. No patch is written: the clone itself is the preserved artifact. Fails closed: if any of those reads
- * fails, the clone is kept. Synchronous, so a signal handler can call it.
+ * fails, the clone is kept. Every read runs with the shared lane git hardening (config pins such as
+ * `core.fsmonitor=false`, repository-location env scrubbed); a clone that defines a filter driver is kept; and
+ * `-C dir` must be the clone's own top level, else the clone is kept. Synchronous, so a signal handler can call it.
  *
  * Accepted gaps (recorded, not hidden): an annotated or lightweight TAG on a commit outside `startSha`'s history
  * is not checked, because the clone copies the source repo's tags and many of those legitimately sit off-history;
@@ -600,8 +603,17 @@ export function collectAndClearRolloutQuota({
  */
 export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmFn = rmSync } = {}) {
   const keep = (reason) => ({ removed: false, path: dir, reason });
-  const git = (...args) => String(execFn('git', ['-C', dir, ...args], { timeout: GIT_STEP_TIMEOUT_MS }));
+  // Codex can write this clone's git config and the CLI may inherit GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE: run every
+  // read with the shared lane pins (`core.fsmonitor=false` — a hook could otherwise run on the host or report "clean"),
+  // no replace refs, no optional index lock, and the repository-location env scrubbed so `-C dir` cannot inspect another repo.
+  const gitHardened = (args) => String(execFn('git', ['-C', dir, '--no-optional-locks', ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: GIT_STEP_TIMEOUT_MS }));
+  const git = (...args) => gitHardened(args);
   try {
+    // A filter driver would run on worktree content during `status`; refuse such a clone (kept, not deleted).
+    assertNoLaneFilterDrivers(gitHardened);
+    // `-C dir` must be the clone's own top level: with `.git` removed git would walk up and report on a parent repo.
+    if (realpathSync(git('rev-parse', '--show-toplevel').trim()) !== realpathSync(dir)) return keep('not the clone\'s own repository');
     // Two reads: `--untracked-files=all` lists every changed/untracked file; `--ignored=traditional` (with
     // `--untracked-files=normal`) lists ignored paths collapsed to their top directory, so `node_modules/`
     // stays one line instead of thousands.

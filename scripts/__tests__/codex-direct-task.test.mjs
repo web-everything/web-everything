@@ -3367,14 +3367,86 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
   });
 
   it('an unreadable HEAD keeps a clean clone (status succeeds, rev-parse fails)', () => {
+    const { dir, sha } = makeClone();
     const rm = vi.fn();
-    const execFn = (bin, args) => {
-      if (args.includes('rev-parse')) throw new Error('HEAD unreadable');
-      return '';
+    // Everything succeeds for real (top level, status, config) except resolving HEAD itself.
+    const execFn = (bin, args, opts) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) throw new Error('HEAD unreadable');
+      return execFileSync(bin, args, { ...opts, encoding: 'utf8' });
     };
-    const r = cleanupScratchClone({ dir: '/nonexistent/clone', startSha: 'x', execFn, rmFn: rm });
+    const r = cleanupScratchClone({ dir, startSha: sha, execFn, rmFn: rm });
     expect(r.removed).toBe(false);
+    expect(r.reason).toBe('status unreadable');
     expect(rm).not.toHaveBeenCalled();
+  });
+
+  describe('the cleanup reads are hardened against a clone Codex wrote to', () => {
+    it('a core.fsmonitor hook in the clone config never runs and the dirty clone is kept', () => {
+      const { root, dir, sha } = makeClone();
+      const marker = join(root, 'fsmonitor-ran');
+      const hook = join(root, 'hook.sh');
+      writeFileSync(hook, `#!/bin/sh\ntouch '${marker}'\nprintf '\\0'\n`, { mode: 0o755 });
+      git(dir, 'config', 'core.fsmonitor', hook);
+      writeFileSync(join(dir, 'a.txt'), 'edited\n');
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(() => statSync(marker)).toThrow();
+      expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('edited\n');
+    });
+
+    it('a filter driver in the clone config keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'config', 'filter.evil.clean', 'cat');
+      const rm = vi.fn();
+      const r = cleanupScratchClone({ dir, startSha: sha, rmFn: rm });
+      expect(r.removed).toBe(false);
+      expect(rm).not.toHaveBeenCalled();
+    });
+
+    it('an inherited GIT_DIR pointing at another repository cannot make the clone look clean', () => {
+      const { dir, sha } = makeClone();
+      const other = makeClone();
+      writeFileSync(join(dir, 'work.txt'), 'precious\n');
+      const prior = process.env.GIT_DIR;
+      process.env.GIT_DIR = join(other.dir, '.git');
+      try {
+        const r = cleanupScratchClone({ dir, startSha: sha });
+        expect(r.removed).toBe(false);
+        expect(readFileSync(join(dir, 'work.txt'), 'utf8')).toBe('precious\n');
+      } finally {
+        if (prior === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = prior;
+      }
+    });
+
+    it('a clone whose own .git is gone (git would walk up to a parent repo) is kept', () => {
+      const { dir: parent, sha } = makeClone();
+      const inner = join(parent, 'inner');
+      mkdirSync(inner);
+      writeFileSync(join(inner, 'work.txt'), 'precious\n');
+      const rm = vi.fn();
+      const r = cleanupScratchClone({ dir: inner, startSha: sha, rmFn: rm });
+      expect(r.removed).toBe(false);
+      expect(rm).not.toHaveBeenCalled();
+    });
+
+    it('every cleanup git call carries the lane pins and a scrubbed repository-location env', () => {
+      const { dir, sha } = makeClone();
+      const seen = [];
+      const execFn = (bin, args, opts) => { seen.push({ args, env: opts.env }); return execFileSync(bin, args, { ...opts, encoding: 'utf8' }); };
+      const prior = process.env.GIT_WORK_TREE;
+      process.env.GIT_WORK_TREE = '/elsewhere';
+      try {
+        expect(cleanupScratchClone({ dir, startSha: sha, execFn }).removed).toBe(true);
+      } finally {
+        if (prior === undefined) delete process.env.GIT_WORK_TREE; else process.env.GIT_WORK_TREE = prior;
+      }
+      expect(seen.length).toBeGreaterThan(5);
+      for (const { args, env } of seen) {
+        expect(args).toContain('core.fsmonitor=false');
+        expect(args).toContain('--no-optional-locks');
+        expect(env.GIT_WORK_TREE).toBeUndefined();
+      }
+    });
   });
 
   it('preserves untracked files when status.showUntrackedFiles is disabled', () => {
