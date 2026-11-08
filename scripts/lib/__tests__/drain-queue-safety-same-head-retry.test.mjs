@@ -96,7 +96,8 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     'quarantine entry expired', 'entry for another job', 'PR not CLEAN', 'list not in quarantine mode',
     'job bound to another commit', 'job name mismatch', 'summary counts an unlisted failing test',
     'aggregator shows an uncovered failure', 'truncated test name', 'aggregator log has no dependency failure',
-    'aggregator has an independent error', 'unhandled error alongside the listed failure'])('fails closed: %s', kind => fixture(f => {
+    'aggregator has an independent error', 'unhandled error alongside the listed failure',
+    'unit job has a later independent error', 'aggregator log is truncated'])('fails closed: %s', kind => fixture(f => {
     if (kind === 'quarantine list unreadable') f.list = { ok: false, error: 'offline' };
     if (kind === 'quarantine list throws') f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log,
       quarantine: { readList: () => { throw new Error('boom'); }, now: () => NOW } });
@@ -112,6 +113,8 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     if (kind === 'aggregator log has no dependency failure') f.logs[32] = '';
     if (kind === 'aggregator has an independent error') f.logs[32] = `${AGG}##[error]ReferenceError: x is not defined\n`;
     if (kind === 'unhandled error alongside the listed failure') f.logs[31] += ' Errors  1 error\n Unhandled Rejection\n';
+    if (kind === 'unit job has a later independent error') f.logs[31] = f.logs[31].replace('##[error]Process', '##[error]Artifact upload failed: permission denied\n##[error]Process');
+    if (kind === 'aggregator log is truncated') f.logs[32] = '##[error]Unit shards did not succeed.\n';
     if (kind === 'truncated test name') {
       const long = 'n'.repeat(200);
       f.list.list.entries = [entry(`${FILE}::${long.slice(0, 200)}`)];

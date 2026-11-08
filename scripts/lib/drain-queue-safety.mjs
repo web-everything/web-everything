@@ -345,10 +345,13 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
       if (isDerived) {
         // An aggregator must positively say a unit/coverage job failed, and nothing else.
         const errors = plain.split('\n').filter(l => l.startsWith('##[error]'));
-        if (failures.tests.length || !errors.some(l => /^##\[error\](?:Unit shards|Coverage merge) did not succeed/.test(l))
+        if (failures.tests.length || !errors.at(-1)?.startsWith('##[error]Process completed with exit code 1.') || !errors.some(l => /^##\[error\](?:Unit shards|Coverage merge) did not succeed/.test(l))
           || errors.some(l => !/^##\[error\](?:(?:Unit shards|Coverage merge) did not succeed[^\n]*|Process completed with exit code 1\.)$/.test(l))) return null;
         continue;
       }
+      // Test output may print `##[error]` text; after vitest's summary only the final exit-code line may follow.
+      const afterSummary = plain.slice(plain.search(/^\s*Test Files\s/m)).split('\n').filter(l => l.startsWith('##[error]'));
+      if (afterSummary.length !== 1 || !afterSummary[0].startsWith('##[error]Process completed with exit code 1.')) return null;
       if (failures.complete !== true || !summary || !/^##\[error\]Process completed with exit code 1\.\s*$/m.test(plain) || Number(summary[1]) !== names.size
         || failures.tests.some(t => t.name !== null && t.name.length >= 200)) return null;
       for (const { file, name } of failures.tests) {
