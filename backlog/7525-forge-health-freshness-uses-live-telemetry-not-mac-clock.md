@@ -2,9 +2,11 @@
 bornAs: xylvhc4
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/readiness/forge-remote-health.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: 0e2db5c66ff65990736417159725ea9cbe9d2266
 tags: []
 ---
 

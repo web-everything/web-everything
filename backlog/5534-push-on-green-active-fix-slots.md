@@ -40,3 +40,7 @@ Fixer audit 2026-10-08: ~70% of fixer time idles until a fix-daemon tick (7-30 m
 5. **Identity scoping** — wait records bind to claims by repo key + PR + kind + session name (or session id); R5 refuses a record from another session id.
 6. **State over time** — R5 ignores a completion record written before the claim (a previous round).
 7. **Who wrote it** — completion records keep their #4306 ownership rules; R5 only reads them.
+
+## Progress (2026-11-07)
+
+PRs #6432 and #6474 stop stale owed resumes and unwakeable await-verify records from taking fix slots (overlaps only the fewer refused fix-cap per tick line). Remains: push-on-green and releasing completed claims on fix slots.
