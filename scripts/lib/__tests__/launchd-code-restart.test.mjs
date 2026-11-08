@@ -1,4 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { rebuildStatePath } from '../daemon-rebuild/state.mjs';
 import * as restartModule from '../launchd-code-restart.mjs';
 
 const { restartServicesForClone } = restartModule;
@@ -15,8 +19,8 @@ function fixture(overrides = {}) {
 }
 
 describe('launchd restart by label (R703)', () => {
-  it('exports only restartServicesForClone; no reset hook or stale-service API', () => {
-    expect(Object.keys(restartModule)).toEqual(['restartServicesForClone']);
+  it('exports exactly the stale-service detector and restart API; no reset hook', () => {
+    expect(Object.keys(restartModule).sort()).toEqual(['findStaleCodeServices', 'restartServicesForClone']);
   });
 
   it('the default allowlist restarts only the resource sampler with kickstart -k', async () => {
@@ -294,5 +298,143 @@ describe('launchd restart by label (R703)', () => {
     expect(o.launchctl).not.toHaveBeenCalled();
     expect(o.restarted.size).toBe(0);
     expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+  });
+});
+
+describe('findStaleCodeServices reports older running code without restarting', () => {
+  const cloneRoot = 'fixtures/adopted-clone';
+  const adoptedAt = 1_000_000;
+  function staleFixture(overrides = {}) {
+    return fixture({
+      cloneRoot, now: () => adoptedAt + 120_001,
+      readProcessStartMs: vi.fn(() => adoptedAt - 1),
+      readAdoptedAtMs: vi.fn(() => adoptedAt), onFreshService: vi.fn(),
+      ps: vi.fn(() => { throw new Error('unexpected host process read'); }),
+      ...overrides,
+    });
+  }
+  async function inspect(o) {
+    const flags = await restartModule.findStaleCodeServices(o);
+    expect(o.launchctl).not.toHaveBeenCalled();
+    expect(o.ps).not.toHaveBeenCalled();
+    return flags;
+  }
+
+  it('flags a process started before clone adoption after the default 120000 ms grace', async () => {
+    const o = staleFixture();
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'stale-code' })]);
+    expect(o.readAdoptedAtMs).toHaveBeenCalledWith(cloneRoot);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 119_999, 120_000])('stale process at adoption age %i ms stays quiet, including the grace boundary', async age => {
+    const o = staleFixture({ now: () => adoptedAt + age });
+    expect(await inspect(o)).toEqual([]);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it.each([[500, 500, false], [500, 501, true], [0, 1, true], [300_000, 120_001, false]])(
+    'honours explicit graceMs=%i at age=%i (flag=%s)', async (graceMs, age, flagged) => {
+      const o = staleFixture({ graceMs, now: () => adoptedAt + age });
+      expect(await inspect(o)).toEqual(flagged
+        ? [expect.objectContaining({ label: sampler, reason: 'stale-code' })] : []);
+      expect(o.onFreshService).not.toHaveBeenCalled();
+    });
+
+  it.each([adoptedAt, adoptedAt + 1])('reports explicit fresh evidence for process start %i at or after adoption', async start => {
+    const o = staleFixture({ readProcessStartMs: vi.fn(() => start), now: () => adoptedAt });
+    expect(await inspect(o)).toEqual([]);
+    expect(o.onFreshService.mock.calls).toEqual([[{ label: sampler }]]);
+  });
+
+  it('reports a service that is not running as fresh evidence', async () => {
+    const o = staleFixture({ readProcessStartMs: vi.fn(() => null) });
+    expect(await inspect(o)).toEqual([]);
+    expect(o.onFreshService.mock.calls).toEqual([[{ label: sampler }]]);
+  });
+
+  it('inspects exactly the allowlisted labels and never discovers unrelated services', async () => {
+    const o = staleFixture({ settings: { allowedLabels: [writer] } });
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: writer, reason: 'stale-code' })]);
+    expect(o.readProcessStartMs.mock.calls.map(([label]) => label)).toEqual([writer]);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['empty allowlist', { settings: { allowedLabels: [] } }],
+    ['listed dev-server', { settings: { allowedLabels: ['com.we.dev-server'] } }],
+    ['self label', { selfLabel: sampler }],
+    ['disabled policy', { settings: { enabled: false } }],
+  ])('skips %s without inspection, flags, or fresh evidence', async (_name, overrides) => {
+    const o = staleFixture(overrides);
+    expect(await inspect(o)).toEqual([]);
+    expect(o.readProcessStartMs).not.toHaveBeenCalled();
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ platform: { allowedLabels: [writer] } }, writer, 'platform'],
+    [{ platform: { allowedLabels: [sampler] }, settings: { allowedLabels: [writer] } }, writer, 'tool'],
+  ])('shares restart policy precedence and logs provenance: %j', async (policy, label, source) => {
+    const o = staleFixture(policy);
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label, reason: 'stale-code' })]);
+    expect(lines(o)).toContain('daemon.serviceRestart');
+    expect(lines(o)).toContain(`"allowedLabels":"${source}"`);
+  });
+
+  it('environment policy overrides enabled tool and platform policy', async () => {
+    const o = staleFixture({ platform: { enabled: true }, settings: { enabled: true }, envValues: { enabled: false } });
+    expect(await inspect(o)).toEqual([]);
+    expect(o.readProcessStartMs).not.toHaveBeenCalled();
+    expect(o.onFreshService).not.toHaveBeenCalled();
+    expect(lines(o)).toContain('"enabled":"env"');
+  });
+
+  it('an oversized allowlist uses the standard fallback without inspecting extra labels', async () => {
+    const o = staleFixture({ settings: { allowedLabels: Array.from({ length: 65 }, (_, i) => `com.we.s${i}`) } });
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'stale-code' })]);
+    expect(o.readProcessStartMs.mock.calls.map(([label]) => label)).toEqual([sampler]);
+  });
+
+  it.each([
+    ['throws', () => { throw new Error('process unreadable'); }],
+    ['returns NaN', () => NaN],
+  ])('fails closed with process-unreadable when the process reader %s', async (_name, read) => {
+    const o = staleFixture({ readProcessStartMs: vi.fn(read) });
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'process-unreadable' })]);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it('fails closed with adoption-unreadable for NaN adoption evidence', async () => {
+    const o = staleFixture({ readAdoptedAtMs: vi.fn(() => NaN) });
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'adoption-unreadable' })]);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it.each([['corrupt adoption file', '{not json'], ['unreadable adoption path (directory)', null]])(
+    'fails closed with adoption-unreadable for a %s read by the real reader', async (_name, body) => {
+      const dir = mkdtempSync(join(tmpdir(), 'adopt-'));
+      try {
+        const file = rebuildStatePath(cloneRoot, { WE_DAEMON_STATE_DIR: dir });
+        if (body === null) mkdirSync(file); else writeFileSync(file, body);
+        const o = staleFixture({ readAdoptedAtMs: undefined, env: { WE_DAEMON_STATE_DIR: dir } });
+        expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'adoption-unreadable' })]);
+        expect(o.onFreshService).not.toHaveBeenCalled();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+  it('makes no stale or fresh claim when the clone has adopted nothing', async () => {
+    const o = staleFixture({ readAdoptedAtMs: vi.fn(() => null) });
+    expect(await inspect(o)).toEqual([]);
+    expect(o.onFreshService).not.toHaveBeenCalled();
+  });
+
+  it('unreadable policy produces one policy-unreadable flag and no fresh evidence', async () => {
+    const settings = Object.defineProperty({}, 'enabled', { enumerable: true,
+      get() { throw new Error('policy unreadable'); } });
+    const o = staleFixture({ settings });
+    expect(await inspect(o)).toEqual([expect.objectContaining({ label: null, reason: 'policy-unreadable' })]);
+    expect(o.readProcessStartMs).not.toHaveBeenCalled();
+    expect(o.onFreshService).not.toHaveBeenCalled();
   });
 });
