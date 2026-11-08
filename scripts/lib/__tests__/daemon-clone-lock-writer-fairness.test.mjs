@@ -126,12 +126,11 @@ describe('writer fairness — a writer that gave up blocks NEW reads until a wri
 });
 
 describe('effective writer priority overrides reader claim age', () => {
-  it('an effective writer claim beats an older reader claim and drains existing readers', async () => {
+  it('an effective writer claim beats an older reader claim for exactly the default skip cap, then admits it and drains existing readers', async () => {
     const lockRoot = mkTmp('dcwf-root-');
     const clone = mkTmp('dcwf-clone-');
     let t = 0;
-    // Isolate claim precedence from the separately tested reader skip cap.
-    const base = { lockRoot, leaseMinutes: LEASE, probe: alive, writerPriorityAfter: 1, writerClaimTtlMs: TTL, readerPriorityAfter: 3, writerPriorityMaxSkips: 1e9 };
+    const base = { lockRoot, leaseMinutes: LEASE, probe: alive, writerPriorityAfter: 1, writerClaimTtlMs: TTL, readerPriorityAfter: 3 };
     // L holds a read; W reserves and waits; R is refused 3x during W's drain (starvation begins at t≈1s).
     acquireRead(clone, { ...base, owner: 'L', nowMs: t });
     let rStarved = 0;
@@ -147,8 +146,15 @@ describe('effective writer priority overrides reader claim age', () => {
     });
     // W initially yields to the starved reader, then its effective claim overrides R's older claim.
     expect(w1).toMatchObject({ ok: false, reason: 'reader-priority' });
-    expect(acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t }))
+    // Model a persisted older starvation claim without a skip ledger. The setup's writer-active
+    // refusals would otherwise already exhaust the default budget before claim precedence is tested.
+    const { starvedRoot } = cloneLockDirs(clone, lockRoot);
+    rmSync(join(starvedRoot, '..', 'writer-priority-skips.json'), { force: true });
+    const priorityRefusals = [];
+    const firstRefusal = acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t });
+    expect(firstRefusal)
       .toMatchObject({ ok: false, reason: 'writer-priority', heldBy: 'W' });
+    priorityRefusals.push(firstRefusal);
     // R's older starvation claim remains; W overrides it and waits for L's existing read slot.
     const w2 = await acquireWrite(clone, {
       ...base, owner: 'W', waitMs: 3000, pollMs: 1000, now: () => t, sleep: async (ms) => { t += ms; },
@@ -157,8 +163,13 @@ describe('effective writer priority overrides reader claim age', () => {
     const refused = acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t });
     expect(refused).toMatchObject({ ok: false, reason: 'writer-priority' });
     expect(refused.starved).toBeUndefined();
-    // R keeps retrying (event wakes) while W drains: every refusal is uncounted, so R can never re-trigger
-    // reader priority against the effective writer claim — W is not made to back off, and gets the clone.
+    priorityRefusals.push(refused);
+    expect(priorityRefusals).toHaveLength(DEFAULT_WRITER_PRIORITY_MAX_SKIPS);
+    expect(acquireRead(clone, { ...base, owner: 'R', readerKey: 'reader:r', nowMs: t }))
+      .toEqual({ ok: true });
+    releaseRead(clone, { lockRoot, owner: 'R' });
+    // R keeps retrying while W actually drains: writer-active still refuses admission,
+    // even after the claim skip cap is reached. W gets the clone when L's tick ends.
     let rCount = 0;
     const w3 = await acquireWrite(clone, {
       ...base, owner: 'W', waitMs: 60_000, pollMs: 1000, now: () => t,

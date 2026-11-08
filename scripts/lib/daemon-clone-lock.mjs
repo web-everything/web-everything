@@ -421,6 +421,8 @@ export function acquireRead(root, opts = {}) {
   // Writer fairness: an effective claim refuses NEW reads regardless of reader claim age. The skip cap
   // bypasses writer CLAIMS only, bounding claim-induced skips; a live writer can still delay admission
   // (#4044). Already-held read slots are never removed by this check.
+  // A reader whose attempts only land during writer-active can still be delayed repeatedly;
+  // starvation freedom is bounded by these overrides, not strictly proven.
   const claim = findPriorityWriter(starvedRoot, {
     owner, nowMs, ttlMs: writerClaimTtlMs, probe, after: writerPriorityAfter,
   });
