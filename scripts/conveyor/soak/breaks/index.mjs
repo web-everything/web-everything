@@ -31,6 +31,7 @@
  * `review-hold-red-draft-deadlock.mjs` uses the same automatic registration.
  * `verdict-ledger-slow-push-race-refused.mjs` uses the same automatic registration.
  * `fixing-tag-unverified-launch.mjs` uses the same automatic registration.
+ * `clone-object-maintenance-borrowed-or-busy.mjs` registers the R657 maintenance break through discovery.
  * `refused-stage-pending-referrals-never-resume.mjs` uses the same automatic registration.
  * `overlay-main-sync-tests-stderr-tail.mjs` uses the same automatic registration.
  *
