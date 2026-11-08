@@ -5,7 +5,7 @@ import { mqSameHeadGuard } from '../drain-queue-safety.mjs';
 const repo = 'fixture/drain', pr = 6215, head = 'a'.repeat(40), commit = 'b'.repeat(40);
 const removedAt = '2026-11-01T12:00:00.000Z';
 const endpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
-const latestQuery = `${endpoint}&per_page=1`;
+const latestQuery = `${endpoint}&per_page=100`;
 const beforeQuery = `${endpoint}&status=completed&created=<${removedAt}&per_page=100`;
 const unreadable = 'retry evidence unreadable or incomplete';
 const run = (id, conclusion, created_at) => ({ id, conclusion, created_at, updated_at: created_at,
@@ -13,7 +13,8 @@ const run = (id, conclusion, created_at) => ({ id, conclusion, created_at, updat
 
 function fixture({ failQuery, latest, before, mergeState = 'BEHIND', checks } = {}) {
   const replies = {
-    [latestQuery]: latest ?? { total_count: 2500, workflow_runs: [run(2500, 'success', '2026-11-01T13:00:00Z')] },
+    [latestQuery]: latest ?? { total_count: 2500, workflow_runs: Array.from({ length: 100 }, (_, index) =>
+      run(2500 - index, 'success', '2026-11-01T13:00:00Z')) },
     [beforeQuery]: before ?? { total_count: 2499, workflow_runs: Array.from({ length: 100 }, (_, index) =>
       run(2499 - index, 'failure', '2026-11-01T11:00:00Z')) },
   };
@@ -37,7 +38,8 @@ function fixture({ failQuery, latest, before, mergeState = 'BEHIND', checks } = 
     if (Object.hasOwn(replies, args[1])) return JSON.stringify(replies[args[1]]);
     throw new Error(`unexpected or paged request: ${args.join(' ')}`);
   });
-  const decision = mqSameHeadGuard({ repo, pr, head, exec, log, quarantine: { readList: null } });
+  const decision = mqSameHeadGuard({ repo, pr, head, exec, log, now: Date.parse('2026-11-01T14:00:00Z'),
+    quarantine: { readList: null } });
   const decline = log.mock.calls.map(([line]) => line).find(line => line.startsWith('mq-same-head-retry-declined:'));
   return { decision, decline, exec };
 }
