@@ -879,6 +879,57 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(failed.deferredForHost).toBe(2);
   });
 
+  it.each([2, 3])('reserves a host start for red-team recovery before %i ordinary reviews owed', (owed) => {
+    const order = [];
+    let recoveryStartsAvailable;
+    const take = vi.fn();
+    const dispatch = vi.fn(({ pr }) => { order.push('ordinary'); return { agentId: `agent-${pr}` }; });
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      order.push('red-team');
+      recoveryStartsAvailable = capacity.remainingStarts;
+      if (capacity.remainingStarts < 1) return { dispatched: [] };
+      capacity.take();
+      capacity.remainingStarts--;
+      return { dispatched: [{ prNumber: 900, agentId: 'red-team' }] };
+    });
+    const out = runReviewTick({ reconcile: () => reviewsPlan(owed), dispatch, redTeamOnSkip,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2, take }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+    expect(recoveryStartsAvailable).toBeGreaterThanOrEqual(1);
+    expect(order).toEqual(['red-team', 'ordinary']);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.dispatched).toHaveLength(1);
+    const totalStarts = out.dispatched.length + out.redTeamOnSkip.dispatched.length;
+    expect(totalStarts).toBeLessThanOrEqual(2);
+    expect(take).toHaveBeenCalledTimes(totalStarts);
+  });
+
+  it('a single host start spent by red-team recovery leaves zero starts for two ordinary reviews', () => {
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const take = vi.fn();
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      if (capacity.remainingStarts < 1) return { dispatched: [] };
+      capacity.take();
+      capacity.remainingStarts--;
+      return { dispatched: [{ prNumber: 900, agentId: 'red-team' }] };
+    });
+    const out = runReviewTick({ reconcile: () => reviewsPlan(2), dispatch, redTeamOnSkip,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1, take }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.dispatched).toEqual([]);
+    expect(out.reviewsOwed).toBe(2);
+    expect(out.deferredForHost).toBe(2);
+    expect(out.dispatched.length + out.redTeamOnSkip.dispatched.length).toBeLessThanOrEqual(1);
+    expect(take).toHaveBeenCalledTimes(1);
+  });
+
   it('host admission (verify-admission audit): one shared per-tick budget across repos, evaluated once', async () => {
     const { sharedHostBudget } = await import('../review-daemon.mjs');
     const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
@@ -1259,6 +1310,51 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 0 });
     expect(starved.deferredForLanes).toBe(2);
     expect(starved.pendingNotDispatched[0].reasons.join('\n')).toMatch(/no acquirable lane this tick \(0 acquirable\)/);
+  });
+
+  it('refreshes the cap deferral reason to live 6 of 6 after four starts, rather than reporting the initial 2 of 6', () => {
+    const liveReviewBudget = { left: 4, live: 2, max: 6, reason: 'live review rounds 2 of maxLiveReviewRounds=6 (env)' };
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const prs = Array.from({ length: 5 }, (_, i) => ({ number: 100 + i, labels: ['review:pending'] }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, liveReviewBudget,
+      readPrs: () => prs, readAgents: () => [], tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(dispatch).toHaveBeenCalledTimes(4);
+    expect(out.dispatched).toHaveLength(4);
+    expect(liveReviewBudget.left).toBe(0);
+    expect(out.deferredForCap).toBe(1);
+    expect(out.pendingNotDispatched).toHaveLength(1);
+    const reasons = out.pendingNotDispatched.flatMap(p => p.reasons).join('\n');
+    expect(reasons).toContain('held by the live-review cap');
+    expect(reasons).not.toContain('live review rounds 2 of maxLiveReviewRounds=6');
+    expect(reasons).toContain('live review rounds 6 of maxLiveReviewRounds=6 (env)');
+    expect(out.deferredForCapReason).toContain('live review rounds 6 of maxLiveReviewRounds=6 (env)');
+  });
+
+  it('reports host start exhaustion with one review owed and live 2 of 6, never a live-review cap hold while capacity remains', () => {
+    const liveReviewBudget = { left: 4, live: 2, max: 6, reason: 'live review rounds 2 of maxLiveReviewRounds=6 (env)' };
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      if (capacity.remainingStarts < 1) return { dispatched: [] };
+      capacity.take();
+      capacity.remainingStarts--;
+      capacity.budget.left--;
+      return { dispatched: [{ prNumber: 900, agentId: 'red-team' }] };
+    });
+    const out = runReviewTick({ reconcile: () => reviewsPlan(1), dispatch, redTeamOnSkip, liveReviewBudget,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }),
+      readPrs: () => [{ number: 100, labels: ['review:pending'] }], readAgents: () => [],
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(out.pendingNotDispatched).toHaveLength(1);
+    const reasons = out.pendingNotDispatched.flatMap(p => p.reasons).join('\n');
+    expect(reasons).toMatch(/host start budget|host admission/);
+    expect(reasons).not.toContain('held by the live-review cap');
+    expect(liveReviewBudget.left).toBe(3);
+    expect(out).toMatchObject({ deferredForHost: 1, deferredForCap: 0, deferredForCapReason: null });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(1);
   });
 
   it('scarce review seats go main-fix first, then review:human / ready-to-merge, oldest first', async () => {
