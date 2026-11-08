@@ -21,10 +21,10 @@ it('review regressions: rejects moving an approved edit between identical blocks
     expect(proveIdenticalNetPatch({ exec: run, fromSha: a, toSha: b })).toMatchObject({ ok: false });
     for (const human of [true, false]) {
       const pr = 54630 + variant * 2 + Number(human);
-      const comments = [{ author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(oldDiff)} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` }];
+      const comments = [{ id: 'IC_clearance', author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(oldDiff)} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` }];
       const writes = [], state = { headRefOid: b, labels: ['review:pending'], comments };
       const writerExec = (cmd, args, opts) => cmd === 'git' ? run(cmd, args, opts) : writes.push(args);
-      expect(applyHumanClearanceCarry({ pr, repo: 'owner/repo', exec: writerExec, log: () => {},
+      expect(applyHumanClearanceCarry({ mechanicalCarry: { value: 'trust-drain-record', source: 'test' }, pr, repo: 'owner/repo', exec: writerExec, log: () => {},
         evidence: { humanClearance: latestHumanClearance(comments), headSha: b, headDiffSha: b, headDiff },
         readLiveEvidence: () => ({ headSha: b, comments, reviews: [] }) })).toBeNull();
       // A definitive numbering refusal: the stub git cannot serve that proof, and an unreadable one stays retryable.
@@ -38,7 +38,7 @@ it('review regressions: rejects moving an approved edit between identical blocks
   }
 });
 it('review regressions: a definitive net-patch miss never settles a head the numbering proof could not read', () => {
-  const comments = [{ author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(diff)} -->\n<!-- cleared-human: chalbert -->` }];
+  const comments = [{ id: 'IC_clearance', author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(diff)} -->\n<!-- cleared-human: chalbert -->` }];
   const state = { headRefOid: b, labels: ['review:pending'], comments };
   const transient = { ok: false, retryable: true, reason: 'numbering proof failed: transient read' };
   const definitive = { ok: false, reason: 'not a numbering-only move' };
@@ -59,7 +59,7 @@ it('review regressions: a definitive net-patch miss never settles a head the num
   }
 });
 it('review regressions: a refusal while the numbering proof is switched off is not memoized', () => {
-  const comments = [{ author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(diff)} -->\n<!-- cleared-human: chalbert -->` }];
+  const comments = [{ id: 'IC_clearance', author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(diff)} -->\n<!-- cleared-human: chalbert -->` }];
   const state = { headRefOid: b, labels: ['review:pending'], comments };
   const step = numbering => restampAfterNumbering({ repo: 'owner/repo', pr: 54710, exec: exec(), state, reviews: [],
     numberingSetting: { value: numbering, source: 'test' }, netPatchSetting: { value: true, source: 'test' },
@@ -117,7 +117,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { applyHumanClearanceCarry, latestHumanClearance } from '../human-clearance-carry.mjs';
-import { normalizeDiffFingerprint } from '../review-escalation.mjs';
+import { liveCarryFingerprints } from '../carry-equivalence.mjs';
+import { buildClearedFromMarker, buildReviewedContributionMarker, normalizeDiffFingerprint } from '../review-escalation.mjs';
 import { restampAfterNumbering } from '../numbering-carry.mjs';
 it('uses Git-generated diffs and stable patch ids to distinguish moved edits from safe offset rebases', () => {
   const dir = mkdtempSync(join(tmpdir(), 'net-patch-read-only-'));
@@ -179,10 +180,10 @@ it.each([
     expect(proveIdenticalNetPatch({ exec, fromSha: from, toSha: to })).toMatchObject({ ok: false, different: true });
     const oldDiff = git('diff', root, from), headDiff = git('diff', root, to);
     for (const human of [false, true]) {
-      const comments = [{ author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${from} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(oldDiff)} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` }];
+      const comments = [{ id: 'IC_clearance', author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${from} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(oldDiff)} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` }];
       const writes = [], state = { headRefOid: to, labels: ['review:pending'], comments };
       const writerExec = (cmd, args, opts) => cmd === 'git' ? exec(cmd, args, opts) : writes.push(args);
-      const result = applyHumanClearanceCarry({ pr: 5463, repo: 'owner/repo', cwd: dir, exec: writerExec, log: () => {},
+      const result = applyHumanClearanceCarry({ mechanicalCarry: { value: 'trust-drain-record', source: 'test' }, pr: 5463, repo: 'owner/repo', cwd: dir, exec: writerExec, log: () => {},
         evidence: { humanClearance: latestHumanClearance(comments), headSha: to, headDiffSha: to, headDiff },
         readLiveEvidence: () => ({ headSha: to, comments, reviews: [] }) });
       expect(result).toBeNull();
@@ -195,7 +196,7 @@ it.each([
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-it('real rebase: offset-only change carries human and automated acceptance through existing writers', () => {
+function offsetRebaseFixture({ defaultRefuse = false, tier = 'net-patch' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'net-patch-'));
   const git = (...args) => execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8' }).trim();
   const content = Array.from({ length: 30 }, (_, i) => `line ${i}\n`).join('');
@@ -209,21 +210,34 @@ it('real rebase: offset-only change carries human and automated acceptance throu
     const proof = proveIdenticalNetPatch({ exec, fromSha: from, toSha: to });
     expect(proof.ok).toBe(true);
     const oldDiff = git('diff', root, from), headDiff = git('diff', 'origin/main', to);
-    for (const human of [true, false]) {
-      const original = { author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${from} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(oldDiff)} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` };
-      const comments = [original], writes = [];
+    expect(normalizeDiffFingerprint(oldDiff)).not.toBe(normalizeDiffFingerprint(headDiff));
+    expect(liveCarryFingerprints(oldDiff).contribution).toBe(liveCarryFingerprints(headDiff).contribution);
+    for (const human of (defaultRefuse ? [true] : [true, false])) {
+      const original = { id: 'IC_clearance', author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${from} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(oldDiff)} -->\n${buildReviewedContributionMarker(oldDiff)}${human ? '\n<!-- cleared-human: chalbert -->' : ''}` };
+      const comments = [original], writes = [], logs = [];
       const live = () => ({ headSha: to, comments, reviews: [] });
       if (human) {
-        const result = applyHumanClearanceCarry({ pr: 5195, repo: 'owner/repo', cwd: dir, log: () => {},
-          evidence: { humanClearance: latestHumanClearance(comments), headSha: to, headDiffSha: to, headDiff },
+        const result = applyHumanClearanceCarry({ ...(defaultRefuse ? {} : { mechanicalCarry: { value: 'trust-drain-record', source: 'test' } }), netPatchSetting: { value: tier === 'net-patch', source: 'test' }, equivalence: 'contribution', pr: 5195, repo: 'owner/repo', cwd: dir, log: line => logs.push(line),
+          evidence: { humanClearance: { ...latestHumanClearance(comments), ...liveCarryFingerprints(oldDiff) }, headSha: to, headDiffSha: to, headDiff },
           readLiveEvidence: live, exec: (cmd, args, opts) => {
             if (cmd === 'git') return exec(cmd, args, opts);
             writes.push(args[args.indexOf('--body') + 1]); return '';
           } });
-        expect(result?.carried).toMatchObject({ recorded: true, tier: 'net-patch', actor: 'chalbert' });
+        if (defaultRefuse) {
+          expect(result).toBeNull();
+          expect(logs.some(line => line.includes('humanClearance.mechanicalCarry=refuse'))).toBe(true);
+          expect(writes).toEqual([]);
+          continue;
+        }
+        if (tier === 'net-patch') {
+          expect(result?.carried).toMatchObject({ recorded: true, tier: 'net-patch', actor: 'chalbert' });
+        } else {
+          expect(result?.carried).toMatchObject({ recorded: true, tier: 'contribution', actor: 'chalbert' });
+        }
+        expect(writes[0]).toContain(buildClearedFromMarker(original.id));
         expect(writes[0]).toContain('cleared-human: chalbert');
         const objection = { author: { login: 'chalbert' }, body: 'Do not land this.' };
-        const held = applyHumanClearanceCarry({ pr: 5195, repo: 'owner/repo', cwd: dir, log: () => {},
+        const held = applyHumanClearanceCarry({ mechanicalCarry: { value: 'trust-drain-record', source: 'test' }, pr: 5195, repo: 'owner/repo', cwd: dir, log: () => {},
           evidence: { humanClearance: latestHumanClearance(comments), headSha: to, headDiffSha: to, headDiff },
           exec, readLiveEvidence: () => ({ ...live(), comments: [...comments, objection] }) });
         expect(held?.action).toBe('defer');
@@ -238,6 +252,18 @@ it('real rebase: offset-only change carries human and automated acceptance throu
       }
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+it('real rebase: offset-only change carries human and automated acceptance through existing writers', () => {
+  offsetRebaseFixture();
+});
+it('default refuses an offset-only net-patch carry without recording it', () => {
+  offsetRebaseFixture({ defaultRefuse: true });
+});
+it('explicit trust carries an offset-only contribution with the net-patch alternative disabled', () => {
+  offsetRebaseFixture({ tier: 'contribution' });
+});
+it('default refuses an offset-only contribution carry without recording it', () => {
+  offsetRebaseFixture({ defaultRefuse: true, tier: 'contribution' });
 });
 it('refuses distinct non-UTF-8 source bytes that decode to the same replacement character', () => {
   const dir = mkdtempSync(join(tmpdir(), 'net-patch-encoding-'));

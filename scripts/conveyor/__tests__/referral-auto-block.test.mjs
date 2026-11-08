@@ -24,7 +24,7 @@ const cardReadable = () => true;
 /** The ruling comment the daemon's `record-referral-ruling` run would post, built by the real planner. */
 function autoPolicyComment(pr, { actor = AUTO_POLICY_ACTOR, ruling = 'block' } = {}) {
   const o = openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: pr.headRefOid, cardReadable });
-  const read = { head: pr.headRefOid, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null,
+  const read = { identity: { login: 'chalbert', type: 'User' }, head: pr.headRefOid, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null,
     now: '2026-10-08T12:00:00.000Z', clearerId: 's' };
   const plan = planOperatorRuling(read, { repo, pr: pr.number, finding: 'all-open', ruling, actor, channel: 'review daemon', reason: AUTO_BLOCK_REASON });
   return { plan, comment: { body: plan.body, createdAt: '2026-10-08T12:00:00.000Z', author: { login: 'web-everything' } } };
@@ -51,8 +51,8 @@ describe('auto-block plan', () => {
   it('a trusted human clearance is final for its head; an older clearance leaves the new head reviewable', () => {
     const withClearance = (headSha) => parked({ headRefOid: H2, comments: [
       recordComment(record({ head: H2, runId: 'run-2' }), 5),
-      { body: buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha }),
-        createdAt: iso(10), author: { login: 'web-everything' } },
+      { id: 'IC_human_clearance', body: buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha }),
+        createdAt: iso(10), author: { login: 'chalbert' } },
     ] });
     const opts = { mode: 'auto-block', cardReadable, isJudgment: () => false };
     const older = withClearance(H1);
@@ -66,21 +66,21 @@ describe('auto-block plan', () => {
   it('clear-human then a same-head plain accept remains protected from auto-block', () => {
     const pr = parked();
     pr.comments.push(
-      { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: H1 }), author: { login: 'web-everything' } },
+      { id: 'IC_human_clearance', body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: H1 }), author: { login: 'chalbert' } },
       { body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: H1 }), author: { login: 'web-everything' } },
     );
     expect(parseLatestHumanClearedSha(pr.comments)).toBeNull();
     expect(planAutoBlock(pr, { mode: 'auto-block', cardReadable, isJudgment: () => false })).toBeNull();
   });
   it.each([
-    ['trusted current-head clearance', H2, { login: 'web-everything' }, true],
-    ['trusted stale-head clearance', H1, { login: 'web-everything' }, false],
+    ['trusted current-head clearance', H2, { login: 'chalbert' }, true],
+    ['trusted stale-head clearance', H1, { login: 'chalbert' }, false],
     ['untrusted current-head marker', H2, { login: 'drive-by' }, false],
     ['current-head marker with no author', H2, undefined, false],
   ])('auto-block respects %s with a mixed-case live head', (_name, headSha, author, final) => {
     const pr = parked({ headRefOid: H2.toUpperCase(), comments: [
       recordComment(record({ head: H2, runId: 'run-2' }), 5),
-      { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), createdAt: iso(10), author },
+      { id: 'IC_human_clearance', body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), createdAt: iso(10), author },
     ] });
     const plan = planAutoBlock(pr, { mode: 'auto-block', cardReadable, isJudgment: () => false });
     if (final) expect(plan).toBeNull();
@@ -250,7 +250,7 @@ describe('operator-mode ledger is unchanged', () => {
   it('an operator-authored structured block is NOT a standing block; only auto-policy is', () => {
     const base = parked();
     const o = openReferralFindings({ comments: base.comments, repo, pr: 3794, head: H1, cardReadable });
-    const read = { head: H1, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null, now: '2026-10-08T12:00:00.000Z', clearerId: 's' };
+    const read = { identity: { login: 'chalbert', type: 'User' }, head: H1, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: null, now: '2026-10-08T12:00:00.000Z', clearerId: 's' };
     const plan = planOperatorRuling(read, { repo, pr: 3794, finding: 'all-open', ruling: 'block', actor: OPERATOR_LOGINS[0], channel: 'chat', reason: 'fix it' });
     const comment = { body: plan.body, createdAt: '2026-10-08T12:00:00.000Z', author: { login: OPERATOR_LOGINS[0] } };
     const comments = [...base.comments, comment, recordComment(record({ head: H2, runId: 'run-2' }), 20)];

@@ -397,8 +397,8 @@ export function planOperatorRuling(read, input) {
   if (actor === JUDGE_ACTOR) {
     // The selection may DERIVE supersession (a disputed finding with no --supersedes): refuse it like an explicit one.
     for (const o of selected) assertJudgeAuthority(read, { actor, ruling, supersedes: supersedesFor(o) });
-    assertRulingIdentity(read.identity, actor);
   }
+  if (!byPolicy) assertRulingIdentity(read.identity, actor);
   const record = {
     version: 1, repo, pr: Number(pr), head: read.head,
     rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'not-real' ? { lens: o.seat ?? JSON.parse(o.key)[0] } : {}),

@@ -32,7 +32,8 @@ function ruling(rec, result = 'not-real', extra = {}) {
 function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true, env = {} } = {}) {
   const comments = [...initial], trace = [], warnings = [], logs = [];
   let liveHead = head;
-  const readJson = (args) => args[0] === 'pr' ? { headRefOid: liveHead, body, comments }
+  const readJson = (args) => args[0] === 'api' && args[1] === 'user' ? { login: 'chalbert', type: 'User' }
+    : args[0] === 'pr' ? { headRefOid: liveHead, body, comments }
     : args[1].includes('/compare/') ? (compare instanceof Error ? (() => { throw compare; })() : compare) : { type: fileExists ? 'file' : 'dir' };
   const reader = createRecordReferralRulingReader({ readJson, changedLines, assertFresh: () => {},
     readable: () => true, log: (m) => logs.push(m), now: () => now, env: { CLAUDE_SESSION_ID: 'auto-session', ...env } });
