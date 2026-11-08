@@ -181,36 +181,38 @@ describe('red-team check run contract', () => {
 describe('GitHub-visible red-team publication hold (commit status)', () => {
   const head = 'd'.repeat(40);
   it('posts a head-bound failure or success status on its own context, with a bounded single-line description', async () => {
-    const { postRedTeamPublicationHold, RED_TEAM_PUBLICATION_CONTEXT } = await import('../red-team-check-run.mjs');
+    const { postRedTeamPublicationHold } = await import('../red-team-check-run.mjs');
     const calls = [];
     const gh = (args, opts) => { calls.push({ args, body: JSON.parse(opts.input) }); return ''; };
-    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, reason: `x\n${'y'.repeat(300)}`, gh })).toEqual({ ok: true });
-    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: false, gh })).toEqual({ ok: true });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, reason: `x\n${'y'.repeat(300)}`, gh })).toEqual({ ok: true });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: false, gh })).toEqual({ ok: true });
     expect(calls.map(c => c.args.slice(0, 4))).toEqual([['api', `repos/o/r/statuses/${head}`, '--method', 'POST'], ['api', `repos/o/r/statuses/${head}`, '--method', 'POST']]);
-    expect(calls.map(c => [c.body.state, c.body.context])).toEqual([['failure', RED_TEAM_PUBLICATION_CONTEXT], ['success', RED_TEAM_PUBLICATION_CONTEXT]]);
+    expect(calls.map(c => [c.body.state, c.body.context])).toEqual([['failure', 'red-team/publication #7'], ['success', 'red-team/publication #7']]);
     expect(calls[0].body.description).toHaveLength(140);
     expect(calls[0].body.description).not.toMatch(/\n/);
   });
   it('refuses an invalid identity and reports a failed post', async () => {
     const { postRedTeamPublicationHold } = await import('../red-team-check-run.mjs');
     const gh = vi.fn(() => { throw Error('HTTP 503'); });
-    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: 'nope', held: true, gh })).toMatchObject({ ok: false });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: 'nope', held: true, gh })).toMatchObject({ ok: false });
     expect(gh).not.toHaveBeenCalled();
-    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, gh })).toMatchObject({ ok: false, definite: false, reason: expect.stringContaining('HTTP 503') });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, gh })).toMatchObject({ ok: false, definite: false, reason: expect.stringContaining('HTTP 503') });
   });
   it('detects a definite 4xx rejection from the full error text, even past the reason truncation', async () => {
     const { postRedTeamPublicationHold } = await import('../red-team-check-run.mjs');
     const long = Object.assign(Error(`${'x'.repeat(400)} Resource not accessible by integration (HTTP 403)`), { stderr: '' });
-    const result = postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true, gh: () => { throw long; } });
+    const result = postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, gh: () => { throw long; } });
     expect(result).toMatchObject({ ok: false, definite: true });
     expect(result.reason).not.toMatch(/HTTP 403/);
-    expect(postRedTeamPublicationHold({ repo: 'o/r', headSha: head, held: true,
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true,
       gh: () => { throw Object.assign(Error('gh failed'), { stderr: 'gh: Validation Failed (HTTP 422)' }); } })).toMatchObject({ definite: true });
   });
   it('evaluates absent, cleared, held, and incomplete combined status', async () => {
-    const { evaluateRedTeamPublicationHold: evaluate, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');
+    const { evaluateRedTeamPublicationHold: evaluateAny, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
+    const evaluate = input => evaluateAny({ pr: 7, ...input }), context = redTeamPublicationContext(7);
     const combined = { total_count: 1, statuses: [{ context, state: 'failure' }] };
     const bot = { login: 'web-everything[bot]' }, stranger = { login: 'someone-else' };
+    expect(evaluateAny({ combined, statuses: [] })).toMatchObject({ ok: false, reason: expect.stringMatching(/PR number/) });
     expect(evaluate({ combined: { total_count: 1, statuses: [{ context: 'ci', state: 'failure' }] } })).toMatchObject({ ok: true });
     expect(evaluate({ combined, statuses: [{ id: 2, context, state: 'success', creator: bot }, { id: 1, context, state: 'failure', creator: bot }] }))
       .toMatchObject({ ok: true, reason: expect.stringMatching(/cleared/) });
@@ -221,7 +223,8 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
     expect(evaluate({ combined, statuses: null })).toMatchObject({ ok: false, reason: expect.stringMatching(/history unreadable/) });
   });
   it('an untrusted success never clears a hold, whatever its order in the response', async () => {
-    const { evaluateRedTeamPublicationHold: evaluate, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');
+    const { evaluateRedTeamPublicationHold: evaluateAny, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
+    const evaluate = input => evaluateAny({ pr: 7, ...input }), context = redTeamPublicationContext(7);
     const combined = { total_count: 1, statuses: [{ context, state: 'success' }] };
     const statuses = [{ id: 1, context, state: 'failure', creator: { login: 'web-everything[bot]' } },
       { id: 9, context, state: 'success', creator: { login: 'github-actions[bot]' } }];
@@ -233,13 +236,51 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
     expect(evaluate({ combined, statuses: page })).toMatchObject({ ok: false, reason: expect.stringMatching(/100-status bound/) });
   });
   it('reads the full history only when the context exists', async () => {
-    const { readRedTeamPublicationHoldFact, RED_TEAM_PUBLICATION_CONTEXT: context } = await import('../red-team-check-run.mjs');
+    const { readRedTeamPublicationHoldFact, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
+    const context = redTeamPublicationContext(7);
     const calls = [];
     const gh = args => { calls.push(args[1]); return JSON.stringify({ total_count: 0, statuses: [] }); };
-    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', headSha: head, gh })).toMatchObject({ ok: true });
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh })).toMatchObject({ ok: true });
     expect(calls).toEqual([`repos/o/r/commits/${head}/status?per_page=100`]);
     const gh2 = args => (/\/status\?/.test(args[1]) ? JSON.stringify({ total_count: 1, statuses: [{ context, state: 'failure' }] })
       : JSON.stringify([{ id: 1, context, state: 'failure', creator: { login: 'web-everything[bot]' } }]));
-    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', headSha: head, gh: gh2 })).toMatchObject({ ok: false });
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh: gh2 })).toMatchObject({ ok: false });
+    // The bare, PR-less context (never this PR's) is not read as this PR's hold.
+    const gh3 = args => (/\/status\?/.test(args[1]) ? JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication', state: 'failure' }] })
+      : JSON.stringify([]));
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh: gh3 })).toMatchObject({ ok: true });
+  });
+});
+
+describe('the publication hold is bound to its PR, not only its head (#6535 round 4)', () => {
+  const head = 'e'.repeat(40);
+  const bot = { login: 'web-everything[bot]' };
+  it('a confirmed clear by another PR sharing the head never clears this PR\'s hold', async () => {
+    const { postRedTeamPublicationHold, readRedTeamPublicationHoldFact } = await import('../red-team-check-run.mjs');
+    const posted = [];
+    const writer = (args, opts) => { posted.push({ id: posted.length + 1, creator: bot, ...JSON.parse(opts.input) }); return ''; };
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, gh: writer })).toEqual({ ok: true });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 8, headSha: head, held: false, gh: writer })).toEqual({ ok: true });
+    expect(new Set(posted.map(s => s.context)).size).toBe(2);
+    const reader = args => {
+      const newestFirst = [...posted].reverse();
+      if (/\/status\?/.test(args[1])) {
+        const latest = [...new Map([...posted].map(s => [s.context, s])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }
+      return JSON.stringify(newestFirst);
+    };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh: reader }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 8, headSha: head, gh: reader })).toMatchObject({ ok: true });
+  });
+  it('refuses to post or read a hold without a valid PR number', async () => {
+    const { postRedTeamPublicationHold, readRedTeamPublicationHoldFact } = await import('../red-team-check-run.mjs');
+    const gh = vi.fn(() => '');
+    for (const pr of [undefined, 0, -1, '7x', 1.5]) {
+      expect(postRedTeamPublicationHold({ repo: 'o/r', pr, headSha: head, held: true, gh })).toMatchObject({ ok: false });
+      expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr, headSha: head, gh })).toMatchObject({ ok: false });
+    }
+    expect(gh).not.toHaveBeenCalled();
   });
 });

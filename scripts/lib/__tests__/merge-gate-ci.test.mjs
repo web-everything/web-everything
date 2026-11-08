@@ -13,7 +13,9 @@ import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from 
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
 import { findDuplicateIds } from '../duplicate-id-tripwire.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
-import { readRedTeamCheckFact, RED_TEAM_PUBLICATION_CONTEXT } from '../red-team-check-run.mjs';
+import { readRedTeamCheckFact, redTeamPublicationContext } from '../red-team-check-run.mjs';
+// The gatherer's PR is #7: its hold lives on that PR's own context.
+const RED_TEAM_PUBLICATION_CONTEXT = redTeamPublicationContext(7);
 import { recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 
 const HEAD = 'a'.repeat(40);

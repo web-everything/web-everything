@@ -191,7 +191,7 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   //    be written). Only the drain host has it; elsewhere it is absent. Writers store the canonical lowercase slug,
   //    while `--repo` is case-insensitive to gh, so both spellings are read.
   if (facts.redTeamGateSource !== 'drain-scan' && !pin.error && facts.redTeamCheck.ok) {
-    const remoteHold = readRedTeamPublicationHoldFact({ repo, headSha: pin.sha,
+    const remoteHold = readRedTeamPublicationHoldFact({ repo, pr: num, headSha: pin.sha,
       gh: (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options) });
     if (!remoteHold.ok) facts.redTeamCheck = remoteHold;
   }
