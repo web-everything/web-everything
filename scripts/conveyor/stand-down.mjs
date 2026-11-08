@@ -424,13 +424,13 @@ export function statesOutOfDiffTimeoutEvidence(reason) {
   // recognized evidence phrases; if any other word remains, the report says something else and stays terminal.
   const TEST_FILE = /[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi;
   let r = String(reason ?? '').replace(STAND_DOWN_REASONS['gate-red'], ' ');
-  if (new Set(r.match(TEST_FILE) ?? []).size > 1) return false;
+  if (new Set(r.match(TEST_FILE) ?? []).size !== 1) return false; // exactly one named file, so the CLI can check it against the diff
   const UNRELATED = /\bunrelated to this (?:change|pr)\b|\b(?:outside|not in) (?:the |this )?(?:pr'?s? )?diff\b/i;
   const CORROBORATION = /\ball \d+ other tests?(?: incl\.? [\w./-]+)? pass(?:ed)?\b|\bevery other test passe?s?\b|\bother tests? (?:all )?pass(?:ed)?\b|\bpasses? (?:alone|in isolation)\b|\bsame (?:timeout|failure) on (?:base|main|[0-9a-f]{7,40})\b/gi;
   if (!/\btimed out\b|\btimeout\b/i.test(r) || !UNRELATED.test(r) || !CORROBORATION.test(r)) return false;
   // One quoted test name at most (it is the title of the timed-out test), and it may not itself narrate a failure.
   const quoted = r.match(/'[^']*'|"[^"]*"/g) ?? [];
-  if (quoted.length > 1 || quoted.some((q) => /\bfail|assert|expect|receiv|!==|===|\bmodif|\bchang|\btouch|\bdiff\b|\bPR\b|\bpass/i.test(q))) return false;
+  if (quoted.length > 1 || quoted.some((q) => !/^['"][A-Za-z _.,-]*['"]$/.test(q) || /\bmismatch|\bversus\b|\bvs\b|\bdiffer|\bequal|\binstead\b|\bthan\b|\bnot\b|\bfail|assert|expect|receiv|!==|===|\bmodif|\bchang|\btouch|\bdiff\b|\bPR\b|\bpass/i.test(q))) return false;
   r = r.replace(TEST_FILE, ' ').replace(/'[^']*'|"[^"]*"/g, ' ').replace(CORROBORATION, ' ')
     .replace(/\btimed out(?: at \d+ ?ms)?\b|\btimeouts?\b/gi, ' ').replace(new RegExp(UNRELATED.source, 'gi'), ' ')
     .replace(/\bred only on\b/gi, ' ');

@@ -686,6 +686,10 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out outside the diff; other tests pass; 1 !== 2"))).toBe(false);
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out at 15000ms (unrelated to this change); other tests pass (a file in this PR's diff)"))).toBe(false);
   });
+  it('no named file, or a quoted comparison, stays terminal (audit)', () => {
+    expect(isLoadOnlyRedStandDown(mk("test timed out outside the diff; other tests pass"))).toBe(false);
+    expect(isLoadOnlyRedStandDown(mk("foo.test.mjs timed out (unrelated to this change); other tests pass; 'comparison mismatch: 1 versus 2'"))).toBe(false);
+  });
   it('a bare timeout with no unrelated/other-tests-pass evidence stays terminal', () => {
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
   });
