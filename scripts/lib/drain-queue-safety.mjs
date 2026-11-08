@@ -19,14 +19,36 @@ const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
+const MQ_INFRA_SCAN_BYTES = 256 * 1024;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
+const MQ_INFRA_SIGNATURE_PROBES = ['', 'a', 'ab', 'x\ny', 'test failed', 'Error: assertion failed', 'ok', '1 passed'];
+
+function hasNestedUnboundedQuantifiers(source) {
+  // Track groups structurally so escaped syntax and character classes stay literal.
+  const groups = [false];
+  const unboundedAt = index => /^(?:[+*]|\{\d+,\})/.test(source.slice(index));
+  let inClass = false;
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i];
+    if (char === '\\') { i++; continue; }
+    if (inClass) { if (char === ']') inClass = false; continue; }
+    if (char === '[') { inClass = true; continue; }
+    if (char === '(') groups.push(false);
+    else if (char === ')') {
+      const containsUnbounded = groups.pop();
+      if (containsUnbounded && unboundedAt(i + 1)) return true;
+      if (containsUnbounded) groups[groups.length - 1] = true;
+    } else if (unboundedAt(i)) groups[groups.length - 1] = true;
+  }
+  return false;
+}
 
 function validMqInfraSignatures(value) {
   return Array.isArray(value) && value.length > 0 && value.length <= 32 && value.every(source => {
-    if (typeof source !== 'string' || !source.trim() || source.length > 512) return false;
+    if (typeof source !== 'string' || !source.trim() || source.length > 200) return false;
     try {
       const re = new RegExp(source);
-      return !re.test('') && !['x', 'ordinary test failure', '0123456789'].every(text => re.test(text));
+      return !hasNestedUnboundedQuantifiers(source) && !MQ_INFRA_SIGNATURE_PROBES.some(text => re.test(text));
     } catch { return false; }
   });
 }
@@ -463,7 +485,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, signa
           });
           if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
           // Bound the scan as well as subprocess output. Injected readers may return oversized text.
-          const tail = Buffer.from(text.slice(-MQ_INFRA_LOG_BYTES), 'utf8').subarray(-MQ_INFRA_LOG_BYTES).toString('utf8');
+          const tail = Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
           logVerdicts.set(check.id, patterns.some(pattern => pattern.test(tail)));
         } catch {
           logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';

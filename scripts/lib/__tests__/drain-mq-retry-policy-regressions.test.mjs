@@ -152,3 +152,33 @@ describe('MQ log authorization guard regressions', () => {
     expect(decision.reason).toContain('already spent');
   });
 });
+
+describe('MQ signature cost and specificity bounds', () => {
+  it.each(['[\\s\\S]{2,}', '(a+)+$', '(.*)*', '(?:outage(a{2,}))+', '(outage*){2,}',
+    '.+', '.*', '^', '\\S+', 'test failed', 'Error: assertion failed', 'ok', '1 passed', 'a'.repeat(201)])(
+    'rejects unsafe pattern %j and reports the platform fallback', source => {
+      const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] },
+        platform: { mqInfraSignatures: ['platform outage'] } });
+      expect(result.value.mqInfraSignatures).toEqual(['platform outage']);
+      expect(result.sources.mqInfraSignatures).toBe('platform');
+      expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
+    });
+
+  it.each([...standard, 'a'.repeat(200), 'outage[+*]+', 'outage\\(+\\)+'])('accepts specific bounded pattern %j', source => {
+    const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] }, platform: {} });
+    expect(result.value.mqInfraSignatures).toEqual([source]);
+    expect(result.sources.mqInfraSignatures).toBe('tool');
+    expect(result.invalid).toEqual([]);
+  });
+
+  it.each(['x'.repeat(256 * 1024), 'é'.repeat(128 * 1024)])(
+    'limits pattern scans to the last 256 KiB (suffix case %#)', suffix => {
+      const held = probe({ text: signature + suffix });
+      expect(held.reads).toHaveLength(1);
+      expect(held.decision.hold).toBe(true);
+      expect(held.decision.reason).toContain('non-infrastructure');
+      const accepted = probe({ text: suffix + '\n' + signature });
+      expect(accepted.decision.hold).toBe(false);
+      expect(accepted.reads[0].options.maxBuffer).toBe(bytes);
+    });
+});
