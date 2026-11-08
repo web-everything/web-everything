@@ -8,6 +8,7 @@ import { REVIEW_LABELS } from './review-labels.mjs';
 import { OPEN_PR_MAX_NON_TEST_LINES, parseNumstat, measureEntries, isTestPath } from './pr-size-accounting.mjs';
 import { loadPrSizeSettingsFile } from './pr-size-settings.mjs';
 export { OPEN_PR_MAX_NON_TEST_LINES, measureNonTestLines } from './pr-size-accounting.mjs';
+export const SIZE_OVER_CAP_LABEL = 'size:over-cap';
 const SUMMARY_BYTES = 4096;
 const SUMMARY_COUNT = 100;
 // Require the absolute end of input for identities and paths at trust boundaries.
@@ -154,6 +155,57 @@ export function planSizeAdmission(result) {
   return { ...result, status: result.exempt || result.lines <= OPEN_PR_MAX_NON_TEST_LINES ? 'ok' : 'over' };
 }
 
+function groupFiles(entries) {
+  const groups = new Map(), files = new Set();
+  for (const { paths, changed } of entries) {
+    if (paths.every(isTestPath)) continue;
+    const path = [...paths].reverse().find((path) => !isTestPath(path));
+    const group = path.split('/').slice(0, 2).join('/');
+    groups.set(group, (groups.get(group) || 0) + changed);
+    for (const path of paths.filter((path) => !isTestPath(path))) files.add(path);
+  }
+  return { groups, files };
+}
+
+function summarizeGroups(groups) {
+  const groupSummary = boundedEntries([...groups].map(([group, lines]) => `we:${summaryText(group)}: ${lines}`), '; ');
+  const groupLine = `File groups: ${groups.size ? groupSummary.text : 'unavailable (size unknown)'}`
+    + (groupSummary.omitted ? `; and ${groupSummary.omitted} more (${groupSummary.omitted} group${groupSummary.omitted === 1 ? '' : 's'} omitted; summary budget)` : '');
+  return { groupSummary, groupLine };
+}
+
+/** Pure post-open accounting: callers supply resolved settings, or measureEntries
+ * uses its built-in defaults. No policy reads, labels, events or closing effects run here.
+ */
+export function planSizeGrowth(input) {
+  try {
+    const { numstatText, settings } = input;
+    const entries = parseNumstat(numstatText);
+    const plan = planSizeAdmission(measureEntries(entries, settings));
+    if (plan.status === 'unknown') throw new Error('invalid size measurement');
+    if (plan.status === 'ok') return { status: 'ok', lines: plan.lines };
+    const { groups, files } = groupFiles(entries);
+    const sortedGroups = new Map([...groups].sort((a, b) => b[1] - a[1]));
+    const { groupSummary, groupLine } = summarizeGroups(sortedGroups);
+    return { status: 'over-cap', lines: plan.lines, label: SIZE_OVER_CAP_LABEL, event: 'pr-size-over-cap',
+      splitPlan: { groups: [...sortedGroups].map(([group, lines]) => ({ group, lines })), files: [...files],
+        text: groupLine + (groupSummary.omitted
+          ? ' Human review of the full diff is required; bounded summaries are incomplete.' : '') },
+      autoClose: false };
+  } catch {
+    return { status: 'unknown', lines: null, label: SIZE_OVER_CAP_LABEL, event: 'pr-size-unmeasurable',
+      splitPlan: null, autoClose: false,
+      reason: 'Size could not be measured; human review of the full diff is required.' };
+  }
+}
+
+/** Only a crossing from ok needs a new escalation event. */
+export function planGrowthTransition({ before, after }) {
+  if (after.status === 'ok') return { flag: false };
+  if (before.status === 'ok') return { flag: true, crossed: true };
+  return { flag: true, crossed: false, reemit: false };
+}
+
 function fileSplitItem(fields, cwd) {
   // Scaffold resolves its root by script location, not cwd. Use the target lane's
   // copy so a direct pr-land caller cannot file in the dispatcher's checkout.
@@ -293,19 +345,8 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), env = process.e
     // make an unresolved head eligible for trusted card lookup.
     const markerKey = key || sha256(JSON.stringify([repo, request.pr ?? ref, sha, base]));
     const filingRequest = { ...request, repo, sha: head, baseSha, key: markerKey };
-    const groups = new Map(), files = new Set();
-    if (plan.status === 'over') {
-      for (const { paths, changed } of entries) {
-        if (paths.every(isTestPath)) continue;
-        const path = [...paths].reverse().find((path) => !isTestPath(path));
-        const group = path.split('/').slice(0, 2).join('/');
-        groups.set(group, (groups.get(group) || 0) + changed);
-        for (const path of paths.filter((path) => !isTestPath(path))) files.add(path);
-      }
-    }
-    const groupSummary = boundedEntries([...groups].map(([group, lines]) => `we:${summaryText(group)}: ${lines}`), '; ');
-    const groupLine = `File groups: ${groups.size ? groupSummary.text : 'unavailable (size unknown)'}`
-      + (groupSummary.omitted ? `; and ${groupSummary.omitted} more (${groupSummary.omitted} group${groupSummary.omitted === 1 ? '' : 's'} omitted; summary budget)` : '');
+    const { groups, files } = groupFiles(plan.status === 'over' ? entries : []);
+    const { groupSummary, groupLine } = summarizeGroups(groups);
     // file-item's legacy comma-list API cannot represent commas. Its YAML writer
     // supplies the surrounding double quotes: JSON-escape their CONTENTS here.
     // Escape before budgeting so controls/quotes cannot expand past the argument cap.
