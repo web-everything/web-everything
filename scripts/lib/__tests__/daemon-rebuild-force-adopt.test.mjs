@@ -666,6 +666,31 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(handoffOf(env)).toMatch(/NOT adopted [0-9a-f]{40} \(adoption did not complete\)/);
   });
 
+  it('failed forced finalization after HEAD already moved to the forced sha keeps the watch', async () => {
+    const { cloneDir, env, target, arm } = setup();
+    arm();
+    let moved = false;
+    const run = (args, opts) => {
+      // Simulate an exception after the reset landed, with git unavailable for the recovery reset too.
+      if (moved) throw new Error('git unavailable after forced reset');
+      const result = gitRun(args, opts);
+      if (opts?.cwd === cloneDir && args[0] === 'reset' && args.includes('--hard') && args.includes(target)) {
+        expect(result.status).toBe(0);
+        moved = true;
+        throw new Error('git unavailable after forced reset');
+      }
+      return result;
+    };
+    const log = { error: vi.fn() };
+    await expect(tick(cloneDir, env, { runSmoke: failing(), run, log, forceWatchProbe: healthy }))
+      .rejects.toThrow('git unavailable after forced reset');
+    expect(moved).toBe(true);
+    expect(headOf(cloneDir)).toBe(target);
+    expect.soft(readForceWatch(cloneDir, env)).toMatchObject({ sha: target });
+    expect.soft(handoffOf(env)).not.toContain('NOT adopted');
+    expect(log.error.mock.calls.flat().join('\n')).not.toContain('NOT adopted');
+  });
+
   it('a finalization that throws clears the watch AND the ready candidate before the error propagates', async () => {
     const { cloneDir, env, lastGood, arm } = setup();
     arm();
@@ -731,6 +756,52 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     expect(headOf(cloneDir)).toBe(F); // F is force-adopted
     return { originDir, cloneDir, env, F };
   };
+
+  it('readyOnly job process never ticks the force watch', async () => {
+    const { cloneDir, env, F } = await forceAdoptF();
+    const watchBefore = readForceWatch(cloneDir, env);
+    expect(watchBefore).toMatchObject({ sha: F });
+    const probe = vi.fn(async () => ({ healthy: false }));
+    const rollback = vi.fn();
+    const run = (args, opts) => {
+      if (opts?.cwd === cloneDir && args[0] === 'reset' && args.includes('--hard')) rollback(args);
+      return gitRun(args, opts);
+    };
+    await tick(cloneDir, env, { readyOnly: true, runSmoke: passing(), forceWatchProbe: probe, run });
+    expect(probe).not.toHaveBeenCalled();
+    expect(rollback).not.toHaveBeenCalled();
+    expect(headOf(cloneDir)).toBe(F);
+    expect(readForceWatch(cloneDir, env)).toEqual(watchBefore);
+  });
+
+  it('skip-unrelated falls back to build+smoke when the unverified status cannot be recorded', async () => {
+    const { originDir, cloneDir, env } = await forceAdoptF();
+    const successor = advanceMain(originDir, (dir) => writeFile(dir, 'docs.md', 'docs only\n'));
+    let skipPath = false;
+    let refusedTree = false;
+    const run = (args, opts) => {
+      if (skipPath && !refusedTree && opts?.cwd === cloneDir && args[0] === 'rev-parse' && args.includes(`${successor}^{tree}`)) {
+        refusedTree = true;
+        return { status: 128, stdout: '', stderr: 'successor tree unavailable' };
+      }
+      return gitRun(args, opts);
+    };
+    const smokedHeads = [];
+    const runSmoke = vi.fn(async ({ root }) => {
+      smokedHeads.push(headOf(root));
+      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    });
+    const result = await tick(cloneDir, env, {
+      run, runSmoke, forceWatchProbe: healthy,
+      skipCheck: () => { skipPath = true; return { skip: true, reason: 'docs-only' }; },
+    });
+    expect(refusedTree).toBe(true); // the failure reached the inheritance guard, not an earlier prepare read
+    expect(result.reason).not.toBe('skipped-unrelated');
+    expect(result.skippedSmoke).not.toBe(true);
+    expect(runSmoke).toHaveBeenCalled();
+    expect(runSmoke.mock.calls[0][0].changedFiles).toBeNull();
+    expect(smokedHeads).toContain(successor);
+  });
 
   it('a successor touching only an unrelated file re-runs the checks F failed (full smoke) and is not adopted while they fail', async () => {
     const { originDir, cloneDir, env, F } = await forceAdoptF();
@@ -810,5 +881,33 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     const next = passing();
     await tick(cloneDir, env, { runSmoke: next, forceWatchProbe: healthy });
     expect(Array.isArray(next.mock.calls[0][0].changedFiles)).toBe(true);
+  });
+});
+
+
+describe('R508 dispatch smoke after a force', () => {
+  it('a force-adopted head stays a dispatch-smoke suspect', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const ref = 'lane/dispatch-fix';
+    const overlaySha = pushBranch(originDir, ref, (dir) => writeFile(dir, 'scripts/dispatch.mjs', '// dispatch fix\n'));
+    addOverlay(cloneDir, { ref, pinned: true }, { env });
+    const match = vi.fn((files) => files.filter((file) => file === 'scripts/dispatch.mjs'));
+    const dispatchRun = vi.fn(async () => ({ ok: true }));
+    const dispatchSmoke = { settings: { dispatchSmoke: 'on', dispatchPaths: ['scripts/**'] }, match, run: dispatchRun };
+    const held = await tick(cloneDir, env, { runSmoke: failing(), dispatchSmoke, forceWatchProbe: healthy });
+    const F = held.plan.finalSha;
+    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: F, rulingsText: RULINGS }).ok).toBe(true);
+    await tick(cloneDir, env, { runSmoke: failing(), dispatchSmoke, forceWatchProbe: healthy });
+    expect(headOf(cloneDir)).toBe(F);
+    expect(readRebuildState(cloneDir, env).adopted.applied).toEqual(expect.arrayContaining([expect.objectContaining({ ref, sha: overlaySha })]));
+    expect(dispatchRun).not.toHaveBeenCalled(); // failed ordinary smoke never proved this overlay
+    advanceMain(originDir, (dir) => writeFile(dir, 'docs.md', 'successor\n'));
+    match.mockClear();
+    await tick(cloneDir, env, { runSmoke: passing(), dispatchSmoke, forceWatchProbe: healthy });
+    // With adoptedApplied:null the real dispatchSmokeSuspects revisits even the identical adopted overlay.
+    // An adoptedApplied list would exempt ref+sha here and suppress the dispatch entirely.
+    expect(match).toHaveBeenCalledWith(expect.arrayContaining(['scripts/dispatch.mjs']), ['scripts/**']);
+    expect(dispatchRun).toHaveBeenCalledOnce();
   });
 });
