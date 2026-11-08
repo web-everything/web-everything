@@ -576,13 +576,14 @@ export const RERUN_MARKER_PREFIX = 'red-main-quarantine-rerun-';
  * throws; a failed request is reported (`error`, with the manual fallback command) and the claim kept: at most one logical request per sha (the shared gh throttle may retry a rate-limited call, bounded).
  * @returns {{rerun:boolean, runId?:number, reason?:string, error?:string}}
  */
-export function rerunRedMainFailedJobs({ brokenSha, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug, dir = join(tmpdir(), 'we-red-main-quarantine') } = {}) {
-  if (!/^[0-9a-f]{7,40}$/i.test(String(brokenSha ?? ''))) return { rerun: false, reason: 'no-broken-sha' };
+export function rerunRedMainFailedJobs({ brokenSha: rawSha, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug, dir = join(tmpdir(), 'we-red-main-quarantine') } = {}) {
+  if (!/^[0-9a-f]{7,40}$/i.test(String(rawSha ?? ''))) return { rerun: false, reason: 'no-broken-sha' };
+  const brokenSha = String(rawSha).toLowerCase(); // git/GitHub shas are lowercase; compare and claim on one spelling
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' };
   let marker = null;
   try {
     const runs = JSON.parse(String(exec('gh', ['run', 'list', '--repo', repoSlug, '--workflow', 'ci.yml', '--branch', 'main', '--limit', '30', '--json', 'databaseId,headSha,status,conclusion,createdAt'], opts) || '[]'));
-    const mine = (Array.isArray(runs) ? runs : []).filter((r) => r && typeof r.headSha === 'string' && (r.headSha === brokenSha || r.headSha.startsWith(brokenSha)));
+    const mine = (Array.isArray(runs) ? runs : []).filter((r) => r && typeof r.headSha === 'string' && r.headSha.toLowerCase().startsWith(brokenSha));
     const latest = mine.sort((x, y) => Date.parse(y.createdAt) - Date.parse(x.createdAt) || y.databaseId - x.databaseId)[0];
     if (!latest) return { rerun: false, reason: 'no-run-for-sha' };
     if (latest.status !== 'completed' || latest.conclusion !== 'failure') return { rerun: false, reason: 'latest-run-not-failed', runId: latest.databaseId };
@@ -624,6 +625,23 @@ export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = fal
   return testsToSkip({ list: r.list, now, prNumber, fixPrs, onMain });
 }
 
+/**
+ * The `add` command: write the quarantine change, then (only when the write did not report `ok:false`) re-run the failed
+ * jobs of the broken main run and attach the result as `rerun`. Pure wiring over injectable `write`/`rerun`, so the
+ * CLI path (the `--dir` pass-through, the skip on a refused write, the `rerun` field in the output) has a test.
+ * @returns {object} the object the CLI prints as JSON
+ */
+export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChange, rerun = rerunRedMainFailedJobs } = {}) {
+  const tests = String(f.tests ?? '').split(',').filter(Boolean);
+  const ttlMs = f['ttl-min'] ? Number(f['ttl-min']) * 60_000 : undefined;
+  const out = write({
+    actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(f['broken-sha']).slice(0, 9)}, by ${f.actor})`,
+    change: (cur) => addEntries(cur, { tests, brokenSha: f['broken-sha'], owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
+  });
+  const result = out?.ok === false ? undefined : rerun({ brokenSha: f['broken-sha'], ...(f.dir ? { dir: f.dir } : {}) });
+  return result ? { ...out, rerun: result } : out;
+}
+
 function cli(argv) {
   const cmd = argv[0];
   const f = flagsOf(argv.slice(1));
@@ -642,14 +660,7 @@ function cli(argv) {
   }
   if (cmd === 'show') { writeAllSync(1, JSON.stringify(readQuarantine(), null, 2) + '\n'); return; }
   if (cmd === 'add') {
-    const tests = String(f.tests ?? '').split(',').filter(Boolean);
-    const ttlMs = f['ttl-min'] ? Number(f['ttl-min']) * 60_000 : undefined;
-    const out = writeQuarantineChange({
-      actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(f['broken-sha']).slice(0, 9)}, by ${f.actor})`,
-      change: (cur) => addEntries(cur, { tests, brokenSha: f['broken-sha'], owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
-    });
-    const rerun = out?.ok === false ? undefined : rerunRedMainFailedJobs({ brokenSha: f['broken-sha'], ...(f.dir ? { dir: f.dir } : {}) });
-    writeAllSync(1, JSON.stringify(rerun ? { ...out, rerun } : out) + '\n');
+    writeAllSync(1, JSON.stringify(runAddCommand(f, { now })) + '\n');
     return;
   }
   if (cmd === 'prune') {

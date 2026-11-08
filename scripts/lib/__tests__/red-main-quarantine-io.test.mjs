@@ -1,9 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs } from '../red-main-quarantine-io.mjs';
+import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs, runAddCommand } from '../red-main-quarantine-io.mjs';
 import { addEntries, pruneOnGreen, testsToSkip } from '../red-main-quarantine.mjs';
 
 const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -69,6 +69,34 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
   });
 });
 
+describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
+  const flags = { tests: 'a.test.mjs', 'broken-sha': SHA, owner: 'o', reason: 'r', actor: 'a' };
+  it('a successful add calls the rerun with the broken sha and --dir, and attaches `rerun` to the output', () => {
+    const rerun = vi.fn(() => ({ rerun: true, runId: 42 }));
+    const write = vi.fn(() => ({ ok: true, events: [] }));
+    const out = runAddCommand({ ...flags, dir: '/claims' }, { write, rerun });
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(rerun).toHaveBeenCalledWith({ brokenSha: SHA, dir: '/claims' });
+    expect(out).toMatchObject({ ok: true, rerun: { rerun: true, runId: 42 } });
+  });
+  it('without --dir the rerun gets no dir (its default applies)', () => {
+    const rerun = vi.fn(() => ({ rerun: false, reason: 'already-rerun' }));
+    runAddCommand(flags, { write: () => ({ ok: true }), rerun });
+    expect(rerun).toHaveBeenCalledWith({ brokenSha: SHA });
+  });
+  it('a write that reports ok:false triggers no rerun and carries no `rerun` field', () => {
+    const rerun = vi.fn(() => ({ rerun: true }));
+    const out = runAddCommand(flags, { write: () => ({ ok: false, error: 'nope' }), rerun });
+    expect(rerun).not.toHaveBeenCalled();
+    expect(out).toEqual({ ok: false, error: 'nope' });
+  });
+  it('a write that throws propagates and triggers no rerun', () => {
+    const rerun = vi.fn();
+    expect(() => runAddCommand(flags, { write: () => { throw new Error('refused'); }, rerun })).toThrow('refused');
+    expect(rerun).not.toHaveBeenCalled();
+  });
+});
+
 describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of the broken main run, once per sha', () => {
   const runs = (list) => JSON.stringify(list);
   const fake = (list, { failRerun = false } = {}) => {
@@ -131,6 +159,13 @@ describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of
     const { exec, calls } = fake(red);
     expect(rerunRedMainFailedJobs({ brokenSha: SHA.slice(0, 7), exec, dir, repoSlug: 'o/r' }).rerun).toBe(true);
     expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, reason: 'already-rerun' });
+    expect(reruns(calls)).toHaveLength(1);
+  });
+  it('an uppercase sha (short or full) matches the lowercase run sha and shares its claim', () => {
+    const dir = dirOf();
+    const { exec, calls } = fake(red);
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA.slice(0, 9).toUpperCase(), exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: true, runId: 42 });
+    expect(rerunRedMainFailedJobs({ brokenSha: SHA.toUpperCase(), exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, reason: 'already-rerun' });
     expect(reruns(calls)).toHaveLength(1);
   });
   it('an exclusive-create failure that is not "already claimed" fails closed (claim path is a directory)', () => {
