@@ -3214,7 +3214,8 @@ describe('R706 — proven human-clearance carriers', () => {
       at({ body: carrier().body.replace(diff, 'e'.repeat(64)) }),
       at({ body: carrier().body.replace(buildReviewedDiffMarker(diff), '') }),
       at({ author: undefined, viewerDidAuthor: true }),
-      at({ author: { login: 'ghost' } }),
+      // A placeholder login is trusted here only through viewer evidence; an untrusted 'ghost' cannot end anything.
+      at({ author: { login: 'ghost' }, viewerDidAuthor: true }),
       restamp(at().body.replace(buildReviewedShaMarker(unrelated), `<!-- REVIEWED-SHA: ${unrelated.toUpperCase()} -->`).replace('IC_original', 'IC_forged')),
     ];
     for (const policy of [{ mechanicalCarry: 'refuse' }, { mechanicalCarry: 'trust-drain-record' }]) {

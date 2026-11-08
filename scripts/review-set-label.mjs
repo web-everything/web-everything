@@ -1835,8 +1835,9 @@ export function runReviewLabelCli({
   if (to === 'restamp' && humanClearance) {
     const sourceId = latestHumanClearanceSourceId(prComments)
       ?? latestHumanClearanceSourceId(readCarryEvidence().comments);
-    // Missing evidence is left unstamped: readers refuse the unproven carrier.
-    humanClearance = { ...humanClearance, sourceId };
+    // R728: with no citable source the clearance cannot be carried. Readers would treat an uncited carrier as a plain
+    // accept that ends the chain, so post exactly that: a plain restamp, never a `cleared-human` record nobody proved.
+    humanClearance = sourceId ? { ...humanClearance, sourceId } : null;
   }
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
