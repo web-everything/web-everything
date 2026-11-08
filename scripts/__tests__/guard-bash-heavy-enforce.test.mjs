@@ -143,6 +143,30 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     expect(decide(`eval -- ${run}`, {})).not.toBeNull();
     expect(decide(`eval -- '${run}'`, {})).not.toBeNull();
   });
+  // Operator send-back on #6461 round 7: a wrapper's command string is a whole command line, so a heavy run after
+  // another command in it (`npx --call "echo ok; npx vitest run a"`) is denied, and the admitted one is allowed.
+  it.each([
+    'npx --call "echo ok; npx vitest run a"', 'npx -c "echo ok; npx vitest run a"', 'npx --call="echo ok; npx vitest run a"',
+    'flock /tmp/l -c "echo ok; npx vitest run a"', 'watch "echo ok; npx vitest run a"', 'npx -c "echo ok && npx playwright test a"',
+  ])('denies the nested heavy run of a wrapper command string `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it('allows an admitted run inside a wrapper command string', () => {
+    expect(decide(`npx -c "echo ok; ${queue}npx vitest run a"`, {})).toBeNull();
+  });
+  // Operator send-back on #6461 round 7: the shell's `-c` is read by the shared shellCString reader, so `-c` in any
+  // option cluster and options that take a value before it hide nothing.
+  it.each([
+    'bash -ce "npx vitest run a"', 'bash -o pipefail -c "npx vitest run a"', 'bash -O extglob -c "npx vitest run a"',
+    'bash --rcfile f -c "npx vitest run a"', 'bash -euo pipefail -c "npx vitest run a"', 'sh -ec "npx vitest run a"',
+    'busybox sh -ec "npx vitest run a"', "bash -o pipefail -c 'npx playwright test a'",
+  ])('denies a heavy run behind a shell `-c` with options `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it('allows an admitted run behind a shell `-c` with options, and a script file', () => {
+    expect(decide(`bash -o pipefail -c "${queue}npx vitest run a"`, {})).toBeNull();
+    expect(decide('bash -o pipefail script.sh', {})).toBeNull();
+  });
   it.each(execWrappers.filter(wrapper => !/^(?:nohup|setsid)$/.test(wrapper)))('allows the admitted run behind `%s`', wrapper => {
     expect(decide(`${wrapper} ${queue}npx vitest run a`, {})).toBeNull();
   });

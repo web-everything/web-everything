@@ -352,6 +352,19 @@ describe('agent command audit', () => {
     expect(classifyCommand(`${queue}eval 'npx vitest run a; npx playwright test b'`).map(({ category, queued }) => [category, queued]))
       .toEqual([['vitest', true], ['playwright', true]]);
   });
+  // Operator send-back on #6461 round 7: a wrapper's command-string (`npx --call "…"`, `npx -c "…"`, `flock f -c "…"`,
+  // `watch "…"`, `pnpm dlx -c "…"`) is a whole command line, so every command in it is classified.
+  it.each([
+    'npx --call "echo ok; npx vitest run a"', 'npx -c "echo ok; npx vitest run a"', 'npx --call="echo ok; npx vitest run a"',
+    'flock /tmp/l -c "echo ok; npx vitest run a"', 'watch "echo ok; npx vitest run a"', 'pnpm dlx -c "echo ok; npx vitest run a"',
+  ])('classifies the nested run of a wrapper command string: %s', command => {
+    expect(classifyCommand(command).map(({ category, queued }) => [category, queued])).toEqual([['vitest', false]]);
+  });
+  it('classifies every command of a wrapper command string, admitted or not', () => {
+    expect(classifyCommand('npx -c "echo ok && npx playwright test a"').map(row => row.category)).toEqual(['playwright']);
+    expect(classifyCommand(`npx -c "echo ok; ${queue}npx vitest run a"`).map(({ category, queued }) => [category, queued]))
+      .toEqual([['vitest', true]]);
+  });
   it.each(['nohup echo hi', 'nohup npx playwright --version', 'eval echo playwright test', 'setsid ls'])('leaves a harmless launched command unaudited: %s', cmd => {
     expect(classifyCommand(cmd)).toEqual([]);
   });
@@ -393,6 +406,29 @@ describe('agent command audit', () => {
   it('redacts only the password of a quoted htpasswd program and keeps the next command', () => {
     expect(redact("'/usr/bin/htpasswd' -nb user Zq9vWm4Lp; npm ci")).toBe("'/usr/bin/htpasswd' -nb user [REDACTED]; npm ci");
     expect(redact('"htpasswd" -nb u Zq9vWm4Lp && echo ok')).toBe('"htpasswd" -nb u [REDACTED] && echo ok');
+  });
+  // Operator send-back on #6461 round 7: a credential header's value runs to the end of its argument, past `;`,
+  // spaces and quotes inside it, so a later cookie (`sid=…`) or Digest field is redacted too.
+  it('redacts every cookie of a Cookie header value through auditLines', () => {
+    const command = "git clone -c 'http.extraHeader=Cookie: theme=light; sid=Zq9vWm4Lp' https://x.test/r.git";
+    const out = JSON.stringify(auditLines([claude(command)]));
+    expect(out).not.toContain('Zq9vWm4Lp');
+    expect(out).not.toMatch(/sid=/);
+    expect(redact(command)).toBe("git clone -c 'http.extraHeader=[REDACTED]' https://x.test/r.git");
+  });
+  it.each([
+    'curl -H "Cookie: a=1; sid=Zq9vWm4Lp" u', "curl -H 'Set-Cookie: a=1; sid=Zq9vWm4Lp' u", 'curl -H Cookie:\\ a=1\\;\\ sid=Zq9vWm4Lp u',
+    'git -c "http.extraHeader=Cookie: theme=light; sid=Zq9vWm4Lp" fetch',
+    'curl -H \'Authorization: Digest username="u", response="Zq9vWm4Lp"\' u', 'curl -H "X-Api-Key: a b Zq9vWm4Lp" u',
+    'curl -H "Cookie:a=1;sid=Zq9vWm4Lp" u', "curl -b x -H $'Cookie: a=1; sid=Zq9vWm4Lp' u",
+  ])('redacts a whole credential header value inside one argument: %s', command => {
+    const out = redact(command);
+    expect(out).not.toContain('Zq9vWm4Lp');
+    expect(out).toContain('[REDACTED]');
+  });
+  it('keeps a harmless header value and the arguments after a credential header', () => {
+    expect(redact("curl -H 'Accept: a; q=Zq9vWm4Lp' u")).toBe("curl -H 'Accept: a; q=Zq9vWm4Lp' u");
+    expect(redact('curl -H "Cookie: a=1; sid=Zq9vWm4Lp" -o out.txt u')).toBe('curl -H "[REDACTED]" -o out.txt u');
   });
   it('keeps the words around a quoted option value and a look-alike long option', () => {
     expect(redact("mysql -h db '-p'Zq9vWm4Lp -e 'select 1'")).toBe("mysql -h db -p [REDACTED] -e 'select 1'");

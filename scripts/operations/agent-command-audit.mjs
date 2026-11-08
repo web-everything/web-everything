@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, commandSubstitutionBodies, envSplitString, heavyRunHeads, heredocFeedsShell, heredocScan, parseSegments, shellCString, shellTokens, stripShellControl, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, envSplitString, heavyRunHeads, heredocFeedsShell, heredocScan, parseSegments, runnerInvocation, shellCString, shellTokens, stripShellControl, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -348,11 +348,39 @@ function redactLine(text) {
   return redactLineRules(clean) + (cut ? ' …[truncated]' : '');
 }
 
+// A credential header name and its colon inside one shell word, with a value after it in that word.
+const HEADER_IN_WORD = /(?<![\w-])([\w-]+)\s*:\s*(?=\S)/g;
+
+/** A credential header inside one shell word (`'Cookie: a=1; sid=v'`, `-c 'http.extraHeader=Cookie: …'`,
+ *  `Cookie:\ a=1\;\ sid=v`, `'Authorization: Digest u="x", response="v"'`): its value runs to the END of that word,
+ *  past the `;`, spaces and quotes inside it, so a later cookie or Digest field is redacted too (operator
+ *  send-back on #6461 round 7). The word's closing quote is kept. One pass over the words; linear. */
+function redactHeaderWords(text) {
+  let out = '', last = 0;
+  for (let i = 0; i < text.length;) {
+    if (/[\s;|&()<>]/.test(text[i])) { i += 1; continue; }
+    const end = Math.max(shellWordEnd(text, i), i + 1);
+    const word = text.slice(i, end);
+    const close = /["']$/.test(word) && word.length > 1 ? word.slice(-1) : '';
+    HEADER_IN_WORD.lastIndex = 0;
+    for (let m; (m = HEADER_IN_WORD.exec(word));) {
+      if (HEADER_IN_WORD.lastIndex >= word.length - close.length) break; // no value left in this word
+      if (!CREDENTIAL_HEADER.test(m[1])) continue;
+      out += text.slice(last, i + m.index) + '[REDACTED]' + close;
+      last = end;
+      break;
+    }
+    i = end;
+  }
+  return out + text.slice(last);
+}
+
 function redactLineRules(clean) {
   // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
   // Every rule that starts with a repeated class is anchored to a word start, so none of them is quadratic.
   // URL userinfo and curl/git-style `user:password` pairs are bounded as whole shell words (quoted parts included).
-  const headers = redactUrlUserinfo(clean)
+  // A header value inside one word runs to the word's end; a value in the next word is left to the rule below.
+  const headers = redactUrlUserinfo(redactHeaderWords(clean))
     // HTTP-style credential headers and `token: v`, with or without an auth scheme word.
     // A value opening with an escaped quote (`password: \"v\"`) is a quoted member, left to redactJsonMembers.
     .replace(/(?<![\w-])([\w-]+)\s*:\s*(?:(?:Bearer|Basic|Digest|Negotiate|token)\s+)?[^\s"';\\][^\s"';]*/gi,
@@ -446,6 +474,14 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
     const shellC = shellCString(head);
     if (shellC) {
       for (const hit of classifyCommand(shellC.text, depth + 1, shellC.innerSubstitutions)) out.push({ ...hit, queued: queued || hit.queued });
+      continue;
+    }
+    // A wrapper's command string is a whole command line: canonicalCommand keeps it (`npx --call "<line>"`,
+    // `npx -c`, `flock f -c`, `watch`) and a runner's `-c`/`--call`/`dlx -c` hands it on (`pnpm dlx -c "<line>"`).
+    // With more than one command in it, each one is classified (operator send-back on #6461 round 7).
+    const line = [head, runnerInvocation(head)?.exec].find(text => text && parseSegments(text).segments.length > 1);
+    if (line) {
+      for (const hit of classifyCommand(line, depth + 1, false)) out.push({ ...hit, queued: queued || hit.queued });
       continue;
     }
     // The command a launcher runs (`nohup …`, `setsid -f …`, `eval '…'`), unwrapped by the Bash guard's shared walker,

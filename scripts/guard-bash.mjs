@@ -1439,8 +1439,6 @@ export function unparseableReason(command) {
 // happened to contain a SEPARATOR; `bash -c "npm run build"` walked through it), and it is structural
 // rather than accidental, so it does not depend on where the separators fall.
 const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'busybox']);
-/** `-c`, `-ec`, `-xc`… — the flag whose VALUE is a command line the shell executes. */
-const SHELL_C_FLAG = /^-[A-Za-z]*c$/;
 // Bounded so a pathological nest can never wedge the guard (the deep-`exec` RangeError is a known,
 // separately-filed follow-up; this expansion must not add a second one).
 const NESTED_DEPTH_CAP = 4;
@@ -1610,19 +1608,22 @@ export function nestedCommandStrings(segment) {
    *  redirect to a non-scratch path. A `'…'` word resolves nothing, so it is passed through verbatim. */
   const asShellSees = (w) => (w.dq ? w.text.replace(/\\(["\\$`])/g, '$1') : w.text);
 
+  // A wrapper's command string (`npx --call "<line>"`, `npx -c "<line>"`, `flock f -c "<line>"`, `watch "<line>"`)
+  // is what canonicalCommand returns, kept whole; with more than one command in it, every command is re-executed
+  // (operator send-back on #6461 round 7: `npx --call "echo ok; npx vitest run a"` hid the vitest run).
+  if (parseSegments(cmd).segments.length > 1) reexec(cmd);
+
   const words = headWords(cmd);
   const prog = words.length ? words[0].text : '';
   if (prog === 'eval') {
     // bash concatenates eval's arguments with a space and executes the result; a leading `--` ends eval's options.
     reexec(words.slice(words[1]?.text === '--' ? 2 : 1).map(asShellSees).join(' '));
   } else if (SHELL_PROGRAMS.has(prog)) {
-    for (let i = 1; i < words.length; i++) {
-      const w = words[i].text;
-      if (SHELL_C_FLAG.test(w)) { if (words[i + 1]) reexec(asShellSees(words[i + 1])); break; }
-      if (w.startsWith('-')) continue;
-      if (prog === 'busybox' && SHELL_PROGRAMS.has(w)) continue;   // `busybox sh -c '…'`
-      break;                                                        // a SCRIPT FILE, not a `-c` string
-    }
+    // The shared `-c` reader: `-c` in any cluster (`-ce`, `-euxc`), options that take a value before it (`-o
+    // pipefail`, `-O extglob`, `--rcfile f`) and `busybox sh` (operator send-back on #6461 round 7). A script
+    // file operand is not a command string.
+    const shellC = shellCString(cmd);
+    if (shellC) reexec(shellC.text);
   } else {
     const inv = runnerInvocation(cmd);
     if (inv && inv.exec) reexec(inv.exec);
