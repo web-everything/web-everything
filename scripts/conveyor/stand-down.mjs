@@ -821,7 +821,7 @@ if (IS_CLI) {
     const named = new Set((detail ?? '').match(/[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi) ?? []);
     if (!named.size) return false;
     try {
-      const out = execFileSync('gh', ['pr', 'diff', String(pr), '--name-only', ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : [])], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+      const out = execFileSync('gh', ['pr', 'diff', String(pr), '--name-only', ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : [])], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
       return out.split('\n').some((f) => named.has(f.split('/').pop()));
     } catch { return true; } // unreadable diff: fail closed, stays terminal
   })();
