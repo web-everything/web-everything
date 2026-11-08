@@ -8,6 +8,9 @@
  * A registration retires only on git-proved evidence:
  *   - `in-main` / `pr-merged`: merging it onto main changes nothing (exact tree compare, so any history shape:
  *     merged, squash-merged, or a loader `-m<N>` merge ref of a merged branch).
+ *   - `redundant-merge-sibling`: an unpinned loader merge ref with no recorded PR or edge resolution conflicts
+ *     with main, but every non-merge commit it carries is in its registered base's origin tip, whose PR is OPEN.
+ *     Every sibling merge must reproduce its parents' clean merge tree, proving it adds no resolution edits.
  *   - `superseded`: its PR is CLOSED unmerged, a MERGED PR of the same repository, merged into main and reachable
  *     from main, cross-references it and declares `Supersedes #N` in visible prose. Its author and any post-merge
  *     body editor must be trusted (supersede-rule.mjs). Every non-merge commit the
@@ -103,12 +106,12 @@ function ghJson(gh, args) {
 /** The registration's PR: its recorded number, else a PR whose head is the ref, else (for `-m<N>`) its base branch. */
 function findPr({ gh, row, repo }) {
   if (Number.isInteger(row.pr)) {
-    const view = ghJson(gh, ['pr', 'view', String(row.pr), '--repo', repo, '--json', 'number,state,headRefName']);
+    const view = ghJson(gh, ['pr', 'view', String(row.pr), '--repo', repo, '--json', 'number,state,headRefName,isCrossRepository']);
     return view.ok && view.value ? { ok: true, pr: view.value, via: 'registration' } : { ok: false };
   }
   for (const [head, via] of [[row.ref, 'head'], [mergeRefBase(row.ref), 'merge-ref-base']]) {
     if (!head) continue;
-    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', head, '--state', 'all', '--json', 'number,state,headRefName', '--limit', '5']);
+    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', head, '--state', 'all', '--json', 'number,state,headRefName,isCrossRepository', '--limit', '5']);
     if (!list.ok || !Array.isArray(list.value)) return { ok: false };
     const exact = list.value.filter((pr) => pr?.headRefName === head);
     if (exact.length > 1) return { ok: false, ambiguous: true };
@@ -149,10 +152,12 @@ function prCommits({ gh, pr, repo }) {
 
 /**
  * Decide, per registration, whether it retires. Never mutates anything.
- * @param {{rows:Array<{ref:string, pr?:number|null}>, git:Function, gh:Function, repo:string, mainRef?:string}} o
+ * `proofRows` are registrations that may be CITED as evidence (a redundant sibling's base) but are never decided
+ * here: a caller that withholds a registration from `rows` (the loader's own candidate) still passes it as proof.
+ * @param {{rows:Array<{ref:string, pr?:number|null}>, proofRows?:Array<{ref:string, pr?:number|null}>, git:Function, gh:Function, repo:string, mainRef?:string}} o
  * @returns {Array<{ref:string, action:'retire'|'keep', reason:string, tip?:string, pr?:number|null, evidence?:object}>}
  */
-export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }) {
+export function planRetirements({ rows, proofRows = [], git, gh, repo, mainRef = 'origin/main' }) {
   return rows.map((row) => {
     const keep = (reason, extra = {}) => ({ ref: row.ref, action: 'keep', reason, ...extra });
     const carried = carriedBeyondMain({ git, ref: row.ref, mainRef });
@@ -166,6 +171,33 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     if (!found.ok) return keep(found.ambiguous ? 'pr-ambiguous' : 'pr-state-unknown', { tip, evidence });
     const pr = found.pr;
     const prNumber = pr ? pr.number : null;
+    const baseRef = mergeRefBase(row.ref);
+    const baseRow = baseRef && row.pr == null && !row.pinned && !row.edgeResolution
+      ? [...rows, ...proofRows].find((entry) => entry.ref === baseRef) : null;
+    // Ancestry alone cannot preserve edits introduced by merge commits. Unverifiable or edited merge
+    // trees must stay registered; only reproducible clean merges can be ignored for containment.
+    // A sibling with its OWN open PR keeps its registration however that PR was found (recorded or by head lookup):
+    // only the base's PR, found via `merge-ref-base`, is not the sibling's own.
+    const ownOpenPr = pr?.state === 'OPEN' && found.via !== 'merge-ref-base';
+    if (baseRow && carried.cleanMerges && !ownOpenPr) {
+      const baseFound = findPr({ gh, row: baseRow, repo });
+      // A base registration's `pr:N` may point at an unrelated PR: the PR must actually be the base branch's own.
+      // Identity is repo plus branch: a fork PR heading a same-named branch is not the origin base's PR.
+      if (baseFound.ok && baseFound.pr?.state === 'OPEN' && baseFound.pr.headRefName === baseRef
+        && baseFound.pr.isCrossRepository === false) {
+        const baseCarried = carriedBeyondMain({ git, ref: baseRow.ref, mainRef });
+        if (baseCarried.ok && carried.unique.every((sha) =>
+          git(['merge-base', '--is-ancestor', sha, baseCarried.tip]).code === 0)) {
+          // Exit 1 proves conflicts; other failures are unreadable evidence. Merge commits do not enter
+          // the containment check: the registered base preserves the sibling's non-merge work.
+          const onto = git(['merge-tree', '--write-tree', '--no-messages', mainRef, tip]);
+          if (onto.code === 1) {
+            return { ref: row.ref, action: 'retire', reason: 'redundant-merge-sibling', tip, pr: prNumber,
+              evidence: { ...evidence, basePr: baseFound.pr.number, baseRef, baseTip: baseCarried.tip } };
+          }
+        }
+      }
+    }
     // An open PR may still receive commits that belong on the prototype.
     if (pr && pr.state === 'OPEN') return keep('pr-open', { tip, pr: prNumber, evidence });
     // Same rule as the rebuild (plan.mjs refuses a CLOSED PR with `pinned:true` before anything else).

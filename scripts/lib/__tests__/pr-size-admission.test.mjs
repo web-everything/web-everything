@@ -47,6 +47,89 @@ describe('planSizeAdmission — size dials capacity, never permission', () => {
     });
 });
 
+describe('planSizeGrowth — pure post-open size escalation', () => {
+  it('keeps the open-time cap at 300', () => {
+    expect(sizeAdmission.OPEN_PR_MAX_NON_TEST_LINES).toBe(300);
+    expect(sizeAdmission.SIZE_OVER_CAP_LABEL).toBe('size:over-cap');
+  });
+  it('flags over-cap growth with descending file groups and a split plan', () => {
+    expect(sizeAdmission.planSizeGrowth({ numstatText: '101\t0\tdocs/agent/a.md\0'
+      + '100\t50\tscripts/operations/a.mjs\0' + '50\t0\tscripts/operations/b.mjs\0' }))
+      .toEqual({ status: 'over-cap', lines: 301, label: 'size:over-cap', event: 'pr-size-over-cap', autoClose: false,
+        splitPlan: { groups: [{ group: 'scripts/operations', lines: 200 }, { group: 'docs/agent', lines: 101 }],
+          files: ['docs/agent/a.md', 'scripts/operations/a.mjs', 'scripts/operations/b.mjs'],
+          text: 'File groups: we:scripts/operations: 200; we:docs/agent: 101' } });
+  });
+  it.each([0, 299, 300])('leaves %i lines unflagged without an event', (lines) => {
+    expect(sizeAdmission.planSizeGrowth({ numstatText: `${lines}\t0\tsrc/a.mjs\0` }))
+      .toEqual({ status: 'ok', lines });
+  });
+  it('keeps backlog-only growth exempt', () => {
+    expect(sizeAdmission.planSizeGrowth({ numstatText: '1000\t0\tbacklog/1-a.md\0' }))
+      .toEqual({ status: 'ok', lines: 1000 });
+  });
+  it('uses default accounting for tests and data', () => {
+    expect(sizeAdmission.planSizeGrowth({ numstatText: '300\t0\tsrc/a.mjs\0'
+      + '900\t0\tsrc/__tests__/a.mjs\0' + '900\t0\tsrc/a.spec.mjs\0' + '900\t0\tdata/a.json\0' }))
+      .toEqual({ status: 'ok', lines: 300 });
+  });
+  it('uses supplied data settings and retains non-test split paths', () => {
+    const settings = { ...BUILT_IN_PR_SIZE_SETTINGS, dataPaths: ['fixtures/a.json'] };
+    const numstatText = '301\t0\tsrc/a.mjs\0' + '900\t0\tfixtures/a.json\0' + '900\t0\tsrc/a.test.mjs\0';
+    const result = sizeAdmission.planSizeGrowth({ numstatText, settings });
+    expect(result.lines).toBe(301);
+    expect(result.splitPlan.files).toEqual(['src/a.mjs', 'fixtures/a.json']);
+  });
+  it.each(['-\t-\tsrc/a.mjs\0', 'malformed', '1\t0\tsrc/a.mjs\0partial', null, undefined, 123])(
+    'fails closed on unmeasurable numstat %j', (numstatText) => {
+      expect(sizeAdmission.planSizeGrowth({ numstatText })).toEqual({ status: 'unknown', lines: null,
+        label: 'size:over-cap', event: 'pr-size-unmeasurable', splitPlan: null, autoClose: false,
+        reason: expect.any(String) });
+    });
+  it('fails closed on measurement failure or missing input without throwing', () => {
+    for (const input of [undefined, null, { numstatText: '301\t0\tdata/a.json\0', settings: null },
+      { numstatText: '9007199254740991\t0\tsrc/a.mjs\0' + '1\t0\tsrc/b.mjs\0' }]) {
+      expect(sizeAdmission.planSizeGrowth(input)).toMatchObject({ status: 'unknown', lines: null, autoClose: false });
+    }
+  });
+  it('bounds and escapes split text, escalating omitted groups to human review', () => {
+    const result = sizeAdmission.planSizeGrowth({ numstatText: Array.from({ length: 150 }, (_, i) =>
+      `301\t0\tgroup${i}/<script>\n/a.mjs\0`).join('') });
+    expect(result.splitPlan.groups).toHaveLength(150);
+    expect(result.splitPlan.files).toHaveLength(150);
+    expect(Buffer.byteLength(result.splitPlan.text)).toBeLessThan(4400);
+    // Case-insensitive, string-based (no HTML-filtering regexp: CodeQL flags a /<script>/ regexp as bad HTML filtering).
+    expect(result.splitPlan.text.toLowerCase().includes('<script')).toBe(false);
+    expect(result.splitPlan.text.includes('\n')).toBe(false);
+    expect(result.splitPlan.text).toContain('omitted; summary budget');
+    expect(result.splitPlan.text).toContain('Human review of the full diff is required');
+  });
+  it('never closes or blocks measured or unknown growth', () => {
+    for (const numstatText of ['301\t0\tsrc/a.mjs\0', 'bad', '300\t0\tsrc/a.mjs\0']) {
+      const result = sizeAdmission.planSizeGrowth({ numstatText });
+      expect(result.autoClose ?? false).toBe(false);
+      expect(result).not.toHaveProperty('blocking');
+      expect(result).not.toHaveProperty('block');
+    }
+  });
+});
+
+describe('planGrowthTransition', () => {
+  const ok = { status: 'ok', lines: 300 };
+  it.each(['over-cap', 'unknown'])('flags a crossing to %s', (status) => {
+    expect(sizeAdmission.planGrowthTransition({ before: ok, after: { status } }))
+      .toEqual({ flag: true, crossed: true });
+  });
+  it.each([['over-cap', 'over-cap'], ['over-cap', 'unknown'], ['unknown', 'over-cap'], ['unknown', 'unknown']])(
+    'does not reemit for already-flagged %s to %s', (before, after) => {
+      expect(sizeAdmission.planGrowthTransition({ before: { status: before }, after: { status: after } }))
+        .toEqual({ flag: true, crossed: false, reemit: false });
+    });
+  it.each(['ok', 'over-cap', 'unknown'])('clears the flag after %s when growth is ok', (status) => {
+    expect(sizeAdmission.planGrowthTransition({ before: { status }, after: ok })).toEqual({ flag: false });
+  });
+});
+
 const evidence = '100\t50\tscripts/operations/a.mjs\0'
   + '50\t0\tscripts/operations/b.mjs\0'
   + '101\t0\tdocs/agent/a.md\0'
