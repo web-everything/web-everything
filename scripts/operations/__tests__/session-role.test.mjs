@@ -157,3 +157,58 @@ describe('workerMarkerSettingsEnv — the marker every `claude --bg` spawn carri
       .toEqual({ [WORKER_MARKER_ENV]: '1' });
   });
 });
+
+describe('markWorkerEnv — account split (PR1)', () => {
+  const FAKE = 'fake-token-DO-NOT-LEAK-0123456789';
+  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: false, ...extra });
+  const opts = (m, reads = []) => ({ map: m, readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });
+  it('env is byte-identical to the marker-only env when nothing is mapped', () => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
+    const reads = [];
+    expect(markWorkerEnv(env, opts(map({ daemons: {} }), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(reads).toEqual([]);
+  });
+  it('shipped (empty) map leaves any env unchanged apart from the marker', () => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' };
+    expect(markWorkerEnv(env)).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+  });
+  it('a mapped daemon gets its token + scrub, and inherited credentials are removed', () => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'old', ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 't' };
+    const out = markWorkerEnv(env, opts(map()));
+    expect(out.CLAUDE_CODE_OAUTH_TOKEN).toBe(FAKE);
+    expect(out.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+    expect(out.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(out.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(out[WORKER_MARKER_ENV]).toBe('1');
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('old');
+  });
+  it('an interactive env (no launchd label) is untouched even with a populated map', () => {
+    const reads = [];
+    const env = { PATH: '/p', CLAUDE_CODE_OAUTH_TOKEN: 'mine' };
+    expect(markWorkerEnv(env, opts(map(), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(reads).toEqual([]);
+  });
+  it('refuse throws a clear error naming the label, with no token in it', () => {
+    let msg = '';
+    try { markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.mystery' }, opts(map({ enforce: true }))); } catch (e) { msg = e.message; }
+    expect(msg).toContain('com.we.mystery');
+    expect(msg).not.toContain(FAKE);
+  });
+  it('a keychain failure throws without leaking the token', () => {
+    let msg = '';
+    const o = { map: map(), readKeychain: () => { throw new Error(`boom ${FAKE}`); } };
+    try { markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, o); } catch (e) { msg = e.message + e.stack; }
+    expect(msg).not.toBe('');
+    expect(msg).not.toContain(FAKE);
+  });
+  it('workerMarkerSettingsEnv never carries a token', () => {
+    const out = workerMarkerSettingsEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'x', ANTHROPIC_API_KEY: 'y', ANTHROPIC_AUTH_TOKEN: 'z', KEEP: '1' });
+    expect(JSON.stringify(out)).not.toMatch(/OAUTH_TOKEN|API_KEY|AUTH_TOKEN/);
+    expect(out.KEEP).toBe('1');
+  });
+  it('the two formerly-bypassing spawn sites route through markWorkerEnv', () => {
+    for (const f of ['lib/review-precedents-io.mjs', 'operations/maintenance-io.mjs']) {
+      expect(readFileSync(join(ROOT, 'scripts', f), 'utf8'), f).toMatch(/markWorkerEnv\(/);
+    }
+  });
+});
