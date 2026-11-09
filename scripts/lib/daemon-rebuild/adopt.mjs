@@ -110,6 +110,11 @@ export function matchReadyCandidate({
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
+// R790: one-time ruled weakening for this exact legacy drop; content/driver and time proof still apply.
+export const RULED_LEGACY_PR_MERGED_DROPS = Object.freeze([
+  Object.freeze({ ref: 'lane/redteam-pending-on-accept-m1', pr: 6554, at: '2026-11-09T11:58:41.018Z', ruling: 'R790' }),
+]);
+
 /** Prove a removed overlay graduated into this build, including squash-merged content. Unknown evidence refuses. */
 export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
   try {
@@ -122,7 +127,12 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
     // still has to agree independently; anything else refuses (live 2026-11-04 author-lookup-defer-m2).
     const retiredWithProof = last?.kind === 'auto-retired' && ['pr-merged', 'in-main'].includes(last.reason)
       && last.tip === sha && last.evidence?.contentInMain === true && last.evidence?.cleanMerges === true;
-    if ((last?.kind === 'auto-dropped' && last.reason === 'in-main') || retiredWithProof) {
+    const droppedWithProof = last?.kind === 'auto-dropped' && last.reason === 'pr-merged'
+      && last.tip === sha && last.evidence?.contentInMain === true && last.evidence?.cleanMerges === true;
+    const ruledLegacyDrop = last?.kind === 'auto-dropped' && last.reason === 'pr-merged'
+      && last.evidence === undefined && RULED_LEGACY_PR_MERGED_DROPS.some((entry) =>
+        last.ref === entry.ref && last.pr === entry.pr && last.at === entry.at);
+    if ((last?.kind === 'auto-dropped' && last.reason === 'in-main') || retiredWithProof || droppedWithProof || ruledLegacyDrop) {
       const droppedMs = timeMs(last.at);
       const readyMs = timeMs(readyAt);
       if (!Number.isFinite(droppedMs) || !Number.isFinite(readyMs) || droppedMs >= readyMs) return false;

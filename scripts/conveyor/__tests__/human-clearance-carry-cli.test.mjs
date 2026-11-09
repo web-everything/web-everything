@@ -1,4 +1,4 @@
-import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { run } from '../human-clearance-carry-cli.mjs';
@@ -10,6 +10,7 @@ vi.mock('../../lib/human-clearance-carry.mjs', async importOriginal => {
   return { ...actual, applyHumanClearanceCarry: vi.fn(actual.applyHumanClearanceCarry) };
 });
 beforeEach(() => vi.mocked(applyHumanClearanceCarry).mockClear());
+afterEach(() => vi.unstubAllEnvs());
 
 it('CLI exits 1 with one failure JSON line on stdout when arguments are missing', () => {
   const child = spawnSync(process.execPath, [resolve('scripts/conveyor/human-clearance-carry-cli.mjs')], {
@@ -32,7 +33,7 @@ function cliFixture({ headSha = toSha, reviews = [], labels = [], objection = fa
     id: 'clearance', createdAt: '2026-10-01T00:00:00Z' }];
   if (objection) comments.push({ ...trusted('Please stop: this still needs changes.'),
     id: 'objection', createdAt: '2026-10-02T00:00:00Z' });
-  const evidence = { humanClearance: { sha: fromSha, diff: fingerprint, actor: 'chalbert' },
+  const evidence = { humanClearance: { sha: fromSha, diff: fingerprint, actor: 'chalbert', sourceId: 'clearance' },
     headSha: toSha, headDiffSha: toSha, headDiff: fingerprint };
   const readEvidence = vi.fn(() => evidence);
   let proofFinished = false;
@@ -77,7 +78,7 @@ function cliFixture({ headSha = toSha, reviews = [], labels = [], objection = fa
   });
   const write = vi.fn();
   const options = { ...job, cwd: '.', exec, readEvidence, write, log: vi.fn(),
-    carryOptions: { setting: { value: true, source: 'test' }, netPatchSetting: { value: false, source: 'test' },
+    carryOptions: { mechanicalCarry: { value: 'trust-drain-record', source: 'test' }, setting: { value: true, source: 'test' }, netPatchSetting: { value: false, source: 'test' },
       equivalence: 'contribution' } };
   return { exec, readEvidence, evidence, comments, options, write,
     finishProof: () => { proofFinished = true; },
@@ -92,6 +93,24 @@ function changeContent(f) {
 }
 
 describe('human clearance carry CLI', () => {
+  it.each(['tree', 'numbering'])('default refuses a proven %s carry whose reviewed diff changed without posting', tier => {
+    const f = cliFixture({ identicalTrees: tier === 'tree' });
+    delete f.options.carryOptions.mechanicalCarry;
+    f.options.carryOptions.proveNumbering = () => {
+      f.finishProof();
+      return { ok: true, reason: 'only numbering changed' };
+    };
+    if (tier === 'numbering') f.evidence.humanClearance.diff = null;
+    else {
+      const oldDiff = 'diff --git a/example.txt b/example.txt\n--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old\n+reviewed\n';
+      Object.assign(f.evidence.humanClearance, liveCarryFingerprints(oldDiff));
+      f.evidence.headDiff = oldDiff.replace('@@ -1 +1 @@', '@@ -2 +2 @@');
+    }
+    expect(f.run().result.carried).toBeNull();
+    expect(f.options.log.mock.calls.some(([line]) => line.includes('humanClearance.mechanicalCarry=refuse'))).toBe(true);
+    expect(f.posts()).toHaveLength(0);
+  });
+
   it.each(['.github/workflows/merge-gate.yml', '.github/actions/check/action.yml',
     '.github/workflows/deleted.yml', '.github/workflows/renamed-away.yml',
     './.GitHub/Workflows/merge-gate.yml', '.github\\actions\\check\\action.yml'])
@@ -247,6 +266,7 @@ describe('human clearance carry CLI', () => {
     [mode, 'moved head', 0, 'head moved'],
     [mode, 'missing formal reviews', 1, 'formal reviews unreadable'],
   ]))('production defaults with carryOptions %s refuse %s without posting', (mode, scenario, status, reason) => {
+    vi.stubEnv('WE_HUMAN_CLEARANCE_MECHANICAL_CARRY', 'trust-drain-record');
     const f = cliFixture({ headSha: scenario === 'moved head' ? 'e'.repeat(40) : toSha,
       reviews: scenario === 'missing formal reviews' ? null : [] });
     if (scenario === 'content change') changeContent(f);
