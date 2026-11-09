@@ -1,6 +1,6 @@
 /** File held handoff cards through file-item in this checkout; never mutate the handoff. */
 import { createHash } from 'node:crypto';
-import { appendFileSync, readFileSync, readdirSync, realpathSync, lstatSync, statSync } from 'node:fs';
+import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -125,7 +125,7 @@ async function fileInCheckout(input) {
   });
 }
 
-export async function runFileHeldCards({ source = join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md'),
+async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md'),
   ledger, dryRun = false, select, since, max = 10, deps = {} } = {}) {
   validateOptions({ max, since, select });
   const { root = REPO_ROOT, fileItem = fileInCheckout, log = console.log, now = () => new Date().toISOString() } = deps;
@@ -166,7 +166,8 @@ export async function runFileHeldCards({ source = join(homedir(), 'workspace', '
       continue;
     }
     const row = { hash: card.hash, ...summary, card: null, filedAt: now() };
-    const duplicate = titles.get(titleKey(input.title));
+    // A truncated title is not a full identity: two distinct cards can share its first 110 chars.
+    const duplicate = input.title.endsWith('…') ? undefined : titles.get(titleKey(input.title));
     if (duplicate) {
       Object.assign(row, { card: duplicate, status: 'duplicate' });
       result.duplicates.push(row);
@@ -200,6 +201,18 @@ export async function runFileHeldCards({ source = join(homedir(), 'workspace', '
     appendFileSync(ledger, `${separator}${JSON.stringify(row)}\n`);
   }
   return result;
+}
+
+export async function runFileHeldCards(options = {}) {
+  if (options.dryRun) return runFileHeldCardsLocked(options);
+  // Ledger-scoped lock held through select, filing and append, so overlapping runs cannot double-file a card.
+  const source = resolve(expandHome(options.source || join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md')));
+  const lock = `${resolve(expandHome(options.ledger || join(dirname(source), 'cards-filed.jsonl')))}.lock`;
+  try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); } catch (error) {
+    if (error.code === 'EEXIST') throw new Error('another file-held-cards run holds the ledger lock; retry when it finishes');
+    throw error;
+  }
+  try { return await runFileHeldCardsLocked(options); } finally { try { unlinkSync(lock); } catch { /* already gone */ } }
 }
 
 export function fileHeldCardsOperation() {
