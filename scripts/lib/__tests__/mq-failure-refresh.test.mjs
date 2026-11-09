@@ -118,3 +118,20 @@ describe('mq failure head refresh executor', () => {
     expect(pushes(options)).toHaveLength(1);
   });
 });
+
+
+describe('mq no-op refresh fallback', () => {
+  it('unchanged merged head persists a normal-fixer fallback without pushing or reporting refreshed', async () => {
+    const options = fixture();
+    options.io.git.mockResolvedValue({ ok: true, head: identity.head });
+    const recordRefresh = vi.spyOn(options.ledger, 'recordRefresh');
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'fix', note: expect.stringMatching(/unchanged|no.op|already.*main/i) });
+    expect(pushes(options)).toHaveLength(0);
+    expect(recordRefresh).not.toHaveBeenCalled();
+    expect(await options.ledger.readFixFallback(identity)).toBe(true);
+    expect(options.io.removeCheckout).toHaveBeenCalledTimes(1);
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop' });
+    expect(options.io.createCheckout).toHaveBeenCalledTimes(1);
+    expect(pushes(options)).toHaveLength(0);
+  });
+});

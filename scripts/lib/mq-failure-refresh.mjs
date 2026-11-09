@@ -57,6 +57,10 @@ function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
       return { action: 'fix', note: 'Merge conflict or failure; normal fix required' };
     }
     if (!/^[a-f0-9]{40}$/.test(merged.head ?? '')) return stop('Unknown merged head; operator inspection required');
+    if (merged.head === head) {
+      yield () => ledger.recordFixFallback(identity);
+      return { action: 'fix', note: 'Merge left head unchanged (main already included); normal fix required' };
+    }
     // Reserve the successor BEFORE publication: a crash after push cannot grant it another refresh.
     yield () => ledger.recordRefresh({ ...identity, newHead: merged.head });
     if ((yield () => io.readHead({ repo, pr })) !== head) return stop('Head changed after merge; refusing stale push');

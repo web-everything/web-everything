@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createDrainMqFailureRecoveryIo, routeMqFailureOnHold } from '../drain-mq-failure-recovery-io.mjs';
 import { createMqFailureLedger } from '../mq-failure-ledger.mjs';
 import { parseMqFailureRoute } from '../mq-failure-route.mjs';
+import { admitMqFailureRoute } from '../../conveyor/mq-failure-intake.mjs';
 
 const identity = { repo: 'acme/web', pr: 42, head: 'a'.repeat(40) };
 const mergeHead = 'b'.repeat(40);
@@ -48,6 +49,7 @@ function fixture(mode = 'real') {
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
       if (mode === 'expired log') throw new Error('410 expired');
       return mode === 'infra' ? 'The runner has lost communication with the server.'
+        : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
         : mode === 'oversized log' ? failureLog + 'x'.repeat(300000) : failureLog;
     }
     throw new Error('Unexpected request');
@@ -123,5 +125,23 @@ describe('drain MQ failure production adapter', () => {
     expect(await routeMqFailureOnHold({ ...f.options, io })).toMatchObject({ routed: false, reason: expect.stringMatching(/operator|evidence|unreadable/i) });
     expect(f.exec.mock.calls.length).toBeLessThanOrEqual(2);
     expect(f.writes()).toEqual([]);
+  });
+});
+
+
+describe('drain proven real failure routing', () => {
+  it('proven real failure with incomplete paths publishes evidence for the normal fixer', async () => {
+    const f = fixture('incomplete test paths');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    expect(f.writes()).toHaveLength(2);
+    const comment = f.writes().find(([, args]) => args.some(arg => arg.endsWith('/comments')));
+    const route = parseMqFailureRoute({ expected: identity, comment: {
+      body: JSON.parse(comment[2].input).body, author: { login: 'chalbert' },
+    } });
+    expect(route).toMatchObject({ ...identity, complete: false, failureProven: true, failedJobs: ['unit'],
+      testFiles: ['tests/widget.test.mjs'], assertions: expect.arrayContaining(['FAIL unidentified failing test', 'AssertionError: expected false']) });
+    expect(admitMqFailureRoute({ ...identity, route,
+      changedFiles: { ...identity, complete: true, files: ['src/unrelated.mjs'] } }))
+      .toMatchObject({ kind: 'fix', recoveryAction: 'fix', evidence: { complete: false, failedJobs: ['unit'] } });
   });
 });

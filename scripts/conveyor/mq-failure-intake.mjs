@@ -20,5 +20,6 @@ export function admitMqFailureRoute(input) {
   if (!matches(route, input) || route.stale !== false) return null;
   return { kind: 'fix', repo, pr, head, recoveryAction: classifyMqFailureIntake(input),
     evidence: structuredClone({ failedJobs: route.failedJobs, testFiles: route.testFiles,
-      assertions: route.assertions, complete: route.complete }) };
+      assertions: route.assertions, complete: route.complete,
+      ...(typeof route.failureProven === 'boolean' ? { failureProven: route.failureProven } : {}) }) };
 }

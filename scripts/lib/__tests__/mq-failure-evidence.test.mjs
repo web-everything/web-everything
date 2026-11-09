@@ -123,3 +123,16 @@ describe('mq failure per-marker path attribution', () => {
     });
   });
 });
+
+
+describe('mq proven failure versus path completeness', () => {
+  it('proven real failure with incomplete paths remains real while refresh stays blocked', async () => {
+    const io = fixture();
+    io.readJobLog.mockResolvedValue({ text: `${log}\nFAIL unidentified failing test\nAssertionError: expected false`, complete: true });
+    const evidence = await collect(io);
+    expect(evidence).toMatchObject({ complete: false, failureProven: true, failedJobs: [failed.name],
+      testFiles: ['scripts/lib/__tests__/widget.test.mjs'] });
+    expect(evidence.assertions).toContain('AssertionError: expected false');
+    expect(classifyMqFailureEvidence(evidence)).toBe('real');
+  });
+});

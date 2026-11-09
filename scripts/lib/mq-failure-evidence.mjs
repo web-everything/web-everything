@@ -22,7 +22,9 @@ function failurePaths(text, repo) {
   return { paths, complete };
 }
 export function classifyMqFailureEvidence(evidence) {
-  if (evidence?.complete !== true || !evidence.failedJobs?.length) return 'unknown';
+  // Missing paths forbid refresh, while fully read, head-bound assertions can still prove a real
+  // defect for the normal fixer. Missing/unreadable logs never receive this separate proof.
+  if ((evidence?.complete !== true && evidence?.failureProven !== true) || !evidence?.failedJobs?.length) return 'unknown';
   if (evidence.assertions?.some(line => assertion.test(line))) return 'real';
   return evidence.assertions?.length && evidence.assertions.every(line => infra.test(line)) ? 'infra' : 'unknown';
 }
@@ -92,6 +94,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
       }
     }
     result.complete = pathsComplete;
+    if (!pathsComplete && result.assertions.some(line => assertion.test(line))) result.failureProven = true;
   } catch { /* Unreadable or oversized evidence remains incomplete for fix/operator inspection. */ }
   return result;
 }

@@ -3,11 +3,13 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 const valid = route => route && route.version === 1 && typeof route.repo === 'string'
   && /^[\w.-]+\/[\w.-]+$/.test(route.repo) && Number.isInteger(route.pr) && route.pr > 0
   && /^[a-f0-9]{40}$/.test(route.head) && typeof route.complete === 'boolean'
+  && (route.failureProven === undefined || typeof route.failureProven === 'boolean')
   && ['failedJobs', 'testFiles', 'assertions'].every(key => Array.isArray(route[key])
     && route[key].length <= 100 && route[key].every(s => typeof s === 'string' && s.length <= 8192));
 export function buildMqFailureRoute(route) {
   const payload = { version: 1, repo: route.repo, pr: route.pr, head: route.head,
-    failedJobs: route.failedJobs, testFiles: route.testFiles, assertions: route.assertions, complete: route.complete };
+    failedJobs: route.failedJobs, testFiles: route.testFiles, assertions: route.assertions, complete: route.complete,
+    ...(route.failureProven !== undefined ? { failureProven: route.failureProven } : {}) };
   if (!valid(payload)) throw new TypeError('Invalid MQ route evidence');
   // JSON escapes keep hostile log newlines and HTML terminators inside one inert leading marker.
   const json = JSON.stringify(payload).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
