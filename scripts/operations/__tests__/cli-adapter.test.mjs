@@ -47,7 +47,7 @@ describe('driveRun permanent guard refusal', () => {
     const context = fixture();
     const pending = advance(context.run, { registry: context.registry });
     const run = { ...pending, effects: pending.effects.map((entry, index) => index === 0
-      ? { ...entry, status: 'refused', error: 'guard: SELF-CLEAR REFUSED — author cannot clear' }
+      ? { ...entry, status: 'refused', attempts: 1, error: 'guard: SELF-CLEAR REFUSED — author cannot clear' }
       : entry) };
     context.store.write(run);
     const guard = vi.fn();

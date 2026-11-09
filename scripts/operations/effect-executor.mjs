@@ -49,7 +49,7 @@
  */
 
 import { effectsForStep } from './engine.mjs';
-import { assertRunRecord, isPollableHandle } from './run-record.mjs';
+import { assertRunRecord, isPollableHandle, PERMANENT_GUARD_REFUSAL_MARKERS } from './run-record.mjs';
 
 /**
  * The reserved effect type for an append to the #3007 verdict ledger. Named here so #3035/#3036 declare
@@ -69,8 +69,6 @@ export const LEDGER_EFFECT_TYPE = 'verdict-ledger.append';
 export function notApplied(message, extra = {}) {
   return Object.assign(new Error(message), { ...extra, notApplied: true });
 }
-
-const PERMANENT_GUARD_REFUSAL_MARKERS = Object.freeze(['SELF-CLEAR REFUSED']);
 
 /** A permanent guard refusal proves nothing landed and names a recognized guard. */
 export function isPermanentGuardRefusal(error) {

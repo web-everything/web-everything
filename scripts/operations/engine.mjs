@@ -46,7 +46,7 @@
  */
 
 import { defaultRegistry, validateInput } from './registry.mjs';
-import { assertRunRecord, effectKey, newRunRecord, normalizeJudgeTelemetry } from './run-record.mjs';
+import { assertRunRecord, effectKey, hasPermanentGuardRefusalEvidence, newRunRecord, normalizeJudgeTelemetry } from './run-record.mjs';
 
 /** Every state a run can be in. Derived from the record; never stored, so it cannot go stale. */
 export const RUN_STATUSES = Object.freeze(['running', 'awaiting-judge', 'awaiting-confirm', 'awaiting-effect', 'complete']);
@@ -280,8 +280,8 @@ function resolvePending(run, declaration, resume) {
     if (outstanding.length > 0) {
       // A guard refusal ends the run only when no other attempted effect is unresolved.
       // Declared effects may follow the refusal; none may precede it.
-      if (outstanding[0].status === 'refused'
-        && outstanding.every((entry) => entry.status === 'refused' || entry.status === 'declared')) {
+      if (hasPermanentGuardRefusalEvidence(outstanding[0])
+        && outstanding.every((entry) => hasPermanentGuardRefusalEvidence(entry) || entry.status === 'declared')) {
         return { ...withFinding(run, declaration, stepName, effectFinding(run, stepIndex)),
           pending: null, cursor: declaration.steps.length, outcome: 'refused' };
       }

@@ -486,11 +486,30 @@ describe('a permanent effect guard refusal settles the run', () => {
     expect(calls).toEqual(['guard.clear']);
   });
 
+  it.each([
+    ['null error', { attempts: 1, error: null }],
+    ['zero attempts', { attempts: 0, error: message }],
+    ['unrelated error', { attempts: 1, error: 'connection refused before writing' }],
+  ])('rejects malformed refused evidence (%s) without settling the run', (_name, evidence) => {
+    const { registry, run, calls } = fixture();
+    const malformed = { ...run, effects: run.effects.map((entry, index) => (
+      index === 0 ? { ...entry, status: 'refused', ...evidence } : entry
+    )) };
+    const before = JSON.parse(JSON.stringify(malformed));
+
+    expect(() => advanceWhileRunning(malformed, { registry })).toThrow(/refused/);
+    expect(malformed).toEqual(before);
+    expect(malformed.pending).toEqual(run.pending);
+    expect(malformed.cursor).toBe(0);
+    expect(malformed.outcome).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+
   it('resumes a persisted refused entry with an applied prefix and a later declared entry', () => {
     const { registry, declaration, run, calls } = fixture();
     const persisted = JSON.parse(JSON.stringify({ ...run, effects: [
       { ...run.effects[0], status: 'applied', result: { ok: true } },
-      { ...run.effects[1], status: 'refused', error: message },
+      { ...run.effects[1], status: 'refused', attempts: 1, error: message },
       { ...run.effects[1], key: `${run.id}#0#2`, index: 2 },
     ] }));
     expect(unappliedEffects(persisted, 0).map((e) => e.status)).toEqual(['refused', 'declared']);
@@ -511,7 +530,7 @@ describe('a permanent effect guard refusal settles the run', () => {
     const unresolved = { ...run, effects: run.effects.map((entry, index) => (
       index === (position === 'before' ? 0 : 1)
         ? { ...entry, status }
-        : { ...entry, status: 'refused', error: message }
+        : { ...entry, status: 'refused', attempts: 1, error: message }
     )) };
     expect(advanceWhileRunning(unresolved, { registry })).toBe(unresolved);
     expect(unresolved.pending).toEqual(run.pending);
