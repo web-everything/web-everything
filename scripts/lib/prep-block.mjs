@@ -39,7 +39,7 @@ export function parsePrep(text) {
       current = HEADINGS.find((name) => name.toLowerCase() === heading[1].toLowerCase());
       if (!sections.has(current)) sections.set(current, []);
       sections.get(current).push(heading[2]);
-    } else if (/^PREP:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
+    } else if (/^PREP:/i.test(clean) || /^Slot:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
       current = undefined;
     } else if (current) sections.get(current).push(line);
   }

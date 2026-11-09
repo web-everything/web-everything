@@ -126,6 +126,16 @@ describe('guard-prep', () => {
     expect(JSON.parse(output.stdout)).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } });
     expect(output.stderr).toBe('');
   });
+  it('logs a Slot waiver through the audit boundary', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prep-hook-'));
+    try {
+      const logPath = join(dir, 'events.log'); const output = [];
+      const text = prompt + '\nprep: waived — urgent incident\nSlot: waived — urgent incident';
+      runHook({ read: () => JSON.stringify(event(text)), logPath, stdout: (t) => output.push(t) });
+      expect(output).toEqual([]);
+      expect(readFileSync(logPath, 'utf8').trim().split('\n').map(JSON.parse).map((e) => e.kind)).toEqual(['waiver', 'slot-waiver']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('allows waiver and writes an audit line through the boundary using one verdict and applicability check', () => {
     const dir = mkdtempSync(join(tmpdir(), 'prep-hook-'));
     try {

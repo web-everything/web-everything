@@ -23,7 +23,7 @@ function evaluatePrep(event) {
   const decision = reasons.length === 0 ? null : { hookSpecificOutput: {
     hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reasons.join('\n'),
   } };
-  return { decision, verdict };
+  return { decision, verdict: { ...verdict, slotWaived: slot.waived ? slot.reason : '' } };
 }
 
 export function decide(event) {
@@ -37,7 +37,10 @@ export function runHook({ read = () => readFileSync(0, 'utf8'), evaluate = evalu
     const event = JSON.parse(read());
     const { decision, verdict } = evaluate(event);
     if (decision) stdout(JSON.stringify(decision));
-    else if (verdict?.waived) logPrepEvent({ kind: 'waiver', detail: verdict.reason }, { logPath });
+    else {
+      if (verdict?.waived) logPrepEvent({ kind: 'waiver', detail: verdict.reason }, { logPath });
+      if (verdict?.slotWaived) logPrepEvent({ kind: 'slot-waiver', detail: verdict.slotWaived }, { logPath });
+    }
   } catch (error) {
     const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
     logPrepEvent({ kind: 'hook-error', detail }, { logPath });

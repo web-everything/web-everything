@@ -18,7 +18,7 @@ const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writ
 
 describe('renderWorkerBrief', () => {
   it('tells dispatchers every Agent brief needs a Slot line with all four forms', () => {
-    expect(renderWorkerBrief(params)).toContain('Every Agent brief needs a `Slot:` line: `Slot: plan:<item>`, `Slot: blocker:<what it unblocks>`, `Slot: operator:<quoted placement>`, or `Slot: waived — <reason>`.');
+    expect(renderWorkerBrief(params)).toContain('Every build Agent brief (the ones the prep gate covers) needs a `Slot:` line: `Slot: plan:<item>`, `Slot: blocker:<what it unblocks>`, `Slot: operator:<quoted placement>`, or `Slot: waived — <reason>`.');
   });
 
   it.each([
