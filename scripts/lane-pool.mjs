@@ -1492,6 +1492,9 @@ function historyQuarantine(repo, n) {
   }
 }
 
+// Fail-closed: any read error other than ENOENT (EACCES, ENOTDIR, bad JSON) still counts as quarantined.
+const isHistoryQuarantined = (repo, n) => historyQuarantine(repo, n) !== null;
+
 // Use release's honest-history environment and traversal, but no remote proof/fetch: this is readability,
 // not a pushed-work verdict. All local branch/stash tips are walked (without exclusions), so an origin
 // tip cannot hide a missing ancestor. git() bounds time/output; hitting either bound fails closed too.
@@ -1609,7 +1612,7 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   if (!existsSync(dir)) return { lane: n, exists: false };
   const lease = readLease(dir);
   // A history-quarantined lane is never acquirable (acquire would refuse it), so it must not be advertised either.
-  if (existsSync(historyQuarantinePath(repo, n))) return { lane: n, exists: false, quarantined: true };
+  if (isHistoryQuarantined(repo, n)) return { lane: n, exists: false, quarantined: true };
   if (leaseDisqualifiesAcquire(lease, nowMs, ttlMs)) return { lane: n, exists: true, lease, dirtyOrAhead: null };
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
@@ -2628,7 +2631,7 @@ async function cmdAcquire(repo) {
       }
       const pickable = candidateDirs
         .map((d) => Number(basename(d).slice(5)))
-        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !existsSync(historyQuarantinePath(repo, n)))
+        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
         .sort((a, b) => a - b);
       for (const pick of pickable) {
         const claimed = tryClaimLane(laneDir(repo, pick), session, Date.now(), ttlMs);
@@ -4078,9 +4081,9 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
         if (limit !== null && out.length >= limit) break; // #xn432dz --limit: stop once N are found
       }
     }
-    return out.filter((n) => !existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n));
+    return out.filter((n) => !isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n));
   } catch (e) {
-    if (e && e.partialScan) return out.filter((n) => !existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
+    if (e && e.partialScan) return out.filter((n) => !isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
     throw e;
   } finally {
     scanDeadlineMs = null;
@@ -4108,7 +4111,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
 // A quarantine record can land after a list was cached, so every answer (cache hit or fresh) is re-filtered.
 function acquirableListCached(repo, opts) {
   const paths = acquirableListCachedRaw(repo, opts); // may wait on a scan lock: snapshot records AFTER it returns
-  const quarantined = new Set(existingLanes(repo).filter((n) => existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n)));
+  const quarantined = new Set(existingLanes(repo).filter((n) => isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)));
   return quarantined.size ? paths.filter((p) => !quarantined.has(p)) : paths;
 }
 function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
