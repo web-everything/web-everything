@@ -270,7 +270,7 @@ describe('main-pinned rebuild job dependencies', () => {
     const dir = f.dependencyDir(cwd);
     const text = 'reviewed dependency\n';
     expect(JSON.parse(readFileSync(join(dir, '.snapshot-integrity.json'), 'utf8'))).toEqual({
-      lockHash: sha(LOCK), treeDigest: sha(JSON.stringify([
+      installer: 'npm-ci', lockHash: sha(LOCK), treeDigest: sha(JSON.stringify([
         { path: 'pkg/index.js', size: Buffer.byteLength(text), sha256: sha(text) },
       ])),
     });

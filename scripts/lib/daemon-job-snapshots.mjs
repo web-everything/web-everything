@@ -114,7 +114,7 @@ export function ensureCodeSnapshot({ jobsDir, codeSha, repoDir, materialize }) {
   const dir = join(snapshotsRoot(jobsDir), 'code', codeSha);
   mkdirSync(join(snapshotsRoot(jobsDir), 'code'), { recursive: true });
   return withSnapshotLock(jobsDir, dir, () => {
-    if (verifyCodeSnapshot(dir, codeSha)) return dir;
+    if (verifyCodeSnapshot(dir, codeSha, repoDir)) return dir;
     rmSync(dir, { recursive: true, force: true });
     buildOnce(dir, (into) => {
       make(into);
@@ -122,7 +122,7 @@ export function ensureCodeSnapshot({ jobsDir, codeSha, repoDir, materialize }) {
         codeSha, treeDigest: codeTreeDigest(into),
       }));
     }, { acceptConcurrentWinner: false });
-    if (!verifyCodeSnapshot(dir, codeSha)) {
+    if (!verifyCodeSnapshot(dir, codeSha, repoDir)) {
       rmSync(dir, { recursive: true, force: true });
       throw new Error('code snapshot integrity verification failed; retry next tick');
     }
@@ -160,12 +160,54 @@ function codeTreeDigest(root) {
   return sha256(JSON.stringify(entries));
 }
 
-function verifyCodeSnapshot(dir, codeSha) {
+/** Hash raw Git objects: staging would apply clean filters, ident and text conversions. */
+function gitCodeTree(root, expectedTree) {
+  const algorithm = expectedTree.length === 64 ? 'sha256' : 'sha1';
+  const objectHash = (type, bytes) => createHash(algorithm)
+    .update(`${type} ${bytes.length}\0`).update(bytes).digest();
+  function tree(at) {
+    const entries = [];
+    for (const name of readdirSync(at, { encoding: 'buffer' })) {
+      if (at === root && [COMPLETE_MARKER, INTEGRITY_MARKER, 'node_modules'].includes(name.toString())) continue;
+      const path = Buffer.concat([Buffer.from(at), Buffer.from(sep), name]);
+      const info = lstatSync(path);
+      let mode;
+      let hash;
+      if (info.isDirectory()) {
+        mode = '40000';
+        hash = tree(path);
+      } else if (info.isSymbolicLink()) {
+        mode = '120000';
+        hash = objectHash('blob', readlinkSync(path, { encoding: 'buffer' }));
+      } else if (info.isFile()) {
+        mode = info.mode & 0o100 ? '100755' : '100644';
+        hash = objectHash('blob', filesystem.readFileSync(path));
+      } else throw new Error('unsupported code entry');
+      entries.push({
+        // Git sorts directories as though their names have a trailing slash.
+        sortKey: Buffer.concat([name, Buffer.from(info.isDirectory() ? '/' : '')]),
+        bytes: Buffer.concat([Buffer.from(`${mode} `), name, Buffer.from([0]), hash]),
+      });
+    }
+    entries.sort((a, b) => Buffer.compare(a.sortKey, b.sortKey));
+    return objectHash('tree', Buffer.concat(entries.map(entry => entry.bytes)));
+  }
+  return tree(root).toString('hex');
+}
+
+function verifyCodeSnapshot(dir, codeSha, repoDir) {
   try {
     if (!lstatSync(dir).isDirectory() || !lstatSync(join(dir, COMPLETE_MARKER)).isFile()
       || !lstatSync(join(dir, INTEGRITY_MARKER)).isFile()) return false;
     const record = JSON.parse(readFileSync(join(dir, INTEGRITY_MARKER), 'utf8'));
-    return record.codeSha === codeSha && record.treeDigest === codeTreeDigest(dir);
+    if (record.codeSha !== codeSha || record.treeDigest !== codeTreeDigest(dir)) return false;
+    if (!repoDir) return true; // Explicit materializer-only callers have no Git object store.
+    const expected = childProcess.execFileSync('git', ['-C', repoDir, 'rev-parse', `${codeSha}^{tree}`], {
+      encoding: 'utf8', timeout: DEFAULT_CHILD_TIMEOUT_MS, maxBuffer: 4096,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(expected)
+      && gitCodeTree(dir, expected) === expected;
   } catch { return false; }
 }
 
@@ -227,11 +269,11 @@ function dependencyTreeDigest(root) {
   return sha256(JSON.stringify(entries));
 }
 
-function verifyDependencyStore(dir, lockHash) {
+function verifyDependencyStore(dir, lockHash, installer = 'npm-ci') {
   try {
     if (!lstatSync(dir).isDirectory() || !statSync(join(dir, COMPLETE_MARKER)).isFile()) return false;
     const record = JSON.parse(readFileSync(join(dir, INTEGRITY_MARKER), 'utf8'));
-    return record.lockHash === lockHash
+    return record.installer === installer && record.lockHash === lockHash
       && sha256(readFileSync(join(dir, 'package-lock.json'))) === lockHash
       && record.treeDigest === dependencyTreeDigest(join(dir, 'node_modules'));
   } catch { return false; }
@@ -246,8 +288,11 @@ function verifyDependencyStore(dir, lockHash) {
  */
 export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInstaller(), adopter = false }) {
   const lock = readFileSync(join(sourceDir, 'package-lock.json'), 'utf8');
-  const key = lockfileKey(lock);
-  const namespace = adopter ? 'adopter-node-modules' : 'node-modules';
+  const namespace = adopter ? 'adopter-node-modules' : install.storeNamespace ?? 'node-modules';
+  if (!['node-modules', 'adopter-node-modules', 'rebuild-node-modules'].includes(namespace)) {
+    throw new TypeError('unsupported dependency store namespace');
+  }
+  const key = `${namespace === 'rebuild-node-modules' ? 'rebuild-' : ''}${lockfileKey(lock)}`;
   const dir = join(snapshotsRoot(jobsDir), namespace, key);
   mkdirSync(join(snapshotsRoot(jobsDir), namespace), { recursive: true });
   const lockHash = sha256(lock);
@@ -259,12 +304,12 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
       copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
       install(into);
       writeFileSync(join(into, INTEGRITY_MARKER), JSON.stringify({
-        lockHash, treeDigest: dependencyTreeDigest(join(into, 'node_modules')),
+        installer: install.installer ?? 'npm-ci', lockHash, treeDigest: dependencyTreeDigest(join(into, 'node_modules')),
       }));
     }, { acceptConcurrentWinner: false });
     // "C: a rebuilt tree still changing during verification refuses adoption after
     // one repair" defends this second read against the freshly recorded digest.
-    if (!verifyDependencyStore(dir, lockHash)) {
+    if (!verifyDependencyStore(dir, lockHash, install.installer ?? 'npm-ci')) {
       rmSync(dir, { recursive: true, force: true });
       throw new Error('dependency integrity verification failed; retry next tick');
     }
@@ -306,7 +351,7 @@ function listStores(dir) {
 export function evictSnapshots({ jobsDir, referenced, keep = DEFAULT_SNAPSHOT_KEEP, dryRun = false }) {
   const refs = new Set(referenced);
   const evicted = [];
-  for (const [sub, ref] of [['code', codeRef], ['node-modules', nodeModulesRef]]) {
+  for (const [sub, ref] of [['code', codeRef], ['node-modules', nodeModulesRef], ['rebuild-node-modules', nodeModulesRef]]) {
     const dir = join(snapshotsRoot(jobsDir), sub);
     const stores = listStores(dir);
     const held = new Set(stores.filter((s) => refs.has(ref(s.key))).map((s) => s.key));

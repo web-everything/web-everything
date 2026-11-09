@@ -104,7 +104,7 @@ export function rebuildJobsDir(root, env = process.env) {
 
 /** Snapshot `node_modules` installer: an APFS clone of the clone's own tree when the lockfile matches, else npm ci. */
 export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller() } = {}) {
-  return (into) => {
+  const install = (into) => {
     const src = join(sourceRoot, 'node_modules');
     let same = false;
     try { same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8') === readFileSync(join(into, 'package-lock.json'), 'utf8'); } catch { same = false; }
@@ -116,6 +116,8 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
     }
     fallback(into);
   };
+  install.installer = 'checkout-copy';
+  return install;
 }
 
 function readConsumed(dir) {
@@ -154,7 +156,9 @@ export async function rebuildCloneAsJob({
   mkdirSync(store.dir, { recursive: true });
   const kind = REBUILD_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
-  const snap = snapshot ?? { repoDir: root, install: npmCiInstaller() };
+  const install = npmCiInstaller();
+  install.storeNamespace = 'rebuild-node-modules';
+  const snap = snapshot ?? { repoDir: root, install };
   const tickClock = clock ?? clockFor(store.dir);
 
   // 1. Consume finished jobs once (oldest first) and say what each did — the job's outcome reaches the daemon log.

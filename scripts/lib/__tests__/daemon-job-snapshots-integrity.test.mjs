@@ -8,7 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import {
-  cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync,
+  cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync,
   rmSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
@@ -146,6 +146,102 @@ function fixture() {
   return { root, snapshot, env, install, child, adopt, store, unchanged, cloneInstaller };
 }
 
+describe('Git-backed snapshot code authority', () => {
+  it('rejects executable ident-expansion injection even when Git clean transformations produce the pinned blob', async () => {
+    const { execFileSync } = await vi.importActual('node:child_process');
+    io.exec.mockImplementation((command, argv, options) => {
+      if (!['git', 'tar'].includes(command)) throw new Error(`Unexpected process: ${command}`);
+      return execFileSync(command, argv, options);
+    });
+    const repoDir = join(base, 'ident-repo');
+    mkdirSync(repoDir);
+    const git = (...args) => execFileSync('git', ['-C', repoDir, ...args], {
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    }).trim();
+    git('init', '--quiet', '--template=');
+    put(repoDir, '.gitattributes', 'code.mjs ident\n');
+    const pinned = 'const x = "$Id$";\n';
+    const injected = 'const x = "$Id: "; evil(); // $";\n';
+    put(repoDir, 'code.mjs', pinned);
+    git('add', '.');
+    git('-c', 'user.name=Snapshot fixture', '-c', 'user.email=snapshot@example.invalid',
+      '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'ident fixture');
+    const codeSha = git('rev-parse', 'HEAD');
+    const archive = snapshots.gitArchiveMaterializer(repoDir, codeSha);
+    let corruptRepair = false;
+    const materialize = vi.fn(into => {
+      archive(into);
+      // Materialize raw committed bytes, independent of archive attribute expansion.
+      put(into, 'code.mjs', corruptRepair ? injected : pinned);
+    });
+    const options = { jobsDir: join(base, 'ident-jobs'), repoDir, codeSha, materialize };
+    const dir = snapshots.ensureCodeSnapshot(options);
+    expect(materialize).toHaveBeenCalledTimes(1);
+    put(dir, 'code.mjs', injected);
+    const codePath = join(dir, 'code.mjs');
+    expect(git('hash-object', '--path=code.mjs', codePath)).toBe(git('rev-parse', `${codeSha}:code.mjs`));
+    expect(git('hash-object', '--no-filters', codePath)).not.toBe(git('rev-parse', `${codeSha}:code.mjs`));
+    // Forge the complete receipt, including the pinned attributes, so the raw-byte
+    // Git tree comparison is the only remaining evidence that rejects this code.
+    const entries = ['.gitattributes', 'code.mjs'].map(name => {
+      const path = join(dir, name);
+      const bytes = readFileSync(path);
+      return { path: name, type: 'file', mode: lstatSync(path).mode,
+        size: bytes.length, sha256: sha(bytes) };
+    });
+    put(dir, INTEGRITY, JSON.stringify({ codeSha, treeDigest: sha(JSON.stringify(entries)) }));
+    corruptRepair = true;
+
+    expect(() => snapshots.ensureCodeSnapshot(options)).toThrow('code snapshot integrity verification failed');
+    expect(materialize).toHaveBeenCalledTimes(2);
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it('rejects changed code with a forged matching receipt when one repair still differs from the pinned Git tree', async () => {
+    const { execFileSync } = await vi.importActual('node:child_process');
+    io.exec.mockImplementation((command, argv, options) => {
+      if (!['git', 'tar'].includes(command)) throw new Error(`Unexpected process: ${command}`);
+      return execFileSync(command, argv, options);
+    });
+    const repoDir = join(base, 'code-repo');
+    mkdirSync(repoDir);
+    const git = (...args) => execFileSync('git', ['-C', repoDir, ...args], {
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    }).trim();
+    git('init', '--quiet', '--template=');
+    put(repoDir, 'code.mjs', '// pinned code\n');
+    git('add', 'code.mjs');
+    git('-c', 'user.name=Snapshot fixture', '-c', 'user.email=snapshot@example.invalid',
+      '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'fixture');
+    const codeSha = git('rev-parse', 'HEAD');
+    const archive = snapshots.gitArchiveMaterializer(repoDir, codeSha);
+    let corruptRepair = false;
+    const materialize = vi.fn(into => {
+      archive(into);
+      if (corruptRepair) put(into, 'code.mjs', '// still forged after repair\n');
+    });
+    const options = { jobsDir: join(base, 'code-jobs'), repoDir, codeSha, materialize };
+    const dir = snapshots.ensureCodeSnapshot(options);
+    expect(readFileSync(join(dir, 'code.mjs'), 'utf8')).toBe('// pinned code\n');
+
+    put(dir, 'code.mjs', '// forged cached code\n');
+    const path = join(dir, 'code.mjs');
+    const bytes = readFileSync(path);
+    // Reproduce the writable receipt independently of the production verifier.
+    const treeDigest = sha(JSON.stringify([{
+      path: 'code.mjs', type: 'file', mode: lstatSync(path).mode,
+      size: bytes.length, sha256: sha(bytes),
+    }]));
+    put(dir, INTEGRITY, JSON.stringify({ codeSha, treeDigest }));
+    expect(git('hash-object', path)).not.toBe(git('rev-parse', `${codeSha}:code.mjs`));
+    corruptRepair = true;
+
+    expect(() => snapshots.ensureCodeSnapshot(options)).toThrow('code snapshot integrity verification failed');
+    expect(materialize).toHaveBeenCalledTimes(2);
+    expect(existsSync(dir)).toBe(false);
+  });
+});
+
 describe('adopter dependency provenance and integrity', () => {
   it('normalizes a successful dependency-free npm ci, verifies its empty digest and repairs added files', () => {
     const f = fixture();
@@ -158,7 +254,7 @@ describe('adopter dependency provenance and integrity', () => {
     expect(io.exec.mock.calls[0].slice(0, 2)).toEqual(['npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund']]);
     expect(readdirSync(join(store.dir, 'node_modules'))).toEqual([]);
     expect(JSON.parse(readFileSync(join(store.dir, INTEGRITY), 'utf8'))).toEqual({
-      lockHash: sha(LOCK), treeDigest: sha('[]'),
+      installer: 'npm-ci', lockHash: sha(LOCK), treeDigest: sha('[]'),
     });
     expect(realEnsureNodeModulesStore(options)).toEqual(store);
     expect(io.exec).toHaveBeenCalledTimes(1);
