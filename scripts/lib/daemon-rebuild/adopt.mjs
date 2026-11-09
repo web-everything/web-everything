@@ -150,17 +150,19 @@ export async function redecideWithCandidate({ m, ready, git, args, alert, loadCa
   try {
     dir = mkdtempSync(join(tmpdir(), 'we-ready-redecide-'));
     const finalSha = ready.adopt.finalSha;
+    const expected = JSON.stringify(ready.adopt); // snapshot before candidate code runs
     const candidate = await loadCandidate({ git, finalSha, dir });
     if (typeof candidate?.matchReadyCandidate !== 'function' || typeof candidate?.overlayGraduated !== 'function') {
       throw new Error('candidate adoption exports unavailable');
     }
     const result = await candidate.matchReadyCandidate({
       ...args,
+      ready: structuredClone(ready),
       leftForMain: (applied, build) => args.leftForMain(applied, build, candidate.overlayGraduated),
     });
     if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('candidate returned a non-object decision');
     // Bound the candidate's answer: exactly the ready record's own adopt metadata, never a rewritten plan.
-    const sameAdopt = JSON.stringify(result.adopt) === JSON.stringify(ready.adopt);
+    const sameAdopt = JSON.stringify(result.adopt) === expected && JSON.stringify(ready.adopt) === expected;
     if (!sameAdopt || result.adopt?.finalSha !== finalSha || !Array.isArray(result.dropRefs) || result.dropRefs.length !== 0) return m;
     alert('ready-candidate-redecided', { match: 'redecided-by-candidate', target: finalSha });
     return { ...result, match: 'redecided-by-candidate' };

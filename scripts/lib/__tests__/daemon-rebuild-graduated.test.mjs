@@ -530,6 +530,7 @@ describe('redecideWithCandidate (R787/R796)', () => {
 
   it.each([
     ['other finalSha', { adopt: { finalSha: 'OTHER' }, dropRefs: [] }],
+    ['rewritten adopt metadata', { adopt: { ...fixture().ready.adopt, inputsKey: 'TAMPERED' }, dropRefs: [] }],
     ['nonempty dropRefs', { adopt: fixture().ready.adopt, dropRefs: [{ ref: 'lane/drop' }] }],
     ['missing dropRefs', { adopt: fixture().ready.adopt }],
     ['candidate refusal', { adopt: null, reason: 'superseded-omits-live-overlay: still missing' }],
