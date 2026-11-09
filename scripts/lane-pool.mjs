@@ -4106,8 +4106,8 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
 // prior behavior exactly: no caller-side bound, only the scan/lock's own.
 // A quarantine record can land after a list was cached, so every answer (cache hit or fresh) is re-filtered.
 function acquirableListCached(repo, opts) {
+  const paths = acquirableListCachedRaw(repo, opts); // may wait on a scan lock: snapshot records AFTER it returns
   const quarantined = new Set(existingLanes(repo).filter((n) => existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n)));
-  const paths = acquirableListCachedRaw(repo, opts);
   return quarantined.size ? paths.filter((p) => !quarantined.has(p)) : paths;
 }
 function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
