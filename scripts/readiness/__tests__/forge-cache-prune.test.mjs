@@ -74,7 +74,7 @@ async function child(name, age, kind = 'file', contents = '1234567890') {
     bytes: kind === 'symlink' ? (await fs.lstat(path)).size : Buffer.byteLength(contents)};
 }
 async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active') {
-  await json(join(receipts, worker, 'reservation.json'), {run});
+  await json(join(receipts, worker, 'reservation.json'), {run, writerGuard: 1});
   return run;
 }
 const record = siblings => ({lock, inputDigest: hex('b'), manifestDigest: hex('c'),
@@ -168,10 +168,10 @@ describe('planPrune', () => {
     expectDecision(plan(entries, options), selected([orphan.name, malformed.name]),
       selected([liveProfile.name, youngProfile.name, liveIndex.name, youngIndex.name]));
   });
-  it.each([3, 4, 12])('dev-v%i profiles obey age, size, high-water, minimum-age and exact live-name protection', version => {
+  it.each([3, 4, 12])('dev-v%i profiles with unrelated digests obey age, size, high-water, minimum-age and live protection', version => {
     const old = entry('b', 20, 100, version), eligible = entry('c', 3, 300, version);
     const infant = entry('d', 0.5, 300, version), protectedProfile = entry('e', 20, 300, version);
-    const current = entry('b', 20);
+    const current = entry('f', 20);
     const live = {complete: true, profiles: new Set([key(current), key(protectedProfile)])};
     const entries = [old, eligible, infant, protectedProfile, current];
     expectDecision(plan(entries, {live}), [old], [eligible, infant, protectedProfile, current]);
@@ -323,8 +323,8 @@ describe('executePrune', () => {
     expect(await fs.readFile(sentinel, 'utf8')).toBe('outside');
   }, 20_000);
 
-  it.each([3, 4, 12])('pruning dev-v%i never removes the index of a live v5 profile with the same digest', async version => {
-    const legacy = await materialize('b', 30, version), current = await materialize('b', 30);
+  it.each([3, 4, 12])('pruning dev-v%i with a different digest preserves the index of a live v5 profile', async version => {
+    const legacy = await materialize('d', 30, version), current = await materialize('b', 30);
     const marker = await child('.warm-inputs-live', 30, 'file', JSON.stringify({profile: hex('b')}));
     const run = await reserve(); await json(join(receipts, `${run}.running`), record(false));
     const live = await readLiveEvidence({receipts});
@@ -373,8 +373,8 @@ describe('executePrune', () => {
     expect(await exists(marker)).toBe(true);
   }, 20_000);
 
-  it('applies retention to legacy profiles without protecting them through a current profile with the same digest', async () => {
-    const legacy = [await materialize('b', 20, 3), await materialize('b', 20, 4), await materialize('b', 20, 12)];
+  it('applies retention to legacy profiles with a different digest from the live profile', async () => {
+    const legacy = [await materialize('d', 20, 3), await materialize('d', 20, 4), await materialize('d', 20, 12)];
     const current = await materialize();
     const run = await reserve();
     await json(join(receipts, `${run}.running`), record(false));
@@ -384,6 +384,23 @@ describe('executePrune', () => {
     expect(keys(result.skipped)).toEqual(keys([current]));
     for (const e of legacy) expect(await exists(e.path)).toBe(false);
     expect(await fs.readFile(join(current.path, 'payload'), 'utf8')).toBe('cache');
+  }, 20_000);
+
+  it.each(['matching-digest', 'legacy-wrapper', 'missing-profile'])
+  ('rechecks %s protection after planning and preserves every protected candidate', async fault => {
+    const entries = [await materialize('b', 30, 3), await materialize('b', 30, 4),
+      await child('.warm-inputs-matching', 30, 'file', JSON.stringify({profile: hex('b')}))];
+    if (fault !== 'matching-digest') entries.push(await child('arbitrary', 30));
+    const planned = plan(await scanCache(root));
+    const run = await reserve();
+    if (fault === 'legacy-wrapper') await json(join(receipts, 'worker-active', 'reservation.json'), {run});
+    const active = record(false);
+    if (fault === 'missing-profile') delete active.manifest;
+    await json(join(receipts, `${run}.running`), active);
+    const applied = await executePrune(planned, {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(applied.deleted).toEqual([]);
+    expect(keys(applied.skipped)).toEqual(keys(entries));
+    for (const e of entries) expect(await exists(e.path)).toBe(true);
   }, 20_000);
 
   it('anchors deletion when the checked parent is replaced by an outside symlink before delete', async () => {
@@ -537,6 +554,54 @@ describe('CLI settings refusal', () => {
     expect(cli.status).not.toBe(0);
     expect(cli.stderr).toContain(fault.variable);
   }, 20_000);
+});
+
+describe('live reservation compatibility', () => {
+  it.each([false, true])('protects every matching profile version and its index with siblings=%s', async siblings => {
+    const digest = siblings ? 'c' : 'b';
+    const run = await reserve(); await json(join(receipts, `${run}.running`), record(siblings));
+    const profiles = [3, 4, 5, 12].map(version => entry(digest, 30, 10, version));
+    const index = await child('.warm-inputs-matching', 30, 'file', JSON.stringify({profile: hex(digest)}));
+    const scanned = await scanCache(root);
+    const unrelated = entry('f', 30);
+    const live = await readLiveEvidence({receipts});
+    expect(live.complete).toBe(true);
+    expectDecision(plan([...profiles, ...scanned, unrelated], {live}), [unrelated], [...profiles, ...scanned]);
+  });
+
+  it.each(['legacy-wrapper', 'missing-manifest', 'missing-digest'])
+  ('protects the whole lock for %s, counting its bytes under size pressure', async fault => {
+    const run = await reserve();
+    if (fault === 'legacy-wrapper') await json(join(receipts, 'worker-active', 'reservation.json'), {run});
+    const active = record(false);
+    if (fault === 'missing-manifest') delete active.manifest;
+    if (fault === 'missing-digest') delete active.inputDigest;
+    await json(join(receipts, `${run}.running`), active);
+    const protectedEntries = [entry('b', 30, 100, 3), entry('c', 30, 100, 4),
+      await child('.warm-inputs-unrelated', 30), await child('arbitrary', 30)];
+    const other = {...entry('f', 3, 10), lock: hex('e')};
+    other.path = join(root, other.lock, other.name);
+    const live = await readLiveEvidence({receipts});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set([lock]));
+    expectDecision(plan([...protectedEntries, other], {live, settings: settings({maxBytes: 100})}),
+      [other], protectedEntries);
+    expectDecision(plan([...protectedEntries, other], {live,
+      disk: {usedPct: 90, usedBytes: 900, totalBytes: 1000}}), [other], protectedEntries);
+  });
+
+  it.each(['missing', 'invalid'])('refuses unknown %s lock with an operator repair message', async fault => {
+    const run = await reserve();
+    await json(join(receipts, 'worker-active', 'reservation.json'), {run});
+    const active = record(false);
+    if (fault === 'missing') delete active.lock;
+    else active.lock = '../outside';
+    await json(join(receipts, `${run}.running`), active);
+    const live = await readLiveEvidence({receipts});
+    expect(live.complete).toBe(false);
+    expect(live.refused).toMatch(/preserving cache.*repair/);
+    expect(plan([entry('b', 30)], {live}).prune).toEqual([]);
+  });
 });
 
 describe('readLiveEvidence', () => {

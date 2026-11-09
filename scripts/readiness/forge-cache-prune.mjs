@@ -42,6 +42,14 @@ function validEntry(root, e) {
     && Number.isFinite(e.mtimeMs) && Number.isSafeInteger(e.bytes) && e.bytes >= 0;
 }
 
+function liveProtects(live, lock, name) {
+  if (live.locks?.has(lock) || live.profiles.has(`${lock}/${name}`)) return true;
+  // Evidence uses a canonical v5 key, but the digest may be active in any
+  // profile layout. Older wrappers do not participate in our writer leases.
+  const profile = /^dev-v[0-9]+-([a-f0-9]{64})(?![\s\S])/.exec(name);
+  return !!profile && live.profiles.has(`${lock}/dev-v5-${profile[1]}`);
+}
+
 export function planPrune({root, entries, now = Date.now(), settings = resolveSettings(), disk, live}) {
   const result = {prune: [], keep: [], now, minAgeMs: Math.max(HOUR, settings.minAgeMs)};
   if (live?.complete !== true || !(live.profiles instanceof Set)) {
@@ -68,8 +76,9 @@ export function planPrune({root, entries, now = Date.now(), settings = resolveSe
     let prune = false;
     if (result.refused) reason = result.refused;
     else if (!validEntry(root, e)) reason = 'Invalid cache boundary or metadata';
-    else if (live.profiles.has(`${e.lock}/${e.name}`)) reason = 'Protected by live reservation';
-    else if (e.indexProfile && protectedProfiles.has(`${e.lock}/${e.indexProfile}`)) reason = 'Index of protected profile';
+    else if (liveProtects(live, e.lock, e.name)) reason = 'Protected by live reservation';
+    else if (e.indexProfile && (liveProtects(live, e.lock, e.indexProfile)
+      || protectedProfiles.has(`${e.lock}/${e.indexProfile}`))) reason = 'Index of protected profile';
     else if (now - e.mtimeMs < result.minAgeMs) reason = 'Younger than minimum age';
     else if (now - e.mtimeMs > settings.maxAgeHours * HOUR) { reason = 'Expired age'; prune = true; }
     else if (retained > settings.maxBytes) { reason = 'Cache size cap'; prune = true; }
@@ -108,7 +117,7 @@ async function readJson(path) {
 }
 
 export async function readLiveEvidence({receipts}) {
-  const profiles = new Set();
+  const profiles = new Set(), locks = new Set();
   try {
     await directory(receipts);
     const names = await fs.readdir(receipts);
@@ -116,26 +125,30 @@ export async function readLiveEvidence({receipts}) {
     for (const name of names.filter(n => WORKER.test(n))) {
       const worker = join(receipts, name);
       await directory(worker);
-      const {run} = await readJson(join(worker, 'reservation.json'));
+      const {run, writerGuard} = await readJson(join(worker, 'reservation.json'));
       if (typeof run !== 'string' || !RUN.test(run)) throw new Error('Invalid reserved run');
       let found = false;
       for (const suffix of ['prepared', 'running', 'receipt']) {
         let record;
         try { record = await readJson(join(receipts, `${run}.${suffix}`)); }
         catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-        const digest = record.manifest?.siblings ? record.manifestDigest : record.inputDigest;
-        if (!HEX.test(record.lock) || !HEX.test(digest)
-          || !record.manifest || typeof record.manifest !== 'object' || Array.isArray(record.manifest)) {
-          throw new Error('Invalid reserved profile evidence');
-        }
-        profiles.add(`${record.lock}/dev-v5-${digest}`);
+        if (typeof record.lock !== 'string' || !HEX.test(record.lock)) throw new Error('Invalid reserved lock evidence');
+        const manifestKnown = record.manifest && typeof record.manifest === 'object' && !Array.isArray(record.manifest);
+        const digest = manifestKnown ? (record.manifest.siblings ? record.manifestDigest : record.inputDigest) : undefined;
+        const profileKnown = typeof digest === 'string' && HEX.test(digest);
+        // A legacy writer can change profiles without taking a lease. Missing
+        // profile evidence is likewise safe only at the whole-lock boundary.
+        if (writerGuard !== 1 || !profileKnown) locks.add(record.lock);
+        // Keep refusing corrupt digests, even though the known lock is protected.
+        if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
+        if (profileKnown) profiles.add(`${record.lock}/dev-v5-${digest}`);
         found = true;
       }
       if (!found) throw new Error('Missing reserved run record');
     }
-    return {complete: true, profiles};
+    return {complete: true, profiles, locks};
   } catch (error) {
-    return {complete: false, profiles, refused: `${error.message}; ${repair}`};
+    return {complete: false, profiles, locks, refused: `${error.message}; ${repair}`};
   }
 }
 
@@ -170,8 +183,8 @@ export async function scanCache(root) {
   return entries;
 }
 
-// Warm-input indexes store v5 digests. Expand them before comparing names so
-// older profile versions with the same digest cannot inherit or remove an index.
+// Warm-input indexes store digests under canonical v5 keys. Live protection
+// spans all versions; deletion ownership remains specific to the v5 profile.
 async function readIndexProfile(path, name, st) {
   if (!name.startsWith('.warm-inputs-') || !st.isFile()) return undefined;
   try {
@@ -333,7 +346,7 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
         if (expected.dev !== actual.dev || expected.ino !== actual.ino) throw new Error(`Cache root changed; ${repair}`);
         const live = await readLiveEvidence({receipts});
         if (!live.complete) throw new Error(live.refused);
-        if (live.profiles.has(`${e.lock}/${e.name}`)) { result.skipped.push(e); continue; }
+        if (liveProtects(live, e.lock, e.name)) { result.skipped.push(e); continue; }
         let st;
         try { st = await fs.lstat(e.path); }
         catch (error) {
@@ -347,7 +360,7 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
         }
         const indexProfile = await readIndexProfile(e.path, e.name, st);
         if (indexProfile) {
-          let protectedProfile = live.profiles.has(`${e.lock}/${indexProfile}`);
+          let protectedProfile = liveProtects(live, e.lock, indexProfile);
           try {
             const profile = await fs.lstat(join(parent, indexProfile));
             protectedProfile ||= (plan.now ?? Date.now()) - profile.mtimeMs < Math.max(HOUR, plan.minAgeMs ?? HOUR);
