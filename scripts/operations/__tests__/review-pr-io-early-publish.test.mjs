@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { REVIEW_EFFECTS } from '../review-pr.mjs';
 
 const head = 'a'.repeat(40);
@@ -12,7 +16,8 @@ function fixture(overrides = {}) {
   const sleep = vi.fn(async ms => { time += ms; });
   const publishGate = vi.fn(() => pending);
   const readPublishHead = vi.fn(() => head);
-  const sinks = createReviewPrSinks({ env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'fast-checks', WE_REVIEW_CANCEL_ON_CI_RED: 'false',
+  const root = mkdtempSync(join(tmpdir(), 'early-publish-'));
+  const sinks = createReviewPrSinks({ root, runStore: frozenWriteUpStore(root, ['verdict.md']), env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'fast-checks', WE_REVIEW_CANCEL_ON_CI_RED: 'false',
     WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100', ...overrides.env },
     runNode, sleep, now: () => time, publishGate, readPublishHead, out: () => {},
     ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'env')) });
