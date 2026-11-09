@@ -103,6 +103,7 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
   holdFn = redTeamEnqueueHold } = {}) {
   let published = false;
+  let clearingAttempted = false;
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
       return failure('invalid red-team check identity or WE_APP_ID; operator must inspect configuration');
@@ -122,6 +123,8 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
       if (!disposition.result) throw Error('no trusted red-team result on live head');
       if (!Array.isArray(disposition.result.shapedLines) || disposition.result.shapedLines.length)
         throw Error('red-team result has malformed or unparsed finding evidence; operator must inspect the full result');
+      if (disposition.result.completedReview !== true || !redTeamResultId(disposition.result))
+        throw Error('red-team result lacks completed review content; operator must inspect the full result');
       const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
       if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);
       const history = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
@@ -154,6 +157,9 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
       return runs.map(run => run.id);
     };
     const before = inspect();
+    const held = postRedTeamPublicationHold({ repo, pr, headSha, held: true,
+      reason: 'validating live red-team check publication', gh });
+    if (!held.ok) throw Error(held.reason);
     let postedId;
     const posted = postRedTeamCheckRun({ repo, pr, headSha,
       gh: (args, options) => {
@@ -173,14 +179,18 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
     if (after[0] !== postedId || after.length !== before.length + 1
       || before.some((id, index) => after[index + 1] !== id))
       throw Error('another red-team check raced publication');
+    clearingAttempted = true;
+    const cleared = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh });
+    if (!cleared.ok) throw Error(cleared.reason);
     return { ok: true };
   } catch (error) {
     const reason = `live red-team check not clear: ${message(error)}`;
     if (published) {
       const supersede = postRedTeamCheckRun({ repo, pr, headSha, gh,
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason }) });
-      if (!supersede.ok) {
-        const failures = `${reason}; ${supersede.reason}`;
+      if (!supersede.ok || clearingAttempted) {
+        // A lost clear response may have removed the hold, so restore it even if supersession worked.
+        const failures = supersede.ok ? reason : `${reason}; ${supersede.reason}`;
         const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
         return failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}`);
       }

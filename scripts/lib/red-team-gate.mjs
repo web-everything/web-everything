@@ -101,6 +101,12 @@ export function parseRedTeamComment(body) {
   const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
   // Non-enumerable: it only keys the digest and must not change the parsed shape callers compare or serialise.
   Object.defineProperty(parsed, 'shapedLines', { value: shapedLines, enumerable: false });
+  // A marker identifies a review; it does not prove that a review finished. Preserve completion
+  // metadata without changing the serialized findings contract or the result digest.
+  const verdict = /^Advisory only:.* · recorded verdict `(accept|changes|needs-human)`\.$/m.exec(text)?.[1];
+  const completedReview = Boolean(verdict && (findings.length
+    || (verdict === 'accept' && /^The red team tried to break this change and reported nothing\.$/m.test(text))));
+  Object.defineProperty(parsed, 'completedReview', { value: completedReview, enumerable: false });
   return parsed;
 }
 
