@@ -308,4 +308,41 @@ describe('reserved priority slot (drain freeze read)', () => {
     expect(exec).toHaveBeenCalledTimes(1);
     expect(f.throttle.sleep).not.toHaveBeenCalled();
   });
+  const RL = 'HTTP 403: API rate limit exceeded';
+  it('sync: a reserved read that hits primary exhaustion spends NO diagnostic rate_limit probe, but still records the shared block', () => {
+    const f = fullPool('red-main-freeze-read');
+    const exec = vi.fn(() => { throw Object.assign(new Error(RL), { status: 1, stderr: RL }); });
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 20000, throttle: { ...f.throttle, reservedSlot: true, exec } })).toThrow(/rate limit/);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls.some(([a]) => a.includes('rate_limit'))).toBe(false);
+    expect(f.rows().some(r => r.outcome === 'budget_exhausted')).toBe(true);
+  });
+  it('sync: an injected probeBudget is not consulted for a reserved read either', () => {
+    const f = fullPool('red-main-freeze-read');
+    const exec = vi.fn(() => { throw Object.assign(new Error(RL), { status: 1, stderr: RL }); });
+    const probeBudget = vi.fn(() => '');
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 20000, throttle: { ...f.throttle, reservedSlot: true, exec, probeBudget } })).toThrow(/rate limit/);
+    expect(probeBudget).not.toHaveBeenCalled();
+  });
+  it('sync: an ordinary read still probes the bucket after primary exhaustion (unchanged)', () => {
+    const f = fullPool('lane-pool-health-watch-we', { WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'ungated' });
+    const exec = vi.fn(() => { throw Object.assign(new Error(RL), { status: 1, stderr: RL }); });
+    expect(() => runGhSync(READ, { encoding: 'utf8', throttle: { ...f.throttle, exec } })).toThrow(/rate limit/);
+    expect(exec.mock.calls.some(([a]) => a.includes('rate_limit'))).toBe(true);
+  });
+  it('passthrough: a reserved read that hits primary exhaustion spawns once, with no diagnostic probe, and records the block', () => {
+    const f = fullPool('red-main-freeze-read');
+    const spawn = vi.fn(() => ({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from(RL) }));
+    const r = runGhCliPassthrough(FREEZE_ARGS, { throttle: { ...f.throttle, reservedSlot: true }, spawn });
+    expect(r.status).toBe(1);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(f.rows().some(x => x.outcome === 'budget_exhausted')).toBe(true);
+  });
+  it('passthrough: an injected probeBudget is not consulted for a reserved read', () => {
+    const f = fullPool('red-main-freeze-read');
+    const spawn = vi.fn(() => ({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from(RL) }));
+    const probeBudget = vi.fn(() => '');
+    runGhCliPassthrough(FREEZE_ARGS, { throttle: { ...f.throttle, reservedSlot: true, probeBudget }, spawn });
+    expect(probeBudget).not.toHaveBeenCalled();
+  });
 });
