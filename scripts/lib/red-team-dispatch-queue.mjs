@@ -195,9 +195,9 @@ function normalizeCapacity(capacity) {
   if (capacity.budget && typeof capacity.budget === 'object' && whole(capacity.budget.left) !== capacity.budget.left) {
     capacity.budget.left = whole(capacity.budget.left);
   }
-  const lanes = whole(capacity.lanes), remainingStarts = whole(capacity.remainingStarts);
-  return lanes === capacity.lanes && remainingStarts === capacity.remainingStarts ? capacity
-    : { ...capacity, lanes, remainingStarts };
+  // Floored in place as well: the runner decrements the caller's own object, so a copy would replenish it per call.
+  for (const key of ['lanes', 'remainingStarts']) if (whole(capacity[key]) !== capacity[key]) capacity[key] = whole(capacity[key]);
+  return capacity;
 }
 const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'number' && !Number.isNaN(capacity.lanes)
   && (capacity.remainingStarts == null || (typeof capacity.remainingStarts === 'number' && !Number.isNaN(capacity.remainingStarts)))

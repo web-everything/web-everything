@@ -582,6 +582,14 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       await block(f, 1);
       for (const bad of [undefined, NaN, '1']) expect(f.queue.admit(repo, bad)).toEqual([]);
     });
+    it('floors the caller capacity object in place so runner decrements reach it', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1]));
+      const cap = { lanes: 1.7, remainingStarts: 2.2 };
+      runWithRedTeamQueue({ ...inputs([1], { capacity: cap }), queue: f.queue,
+        run: options => { expect(options.capacity).toBe(cap); options.capacity.lanes--; return { rows: [], dispatched: [], notStarted: [] }; } });
+      expect(cap).toEqual({ lanes: 0, remainingStarts: 2 });
+    });
     it('survives a restart', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2]));
