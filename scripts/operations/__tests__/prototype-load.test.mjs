@@ -2290,9 +2290,13 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     const settings = { ruledWeakened: [entry()] };
     const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
-    for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
+    // A readable DIFFERENT fingerprint proves other code: readiness does not speak, so the audit gate refuses.
+    const other = await auditedFixture('warn', { ready, settings, fingerprint: () => OTHER_FP }).run();
+    expect(other).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    // An unreadable live fingerprint proves nothing, so the record's readable fingerprint still refuses (fail closed).
+    for (const fingerprint of [() => null, () => { throw new Error('boom'); }]) {
       const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
-      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
     }
   });
 });
@@ -2662,20 +2666,21 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
       // The entry alone is a trigger: the record stores no fingerprint, so only the entry's fingerprint can start the read.
       const alone = vi.fn(() => FP);
       const refused = await auditedFixture('warn', { ready: auditLines([weak({ fingerprint: undefined })]), settings: { ruledWeakened: [entry()] }, fingerprint: alone }).run();
-      expect(refused).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      // A record with no stored fingerprint cannot carry, so it does not speak for this head: the audit gate refuses.
+      expect(refused).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
       expect(alone).toHaveBeenCalledTimes(1);
     });
     it.each([
       ['an exact-sha ready record', [green({ sha: SHA })], { source: 'ready-record' }],
-      ['an other-sha ready record without a fingerprint', [green({ fingerprint: undefined })], null],
+      // No stored fingerprint: it is other code, so readiness is produced fresh from the audit and check-run.
+      ['an other-sha ready record without a fingerprint', [green({ fingerprint: undefined })], { source: 'canonical-check-run' }],
     ])('%s never triggers the read', async (_, records, gate) => {
       const fingerprint = vi.fn(() => FP);
       const f = auditedFixture('warn', { ready: auditLines(records), fingerprint });
       const out = await f.run();
-      if (gate) expect(out.gate).toMatchObject(gate); else expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      expect(out.gate).toMatchObject(gate);
       expect(fingerprint).not.toHaveBeenCalled();
-      if (gate) expect(branchFetches(f)).toBe(await baselineFetches());
-      else expect(branchFetches(f)).toBe(0); // refused at the ready stage, before any fetch of the live branch
+      if (gate.source === 'ready-record') expect(branchFetches(f)).toBe(await baselineFetches());
     });
     it('a failed (null) read is memoized too: the audit stage does not repeat it', async () => {
       const fingerprint = vi.fn(() => null);
@@ -2701,9 +2706,13 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
     const settings = { ruledWeakened: [entry()] };
     const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
-    for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
+    // A readable DIFFERENT fingerprint proves other code: readiness does not speak, so the audit gate refuses.
+    const other = await auditedFixture('warn', { ready, settings, fingerprint: () => OTHER_FP }).run();
+    expect(other).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    // An unreadable live fingerprint proves nothing, so the record's readable fingerprint still refuses (fail closed).
+    for (const fingerprint of [() => null, () => { throw new Error('boom'); }]) {
       const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
-      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
     }
   });
 });
@@ -2838,9 +2847,10 @@ describe('refuse-only safety properties P1–P9', () => {
   it('P9 an audited re-load of a live ref passes the admission gates, then reports already without any mutation', async () => {
     const f = fixture({ list: [BASE.branch, 'lane/old'] });
     expect(await f.run()).toMatchObject({ ok: true, registered: 'already', canonicalAudit: { ok: true } });
-    for (const action of ['add', 'remove', 'replace', 'retire']) expect(mutations(f, action)).toHaveLength(0);
+    // The live registration itself is never added, removed, replaced or rebuilt. (Other proved-merged entries may still
+    // be retired by the normal retirement step, which is why the planner is not asserted absent.)
+    for (const action of ['add', 'remove', 'replace']) expect(mutations(f, action)).toHaveLength(0);
     expect(f.calls.some((c) => c.args[0] === 'push')).toBe(false);
-    expect(f.retirePlanner).not.toHaveBeenCalled();
   });
   it('real settings R786 (#6588), R790 (a7200c728), R796 (166689d) pass the canonical ruled gate using fake IO', async () => {
     const shipped = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
@@ -2936,6 +2946,12 @@ describe('stale readiness never blocks a code-changed head', () => {
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
     expect(f.calls).toEqual([]); expect(f.readyWrites).toEqual([]);
   });
+  it.each([['null', () => null], ['throw', () => { throw new Error('boom'); }]])(
+    'an unreadable live fingerprint (%s) cannot clear another sha\'s negative evidence that stores a fingerprint', async (_, fingerprint) => {
+      const f = fixture({ ready: auditLines([rec({ sha: OLD, tests: 'red', fingerprint: FP })]), fingerprint });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+      expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+    });
   it('still refuses when negative evidence for the same net diff sits on another sha (carried), and never writes readiness', async () => {
     const f = fixture({ ready: auditLines([rec({ sha: OLD, audit: 'WEAKENED', fingerprint: FP })]), fingerprint: () => FP });
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });

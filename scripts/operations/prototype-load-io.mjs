@@ -478,7 +478,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const readTestCheck = testCheck || (({ sha }) => {
         const gh = (args) => {
           try { return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: repo, env: childEnv,
-            encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024, throttle: { caller: 'prototype-load', ...(exec !== execFileSync ? { exec } : {}) } })) }; }
+            encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024, throttle: { caller: 'prototype-load', ...(exec !== execFileSync ? { exec: (ghArgs, ghOpts) => exec('gh', ghArgs, ghOpts) } : {}) } })) }; }
           catch { return { code: 1, stdout: '' }; }
         };
         const origin = resolveOriginRepository({ git: (args) => git(...args), gh });

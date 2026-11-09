@@ -95,8 +95,12 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
  * readyEvidence is null AND a record speaks for this head. */
 export function readyRecordSpeaksFor(records, input, liveFp = null) {
   const live = lowerSha(input.sha);
+  // An unreadable live fingerprint (failed fetch/read) cannot prove a record is about other code, so a record that
+  // stores a readable fingerprint still speaks: a transient git failure must not clear negative evidence.
+  const liveUnknown = !carriesAcross(liveFp, liveFp);
   return (Array.isArray(records) ? records : []).some((r) => r && typeof r === 'object' && r.ref === input.branch
-    && (!validSha(r.sha) || lowerSha(r.sha) === live || carriesAcross(r.fingerprint, liveFp)));
+    && (!validSha(r.sha) || lowerSha(r.sha) === live || carriesAcross(r.fingerprint, liveFp)
+      || (liveUnknown && carriesAcross(r.fingerprint, r.fingerprint))));
 }
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
