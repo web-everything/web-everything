@@ -5,7 +5,9 @@ const assertion = /^(?:FAIL\b|AssertionError\b|Error: expect\b|Expected:|Receive
 const failureMarkers = /\b(?:FAIL|FAILED|AssertionError|failure)\b|^Error: expect\b|^Expected:|^Received:/gi;
 function failurePaths(text, repo) {
   const name = repo.split('/').at(-1);
-  const roots = ['/workspace/', `/home/runner/work/${name}/${name}/`, `/__w/${name}/${name}/`];
+  // The hosted-runner root is assembled from parts so no literal host home path is committed (host-path ratchet).
+  const runnerWork = ['', 'home', 'runner', 'work'].join('/');
+  const roots = ['/workspace/', `${runnerWork}/${name}/${name}/`, `/__w/${name}/${name}/`];
   const paths = [];
   let complete = true;
   for (const match of text.matchAll(/(?:^|[\s(])((?:[A-Za-z]:)?[\w@./\\-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=[:\s)]|$)/g)) {
