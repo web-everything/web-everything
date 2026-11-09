@@ -446,4 +446,9 @@ describe('mq failure evidence: real #6499 log shapes', () => {
       902: ghAggregate('Unit shards did not succeed; refusing incomplete coverage.'), 903: ghAggregate('Unit shards did not succeed.') }));
     expect(evidence.testFiles).toContain('tests/inside.test.mjs');
   });
+  it('vitest unhandled errors (stackless rejection) keep evidence incomplete so refresh is never chosen', async () => {
+    const evidence = await collect(io({ 901: `${shardLog}\nUnhandled Rejection\nErrors  1 error`,
+      902: ghAggregate('Unit shards did not succeed; refusing incomplete coverage.'), 903: ghAggregate('Unit shards did not succeed.') }));
+    expect(evidence.complete).toBe(false);
+  });
 });

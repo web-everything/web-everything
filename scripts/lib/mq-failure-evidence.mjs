@@ -117,7 +117,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         let parsed = false, hasAssertions = false, markers = 0, attributed = 0;
         const jobAssertions = [], jobPaths = new Set(), causalityLines = [], markerLines = [];
         let activePaths = [], capturedOutput = false, unterminatedBlock = false;
-        const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
+        let unhandledErrors = false; const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
         for (const raw of clean(log.text).split(/\r?\n/)) {
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
           // Vitest echoes passing tests' stdout/stderr verbatim. These blocks can contain fake
@@ -132,6 +132,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
             else continue;
           }
           if (line) causalityLines.push(line);
+          if (/^(?:Errors\s+\d+ errors?\b|.*Unhandled (?:Rejection|Error)s?\b)/.test(line)) unhandledErrors = true;
           const summary = /^(Test Files|Tests)\s+(?:(\d+) failed)?/.exec(line);
           if (summary) { const n = summary[2] === undefined ? 0 : Number(summary[2]); if (summary[1] === 'Tests') summaryTests = n; else summaryFiles = n; }
           const heading = /^FAIL\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>/.exec(line);
@@ -159,7 +160,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         // can hide a failing test from the parser, but not from the totals the runner printed itself.
         if ((summaryFiles !== null && summaryFiles !== failHeadingFiles.size)
           || (summaryTests !== null && summaryTests !== failHeadings)) pathsComplete = false;
-        if (capturedOutput || unterminatedBlock) pathsComplete = false; // an unended captured block may hide real failures
+        if (capturedOutput || unterminatedBlock || unhandledErrors) pathsComplete = false; // unhandled errors have no FAIL heading // an unended captured block may hide real failures
         if (jobAssertions.length > 100 || jobPaths.size > 100) return result;
         // Any structured failure marker in a derived job's own log (attributed or not) is real evidence,
         // not boilerplate: it must go through normal attribution instead of being exempted.
