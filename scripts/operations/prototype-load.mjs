@@ -19,13 +19,15 @@ export function jsonLines(text) {
   return String(text).split(/\r?\n/).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
 }
 /** A bounded, complete check-run page; latest `test` run on this SHA decides. */
+/** The `test` gate must come from the GitHub Actions app (id 15368), never a same-named check from another integration. */
+export const TEST_CHECK_APP_ID = 15368;
 export function testCheckEvidence(data, sha) {
   if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
     || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count) return null;
-  const runs = data.check_runs.filter((r) => r?.name === 'test' && r.head_sha === sha);
+  const runs = data.check_runs.filter((r) => r?.name === 'test' && r.head_sha === sha && r.app?.id === TEST_CHECK_APP_ID);
   if (!runs.length || runs.some((r) => !Number.isSafeInteger(r.id))) return null;
   const latest = runs.sort((a, b) => b.id - a.id)[0];
-  return { sha: latest.head_sha, name: latest.name, status: latest.status, conclusion: latest.conclusion, id: latest.id };
+  return { sha: latest.head_sha, name: latest.name, status: latest.status, conclusion: latest.conclusion, id: latest.id, appId: latest.app.id };
 }
 /** A WEAKENED fix-ready record loads ONLY as a ruled exception (operator R396): the record must carry
  *  `auditRuling` and a non-empty `auditDisclosed`, AND the settings allowlist `ruledWeakened` must hold an entry whose

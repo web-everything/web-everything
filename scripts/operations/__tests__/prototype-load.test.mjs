@@ -247,7 +247,7 @@ function fixture(options = {}) {
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
   const load = createPrototypeLoader({ exec, fs, env, retirePlanner,
-    testCheck: options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success' })),
+    testCheck: options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
@@ -1891,11 +1891,11 @@ describe('prototype-load', () => {
       expect(f.retirePlanner.mock.calls[0][0].rows.map((row) => row.ref)).not.toContain(BASE.branch);
     });
     it('hands the planner the FULL registry as proof context while still never planning the candidate (R10)', async () => {
-      const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'] });
+      const f = fixture({ list: ['lane/old', BASE.branch], contained: ['lane/old'] });
       await f.run({ dryRun: true });
       const call = f.retirePlanner.mock.calls[0][0];
-      expect(call.rows.map((row) => row.ref)).toEqual(['lane/old', 'lane/also']);
-      expect(call.proofRows.map((row) => row.ref)).toEqual(['lane/old', 'lane/also']);
+      expect(call.rows.map((row) => row.ref)).toEqual(['lane/old']);
+      expect(call.proofRows.map((row) => row.ref)).toEqual(['lane/old', BASE.branch]);
     });
     it('retire-only mode drops proved registrations with no candidate and no ready record', async () => {
       const f = fixture({ list: ['lane/old', 'lane/live'], ready: '', ...retireOld() });
@@ -2842,10 +2842,18 @@ describe('refuse-only safety properties P1–P9', () => {
 
 
 describe('test check-run evidence bounds (P8)', () => {
-  const pass = { id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success' };
+  const pass = { id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 } };
   it('uses the latest test run on the exact SHA, even when an older success exists', () => {
     expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [pass, { ...pass, id: 2, conclusion: 'failure' }] }, SHA)).toMatchObject({ sha: SHA, conclusion: 'failure' });
     expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, head_sha: TREE }] }, SHA)).toBeNull();
+  });
+  it('binds the test check to the GitHub Actions app, not its name alone', async () => {
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, app: { id: 1 } }] }, SHA)).toBeNull();
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, app: undefined }] }, SHA)).toBeNull();
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [pass, { ...pass, id: 9, app: { id: 1 }, conclusion: 'success' }] }, SHA)).toMatchObject({ id: 1, appId: 15368 });
+    const f = fixture({ ready: '', testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 1 }) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('refuses an oversized or incomplete page rather than treating a truncated success as evidence', () => {
     for (const total_count of [101, -1, null, 2]) expect(prototypeLoad.testCheckEvidence({ total_count, check_runs: [pass] }, SHA)).toBeNull();

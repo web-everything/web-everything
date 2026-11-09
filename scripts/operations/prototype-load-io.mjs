@@ -21,7 +21,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, TEST_CHECK_APP_ID, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -486,7 +486,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return testCheckEvidence(JSON.parse(result.stdout), sha);
       });
       const checkRun = await readTestCheck({ sha: input.sha, branch: input.branch });
-      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.status !== 'completed' || checkRun.conclusion !== 'success')
+      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success')
         return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
       const canonical = out.canonicalAudit.record;
       const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: 'green',
