@@ -487,11 +487,13 @@ export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = 
 }
 
 /** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
-export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync }) {
-  // R807: only a fresh "no bundle" record keeps git tests local; unknown (missing/expired/unreadable) goes remote and
-  // prepare decides (an old runner is refused there with a safe local fallback).
-  try { return capabilityBundleVerdict(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }) !== 'no'; }
-  catch { return true; }
+export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync, unknownOk = true }) {
+  // R807: 'yes' routes remote; a fresh "no" stays local; unknown (missing/expired/unreadable) routes remote only when the
+  // caller can enforce the affirmation at prepare (the built-in client); an external client override cannot, so it stays local.
+  let verdict;
+  try { verdict = capabilityBundleVerdict(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
+  catch { verdict = 'unknown'; }
+  return verdict === 'yes' || (verdict === 'unknown' && unknownOk);
 }
 export function writeRunnerCapabilities({ root, host, capabilities, clock = Date.now, write = writeFileSync, mkdir = mkdirSync, rename = renameSync }) {
   try {
@@ -895,7 +897,8 @@ export async function runWithRemoteDecision({
     if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
     return overloaded;
   };
-  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock });
+  const externalClient = policy.settings.remote.clientPath != null || remoteClientOverride != null;
+  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock, unknownOk: !externalClient });
   let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
   if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
     && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);
