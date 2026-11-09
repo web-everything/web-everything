@@ -18,7 +18,8 @@ export function isMutatingGhCall(cmd, args = []) {
       if (!a[i] || a[i].startsWith('-')) return true;
       return isMutatingGhCall(a[i], a.slice(i + 1));
     }
-    return a.some(s => /\b(?:gh|git|enqueue|refresh|numbering)\b/.test(s));
+    // A shell can run anything: refuse every shell wrapper (fail closed). Callers must use argv.
+    return true;
   }
   if (name === 'git') {
     // Global options can install aliases/helpers: only the direct read forms are admitted.
@@ -115,6 +116,9 @@ function assertRead(cmd, args, shell = false) {
     if (/[;&|<>`$()\n\r\\'"]/.test(text)) throw new Error('DRAIN_CLASSIFY_ONLY: shell command refused; use read-only argv');
     const words = text.trim().split(/\s+/);
     cmd = words.shift(); args = words;
+    if (basename(String(cmd)) === 'git' && args[0] === 'diff' && !(args.includes('--no-ext-diff') && args.includes('--no-textconv'))) {
+      throw new Error('DRAIN_CLASSIFY_ONLY: shell git diff must carry --no-ext-diff --no-textconv');
+    }
   }
   if (isMutatingGhCall(cmd, Array.isArray(args) ? args : [])) {
     throw new Error(`DRAIN_CLASSIFY_ONLY: mutating or unknown command refused (${String([cmd, ...(Array.isArray(args) ? args : [])].join(' ')).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 120)}); use the local drain`);
@@ -134,13 +138,25 @@ export function installGuard() {
       const options = Array.isArray(argv[1]) ? argv[2] : argv[1];
       assertRead(argv[0], argv[1], key === 'exec' || key === 'execSync' || !!options?.shell);
     };
-    const harden = argv => {
-      if (Array.isArray(argv[1]) && !(key === 'exec' || key === 'execSync')) argv[1] = hardenGitArgs(argv[0], argv[1]);
+    const harden = (argv, phase) => {
+      if (phase === 'post' && Array.isArray(argv[1]) && !(key === 'exec' || key === 'execSync')) argv[1] = hardenGitArgs(argv[0], argv[1]);
+      // exec/execSync take one command string (already restricted to a single simple command by assertRead).
+      if (phase === 'pre' && (key === 'exec' || key === 'execSync') && typeof argv[0] === 'string') {
+        const m = /^(\s*(?:\S*\/)?git\s+diff)(\s|$)/.exec(argv[0]);
+        if (m) {
+          const words = argv[0].trim().split(/\s+/).slice(2);
+          // Same admission rule as the argv form: only a diff that already asks for --no-ext-diff (or is stat-only) is
+          // completed with the missing protections; anything else is left untouched and refused by assertRead.
+          const statOnly = words.some(x => ['--numstat', '--name-only', '--name-status', '--shortstat', '--stat'].includes(x));
+          const extra = (statOnly || words.includes('--no-ext-diff') ? ['--no-ext-diff', '--no-textconv'] : []).filter(f => !words.includes(f));
+          if (extra.length) argv[0] = `${m[1]} ${extra.join(' ')}${argv[0].slice(m[1].length)}`;
+        }
+      }
       return argv;
     };
-    const wrapped = function (...argv) { check(argv); return Reflect.apply(original, this, harden(argv)); };
+    const wrapped = function (...argv) { harden(argv, 'pre'); check(argv); harden(argv, 'post'); return Reflect.apply(original, this, argv); };
     if (original[promisify.custom]) {
-      wrapped[promisify.custom] = function (...argv) { check(argv); return Reflect.apply(original[promisify.custom], this, harden(argv)); };
+      wrapped[promisify.custom] = function (...argv) { harden(argv, 'pre'); check(argv); harden(argv, 'post'); return Reflect.apply(original[promisify.custom], this, argv); };
     }
     childProcess[key] = wrapped;
   }

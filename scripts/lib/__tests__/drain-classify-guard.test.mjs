@@ -210,3 +210,23 @@ describe('read-only graphql', () => {
     expect(isMutatingGhCall('gh', ['api', 'graphql'])).toBe(true);
   });
 });
+
+describe('shell wrappers and exec string hardening', () => {
+  it('refuses every shell wrapper and rewrites exec/execSync git diff strings with both protections', () => {
+    for (const sh of ['sh', 'bash', 'zsh']) expect(isMutatingGhCall(sh, ['-c', 'rm some-file'])).toBe(true);
+    const source = `
+      import childProcess from 'node:child_process';
+      import assert from 'node:assert/strict';
+      const seen = [];
+      for (const k of ['exec', 'execSync']) childProcess[k] = (...a) => { seen.push(a[0]); return ''; };
+      const { installGuard } = await import(${JSON.stringify(new URL('../drain-classify-guard.mjs', import.meta.url).href)});
+      installGuard();
+      childProcess.execSync('git diff --no-ext-diff a...b');
+      childProcess.exec('git diff --numstat a...b');
+      assert.deepEqual(seen, ['git diff --no-textconv --no-ext-diff a...b', 'git diff --no-ext-diff --no-textconv --numstat a...b']);
+      assert.throws(() => childProcess.execSync("sh -c 'rm x'"), /DRAIN_CLASSIFY_ONLY/);
+      process.stdout.write('ok');
+    `;
+    expect(execFileSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', env: { ...process.env, DRAIN_CLASSIFY_ONLY: '0' } })).toBe('ok');
+  });
+});
