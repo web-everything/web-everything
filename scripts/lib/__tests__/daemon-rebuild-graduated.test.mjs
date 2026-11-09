@@ -547,6 +547,16 @@ describe('redecideWithCandidate (R787/R796)', () => {
     expect(o.alert).toHaveBeenCalledWith('redecide-containment-failed', expect.any(Object));
   });
 
+  it.each([
+    ['loader', (o) => o.loadCandidate.mockImplementation(() => new Promise(() => {}))],
+    ['matcher', (o) => o.candidate.matchReadyCandidate.mockImplementation(() => new Promise(() => {}))],
+  ])('fails closed when the candidate %s never settles', async (_name, hang) => {
+    const o = setup();
+    hang(o);
+    expect(await adoption.redecideWithCandidate({ ...o, timeoutMs: 20 })).toBe(o.m);
+    expect(o.alert).toHaveBeenCalledWith('redecide-candidate-error', { error: 'candidate re-decision timed out' });
+  });
+
   it('retains the original refusal and cleans scratch when the loader throws', async () => {
     const o = setup();
     let scratch;

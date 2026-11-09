@@ -161,7 +161,14 @@ function omittedContentContained({ git, finalSha, omitted, liveApplied }) {
 }
 
 /** R787/R796: only a verified omission may ask the smoke-passed candidate for one fresh decision. */
-export async function redecideWithCandidate({ m, ready, git, args, alert, loadCandidate = loadReadyAdoption }) {
+const REDECIDE_TIMEOUT_MS = 30_000;
+function withDeadline(promise, ms) {
+  let timer;
+  const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('candidate re-decision timed out')), ms); });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+export async function redecideWithCandidate({ m, ready, git, args, alert, loadCandidate = loadReadyAdoption, timeoutMs = REDECIDE_TIMEOUT_MS }) {
   if (m?.adopt !== null || !m.reason?.startsWith('superseded-omits-live-overlay')) return m;
   let dir;
   try {
@@ -169,16 +176,16 @@ export async function redecideWithCandidate({ m, ready, git, args, alert, loadCa
     const finalSha = ready.adopt.finalSha;
     const expected = JSON.stringify(ready.adopt); // snapshot before candidate code runs
     const liveSnapshot = structuredClone(args.liveApplied); // the proof reads the running code's own copy, never one candidate code can mutate
-    const candidate = await loadCandidate({ git, finalSha, dir });
+    const candidate = await withDeadline(Promise.resolve().then(() => loadCandidate({ git, finalSha, dir })), timeoutMs);
     if (typeof candidate?.matchReadyCandidate !== 'function' || typeof candidate?.overlayGraduated !== 'function') {
       throw new Error('candidate adoption exports unavailable');
     }
-    const result = await candidate.matchReadyCandidate({
+    const result = await withDeadline(Promise.resolve().then(() => candidate.matchReadyCandidate({
       ...args,
       ready: structuredClone(ready),
       liveApplied: structuredClone(liveSnapshot),
       leftForMain: (applied, build) => args.leftForMain(applied, build, candidate.overlayGraduated),
-    });
+    })), timeoutMs);
     if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('candidate returned a non-object decision');
     // Bound the candidate's answer: exactly the ready record's own adopt metadata, never a rewritten plan.
     const sameAdopt = JSON.stringify(result.adopt) === expected && JSON.stringify(ready.adopt) === expected;
