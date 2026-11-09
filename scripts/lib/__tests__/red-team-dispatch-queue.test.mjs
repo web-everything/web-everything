@@ -476,4 +476,45 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const override = join('fixture-state', 'custom-queue.json');
     expect(defaultQueueFile({ WE_RED_TEAM_QUEUE_FILE: override }, home)).toBe(override);
   });
+  describe('non-runnable head does not consume an admission', () => {
+    const block = async (f, pr) => {
+      await f.queue.admit(repo, 1);
+      await f.queue.settle(repo, refused(pr, 'review-unfinished'));
+    };
+    it('a review-unfinished head is probed each tick but the next runnable PR is admitted in the same tick', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      await block(f, 1);
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2]);
+      expect(f.logs.some(line => line.includes('probe example/project#1'))).toBe(true);
+      expect(f.logs.some(line => line.includes('admit example/project#2: capacity 1'))).toBe(true);
+      expect(f.logs.some(line => line.includes('hold example/project#3: capacity 1'))).toBe(true);
+    });
+    it('keeps FIFO order and the capacity bound among runnable PRs', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
+      await block(f, 2);
+      expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
+      expect(numbers(f.queue.admit(repo, 0))).toEqual([2]);
+    });
+    it('does not spend a retry while probing, and stops being blocked once dispatched', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      const before = f.queue.entries()[0].attempts;
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'review-unfinished' }, { prNumber: 2, action: 'dispatch' }],
+        dispatched: [{ prNumber: 2 }], notStarted: [{ prNumber: 1, reason: 'review-unfinished' }] });
+      expect(f.queue.entries().find(entry => entry.pr === 1).attempts).toBe(before);
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, started({ plan: { refusals: [{ prNumber: 1, kind: 'already-reviewed-head' }] } }));
+      expect(numbers(f.queue.entries())).not.toContain(1);
+    });
+    it('survives a restart', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      expect(numbers(f.open().admit(repo, 1))).toEqual([1, 2]);
+    });
+  });
 });
