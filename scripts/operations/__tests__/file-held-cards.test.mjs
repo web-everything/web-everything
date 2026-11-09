@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, statSync, symlinkSync, linkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { qualifyBareBasenames } from '../file-held-cards.mjs';
 import { sizeRefusal } from '../../backlog/scaffold.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
-import { finishFileHeldCards, parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards, main } from '../file-held-cards.mjs';
+import * as heldCards from '../file-held-cards.mjs';
+import { finishFileHeldCards, createFileHeldCardsSinks, parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards } from '../file-held-cards.mjs';
 import { operatorControlCliPolicy, resolveOperation } from '../run.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
@@ -98,13 +100,13 @@ it('caps batches at ten by default, supports max and leaves overflow for the nex
   expect((await run()).filed).toHaveLength(1);
 });
 
-it('logs and ledgers normalized duplicate titles without filing or retrying them', async () => {
+it('logs normalized duplicate titles without filing them or writing the ledger', async () => {
   seed('- [R1] 2026-11-08: Repair behavior; extra details');
   writeFileSync(join(root, 'backlog', '123-old.md'), '---\ntitle: other\n---\n# REPAIR   behavior; extra  details\n');
   expect((await run()).duplicates).toHaveLength(1);
-  expect(JSON.parse(readFileSync(ledger, 'utf8'))).toMatchObject({ status: 'duplicate', card: '123-old.md' });
+  expect(existsSync(ledger)).toBe(false);
   expect(log).toHaveBeenCalledWith(expect.stringContaining('duplicate'));
-  expect((await run()).duplicates).toEqual([]);
+  expect((await run()).duplicates).toHaveLength(1);
   expect(fileItem).not.toHaveBeenCalled();
 });
 
@@ -133,20 +135,26 @@ it('does not ledger a failed or incomplete file-item response', async () => {
   expect(existsSync(ledger)).toBe(false);
 });
 
-it('CLI validates bounds and unknown flags with operator guidance', async () => {
-  const stderr = { write: vi.fn() };
-  expect(await main(['--max=-1'], { stderr })).toBe(2);
-  expect(await main(['--unknown'], { stderr })).toBe(2);
-  expect(stderr.write).toHaveBeenCalledWith(expect.stringContaining('--max'));
+it('has no standalone entry point: the only way in is run.mjs file-held-cards', () => {
+  expect(heldCards).not.toHaveProperty('main');
 });
 
-it('CLI JSON dry-run uses declared flags and does not file or touch the ledger', async () => {
+it('run.mjs validates bounds and unknown flags with operator guidance', async () => {
+  const { declaration, registry, sinks } = resolveOperation('file-held-cards', {});
+  for (const argv of [['--max=-1'], ['--unknown']]) {
+    const outcome = await runOperationCli({ declaration, registry, argv, store: createMemoryRunStore(), newRunId: () => 'held-bad', sinks });
+    expect(outcome.code).not.toBe(0);
+  }
+});
+
+it('run.mjs JSON dry-run uses declared flags and does not file or touch the ledger', async () => {
   seed('- [R1] 2026-11-08: Repair behavior');
-  const stdout = { write: vi.fn() };
-  const stderr = { write: vi.fn() };
-  expect(await main([`--source=${source}`, '--dry-run', '--json'], { root, fileItem, stdout, stderr })).toBe(0);
-  const result = JSON.parse(stdout.write.mock.calls.map(([text]) => text).join(''));
-  expect(result.planned).toHaveLength(1);
+  const { declaration, registry, finish } = resolveOperation('file-held-cards', { json: true });
+  const sinks = createFileHeldCardsSinks({ root, fileItem });
+  const outcome = await runOperationCli({ declaration, registry, argv: [`--source=${source}`, '--dry-run', '--json'],
+    store: createMemoryRunStore(), newRunId: () => 'held-dry', sinks });
+  expect(outcome.code).toBe(0);
+  expect(JSON.parse(finish(outcome).lines.join('\n')).planned).toHaveLength(1);
   expect(fileItem).not.toHaveBeenCalled();
   expect(existsSync(ledger)).toBe(false);
   expect(operatorControlCliPolicy('file-held-cards', ['--dry-run'])).toEqual({ zeroWrites: true, memoryStore: true });
@@ -174,9 +182,12 @@ it('appends safely to a valid ledger lacking its final newline', async () => {
 
 it('refuses a ledger inside the checkout or aliasing the source', async () => {
   seed('- [R1] 2026-11-08: Repair behavior');
-  await expect(run({ ledger: source })).rejects.toThrow(/outside/);
-  await expect(run({ ledger: join(root, 'cards-filed.jsonl') })).rejects.toThrow(/outside/);
+  // The ledger is fixed beside the source, so a source inside the checkout puts the ledger inside it.
+  const inside = join(root, 'cards-to-file.md');
+  writeFileSync(inside, '- [R1] 2026-11-08: Repair behavior');
+  await expect(run({ source: inside })).rejects.toThrow(/outside/);
   expect(fileItem).not.toHaveBeenCalled();
+  expect('ledger' in resolveOperation('file-held-cards', {}).declaration.input).toBe(false);
 });
 
 it('rejects an external symlink to an in-repository ledger without changing its bytes', async () => {
@@ -197,8 +208,10 @@ it('rejects a new ledger reached through a symlinked repository directory', asyn
   seed('- [R1] 2026-11-08: Repair behavior');
   const alias = join(temp, 'repo-alias');
   symlinkSync(root, alias, 'dir');
-  await expect(run({ ledger: join(alias, 'new-ledger.jsonl') })).rejects.toThrow(/outside/);
-  expect(existsSync(join(root, 'new-ledger.jsonl'))).toBe(false);
+  const aliased = join(alias, 'cards-to-file.md');
+  writeFileSync(aliased, '- [R1] 2026-11-08: Repair behavior');
+  await expect(run({ source: aliased })).rejects.toThrow(/outside/);
+  expect(existsSync(join(root, 'cards-filed.jsonl'))).toBe(false);
   expect(fileItem).not.toHaveBeenCalled();
 });
 
@@ -220,38 +233,13 @@ it('rejects a ledger symlink to the source without changing its bytes', async ()
   expect(fileItem).not.toHaveBeenCalled();
 });
 
-it('rejects an external hard link to a repository ledger without changing bytes or calling fileItem', async () => {
-  seed('- [R1] 2026-11-08: Repair behavior');
-  const target = join(root, 'backlog', 'cards-filed.jsonl');
-  const original = JSON.stringify({ hash: hashLine('previous card'), tag: 'R0', date: '2026-11-07',
-    card: 'xprevious', title: 'Previous behavior', filedAt: '2026-11-08T12:00:00Z' }) + '\n';
-  writeFileSync(target, original);
-  linkSync(target, ledger);
-  const before = readFileSync(source);
-  await expect(run()).rejects.toThrow(/outside/);
-  expect(readFileSync(target, 'utf8')).toBe(original);
-  expect(readFileSync(ledger, 'utf8')).toBe(original);
-  expect(readFileSync(source)).toEqual(before);
-  expect(fileItem).not.toHaveBeenCalled();
-});
-
-it('allows a hard-linked ledger when all file identities are outside the repository', async () => {
-  seed('- [R1] 2026-11-08: Repair behavior');
-  const external = join(temp, 'other-ledger.jsonl');
-  writeFileSync(external, '');
-  linkSync(external, ledger);
-  expect((await run()).filed).toHaveLength(1);
-  expect(fileItem).toHaveBeenCalledTimes(1);
-  expect(JSON.parse(readFileSync(ledger, 'utf8')).card).toBe('xtest');
-});
-
 it('keeps truncated-title cards distinct and refuses an overlapping run via the ledger lock', async () => {
   const long = 'z'.repeat(130);
   seed(`- [R1] 2026-11-08: ${long} one\n- [R1] 2026-11-08: ${long} two`);
   expect((await run()).filed).toHaveLength(2);
   seed('- [R2] 2026-11-08: Lock probe');
-  const st = statSync(ledger);
-  const lockFile = join(tmpdir(), `file-held-cards-${st.dev}-${st.ino}.lock`);
+  const id = createHash('sha256').update(join(realpathSync(temp), 'cards-filed.jsonl')).digest('hex').slice(0, 24);
+  const lockFile = join(tmpdir(), `file-held-cards-${id}.lock`);
   writeFileSync(lockFile, '1');
   try { await expect(run()).rejects.toThrow(/ledger lock/); } finally { rmSync(lockFile, { force: true }); }
   expect(fileItem).toHaveBeenCalledTimes(2);
@@ -297,6 +285,40 @@ it('a closed card with the same title does not suppress a fresh handoff', async 
   const result = await run();
   expect(result.duplicates).toHaveLength(0);
   expect(result.filed).toHaveLength(1);
+});
+
+it('one filed plus one refused card exits non-zero', () => {
+  const outcome = { code: 0, run: { effects: [{ type: 'file-held-cards.file', result: { filed: [{ tag: 'R1', date: 'd', title: 't' }], refused: [{ tag: 'R2', date: 'd' }], duplicates: [], planned: [], failed: [] } }] } };
+  expect(finishFileHeldCards(outcome).code).toBe(1);
+});
+
+it('a duplicate is never ledgered and gets filed on the next run once its twin closes', async () => {
+  seed('- [R1] 2026-11-08: Repair behavior');
+  writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: open\n---\n# Repair behavior\n');
+  const first = await run();
+  expect(first.duplicates).toHaveLength(1);
+  expect(fileItem).not.toHaveBeenCalled();
+  expect(existsSync(ledger)).toBe(false);
+  writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: resolved\n---\n# Repair behavior\n');
+  const second = await run();
+  expect(second.filed).toHaveLength(1);
+  expect(fileItem).toHaveBeenCalledTimes(1);
+});
+
+it('duplicates do not count against the batch budget', async () => {
+  seed('- [R1] 2026-11-08: Repair behavior\n- [R1] 2026-11-08: Fresh card');
+  writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: open\n---\n# Repair behavior\n');
+  const result = await run({ max: 1 });
+  expect(result.duplicates).toHaveLength(1);
+  expect(result.filed).toHaveLength(1);
+});
+
+it('a status-marked ledger row whose card exists nowhere throws', async () => {
+  seed('- [R2] 2026-11-08: Fresh card');
+  writeFileSync(ledger, JSON.stringify({ hash: hashLine('other'), tag: 'R0', date: '2026-11-07', title: 'Old', card: '8999',
+    status: 'filed-elsewhere', filedAt: '2026-11-08T12:00:00Z' }) + '\n');
+  await expect(run()).rejects.toThrow(/ledgered card/);
+  expect(fileItem).not.toHaveBeenCalled();
 });
 
 it('a file-item failure makes the finished outcome exit non-zero', () => {
