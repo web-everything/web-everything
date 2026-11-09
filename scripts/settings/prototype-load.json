@@ -258,6 +258,14 @@
         "scripts/conveyor/pr-stall-sweep.mjs:342 — Treats a missing PID namespace as matching locally. A stale record from another machine can therefore be declared dead by a local PID probe. (R803: ruled single-host exception inherited from #6603)",
         "scripts/conveyor/pr-stall-sweep.mjs:152 — Operator resets discard earlier restart spend from lifetime caps, spacing, and idempotency checks. (R804: the recorded operator reset is the ruled action)"
       ]
+    },
+    {
+      "ref": "lane/drain-freeze-priority",
+      "sha": "cbcec6ed1c53f31ba7586a8b99be954e87911dda",
+      "ruling": "R813",
+      "findings": [
+        "scripts/lib/gh-throttle.mjs:2012 — Raises the configured concurrency ceiling from cap to cap + 1 for reserved freeze reads, allowing execution when the original gate would throttle. The passthrough path repeats this override at line 2288."
+      ]
     }
   ]
 }
