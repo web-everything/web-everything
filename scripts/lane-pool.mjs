@@ -1478,6 +1478,59 @@ function refreshLane(repo, n, { force = false } = {}) {
  * @param {number} n
  * @param {{leasedOnly?: boolean}} [opts]
  */
+// History quarantine is metadata only: never move/delete the clone, and never gate release/reap on it.
+const historyQuarantinePath = (repo, n) => join(repo.poolDir, '.quarantine-state', `lane-${n}.json`);
+function historyQuarantine(repo, n) {
+  const file = historyQuarantinePath(repo, n);
+  try {
+    const record = JSON.parse(readFileSync(file, 'utf8'));
+    if (typeof record.reason !== 'string' || !record.reason) throw new Error('missing reason');
+    return record;
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    return { reason: 'history quarantine record unreadable; inspect it manually' };
+  }
+}
+
+// Fail-closed: any read error other than ENOENT (EACCES, ENOTDIR, bad JSON) still counts as quarantined.
+const isHistoryQuarantined = (repo, n) => historyQuarantine(repo, n) !== null;
+
+// Use release's honest-history environment and traversal, but no remote proof/fetch: this is readability,
+// not a pushed-work verdict. All local branch/stash tips are walked (without exclusions), so an origin
+// tip cannot hide a missing ancestor. git() bounds time/output; hitting either bound fails closed too.
+function probeLaneHistory(dir) {
+  // GIT_SHALLOW_FILE=/dev/null: a .git/shallow boundary must not mask a missing ancestor (a shallow lane fails closed here).
+  const read = (args, opts = {}) => git(args, dir, { ...opts, env: { ...releaseEvidenceEnv(args), GIT_SHALLOW_FILE: '/dev/null' } });
+  read(['rev-list', '--max-count=200', 'HEAD']);
+  const branches = read(['for-each-ref', '--format=%(objectname)', 'refs/heads/']);
+  const stash = read(['for-each-ref', '--format=%(objectname)', 'refs/stash']);
+  const reflog = stash ? read(['reflog', 'show', '--format=%H', 'refs/stash', '--']) : '';
+  const tips = [read(['rev-parse', '--verify', '--quiet', 'HEAD']), branches, stash, reflog]
+    .join('\n').split('\n').filter(Boolean);
+  const input = tips.map(sha => `${sha}\n`).join('');
+  const opts = { stdio: ['pipe', 'pipe', 'pipe'], input };
+  const present = read(['cat-file', '--batch-check=%(objectname) %(objecttype)'], opts).split('\n');
+  if (present.length !== tips.length || !present.every(line => / commit$/.test(line))) {
+    throw new Error('local history tip missing or not a commit');
+  }
+  read(['rev-list', '--ignore-missing', '--stdin'], opts);
+}
+
+function requireReadableLaneHistory(repo, n) {
+  let firstError;
+  // Exactly one retry, including timeouts/output-limit errors. Preserve the initial diagnostic.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { probeLaneHistory(laneDir(repo, n)); return; } catch (e) {
+      firstError ??= msgOf(e).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 2000);
+    }
+  }
+  const file = historyQuarantinePath(repo, n);
+  const reason = `history unreadable after two probes: ${firstError}`;
+  mkdirSync(join(repo.poolDir, '.quarantine-state'), { recursive: true });
+  writeFileSync(file, JSON.stringify({ lane: n, reason, at: new Date().toISOString(), firstError }) + '\n');
+  throw new Error(`lane-${n} QUARANTINED: ${reason}; inspect/repair history (or probe limits), then remove ${file} manually`);
+}
+
 function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, path: dir, exists: false };
@@ -1486,6 +1539,12 @@ function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
   // #2275 — surface the hold so a picker can filter (and a human sees who owns a lane). `leased` is only
   // true for a LIVE lease; a stale marker reads as free (reclaimable), matching acquire's own logic.
   const leased = lease ? !isLeaseStale(lease, Date.now(), ttlMsFromFlags()) : false;
+  const quarantine = historyQuarantine(repo, n);
+  if (quarantine) return {
+    lane: n, path: dir, exists: true, deps: depsReady(dir), lease: lease || null, leased,
+    ...(readError ? { readError } : {}), status: 'QUARANTINED', reason: quarantine.reason,
+    recovery: `Inspect/repair history (or probe limits), then remove ${historyQuarantinePath(repo, n)} manually`,
+  };
   if (leasedOnly && !leased) {
     return {
       lane: n,
@@ -1552,6 +1611,8 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, exists: false };
   const lease = readLease(dir);
+  // A history-quarantined lane is never acquirable (acquire would refuse it), so it must not be advertised either.
+  if (isHistoryQuarantined(repo, n)) return { lane: n, exists: false, quarantined: true };
   if (leaseDisqualifiesAcquire(lease, nowMs, ttlMs)) return { lane: n, exists: true, lease, dirtyOrAhead: null };
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
@@ -2328,6 +2389,8 @@ async function cmdAcquire(repo) {
     const n = Number(flags.lane);
     const dir = laneDir(repo, n);
     if (!existsSync(dir)) fail(`lane-${n} does not exist (${dir})`);
+    const quarantine = historyQuarantine(repo, n);
+    if (quarantine) fail(`lane-${n} QUARANTINED: ${quarantine.reason}; inspect/repair history (or probe limits), then remove ${historyQuarantinePath(repo, n)} manually`);
     // #2350 — a RESERVED lane is off-limits to an ordinary acquire, INCLUDING the OWNING session's own plain
     // re-acquire. Without this pre-claim guard, `tryClaimLane`'s `leaseOwnedBy` self-refresh would rewrite the
     // marker as an ordinary (non-reserved) lease and then the reset path below would `reset --hard` the lane —
@@ -2568,7 +2631,7 @@ async function cmdAcquire(repo) {
       }
       const pickable = candidateDirs
         .map((d) => Number(basename(d).slice(5)))
-        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane)
+        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
         .sort((a, b) => a - b);
       for (const pick of pickable) {
         const claimed = tryClaimLane(laneDir(repo, pick), session, Date.now(), ttlMs);
@@ -2583,6 +2646,9 @@ async function cmdAcquire(repo) {
         // blip, the #2924 re-verify, a bad `--base`, an npm hiccup) — none of which are reasons to give up on
         // every OTHER candidate this pool might still offer.
         try {
+          // Probe before --no-reset's safety check too: otherwise unreadable history is merely refused
+          // there and retried on every acquire instead of being persistently quarantined.
+          requireReadableLaneHistory(repo, pick);
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
           // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
@@ -2734,6 +2800,7 @@ async function cmdAcquire(repo) {
   // would silently re-run `fetchOriginPruneWithRetry`/`checkout -B`/`ensureDeps` a second time for no reason.
   if (flags.lane !== undefined) {
     try {
+      requireReadableLaneHistory(repo, chosen);
       provisionClaimedLane(repo, chosen, targetWasReserved);
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
@@ -3446,6 +3513,11 @@ function printStatus(repo) {
   }
   log(`pool "${repo.name}" @ ${repo.poolDir} (integration branch: origin/${repo.branch})${leasedOnly ? ' — leased-only (git-probed rows below only)' : ''}`);
   for (const r of rows) {
+    if (r.status === 'QUARANTINED') {
+      log(`  lane-${r.lane}: QUARANTINED · ${r.reason}${r.leased ? ` · ${describeLease(r.lease)}` : ''}`);
+      log(`    ${r.recovery}`);
+      continue;
+    }
     if (leasedOnly && !r.leased) {
       log(`  lane-${r.lane}: (unleased — skipped, --leased-only) · deps ${r.deps}`);
       continue;
@@ -4009,9 +4081,9 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
         if (limit !== null && out.length >= limit) break; // #xn432dz --limit: stop once N are found
       }
     }
-    return out.map((n) => laneDir(repo, n));
+    return out.filter((n) => !isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n));
   } catch (e) {
-    if (e && e.partialScan) return out.map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
+    if (e && e.partialScan) return out.filter((n) => !isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
     throw e;
   } finally {
     scanDeadlineMs = null;
@@ -4036,7 +4108,13 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
 // holder's scan actually finished or the lock's OWN (far larger) staleness grace elapsed — 3.4x its wait in the
 // worst observed case. `null` (the default, e.g. `list --acquirable`'s own direct callers) reproduces the
 // prior behavior exactly: no caller-side bound, only the scan/lock's own.
-function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
+// A quarantine record can land after a list was cached, so every answer (cache hit or fresh) is re-filtered.
+function acquirableListCached(repo, opts) {
+  const paths = acquirableListCachedRaw(repo, opts); // may wait on a scan lock: snapshot records AFTER it returns
+  const quarantined = new Set(existingLanes(repo).filter((n) => isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)));
+  return quarantined.size ? paths.filter((p) => !quarantined.has(p)) : paths;
+}
+function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
   const hit = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
   if (hit) return slice(hit);
