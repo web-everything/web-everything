@@ -522,7 +522,7 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(out.act).toEqual([]);
   });
   const foreignStatus = (patch = {}) => statusFor({ host: 'renamed-mac', startedAt: 'unreadable', ...patch });
-  const staleStatusAt = () => NOW - 31 * 60_000;
+  const staleStatusAt = () => NOW - 121 * 60_000;
   it.each(['queued', 'running'])('a stale foreign-named %s owner with a dead pid restarts despite unreadable run age', async status => {
     const { out, probe } = await sweep({ status: foreignStatus({ status }), readStatusAt: staleStatusAt });
     expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
@@ -544,6 +544,16 @@ describe('pending red-team watchdog in the shadow sweep', () => {
   it('a foreign-named owner with fresh statusAt holds without restarting', async () => {
     const { out, probe } = await sweep({ status: foreignStatus(), readStatusAt: () => NOW - 29 * 60_000 });
     expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a foreign-named dead owner silent past 30 but under 120 minutes still holds', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus(), readStatusAt: () => NOW - 45 * 60_000 });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+  });
+  it('a foreign-named owner whose pid probe is unknown (null) holds without restarting', async () => {
+    const { out } = await sweep({ status: foreignStatus(), alive: null, readStatusAt: staleStatusAt });
     expect(out.act).toEqual([]);
     expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
   });

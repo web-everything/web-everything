@@ -38,6 +38,7 @@ export const STALL_SWEEP_DEFAULTS = Object.freeze({ mode: 'off', intervalMinutes
 const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'maxRedTeamRestartsPerHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
 const SETTINGS_FILE = join(ROOT, 'scripts/settings/pr-stall-sweep.json');
 const envName = (k) => `WE_PR_STALL_SWEEP_${k.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
+const STALE_RUN_MS = 120 * 60_000;
 const msg = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 200);
 
 /** Only ESRCH proves absence; unexpected probe failures leave ownership unknown. */
@@ -300,8 +301,13 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
             }
           } else if (Number.isSafeInteger(status.pid) && status.pid > 0) {
             const statusAt = await readStatusAt({ repo: row.repo, pr: row.number, head, env });
-            if (foreignStaleOwnerDead(status, { host: local.host, namespace: local.namespace, statusAt, now, env,
-              isAlive: local.isAlive, readPidStart: local.readPidStart })) ownerAlive = false;
+            // Only a probe that answers exactly false counts as dead (null = unknown holds), and the record must
+            // have been silent past the sweep's own stale-run window, not only the 30 minute foreign-host floor.
+            const sameTable = status.pidNamespace == null || status.pidNamespace === local.namespace;
+            const alive = sameTable && Number.isFinite(statusAt) && now - statusAt > STALE_RUN_MS ? await local.isAlive(status.pid) : null;
+            if (alive !== null && alive !== undefined
+              && foreignStaleOwnerDead(status, { host: local.host, namespace: local.namespace, statusAt, now, env,
+                isAlive: () => alive, readPidStart: local.readPidStart })) ownerAlive = false;
           }
         }
       } catch (e) { ownerAlive = null; base.errors.push(`red-team owner ${row.repo}#${row.number}: ${msg(e)}`); }
