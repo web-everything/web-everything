@@ -79,7 +79,10 @@ describe('daemon renderer', () => {
     expect(diffPlists(xml, { Label: label, ProgramArguments: [label], EnvironmentVariables: { PATH: host.path } })).toEqual([]);
   });
 
-  it('preserves shell metacharacters in host.home without executing substitutions', () => {
+  // The rendered publisher command runs under /bin/zsh on the macOS host. zsh is absent on Linux CI, so the
+  // production-shell run is explicitly skipped there (visible as skipped) and a /bin/sh run always covers the
+  // POSIX source's quoting.
+  const metacharacterProbe = shellArgv => {
     const root = temp();
     const home = join(root, 'home-$(touch dollar-executed)-`touch backtick-executed`-$HOME-\'"&<>');
     const app = join(home, 'workspace/plateau-app');
@@ -95,15 +98,22 @@ describe('daemon renderer', () => {
     const args = [...xml.match(/<array>([\s\S]*?)<\/array>/)[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map(match => decode(match[1]));
     const env = Object.fromEntries([...xml.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)[1].matchAll(/<key>([^<]*)<\/key>\s*<string>([\s\S]*?)<\/string>/g)].map(match => [decode(match[1]), decode(match[2])]));
     expect(env.WE_WIP_PUBLISH_HOME).toBe(home);
-    expect(args[2]).not.toContain(home);
     expect(args.slice(0, 2)).toEqual(['/bin/zsh', '-lc']);
-    // Execute through the rendered shell when the host has it (startup files off); zsh is absent on Linux CI,
-    // where the POSIX source is probed with /bin/sh instead.
-    const shell = existsSync(args[0]) ? [args[0], ['-f', '-c', args[2]]] : ['/bin/sh', ['-c', args[2]]];
-    const output = execFileSync(shell[0], shell[1], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
+    expect(args[2]).not.toContain(home);
+    const [shell, flags] = shellArgv(args);
+    const output = execFileSync(shell, [...flags, args[2]], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
     expect(output.trim()).toBe(realpathSync(app));
     expect(existsSync(join(root, 'dollar-executed'))).toBe(false);
     expect(existsSync(join(root, 'backtick-executed'))).toBe(false);
+  };
+
+  it.skipIf(!existsSync('/bin/zsh'))('preserves shell metacharacters in host.home without executing substitutions (rendered /bin/zsh)', () => {
+    // Disable startup files for the probe; run the rendered shell source with only rendered env.
+    metacharacterProbe(args => [args[0], ['-f', '-c']]);
+  });
+
+  it('preserves shell metacharacters in host.home without executing substitutions (POSIX /bin/sh)', () => {
+    metacharacterProbe(() => ['/bin/sh', ['-c']]);
   });
 
   it('preserves booleans, intervals, paths and process type and reports leaf differences', () => {
