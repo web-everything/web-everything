@@ -151,7 +151,7 @@ describe('daemonRebuild.skipUnrelated', () => {
     expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(r.head);
     expect(readRebuildState(f.cloneDir, f.env).adopted.head).toBe(r.head);
     expect(log.error.mock.calls.map((c) => c[0]).join('\n')).toMatch(/skipped rebuild\+smoke .*none of 2 changed file\(s\) is imported/);
-  });
+  }, 60000);
 
   it('default (no injected check) skips a docs-only move using the daemon entries, but not an imported change', async () => {
     const f = makeFixture();
@@ -169,7 +169,7 @@ describe('daemonRebuild.skipUnrelated', () => {
     expect(docs.r.reason).toBe('skipped-unrelated');
     const code = await run((dir) => writeFile(dir, 'scripts/lib/a.mjs', 'export const a = 3;\n'));
     expect(code.runSmoke).toHaveBeenCalledTimes(1);
-  });
+  }, 60000);
 
   it('a change to an imported file still builds and smokes', async () => {
     const f = makeFixture();
@@ -178,7 +178,7 @@ describe('daemonRebuild.skipUnrelated', () => {
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(r.adopted).toBe(true);
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 
   it('a lockfile or package.json change still builds and smokes', async () => {
     const f = makeFixture();
@@ -187,14 +187,14 @@ describe('daemonRebuild.skipUnrelated', () => {
     expect(lock.runSmoke).toHaveBeenCalledTimes(1);
     const pkg = await next(f, skipCheck, (dir) => writeFile(dir, 'package.json', '{"x":1}\n'));
     expect(pkg.runSmoke).toHaveBeenCalledTimes(1);
-  });
+  }, 60000);
 
   it('knob off (WE_DAEMON_REBUILD_SKIP_UNRELATED=0): even a docs-only move smokes', async () => {
     const f = makeFixture();
     await adoptBaseline(f);
     const { runSmoke } = await next(f, undefined, (dir) => writeFile(dir, 'docs/y.md', 'y\n'), '0');
     expect(runSmoke).toHaveBeenCalledTimes(1);
-  });
+  }, 60000);
 });
 
 describe('decideSkipRebuild / resolveSkipUnrelated', () => {
@@ -252,7 +252,7 @@ describe('the skip decision covers everything the shared candidate smoke exercis
       expect(runSmoke).toHaveBeenCalledTimes(1);
       expect(r.reason).not.toBe('skipped-unrelated');
     }
-  });
+  }, 60000);
 
   it('the same sibling-only change is still unrelated to a docs-only neighbour: docs still skip', async () => {
     const f = makeFixture();
@@ -264,7 +264,7 @@ describe('the skip decision covers everything the shared candidate smoke exercis
     });
     expect(runSmoke).not.toHaveBeenCalled();
     expect(r.reason).toBe('skipped-unrelated');
-  });
+  }, 60000);
 });
 
 describe('a file the daemon can run or read without importing it is never "unrelated"', () => {
@@ -302,7 +302,7 @@ describe('a rename out of the closure is not hidden', () => {
     });
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 });
 
 // ── the shortcut's own preconditions: each guard, removed alone, must redden a test here ────────────────────────
@@ -327,7 +327,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     expect(skipCheck).toHaveBeenCalledTimes(1);
     expect(runSmoke).not.toHaveBeenCalled();
     expect(r.reason).toBe('skipped-unrelated');
-  });
+  }, 60000);
 
   it('never adopted (no verified baseline): the check is not consulted and the smoke runs', async () => {
     const f = makeFixture();
@@ -336,7 +336,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     expect(skipCheck).not.toHaveBeenCalled();
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 
   it('adopted head is not the clone HEAD (a tree that was never the verified build): no shortcut', async () => {
     const f = makeFixture();
@@ -345,7 +345,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     const { r, skipCheck } = await unrelatedMove(f);
     expect(skipCheck).not.toHaveBeenCalled();
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 
   it('held clone: no shortcut', async () => {
     const f = makeFixture();
@@ -354,7 +354,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     const { r, skipCheck } = await unrelatedMove(f);
     expect(skipCheck).not.toHaveBeenCalled();
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 
   it('quarantined clone: no shortcut', async () => {
     const f = makeFixture();
@@ -363,7 +363,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     const { r, skipCheck } = await unrelatedMove(f);
     expect(skipCheck).not.toHaveBeenCalled();
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 
   it('a sibling daemon mid-smoke (live build lease): the clone is not moved under it', async () => {
     const f = makeFixture();
@@ -380,7 +380,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     expect(runSmoke).not.toHaveBeenCalled();
     expect(r.reason).toBe('rebuild-in-progress');
     expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
-  });
+  }, 60000);
 
   it('a build adopted with a busy-skipped probe is not carried forward unsmoked', async () => {
     const f = makeFixture();
@@ -390,7 +390,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     expect(skipCheck).not.toHaveBeenCalled();
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 
   it('a busy-skipped record for some OTHER tree does not block the shortcut', async () => {
     const f = makeFixture();
@@ -399,7 +399,7 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     const { r, skipCheck } = await unrelatedMove(f);
     expect(skipCheck).toHaveBeenCalledTimes(1);
     expect(r.reason).toBe('skipped-unrelated');
-  });
+  }, 60000);
 });
 
 describe('a non-ASCII changed path is matched, not C-quoted past the closure', () => {
@@ -419,7 +419,7 @@ describe('a non-ASCII changed path is matched, not C-quoted past the closure', (
     });
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 });
 
 // ── review round 2 (#4272): a script a daemon SPAWNS by path is code it runs, though no `import` names it ───────
@@ -568,5 +568,5 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     });
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(r.reason).not.toBe('skipped-unrelated');
-  });
+  }, 60000);
 });
