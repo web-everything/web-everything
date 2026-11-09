@@ -232,6 +232,12 @@ describe('postNoteComment — the IO shell', () => {
 });
 
 describe('informational note kinds (conveyor.notes.informationalKinds)', async () => {
+  it.each(commentPolicy.NO_ASK_NOTE_KINDS)('%s remains informational with an empty settings list', (kind) => {
+    expect(commentPolicy.isInformationalNote({ kind }, { kinds: [] })).toBe(true);
+  });
+  it('does not classify an unknown kind as informational with an empty settings list', () => {
+    expect(commentPolicy.isInformationalNote({ kind: 'unknown-note-kind' }, { kinds: [] })).toBe(false);
+  });
   it('exports referral-hold-auto-resolved as a built-in no-ask kind', () => {
     expect(commentPolicy.NO_ASK_NOTE_KINDS).toContain('referral-hold-auto-resolved');
   });

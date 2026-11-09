@@ -60,6 +60,8 @@ export function loadPrCommentSettings({ path = DEFAULT_SETTINGS_PATH, env = glob
  * informational note, never as "needs your decision", so the needs-you feed does not raise them.
  */
 export const DEFAULT_INFORMATIONAL_NOTE_KINDS = Object.freeze(['timeout-retry-fallback-heal']);
+// These kinds explicitly declare no ask, regardless of the configurable informational list.
+export const NO_ASK_NOTE_KINDS = Object.freeze(['timeout-retry-fallback-heal', 'referral-hold-auto-resolved']);
 
 /** @returns {string[]} */
 export function loadInformationalNoteKinds({ path = DEFAULT_SETTINGS_PATH } = {}) {
@@ -72,7 +74,7 @@ export function loadInformationalNoteKinds({ path = DEFAULT_SETTINGS_PATH } = {}
 
 /** @param {{kind?:string}} note @param {{kinds?:string[]}} [o] @returns {boolean} */
 export function isInformationalNote(note, { kinds = loadInformationalNoteKinds() } = {}) {
-  return kinds.includes(note?.kind);
+  return NO_ASK_NOTE_KINDS.includes(note?.kind) || kinds.includes(note?.kind);
 }
 
 /**
