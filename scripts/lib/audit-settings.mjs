@@ -192,7 +192,11 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // Landed on main since (PR #6381, CI run 42791408190): the held-card filer (an exclusive create and a lock file name).
   'scripts/operations/file-held-cards.mjs',
   // Landed on main since: the judge kill-switch store (an exclusive `wx` create).
-  'scripts/lib/judge-switches.mjs']);
+  'scripts/lib/judge-switches.mjs',
+  // Landed on main since (PR #6381, CI run 43334197514): the lock-waiter busy-spin soak break (a lock file name), the
+  // review head index (an exclusive create) and the fix-ready record (an exclusive create and a lock file name).
+  'scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.mjs', 'scripts/lib/review-head-index.mjs',
+  'scripts/operations/fix-ready-record.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
@@ -263,7 +267,9 @@ export const LOCK_USERS = Object.freeze([
   // Landed on main since: the daemon self-sync lock user.
   'scripts/lib/daemon-self-sync.mjs',
   // Landed on main since: the PR stall reset (takes withFileLock from atomic-json-file.mjs).
-  'scripts/conveyor/pr-stall-reset.mjs']);
+  'scripts/conveyor/pr-stall-reset.mjs',
+  // Landed on main since (PR #6381, CI run 43334197514): the live-owner watch IO and the review head index.
+  'scripts/conveyor/pr-live-owner-watch-io.mjs', 'scripts/lib/review-head-index.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
