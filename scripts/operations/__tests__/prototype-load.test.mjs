@@ -37,7 +37,7 @@ const settings = {
 };
 function fixture(options = {}) {
   const candidateSha = options.sha || SHA;
-  const calls = [], records = [], sleeps = [], reads = [], cloneRoots = [];
+  const calls = [], records = [], readyWrites = [], sleeps = [], reads = [], cloneRoots = [];
   let clock = 0;
   let remoteTip = candidateSha;
   let tipReads = 0;
@@ -55,10 +55,11 @@ function fixture(options = {}) {
       reads.push(p);
       if (p === '/home/test/platform-preferences.json') return JSON.stringify({ prototypeLoad: options.platformSettings });
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      if (p.endsWith('/test-clone-key.json')) return options.registryRaw ?? (options.list ? JSON.stringify({ overlays: [...registrations.values()] }) : '');
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
       if (p === '/home/test/canonical-audits.jsonl') {
         if (options.auditReadError) throw Object.assign(new Error('audit file unreadable'), { code: options.auditReadError });
-        return options.audits ?? '';
+        return options.audits ?? auditLines([auditRecord({ head: candidateSha, base: 'e'.repeat(40) })]);
       }
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
@@ -71,7 +72,7 @@ function fixture(options = {}) {
       }
       const e = new Error('missing'); e.code = 'ENOENT'; throw e;
     },
-    mkdirSync() {}, appendFileSync(p, line) { records.push({ path: p, ...JSON.parse(line) }); },
+    mkdirSync() {}, appendFileSync(p, line) { (p === '/home/test/ready' ? readyWrites : records).push({ path: p, ...JSON.parse(line) }); },
   };
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
@@ -150,7 +151,7 @@ function fixture(options = {}) {
     if (args[0] === 'fetch') {
       const ref = args[2]?.replace(/^\+refs\/heads\//, '').split(':')[0];
       if (options.staleFetchFails === ref) return fail(1);
-      if (options.liveFetchFails && args.length > 3 && args[2] === 'main') return fail(1); // only the `origin main <branch>` fetch, not the bare `origin main`
+      if (options.mainFetchFails && args.length === 3 && args[2] === 'main' || options.liveFetchFails && args.length > 3 && args[2] === 'main') return fail(1); // only the `origin main <branch>` fetch, not the bare `origin main`
       if (ref === BASE.branch && tipReads > 0 && options.advanceEstablishedBeforeSwap) establishedAdvanced = true;
       if (establishedTips.has(ref)) {
         const count = (establishedFetches.get(ref) || 0) + 1;
@@ -182,7 +183,7 @@ function fixture(options = {}) {
         if (options.staleDiffFails === ref) return fail(1);
         if (options.staleChanged?.[ref] !== undefined) return options.staleChanged[ref];
       }
-      return args.at(-1).startsWith('origin/main...') ? 'M\0x\0' : options.diff ?? 'M\0x\0';
+      return args.at(-1).startsWith('origin/main...') ? options.ownDiff ?? 'M\0x\0' : options.diff ?? 'M\0x\0';
     }
     if (args[0] === 'cherry') {
       expect(args.slice(1, 2)).toEqual(['origin/main']);
@@ -192,6 +193,7 @@ function fixture(options = {}) {
     }
     if (args[0] === 'merge-base') {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
+      if (args[2] === 'e'.repeat(40) && args[3] === 'origin/main') return '';
       if (options.auditBaseInMain && args[3] === 'origin/main' && args[2] === options.auditBaseInMain) return '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
       if ([...establishedTips.values()].includes(args[2])) {
@@ -244,10 +246,12 @@ function fixture(options = {}) {
   }
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
-  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, ...options.settings }), now: () => clock,
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner,
+    testCheck: options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success' })),
+    dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 const auditRecord = (overrides = {}) => ({
@@ -256,7 +260,14 @@ const auditRecord = (overrides = {}) => ({
 });
 const auditLines = (records) => records.map(record => JSON.stringify(record)).join('\n') + '\n';
 function auditedFixture(mode, options = {}) {
-  return fixture({ ...options, settings: {
+  // Historical warn-era success fixtures now supply real canonical evidence explicitly.
+  let audits = '';
+  if (options.ready) {
+    const ready = prototypeLoad.jsonLines(options.ready).at(-1);
+    audits = auditLines([auditRecord({ base: 'e'.repeat(40),
+      ...(ready?.audit === 'WEAKENED' ? { head: ready.sha, verdict: 'WEAKENED', findings: ready.auditDisclosed, fingerprint: ready.fingerprint } : {}) })]);
+  }
+  return fixture({ audits, ...options, settings: {
     auditRecordPath: '~/canonical-audits.jsonl',
     ...(mode === undefined ? {} : { canonicalAuditMode: mode }), ...options.settings,
   } });
@@ -382,7 +393,7 @@ describe('prototype-load ruled-WEAKENED admission', () => {
 });
 
 describe('prototype-load canonical audit admission', () => {
-  it('keeps the warn default in the standard cascade layer, not the tool file, so a platform refuse is not overridden', () => {
+  it('has no tool-file mode: admission always refuses without canonical evidence', () => {
     const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped).not.toHaveProperty('canonicalAuditMode');
   });
@@ -393,20 +404,15 @@ describe('prototype-load canonical audit admission', () => {
     ['weakened with absent mode', undefined, [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
     ['unreadable in warn', 'warn', [], 'no-record', 'EACCES'],
     ['missing file with absent mode', undefined, [], 'no-record', 'ENOENT'],
-  ])('%s proceeds with failed canonical evidence and a loud warning line', async (_, mode, records, reason, auditReadError) => {
+  ])('%s refuses failed canonical evidence without warn fallback', async (_, mode, records, reason, auditReadError) => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       const f = auditedFixture(mode, { audits: auditLines(records), auditReadError });
-      const out = await f.run();
-      expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode: 'warn', ok: false, reason } });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse', ok: false, reason } });
       expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
-      const lines = [...warning.mock.calls, ...error.mock.calls, ...stderr.mock.calls]
-        .map(args => args.map(String).join(' ')).join('\n');
-      expect(lines).toMatch(/WARNING[^\n]*canonical[ -]audit/i);
-      expect(mutations(f, 'add')).toHaveLength(1);
-    } finally { warning.mockRestore(); error.mockRestore(); stderr.mockRestore(); }
+      expect(warning).not.toHaveBeenCalled(); expect(mutations(f, 'add')).toHaveLength(0);
+      expect(f.calls).toEqual([]);
+    } finally { warning.mockRestore(); }
   });
   it.each([
     ['no records', [], 'no-record'],
@@ -435,7 +441,7 @@ describe('prototype-load canonical audit admission', () => {
     const record = auditRecord();
     const f = auditedFixture(mode, { auditBaseInMain: TREE, audits: `malformed json\n${auditLines([record])}` });
     const out = await f.run();
-    expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode, ok: true } });
+    expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode: 'refuse', ok: true } });
     expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
     expect(mutations(f, 'add')).toHaveLength(1);
   });
@@ -444,15 +450,10 @@ describe('prototype-load canonical audit admission', () => {
     expect(await f.run()).toMatchObject({ stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
     expect(mutations(f, 'add')).toHaveLength(0);
   });
-  it('checks ready evidence before reading canonical audits, including when explicit ready arguments pass', async () => {
+  it('arguments cannot bypass missing readiness or canonical audits', async () => {
     const f = auditedFixture('refuse', { ready: '', auditReadError: 'EACCES' });
-    expect((await f.run()).stopReason).toBe('no-ready');
-    expect(f.reads).not.toContain('/home/test/canonical-audits.jsonl');
-    const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
-    expect(out).toMatchObject({ stopReason: 'no-canonical-audit',
-      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
-    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
-    expect(f.calls).toEqual([]);
+    expect(await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' })).toMatchObject({ stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl'); expect(f.calls).toEqual([]);
   });
   it('uses input.sha rather than a fixed or unrelated audit head', async () => {
     const f = auditedFixture('refuse', { sha: MERGE, audits: auditLines([auditRecord()]) });
@@ -478,7 +479,7 @@ describe('prototype-load canonical audit admission', () => {
     ['platform refuse', 'refuse', undefined, 'refuse'],
     ['tool empty object over platform warn', 'warn', {}, 'refuse'],
     ['tool empty object over platform refuse', 'refuse', {}, 'refuse'],
-    ['explicit tool warn over invalid platform', {}, 'warn', 'warn'],
+    ['explicit tool warn over invalid platform', {}, 'warn', 'refuse'],
     ['explicit tool refuse over invalid platform', {}, 'refuse', 'refuse'],
   ])('%s preserves scalar mode precedence', async (_, platformMode, toolMode, expectedMode) => {
     const f = auditedFixture(toolMode, {
@@ -865,13 +866,14 @@ describe('prototype-load', () => {
     ['missing', ''], ['wrong sha', JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' })],
     ['weakened', JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED' })],
   ])('no-ready: %s stops before git and records', async (_, ready) => {
-    const f = fixture({ ready }); expect((await f.run()).stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(0); expect(f.records[0].stopReason).toBe('no-ready');
+    const f = fixture({ ready, testCheck: async () => null }); expect((await f.run()).stopReason).toBe('no-ready');
+    expect(f.calls).toHaveLength(ready ? 0 : 2); expect(f.records[0].stopReason).toBe('no-ready');
   });
-  it('accepts explicit tests-run and NOT WEAKENED pair', async () => {
-    const f = fixture({ ready: '' }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(true);
+  it('refuses explicit tests-run and NOT WEAKENED without a passing check-run', async () => {
+    const f = fixture({ ready: '', testCheck: async () => null }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(false);
   });
   it('refuses a branch tip mismatch before main checks', async () => {
-    const f = fixture({ tip: TREE }); const r = await f.run(); expect(r.gate.reason).toBe('sha-not-branch-tip'); expect(r.stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(2);
+    const f = fixture({ tip: TREE }); const r = await f.run(); expect(r.gate.reason).toBe('sha-not-branch-tip'); expect(r.stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(4);
   });
   it.each(['lane/../x', '-danger', 'lane/x.lock', 'main'])('bad-input: refuses unsafe ref %s', async (branch) => {
     const f = fixture(); expect((await f.run({ branch })).stopReason).toBe('bad-input'); expect(f.calls).toHaveLength(0);
@@ -1154,6 +1156,7 @@ describe('prototype-load', () => {
         fs: { mkdtempSync: () => worktree, existsSync: () => false, rmSync: vi.fn(),
           readFileSync: (path) => {
             if (path === worktree + '/one.test.mjs') return '';
+            if (path === '/home/test/canonical-audits.jsonl') return auditLines([auditRecord({ base: 'e'.repeat(40) })]);
             if (path === '/home/test/ready') return JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' });
             throw Object.assign(new Error('missing'), { code: 'ENOENT' });
           } } } });
@@ -1350,6 +1353,7 @@ describe('prototype-load', () => {
   ])('retains a landed-only registration without a swap failure: %s', async (_, options) => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, ...options });
     const r = await f.run();
+    if (options.list?.includes(BASE.branch)) { expect(r).toMatchObject({ ok: true, registered: 'already', adopted: false }); expect(f.calls).toEqual([]); expect(f.registrations.has('lane/old')).toBe(true); return; }
     expect(r).toMatchObject({ ok: true, adopted: true, stopReason: null, contained: [], swap: { contained: [], removed: [] } });
     expect(r.swap.failed).toBeUndefined();
     expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
@@ -1511,6 +1515,7 @@ describe('prototype-load', () => {
       },
     });
     const r = await f.run();
+    if (already) { expect(r).toMatchObject({ ok: true, registered: 'already', adopted: false, removed: [] }); expect(f.calls).toEqual([]); return; }
     expect(r).toMatchObject({ ok: false, stopReason: 'check-unverifiable', adopted: false, removed: [], error: 'adoption wait interrupted' });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old.');
@@ -1537,6 +1542,7 @@ describe('prototype-load', () => {
     const f = fixture({ behind, list: [...(already ? [BASE.branch] : []), 'lane/old', 'lane/also'],
       contained: ['lane/old', 'lane/also'], changeAfterContainment });
     const r = await f.run();
+    if (already) { expect(r).toMatchObject({ ok: true, registered: 'already', adopted: false, removed: [] }); expect(f.calls).toEqual([]); expect(f.lateChanges).toEqual([]); return; }
     expect(f.lateChanges).toContain(changeAfterContainment);
     expect(r.adopted).toBe(true);
     expect(r.ok).toBe(false);
@@ -1550,9 +1556,9 @@ describe('prototype-load', () => {
     expect([...f.registrations.keys()]).toContain('lane/old');
     if (changeAfterContainment === 'registration replaced') expect(f.registrations.get('lane/old').reason).toBe('concurrent writer');
   });
-  it('refreshes containment when the replacement is already registered', async () => {
+  it('leaves containment unchanged when the replacement is already registered', async () => {
     const f = fixture({ list: [BASE.branch, 'lane/old'], contained: ['lane/old'], advanceEstablishedBeforeSwap: true });
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', registered: 'already', removed: [] });
+    expect(await f.run()).toMatchObject({ ok: true, stopReason: null, registered: 'already', removed: [] });
     expect(mutations(f, 'add')).toEqual([]);
     expect(mutations(f, 'remove')).toEqual([]);
   });
@@ -1689,8 +1695,8 @@ describe('prototype-load', () => {
   });
   it('explains refusals in plain words', async () => {
     expect(await fixture({}).run({ sha: 'abc1234' })).toMatchObject({ stopReason: 'bad-input', fallback: expect.stringContaining('full 40-character sha') });
-    const noReady = await fixture({ ready: '' }).run();
-    expect(noReady.stopReason).toBe('no-ready'); expect(noReady.fallback).toMatch(/fix-ready record.*"tests":"green".*"audit":"NOT WEAKENED"/);
+    const noReady = await fixture({ ready: '', testCheck: async () => null }).run();
+    expect(noReady.stopReason).toBe('no-ready'); expect(noReady.fallback).toMatch(/Complete the test check-run on this SHA.*labels only/);
     const moved = await fixture({ tip: 'e'.repeat(40) }).run();
     expect(moved).toMatchObject({ stopReason: 'no-ready', fallback: expect.stringContaining(`branch tip is ${'e'.repeat(40)}`) });
   });
@@ -1888,11 +1894,11 @@ describe('prototype-load', () => {
       expect(f.retirePlanner.mock.calls[0][0].rows.map((row) => row.ref)).not.toContain(BASE.branch);
     });
     it('hands the planner the FULL registry as proof context while still never planning the candidate (R10)', async () => {
-      const f = fixture({ list: ['lane/old', BASE.branch], contained: ['lane/old'] });
+      const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'] });
       await f.run({ dryRun: true });
       const call = f.retirePlanner.mock.calls[0][0];
-      expect(call.rows.map((row) => row.ref)).toEqual(['lane/old']);
-      expect(call.proofRows.map((row) => row.ref)).toEqual(['lane/old', BASE.branch]);
+      expect(call.rows.map((row) => row.ref)).toEqual(['lane/old', 'lane/also']);
+      expect(call.proofRows.map((row) => row.ref)).toEqual(['lane/old', 'lane/also']);
     });
     it('retire-only mode drops proved registrations with no candidate and no ready record', async () => {
       const f = fixture({ list: ['lane/old', 'lane/live'], ready: '', ...retireOld() });
@@ -1976,12 +1982,12 @@ describe('prototype-load', () => {
   });
   it('happy path pins full command sequence, safe env and recorded provenance', async () => {
     const f = fixture(); const r = await f.run({ why: 'load tested patch' }); expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, cloneSource: 'settings:prototype-load.json#daemons.control.clone' });
-    expect(f.calls.map((c) => c.cmd === 'node' ? `${c.args[1]}${c.args.includes('--check') ? ':check' : ''}` : c.args[0])).toEqual(['fetch', 'rev-parse', 'fetch', 'diff', 'merge-base', 'diff', 'add:check', 'list', 'fetch', 'rev-parse', 'add', '-C']);
+    expect(f.calls.map((c) => c.cmd === 'node' ? `${c.args[1]}${c.args.includes('--check') ? ':check' : ''}` : c.args[0])).toEqual(['fetch', 'merge-base', 'fetch', 'rev-parse', 'fetch', 'diff', 'merge-base', 'diff', 'add:check', 'list', 'fetch', 'rev-parse', 'add', '-C']);
     expect(f.records[0]).toMatchObject({ path: '/home/test/records', daemon: 'control', branch: BASE.branch, sha: SHA, effectiveRef: BASE.branch, effectiveSha: SHA, dryRun: false, ok: true, registered: true, adopted: true, why: 'load tested patch' });
     expect(r.settings.sources['daemons.control.clone']).toBe('tool'); expect(r.settings.log).toContain('wev-control');
   });
-  it('already registered is idempotent but still waits for adoption', async () => {
-    const f = fixture({ list: [BASE.branch] }); expect((await f.run()).registered).toBe('already'); expect(mutations(f, 'add')).toHaveLength(0); expect(f.calls.at(-1).args[0]).toBe('-C');
+  it('already registered is idempotent without rebuilding or waiting', async () => {
+    const f = fixture({ list: [BASE.branch] }); expect((await f.run()).registered).toBe('already'); expect(mutations(f, 'add')).toHaveLength(0); expect(f.calls).toEqual([]);
   });
   it('dry-run checks original ref and records without push/add/remove or adoption', async () => {
     const f = fixture({ behind: true, list: ['lane/old'], contained: ['lane/old'] }); const r = await f.run({ dryRun: true }); expect(r.ok).toBe(true); expect(r.wouldMerge.ref).toBe('lane/new-m1'); expect(r.wouldRegister).toBe(true); expect(r.effectiveRef).toBe(BASE.branch); expect(r.wouldRemove).toEqual([]); expect(r.wouldRetain).toEqual(['lane/old']); expect(r.wouldStopReason).toBe('swap-remove-failed');
@@ -2025,7 +2031,7 @@ describe('prototype-load', () => {
     run = (await applyPendingEffects(run, { store: createMemoryRunStore(), sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => f.run(input) } })).run;
     run = advance(run, { registry }); run = advance(run, { registry });
     expect(run.verdict).toMatchObject({ ok: true, dryRun: true, registered: false, adopted: false });
-    expect(JSON.parse(JSON.stringify(run.verdict)).gate.testsRun).toBe('case-1');
+    expect(JSON.parse(JSON.stringify(run.verdict)).gate.source).toBe('canonical-check-run');
   });
   it('publishes incomplete cleanup through the declared operation without losing adoption evidence', async () => {
     const f = fixture({ list: ['lane/old'], contained: ['lane/old'], changeAfterContainment: 'tip advanced' });
@@ -2242,7 +2248,7 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     expect(prototypeLoad.readyEvidence([green({ sha: [OLD] })], input, [], FP)).toBeNull();
     expect(prototypeLoad.readyEvidence([green({ sha: [SHA] })], input, [], FP)).toBeNull();
   });
-  it('warn mode treats an array-sha ready record as carried, never as the live head\'s own', async () => {
+  it('retired warn mode treats an array-sha ready record as carried, never as the live head\'s own', async () => {
     // readyEvidence already refuses it; this pins the IO gate's own fail-closed compare if a record ever gets through.
     const ready = auditLines([green({ sha: [SHA] })]);
     const out = await auditedFixture('warn', { ready, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
@@ -2368,20 +2374,20 @@ describe('carried evidence precedence (R503 red team)', () => {
     const out = await auditedFixture('warn', { ready: auditLines([ready(), liveWeak]), fingerprint: () => FP }).run();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
   });
-  it('round 3: in warn mode a carried green record never loads over a canonical WEAKENED audit', async () => {
+  it('round 3: retired warn mode refuses a carried green record never loads over a canonical WEAKENED audit', async () => {
     const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
     const out = await auditedFixture('warn', { ready: auditLines([ready()]), audits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
-    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'warn', ok: false, reason: 'weakened' } });
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse', ok: false, reason: 'weakened' } });
     // A carried WEAKENED audit of the older head blocks the carried green record the same way.
     const carriedAudits = auditLines([auditRecord({ head: A, fingerprint: FP, verdict: 'WEAKENED', findings: ['weakened guard'] })]);
     const carried = await auditedFixture('warn', { ready: auditLines([ready()]), audits: carriedAudits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(carried).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'weakened' } });
   });
-  it('round 3: warn mode keeps its existing behaviour for a live-head ready record and for a missing audit', async () => {
+  it('round 3: retired warn mode refuses live-head WEAKENED and missing audit', async () => {
     const own = ready({ sha: SHA, fingerprint: undefined });
     const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
-    expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'weakened' } });
-    expect(await auditedFixture('warn', { ready: auditLines([ready()]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'no-record' } });
+    expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'weakened' } });
+    expect(await auditedFixture('warn', { ready: auditLines([ready()]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
   });
   it('round 3 self-review: a live-head WEAKENED audit that findAudit drops as malformed still blocks the carried pass', () => {
     const pass = audit({ at: at(1) });
@@ -2430,22 +2436,34 @@ describe('canonicalAuditEvidence live fingerprint wiring (R503)', () => {
   });
   it('computes the live fingerprint exactly once, for origin/main and the live sha, when a candidate exists', async () => {
     let f, fetchesBefore;
-    const fingerprint = vi.fn(() => { fetchesBefore = f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3).map((c) => c.args); return FP; });
+    const fingerprint = vi.fn(() => { fetchesBefore = f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length === 3).map((c) => c.args); return FP; });
     f = auditedFixture('refuse', { audits: auditLines([old(), old({ base: 'f'.repeat(40) })]), auditBaseInMain: TREE, fingerprint });
     await f.run();
     expect(fingerprint).toHaveBeenCalledTimes(1);
     expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
     // the live branch was fetched BEFORE it was fingerprinted
-    expect(fetchesBefore).toEqual([['fetch', 'origin', 'main', BASE.branch]]);
+    expect(fetchesBefore).toEqual([['fetch', 'origin', 'main'],
+      ['fetch', 'origin', `+refs/heads/${BASE.branch}:refs/remotes/origin/${BASE.branch}`]]);
   });
-  it('a failed fetch of the live branch means no carry and the fingerprint is never computed', async () => {
+  it('a failed read-only main fetch means no carry and the fingerprint is never computed', async () => {
     const fingerprint = vi.fn(() => FP);
     // the injected fingerprint matches and main covers the base, so only the failed live fetch can withhold the carry
     const control = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(control).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
-    const out = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint, liveFetchFails: true }).run();
+    const out = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint, mainFetchFails: true }).run();
     expect(fingerprint).not.toHaveBeenCalled();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+  });
+  it('a failed candidate-object fetch refuses carry before fingerprinting or registration', async () => {
+    const fingerprint = vi.fn(() => FP);
+    const f = auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE,
+      fingerprint, staleFetchFails: BASE.branch });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { ok: false, reason: 'no-record' } });
+    expect(fingerprint).not.toHaveBeenCalled();
+    expect(f.calls.filter(({ cmd }) => cmd === 'node')).toEqual([]);
+    expect(f.readyWrites).toEqual([]);
+    expect(f.records).toHaveLength(1);
   });
   // The production wiring: no injected `fingerprint`, so netDiffFingerprint runs over the loader's own exec.
   describe('default (non-injected) fingerprint wiring', () => {
@@ -2477,8 +2495,9 @@ describe('canonicalAuditEvidence live fingerprint wiring (R503)', () => {
       expect(seen[0].at(-1)).toBe(`${SHA}^{commit}`);
       expect(seen[1].at(-1)).toBe('origin/main^{commit}');
       expect(seen[3].slice(-2)).toEqual([FORK, SHA]);
-      // and the live branch was fetched before the helper first touched git
-      const firstFetch = f.calls.findIndex((c) => c.args[0] === 'fetch' && c.args.length > 3 && c.args[3] === BASE.branch);
+      // The candidate's objects, as well as main, precede the fingerprint reader.
+      const firstFetch = f.calls.findIndex((c) => c.args[0] === 'fetch'
+        && c.args[2] === `+refs/heads/${BASE.branch}:refs/remotes/origin/${BASE.branch}`);
       const firstHelper = f.calls.findIndex((c) => c.cmd === 'git' && c.args.includes('--end-of-options'));
       expect(firstFetch).toBeGreaterThanOrEqual(0);
       expect(firstHelper).toBeGreaterThan(firstFetch);
@@ -2598,27 +2617,27 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
       .toMatchObject({ record: olderExact });
   });
   describe('lazy live fingerprint', () => {
-    it('accepts a function and reads it once; the arguments path never reads it', () => {
+    it('accepts a function and reads it once even with label arguments', () => {
       const lazy = vi.fn(() => FP);
       const r = green();
       expect(prototypeLoad.readyEvidence([r], input, [], lazy)).toEqual({ source: 'ready-record', record: r });
       expect(lazy).toHaveBeenCalledTimes(1);
       const skipped = vi.fn(() => FP);
-      expect(prototypeLoad.readyEvidence([r], { ...input, testsRun: 'fixture-green', audit: 'NOT WEAKENED' }, [], skipped).source).toBe('arguments');
-      expect(skipped).not.toHaveBeenCalled();
+      expect(prototypeLoad.readyEvidence([r], { ...input, testsRun: 'fixture-green', audit: 'NOT WEAKENED' }, [], skipped).source).toBe('ready-record');
+      expect(skipped).toHaveBeenCalledTimes(1);
     });
   });
   describe('loader: live fingerprint is read lazily and once (R503)', () => {
-    // The loader fetches the live branch itself; the fingerprint read adds exactly one more `fetch origin main <branch>`.
-    const branchFetches = (f) => f.calls.filter((c) => c.args[0] === 'fetch' && c.args[2] === 'main' && c.args[3] === BASE.branch).length;
+    // Coverage/carry share one main fetch; carry also fetches the candidate's objects before reading its fingerprint.
+    const branchFetches = (f) => f.calls.filter((c) => c.args[0] === 'fetch' && c.args[2] === 'main' && c.args.length === 3).length;
     const baselineFetches = async () => { const f = auditedFixture('warn', { ready: auditLines([green({ sha: SHA })]) }); await f.run(); return branchFetches(f); };
     const oldAudit = () => auditRecord({ head: OLD, fingerprint: FP });
-    it('the --tests-run/--audit arguments path never runs the fingerprint read or its fetch', async () => {
+    it('the --tests-run/--audit labels preserve the normal fingerprint read', async () => {
       const fingerprint = vi.fn(() => FP);
       const f = auditedFixture('warn', { ready: auditLines([green()]), fingerprint });
       const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
-      expect(out.gate).toMatchObject({ source: 'arguments' });
-      expect(fingerprint).not.toHaveBeenCalled();
+      expect(out.gate).toMatchObject({ source: 'ready-record' });
+      expect(fingerprint).toHaveBeenCalledTimes(1);
       expect(branchFetches(f)).toBe(await baselineFetches());
     });
     it('a ready record for another sha that stores a fingerprint triggers exactly one read, for origin/main and the live sha', async () => {
@@ -2628,7 +2647,7 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
       expect(out.gate).toMatchObject({ source: 'ready-record' });
       expect(fingerprint).toHaveBeenCalledTimes(1);
       expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
-      expect(branchFetches(f)).toBe(await baselineFetches() + 1);
+      expect(branchFetches(f)).toBe(await baselineFetches());
     });
     it('a ruled-exception allowlist entry for another sha that stores a fingerprint also triggers the read', async () => {
       const fingerprint = vi.fn(() => FP);
@@ -2665,7 +2684,7 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
       const out = await f.run();
       expect(out).toMatchObject({ ok: true });
       expect(fingerprint).toHaveBeenCalledTimes(1);
-      expect(branchFetches(f)).toBe(await baselineFetches() + 1);
+      expect(branchFetches(f)).toBe(await baselineFetches());
     });
     it.each([['null', () => null], ['throw', () => { throw new Error('boom'); }]])('a failed read (%s) is no carry and not a crash', async (_, fingerprint) => {
       const out = await auditedFixture('warn', { ready: auditLines([green()]), fingerprint }).run();
@@ -2727,4 +2746,123 @@ describe('prototype-load daemon key resolution (R502 item 1)', () => {
       const f = fixture({ settings }); expect((await f.run({ daemon: 'mergewatch', ...extra })).stopReason).toBe('unsupported-daemon'); expect(f.calls).toHaveLength(0);
     }
   });
+});
+
+
+describe('refuse-only safety properties P1–P9', () => {
+  const weak = { ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R787', auditDisclosed: ['guard removed'] };
+  const ruled = { ref: BASE.branch, sha: SHA, ruling: 'R787', findings: weak.auditDisclosed };
+  const canonicalWeak = auditRecord({ verdict: 'WEAKENED', findings: weak.auditDisclosed });
+  it('P1 refuses canonical WEAKENED even with a green ready record', async () => {
+    const f = auditedFixture(undefined, { audits: auditLines([canonicalWeak]) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit' });
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['warn', 'other', { nested: 'warn' }])('P2 no mode setting or environment can bypass refusal: %j', async mode => {
+    const f = auditedFixture(mode, { env: { WE_PROTOTYPE_LOAD_CANONICAL_AUDIT_MODE: 'warn' } });
+    expect(await f.run({ canonicalAuditMode: 'warn' })).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(f.calls).toEqual([]);
+  });
+  it('P3 refusal writes only the load record, without recovery, retirement or publishing', async () => {
+    const f = auditedFixture('warn', { pendingDrops: 'unsettled', list: ['lane/old'] });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-canonical-audit' });
+    expect(f.calls).toEqual([]); expect(f.readyWrites).toEqual([]);
+    expect(f.retirePlanner).not.toHaveBeenCalled(); expect(f.records).toHaveLength(1);
+  });
+  it('P4 ruled readiness is checked first and still needs matching canonical findings', async () => {
+    for (const findings of [['guard removed'], ['different'], []]) {
+      const f = auditedFixture('refuse', { ready: auditLines([weak]), settings: { ruledWeakened: [ruled] },
+        audits: auditLines([{ ...canonicalWeak, findings }]), auditBaseInMain: TREE });
+      const out = await f.run();
+      expect(out.gate.ruledWeakened).toEqual({ ruling: 'R787', findings: weak.auditDisclosed });
+      expect(out.ok).toBe(findings[0] === 'guard removed');
+      if (!out.ok) { expect(out.stopReason).toBe('no-canonical-audit'); expect(mutations(f, 'add')).toHaveLength(0); }
+    }
+    const missing = auditedFixture('refuse', { ready: auditLines([weak]), settings: { ruledWeakened: [ruled] }, audits: '' });
+    expect(await missing.run()).toMatchObject({ stopReason: 'no-canonical-audit' });
+  });
+  it('P5 arguments are labels and never readiness', async () => {
+    expect(prototypeLoad.readyEvidence([], { ...BASE, testsRun: 'claimed', audit: 'NOT WEAKENED' })).toBeNull();
+    const f = auditedFixture('warn', { ready: '' });
+    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, registered: false });
+    expect(f.readyWrites).toEqual([]); expect(f.calls).toEqual([]);
+  });
+  it.each([null, { ok: false, reason: 'could-not-run' }, { ok: true, ran: false, sha: SHA }, { ok: true, sha: TREE }, { ok: true, sha: SHA }])('P6 requires a real passing dispatch smoke bound to the SHA: %j', async result => {
+    const smoke = vi.fn(async () => result);
+    const f = fixture({ dispatchSmoke: smoke, ownDiff: 'M\0scripts/operations/dispatch-lane.mjs\0', diff: 'M\0scripts/operations/dispatch-lane.mjs\0' });
+    const out = await f.run();
+    expect(smoke).toHaveBeenCalledWith({ sha: SHA, files: ['scripts/operations/dispatch-lane.mjs'] });
+    expect(out.ok).toBe(result?.ok === true && result.sha === SHA && result.ran !== false);
+    if (!out.ok) { expect(out.stopReason).toBe('dispatch-smoke-failed'); expect(mutations(f, 'add')).toHaveLength(0); expect(f.readyWrites).toEqual([]); }
+  });
+  it('P7 removes exactly one registration via expected-entry/tip guarded retirement', async () => {
+    const remove = vi.fn(async () => ({ retired: true }));
+    const f = fixture({ list: ['lane/old', 'lane/other'], removeRegistration: remove });
+    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', reason: 'withdraw unaudited' })).toMatchObject({ ok: true, removed: ['lane/old'] });
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith({ root: '/home/test/workspace/wev-control', ref: 'lane/old', expectedTip: 'd'.repeat(39) + '0', expectedEntry: { ref: 'lane/old' }, by: 'tester' });
+    expect(f.retirePlanner).not.toHaveBeenCalled(); expect(mutations(f, 'add')).toHaveLength(0);
+    expect(prototypeLoadOperation().input).toMatchObject({ remove: { type: 'string' }, reason: { type: 'string' } });
+  });
+  it('P7 refuses stacked dependents, missing reason and changed-entry/tip removal', async () => {
+    const remove = vi.fn(async () => ({ retired: false, refused: 'tip-moved' }));
+    const stacked = JSON.stringify({ list: [{ ref: 'lane/old' }, { ref: 'lane/top', stackBases: ['lane/old'] }] });
+    const f = fixture({ listRaw: stacked, removeRegistration: remove });
+    expect(await f.run({ branch: '', remove: 'lane/old', reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'stacked-dependents' });
+    expect(remove).not.toHaveBeenCalled();
+    expect(await f.run({ branch: '', remove: 'lane/old' })).toMatchObject({ stopReason: 'bad-input' });
+    const moved = fixture({ list: ['lane/old'], removeRegistration: remove });
+    expect(await moved.run({ branch: '', remove: 'lane/old', reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'tip-moved', removed: [] });
+  });
+  it('P8 produces fix-ready from canonical audit and a passing exact-sha test check, without argument evidence', async () => {
+    const f = fixture({ ready: '' });
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(f.readyWrites).toHaveLength(1);
+    expect(f.readyWrites[0]).toMatchObject({ ref: BASE.branch, sha: SHA, audit: 'NOT WEAKENED', tests: 'green', testCheck: { sha: SHA, name: 'test', conclusion: 'success' } });
+  });
+  it.each([null, { sha: TREE, name: 'test', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'other', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'in_progress', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'completed', conclusion: 'failure' }])('P8 fails closed on absent, wrong-sha or nonpassing check evidence: %j', async check => {
+    const f = fixture({ ready: '', testCheck: async () => check });
+    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('P9 keeps an already-live unaudited registration, without rebuild/removal/gate or fetch', async () => {
+    const f = auditedFixture('refuse', { ready: '', list: [BASE.branch] });
+    expect(await f.run()).toMatchObject({ ok: true, registered: 'already' });
+    expect(f.calls).toEqual([]); expect(f.readyWrites).toEqual([]); expect(f.retirePlanner).not.toHaveBeenCalled();
+  });
+  it('real settings R786 (#6588), R790 (a7200c728), R796 (166689d) pass the canonical ruled gate using fake IO', async () => {
+    const shipped = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
+    for (const ruling of ['R786', 'R790', 'R796']) {
+      const entry = shipped.ruledWeakened.find((e) => e.ruling === ruling);
+      expect(entry, ruling).toBeDefined();
+      const f = fixture({ sha: entry.sha, ready: auditLines([{ ref: entry.ref, sha: entry.sha, tests: 'green', audit: 'WEAKENED', auditRuling: entry.ruling, auditDisclosed: entry.findings }]),
+        audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
+        settings: { ...shipped, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
+      expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling } } });
+    }
+  });
+});
+
+
+describe('test check-run evidence bounds (P8)', () => {
+  const pass = { id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success' };
+  it('uses the latest test run on the exact SHA, even when an older success exists', () => {
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [pass, { ...pass, id: 2, conclusion: 'failure' }] }, SHA)).toMatchObject({ sha: SHA, conclusion: 'failure' });
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, head_sha: TREE }] }, SHA)).toBeNull();
+  });
+  it('refuses an oversized or incomplete page rather than treating a truncated success as evidence', () => {
+    for (const total_count of [101, -1, null, 2]) expect(prototypeLoad.testCheckEvidence({ total_count, check_runs: [pass] }, SHA)).toBeNull();
+    expect(prototypeLoad.testCheckEvidence({ total_count: 100, check_runs: Array.from({ length: 100 }, (_, i) => ({ ...pass, id: i })) }, SHA)).toMatchObject({ sha: SHA, conclusion: 'success' });
+  });
+});
+
+
+const shippedRuledSettings = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
+it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))('real settings #6603 R803 passes the canonical ruled gate (requires its settings entry)', async () => {
+  const entry = shippedRuledSettings.ruledWeakened.find((e) => e.ruling === 'R803');
+  expect(entry).toBeDefined();
+  const f = fixture({ sha: entry.sha, ready: auditLines([{ ref: entry.ref, sha: entry.sha, tests: 'green', audit: 'WEAKENED', auditRuling: entry.ruling, auditDisclosed: entry.findings }]),
+    audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
+    settings: { ...shippedRuledSettings, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
+  expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R803' } } });
 });
