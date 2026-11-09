@@ -1,6 +1,6 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold } from './red-team-check-run.mjs';
-import { redTeamEnqueueHold, sendBackReason } from './drain-queue-safety.mjs';
+import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -476,7 +476,6 @@ export function recordRedTeamStatus(input, options = {}) {
             const live = JSON.parse(gh(['pr', 'view', String(input.pr), '--repo', input.repo, '--json', 'headRefOid,labels'],
               { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
             if (live?.headRefOid !== head || !Array.isArray(live.labels)) throw Error('red-team live head or labels unreadable');
-            sendBack ||= !!sendBackReason(live.labels);
             hold = redTeamEnqueueHold({ ...input, head, comments, scheduled: true,
               recorded: input.result === 'ran', env: options.env ?? process.env });
           } catch { /* unreadable evidence retains the hold */ }

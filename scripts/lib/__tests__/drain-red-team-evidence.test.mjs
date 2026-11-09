@@ -69,6 +69,28 @@ describe('status persistence and check publication share one claim', () => {
     } finally { gh.mockRestore(); }
   });
 
+  it.each([
+    ['review:human', ['ready-to-merge', 'review:human']],
+    ['review:pending', ['ready-to-merge', 'review:pending']],
+    ['review:changes', ['ready-to-merge', 'review:changes']],
+    ['missing ready-to-merge', ['review:accepted']],
+  ])('a finished clean red team ignores %s labels but preserves explicit send-back failure', (_name, labels) => {
+    const f = fixture(), checks = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' };
+    const options = { env: f.env, log: () => {},
+      comments: [{ author: { login: 'web-everything' }, body:
+        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+      gh: () => JSON.stringify({ headRefOid: f.head, labels }),
+      postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; } };
+
+    expect(recordRedTeamStatus(input, options)).toEqual({ published: true });
+    expect(recordRedTeamStatus({ ...input, sendBack: true }, options)).toEqual({ published: true });
+    expect(checks).toMatchObject([
+      { name: 'red-team', head_sha: f.head, status: 'completed', conclusion: 'success' },
+      { name: 'red-team', head_sha: f.head, status: 'completed', conclusion: 'failure' },
+    ]);
+  });
+
   it('successful completion followed by failed publication of a terminal failure keeps the hold and attempts the failure supersede', () => {
     const f = fixture(), appId = 5037855, runs = [], attempts = [];
     const input = { ...f, loopPayload: payload(f.head), status: 'finished' };
