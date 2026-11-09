@@ -466,6 +466,37 @@ describe('the label sink', () => {
     expect(argv.join(' ')).not.toContain('gh ');
   });
 
+  // Resume from a DIFFERENT checkout: the staged file lives under the first lane's root, so this root has none.
+  // The durable run record still holds the frozen write-up effect, and the sink regenerates the file from it.
+  const runRecord = { id: 'run-1', effects: [
+    { key: 'run-1#3#0', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '# frozen verdict' } },
+  ] };
+
+  it('resumed from another root: regenerates the missing body file from the run record write-up payload', async () => {
+    const seen = []; let onDisk = null;
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); onDisk = readFileSync(argv.find((a) => a.startsWith('--body-file=')).slice(12), 'utf8'); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(onDisk).toBe('# frozen verdict');
+  });
+
+  it('resumed from another root with no recoverable write-up: refuses before any write instead of shelling a missing file', async () => {
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => ({ id: 'run-1', effects: [] }) }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+  });
+
+  it('a body file already staged in this root is never overwritten from the record', async () => {
+    const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+    mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'local bytes');
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: () => '{"ok":true,"pr":7,"to":"accepted"}' });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(readFileSync(path, 'utf8')).toBe('local bytes');
+  });
+
   // #2898 — the single home renders the attribution it is GIVEN. Before this the CLI hardcoded "via the
   // Plateau Loop review console" for every caller, so the live run on PR #1146 posted a comment claiming a
   // surface it never touched, three lines above its own footer naming this operation.
