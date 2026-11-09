@@ -4,7 +4,8 @@
  *   by the same CLI that raises/clears it locally, and the merge-gate reads that branch: pass while clear, hold while
  *   frozen, FAIL CLOSED whenever the shared copy is missing or unreadable. Every git/fs call is stubbed.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
@@ -34,6 +35,61 @@ const reader = ({ text = null, fetchFails = false } = {}) => (args) => {
 /** The merge-gate's red-main-freeze row for a given shared read. */
 const PR = { number: 1, title: 't', body: 'b', labels: [], commits: [], baseRefName: 'main', headRefName: 'lane/x', headRefOid: 'a'.repeat(40), statusCheckRollup: [] };
 const gate = (redMain) => evaluatePrGates({ repo: 'o/r', num: 1, pr: PR, defaultBranch: 'main', redMain }).results.find((r) => r.id === 'red-main-freeze');
+
+describe('shared freeze API deadline retries', () => {
+  const read = rest => readSharedFreeze({ readsSource: 'api', rest, slug: 'o/r', branch: BRANCH });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('restarts the whole read with a fresh deadline after attempt 1 expires and returns the readable freeze', () => {
+    let now = 1000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const commit = 'a'.repeat(40);
+    const text = JSON.stringify({ frozen: true, reason: 'operator stop' });
+    const sha = createHash('sha1').update(`blob ${Buffer.byteLength(text)}\0`).update(text).digest('hex');
+    const parts = SHARED_FREEZE_FILE.split('/');
+    let attempts = 0;
+    const rest = vi.fn(path => {
+      let json;
+      if (path.includes('/git/ref/')) {
+        attempts += 1;
+        if (attempts === 1) now += 20_001;
+        json = { object: { sha: commit } };
+      } else if (path.includes('/git/commits/')) json = { tree: { sha: 'tree0' } };
+      else if (path.includes('/git/trees/')) {
+        const i = Number(path.split('tree').at(-1));
+        json = { truncated: false, tree: [{ path: parts[i], type: i < parts.length - 1 ? 'tree' : 'blob', mode: '100644', sha: i < parts.length - 1 ? `tree${i + 1}` : sha }] };
+      } else if (path.includes('/contents/')) json = { type: 'file', encoding: 'base64', size: Buffer.byteLength(text), sha, content: Buffer.from(text).toString('base64') };
+      else throw new Error(`unexpected REST path: ${path}`);
+      return { status: 200, json, notModified: false };
+    });
+
+    const result = read(rest);
+    expect(attempts).toBe(2);
+    expect(result).toMatchObject({ frozen: true, reason: 'operator stop' });
+    expect(result.error).toBeUndefined();
+    expect(gate(result)).toMatchObject({ status: 'hold' });
+  });
+
+  it('exhausts exactly 3 deadline attempts and keeps the gate closed', () => {
+    const rest = vi.fn(() => { throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }); });
+    const result = read(rest);
+    expect(rest).toHaveBeenCalledTimes(3);
+    expect(result).toMatchObject({ source: `${BRANCH}:${SHARED_FREEZE_FILE}`, transient: true });
+    expect(result.error).toContain('freeze-read: deadline');
+    expect(result.frozen).toBeUndefined();
+    expect(gate(result)).toMatchObject({ status: 'fail-closed' });
+  });
+
+  it.each([500, 404])('does not retry a non-deadline HTTP %s error and keeps the gate closed', status => {
+    const rest = vi.fn(() => { throw Object.assign(new Error(`gh: HTTP ${status}`), { httpStatus: status }); });
+    const result = read(rest);
+    expect(rest).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ source: `${BRANCH}:${SHARED_FREEZE_FILE}`, transient: true });
+    expect(result.error).toContain(`api-http-${status}`);
+    expect(result.frozen).toBeUndefined();
+    expect(gate(result)).toMatchObject({ status: 'fail-closed' });
+  });
+});
 
 describe('shared red-main freeze (xyd06qo)', () => {
   it('the branch comes from the policy cascade (default ops/red-main-freeze)', () => {
