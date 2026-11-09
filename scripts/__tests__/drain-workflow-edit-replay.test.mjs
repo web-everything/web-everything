@@ -10,7 +10,7 @@ const fixtures = [
     labels: ['ready-to-merge', 'review:accepted', 'review-round:1'],
     files: ['.github/workflows/merge-gate.yml', 'scripts/lib/__tests__/merge-gate-ci.test.mjs', 'scripts/lib/merge-gate-ci.mjs'] },
 ];
-function replay(pr, { setting, clearance, author = 'web-everything', ...extra } = {}) {
+function replay(pr, { setting, clearance, author = 'chalbert', ...extra } = {}) {
   const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
   if (clearance) comments.push({ author: { login: author }, body: `<!-- reviewed-sha: ${clearance} -->\n<!-- cleared-human: operator -->` });
   const repo = 'web-everything/web-everything';
