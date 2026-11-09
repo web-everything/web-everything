@@ -40,21 +40,29 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
     return failure(`no red-team check run on head for ${identity}: external_id missing or mismatching`);
   if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0))
     return failure('red-team check run ordering unreadable; inspect check history');
+  // A policy-clear run decides only when this PR has no real-round run on the head (#6535 round 6): a round that
+  // started after the policy-clear absence read can land before its post, and must still decide. Any run without
+  // the policy-clear marker counts as a real round (fail closed); only the WE App's runs reach here.
+  const rounds = runs.filter(run => run.output?.title !== RED_TEAM_POLICY_CLEAR_TITLE);
+  const deciding = rounds.length ? rounds : runs;
   // GitHub run ids order creations, including reruns whose timestamps tie or are absent.
-  runs.sort((a, b) => Number(b.id) - Number(a.id));
-  const latest = runs[0];
+  deciding.sort((a, b) => Number(b.id) - Number(a.id));
+  const latest = deciding[0];
   if (!latest) return failure('no red-team check run on head');
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
   return { ok: true, reason: 'red-team check run succeeded on head' };
 }
 
-export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false } = {}) {
+/** The output title that marks a policy-clear run (no round ran). Round payloads never carry it. */
+export const RED_TEAM_POLICY_CLEAR_TITLE = 'Red team policy clear';
+
+export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false } = {}) {
   const finished = status === 'finished';
   const clear = finished && hold === null && sendBack === false;
   return { name: 'red-team', head_sha: headSha, external_id: prIdentity(repo, pr), status: finished ? 'completed' : 'in_progress',
     ...(finished ? { conclusion: clear ? 'success' : 'failure' } : {}),
-    output: { title: clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress',
+    output: { title: clear ? (policyClear === true ? RED_TEAM_POLICY_CLEAR_TITLE : 'Red team clear') : finished ? 'Red team held' : 'Red team in progress',
       summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000) } };
 }
 
@@ -76,13 +84,17 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  * already shows a result. It first reads the head and posts only when this PR has NO red-team check run there: an
  * existing success needs nothing, and any other run (in progress, failed, unreadable) belongs to a real round and
  * is never overridden. Any refusal or failed post returns `ok:false`; the caller posts no comment and retries.
+ * A real round can still start between that read and the post, so the absence read alone cannot protect it. The
+ * post therefore carries the policy-clear marker, and evaluateRedTeamCheckFact lets a marked run decide only when
+ * this PR has no real-round run on the head: whatever the id order, a real round always outranks a policy-clear.
+ * (Policy-clear runs posted before this marker existed read as round successes; they predate any racing round.)
  */
 export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
   const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
   if (fact.ok === true) return { ok: true, reason: 'red-team check already clear on head' };
   if (fact.reason !== 'no red-team check run on head') return failure(`policy-clear check not posted: ${fact.reason}`);
   return postRedTeamCheckRun({ repo, pr, headSha, gh,
-    payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false }) });
+    payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
 }
 
 /** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a

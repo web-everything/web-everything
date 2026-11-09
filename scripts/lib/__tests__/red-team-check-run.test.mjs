@@ -68,6 +68,40 @@ describe('red-team check run contract', () => {
       expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: undefined, gh })).toMatchObject({ ok: false });
       expect(gh).not.toHaveBeenCalled();
     });
+    // PR #6535 round 6 block: a real round can start AFTER the absence read and BEFORE the policy-clear post, so
+    // the policy-clear success gets the higher id. It must never supersede that round, whatever the id order.
+    it('a real round that starts between the absence read and the post is never superseded', () => {
+      let posted = null;
+      const gh = vi.fn((args, options) => {
+        if (args.includes('POST')) { posted = { ...JSON.parse(options.input), id: 12, app: { id: APP_ID } }; return '{}'; }
+        const runs = posted ? [run({ id: 11, status: 'in_progress', conclusion: null }), posted] : [];
+        return JSON.stringify({ total_count: runs.length, check_runs: runs });
+      });
+      expect(publish(gh)).toEqual({ ok: true });
+      expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
+        .toMatchObject({ ok: false, reason: expect.stringMatching(/in progress/) });
+    });
+    const policyClear = (over = {}) => run({ id: 12, output: { title: api.RED_TEAM_POLICY_CLEAR_TITLE }, ...over });
+    it.each([
+      ['a policy-clear success alone', [policyClear()], true],
+      ['a real success with a newer policy-clear', [run({ id: 11 }), policyClear()], true],
+      ['a real success with an older policy-clear', [policyClear({ id: 9 }), run({ id: 11 })], true],
+      ['a real failure with a newer policy-clear', [run({ id: 11, conclusion: 'failure' }), policyClear()], false],
+      ['a real failure with an older policy-clear', [policyClear({ id: 9 }), run({ id: 11, conclusion: 'failure' })], false],
+      ['a real in-progress round with an older policy-clear', [policyClear({ id: 9 }), run({ id: 11, status: 'in_progress', conclusion: null })], false],
+      ['a newer real failure over an older real success, both under a policy-clear', [run({ id: 10 }), run({ id: 11, conclusion: 'failure' }), policyClear()], false],
+      ['a policy-clear that is not a success', [policyClear({ conclusion: 'failure' })], false],
+    ])('only a real round decides when one exists: %s', (_name, checkRuns, ok) => {
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns }).ok).toBe(ok);
+    });
+    it('marks the policy-clear post and leaves round payloads unmarked', () => {
+      const gh = ghWith([]);
+      publish(gh);
+      const post = gh.mock.calls.find(([args]) => args.includes('POST'));
+      expect(JSON.parse(post[1].input).output.title).toBe(api.RED_TEAM_POLICY_CLEAR_TITLE);
+      for (const over of [{ status: 'finished', hold: null }, { status: 'finished', hold: 'held' }, { status: 'started', hold: null }])
+        expect(api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...over }).output.title).not.toBe(api.RED_TEAM_POLICY_CLEAR_TITLE);
+    });
   });
 
   it('passes success on the exact head from the configured app', () => {
