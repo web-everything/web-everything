@@ -200,6 +200,16 @@ describe('world capsule (R649 S1)', () => {
     expect(inner).not.toHaveBeenCalled();
   });
 
+  it('poisons the recorder after a conflicting or failed response so it cannot finalize', async () => {
+    const argv = ['api', '--method', 'GET', 'repos/o/r'];
+    for (const second of [async () => '{"v":2}', async () => { throw new Error('boom'); }]) {
+      const recorder = createCapsuleRecorder();
+      await recordingRunChild(async () => '{"v":1}', recorder)('gh', argv);
+      await expect(recordingRunChild(second, recorder)('gh', argv)).rejects.toThrow();
+      expect(() => finalizeCapsule(recorder, { stateRoots: [] })).toThrow();
+    }
+  });
+
   it('does not import readPrsFromFile', () => {
     const source = readFileSync(join(process.cwd(), 'scripts/lib/daemon-rebuild/world-capsule.mjs'), 'utf8');
     expect(source).not.toContain('readPrsFromFile');

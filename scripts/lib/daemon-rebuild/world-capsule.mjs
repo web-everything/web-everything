@@ -148,6 +148,8 @@ function validate(capsule) {
   return { version: 1, gh, state, manifestSha256: capsule.manifestSha256 };
 }
 
+const poisoned = new WeakSet();
+
 export function createCapsuleRecorder() {
   const recorder = Object.freeze({});
   recorders.set(recorder, new Map());
@@ -161,18 +163,25 @@ export function recordingRunChild(inner, recorder) {
     if (command !== 'gh') return inner(command, args, ...executionOptions);
     const key = readOnlyKey(command, args);
     requireRepositoryContext(args, executionOptions);
-    const result = await inner(command, args, ...executionOptions);
-    const body = safeText(typeof result === 'string' ? result : result?.stdout);
-    const entry = { key, sha256: hash(body), body };
-    if (entries.has(key) && entries.get(key).sha256 !== entry.sha256) fail();
-    entries.set(key, entry);
-    return result;
+    // Any failure after validation (inner error, unsafe body, conflicting response) poisons the recorder:
+    // rejected evidence must never end up in a finalized capsule.
+    try {
+      const result = await inner(command, args, ...executionOptions);
+      const body = safeText(typeof result === 'string' ? result : result?.stdout);
+      const entry = { key, sha256: hash(body), body };
+      if (entries.has(key) && entries.get(key).sha256 !== entry.sha256) fail();
+      entries.set(key, entry);
+      return result;
+    } catch (error) {
+      poisoned.add(recorder);
+      throw error;
+    }
   };
 }
 
 export function finalizeCapsule(recorder, { stateRoots } = {}) {
   const entries = recorders.get(recorder);
-  if (!entries || !Array.isArray(stateRoots)) fail();
+  if (!entries || poisoned.has(recorder) || !Array.isArray(stateRoots)) fail();
   const gh = [...entries.values()].map(entry => ({ ...entry }));
   const state = [];
   for (const descriptor of stateRoots) {
