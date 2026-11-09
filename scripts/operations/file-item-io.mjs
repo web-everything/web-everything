@@ -30,6 +30,9 @@ import { FILE_ITEM_QUEUE_EFFECT } from './file-item.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
 import { classifySession } from './session-role.mjs';
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { searchCapabilities } from '../capability-search.mjs';
 import { localDateString } from '../lib/local-date.mjs';
 
 export { REPO_ROOT };
@@ -47,6 +50,12 @@ export function createFileItemReader({ root = REPO_ROOT,
     let tipRead = false;
     return {
       // The session role gates who may file an operator task (operatorTaskFields).
+      searchDuplicates: (query) => {
+        // The search CLI tolerates a missing corpus; filing must prove it was readable.
+        const backlogDir = opts.backlogDir ?? join(root, 'backlog');
+        readdirSync(backlogDir);
+        return searchCapabilities(query, { root, backlogDir, limit: Number.MAX_SAFE_INTEGER });
+      },
       ...read(), operatorTask: readPolicy(), sessionRole: classifySession(env).role,
       get originMainSha() {
         if (!tipRead) {

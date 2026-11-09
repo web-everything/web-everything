@@ -115,9 +115,11 @@ describe('soak/breaks/index.mjs — directory discovery', () => {
     expect(files.length).toBeGreaterThan(0);
     const out = execFileSync(
       process.execPath,
-      ['-e', "import('./index.mjs').then((m) => process.stdout.write(String(m.BREAKS.length)))"],
+      ['-e', "import('./index.mjs').then((m) => process.stdout.write(JSON.stringify(m.BREAKS.map(b => b.id))))"],
       { cwd: REAL_BREAKS_DIR, encoding: 'utf8' },
     );
-    expect(Number(out)).toBe(files.length);
+    const ids = JSON.parse(out);
+    expect(ids).toHaveLength(files.length);
+    expect(ids.filter(id => id === 'clone-object-maintenance-borrowed-or-busy')).toHaveLength(1);
   });
 });
