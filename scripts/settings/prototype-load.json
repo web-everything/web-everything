@@ -294,6 +294,15 @@
       "findings": [
         "scripts/lib/red-team-withheld-publish.mjs:103 \u2014 Legacy recovery relies on marker-only deduplication without comparing the posted comment against recovered findings. Reproduced: a seat row containing one confirmed break plus an existing trusted \u201cno break found\u201d comment returns `skipped`, writes nothing, raises no alert, and leaves the gate seeing zero findings. Conflicting evidence silently bypasses the hold."
       ]
+    },
+    {
+      "ref": "lane/ci-heal-reset",
+      "sha": "1e3b7159e4f9d463087b412c7a885621c97ecb8e",
+      "ruling": "R815",
+      "findings": [
+        "scripts/operations/operator-controls-io.mjs:150 — The new operation resets exhausted resumeFailures to zero, bypassing the existing three-failure stop and permitting additional resume attempts on the same head.",
+        "scripts/operations/operator-controls.mjs:108 — The advertised two-reset limit relies solely on record.operatorResets. The existing re-mark path (scripts/conveyor/await-verify.mjs:404) preserves resumeFailures but drops operatorResets, allowing repeated same-head re-marks to replenish the reset budget indefinitely."
+]
     }
   ]
 }
