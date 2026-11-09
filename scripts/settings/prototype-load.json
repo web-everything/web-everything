@@ -276,6 +276,16 @@
         "scripts/conveyor/reconcile-core.mjs:1167 — Already-hung rows skip the new fresh-status check. The preceding hung detector releases pending calls at the same grace threshold, so even a fresh busy/waiting status cannot enforce the claimed protection.",
         "scripts/conveyor/soak/breaks/idle-row-dangling-call-holds-pr.mjs:57 — fixPresent runs the same scenario as the test; a behavioral regression returns false and selects it.fails in defineBreakTest, allowing the regression to pass as an expected failure."
 ]
+    },
+    {
+      "ref": "lane/merge-gate-retrigger-wip2",
+      "sha": "2003ae3eaf94c3995fec985331527f9d58b26358",
+      "ruling": "R813",
+      "findings": [
+        "scripts/conveyor/ci-red-recovery-watch.mjs:1493 \u2014 Legacy candidates skip preflight entirely. A completed required failure plus another absent context still qualifies, bypassing live evidence validation and, for classic candidates, the PR-wide retry cap.",
+        "scripts/conveyor/missing-run-push.mjs:73 \u2014 Writer admission is optional, and the production trigger at ci-red-recovery-watch.mjs:1525 supplies none of its enabling inputs. Writer tests explicitly inject those inputs, so they cannot detect production bypassing evidence and cap checks.",
+        "scripts/conveyor/fix-claim-store.mjs:92 \u2014 The claim reader treats directory-read errors as no claims and skips unreadable or corrupt entries. Both new admission and existing writer checks therefore accept an unreadable claim store as unclaimed, despite their fail-closed assertions."
+      ]
     }
   ]
 }
