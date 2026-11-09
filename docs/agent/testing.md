@@ -3967,7 +3967,7 @@ global and system config), so a caller's `core.fileMode=false` cannot hide a chm
 own `origin` remote, which the lane can rewrite.
 Known limit: other entries still trust the index stat cache, so a lane that hand-rewrites `.git/index`
 with stat fields matching an edited file reads clean. Release does not refuse that shape yet; the
-bounded content check is #xuuhfpf. Tests must not promise refusal for it until that lands.
+bounded content check is #8143. Tests must not promise refusal for it until that lands.
 A lane whose `.git` is not a real directory, carries a `.git/commondir`, or does not resolve its git dir and
 common dir to its own `.git` refuses before any release work (config scrub, litter cleanup, salvage push,
 evidence reads): those redirect refs, objects and config to another repository, so every later step would
@@ -3986,7 +3986,7 @@ A work refusal exits 1, names each kept lane in `--json` (`kept: [{ pool?, lane,
 and journals a loud `release-refused` line. A failed card save does the same with `reason: 'card-salvage-failed'`;
 a lane hold stays exit 0 (it journals `hold-refused`) but is listed with `reason: 'held'`. Tests pin the exit code,
 the `kept` list and the journal line. Callers that ignore the exit code (the drain's release-on-land,
-a launch-failure un-reserve, the reaper) do not yet read `kept`; that caller-side work is #x3h0sng.
+a launch-failure un-reserve, the reaper) do not yet read `kept`; that caller-side work is #8142.
 Canonical-origin isolation fixtures must assert refusal and an unchanged lease when the owning pool's
 origin is unresolved. Reclaim fixtures with rejected salvage must first assert that reaper release
 refuses, then explicitly discard the lease to exercise reclaim on unpreserved work. The card-filer soak
