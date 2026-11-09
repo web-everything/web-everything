@@ -1,0 +1,259 @@
+// @vitest-environment node
+import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import yaml from 'js-yaml';
+import { SCHEMA, LOCAL_ONLY, build, verify, auditWorkflow } from '../lib/drain-verdict.mjs';
+import { resultToVerdictInputs, runCli } from '../drain-classify-only.mjs';
+
+const computedAt = '2026-11-09T12:00:00.000Z';
+const now = Date.parse(computedAt);
+const headSha = 'a'.repeat(40), mainSha = 'b'.repeat(40), movedSha = 'c'.repeat(40);
+const provenance = { runId: '123456', event: 'schedule', ref: 'refs/heads/main', workflow: 'drain-verdict' };
+const ctx = { pr: 7, repo: 'o/r', mainSha, computedAt, provenance };
+const inputs = () => ({ ...structuredClone(ctx), headSha, decision: 'enqueue' });
+const live = () => ({ repo: ctx.repo, pr: ctx.pr, headSha, mainSha, provenance: { ...provenance } });
+const valid = () => ({ schema: 'drain-verdict/2', ...inputs(),
+  localOnly: { 'red-main-freeze': 'unknown', 'card-group': 'unknown' } });
+const refuse = (v, lookup = live(), opts = {}) => {
+  const result = verify(v, lookup, { now, ...opts });
+  expect(result).toEqual({ ok: false, reason: expect.any(String) });
+  expect(result.reason.trim()).not.toBe('');
+};
+const row = { num: 7, repo: 'o/r', headSha };
+const base = () => ({ ok: true, dryRun: true, toMerge: [], skipped: [], parked: [], skipReasons: [] });
+
+describe('T1: strict v2 shape and forged verdict refusals', () => {
+  it('builds exactly the v2 contract and verifies a valid verdict', () => {
+    expect(SCHEMA).toBe('drain-verdict/2');
+    expect(LOCAL_ONLY).toEqual(['red-main-freeze', 'card-group']);
+    expect(build(inputs())).toEqual(valid());
+    expect(build({ ...inputs(), localOnly: { 'red-main-freeze': 'pass', 'card-group': 'fail' } }))
+      .toEqual(valid());
+    expect(verify(valid(), live(), { now })).toEqual({ ok: true });
+    expect(verify({ ...valid(), decision: 'local' }, live(), { now })).toEqual({ ok: true });
+  });
+
+  const mutants = [
+    ['extra top-level key', v => { v.actions = []; }],
+    ['extra localOnly key', v => { v.localOnly.result = 'unknown'; }],
+    ['extra provenance key', v => { v.provenance.actor = 'trusted'; }],
+    ['localOnly pass claim', v => { v.localOnly['red-main-freeze'] = 'pass'; }],
+    ['wrong localOnly id', v => { delete v.localOnly['card-group']; v.localOnly.other = 'unknown'; }],
+    ['hold decision', v => { v.decision = 'hold'; }],
+    ['wrong schema', v => { v.schema = 'drain-verdict/1'; }],
+    ...['repo', 'pr', 'headSha', 'mainSha'].map(key => [`foreign ${key}`, v => {
+      v[key] = key === 'pr' ? 8 : key.endsWith('Sha') ? movedSha : 'foreign/repo';
+    }]),
+    ['foreign runId', v => { v.provenance.runId = '999'; }],
+    ['foreign workflow', v => { v.provenance.workflow = 'other'; }],
+    ['pull_request provenance', v => { v.provenance.event = 'pull_request'; }],
+    ['feature ref', v => { v.provenance.ref = 'refs/heads/feature'; }],
+    ...['top', 'localOnly', 'provenance'].map(level => [`own __proto__ key at ${level}`, v => {
+      Object.defineProperty(level === 'top' ? v : v[level], '__proto__', {
+        value: { polluted: true }, enumerable: true, configurable: true,
+      });
+    }]),
+    ...Object.keys(valid()).map(key => [`missing ${key}`, v => { delete v[key]; }]),
+    ...['localOnly', 'provenance'].flatMap(level => Object.keys(valid()[level])
+      .map(key => [`missing ${level}.${key}`, v => { delete v[level][key]; }])),
+  ];
+  it.each(mutants)('refuses %s', (_name, mutate) => {
+    const v = valid(); mutate(v); refuse(v);
+  });
+  it.each([null, undefined, 'verdict', 7, [], [valid()]])('refuses non-record %j', value => refuse(value));
+  it.each(['localOnly', 'provenance'])('refuses malformed nested %s', key => {
+    for (const value of [null, [], 'unknown']) refuse({ ...valid(), [key]: value });
+  });
+  it.each(['event', 'ref'])('refuses forbidden %s even when live agrees', key => {
+    const v = valid(), lookup = live();
+    v.provenance[key] = lookup.provenance[key] = key === 'event' ? 'pull_request' : 'refs/heads/feature';
+    refuse(v, lookup);
+  });
+  it('accepts workflow_dispatch provenance when live agrees', () => {
+    const v = valid(), lookup = live();
+    v.provenance.event = lookup.provenance.event = 'workflow_dispatch';
+    expect(verify(v, lookup, { now })).toEqual({ ok: true });
+  });
+  it.each([
+    ['null', () => null], ['array', () => []],
+    ...Object.keys(inputs()).map(key => [`missing ${key}`, () => {
+      const value = inputs(); delete value[key]; return value;
+    }]),
+    ['invalid PR', () => ({ ...inputs(), pr: 0 })],
+    ['null head', () => ({ ...inputs(), headSha: null })],
+    ['hold', () => ({ ...inputs(), decision: 'hold' })],
+    ['bad timestamp', () => ({ ...inputs(), computedAt: 'yesterday' })],
+    ['bad provenance', () => ({ ...inputs(), provenance: null })],
+  ])('build throws TypeError for %s', (_name, value) => expect(() => build(value())).toThrow(TypeError));
+});
+
+describe('T2: freshness and live SHA binding', () => {
+  it('accepts exactly the default max age', () => {
+    expect(verify(valid(), live(), { now: now + 10 * 60_000 })).toEqual({ ok: true });
+  });
+  it('refuses just over ten minutes', () => refuse(valid(), live(), { now: now + 600_001 }));
+  it('honors a custom maxAgeMinutes, including its boundary', () => {
+    expect(verify(valid(), live(), { now: now + 120_000, maxAgeMinutes: 2 })).toEqual({ ok: true });
+    refuse(valid(), live(), { now: now + 120_001, maxAgeMinutes: 2 });
+  });
+  it.each([
+    ['future', new Date(now + 1).toISOString()], ['garbage', 'garbage'],
+    ['parseable non-ISO', 'November 9, 2026 12:00:00 GMT'], ['numeric timestamp', now],
+  ])('refuses %s computedAt', (_name, value) => refuse({ ...valid(), computedAt: value }));
+  it.each(['mainSha', 'headSha'])('refuses moved live %s', key => refuse(valid(), { ...live(), [key]: movedSha }));
+});
+
+describe('T3: result mapping preserves local fallback', () => {
+  it.each([
+    ['enqueue', 'toMerge', { ...base(), toMerge: [row] }],
+    ['local', 'skipped', { ...base(), skipped: [{ ...row, reason: 'not ready' }] }],
+    ['local', 'parked', { ...base(), parked: [{ ...row, reasons: ['agent-reviewable'] }] }],
+    ['local', 'hold', { ...base(), skipped: [{ ...row, reason: 'review hold: awaiting review' }] }],
+    ['local', 'humanRequired', { ...base(), parked: [{ ...row, humanRequired: true, reasons: ['workflow hold'] }] }],
+    ['local', 'checks pending', { ...base(), skipped: [{ ...row, reason: 'checks pending' }],
+      skipReasons: [{ ...row, kind: 'checks-pending', reason: 'checks pending' }] }],
+  ])('maps %s for %s and round-trips through build/verify', (decision, _name, result) => {
+    const mapped = resultToVerdictInputs(result, structuredClone(ctx));
+    expect(mapped).toMatchObject({ ...ctx, headSha, decision });
+    expect(verify(build(mapped), live(), { now })).toEqual({ ok: true });
+  });
+  it.each([
+    ['failed result', { ...base(), ok: false }], ['not dry-run', { ...base(), dryRun: false }],
+    ['failed repo', { ...base(), failedRepos: [{ repo: 'o/r' }] }],
+    ...['toMerge', 'skipped', 'parked', 'skipReasons'].map(key => {
+      const value = { ...base(), toMerge: [row] }; delete value[key]; return [`missing ${key}`, value];
+    }),
+    ['null headSha', { ...base(), toMerge: [{ ...row, headSha: null }] }],
+    ['contradictory rows', { ...base(), toMerge: [row], skipped: [row] }],
+    ['ambiguous headSha', { ...base(), skipped: [row], parked: [{ ...row, headSha: movedSha }] }],
+    ['deferred candidate', { ...base(), toMerge: [row], deferred: [{ ...row, reason: 'blocked-by' }] }],
+    ['skip-reasoned candidate', { ...base(), toMerge: [row], skipReasons: [{ ...row, kind: 'blocked-by', reason: 'blocked-by #1' }] }],
+    ['target absent', base()], ['other target', { ...base(), toMerge: [{ ...row, num: 8 }] }],
+  ])('refuses %s with an explicit local drain fallback', (_name, result) => {
+    expect(() => resultToVerdictInputs(result, ctx)).toThrow(/local drain/);
+  });
+});
+
+// Always mutate the shipped workflow, never a synthetic replacement for missing evidence.
+const workflowText = () => readFileSync(new URL('../../.github/workflows/drain-verdict.yml', import.meta.url), 'utf8');
+const mutateWorkflow = mutate => {
+  const doc = yaml.safeLoad(workflowText()); mutate(doc); return yaml.safeDump(doc);
+};
+const jobs = doc => Object.values(doc.jobs);
+const checkouts = doc => jobs(doc).flatMap(job => job.steps || []).filter(step => /^actions\/checkout@/.test(step.uses || ''));
+const rejectedWorkflow = text => {
+  const result = auditWorkflow(text);
+  expect(result).toMatchObject({ ok: false, problems: expect.any(Array) });
+  expect(result.problems.length).toBeGreaterThan(0);
+  for (const problem of result.problems) expect(problem).toEqual(expect.any(String));
+};
+
+describe('T4: audit the real read-only workflow and permission mutants', () => {
+  it('accepts the shipped workflow', () => {
+    const text = workflowText(), doc = yaml.safeLoad(text);
+    expect(checkouts(doc).length).toBeGreaterThan(0);
+    expect(auditWorkflow(text)).toEqual({ ok: true, problems: [] });
+  });
+  it.each(['contents', 'pull-requests', 'id-token'])('refuses top-level %s: write', permission => {
+    rejectedWorkflow(mutateWorkflow(doc => { doc.permissions = { ...doc.permissions, [permission]: 'write' }; }));
+  });
+  it.each(['contents', 'pull-requests', 'id-token', 'checks', 'packages', 'statuses', 'issues', 'deployments'])
+    ('refuses job-level %s: write', permission => {
+      rejectedWorkflow(mutateWorkflow(doc => { jobs(doc)[0].permissions = { [permission]: 'write' }; }));
+    });
+  it.each([
+    ['top-level write-all', doc => { doc.permissions = 'write-all'; }],
+    ['job write-all', doc => { jobs(doc)[0].permissions = 'write-all'; }],
+    ['missing permissions', doc => { delete doc.permissions; }],
+    ['credential persistence omitted', doc => { for (const step of checkouts(doc)) { step.with ||= {}; delete step.with['persist-credentials']; } }],
+    ['credential persistence true', doc => { for (const step of checkouts(doc)) step.with = { ...step.with, 'persist-credentials': true }; }],
+    ['feature checkout', doc => { for (const step of checkouts(doc)) step.with = { ...step.with, ref: 'feature' }; }],
+    ['unpinned action', doc => { jobs(doc)[0].steps.push({ uses: 'actions/upload-artifact@v4' }); }],
+    ['short SHA action', doc => { jobs(doc)[0].steps.push({ uses: 'actions/upload-artifact@abcdef0' }); }],
+    ['App token action', doc => { jobs(doc)[0].steps.push({ uses: `actions/create-github-app-token@${'d'.repeat(40)}` }); }],
+    ...['pull_request', 'pull_request_target', 'push'].map(event => [`${event} trigger`, doc => { doc.on = { ...doc.on, [event]: {} }; }]),
+    ...['EXTRA_TOKEN', 'APP_PRIVATE_KEY'].flatMap(name => [
+      [`literal ${name}`, doc => { doc.env = { ...doc.env, [name]: 'credential' }; }],
+      [`job ${name} expression`, doc => { jobs(doc)[0].env = { [name]: '${{ vars.CREDENTIAL }}' }; }],
+      [`step ${name}`, doc => { jobs(doc)[0].steps.push({ run: 'true', env: { [name]: 'credential' } }); }],
+    ]),
+  ])('refuses %s', (_name, mutate) => rejectedWorkflow(mutateWorkflow(mutate)));
+  it.each(['${{ secrets.GITHUB_TOKEN }}', '${{ secrets.APP_KEY }}', "${{ secrets['APP_KEY'] }}"])
+    ('refuses secret reference %s', reference => {
+      rejectedWorkflow(mutateWorkflow(doc => { doc.env = { ...doc.env, GITHUB_TOKEN: reference }; }));
+    });
+  it('scans raw text for secrets references too', () => rejectedWorkflow(`${workflowText()}\n# secrets.GITHUB_TOKEN\n`));
+});
+
+const argv = ['--only=7', '--verdict-out=verdict.json', '--repo=o/r'];
+function ioFor() {
+  return {
+    env: { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'schedule',
+      GITHUB_RUN_ID: provenance.runId, GITHUB_REPOSITORY: ctx.repo, GITHUB_TOKEN: 'read-only-fixture' },
+    now: () => now,
+    execFileSync: vi.fn((cmd, args) => {
+      if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === 'origin/main') return mainSha + '\n';
+      if (cmd === 'gh' && args[0] === 'repo') return ctx.repo + '\n';
+      if (cmd === process.execPath && args.some(arg => /(?:^|\/)merge-ai-prs\.mjs$/.test(arg)))
+        return JSON.stringify({ ...base(), toMerge: [row] });
+      throw new Error(`Unexpected injected command: ${cmd} ${args.join(' ')}`);
+    }),
+    writeFileSync: vi.fn(),
+  };
+}
+
+describe('T5: CLI refuses unsafe environments and arguments before exec', () => {
+  it.each([
+    ['outside Actions', env => { env.GITHUB_ACTIONS = 'false'; }],
+    ['missing Actions', env => { delete env.GITHUB_ACTIONS; }],
+    ['feature ref', env => { env.GITHUB_REF = 'refs/heads/feature'; }],
+    ...['pull_request', 'pull_request_target', 'push', ''].map(event => [`event ${event}`, env => { env.GITHUB_EVENT_NAME = event; }]),
+    ['missing run ID', env => { delete env.GITHUB_RUN_ID; }],
+    ['empty run ID', env => { env.GITHUB_RUN_ID = ''; }],
+    ...['APP_PRIVATE_KEY', 'MY_APP_ID', 'SOME_SECRET', 'BOT_PAT', 'GH_TOKEN', 'EXTRA_TOKEN', 'private_key', 'app_id', 'secret', 'bot_pat']
+      .map(name => [`credential ${name}`, env => { env[name] = 'foreign-credential'; }]),
+    ['empty forbidden credential still present', env => { env.APP_PRIVATE_KEY = ''; }],
+  ])('refuses %s before any process or write', async (_name, mutate) => {
+    const io = ioFor(); mutate(io.env);
+    await expect(async () => runCli(argv, io)).rejects.toThrow();
+    expect(io.execFileSync).not.toHaveBeenCalled();
+    expect(io.writeFileSync).not.toHaveBeenCalled();
+  });
+  it.each([
+    [], ['--verdict-out=x'], ['--only=7'],
+    ...['0', '-1', 'no', '1.5', '7x', ''].map(value => [`--only=${value}`, '--verdict-out=x']),
+    ['--only=7', '--verdict-out='], [...argv, '--only=8'], [...argv, '--verdict-out=other'],
+    [...argv, '--repo=other/repo'], [...argv, '--unknown'], [...argv, '--classify-only'],
+    ['--only=7', '--verdict-out=x', '--repo=invalid'],
+  ])('refuses bad/repeated/unknown argv %j before exec', async (...args) => {
+    const io = ioFor();
+    await expect(async () => runCli(args, io)).rejects.toThrow();
+    expect(io.execFileSync).not.toHaveBeenCalled();
+    expect(io.writeFileSync).not.toHaveBeenCalled();
+  });
+  it.each(['schedule', 'workflow_dispatch'])('writes a verifiable verdict for %s without a guard preload', async event => {
+    const io = ioFor(); io.env.GITHUB_EVENT_NAME = event;
+    // The sole permitted token alias must not be mistaken for an extra credential.
+    io.env.GH_TOKEN = io.env.GITHUB_TOKEN;
+    await runCli(argv, io);
+    expect(io.writeFileSync).toHaveBeenCalledTimes(1);
+    const [path, bytes] = io.writeFileSync.mock.calls[0];
+    expect(path).toBe('verdict.json');
+    const verdict = JSON.parse(String(bytes));
+    expect(verdict).toEqual({ ...valid(), provenance: { ...provenance, event } });
+    expect(verify(verdict, { ...live(), provenance: { ...provenance, event } }, { now })).toEqual({ ok: true });
+    const children = io.execFileSync.mock.calls.filter(([cmd]) => cmd === process.execPath);
+    expect(children).toHaveLength(1);
+    const [, args, options] = children[0];
+    expect(args).toEqual(expect.arrayContaining(['--only=7', '--dry-run', '--json']));
+    expect(args.some(arg => arg === '--import' || arg.startsWith('--import='))).toBe(false);
+    expect(options.env).not.toHaveProperty('DRAIN_CLASSIFY_ONLY');
+    expect(options.env.NODE_OPTIONS || '').not.toMatch(/--import|drain-classify-guard/);
+  });
+  it('resolves the optional repo from the injected environment', async () => {
+    const io = ioFor();
+    await runCli(argv.slice(0, 2), io);
+    expect(io.writeFileSync).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(io.writeFileSync.mock.calls[0][1])).repo).toBe(ctx.repo);
+  });
+});
