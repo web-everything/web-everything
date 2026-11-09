@@ -223,6 +223,62 @@ describe('the Git proof of omitted content in the candidate build', () => {
   );
 });
 
+describe('readyBuildVerified rollback check uses the head\'s true main base across rebuild overlay merges', () => {
+  // Live 2026-11-09 (review daemon): head = rebuild merge of an overlay onto M1; the overlay's PR later merged into
+  // main (M2), so merge-base(head, mainTip) became the overlay commit, newer than a good plain-main fallback.
+  function fixture() {
+    const dir = mktemp('we-rebuild-truebase-');
+    const g = (args, env = {}) => {
+      const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        cwd: dir, encoding: 'utf8', timeout: 20_000, env: { ...process.env, ...env },
+      });
+      if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    g(['init', '-q', '-b', 'main']);
+    const commit = (name) => { writeFile(dir, name, `${name}\n`); g(['add', name]); g(['commit', '-q', '-m', name]); return g(['rev-parse', 'HEAD']); };
+    const M0 = commit('m0.txt');
+    const M1 = commit('m1.txt');
+    g(['checkout', '-q', '-b', 'overlay', M1]);
+    const OV = commit('ov.txt');
+    g(['checkout', '-q', '--detach', M1]);
+    const rebuildEnv = {
+      GIT_COMMITTER_NAME: 'daemon-rebuild', GIT_COMMITTER_EMAIL: 'daemon-rebuild@localhost',
+      GIT_AUTHOR_NAME: 'daemon-rebuild', GIT_AUTHOR_EMAIL: 'daemon-rebuild@localhost',
+    };
+    g(['merge', '-q', '--no-ff', '-m', 'daemon-rebuild: merge overlay lane/ov (pr 1)', OV], rebuildEnv);
+    const head = g(['rev-parse', 'HEAD']);
+    g(['checkout', '-q', 'main']);
+    g(['merge', '-q', '--no-ff', '-m', 'Merge PR ov', OV]);
+    const M2 = g(['rev-parse', 'HEAD']);
+    const M3 = commit('m3.txt');
+    const mainTip = g(['rev-parse', 'main']);
+    const verify = (mainSha, prevHead = head) => readyBuildVerified({
+      git: (args) => git(dir, args), adopt: { finalSha: mainSha, mainSha, applied: [] }, prevHead, mainTip,
+    });
+    return { M0, M1, OV, M2, M3, head, verify };
+  }
+
+  it('accepts a plain-main candidate at/after M1 even though the merged overlay commit is newer', () => {
+    const f = fixture();
+    expect(f.verify(f.M1)).toBe(true);
+    expect(f.verify(f.M3)).toBe(true);
+  });
+
+  it('still refuses a genuinely older candidate (before the head\'s true main base)', () => {
+    const f = fixture();
+    expect(f.verify(f.M0)).toBe(false);
+  });
+
+  it('keeps the plain merge-base rule for a head with no rebuild merges, and fails closed on an unreadable head', () => {
+    const f = fixture();
+    expect(f.verify(f.M3, f.M3)).toBe(true);
+    expect(f.verify(f.M1, f.M3)).toBe(false);
+    expect(f.verify(f.M1, f.M2)).toBe(false);
+    expect(f.verify(f.M3, 'f'.repeat(40))).toBe(false);
+  });
+});
+
 describe('a passed candidate blocked at finalize by a long reader tick is adopted later without re-smoking', () => {
   it('readyBuildVerified refuses a force-pushed pinned sha and rebuildClone freshly smokes the current plan', async () => {
     const { originDir, cloneDir, env } = makeFixture();
