@@ -706,6 +706,19 @@ describe('stale record owned by a foreign host name', () => {
     f.probe.readPidStart = () => { throw Error('ps failed'); };
     expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
   });
+  // The shortcut is for FOREIGN hosts only. A same-host record with no usable pid reaches the shortcut's clauses; the control
+  // (same record, foreign host) is recovered, so the host clause alone is what holds the same-host one.
+  it('does not apply the foreign-host abandonment shortcut to a same-host record', () => {
+    expect(rebound({ pid: null }).plan()).toMatchObject({ mode: 'fresh' });
+    const { plan } = rebound({ pid: null, host: hostname() }, { expectFresh: false });
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('the production recovery probe supplies host, namespace and birth-time reader', () => {
+    const probe = recovery.recoveryProbe();
+    expect(probe).toMatchObject({ host: hostname(), namespace: pidNamespace() });
+    expect(typeof probe.isAlive).toBe('function');
+    expect(typeof probe.readPidStart).toBe('function');
+  });
   it('does not treat a bound abandonment from another pid namespace as proof of death', () => {
     // Same rewrite with the namespace unset is recovered (the control), so the namespace is what holds it.
     expect(rebound({ pidNamespace: null }).plan()).toMatchObject({ mode: 'fresh' });
