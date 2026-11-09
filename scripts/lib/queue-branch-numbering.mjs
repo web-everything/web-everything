@@ -49,7 +49,7 @@ export const isMergeGroupCiRun = (env = process.env) => env.GITHUB_ACTIONS === '
 /** Temporary ids are unconditionally refused in merge-group CI, independent of drain settings. */
 export function mergeGroupHashRefusals({ env = process.env, files }) {
   if (!isMergeGroupCiRun(env)) return [];
-  return hashBacklogFiles(files).map((file) => `Backlog file "${file}" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)`);
+  return hashBacklogFiles(files).map((file) => `Backlog file "${shownText(file)}" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)`);
 }
 
 export const BRANCH_NUMBERING_CI_CONTRACT = 'drain-branch-numbering-ci-v1';
@@ -182,9 +182,11 @@ const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => {
   return args.includes('-z') ? out : out.trim();
 };
 // Card names from a PR branch are untrusted: strip controls, line separators and bidi overrides before logging.
-const UNSAFE_SHOWN = (n) => n < 0x20 || n === 0x7f || n === 0x2028 || n === 0x2029 || n === 0x200e || n === 0x200f
-  || (n >= 0x202a && n <= 0x202e) || (n >= 0x2066 && n <= 0x2069);
-const shownPaths = (files) => files.map((f) => [...String(f)].map((c) => UNSAFE_SHOWN(c.codePointAt(0)) ? ' ' : c).join('')).join(', ');
+// C0, DEL and C1 (NEL, CSI), line/paragraph separators, and bidi marks/overrides/isolates.
+const UNSAFE_SHOWN = (n) => n < 0x20 || (n >= 0x7f && n <= 0x9f) || n === 0x2028 || n === 0x2029 || n === 0x061c
+  || n === 0x200e || n === 0x200f || (n >= 0x202a && n <= 0x202e) || (n >= 0x2066 && n <= 0x2069);
+const shownText = (text) => [...String(text)].map((c) => UNSAFE_SHOWN(c.codePointAt(0)) ? ' ' : c).join('');
+const shownPaths = (files) => files.map(shownText).join(', ');
 
 /** Caller holds the numbering mutex and has refreshed origin/main. Unknown PRs retain reservations. */
 export function fallbackMinNext({ cwd = process.cwd(), exec = execFileSync, fs = nodeFs, statePath = numberingStatePath() } = {}) {
@@ -327,7 +329,8 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       }, { runUnlockedOnContention: false });
       if (outcome.ran === false) throw new Error('numbering mutex refused — retry next pass');
       return outcome.result;
-    } catch (e) { return { action: 'skip', reason: `merge-queue: branch numbering refused: ${String(e.message || e)}` }; }
+    // Refusal text can carry raw tracked-path names (guards, fs errors): sanitize once, here, before any log or event.
+    } catch (e) { return { action: 'skip', reason: `merge-queue: branch numbering refused: ${shownText(e.message || e)}` }; }
     finally {
       if (temporary) {
         try {
@@ -422,7 +425,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
         }
         graphql('mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', [`id=${pr.id}`]);
         result.dequeued.push(pr.number);
-        event('queue-dequeued', pr.number, { reason: 'hash-cards-numbering', files });
+        event('queue-dequeued', pr.number, { reason: 'hash-cards-numbering', files: files.map(shownText) });
         log.write(`  ⇠ PR ${pr.number} DEQUEUED: carries hash card(s) ${shownPaths(files)} — numbering on its branch, re-enqueued after CI\n`);
         const out = prepare({ c: { num: pr.number, repo: null, headRef: pr.headRefName, item: null, hasManifest: false }, traceHeadSha: pr.headRefOid, cwd, isLocal: true, isOpen });
         log.write(`  ↻ PR ${pr.number} queue branch preparation: ${out.action}${out.reason ? ` — ${out.reason}` : ''}${out.newHead ? ` → ${out.newHead}` : ''}\n`);

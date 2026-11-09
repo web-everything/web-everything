@@ -117,6 +117,13 @@ describe('queue branch numbering', () => {
       'Backlog file "backlog/xabc123-foo.md" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)',
     ]);
   });
+  it('mergeGroupRefusalShowsAnUntrustedCardNameOnOneLineWithoutControls', () => {
+    const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group' };
+    const hostile = ['\n', String.fromCodePoint(0x202e), String.fromCodePoint(0x85), String.fromCodePoint(0x9b), String.fromCodePoint(0x2028)];
+    const [message] = mergeGroupHashRefusals({ env, files: [`backlog/xabc123-a${hostile.join('')}b.md`] });
+    expect(message).toContain('Backlog file "backlog/xabc123-a     b.md"');
+    for (const c of hostile) expect(message).not.toContain(c);
+  });
   it('does not refuse hash cards outside merge-group CI', () => {
     for (const env of [{}, { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'merge_group' }]) {
       expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md'] })).toEqual([]);
@@ -775,6 +782,29 @@ it('checksALeadingWhitespaceTrackedPathAsItselfNotItsTrimmedTwin', () => {
       fs: { ...realFs, mkdtempSync: () => temporary }, statePath: join(root, 'reservations.json'), lock, number });
     // The refusal names ' x' itself (two spaces after the colon), not the regular file 'x'.
     expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('symlinked tracked path refused:  x') });
+    expect(number).not.toHaveBeenCalled();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('refusalReasonCarryingARawTrackedPathIsSanitizedBeforeItIsLogged', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-refusal-text-'));
+  try {
+    const temporary = join(root, 'temporary');
+    mkdirSync(join(temporary, 'tree', 'backlog'), { recursive: true });
+    const RLO = String.fromCodePoint(0x202e);
+    // Not on disk: the guard's fs error message quotes this raw name.
+    const card = `backlog/xabc123-a\n  ✓ PR 1 numbered${RLO}.md`;
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      if (args[0] === 'ls-files') return `${card}\0`;
+      return '';
+    });
+    const number = vi.fn(), lock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example', num: 1 }, traceHeadSha: 'head', exec,
+      fs: { ...realFs, mkdtempSync: () => temporary }, statePath: join(root, 'reservations.json'), lock, number });
+    expect(out.action).toBe('skip');
+    expect(out.reason).toContain('xabc123-a   ✓ PR 1 numbered .md');
+    expect(out.reason).not.toMatch(new RegExp(`[\n${RLO}]`));
     expect(number).not.toHaveBeenCalled();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
