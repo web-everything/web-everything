@@ -180,7 +180,7 @@ describe('world capsule (R649 S1)', () => {
   });
 
   it('does not import readPrsFromFile', () => {
-    const source = readFileSync(new URL('../daemon-rebuild/world-capsule.mjs', import.meta.url), 'utf8');
+    const source = readFileSync(join(process.cwd(), 'scripts/lib/daemon-rebuild/world-capsule.mjs'), 'utf8');
     expect(source).not.toContain('readPrsFromFile');
   });
 });
