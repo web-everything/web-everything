@@ -432,6 +432,12 @@ describe('classifyIdleFinished — PURE core', () => {
       .toEqual({ finished: false, reason: 'pending-tool-call', ageMs: 75 * 60_000 });
   });
 
+  it('rowIdle + pending call with zero/negative/sub-threshold pendingGraceMs fails closed', () => {
+    for (const g of [0, -1, THRESHOLD - 1]) {
+      expect(classifyIdleFinished({ lastActivityMs: NOW - 500 * 60_000, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true, pendingGraceMs: g }).finished).toBe(false);
+    }
+  });
+
   it('rowIdle + pending call with NO pendingGraceMs given fails closed (not finished)', () => {
     expect(classifyIdleFinished({ lastActivityMs: NOW - 500 * 60_000, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true }).finished).toBe(false);
   });

@@ -439,7 +439,7 @@ export function classifyIdleFinished({ lastActivityMs, nowMs, thresholdMs, pendi
   // transcript has been silent past the window.
   // R794: the override also needs silence past the hung detector's full pending-call grace (`pendingGraceMs`);
   // a missing/invalid grace fails closed.
-  if (pendingToolUse) return rowIdle === true && Number.isFinite(pendingGraceMs) && ageMs >= pendingGraceMs
+  if (pendingToolUse) return rowIdle === true && Number.isFinite(pendingGraceMs) && pendingGraceMs >= thresholdMs && ageMs >= pendingGraceMs
     ? { finished: true, reason: 'idle-row-dangling-tool-call', ageMs }
     : { finished: false, reason: 'pending-tool-call', ageMs };
   return { finished: true, reason: 'turn-ended-idle', ageMs };
