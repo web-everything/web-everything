@@ -50,7 +50,7 @@ describe('result label repair trust boundary', () => {
 
     expect(input.sync).toHaveBeenCalledTimes(1);
     expect(input.sync).toHaveBeenCalledWith({ repo: input.repo, pr, head,
-      env: expect.any(Object), log: expect.any(Function) });
+      env: expect.any(Object), log: expect.any(Function), provider: expect.any(Object) });
     expect(result).toEqual({
       rawPrs: [{ ...before[0], labels: ['bug', 'red-team:clear'] }],
       applied: [{ pr, head, add: 'red-team:clear', remove: ['red-team:pending'] }],

@@ -39,7 +39,7 @@ describe('syncResultOnHeadLabels', () => {
     const result = syncResultOnHeadLabels(input);
 
     expect(input.sync).toHaveBeenCalledTimes(1);
-    expect(input.sync).toHaveBeenCalledWith({ repo, pr, head, env: expect.any(Object), log: input.log });
+    expect(input.sync).toHaveBeenCalledWith({ repo, pr, head, env: expect.any(Object), log: input.log, provider: expect.any(Object) });
     expect(result).toEqual({
       rawPrs: [{ ...before[0], labels: ['bug', label] }],
       applied: [{ pr, head, ...plan }],
@@ -101,5 +101,20 @@ describe('syncResultOnHeadLabels', () => {
 
     expect(input.sync).toHaveBeenCalledTimes(1);
     expect(second).toEqual({ rawPrs: first.rawPrs, applied: [], errors: [] });
+  });
+});
+
+import { headGuardedProvider } from '../red-team-result-label-sync.mjs';
+describe('headGuardedProvider', () => {
+  const head = 'a'.repeat(40);
+  it('writes when the live head still matches', () => {
+    const setLabels = vi.fn();
+    headGuardedProvider({ readPrState: () => ({ headRefOid: head }), setLabels }, head).setLabels('r', 1, { add: 'x' });
+    expect(setLabels).toHaveBeenCalledOnce();
+  });
+  it('refuses the write when the head moved before it', () => {
+    const setLabels = vi.fn();
+    expect(() => headGuardedProvider({ readPrState: () => ({ headRefOid: 'b'.repeat(40) }), setLabels }, head).setLabels('r', 1, {})).toThrow(/head moved/);
+    expect(setLabels).not.toHaveBeenCalled();
   });
 });
