@@ -495,7 +495,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       await f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
       await block(f, 1);
       expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
-      expect(numbers(f.queue.admit(repo, 0))).toEqual([1]);
+      expect(numbers(f.queue.admit(repo, 0))).toEqual([]); // fail closed: no probe at zero admission
     });
     it('does not spend a retry while probing, and stops being blocked once dispatched', async () => {
       const f = fixture();

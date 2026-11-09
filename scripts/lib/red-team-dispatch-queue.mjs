@@ -89,7 +89,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
       const mine = entries.filter(entry => entry.repo === repo);
-      const probes = new Set(mine.filter(entry => entry.blocked).map(entry => entry.key));
+      // Zero admission (unreadable capacity, fail closed) admits no probe either.
+      const probes = new Set(mine.filter(entry => entry.blocked && bound > 0).map(entry => entry.key));
       const runnable = mine.filter(entry => !probes.has(entry.key)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
