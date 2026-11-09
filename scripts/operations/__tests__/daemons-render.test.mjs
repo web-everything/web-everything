@@ -98,7 +98,10 @@ describe('daemon renderer', () => {
     expect(env.WE_STATE_ROOT).toBe(`${hostileHome}/workspace/webeverything`);
     expect(args).toHaveLength(3);
     expect(args.slice(0, 2)).toEqual(['/bin/zsh', '-lc']);
-    expect(args[2]).toContain('"$WE_WIP_PUBLISH_HOME/workspace/plateau-app"');
+    // Exact command pin: the only expansion is the double-quoted env reference in the cd, so no eval, unquoted
+    // expansion or home substitution can enter without changing this string.
+    expect(args[2]).toBe('cd "$WE_WIP_PUBLISH_HOME/workspace/plateau-app" && { git pull --ff-only --quiet || echo "wip-publisher: git pull skipped (offline or local changes) — running the code on disk"; } && exec npm run --silent wip:publish');
+    expect(args[2].match(/\$/g)).toHaveLength(1);
     for (const fragment of ['dollar-executed', 'backtick-executed', hostileHome]) expect(args[2]).not.toContain(fragment);
     expect(xml).toContain('&quot;&amp;&lt;&gt;');
     expect(xml).not.toContain('{home}');
