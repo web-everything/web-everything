@@ -5,6 +5,9 @@ import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
 
 const transactions = new WeakMap();
+// Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
+// still probed every tick, but it must not occupy one of the capacity-bound admissions.
+const NON_RUNNABLE_REASONS = new Set(['review-unfinished']);
 const copy = entries => entries.map(entry => ({ ...entry }));
 const note = (log, message) => {
   try { log(`review-daemon: red-team queue ${message}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')); }
@@ -84,10 +87,14 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     },
     admit(repo, count) {
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
-      const admitted = entries.filter(entry => entry.repo === repo).slice(0, bound);
-      const keys = new Set(admitted.map(entry => entry.key));
-      for (const entry of entries.filter(entry => entry.repo === repo)) {
-        note(log, `${keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}`);
+      // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
+      const mine = entries.filter(entry => entry.repo === repo);
+      const probes = new Set(mine.filter(entry => entry.blocked).map(entry => entry.key));
+      const runnable = mine.filter(entry => !probes.has(entry.key)).slice(0, bound);
+      const keys = new Set(runnable.map(entry => entry.key));
+      const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
+      for (const entry of mine) {
+        note(log, `${probes.has(entry.key) ? 'probe' : keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}`);
       }
       return copy(admitted);
     },
@@ -99,10 +106,16 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
         const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip' } : undefined);
+        if (entry.blocked && (dispatched.some(matches) || !failure)) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
+          if (NON_RUNNABLE_REASONS.has(failure.reason)) {
+            // No retry is spent and the slot is released: the entry stays queued, flagged, and is re-probed.
+            if (entry.blocked !== failure.reason) { entry.blocked = failure.reason; changed(`blocked ${entry.key}: ${failure.reason}`); }
+            continue;
+          }
           entry.attempts++;
           if (entry.attempts >= limit) {
             entries.splice(entries.indexOf(entry), 1);
