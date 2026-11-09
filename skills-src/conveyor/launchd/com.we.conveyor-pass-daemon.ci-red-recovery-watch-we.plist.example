@@ -8,7 +8,7 @@
 	mechanical rebase onto main by scripts/conveyor/ci-red-recovery-watch.mjs". The manifest entry in
 	daemon-manifest.mjs declared this watcher but NO launchd template existed, so nothing ever installed it and those
 	PRs sat refused forever (live: PRs 3990/4019/4021 after the 2026-10-05 Actions outage). Shaped like
-	com.we.conveyor-pass-daemon.ci-red-recovery-watch-we, run from the wev-review-daemon clone (self-synced, so overlays
+	com.we.conveyor-pass-daemon.ci-red-recovery-watch-we, run from the wev-pass-readers clone (self-synced, so overlays
 	reach this pass too). Sibling repos: copy this file and change the pass name (the ProgramArguments entry after the
 	pass flag) to ci-red-recovery-watch-frontierui or ci-red-recovery-watch-plateau-app. (No double hyphen may appear
 	inside an XML comment, so the flag itself is not spelled out here.)
@@ -43,18 +43,18 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
-		<string>/Users/nicolasgilbert/workspace/wev-review-daemon/skills-src/conveyor/pass-daemon.mjs</string>
+		<string>/Users/nicolasgilbert/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs</string>
 		<string>--pass=ci-red-recovery-watch-we</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.ci-red-recovery-watch-we.log</string>
+	<string>/Users/nicolasgilbert/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-we.log</string>
 	<key>StandardOutPath</key>
-	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.ci-red-recovery-watch-we.log</string>
+	<string>/Users/nicolasgilbert/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-we.log</string>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/nicolasgilbert/workspace/wev-review-daemon</string>
+	<string>/Users/nicolasgilbert/workspace/wev-pass-readers</string>
 </dict>
 </plist>
