@@ -217,7 +217,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason }) });
       if (!supersede.ok) {
         const failures = `${reason}; ${supersede.reason}`;
-        const hold = postRedTeamPublicationHoldUnlocked({ repo, pr, headSha, held: true, reason: failures, gh });
+        const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
         return failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}`);
       }
     }
@@ -237,11 +237,8 @@ export const RED_TEAM_PUBLICATION_CONTEXT = 'red-team/publication';
 export const redTeamPublicationContext = pr => /^[1-9]\d*$/.test(String(pr ?? '')) && Number.isSafeInteger(Number(pr))
   ? `${RED_TEAM_PUBLICATION_CONTEXT} #${Number(pr)}` : null;
 
-export function postRedTeamPublicationHold(options = {}) {
-  return withRedTeamCheckLock(options, () => postRedTeamPublicationHoldUnlocked(options));
-}
-
-function postRedTeamPublicationHoldUnlocked({ repo, pr, headSha, held, reason = '', gh = runGhSync } = {}) {
+/** Deliberately NOT under the check lock: this is the last-resort hold for when check writes (or the lock) fail. */
+export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '', gh = runGhSync } = {}) {
   try {
     const context = redTeamPublicationContext(pr);
     if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context) throw Error('invalid red-team publication hold identity (repo, PR number and head required)');

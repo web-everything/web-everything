@@ -105,17 +105,23 @@ describe('red-team check run contract', () => {
       expect(io.readLive).toHaveBeenCalledTimes(2);
     });
 
-    it.each(['helper', 'poster', 'policy-clear', 'status'])('%s times out without reads or POSTs while the lock is held', kind => {
+    it.each(['helper', 'poster', 'policy-clear'])('%s times out without reads or POSTs while the lock is held', kind => {
       const io = { ...fixture(), lockTimeoutMs: 10 };
       const result = api.withRedTeamCheckLock(io, () => {
         if (kind === 'helper') return publish(io);
         if (kind === 'policy-clear') return api.publishRedTeamPolicyClearCheck(io);
-        if (kind === 'status') return api.postRedTeamPublicationHold({ ...io, held: true });
         return api.postRedTeamCheckRun({ ...io, payload: api.redTeamCheckRunPayload({ ...io, status: 'finished', hold: null }) });
       });
       expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/lock.*retry|lock.*operator/i) });
       expect(io.gh).not.toHaveBeenCalled();
       expect(io.readLive).not.toHaveBeenCalled();
+    });
+
+    it('the last-resort publication hold is NOT behind the check lock and posts while the lock is held', () => {
+      const io = { ...fixture(), lockTimeoutMs: 10 };
+      const out = api.withRedTeamCheckLock(io, () => api.postRedTeamPublicationHold({ ...io, held: true, reason: 'x' }));
+      expect(out).toEqual({ ok: true });
+      expect(io.gh).toHaveBeenCalled();
     });
 
     it.each(['live', 'failure'])('serializes a concurrent %s writer behind the live helper across processes', async secondMode => {
@@ -249,10 +255,10 @@ describe('red-team check run contract', () => {
       expect(io.gh).not.toHaveBeenCalled();
     });
 
-    it.each(['helper', 'poster', 'policy-clear', 'status'])('%s fails closed on lock errors', kind => {
+    it.each(['helper', 'poster', 'policy-clear'])('%s fails closed on lock errors', kind => {
       const io = { ...fixture(), lock: () => { throw Error('permission denied'); } };
       const out = kind === 'helper' ? publish(io) : kind === 'poster' ? api.postRedTeamCheckRun(io)
-        : kind === 'status' ? api.postRedTeamPublicationHold(io) : api.publishRedTeamPolicyClearCheck(io);
+        : api.publishRedTeamPolicyClearCheck(io);
       expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('permission denied') });
       expect(io.gh).not.toHaveBeenCalled();
     });
