@@ -500,6 +500,18 @@ describe('the label sink', () => {
     expect(readFileSync(path, 'utf8')).toBe('# frozen verdict');
   });
 
+  it('a symlinked run directory is refused: nothing is written outside the sidecar', async () => {
+    const outsideDir = join(root, 'elsewhere'); mkdirSync(outsideDir, { recursive: true });
+    mkdirSync(reviewSidecarDir(root), { recursive: true });
+    symlinkSync(outsideDir, join(reviewSidecarDir(root), 'run-1'));
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(existsSync(join(outsideDir, 'o-n-7-verdict.md'))).toBe(false);
+    expect(seen).toEqual([]);
+  });
+
   it('an unreadable run record refuses before any write instead of shelling', async () => {
     const seen = [];
     const sinks = createReviewPrSinks({ root, runStore: { read: () => { throw new Error('corrupt'); } }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),

@@ -45,7 +45,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -165,6 +165,10 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   try { current = readFileSync(path, 'utf8'); } catch { current = null; }
   if (current !== entry.payload.body) {
     mkdirSync(dirname(path), { recursive: true });
+    // The run directory must really live under this checkout's sidecar: a symlinked directory would redirect the write.
+    const sidecar = realpathSync(reviewSidecarDir(root));
+    const dir = realpathSync(dirname(path));
+    if (dir !== join(sidecar, runId)) throw notApplied(`the staged write-up directory for ${runId} resolves outside the review sidecar`, {});
     // Never write THROUGH a link: any existing staged file (symlink included) is unlinked and recreated, not followed.
     try { lstatSync(path); unlinkSync(path); } catch { /* absent */ }
     writeFileSync(path, entry.payload.body, { encoding: 'utf8', flag: 'wx' });
