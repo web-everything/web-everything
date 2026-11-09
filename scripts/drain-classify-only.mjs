@@ -80,7 +80,7 @@ export function runCli(argv = process.argv.slice(2), io = {}) {
   const started = (io.now || Date.now)();
   const mainSha = exec('git', ['rev-parse', 'origin/main']).trim();
   const args = [fileURLToPath(new URL('./merge-ai-prs.mjs', import.meta.url)), `--only=${flags.only}`,
-    '--dry-run', '--json', '--no-drain-lease',
+    '--dry-run', '--json', '--no-drain-lease', '--label=ready-to-merge',
     ...(flags.repo ? [`--only-repo=${flags.repo}`, `--repos=${flags.repo}`] : ['--this-repo'])];
   const raw = exec(process.execPath, args);
   let result;

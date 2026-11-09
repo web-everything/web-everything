@@ -298,3 +298,17 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     expect(JSON.parse(String(io.writeFileSync.mock.calls[0][1])).repo).toBe(ctx.repo);
   });
 });
+
+describe('T5b: review-escalation pass is kept on in the real drain call', () => {
+  it('passes --label=ready-to-merge and never relaxes escalation', () => {
+    const io = ioFor();
+    runCli(argv, io);
+    const call = io.execFileSync.mock.calls.find(([cmd, a]) => cmd === process.execPath && a.some(x => /merge-ai-prs\.mjs$/.test(x)));
+    expect(call[1]).toContain('--label=ready-to-merge');
+    expect(call[1].some(x => /no-review-escalation/.test(x))).toBe(false);
+  });
+  it('the real drain enables REVIEW_ESCALATION only for a label-scoped run (omitting the label would skip it)', () => {
+    const src = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    expect(src).toMatch(/const REVIEW_ESCALATION = label && !escalationRelief\.passWide;/);
+  });
+});
