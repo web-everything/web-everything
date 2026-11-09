@@ -34,7 +34,7 @@ describe('ci-heal-reset', () => {
     expect(f.reader('ci-heal-reset', input).awaitVerify.map(r => r.key)).toEqual(['target', 'second', 'other-head']);
     await f.sink(f.plan());
     expect(f.writeAwaitVerify).toHaveBeenCalledTimes(2);
-    expect(f.stored()).toEqual(rows.map((r, i) => i < 2 ? { ...r, record: { ...r.record, resumeFailures: 0 } } : r));
+    expect(f.stored()).toEqual(rows.map((r, i) => i < 2 ? { ...r, record: { ...r.record, resumeFailures: 0, operatorResets: 1 } } : r));
     expect(AWAIT_VERIFY_LIMITS.maxResumeFailures).toBe(3);
     expect(f.stored()[0].record.resumeFailures).toBeLessThan(AWAIT_VERIFY_LIMITS.maxResumeFailures);
   });
@@ -61,6 +61,19 @@ describe('ci-heal-reset', () => {
     await f.sink(f.plan());
     expect(parseOperatorActions(f.comments())).toMatchObject([{ actor: input.actor, channel: input.channel, reason: input.reason, at: now,
       details: { pr: 7, head, previousResumeFailures: 3, undo: expect.any(String) } }]);
+  });
+  it('refuses a stored sha that shares the prefix but differs from the live head', () => {
+    const sibling = head.slice(0, 9) + '9'.repeat(31);
+    expect(() => fixture([row('prefix-twin', { sha: sibling })]).plan()).toThrow('head moved');
+  });
+  it('bounds repeated resets per pr@head and escalates instead of resetting again', async () => {
+    const f = fixture();
+    await f.sink(f.plan());
+    f.stored()[0].record.resumeFailures = AWAIT_VERIFY_LIMITS.maxResumeFailures;
+    await f.sink(f.plan());
+    expect(f.stored()[0].record.operatorResets).toBe(2);
+    f.stored()[0].record.resumeFailures = AWAIT_VERIFY_LIMITS.maxResumeFailures;
+    expect(() => f.plan()).toThrow(/limit reached/);
   });
   it('refuses non-operator actors', () => {
     expect(() => fixture().plan({ ...input, actor: 'intruder' })).toThrow(/registered operator/);

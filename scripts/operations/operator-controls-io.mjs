@@ -147,7 +147,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
       planOperatorControl(name, latest, i); // Check the live head again immediately before writing.
       if (controlFingerprint(name, latest, i) !== p.fingerprint) throw new Error('await-verify state changed before mutation');
       for (const { record } of p.resets) {
-        const result = await writeAwaitVerify({ ...record, resumeFailures: 0 });
+        const result = await writeAwaitVerify({ ...record, resumeFailures: 0, operatorResets: (record.operatorResets ?? 0) + 1 });
         if (result?.ok !== true) throw new Error(`await-verify write failed: ${result?.reason ?? 'unconfirmed'}`);
       }
     } else if (name === 'rearm') child('scripts/conveyor/rearm-review.mjs', [String(i.pr), ...attribution]);
@@ -170,7 +170,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
       if (after.head !== p.record.details.head || !Array.isArray(after.awaitVerify)) return false;
       const expected = { ...after, awaitVerify: after.awaitVerify.map(row => {
         const old = p.resets.find(r => r.key === row.key);
-        return old ? { ...row, record: { ...row.record, resumeFailures: old.record.resumeFailures } } : row;
+        return old ? { ...row, record: { ...row.record, resumeFailures: old.record.resumeFailures, operatorResets: old.record.operatorResets } } : row;
       }) };
       return p.resets.every(old => after.awaitVerify.some(row => row.key === old.key && row.record.resumeFailures === 0))
         && controlFingerprint(p.op, expected, p.input) === p.fingerprint;

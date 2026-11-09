@@ -11,6 +11,7 @@ import { previousCiFailurePending } from '../conveyor/await-verify.mjs';
 import { AWAIT_VERIFY_LIMITS } from '../conveyor/await-verify-pass.mjs';
 
 export const CONTROL_OPS = Object.freeze(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset']);
+export const MAX_OPERATOR_RESETS = 2;
 export const OPERATOR_CONTROL_EFFECT = 'operator.control';
 export function validateOperatorAttribution({ actor, channel, reason }) {
   if (typeof actor !== 'string' || !OPERATOR_LOGINS.includes(actor.toLowerCase())) throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this action is the operator's`);
@@ -94,13 +95,16 @@ export function planOperatorControl(name, read, input) {
     extension = planRoundExtension({ ...read, now: read.now }, { ...input, by: input.n ?? 1 });
     steps.push(`post verified round extension +${input.n ?? 1} via github.round-extension; kind=${input.kind ?? 'fix'} (raises every cap today)`);
   } else if (name === 'ci-heal-reset') {
-    const matches = sha => typeof sha === 'string' && /^[a-f\d]{40}$(?![\s\S])/i.test(sha) && sha.toLowerCase().startsWith(input.head.toLowerCase());
+    const full = sha => typeof sha === 'string' && /^[a-f\d]{40}$(?![\s\S])/i.test(sha);
+    const matches = sha => full(sha) && sha.toLowerCase().startsWith(input.head.toLowerCase());
+    const liveHead = String(read.head ?? '').toLowerCase();
     if (!matches(read.head)) throw new Error('head moved: state changed since the exhausted record');
     if (!Array.isArray(read.awaitVerify)) throw new Error('await-verify records unavailable');
     const rows = read.awaitVerify.filter(({ record }) => record.repo === input.repo && record.pr === input.pr);
-    const matching = rows.filter(({ record }) => matches(record.sha));
+    const matching = rows.filter(({ record }) => matches(record.sha) && String(record.sha).toLowerCase() === liveHead);
     if (rows.length && !matching.length) throw new Error('head moved: state changed since the exhausted record');
     resets = matching.filter(({ record }) => previousCiFailurePending(record) && Number.isSafeInteger(record.resumeFailures) && record.resumeFailures >= AWAIT_VERIFY_LIMITS.maxResumeFailures);
+    if (matching.some(({ record }) => (record.operatorResets ?? 0) >= MAX_OPERATOR_RESETS)) throw new Error(`ci-heal-reset limit reached (${MAX_OPERATOR_RESETS} per pr@head); escalate for a human repair instead of resetting again`);
     undo = 'restore each record’s previousResumeFailures through an operator-reviewed store repair; the normal resume failure cap still applies';
     if (!resets.length) why = 'no matching exhausted await-verify record';
     steps = resets.map(({ key }) => `writeStoredAwaitVerify(${key}) with resumeFailures:0; preserve every other field`);
