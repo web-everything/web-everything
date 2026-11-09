@@ -95,6 +95,7 @@ import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operation
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
+import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
@@ -1255,6 +1256,7 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 
 /** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
+let redTeamDispatchQueue;
 export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
@@ -1268,8 +1270,11 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         ({ rawPrs } = syncResultOnHeadLabels({ repo: o.repo, refusals: o.plan?.refusals,
           rawPrs, log: line => log.error(line) }));
       } catch { /* Label repair must never block red-team recovery. */ }
-      return runRedTeamOnSkip({ ...o, rawPrs,
-        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) });
+      const options = { ...o, rawPrs,
+        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
+      if (process.env.WE_RED_TEAM_DISPATCH_QUEUE === 'off') return runRedTeamOnSkip(options);
+      redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: options.log });
+      return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,

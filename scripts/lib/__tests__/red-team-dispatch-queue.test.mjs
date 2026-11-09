@@ -318,6 +318,43 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(f.open().entries()).toEqual(before);
   });
 
+  it.each(['sync', 'async'])('runner %s failure rolls back sync mutations, admissions and persisted state', async mode => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1, 2, 3]));
+    await f.queue.admit(repo, 1);
+    const before = structuredClone(f.queue.entries());
+    const persisted = new Map(f.files);
+    f.operations.length = 0;
+    const error = new Error('runner failed after sync mutations');
+    const options = inputs([2, 3, 4], { capacity: capacity(1) });
+    options.plan.refusals[0].headSha = 'f'.repeat(40);
+    const run = vi.fn(() => {
+      // Sync removed PR 1, replaced PR 2's head and appended PR 4 before admission.
+      expect(numbers(f.queue.entries())).toEqual([3, 2, 4]);
+      expect(f.queue.entries()[1]).toMatchObject({ head: 'f'.repeat(40), attempts: 0 });
+      if (mode === 'async') return Promise.reject(error);
+      throw error;
+    });
+    let caught;
+    try {
+      await runWithRedTeamQueue({ queue: f.queue, ...options, run });
+    } catch (failure) { caught = failure; }
+    expect(caught).toBe(error);
+    expect(run).toHaveBeenCalledOnce();
+    expect(f.queue.entries()).toEqual(before);
+    expect(f.files).toEqual(persisted);
+    expect(f.operations).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+    // Settlement without another admit must still act on the pre-transaction admission (PR 1),
+    // rather than the failed transaction's admission (PR 3).
+    await f.queue.settle(repo, {
+      rows: [{ prNumber: 1, action: 'clear' }, { prNumber: 3, action: 'clear' }],
+      dispatched: [], notStarted: [],
+    });
+    expect(numbers(f.queue.entries())).toEqual([2, 3]);
+    expect(numbers(f.open().entries())).toEqual([2, 3]);
+  });
+
   it('admit is FIFO per repo, supports Infinity and does not dequeue before settlement', async () => {
     const f = fixture();
     await f.queue.sync(repo, candidates([3, 1, 2]));
