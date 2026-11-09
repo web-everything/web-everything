@@ -95,6 +95,7 @@ import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operation
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
+import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -1261,8 +1262,15 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
     acquirableLanes: defaultAcquirableLaneNumbers, readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     liveReviewBudget: liveReviewRoundBudget(),
-    redTeamOnSkip: o => runRedTeamOnSkip({ ...o,
-      dispatch: d => dispatchReviewJob(d), log: line => log.error(line) }),
+    redTeamOnSkip: o => {
+      let rawPrs = o.rawPrs;
+      try {
+        ({ rawPrs } = syncResultOnHeadLabels({ repo: o.repo, refusals: o.plan?.refusals,
+          rawPrs, log: line => log.error(line) }));
+      } catch { /* Label repair must never block red-team recovery. */ }
+      return runRedTeamOnSkip({ ...o, rawPrs,
+        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) });
+    },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,
     postRefreshMarker: defaultPostRebaseComment,
