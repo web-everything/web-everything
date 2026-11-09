@@ -120,7 +120,7 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   else {
     try {
       prs = String((io.execFileSync || execFileSync)('gh', ['pr', 'list', '--repo', flags.repo || env.GITHUB_REPOSITORY,
-        '--state', 'open', '--search', 'sort:updated-desc', '--limit', '10', '--json', 'number', '--jq', '.[].number'],
+        '--state', 'open', '--limit', '10', '--json', 'number', '--jq', '.[].number'],
       { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 60_000, env })).split('\n').filter(Boolean);
     } catch { return fail('open PR list unreadable'); }
   }

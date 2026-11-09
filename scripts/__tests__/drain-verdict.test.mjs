@@ -15,7 +15,7 @@ const inputs = () => ({ ...structuredClone(ctx), headSha, decision: 'enqueue' })
 const live = () => ({ repo: ctx.repo, pr: ctx.pr, headSha, mainSha, provenance: { ...provenance } });
 const valid = () => ({ schema: 'drain-verdict/2', ...inputs(),
   localOnly: { 'red-main-freeze': 'unknown', 'card-group': 'unknown',
-    'manifest-baseline': 'unknown', 'couple-whole': 'unknown' } });
+    'manifest-baseline': 'unknown', 'couple-whole': 'unknown', 'test-gaming-scan': 'unknown' } });
 const refuse = (v, lookup = live(), opts = {}) => {
   const result = verify(v, lookup, { now, ...opts });
   expect(result).toEqual({ ok: false, reason: expect.any(String) });
@@ -27,7 +27,7 @@ const base = () => ({ ok: true, dryRun: true, heldCoupleMembers: 0, toMerge: [],
 describe('T1: strict v2 shape and forged verdict refusals', () => {
   it('builds exactly the v2 contract and verifies a valid verdict', () => {
     expect(SCHEMA).toBe('drain-verdict/2');
-    expect(LOCAL_ONLY).toEqual(['red-main-freeze', 'card-group', 'manifest-baseline', 'couple-whole']);
+    expect(LOCAL_ONLY).toEqual(['red-main-freeze', 'card-group', 'manifest-baseline', 'couple-whole', 'test-gaming-scan']);
     expect(build(inputs())).toEqual(valid());
     expect(build({ ...inputs(), localOnly: { 'red-main-freeze': 'pass', 'card-group': 'fail' } }))
       .toEqual(valid());
@@ -41,15 +41,15 @@ describe('T1: strict v2 shape and forged verdict refusals', () => {
     }
   });
 
-  it.each(['manifest-baseline', 'couple-whole'])('build always marks %s unknown despite a supplied pass', id => {
+  it.each(['manifest-baseline', 'couple-whole', 'test-gaming-scan'])('build always marks %s unknown despite a supplied pass', id => {
     expect(build({ ...inputs(), localOnly: { ...valid().localOnly, [id]: 'pass' } })).toEqual(valid());
   });
 
-  it.each(['manifest-baseline', 'couple-whole'])('verify refuses a %s pass claim', id => {
+  it.each(['manifest-baseline', 'couple-whole', 'test-gaming-scan'])('verify refuses a %s pass claim', id => {
     const v = valid(); v.localOnly[id] = 'pass'; refuse(v);
   });
 
-  it.each(['manifest-baseline', 'couple-whole'])('verify refuses missing %s', id => {
+  it.each(['manifest-baseline', 'couple-whole', 'test-gaming-scan'])('verify refuses missing %s', id => {
     const v = valid(); delete v.localOnly[id]; refuse(v);
   });
 
