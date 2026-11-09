@@ -114,7 +114,18 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const run = vi.fn(started);
     await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5]), capacity: bound, run });
     expect(run).toHaveBeenCalledOnce();
-    expect(run.mock.calls[0][0].plan.refusals).toHaveLength(Math.min(5, expected));
+    // Exhausted but readable capacity passes everything through (the runner refuses before any retry is spent,
+    // and worker-free settlement must not wait); unreadable capacity holds all (separate test).
+    const passThrough = expected === 0;
+    expect(run.mock.calls[0][0].plan.refusals).toHaveLength(passThrough ? 5 : Math.min(5, expected));
+  });
+
+  it('exhausted readable capacity still lets worker-free settlement (clear) reach the runner', async () => {
+    const f = fixture();
+    const run = vi.fn(() => ({ rows: [{ prNumber: 1, action: 'clear' }], dispatched: [], notStarted: [] }));
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1]), capacity: capacity(0), run, log: f.log });
+    expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1]);
+    expect(numbers(f.queue.entries())).toEqual([]);
   });
 
   it('no retry spend while queued: run never receives held-out PRs', async () => {
@@ -151,7 +162,9 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const f = fixture();
     await f.queue.sync(repo, candidates([1, 2]));
     await f.queue.sync(otherRepo, candidates([1]));
-    await runWithRedTeamQueue({ queue: f.queue, ...inputs([2]), capacity: capacity(0), run: started, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([2]), capacity: capacity(0), log: f.log,
+      run: () => ({ rows: [{ prNumber: 2, action: 'skip', why: 'no review capacity left' }], dispatched: [],
+        notStarted: [{ prNumber: 2, reason: 'no review capacity left' }] }) });
     expect(f.queue.entries().map(entry => entry.key)).toEqual([`${repo}#2`, `${otherRepo}#1`]);
     expect(f.logs.some(line => line.startsWith(prefix) && line.includes('remove') && /closed|merged|absent|candidate/.test(line))).toBe(true);
     await f.queue.sync(repo, []);

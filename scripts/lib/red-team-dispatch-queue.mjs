@@ -155,7 +155,15 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
   const transaction = transactions.get(queue)?.();
   try {
     queue.sync(repo, candidates);
-    const admitted = queue.admit(repo, redTeamQueueAdmitCount(capacity));
+    // Exhausted but readable capacity: the runner refuses ("no review capacity left") before any retry is spent,
+    // so everything passes through and worker-free settlement (clear/carry/label) is not delayed. Unreadable
+    // capacity still admits nothing (fail closed).
+    const bound = redTeamQueueAdmitCount(capacity);
+    const finite = value => typeof value === 'number' && !Number.isNaN(value);
+    const exhausted = bound === 0 && capacity && finite(capacity.lanes)
+      && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
+      && (capacity.budget == null || finite(capacity.budget.left));
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound);
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
