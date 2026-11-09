@@ -274,11 +274,25 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     expect(f.records).toEqual([]);
   });
 
-  it('deps.runs=1 keeps the single-run behaviour', async () => {
+  it('deps.runs=1 cannot lower the run count below 2', async () => {
     const f = seq('NOT WEAKENED', 'WEAKENED');
     f.deps.runs = 1;
-    expect(await main(ARGS, f.deps)).toBe(0);
-    expect(f.deps.runCodex).toHaveBeenCalledTimes(1);
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.runCodex).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([1, 0, -3, 'x', null])('audit.runs=%j in settings still runs twice', async runs => {
+    settingsOverride.text = JSON.stringify({ audit: { runs } });
+    try {
+      const f = seq('NOT WEAKENED', 'WEAKENED');
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.deps.runCodex).toHaveBeenCalledTimes(2);
+    } finally { settingsOverride.text = null; }
+  });
+
+  it('findAudit treats a NOT WEAKENED record whose runs hold a WEAKENED as WEAKENED', () => {
+    const bad = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', runs: ['NOT WEAKENED', 'WEAKENED'], at: AT };
+    expect(findAudit([bad], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toMatchObject({ verdict: 'WEAKENED' });
   });
 
   it('findAudit returns a WEAKENED record even when a later NOT WEAKENED exists for the same head, base and question', () => {
