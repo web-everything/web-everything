@@ -96,6 +96,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
     if (!isCurrent && (!prior || ts(record) >= ts(prior))) prior = record;
   }
   // A current-question record always decides; a prior-question record only speaks when no current-question record exists (even an unusable one blocks the fallback).
+  if (sawCurrent && !weakCurrent && weakPrior && (!latest || ts(weakPrior) > ts(latest))) return weakPrior;
   return sawCurrent ? (weakCurrent ?? latest) : (weakPrior ?? prior);
 }
 
@@ -145,7 +146,19 @@ export async function main(argv, deps) {
     const runs = [];
     let verdict = 'NOT WEAKENED', findings = [];
     for (let i = 0; i < maxRuns; i++) {
-      const parsed = parseAnswer(await deps.runCodex(prompt));
+      const answer = await deps.runCodex(prompt);
+      let parsed;
+      try { parsed = parseAnswer(answer); } catch {
+        // D2: an unparseable run saves a blocking record, so an earlier pass for this head and base can no longer be
+        // used. The record is WEAKENED so every consumer blocks; exit 3 still applies and nothing is printed.
+        runs.push('UNPARSEABLE');
+        const note = 'unparseable audit run: incomplete or contradictory output; request a fresh audit or human review of the full diff';
+        try {
+          await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base, questionHash: QUESTION_HASH,
+            verdict: 'WEAKENED', findings: [note], runs, unparseable: true });
+        } catch { /* exit 3 below either way */ }
+        throw new Error('unparseable run');
+      }
       runs.push(parsed.verdict);
       if (parsed.verdict === 'WEAKENED') { verdict = 'WEAKENED'; findings = parsed.findings; break; }
       for (const line of parsed.findings) if (!findings.includes(line)) findings.push(line);

@@ -95,7 +95,9 @@ describe('canonical audit', () => {
     expect(await main(ARGS, f.deps)).toBe(3);
     expect(f.errors.join('')).toMatch(/UNPARSEABLE/);
     expect(f.output).toEqual([]);
-    expect(f.records).toEqual([]);
+    // D2: unparseable output saves a blocking record (never an empty slate for an earlier pass).
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
   });
 
   it('fails closed on Codex failure without recording', async () => {
@@ -124,14 +126,14 @@ describe('canonical audit', () => {
     'WEAKENED\nＮＯＴ ＷＥＡＫＥＮＥＤ',
   ];
 
-  it.each(conflictingAnswers)('rejects contradictory verdicts without publishing or recording: %j', async answer => {
+  it.each(conflictingAnswers)('rejects contradictory verdicts without publishing; saves a blocking unparseable record: %j', async answer => {
     for (const args of [ARGS, [...ARGS, '--json']]) {
       const f = fixture(answer);
       expect(await main(args, f.deps)).toBe(3);
       expect(f.errors.join('')).toMatch(/UNPARSEABLE/);
       expect(f.output).toEqual([]);
-      expect(f.deps.appendRecord).not.toHaveBeenCalled();
-      expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
+      expect(f.output).toEqual([]);
+      expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
     }
   });
 
@@ -238,6 +240,7 @@ function adapter(report = { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAK
   return { deps, fs, spawnSync };
 }
 
+const Q = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
 describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wins (D2)', () => {
   const seq = (...answers) => {
     const f = fixture();
@@ -266,12 +269,26 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     expect(f.records[0]).toMatchObject({ verdict: 'NOT WEAKENED', runs: ['NOT WEAKENED', 'NOT WEAKENED'] });
   });
 
-  it('NOT WEAKENED then garbage exits 3 and records nothing', async () => {
+  it('NOT WEAKENED then garbage exits 3 and saves a blocking unparseable record', async () => {
     const f = seq('NOT WEAKENED', 'looks fine to me');
     expect(await main(ARGS, f.deps)).toBe(3);
     expect(f.errors.join('')).toMatch(/UNPARSEABLE/);
-    expect(f.records).toEqual([]);
     expect(f.output).toEqual([]);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', unparseable: true, runs: ['NOT WEAKENED', 'UNPARSEABLE'] });
+  });
+
+  it('an unparseable run blocks an earlier two-run pass for the same head and base', async () => {
+    const earlier = { at: '2026-11-01T00:00:00.000Z', base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], runs: ['NOT WEAKENED', 'NOT WEAKENED'] };
+    const f = seq('garbage');
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(findAudit([earlier, ...f.records], Q)).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
+  });
+
+  it('an unparseable run whose record cannot be saved still exits 3', async () => {
+    const f = seq('garbage');
+    f.deps.appendRecord.mockRejectedValue(new Error('disk'));
+    expect(await main(ARGS, f.deps)).toBe(3);
   });
 
   it('NOT WEAKENED then a Codex failure exits 3 and records nothing', async () => {
@@ -305,6 +322,17 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     } finally { settingsOverride.text = null; }
   });
 
+  it('a prior-question WEAKENED NEWER than the current-question pass blocks; an older one does not', () => {
+    const PRIOR = 'c'.repeat(64);
+    const o = { ...Q, priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-11-30T00:00:00.000Z' }], now: Date.parse('2026-11-09T00:00:00.000Z') };
+    const pass = rec({ at: '2026-11-01T00:00:00.000Z', runs: ['NOT WEAKENED', 'NOT WEAKENED'] });
+    const newerWeak = rec({ questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-11-02T00:00:00.000Z' });
+    const olderWeak = rec({ questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-10-31T12:00:00.000Z' });
+    expect(findAudit([pass, newerWeak], o)).toBe(newerWeak);
+    expect(findAudit([newerWeak, pass], o)).toBe(newerWeak);
+    expect(findAudit([pass, olderWeak], o)).toBe(pass);
+  });
+
   it('a WEAKENED with an unknown timestamp is not masked by an older dated WEAKENED, in either order', () => {
     const dated = rec({ verdict: 'WEAKENED', at: BEFORE });
     const undated = rec({ verdict: 'WEAKENED', at: 'garbage' });
@@ -330,7 +358,6 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     expect(findAudit([pass, weak], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(weak);
   });
 
-  const Q = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
   const rec = o => ({ ...Q, verdict: 'NOT WEAKENED', at: AT, ...o });
   const AFTER = new Date(Date.parse(SINGLE_RUN_PASS_CUTOFF) + 1000).toISOString();
   const BEFORE = new Date(Date.parse(SINGLE_RUN_PASS_CUTOFF) - 1000).toISOString();
@@ -391,7 +418,9 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     expect(await main(ARGS, f.deps)).toBe(3);
     expect(f.deps.stderr).toHaveBeenCalledWith(expect.stringContaining('UNPARSEABLE'));
     expect(f.deps.stdout).not.toHaveBeenCalled();
-    expect(f.fs.appendFileSync).not.toHaveBeenCalled();
+    // D2: a blocking unparseable record is saved (one append), nothing is printed.
+    expect(f.fs.appendFileSync).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(f.fs.appendFileSync.mock.calls[0][1])).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
     expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
   });
 

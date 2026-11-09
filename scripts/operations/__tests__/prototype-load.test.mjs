@@ -2089,6 +2089,11 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       const hider = auditRecord({ head: SHA, base: OTHER_BASE, at: '2026-10-21T12:00:00Z', findings: ['WEAKENED'] });
       expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ at: '2026-10-19T12:00:00Z' }), runsWeak, hider], SHA, () => true, FP, o)).toEqual({ ok: false, reason: 'weakened' });
     });
+    it('a carried WEAKENED with the same net-diff fingerprint blocks even against a newer live-head pass', () => {
+      const weak = old({ base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z' });
+      const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
+      expect(carried(weak, newer)).toEqual({ ok: false, reason: 'weakened' });
+    });
     it('an unknown-time WEAKENED is not masked by an older dated WEAKENED on the carried head', () => {
       const dated = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z' });
       const undated = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: 'not-a-date' });
@@ -2178,9 +2183,9 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
         expect(carry(livePass(), weak(), fixed('2026-10-20T18:00:00Z'), hider())).toEqual({ ok: false, reason: 'weakened' });
         expect(carry(livePass(), fixed('2026-10-20T06:00:00Z'), weak(), hider())).toEqual({ ok: false, reason: 'weakened' });
       });
-      it('a newer own covered audit still supersedes it (fresh re-audit)', () => {
+      it('a newer own covered audit does NOT supersede a same-fingerprint carried WEAKENED (D2)', () => {
         const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
-        expect(carry(livePass(), weak(), hider(), newer)).toEqual({ ok: true, record: newer });
+        expect(carry(livePass(), weak(), hider(), newer)).toEqual({ ok: false, reason: 'weakened' });
       });
       it('a USABLE current-question re-audit of that base decides instead (findAudit alone)', () => {
         expect(carry(livePass(), weak(), old({ base: C, at: '2026-10-21T12:00:00Z' })).ok).toBe(true);
@@ -2319,11 +2324,10 @@ describe('carried evidence precedence (R503 red team)', () => {
     const pass = audit({ at: at(2) });
     expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), pass], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });
-  it('round 1: a fresh live-head audit newer than an unsuperseded carried WEAKENED unblocks', () => {
+  it('round 1 (D2): a fresh live-head audit newer than a carried WEAKENED with the same fingerprint does NOT unblock', () => {
     const fresh = auditRecord({ at: at(3) });
-    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), fresh], SHA, () => true, FP)).toEqual({ ok: true, record: fresh });
-    // and the superseded scenario plus a fresh live-head audit also loads
-    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), audit({ at: at(2) }), fresh], SHA, () => true, FP)).toEqual({ ok: true, record: fresh });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), fresh], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), audit({ at: at(2) }), fresh], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });
   it('a carried WEAKENED newer than the live head\'s own verdict still blocks', () => {
     expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(3) })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
@@ -2336,14 +2340,14 @@ describe('carried evidence precedence (R503 red team)', () => {
   it('a newer own audit of an uncovered base does not supersede a carried WEAKENED (self-review)', () => {
     const records = [auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(2) }), auditRecord({ base: C, at: at(3) })];
     expect(prototypeLoad.canonicalAuditEvidence(records, SHA, (base) => base !== C, FP)).toEqual({ ok: false, reason: 'weakened' });
-    // ...while a newer own audit of a covered base does
-    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP)).toMatchObject({ ok: true });
+    // ...and (D2) a newer own audit of a covered base does not either: the carried WEAKENED has the same fingerprint
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });
   it('covers() is asked once per base, so a flaky second answer cannot pass an audit older than a carried WEAKENED', () => {
     const records = [auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(2) }), auditRecord({ base: C, at: at(3) })];
     const asked = new Map();
     const flaky = (base) => { const n = (asked.get(base) ?? 0) + 1; asked.set(base, n); return base !== C || n === 1; };
-    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, flaky, FP)).toEqual({ ok: true, record: records[2] });
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, flaky, FP)).toEqual({ ok: false, reason: 'weakened' });
     expect([...asked.values()].every((n) => n === 1)).toBe(true);
   });
   it('an upper-case live sha still finds its own WEAKENED audit before any carried pass', () => {

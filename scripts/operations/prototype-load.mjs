@@ -133,7 +133,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const carriedWeak = [...carried, ...hiddenWeak].filter((d) => isWeak(d.record));
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
-    if (carriedWeak.some((d) => !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
+    // A carried WEAKENED with the live head's own net-diff fingerprint is the same change: a newer pass cannot supersede it.
+    if (carriedWeak.some((d) => carriesAcross(d.record.fingerprint, liveFp) || !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
   }
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
