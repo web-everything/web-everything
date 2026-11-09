@@ -70,13 +70,17 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
 }
 
 /**
- * A policy-clear settlement (red team not owed on this head: card-only, a stored not-owed review, or a carried
- * policy-clear) settles the head without a round, so no round writer publishes its check. It publishes the same
- * head-bound success here BEFORE its result comment: a comment without a check would strand the head, because
- * recovery skips a head that already shows a result. A failed post returns `ok:false` and the caller posts no
- * comment, so the next pass retries. Never call this for a head that ran (or owes) a real round.
+ * A recovery policy-clear settlement (a stored not-owed review, or a policy-clear carried across a rebase) settles
+ * the head without a round, so no round writer publishes its check. It publishes the same head-bound success here
+ * BEFORE its result comment: a comment without a check would strand the head, because recovery skips a head that
+ * already shows a result. It first reads the head and posts only when this PR has NO red-team check run there: an
+ * existing success needs nothing, and any other run (in progress, failed, unreadable) belongs to a real round and
+ * is never overridden. Any refusal or failed post returns `ok:false`; the caller posts no comment and retries.
  */
-export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, gh = runGhSync } = {}) {
+export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
+  const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
+  if (fact.ok === true) return { ok: true, reason: 'red-team check already clear on head' };
+  if (fact.reason !== 'no red-team check run on head') return failure(`policy-clear check not posted: ${fact.reason}`);
   return postRedTeamCheckRun({ repo, pr, headSha, gh,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false }) });
 }

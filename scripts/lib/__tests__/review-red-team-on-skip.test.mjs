@@ -253,14 +253,14 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
   it('publishes the cleared head check before the policy-clear comment; a failed post posts nothing', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-stored-clear-check-'));
     const order = [];
-    const o = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs') },
+    const o = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' },
       publishCheck: vi.fn(args => { order.push(['check', args]); return { ok: true }; }) });
     runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); o.rawPrs[0].comments.push({ body: options.input, author: { login: 'web-everything' } }); });
     try {
       expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
       expect(order).toEqual([['check', { repo, pr: storedPr, headSha: storedHead }], ['comment', 'pr']]);
       runGhSync.mockClear();
-      const failed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-2') }, publishCheck: vi.fn(() => ({ ok: false, reason: 'HTTP 502' })) });
+      const failed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-2'), WE_RED_TEAM_GATE_SOURCE: 'both' }, publishCheck: vi.fn(() => ({ ok: false, reason: 'HTTP 502' })) });
       expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('clear failed') });
       expect(runGhSync).not.toHaveBeenCalled();
       expect(failed.syncLabels).not.toHaveBeenCalled();
@@ -636,6 +636,7 @@ describe('daemon rows without formal reviews', () => {
   it('publishes the carried head check before the result comment; a failed post leaves no comment to retry', () => {
     const o = daemonOptions(5929), raw = o.rawPrs[0], order = [];
     o.publishCheck = vi.fn(args => { order.push(['check', args]); return { ok: true }; });
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'both' };
     runGhSync.mockReset();
     runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
     try {
@@ -643,6 +644,7 @@ describe('daemon rows without formal reviews', () => {
       expect(order).toEqual([['check', { repo, pr: 5929, headSha: raw.headRefOid }], ['comment', 'pr']]);
       const failed = daemonOptions(5929);
       failed.publishCheck = vi.fn(() => ({ ok: false, reason: 'HTTP 502' }));
+      failed.env = o.env;
       runGhSync.mockClear();
       expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('carry failed: red-team check not published: HTTP 502') });
       expect(runGhSync).not.toHaveBeenCalled();
@@ -650,6 +652,19 @@ describe('daemon rows without formal reviews', () => {
       // No comment landed, so the next pass plans the same carry again.
       failed.publishCheck = vi.fn(() => ({ ok: true }));
       expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'carry' });
+    } finally { runGhSync.mockReset(); }
+  });
+
+  it('under the drain-scan rollback the carry needs no check (no gate reads it)', () => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0];
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'drain-scan' };
+    o.publishCheck = vi.fn(() => ({ ok: false, reason: 'no App credentials' }));
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((_args, options) => { raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      expect(runGhSync).toHaveBeenCalledOnce();
     } finally { runGhSync.mockReset(); }
   });
 

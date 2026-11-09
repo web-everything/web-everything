@@ -38,6 +38,38 @@ describe('red-team check run contract', () => {
     app: { id: APP_ID }, status: 'completed', conclusion: 'success',
     started_at: '2026-11-07T10:00:00Z', ...over });
 
+  // PR #6535 round 6: the recovery policy-clear writer posts only on a head with no run for this PR.
+  describe('publishRedTeamPolicyClearCheck', () => {
+    const ghWith = runs => vi.fn(args => args.includes('POST') ? '{}' : JSON.stringify({ total_count: runs.length, check_runs: runs }));
+    const publish = gh => api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh });
+    it('posts a head-bound success when the PR has no red-team run on the head', () => {
+      const gh = ghWith([run({ head_sha: OLD_HEAD })]); // an older head's success does not count here
+      expect(publish(gh)).toEqual({ ok: true });
+      const post = gh.mock.calls.find(([args]) => args.includes('POST'));
+      expect(JSON.parse(post[1].input)).toMatchObject({ name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', status: 'completed', conclusion: 'success' });
+    });
+    it('needs no post when the head already shows success', () => {
+      const gh = ghWith([run()]);
+      expect(publish(gh)).toMatchObject({ ok: true });
+      expect(gh.mock.calls.some(([args]) => args.includes('POST'))).toBe(false);
+    });
+    it.each([
+      ['an in-progress round', [run({ status: 'in_progress', conclusion: null })]],
+      ['a failed round', [run({ conclusion: 'failure' })]],
+      ['another PR on the same head only', [run({ external_id: 'o/r#8' })]],
+    ])('never overrides %s', (_name, runs) => {
+      const gh = ghWith(runs);
+      expect(publish(gh)).toMatchObject({ ok: false, reason: expect.stringContaining('policy-clear check not posted') });
+      expect(gh.mock.calls.some(([args]) => args.includes('POST'))).toBe(false);
+    });
+    it('fails closed on an unreadable head or a missing app id', () => {
+      expect(publish(vi.fn(() => { throw Error('offline'); }))).toMatchObject({ ok: false });
+      const gh = ghWith([]);
+      expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: undefined, gh })).toMatchObject({ ok: false });
+      expect(gh).not.toHaveBeenCalled();
+    });
+  });
+
   it('passes success on the exact head from the configured app', () => {
     expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, checkRuns: [run()], appId: APP_ID })).toMatchObject({ ok: true });
   });

@@ -18,7 +18,7 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
-import { publishRedTeamPolicyClearCheck } from './red-team-check-run.mjs';
+import { publishRedTeamPolicyClearCheck, readRedTeamGateSource } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -597,10 +597,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   const rows = [], dispatched = [], notStarted = [];
   // PR #6535: a policy-clear settlement here runs no round, so it publishes the head's red-team check itself, BEFORE
   // its result comment. A failed check post throws, so no comment is posted and the next pass retries the row.
-  // Test runs need explicit IO for this channel, as recordRedTeamStatus does.
-  const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : publishRedTeamPolicyClearCheck);
+  // Under `redTeamGate.source=drain-scan` (the rollback) no gate reads the check, so the carry must not depend on App
+  // credentials there. Test runs need explicit IO for this channel, as recordRedTeamStatus does.
+  const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : args => publishRedTeamPolicyClearCheck({
+    ...args, appId: env.WE_APP_ID, gh: (ghArgs, options) => runGhSync(ghArgs, { ...options, env }) }));
   const publishPolicyClearCheck = (pr, head) => {
-    if (!publisher) return;
+    if (!publisher || readRedTeamGateSource({ env }).value.source === 'drain-scan') return;
     const posted = publisher({ repo, pr, headSha: head });
     if (posted?.ok !== true) throw Error(`red-team check not published: ${posted?.reason ?? 'unknown error'}`);
   };

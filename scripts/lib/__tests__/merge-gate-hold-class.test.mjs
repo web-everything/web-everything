@@ -306,20 +306,32 @@ merge-gate: HOLD — held`;
   it('lets the review that produces the red-team check start on a fresh head', () => {
     expect(probe()).toMatchObject({ allowed: true });
   });
-  it('still refuses a candidate, and an unreadable red-team fact stays real', () => {
+  // Every reason readRedTeamCheckFact / the publication-hold reads can emit besides plain absence (all `ok:false`, so
+  // merge-gate-ci renders them `hold`): each is a real hold the review gate must not excuse.
+  const realReasons = [
+    'red-team check run failed (failure)', 'red-team check run in progress or incomplete',
+    'WE_APP_ID unset or invalid; configure the WE App repository variable',
+    'red-team check runs unreadable: offline',
+    'red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history',
+    'no red-team check run on head for owner/repo#4965: external_id missing or mismatching',
+    'red-team head not pinned: no head', 'Unpublished finished red-team round for PR #4965',
+  ];
+  it.each(realReasons)('keeps a red-team hold for "%s" real, even for a non-candidate', reason => {
+    expect(probe({ readMergeGateVerdict: () => verdict(freshHead.replace('no red-team check run on head', reason)) }))
+      .toMatchObject({ allowed: false });
+    expect(isCandidacyHold({ id: 'red-team', status: 'hold', reason })).toBe(false);
+  });
+  it('still refuses a candidate, and a fail-closed red-team row stays real', () => {
     expect(probe({ readLabels: () => [{ name: 'ready-to-merge' }] })).toMatchObject({ allowed: false });
     expect(probe({ readMergeGateVerdict: () => verdict(freshHead.replace('hold              red-team', 'fail-closed       red-team')) }))
       .toMatchObject({ allowed: false });
-  });
-  it('classifies only a red-team hold as candidacy, never its fail-closed form', () => {
     expect(isCandidacyHold({ id: 'red-team', status: 'hold', reason: 'no red-team check run on head' })).toBe(true);
-    expect(isCandidacyHold({ id: 'red-team', status: 'fail-closed', reason: 'red-team check runs unreadable' })).toBe(false);
+    expect(isCandidacyHold({ id: 'red-team', status: 'fail-closed', reason: 'no red-team check run on head' })).toBe(false);
   });
-  it('defers the red-team hold on the PR leg only; merge_group and an omitted event still block', () => {
+  it('never defers a red-team hold on any event: the PR leg is the only red-team gate for a drain-direct merge', () => {
     const results = [{ id: 'red-team', status: 'hold', reason: 'no red-team check run on head' }];
     const input = { num: 4965, ok: false, results, blocking: results };
-    expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting: 'on' })).toMatchObject({ ok: true, blocking: [] });
-    for (const mergeEvent of ['merge_group', undefined]) expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent, setting: 'on' })).toEqual(input);
+    for (const mergeEvent of ['pull_request', 'merge_group', undefined]) expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent, setting: 'on' })).toEqual(input);
   });
 });
 
