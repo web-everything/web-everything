@@ -419,7 +419,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // #4979 — `record-referral-ruling`'s `write` step posts a PR comment, so it is NOT read-only; listed here for
     // map coverage. The gh reads and the post live in `record-referral-ruling-io.mjs`.
     'extend-rounds': 'extend-rounds.mjs',
-    ...Object.fromEntries(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim'].map(name => [name, 'operator-controls.mjs'])),
+    ...Object.fromEntries(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset'].map(name => [name, 'operator-controls.mjs'])),
     [RECORD_REFERRAL_RULING_OP]: 'record-referral-ruling.mjs',
     // Card 334 — `land-human-only`'s `write` step labels, enqueues and comments, so it is NOT read-only; listed for map
     // coverage. Every gh call lives in `land-human-only-io.mjs`.

@@ -66,6 +66,7 @@ describe('runner freshness policy', () => {
       [
         "adoption-matrix",
         "agent-activity",
+        "ci-heal-reset",
         "claim",
         "clear-claim",
         "clear-stuck-session",
