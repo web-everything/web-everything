@@ -164,21 +164,22 @@ export function settleRedTeamSkip(input = {}) {
     // Ordinary job settlement retains its contradictory-not-owed refusal.
     const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
-    let classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
+    const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
       : classifyRedTeamSkip(redTeam);
+    let settled = classified;
     let rule;
-    if (classified.kind !== 'policy' && realHead && isRealHead(input.readHead)
+    if (settled.kind !== 'policy' && realHead && isRealHead(input.readHead)
       && input.readHead.toLowerCase() === head.toLowerCase()
       && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam })) {
-      classified = { kind: 'policy', reason: 'not owed (stored review)' };
+      settled = { kind: 'policy', reason: 'not owed (stored review)' };
       rule = STORED_NOT_OWED_RULE;
     }
-    let { reason } = classified;
+    let { reason } = settled;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
-    if (classified.kind === 'policy' && !boundRead) {
+    if (settled.kind === 'policy' && !boundRead) {
       reason = 'policy skip head not bound to the reviewed read';
-    } else if (classified.kind === 'policy') {
+    } else if (settled.kind === 'policy') {
       try {
         if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || typeof repo !== 'string' || !repo
           || !isRealHead(head)) throw Error('missing or invalid PR/head');
