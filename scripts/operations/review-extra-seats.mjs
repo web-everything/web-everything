@@ -2,10 +2,11 @@
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
-import { readRedTeamGateSource } from '../lib/red-team-check-run.mjs';
+import { redTeamCheckRunIsEvidence } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
@@ -221,7 +222,7 @@ export function reserveSeatCalls({ ledger, records, want, dailyCap, now, newId, 
 /** Is the red-team check run merge evidence in this mode? Publish-first binds only then (every mode but the
  * drain-scan rollback). Logs the effective value and its source (policy cascade). */
 function checkRunIsEvidence(env, log = () => {}) {
-  return readRedTeamGateSource({ env, log: line => { try { log(line); } catch { /* logging is best effort */ } } }).value.source !== 'drain-scan';
+  return redTeamCheckRunIsEvidence({ env, log });
 }
 
 /** Drop unspent reservations (a round that never started must not burn the day's budget). PURE. */
@@ -2065,7 +2066,9 @@ export function renderRedTeamSummary(r) {
 }
 
 /** The red team's effects: the added seats' io, plus the Claude re-check, the head message and the PR comment. */
-export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus, ...rest } = {}) {
+export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus,
+  readCompleteComments = ({ pr, repo }) => readCompletePrComments(pr, { repo,
+    exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }), ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
   const gh = (args, input) => {
     // maxBuffer: long-lived PRs carry multi-MB comment lists (`pr view --json comments`); the 1 MiB default made
@@ -2079,8 +2082,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     readRecords: ({ strict = false } = {}) => strict
       ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
-    readRecoveryComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
-      exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }),
+    readRecoveryComments: readCompleteComments,
     redTeamStatus: input => {
       const outcome = recordStatus(input, { env });
       if (input.status === 'running' && outcome?.published !== true && checkRunIsEvidence(env, base.log))
@@ -2137,7 +2139,14 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       }
     },
     logTrial: (row) => logDelegationTrial(row, storePath ? { path: storePath } : {}),
-    listComments: ({ pr, repo }) => JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [],
+    // The duplicate check reads this list. `pr view --json comments` stops at one page, so a full page is re-read
+    // through the complete reader (which throws rather than return a partial thread): a result past comment 100
+    // must stay visible here, because the review barrier (`review-pr-io.mjs#postPendingRedTeam`) skips its
+    // pending check when the complete thread already holds this head's result.
+    listComments: ({ pr, repo }) => {
+      const page = JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [];
+      return Array.isArray(page) && page.length >= PR_COMMENTS_PAGE_SIZE ? readCompleteComments({ pr, repo }) : page;
+    },
     postComment: ({ pr, repo, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
   };
 }
