@@ -6,7 +6,7 @@ import { admitMqFailureRoute } from '../../conveyor/mq-failure-intake.mjs';
 
 const identity = { repo: 'acme/web', pr: 42, head: 'a'.repeat(40) };
 const mergeHead = 'b'.repeat(40);
-const branch = `gh-readonly-queue/main/pr-${identity.pr}-${identity.head}`;
+const branch = `gh-readonly-queue/main/pr-${identity.pr}-${'c'.repeat(40)}`;
 const guard = { hold: true, line: `mq-same-head-failed: #42 head ${identity.head} — failed_checks` };
 const failureLog = 'FAIL tests/widget.test.mjs > keeps state\nAssertionError: expected true';
 function fixture(mode = 'real') {
@@ -41,6 +41,12 @@ function fixture(mode = 'real') {
       const payload = JSON.parse(options.input);
       if (endpoint.endsWith('/labels')) { expect(payload.labels).toEqual(['mq-failure-recovery']); return '[]'; }
     }
+    if (endpoint?.includes('/compare/')) {
+      if (mode === 'ancestor lookup throws') throw new Error('compare unavailable');
+      return JSON.stringify(mode === 'non-ancestor' ? { status: 'diverged', behind_by: 1 }
+        : mode === 'ancestor unknown' ? {} : mode === 'ancestor behind' ? { status: 'ahead', behind_by: 1 }
+        : { status: mode === 'identical ancestor' ? 'identical' : 'ahead', behind_by: 0 });
+    }
     if (endpoint?.includes('/actions/runs?')) return JSON.stringify({ total_count: mode === 'oversized runs' ? 1001 : 1,
       workflow_runs: [{ id: 701, event: 'merge_group', head_sha: mode === 'wrong run commit' ? 'd'.repeat(40) : mergeHead,
         head_branch: branch, conclusion: 'failure' }] });
@@ -72,7 +78,8 @@ describe('drain MQ failure production adapter', () => {
       .toMatchObject({ ...identity, failedJobs: ['unit'], testFiles: ['tests/widget.test.mjs'], complete: true, stale: false });
     const runCall = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.includes('/actions/runs?')));
     expect(runCall[1].join(' ')).toContain(`head_sha=${mergeHead}`);
-    expect(runCall[1].join(' ')).toContain(encodeURIComponent(branch));
+    expect(runCall[1].join(' ')).not.toContain('branch=');
+    expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${identity.repo}/compare/${identity.head}...${mergeHead}`))).toBe(true);
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false, reason: expect.stringMatching(/already/i) });
     expect(f.writes()).toHaveLength(2);
     expect(f.exec.mock.calls.every(([, , opts]) => Number.isFinite(opts.timeout) && Number.isFinite(opts.maxBuffer))).toBe(true);
@@ -144,4 +151,20 @@ describe('drain proven real failure routing', () => {
       changedFiles: { ...identity, complete: true, files: ['src/unrelated.mjs'] } }))
       .toMatchObject({ kind: 'fix', recoveryAction: 'fix', evidence: { complete: false, failedJobs: ['unit'] } });
   });
+});
+
+
+describe('drain production ancestry proof', () => {
+  it.each(['real', 'identical ancestor'])('base-SHA branch routes only with positive compare proof: %s', async mode => {
+    const f = fixture(mode);
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    expect(f.writes()).toHaveLength(2);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${identity.repo}/compare/${identity.head}...${mergeHead}`))).toBe(true);
+  });
+  it.each(['non-ancestor', 'ancestor lookup throws', 'ancestor unknown', 'ancestor behind'])(
+    'unverified compare evidence cannot publish a route: %s', async mode => {
+      const f = fixture(mode);
+      expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+      expect(f.writes()).toEqual([]);
+    });
 });

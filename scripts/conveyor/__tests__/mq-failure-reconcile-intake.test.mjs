@@ -129,8 +129,9 @@ describe('mq failure integration completeness', () => {
 
   it('assertion-only failed job prevents refresh alongside an outside-diff failure', async () => {
     const evidence = await collectMqFailureEvidence({ removal: identity, io: {
-      listRuns: vi.fn(async () => ({ runs: [{ id: 701, event: 'merge_group', conclusion: 'failure',
-        head_branch: `gh-readonly-queue/main/pr-${identity.pr}-${identity.head}` }], complete: true, nextPage: null })),
+      listRuns: vi.fn(async () => ({ runs: [{ id: 701, event: 'merge_group', conclusion: 'failure', head_sha: 'c'.repeat(40),
+        head_branch: `gh-readonly-queue/main/pr-${identity.pr}-${'b'.repeat(40)}` }], complete: true, nextPage: null })),
+      isAncestor: vi.fn(async () => true),
       listJobs: vi.fn(async () => ({ jobs: [
         { id: 901, name: 'outside-diff tests', conclusion: 'failure' },
         { id: 902, name: 'unidentified failing tests', conclusion: 'failure' },
