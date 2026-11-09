@@ -75,6 +75,13 @@ describe('ci-heal-reset', () => {
     f.stored()[0].record.resumeFailures = AWAIT_VERIFY_LIMITS.maxResumeFailures;
     expect(() => f.plan()).toThrow(/limit reached/);
   });
+  it('refuses invalid counters and a writer that omits the reset increment', async () => {
+    expect(() => fixture([row('neg', { operatorResets: -1 })]).plan()).toThrow(/invalid operatorResets/);
+    const f = fixture(), writeAwaitVerify = vi.fn(record => ({ ok: true, record: { ...record, operatorResets: undefined } }));
+    const noIncrement = vi.fn(record => { f.stored()[0].record = { ...record, operatorResets: 0 }; return { ok: true }; });
+    const sink = createOperatorControlsSinks({ readContext: f.reader, writeAwaitVerify: noIncrement, writeRecord: vi.fn() })['operator.control'];
+    await expect(sink(f.plan())).rejects.toThrow(/verif/i);
+  });
   it('refuses non-operator actors', () => {
     expect(() => fixture().plan({ ...input, actor: 'intruder' })).toThrow(/registered operator/);
   });

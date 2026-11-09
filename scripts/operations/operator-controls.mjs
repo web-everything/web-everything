@@ -104,6 +104,7 @@ export function planOperatorControl(name, read, input) {
     const matching = rows.filter(({ record }) => matches(record.sha) && String(record.sha).toLowerCase() === liveHead);
     if (rows.length && !matching.length) throw new Error('head moved: state changed since the exhausted record');
     resets = matching.filter(({ record }) => previousCiFailurePending(record) && Number.isSafeInteger(record.resumeFailures) && record.resumeFailures >= AWAIT_VERIFY_LIMITS.maxResumeFailures);
+    if (matching.some(({ record }) => record.operatorResets !== undefined && !(Number.isSafeInteger(record.operatorResets) && record.operatorResets >= 0))) throw new Error('invalid operatorResets counter; escalate');
     if (matching.some(({ record }) => (record.operatorResets ?? 0) >= MAX_OPERATOR_RESETS)) throw new Error(`ci-heal-reset limit reached (${MAX_OPERATOR_RESETS} per pr@head); escalate for a human repair instead of resetting again`);
     undo = 'restore each record’s previousResumeFailures through an operator-reviewed store repair; the normal resume failure cap still applies';
     if (!resets.length) why = 'no matching exhausted await-verify record';

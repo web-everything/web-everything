@@ -172,7 +172,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
         const old = p.resets.find(r => r.key === row.key);
         return old ? { ...row, record: { ...row.record, resumeFailures: old.record.resumeFailures, operatorResets: old.record.operatorResets } } : row;
       }) };
-      return p.resets.every(old => after.awaitVerify.some(row => row.key === old.key && row.record.resumeFailures === 0))
+      return p.resets.every(old => after.awaitVerify.some(row => row.key === old.key && row.record.resumeFailures === 0 && row.record.operatorResets === (old.record.operatorResets ?? 0) + 1))
         && controlFingerprint(p.op, expected, p.input) === p.fingerprint;
     }
     if (p.op === 'refresh') return after.state === 'OPEN' && after.containsMain;
