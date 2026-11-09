@@ -2960,7 +2960,12 @@ function releaseUnprovenCommits(dir, salvage, proof) {
     if (refs === null) return null;
     const head = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
     const branch = releaseEvidenceGit(['symbolic-ref', '--quiet', 'HEAD'], dir);
-    return new Map([...(refs ? refs.split('\n') : []), `HEAD ${head ?? '-'} ${branch ?? '-'}`].map(line => [line.split(' ')[0], line]));
+    // The proof protects every stash reflog entry, so record them all: dropping an older entry leaves the tip as is.
+    const hasStash = refs ? refs.split('\n').some(line => line.startsWith('refs/stash ')) : false;
+    const reflog = hasStash ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : '';
+    if (reflog === null) return null;
+    return new Map([...(refs ? refs.split('\n') : []), `HEAD ${head ?? '-'} ${branch ?? '-'}`,
+      `refs/stash@{reflog} ${reflog.split('\n').filter(Boolean).join(',') || '-'}`].map(line => [line.split(' ')[0], line]));
   };
   const before = snapshot();
   if (!before) return { commits };

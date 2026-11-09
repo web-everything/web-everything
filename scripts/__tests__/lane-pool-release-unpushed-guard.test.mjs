@@ -422,6 +422,13 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     }, () => ['symbolic-ref', 'HEAD', 'refs/heads/work/twin']],
     ['the stash is moved', 'refs/stash', false, stashEdit, pushed => ['update-ref', 'refs/stash', pushed]],
     ['the stash is dropped with its reflog', 'refs/stash', true, stashEdit, () => ['update-ref', '-d', 'refs/stash']],
+    // The tip stays put (and is preserved on the origin), so only the reflog entry in the snapshot sees the drop.
+    ['an older stash entry is dropped', 'refs/stash@{reflog}', true, () => {
+      stashEdit();
+      writeFileSync(join(laneDir, 'seed.txt'), 'newer stashed edit\n');
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+      git(['push', '--quiet', origin, 'refs/stash:refs/heads/preserved-newer-stash'], laneDir);
+    }, () => ['reflog', 'delete', 'refs/stash@{1}']],
   ])('refuses when %s during the verification fetch', (_shape, ref, losesWork, setup, mutation) => {
     const pushed = git(['rev-parse', 'HEAD'], laneDir);
     setup(pushed);
@@ -430,9 +437,13 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     const result = release([], fault);
     expect(result.status, result.stderr).toBe(1);
     expect(result.data.released).toBe(0);
-    expect(result.stderr).toContain(`${ref} changed during the verification fetch`);
+    // The ref is named in the moved list (a dropped stash moves both refs/stash and its reflog entry).
+    const listed = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    expect(result.stderr).toMatch(new RegExp(`fetch refused: (?:\\S+, )*${listed}(?:, \\S+)* changed during the verification fetch`));
     expect(readFileSync(marker, 'utf8')).toBe(lease);
+    // Moves that hide no work leave it still refused on a fault-free retry; moves that hide it now pass the proof.
     if (losesWork) released(release());
+    else refused(release());
   });
   it('verification fetch writes no ref and no FETCH_HEAD in the lane', () => {
     const other = join(base, 'other');
