@@ -36,9 +36,9 @@ function fixture(mode = 'real') {
       mergeStateStatus: mode === 'conflict' ? 'DIRTY' : 'CLEAN', baseRefName: 'main',
       labels: mode === 'unknown labels' ? null : [] });
     const endpoint = args.find(arg => arg.startsWith(`repos/${identity.repo}/`));
+    if (args[0] === 'pr' && args[1] === 'comment') { expect(typeof options.input).toBe('string'); return ''; }
     if (args.includes('POST')) {
       const payload = JSON.parse(options.input);
-      if (endpoint.endsWith('/comments')) { expect(typeof payload.body).toBe('string'); return JSON.stringify({ id: 101 }); }
       if (endpoint.endsWith('/labels')) { expect(payload.labels).toEqual(['mq-failure-recovery']); return '[]'; }
     }
     if (endpoint?.includes('/actions/runs?')) return JSON.stringify({ total_count: mode === 'oversized runs' ? 1001 : 1,
@@ -57,7 +57,7 @@ function fixture(mode = 'real') {
   const io = createDrainMqFailureRecoveryIo({ exec, ledger });
   const log = vi.fn();
   const options = { ...identity, guard, dryRun: false, log, io };
-  return { options, exec, log, writes: () => exec.mock.calls.filter(([, args]) => args.includes('POST')) };
+  return { options, exec, log, writes: () => exec.mock.calls.filter(([, args]) => args.includes('POST') || (args[0] === 'pr' && args[1] === 'comment')) };
 }
 
 describe('drain MQ failure production adapter', () => {
@@ -66,8 +66,8 @@ describe('drain MQ failure production adapter', () => {
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true, reason: expect.any(String) });
     const writes = f.writes();
     expect(writes).toHaveLength(2);
-    const comment = writes.find(([, args]) => args.some(arg => arg.endsWith('/comments')));
-    const body = JSON.parse(comment[2].input).body;
+    const comment = writes.find(([, args]) => args[0] === 'pr' && args[1] === 'comment');
+    const body = comment[2].input;
     expect(parseMqFailureRoute({ comment: { body, author: { login: 'chalbert' } }, expected: identity }))
       .toMatchObject({ ...identity, failedJobs: ['unit'], testFiles: ['tests/widget.test.mjs'], complete: true, stale: false });
     const runCall = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.includes('/actions/runs?')));
@@ -134,9 +134,9 @@ describe('drain proven real failure routing', () => {
     const f = fixture('incomplete test paths');
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
     expect(f.writes()).toHaveLength(2);
-    const comment = f.writes().find(([, args]) => args.some(arg => arg.endsWith('/comments')));
+    const comment = f.writes().find(([, args]) => args[0] === 'pr' && args[1] === 'comment');
     const route = parseMqFailureRoute({ expected: identity, comment: {
-      body: JSON.parse(comment[2].input).body, author: { login: 'chalbert' },
+      body: comment[2].input, author: { login: 'chalbert' },
     } });
     expect(route).toMatchObject({ ...identity, complete: false, failureProven: true, failedJobs: ['unit'],
       testFiles: ['tests/widget.test.mjs'], assertions: expect.arrayContaining(['FAIL unidentified failing test', 'AssertionError: expected false']) });

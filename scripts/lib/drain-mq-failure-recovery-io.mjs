@@ -74,7 +74,7 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
         },
       } });
     },
-    postComment: ({ repo, pr, body }) => write(`repos/${repo}/issues/${pr}/comments`, { body }),
+    postComment: ({ repo, pr, body }) => { request('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', '-'], { input: body }); return { ok: true }; },
     addLabel: ({ repo, pr, label }) => write(`repos/${repo}/issues/${pr}/labels`, { labels: [label] }),
   };
 }
