@@ -66,14 +66,17 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     if (!SOURCE.test(file)) continue;
     const source = readFileSync(file, 'utf8');
     // Over-approximate: literals in comments/fixtures may widen scope too.
-    for (const match of source.matchAll(/(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)(['"])([^'"\r\n]+)\1/g)) {
+    // `import'x'`, `export*from"x"` and `import(\`x\`)` are valid: whitespace is optional, and
+    // dynamic import/require may take a template literal.
+    for (const match of source.matchAll(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(['"`])([^'"`\r\n]+)\1/g)) {
       if (match[2].startsWith('./') || match[2].startsWith('../')) {
         follow(resolve(dirname(file), match[2]));
       }
     }
     for (const match of source.matchAll(/(['"`])([^'"`\r\n]+)\1/g)) {
-      // Repo-root literals cover spawn/readFile targets that are not imports.
-      if (/^(?:scripts|src|tools|skills-src)\//.test(match[2])) follow(resolve(root, match[2]));
+      // Repo-root literals cover spawn/readFile/new URL targets that are not imports.
+      const path = match[2].replace(/^\.\//, '');
+      if (/^(?:scripts|src|tools|skills-src)\//.test(path)) follow(resolve(root, path));
     }
   }
   return closure;
@@ -138,6 +141,10 @@ async function selfTest() {
     writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/dependency';");
     rmSync(join(root, dependency));
   }, dependency, true);
+  await scopeCase('discovers dependencies without executing their source', ({ root }) => {
+    writeFileSync(join(root, dependency), "throw new Error('executed');\nimport'./transitive.mjs';");
+    writeFileSync(join(root, 'fixture/transitive.mjs'), 'export const t = 1;');
+  }, 'fixture/transitive.mjs', true);
   await scopeCase('unrelated changes skip the soak with readable evidence', () => {}, 'backlog/unrelated.md', false);
 }
 
