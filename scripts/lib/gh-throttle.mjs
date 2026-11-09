@@ -640,7 +640,7 @@ export const GH_RESERVED_SLOT_CALLER = 'red-main-freeze-read';
 const RESERVED_WAIT_DEFAULT_MS = 20000;
 /**
  * PURE: may this call take the ONE reserved slot above the cap? Only the named freeze-read caller, only a plain
- * `gh api -i [-H hdr] repos/...` GET (no method override, no body/field flags, no other endpoint), never a write.
+ * `gh api -i [-H hdr] repos/{o}/{r}/(git/ref/heads|git/commits|git/trees|contents)/...` GET (no method override, no body/field flags, no other endpoint), never a write.
  * Anything else (including an unparseable argv) stays in the ordinary queue.
  */
 export function ghReservedSlotEligible({ throttle, caller, args, isWrite }) {
@@ -651,7 +651,7 @@ export function ghReservedSlotEligible({ throttle, caller, args, isWrite }) {
   for (let i = 1; i < a.length; i += 1) {
     if (a[i] === '-i') continue;
     if (a[i] === '-H') { i += 1; if (i >= a.length) return false; continue; }
-    if (a[i].startsWith('-') || !/^repos\/[\w.-]+\/[\w.-]+\//.test(a[i])) return false;
+    if (a[i].startsWith('-') || !/^repos\/[\w.-]+\/[\w.-]+\/(git\/ref\/heads\/|git\/commits\/|git\/trees\/|contents\/)/.test(a[i])) return false;
     paths += 1;
   }
   return paths === 1;
@@ -2060,8 +2060,11 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.min(slotTimeoutMs, ghReservedWaitCapMs(execOpts)) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      const reservedCapMs = reserved ? ghReservedWaitCapMs(execOpts) : 0, reservedStartMs = reserved ? now() : 0;
+      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
+      // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
+      if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
+      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
@@ -2088,7 +2091,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     } catch (e) {
       failure = e;
     } finally {
-      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
+      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap: slotCap, owner }), gateOpts);
     }
     if (!failure && isGhDeferred(result)) return result; // nested CLI deferral is not a landed write
     recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(execStartedMs).toISOString(), caller: ghWaitLogCaller(caller), op: ghOpLabel(args), waitMs, durMs: Date.now() - execStartedMs, ok: !failure });
@@ -2338,8 +2341,11 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.min(slotTimeoutMs, ghReservedWaitCapMs(spawnOpts)) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      const reservedCapMs = reserved ? ghReservedWaitCapMs(spawnOpts) : 0, reservedStartMs = reserved ? now() : 0;
+      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
+      // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
+      if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
@@ -2350,7 +2356,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
       // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
       r = spawn(bin, argv, ghExecOptions(outerLimits === null ? spawnOpts : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
     } finally {
-      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
+      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap: slotCap, owner }), gateOpts);
     }
     if (r.error) { recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'call', ok: false, caller, inv, ...ghCallHoldFields(argv, r.error), ...(outer ? { outer } : {}) }); throw r.error; } // e.g. `gh` not on PATH — not a `gh`-level failure to retry
     const stdoutOverflow = capture && r.stdout && r.stdout.length > maxBuffer;

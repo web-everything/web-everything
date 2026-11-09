@@ -207,6 +207,7 @@ describe('reserved priority slot (drain freeze read)', () => {
     ['another caller', 'review-daemon', FREEZE_ARGS],
     ['a method override', 'red-main-freeze-read', ['api', '-i', '-X', 'DELETE', 'repos/o/r/git/refs/heads/x']],
     ['a body field', 'red-main-freeze-read', ['api', '-i', '-f', 'a=b', 'repos/o/r/issues']],
+    ['a repos endpoint outside the freeze reads', 'red-main-freeze-read', ['api', '-i', 'repos/o/r/issues']],
     ['a non-repos endpoint', 'red-main-freeze-read', ['api', '-i', 'user']],
     ['a classifier-missed write (repo delete)', 'red-main-freeze-read', ['repo', 'delete', 'o/r']],
   ])('%s never takes the reserved slot', (_n, caller, args) => {
@@ -219,5 +220,18 @@ describe('reserved priority slot (drain freeze read)', () => {
     expect(acquireGhSlotSync({ lockRoot: f.throttle.lockRoot, cap: 2, owner: `${process.pid}:r2`, pid: process.pid, now: f.throttle.now, timeoutMs: 0 }).ok).toBe(true);
     expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 4000, throttle: { ...f.throttle, reservedSlot: true } })).toThrow(/throttled/);
     expect(f.elapsed()).toBe(4000);
+  });
+  it('the reserved slot is released after the read, so a following freeze read gets it again', () => {
+    const f = fullPool('red-main-freeze-read');
+    const t = { ...f.throttle, reservedSlot: true };
+    expect(runGhSync(FREEZE_ARGS, { encoding: 'utf8', throttle: t })).toBe('[]');
+    expect(runGhSync(FREEZE_ARGS, { encoding: 'utf8', throttle: t })).toBe('[]');
+    expect(f.elapsed()).toBe(0);
+  });
+  it('a reserved read fails closed when the points budget does not clear inside its call bound', () => {
+    const f = fullPool('red-main-freeze-read');
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 2000, throttle: { ...f.throttle, reservedSlot: true, budgetPerMin: 0 } })).toThrow(/throttled/);
+    expect(f.throttle.exec).not.toHaveBeenCalled();
+    expect(f.elapsed()).toBeLessThanOrEqual(2000);
   });
 });
