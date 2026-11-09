@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { routeNeedsGit } from '../needs-git-route.mjs';
 import { detectTestNeedsGit } from '../remote-exec.mjs';
 import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge, BUNDLE_MAIN_MAX_AGE_CEILING_MS } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
@@ -189,6 +190,16 @@ describe('R593 client and routing', () => {
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'x.test.mjs'], cwd, route: boom })).toBe(true);
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], cwd })).toBe(true);
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'missing.test.mjs'], cwd })).toBe(false);
+    });
+    it('R807: routeNeedsGit fails closed on unreadable files and directory/glob selections', async () => {
+      await fs.mkdir(join(cwd, 'sub'), { recursive: true });
+      const route = (arg) => routeNeedsGit({ argv: ['npx', 'vitest', 'run', arg], cwd });
+      expect(route('missing.test.mjs')).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(route('sub')).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(route('sub/**/*.test.mjs')).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(routeNeedsGit({ argv: ['npx', 'vitest', 'run'], cwd })).toEqual({ local: false });
+      await fs.writeFile(join(cwd, 'pure.test.mjs'), 'export {};\n');
+      expect(route('pure.test.mjs')).toEqual({ local: false });
     });
     it('verdict is yes/no/unknown', () => {
       const rec = capabilityRecord({ host: 'forge', capabilities: { gitBundle: 1 }, nowMs: 1000 });
