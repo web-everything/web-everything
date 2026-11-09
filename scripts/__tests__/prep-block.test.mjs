@@ -164,7 +164,7 @@ describe('slot verdict', () => {
     const prep = 'PREP:\nAcceptance: concrete criteria here\nPre-mortem: concrete risk here\nFiles: scripts/a.mjs path\nTests:\nSlot: plan:backlog item 123';
     expect(prepVerdict(prep).ok).toBe(false);
   });
-  it.each([undefined, null, 123, {}, '', 'Slot:', 'Slot: unknown: concrete placement', 'Slot: plan:x', 'Slot: plan:`<placement>`', 'Slot: operator:abcdefgh'])('refuses missing, empty or invalid Slot %j with all accepted forms', (text) => {
+  it.each([undefined, null, 123, {}, '', 'Slot:', 'Slot: unknown: concrete placement', 'Slot: plan:x', 'Slot: plan:`<placement>`', 'Slot: operator:abcdefgh', 'Slot: operator:"<placement>"', 'Slot: operator:"unmatched placement'])('refuses missing, empty or invalid Slot %j with all accepted forms', (text) => {
     expect(slotVerdict(text)).toEqual({ ok: false, waived: false, reason: expect.stringMatching(/^Slot required \(.*\)/) });
     for (const form of ['Slot: plan:<item>', 'Slot: blocker:<what it unblocks>', 'Slot: operator:<quoted placement>', 'Slot: waived — <reason>']) {
       expect(slotVerdict(text).reason).toContain(form);
@@ -180,8 +180,9 @@ describe('slot verdict', () => {
     for (const value of ['', 'x', 'a b c d e f g', '**blocked**', 'tbd', 'TODO', 'n/a', 'none', '........', '<placement>', '**<placement>**', '<item> <other item>']) {
       expect(slotVerdict(`Slot: ${prefix}${value}`).ok).toBe(false);
     }
-    expect(slotVerdict(`Slot: ${prefix}a b c d e f g h`).ok).toBe(true);
-    expect(slotVerdict(`Slot: ${prefix}**incident**`).ok).toBe(true);
+    const ok = prefix === 'operator:' ? (v) => `"${v}"` : (v) => v;
+    expect(slotVerdict(`Slot: ${prefix}${ok('a b c d e f g h')}`).ok).toBe(true);
+    expect(slotVerdict(`Slot: ${prefix}${ok('**incident**')}`).ok).toBe(true);
   });
   it.each(['—', '–', '-'])('accepts a reasoned Slot waiver with %s', (dash) => {
     expect(slotVerdict(`- **sLoT:** waived ${dash} urgent incident`)).toEqual({ ok: true, reason: 'urgent incident', waived: true });

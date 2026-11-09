@@ -59,13 +59,19 @@ export function prepVerdict(text) {
   return { ok: false, reason: `Prep required (${problems.join('; ')}). Each heading needs a non-placeholder item of at least 8 non-whitespace characters.\n${FORMAT}`, waived: false };
 }
 
+function quotedOk(value) {
+  const m = value.trim().match(/^(?:"([^"]*)"|“([^”]*)”|'([^']*)'|‘([^’]*)’)/);
+  const inner = m ? m.slice(1).find((x) => x !== undefined) : '';
+  return Boolean(m) && nonTrivial(inner);
+}
+
 /** Validate the placement line in an Agent brief independently of PR preparation. */
 export function slotVerdict(text) {
   const lines = (typeof text === 'string' ? text : '').split(/\r?\n/);
   for (const line of lines) {
     const match = stripMarkdown(line).match(/^Slot:\s*(?:(plan|blocker|operator):\s*|waived\s*[—–-]\s*)(.*)$/i);
     const value = match ? match[2].replace(/`/g, '') : '';
-    if (match && nonTrivial(value) && (match[1]?.toLowerCase() !== 'operator' || /["'“”‘’]/.test(value))) {
+    if (match && nonTrivial(value) && (match[1]?.toLowerCase() !== 'operator' || quotedOk(value))) {
       const waived = !match[1];
       return { ok: true, reason: waived ? match[2].trim() : '', waived };
     }
