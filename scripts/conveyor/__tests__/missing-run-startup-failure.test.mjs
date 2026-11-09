@@ -79,7 +79,9 @@ describe('required ruleset context startup failures use missing-run push recover
     const options = {
       repo: REPO, apply: true, mainRuns: [], now: Date.parse('2026-11-09T12:00:00Z'),
       readOpenPrs: () => [value], readRequiredContexts: () => CLASSIC, readAttributedRequiredChecks: () => REQUIRED,
-      readRecoveryEvidence: () => evidence, readPush: () => null,
+      readRecoveryEvidence: vi.fn(() => evidence), readRecoveryPr: vi.fn(() => value),
+      readRecoveryCredential: vi.fn(() => ({ token: 'ghp_acceptance_fixture', env: {} })),
+      checkClaim, readPush: () => null,
       readHeadCommittedAt: () => '2026-11-08T00:00:00Z', readComments: () => comments,
       maxRetriesPerSha: 1, maxRetriesPerPr: 1, trigger,
       postComment: (_, facts) => comments.push({ viewerDidAuthor: true, body: buildMissingRunComment(facts) }),
@@ -88,6 +90,10 @@ describe('required ruleset context startup failures use missing-run push recover
     const first = sweepMissingRunRecovery(options);
     expect(first.applied).toEqual([expect.objectContaining({ ok: true, action: 'pull-request-push', newHeadSha: NEXT })]);
     expect(pushes).toHaveBeenCalledTimes(1);
+    expect(options.readRecoveryPr).toHaveBeenCalledTimes(1);
+    expect(options.readRecoveryCredential).toHaveBeenCalledTimes(1);
+    expect(options.readRecoveryEvidence).toHaveBeenCalledWith(expect.objectContaining({ headSha: HEAD }),
+      { repo: REPO, requiredContexts: REQUIRED });
     expect(checkClaim).toHaveBeenCalledWith({ repo: REPO, branch: value.headRefName });
     expect(comments).toHaveLength(1);
     const second = sweepMissingRunRecovery(options);
@@ -95,6 +101,8 @@ describe('required ruleset context startup failures use missing-run push recover
     expect(second.refusals).toEqual([expect.objectContaining({ kind: expect.stringMatching(/^missing-run-(pr-)?cap-exhausted$/) })]);
     expect(trigger).toHaveBeenCalledTimes(1);
     expect(pushes).toHaveBeenCalledTimes(1);
+    expect(options.readRecoveryPr).toHaveBeenCalledTimes(1);
+    expect(options.readRecoveryEvidence).toHaveBeenCalledTimes(1);
     expect(options.restack).not.toHaveBeenCalled();
   });
 });
