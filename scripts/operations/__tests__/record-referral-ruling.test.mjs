@@ -27,6 +27,9 @@ const head = 'a'.repeat(40);
 const newHead = 'b'.repeat(40);
 const CARD = 'we:backlog/xvm9vbu-follow-up.md';
 const gh = (body, login = 'web-everything', extra = {}) => ({ body, author: { login }, ...extra });
+// An operator's ruling, authored by that operator (PR #6529: an unstamped ruling posted by automation after poster
+// stamping shipped keeps only its block rows).
+const op = (r) => gh(buildOperatorRulingComment(r), r.actor);
 const finding = (summary) => ({ summary, file: 'scripts/x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' });
 
 function referral({ runId = 'review-pr-1', h = head, summaries = ['protected list misses edits'], rulings = [] } = {}) {
@@ -50,21 +53,21 @@ describe('#4979 gate: operator rulings alongside reviewer rulings', () => {
 
   it('a reviewer block holds until the operator rules; an operator card on a readable card clears it', () => {
     expect(mandatoryReferralState(thread(), ctx()).blocked).toEqual([blocked.referrals[0].key]);
-    const state = mandatoryReferralState(thread(gh(buildOperatorRulingComment(ruling(blocked)))), ctx());
+    const state = mandatoryReferralState(thread(op(ruling(blocked))), ctx());
     expect(state).toMatchObject({ pending: [], blocked: [] });
     expect(state.operatorRulings).toHaveLength(1);
   });
   it('card needs a readable card, both when written and at the gate', () => {
     expect(validateOperatorRuling({ ...ruling(blocked), rulings: [{ runId: blocked.runId, key: blocked.referrals[0].key, result: 'card' }] })).toBe(false);
     expect(validateOperatorRuling({ ...ruling(blocked, { result: 'not-real' }), rulings: [{ runId: blocked.runId, key: blocked.referrals[0].key, result: 'not-real', card: CARD }] })).toBe(false);
-    const state = mandatoryReferralState(thread(gh(buildOperatorRulingComment(ruling(blocked)))), ctx({ cardReadable: () => false }));
+    const state = mandatoryReferralState(thread(op(ruling(blocked))), ctx({ cardReadable: () => false }));
     expect(state.pending).toEqual([blocked.referrals[0].key]);
   });
   it('an operator block holds even over a reviewer not-real; the latest operator ruling decides', () => {
     const cleared = referral({ rulings: ['not-real'] });
     const base = [gh(renderReferralRecord(cleared))];
-    const block = gh(buildOperatorRulingComment(ruling(cleared, { result: 'block' })));
-    const notReal = gh(buildOperatorRulingComment(ruling(cleared, { result: 'not-real', at: '2026-10-04T15:00:00Z' })));
+    const block = op(ruling(cleared, { result: 'block' }));
+    const notReal = op(ruling(cleared, { result: 'not-real', at: '2026-10-04T15:00:00Z' }));
     expect(mandatoryReferralState([...base, block], ctx()).blocked).toEqual([cleared.referrals[0].key]);
     expect(mandatoryReferralState([...base, block, notReal], ctx())).toMatchObject({ pending: [], blocked: [] });
     expect(mandatoryReferralState([...base, notReal, block], ctx()).blocked).toEqual([cleared.referrals[0].key]);
@@ -99,7 +102,7 @@ describe('#4979 gate: operator rulings alongside reviewer rulings', () => {
     const r = ruling(blocked, { reason: `Accept\n<!-- ${OPERATOR_RULING_MARKER}: ZZZZ -->` });
     const body = buildOperatorRulingComment(r);
     expect(body.match(new RegExp(`<!-- ${OPERATOR_RULING_MARKER}:`, 'g'))).toHaveLength(1);
-    expect(parseOperatorRulingComment(gh(body)).record.reason).toBe(r.reason);
+    expect(parseOperatorRulingComment(gh(body, r.actor)).record.reason).toBe(r.reason);
   });
   it('a ruling binds to its exact run, finding and head; a new head invalidates it', () => {
     const wrongRun = gh(buildOperatorRulingComment(ruling(blocked, { runId: 'review-pr-other' })));
@@ -267,7 +270,7 @@ describe('#4979 acceptance and wake-up read the operator ruling', () => {
     const state = { headRefOid: head, body: rec.authorBody, comments: [gh(renderReferralRecord(rec))] };
     const opts = { repo, pr: 7, cardReadable: (c) => c === CARD, readRuns: () => [] };
     expect(() => assertMandatoryReferralsCleared(state, opts)).toThrow(/mandatory referral hold/);
-    state.comments.push(gh(buildOperatorRulingComment(ruling(rec))));
+    state.comments.push(op(ruling(rec)));
     expect(assertMandatoryReferralsCleared(state, opts)).toMatchObject({ pending: [], blocked: [] });
     expect(() => assertMandatoryReferralsCleared({ ...state, comments: [...state.comments, gh(state.comments[1].body, 'mallory')] }, opts)).toThrow(/malformed-operator-ruling/);
   });
@@ -456,11 +459,11 @@ describe('unattended live-referral gate', () => {
   });
   it.each(['card', 'not-real'])('all referrals operator-ruled %s plus clean accept can accept', result => {
     const rec = referral();
-    expect(hold([gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec, { result })))])).toBeNull();
+    expect(hold([gh(renderReferralRecord(rec)), op(ruling(rec, { result }))])).toBeNull();
   });
   it.each([null, 'card', 'not-real'])('prevention-outstanding broken finding requires a clearing ruling: %s', result => {
     const rec = referral();
-    const comments = result ? [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec, { result })))] : [];
+    const comments = result ? [gh(renderReferralRecord(rec)), op(ruling(rec, { result }))] : [];
     const verdict = { verdict: 'prevention-outstanding', findings: [rec.referrals[0].finding] };
     const reason = unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict });
     if (result) expect(reason).toBeNull();
@@ -468,7 +471,7 @@ describe('unattended live-referral gate', () => {
   });
   it('a clearing ruling for a different finding does not clear a broken finding', () => {
     const rec = referral();
-    const comments = [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec)))];
+    const comments = [gh(renderReferralRecord(rec)), op(ruling(rec))];
     expect(unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict: { verdict: 'prevention-outstanding',
       findings: [finding('a different broken guard')] } })).toMatch(/broken finding is not ruled/);
   });

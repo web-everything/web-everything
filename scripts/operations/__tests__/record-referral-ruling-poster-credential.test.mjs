@@ -185,10 +185,55 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
     expect(validateOperatorRuling({ ...p.record, poster: 'web-everything' })).toBe(false);
     expect(validateOperatorRuling({ ...p.record, poster: 'Chalbert' })).toBe(false);
     expect(validateOperatorRuling({ ...p.record, actor: 'auto-policy', poster: 'auto-policy', rulings: p.record.rulings.map((r) => ({ ...r, result: 'block', lens: undefined })) })).toBe(false);
-    // A legacy (unstamped) record keeps the trusted-author rule (PR #5925: automation-posted operator rulings).
+    // A legacy (unstamped) record keeps the trusted-author rule only when GitHub dated it before poster stamping
+    // shipped (PR #5925: automation-posted operator rulings recorded before the stamp).
     const { poster, ...legacy } = p.record;
     expect(poster).toBe('chalbert');
-    expect(readOperatorRulings([gh(buildOperatorRulingComment(legacy), 'web-everything')]).rulings).toHaveLength(1);
+    expect(readOperatorRulings([{ ...gh(buildOperatorRulingComment(legacy), 'web-everything'), createdAt: '2026-10-01T00:00:00Z' }]).rulings).toHaveLength(1);
+  });
+
+  describe('PR #6529 red team (result 5acf690a8e9b87a6): omitting poster cannot bypass the author binding', () => {
+    const CUTOFF = '2026-11-08T12:22:33Z';
+    const record = (results) => ({ version: 1, repo, pr: 7, head, actor: 'chalbert', channel: 'claude-code-chat', reason: 'unstamped copy',
+      at: '2026-11-09T10:00:00Z', clearerId: 's',
+      rulings: results.map((result, i) => ({ runId, key: `${rec.referrals[0].key}${i ? `#${i}` : ''}`, result, ...(result === 'card' ? { card: 'we:backlog/1234-x.md' } : {}) })) });
+    const at = (body, login, when) => ({ ...gh(body, login), ...(when === undefined ? {} : { createdAt: when }) });
+    const results = (comments) => readOperatorRulings(comments).rulings.map((r) => r.result);
+
+    it('the red-team shape — actor chalbert, not-real, no poster, bot author, fresh createdAt — is no ruling', () => {
+      const body = buildOperatorRulingComment(record(['not-real']));
+      expect(readOperatorRulings([at(body, 'web-everything', '2026-11-09T11:00:00Z')])).toEqual({ rulings: [], malformed: false });
+      // Nor does it clear the comment gate.
+      const thread = [gh(renderReferralRecord(rec)), at(body, 'web-everything', '2026-11-09T11:00:00Z')];
+      expect(mandatoryReferralState(thread, repo7).pending).toEqual([rec.referrals[0].key]);
+    });
+
+    it.each([
+      ['after the cutoff', '2026-11-09T11:00:00Z'],
+      ['exactly at the cutoff', CUTOFF],
+      ['with no createdAt', undefined],
+      ['with an unparseable createdAt', 'not-a-date'],
+    ])('an unstamped automation copy dated %s keeps only its block rows', (_label, when) => {
+      const body = buildOperatorRulingComment(record(['not-real', 'block', 'card']));
+      expect(results([at(body, 'web-everything', when)])).toEqual(['block']);
+      expect(readOperatorRulings([at(buildOperatorRulingComment(record(['card'])), 'web-everything', when)])).toEqual({ rulings: [], malformed: false });
+    });
+
+    it('the REST spelling created_at is read the same way', () => {
+      const body = buildOperatorRulingComment(record(['not-real', 'block']));
+      expect(results([{ ...gh(body, 'web-everything'), created_at: '2026-11-09T11:00:00Z' }])).toEqual(['block']);
+      expect(results([{ ...gh(body, 'web-everything'), created_at: '2026-10-01T00:00:00Z' }])).toEqual(['not-real', 'block']);
+    });
+
+    it('an unstamped automation copy dated before the cutoff keeps every row (legacy PR #5925)', () => {
+      const body = buildOperatorRulingComment(record(['not-real', 'block', 'card']));
+      expect(results([at(body, 'web-everything', '2026-11-08T12:22:32Z')])).toEqual(['not-real', 'block', 'card']);
+    });
+
+    it('an unstamped ruling authored by an operator stays valid whatever its date', () => {
+      const body = buildOperatorRulingComment(record(['not-real', 'card']));
+      for (const when of ['2026-11-09T11:00:00Z', undefined]) expect(results([at(body, 'chalbert', when)])).toEqual(['not-real', 'card']);
+    });
   });
 
   it('a re-block split onto the App still holds: it withdraws the earlier operator not-real, in the comment gate and the ledger', async () => {

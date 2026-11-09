@@ -24,10 +24,13 @@ function record({ runId = 'review-pr-1', h = head, file = 'scripts/x.mjs', line 
     rulings: reviewerResult ? [{ id: `${runId}:0`, key, reviewerId: reviewer.id, lens: 'correctness',
       result: reviewerResult, rationale: 'checked', evidence: ['diff'] }] : [], ...rest };
 }
+// The operator's own ruling, authored by that operator (PR #6529: an unstamped ruling posted by automation after poster
+// stamping shipped can only hold, so a clearing decision here is posted under the operator's login).
 function ruling(rec, result = 'not-real', extra = {}) {
-  return comment(buildOperatorRulingComment({ version: 1, repo: rec.repo, pr: rec.pr, head: rec.head,
+  const r = { version: 1, repo: rec.repo, pr: rec.pr, head: rec.head,
     actor: 'chalbert', channel: 'chat', reason: 'Operator decision', at: now, clearerId: 'operator-session',
-    rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result, ...(result === 'card' ? { card } : {}) }], ...extra }));
+    rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result, ...(result === 'card' ? { card } : {}) }], ...extra };
+  return comment(buildOperatorRulingComment(r), r.actor === 'auto-policy' ? 'web-everything' : r.actor);
 }
 function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true, env = {} } = {}) {
   const comments = [...initial], trace = [], warnings = [], logs = [];

@@ -3892,6 +3892,21 @@ export function buildOperatorRulingComment(r) {
 }
 
 /**
+ * When operator-ruling `poster` stamping shipped (PR #6529, commit 564af17f8b). An unstamped ruling posted by
+ * automation counts as a legacy ruling only if GitHub dated the comment before this. A fixed constant on purpose:
+ * a setting or environment override would reopen the bypass it closes.
+ */
+export const OPERATOR_RULING_POSTER_STAMP_CUTOFF = '2026-11-08T12:22:33Z';
+const OPERATOR_RULING_POSTER_STAMP_CUTOFF_MS = Date.parse(OPERATOR_RULING_POSTER_STAMP_CUTOFF);
+
+/** GitHub's own creation time of a comment (GraphQL `createdAt` or REST `created_at`), in ms; NaN when absent. */
+function commentCreatedAtMs(comment) {
+  if (!comment || typeof comment !== 'object') return NaN;
+  const at = comment.createdAt ?? comment.created_at;
+  return typeof at === 'string' ? Date.parse(at) : NaN;
+}
+
+/**
  * Read one comment: `null` when it is not an operator-ruling comment, `{record}` when it is a valid one from a
  * trusted principal, `{malformed: true, head?}` otherwise (an outsider's copy, a hand-edit, a truncated write).
  */
@@ -3920,9 +3935,14 @@ export function parseOperatorRulingComment(comment) {
   // fallback split the check from the post, or another operator — can only HOLD: its clearing rows (card / not-real) are
   // dropped and its `block` rows are kept, so a re-block meant to withdraw an earlier clearance still withdraws it (fail
   // closed). With no block row it is no ruling at all (null, not `malformed`, so a clearing copy a failed cleanup left
-  // behind can never block the operator's own re-run). An unstamped (legacy) record keeps the trusted-author rule above
-  // (PR #5925: automation-posted operator rulings recorded before the stamp stay readable).
-  if (record.poster !== undefined && login !== record.poster) {
+  // behind can never block the operator's own re-run).
+  // An unstamped record authored by an operator keeps the trusted-author rule above. An unstamped record authored by
+  // automation (PR #5925: operator rulings posted under the App before the stamp existed) keeps it ONLY when GitHub
+  // dated the comment before poster stamping shipped. Omitting `poster` is otherwise a bypass (PR #6529 red team, result
+  // 5acf690a8e9b87a6): a missing, unparseable or later date reads exactly like a poster mismatch.
+  const legacyAutomation = record.poster === undefined && !OPERATOR_LOGINS.includes(login)
+    && !(commentCreatedAtMs(comment) < OPERATOR_RULING_POSTER_STAMP_CUTOFF_MS);
+  if (legacyAutomation || (record.poster !== undefined && login !== record.poster)) {
     const holds = record.rulings.filter(x => x.result === 'block');
     return holds.length ? { record: { ...record, rulings: holds } } : null;
   }
