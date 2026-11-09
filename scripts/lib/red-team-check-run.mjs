@@ -136,6 +136,9 @@ export function evaluateRedTeamPublicationHold({ pr, combined, statuses, isTrust
   if (!Array.isArray(statuses) || statuses.length > 100 || statuses.some(status => !Number.isSafeInteger(status?.id)))
     return failure('red-team publication hold history unreadable; operator must inspect commit statuses');
   const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
+  // The summary says this PR's context exists, so the history must show it; an empty or contradictory history
+  // (e.g. a failure in the summary but none in the list) is unreadable evidence, never a clear.
+  if (!ordered.length) return failure('red-team publication hold history lacks the summarized hold; operator must inspect commit statuses');
   for (const status of ordered) {
     if (status.state !== 'success')
       return failure(`red-team round not confirmed published (GitHub-visible hold, ${message(status.state)}); retry check publication before enqueue`);

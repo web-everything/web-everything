@@ -239,6 +239,13 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
     expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true,
       gh: () => { throw Object.assign(Error('gh failed'), { stderr: 'gh: Validation Failed (HTTP 422)' }); } })).toMatchObject({ definite: true });
   });
+  it('fails closed when the combined summary carries this PR failure hold but the history is empty (#6535 :145)', async () => {
+    const { evaluateRedTeamPublicationHold: evaluateAny, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
+    const context = redTeamPublicationContext(7);
+    const combined = { total_count: 1, statuses: [{ context, state: 'failure', id: 5 }] };
+    expect(evaluateAny({ pr: 7, combined, statuses: [] })).toMatchObject({ ok: false });
+    expect(evaluateAny({ pr: 7, combined, statuses: [{ id: 3, context: 'other', state: 'success' }] })).toMatchObject({ ok: false });
+  });
   it('evaluates absent, cleared, held, and incomplete combined status', async () => {
     const { evaluateRedTeamPublicationHold: evaluateAny, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
     const evaluate = input => evaluateAny({ pr: 7, ...input }), context = redTeamPublicationContext(7);
