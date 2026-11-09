@@ -67,6 +67,9 @@ export const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 /** A live pid whose heartbeat is older than this is STALLED (statute: SIGTERM, SIGKILL, confirm, relaunch). */
 export const DEFAULT_HEARTBEAT_STALE_MS = 60_000;
 
+/** Backstop for an unprobeable host whose heartbeat stopped, including a host renamed after reboot. */
+export const DEFAULT_FOREIGN_STALE_MS = 30 * 60_000;
+
 /** How long a spawned child has to claim its record before the launch counts as dead. */
 export const DEFAULT_LAUNCH_GRACE_MS = 30_000;
 
@@ -154,10 +157,10 @@ function ms(iso) {
  *
  * @param {object} record - a job run record.
  * @param {{now: number, liveness: ('alive'|'dead'|'foreign'|null), staleMs?: number, launchGraceMs?: number,
- *   sleepDetected?: boolean}} o
+ *   foreignStaleMs?: number, sleepDetected?: boolean}} o
  * @returns {'terminal'|'queued'|'waiting'|'launching'|'live'|'stalled'|'dead'|'foreign'}
  */
-export function classifyJob(record, { now, liveness, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS, sleepDetected = false }) {
+export function classifyJob(record, { now, liveness, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS, foreignStaleMs = DEFAULT_FOREIGN_STALE_MS, sleepDetected = false }) {
   const job = record.job;
   if (TERMINAL_JOB_STATUSES.includes(job.status)) return 'terminal';
   if (job.status === 'queued') {
@@ -170,7 +173,10 @@ export function classifyJob(record, { now, liveness, staleMs = DEFAULT_HEARTBEAT
     const launched = ms(job.launchedAt);
     return Number.isFinite(launched) && now - launched <= launchGraceMs ? 'launching' : 'dead';
   }
-  if (liveness === 'foreign') return 'foreign';
+  if (liveness === 'foreign') {
+    const beat = ms(job.heartbeatAt ?? job.startedAt);
+    return !sleepDetected && Number.isFinite(beat) && now - beat > foreignStaleMs ? 'dead' : 'foreign';
+  }
   if (liveness !== 'alive') return 'dead';
   if (sleepDetected) return 'live';
   const beat = ms(job.heartbeatAt ?? job.startedAt);

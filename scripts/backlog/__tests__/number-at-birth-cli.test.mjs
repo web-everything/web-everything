@@ -215,7 +215,9 @@ fs.writeFileSync(file, JSON.stringify(state));
     const expectHashFileItem = (env = {}) => {
       const before = readdirSync(join(root, 'backlog'));
       const remoteBefore = readFileSync(join(root, 'remote.json'), 'utf8');
-      const { verdict: card } = run(env, 'file-item');
+      // The fixture deliberately reuses the title of the numeric card it just scaffolded; file-item's
+      // duplicate admission (refused by default, see file-item.test.mjs) is answered with the explicit reason.
+      const { verdict: card } = run(env, 'file-item', ['--notDuplicateReason=fixture reuses the legacy scaffold title']);
       expect(card.num).toMatch(/^x[0-9a-z]{6}$/);
       expect(card.id).toBe(`${card.num}-born-numbered`);
       expect(card.rel).toBe(`backlog/${card.id}.md`);

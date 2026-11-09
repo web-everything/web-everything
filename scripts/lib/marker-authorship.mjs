@@ -56,6 +56,7 @@
  * (`we:scripts/lib/github-app-identity.mjs#readBotLogins` — today's bot plus every per-role App's bot, e.g.
  * `plateau-reviewer[bot]`), with `WE_AUTOMATION_LOGINS` still winning when set.
  */
+import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 import { readBotLogins } from './github-app-identity.mjs';
 
 /**
@@ -160,4 +161,67 @@ export function countTrustedLeadingMarker(comments, marker) {
     if (typeof body === 'string' && body.trimStart().startsWith(marker) && isTrustedMarkerAuthor(c)) n += 1;
   }
   return n;
+}
+
+/** Distinct R10 authority; never an operator login. */
+export const JUDGE_ACTOR = 'judge:r10';
+export const JUDGE_ATTRIBUTION = 'Ruled by acting judge (R10), not the operator';
+/** Review-clearance tokens a judge comment may never carry, anywhere: every judge writer and reader shares this. */
+export const JUDGE_RESERVED_TOKEN_RE = /reviewed-sha|cleared-human/i;
+const judgePolicyLogged = new WeakMap();
+export function readJudgeActorPolicy({ env = process.env, platform, tool, log = console.error } = {}) {
+  if (platform === undefined) {
+    const preferences = readPlatformPreferences({ env });
+    if (preferences.errors.length) throw new Error('unreadable judge actor policy; ask the operator');
+    platform = Object.hasOwn(preferences.prefs, 'judgeActor') ? preferences.prefs.judgeActor : {};
+  }
+  const valid = { enabled: v => typeof v === 'boolean', actor: v => v === JUDGE_ACTOR };
+  for (const block of [platform, tool]) {
+    if (block !== undefined && (!block || typeof block !== 'object' || Array.isArray(block)
+      || Object.entries(block).some(([k,v]) => !valid[k]?.(v)))) throw new Error('invalid judge actor policy; ask the operator');
+  }
+  const enabled = env.WE_JUDGE_ACTOR_ENABLED;
+  const r = cascadePolicy('judgeActor', tool, { standard: { enabled: true, actor: JUDGE_ACTOR }, platform, env, log, valid,
+    envValues: { enabled: enabled === undefined ? undefined : enabled === 'true' ? true : enabled === 'false' ? false : enabled,
+      actor: env.WE_JUDGE_ACTOR } });
+  if (r.invalid.length) throw new Error('invalid judge actor policy; ask the operator');
+  // Gate readers resolve this once per pass; log each distinct line once per sink, not once per comment (#6494 F2).
+  const line = `policy-cascade judgeActor enabled=${r.value.enabled} (${r.sources.enabled}) actor=${r.value.actor} (${r.sources.actor})`;
+  const seen = judgePolicyLogged.get(log) ?? new Set();
+  if (!seen.has(line)) { seen.add(line); judgePolicyLogged.set(log, seen); log(line); }
+  return r;
+}
+
+/**
+ * The policy a judge WRITER must hold (#6494 F7). Every gate reader resolves the judge policy without a tool layer
+ * (standard → platform → env), so a tool block may only narrow it: when the gate-visible policy is disabled the
+ * writer is disabled too, at planning and at effect time alike. Otherwise a tool-enabled plan would post a block
+ * the gate then ignores. The tool block still resolves and logs as the writer's own layer.
+ */
+export function readJudgeWriterPolicy({ env = process.env, tool, log = console.error } = {}) {
+  const own = readJudgeActorPolicy({ env, tool, log });
+  if (tool === undefined || !own.value.enabled) return own;
+  const gate = readJudgeActorPolicy({ env, log });
+  if (gate.value.enabled) return own;
+  return { ...own, value: { ...own.value, enabled: false }, sources: { ...own.sources, enabled: `gate-${gate.sources.enabled}` } };
+}
+export function isSecurityClass(value) {
+  return /^security(?:[-/]|$)/i.test(String(value ?? ''));
+}
+
+/** R671 v1 only adds holds; every releasing action remains operator-only. */
+export function assertJudgeAuthority(read, input) {
+  if (input.actor !== JUDGE_ACTOR) return;
+  if (input.ruling !== 'block')
+    throw new Error(`judge ${input.ruling ?? 'grant'} is refused in v1; operator-only`);
+  const policy = (read.judgeActorPolicy ?? readJudgeActorPolicy()).value;
+  if (!policy || typeof policy.enabled !== 'boolean' || policy.actor !== JUDGE_ACTOR)
+    throw new Error('invalid judge actor policy; ask the operator');
+  if (!policy.enabled) throw new Error('judge actor disabled; ask the operator');
+  // Explicit (`--supersedes`, a string) or derived (a planned row's id list) supersession are both refused.
+  const supersedes = Array.isArray(input.supersedes) ? input.supersedes.join(',') : String(input.supersedes ?? '');
+  if (supersedes.trim()) throw new Error('judge cannot supersede rulings; operator-only');
+}
+export function isJudgeAuthored(c) {
+  return AUTOMATION_LOGINS.includes(loginOf(c));
 }

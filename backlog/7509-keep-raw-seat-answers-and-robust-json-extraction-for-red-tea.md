@@ -2,9 +2,11 @@
 bornAs: x4yadqc
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/codex-direct-task.mjs", "we:scripts/gemini-direct-task.mjs"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: fceeaf3234eb22b52471ddfd2364d958abb23429
 tags: []
 ---
 

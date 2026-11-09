@@ -54,3 +54,7 @@ Files written: npm 18.8k, pnpm 18.76k; the pnpm store is 470 MB, counted once. U
 Conclusion: pnpm cuts disk heavily (a warm install is 19 MB vs 726 MB) and install time (3.8 s vs 7 s), but barely cuts fs events. Only a symlink to a shared store cuts events, to 1. So for rebuild jobs, replace cp -cR with a symlink where tests don't write into node_modules; pnpm is the disk and time win for lanes.
 
 The setting itself: `we:scripts/lib/package-manager.mjs` (`resolvePackageManager`, `installArgv`, `installCommand`, `installWithFallback`, `--explain`); nothing calls it yet.
+
+## Progress (2026-11-07)
+
+PR #6419 delivers A1 (measure) and the packageManager setting plus npm fallback (part of A2). PR #6467 delivers lane install via the pnpm global store with npm ci fallback. Remains: A2 rebuilds and CI reading the setting (nothing calls the module yet; daemon rebuild untouched) and A3 live rebuild proof.

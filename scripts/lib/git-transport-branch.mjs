@@ -35,7 +35,7 @@
  */
 import { retryTransientGit } from './git-fetch-retry.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
 /**
@@ -363,15 +363,74 @@ function readExisting(abs) {
  * @param {{board: string, branch: string, paths: string[], run?: Function}} o
  * @returns {Record<string, string|null>} path -> text, or null when the path is not on the branch.
  */
-export function readFromTransportBranch({ board, branch, paths = [], run = defaultGit } = {}) {
+export function readFromTransportBranch({
+  board, branch, paths = [], run = defaultGit, now = Date.now, env = process.env, log = defaultFetchLog, fresh = false,
+} = {}) {
   if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
-  retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
+  coalescedReadFetch({ board, branch, run, now, env, log, fresh });
   const out = {};
   for (const path of paths) {
     const listed = run(['ls-tree', '--name-only', `origin/${branch}`, '--', path], { cwd: board }).trim();
     out[path] = listed ? run(['show', `origin/${branch}:${path}`], { cwd: board }) : null;
   }
   return out;
+}
+
+/** Default TTL for a READ's origin fetch of a transport branch; override with WE_OPS_FETCH_TTL_MS (0 = always fetch). */
+export const OPS_READ_FETCH_TTL_MS = 30_000;
+
+/**
+ * Branches whose reads must never be served from the TTL cache: the merge gate's freeze RECHECK relies on a
+ * read after a verdict seeing a freeze published seconds earlier (merge-gate-check.mjs), so a 30s-stale clear
+ * document would defeat it. These always fetch.
+ */
+export const OPS_READ_NEVER_CACHED = Object.freeze(['ops/red-main-freeze', 'ops/quarantine']);
+
+function defaultFetchLog(msg) { process.stderr.write(`${msg}\n`); }
+
+/**
+ * READS ONLY. Many lanes and daemons read the same ops branch every tick and each ran its own network fetch
+ * (a ~10 MB ledger: ~70% CPU in `git unpack-objects`). A per-repo+branch stamp inside the repo's own git dir
+ * records when the last successful fetch STARTED; a read within the TTL uses the existing remote-tracking ref.
+ * No lock: two overlapping misses simply both fetch (what every read did before), so nothing can wedge. The
+ * stamp is written atomically (tmp file + rename) only after a successful fetch. An unreadable or corrupt stamp,
+ * or any fs problem, means a plain fetch (fail closed). Writes (`stageOnTransportBranch`) never use this: they
+ * always fetch before staging. A DECISION reader (merge gate, anything that approves or blocks) passes
+ * `fresh: true`: it never reads the cache, but its fetch still refreshes the stamp for ordinary readers.
+ * Logs `source=cache|origin`.
+ */
+function coalescedReadFetch({ board, branch, run, now, env, log, fresh = false }) {
+  const rawTtl = env?.WE_OPS_FETCH_TTL_MS;
+  const fromEnv = rawTtl !== undefined && rawTtl !== '' && Number.isFinite(Number(rawTtl));
+  const ttl = fromEnv ? Number(rawTtl) : OPS_READ_FETCH_TTL_MS;
+  const tag = `ttlMs=${ttl}(${fromEnv ? 'env' : 'default'})`;
+  const fetchOrigin = (why) => {
+    retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
+    log(`ops-fetch branch=${branch} source=origin ${tag} ${why}`);
+  };
+  let stampFile;
+  try {
+    if (OPS_READ_NEVER_CACHED.includes(branch) || /freeze/i.test(branch)) return fetchOrigin('never-cached');
+    if (!(ttl > 0)) return fetchOrigin('ttl-disabled');
+    const common = String(run(['rev-parse', '--git-common-dir'], { cwd: board }) ?? '').trim();
+    if (!common) throw new Error('no git dir');
+    const dir = join(resolve(board, common), 'we-ops-fetch');
+    mkdirSync(dir, { recursive: true });
+    stampFile = join(dir, encodeURIComponent(branch));
+  } catch { return fetchOrigin('stamp-unavailable'); }
+  const started = now();
+  try {
+    const at = Number(readFileSync(stampFile, 'utf8').trim());
+    if (!fresh && Number.isFinite(at) && at > 0 && started - at >= 0 && started - at < ttl) {
+      return log(`ops-fetch branch=${branch} source=cache ${tag}`);
+    }
+  } catch { /* unreadable stamp: fetch */ }
+  fetchOrigin(fresh ? 'fresh-required' : 'stamp-stale');
+  try {
+    const tmp = `${stampFile}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    writeFileSync(tmp, String(started));
+    renameSync(tmp, stampFile);
+  } catch { /* next reader just fetches */ }
 }
 
 function defaultGit(args, opts) {

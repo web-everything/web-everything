@@ -62,6 +62,8 @@
  *   Only classified enqueue outcomes authorize holds. Queue contention, independent retry timers,
  *   unreadable evidence and unclassified revalidation aborts retry on the next catch-up.
  *   Events bypass the hold; enabled:false restores retries on every catch-up.
+ *   Complete same-head failure evidence uses blockedBackoffRounds AND this TTL, keyed on
+ *   head+checks and labels. Recent misses sort after never-missed candidates without losing eligibility.
  *
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
@@ -92,6 +94,10 @@ const REFRESH_PAUSE_PATHS = Object.freeze(['scripts/lib/drain-queue-safety', 'sc
 export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, pendingExpiryMinutes: 15, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, missBackoff: Object.freeze({ enabled: true, ttlMinutes: 30 }), refreshPause: Object.freeze({ paths: Object.freeze(REFRESH_PAUSE_PATHS), maxPauseMinutes: 10 }), order: 'priority-then-first-accept' }) });
 /** Compatibility constant for the standard fast-drain timeout; the setting controls child runs. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
+// Fixed maximum: decline dedupe must never suppress a PR indefinitely.
+export const CATCH_UP_DECLINE_TTL_MS = 60 * 60_000;
+// Declines safe to dedupe: bound to a head/labels/checks snapshot. Everything else retries every catch-up.
+export const CATCH_UP_DECLINE_DEDUPE_KINDS = Object.freeze(new Set(['mq-same-head-failed', 'red-team-pending', 'sent-back', 'bornas-collision']));
 const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
 
@@ -315,6 +321,8 @@ export const MISS_BACKOFF_HOLD_ELIGIBILITY = Object.freeze({
   'card-grouped': false,
   'enqueue-backoff': false,
   // Also covers unreadable timeline evidence, which can recover without changing the head or labels.
+  // Keep the source-contract classification false: affirmative same-head failure evidence uses
+  // the separate head+checks+labels backoff below, bounded by BOTH rounds and TTL, not this hold.
   'mq-same-head-failed': false,
   'live-state-unreadable': false,
   'bornas-unreadable': false,
@@ -466,9 +474,16 @@ export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String
  * recently, which is why missing times sort last in {@link planCatchUp}. First acceptance comes from
  * the structured verdict comments (all heads); paginate comments so a long pre-review thread does not hide it.
  */
-export function readyAtQuery(nums) {
-  const one = (n) => `p${n}:pullRequest(number:${Number(n)}){timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{... on LabeledEvent{createdAt label{name}}}}}`;
-  return `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${nums.map(one).join(' ')}}}`;
+export function readyAtQuery(nums, defaultBranch = 'main') {
+  const one = (n) => `p${n}:pullRequest(number:${Number(n)}){headRefOid
+    commits(last:1){nodes{commit{oid status{contexts{context state createdAt}} checkSuites(first:20){pageInfo{hasNextPage} nodes{id status conclusion
+      checkRuns(first:50){pageInfo{hasNextPage} nodes{id status conclusion completedAt}}}}}}}
+    timelineItems(itemTypes:[LABELED_EVENT,UNLABELED_EVENT],last:100){nodes{
+      __typename ... on LabeledEvent{createdAt label{name}} ... on UnlabeledEvent{createdAt label{name}}}}}`;
+  return `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){
+    mainCi:ref(qualifiedName:${JSON.stringify(`refs/heads/${defaultBranch}`)}){target{... on Commit{
+      checkSuites(first:100){pageInfo{hasNextPage} nodes{status workflowRun{databaseId workflow{name}}}}}}}
+    ${nums.map(one).join(' ')}}}`;
 }
 
 /** The latest `ready-to-merge` LabeledEvent time (epoch ms) in a `timelineItems` block, or null. PURE. */
@@ -510,6 +525,7 @@ export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env 
   const seenCursors = new Set();
   let cursor;
   let queued = 0;
+  let mainCiRunId;
   for (;;) {
     const list = await ghGraphql({ query: CATCH_UP_QUERY, owner, name, cursor, env, execFileImpl });
     if (!list.ok) return list;
@@ -528,10 +544,32 @@ export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env 
   // Keep each aliased timeline query bounded even when the listing spans many pages.
   for (let offset = 0; offset < open.length; offset += 100) {
     const batch = open.slice(offset, offset + 100);
-    const times = await ghGraphql({ query: readyAtQuery(batch.map((p) => p.num)), owner, name, env, execFileImpl });
+    const times = await ghGraphql({ query: readyAtQuery(batch.map((p) => p.num), defaultBranch), owner, name, env, execFileImpl });
+    if (times.ok) {
+      const suites = times.repository.mainCi?.target?.checkSuites;
+      // A completed Actions suite with partial workflow/run evidence makes main CI unreadable (fail open).
+      const partial = Array.isArray(suites?.nodes) && suites.nodes.some(s => s?.status === 'COMPLETED' && s.workflowRun
+        && (!s.workflowRun.workflow?.name || !Number.isSafeInteger(s.workflowRun.databaseId) || s.workflowRun.databaseId <= 0));
+      const runs = !partial && suites?.pageInfo?.hasNextPage === false && Array.isArray(suites.nodes)
+        ? suites.nodes.filter(s => s.status === 'COMPLETED' && s.workflowRun?.workflow?.name === 'CI')
+          .map(s => s.workflowRun.databaseId).filter(id => Number.isSafeInteger(id) && id > 0) : [];
+      const id = runs.length ? Math.max(...runs) : undefined;
+      // Mixed snapshots across batches are unreadable for dedupe.
+      if (offset === 0) mainCiRunId = id;
+      else if (mainCiRunId !== id) mainCiRunId = undefined;
+    }
     if (times.ok) for (const p of batch) {
       const record = times.repository[`p${p.num}`];
-      p.readyAt = latestReadyAt(record?.timelineItems);
+      p.readyAt = latestReadyAt({ nodes: record?.timelineItems?.nodes?.filter(e => e?.__typename !== 'UnlabeledEvent') });
+      const commit = record?.commits?.nodes?.[0]?.commit;
+      const evidence = commit?.oid === record?.headRefOid ? catchUpCheckEvidence(commit) : null;
+      if (evidence && record.headRefOid && Array.isArray(record.timelineItems?.nodes)) {
+        Object.assign(p, evidence, { headRefOid: record.headRefOid, labelsDigest: catchUpLabelsDigest(p) });
+        const dates = record.timelineItems.nodes.map(e => Date.parse(e?.createdAt));
+        // Any missing/invalid label timestamp is unknown evidence: leave it unset so the PR re-checks.
+        if (dates.length && dates.every(Number.isFinite)) p.lastLabelChangedAt = Math.max(...dates);
+        else delete p.lastLabelChangedAt;
+      }
       try {
         const dates = (await readComments(p.num, { repo })).flatMap((comment) => {
           const verdict = parseVerdictComment(comment);
@@ -542,7 +580,7 @@ export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env 
       } catch { /* Keep the ready-time fallback when the complete thread is unreadable. */ }
     }
   }
-  return { ok: true, prs, queued };
+  return { ok: true, prs, queued, ...(mainCiRunId !== undefined ? { mainCiRunId } : {}) };
 }
 
 /** IO: catch-up fill depth, independent of GitHub's build batch size. */
@@ -560,12 +598,61 @@ export async function readCatchUpQueueDepth({ repo, env = process.env, execFileI
     ? { ok: true, queued, queuedNums: (result.repository.mergeQueue.entries.nodes || []).map(e => e.pullRequest?.number) } : { ok: false, error: result.error || 'queue depth unreadable' };
 }
 
+/** Complete head-check evidence only; truncated connections always re-check. PURE. */
+function catchUpCheckEvidence(commit) {
+  const suites = commit?.checkSuites;
+  if (!Array.isArray(suites?.nodes) || suites.pageInfo?.hasNextPage !== false) return null;
+  const facts = []; const completed = [];
+  for (const suite of suites.nodes) {
+    const runs = suite?.checkRuns;
+    if (!suite?.id || !suite.status || !Array.isArray(runs?.nodes) || runs.pageInfo?.hasNextPage !== false) return null;
+    if (suite.status === 'COMPLETED' && !suite.conclusion) return null;
+    facts.push([suite.id, suite.status, suite.conclusion ?? null]);
+    for (const run of runs.nodes) {
+      if (!run?.id || !run.status) return null;
+      const at = Date.parse(run.completedAt);
+      if (run.status === 'COMPLETED' && (!Number.isFinite(at) || !run.conclusion)) return null;
+      if (Number.isFinite(at)) completed.push(at);
+      facts.push([run.id, run.status, run.conclusion ?? null, run.completedAt]);
+    }
+  }
+  // Legacy commit statuses are check evidence too; a missing status field is unreadable (null status = none).
+  if (commit?.status === undefined) return null;
+  if (commit.status !== null && !Array.isArray(commit.status?.contexts)) return null; // present-but-partial status is unreadable
+  for (const ctx of commit.status?.contexts ?? []) {
+    const at = Date.parse(ctx?.createdAt);
+    if (!ctx?.context || !ctx.state || !Number.isFinite(at)) return null;
+    completed.push(at);
+    facts.push([`status:${ctx.context}`, ctx.state, ctx.createdAt]);
+  }
+  // No completed evidence is unknown, never an authorization to skip.
+  if (!completed.length) return null;
+  return { lastCheckCompletedAt: Math.max(...completed),
+    checksDigest: createHash('sha256').update(JSON.stringify(facts.sort((a, b) => String(a[0]).localeCompare(String(b[0]))))).digest('hex') };
+}
+
+const catchUpLabelsDigest = pr => Array.isArray(pr?.labels) && pr.labels.every(l => typeof l?.name === 'string')
+  ? createHash('sha256').update(JSON.stringify(pr.labels.map(l => l.name).sort())).digest('hex') : null;
+
+/** Missing memory or change evidence always authorizes a fresh drain, never admission. PURE. */
+function unchangedDecline(pr, held, now, mainCiRunId) {
+  return !!(held && typeof held.reason === 'string' && held.reason && Number.isFinite(held.at)
+    && now >= held.at && now - held.at < Math.min(CATCH_UP_DECLINE_TTL_MS, Number.isFinite(held.ttlMs) && held.ttlMs > 0 ? held.ttlMs : CATCH_UP_DECLINE_TTL_MS)
+    && typeof pr.headRefOid === 'string' && pr.headRefOid && held.headSha === pr.headRefOid
+    && typeof pr.labelsDigest === 'string' && pr.labelsDigest && held.labelsDigest === pr.labelsDigest
+    && typeof pr.checksDigest === 'string' && pr.checksDigest && held.checksDigest === pr.checksDigest
+    && Number.isFinite(pr.lastCheckCompletedAt) && pr.lastCheckCompletedAt <= held.at
+    && Number.isFinite(pr.lastLabelChangedAt) && pr.lastLabelChangedAt <= held.at
+    && Number.isSafeInteger(mainCiRunId) && mainCiRunId > 0 && held.mainCiRunId === mainCiRunId);
+}
+
 /** PURE: ordered candidates that fit the current queue, leaving eligibility to the drain. */
-export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSince,
+export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSince, deprioritize = [], declines, mainCiRunId,
   pendingExpiryMinutes = ENQUEUE_ON_EVENT_DEFAULTS.catchUp.pendingExpiryMinutes, order = 'priority-then-first-accept',
   priority, buildPriority = [], mainFix = null, repo, now = 0, defaultBranch = 'main' }) {
   const pending = new Set(pendingNums);
-  const skipped = []; const candidates = []; const expired = [];
+  const skipped = []; const candidates = []; const expired = []; const skippedUnchanged = [];
+  const memory = declines instanceof Map ? declines : new Map();
   const expiry = Number.isFinite(pendingExpiryMinutes) && pendingExpiryMinutes > 0
     ? pendingExpiryMinutes : ENQUEUE_ON_EVENT_DEFAULTS.catchUp.pendingExpiryMinutes;
   for (const pr of prs) {
@@ -576,7 +663,9 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
     }
     const reason = pr.isDraft ? 'draft' : pr.inQueue ? 'already queued' : pending.has(pr.num) ? 'already pending' : catchUpSkipReason(pr, defaultBranch);
     if (reason) skipped.push({ num: pr.num, reason });
-    else candidates.push(pr);
+    else if (unchangedDecline(pr, memory.get(pr.num), now, mainCiRunId)) {
+      skippedUnchanged.push({ num: pr.num, reason: memory.get(pr.num).reason });
+    } else candidates.push(pr);
   }
   const classes = new Map(rankByDeliveryPriority(candidates.map((pr) => ({ id: pr.num, facts: {
     waitingSince: pr.firstAcceptedAt ?? pr.readyAt,
@@ -590,11 +679,20 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
   const age = (pr) => (order === 'oldest-ready' ? pr.readyAt : pr.firstAcceptedAt ?? pr.readyAt) ?? Infinity;
   candidates.sort((a, b) => (order === 'oldest-ready' ? 0 :
     classes.get(a.num) - classes.get(b.num) || buildIndex(a) - buildIndex(b)) || age(a) - age(b) || a.num - b.num);
+  // Stable partition: retain the configured order within both groups and keep every candidate.
+  const recentMisses = new Set(deprioritize);
+  candidates.sort((a, b) => Number(recentMisses.has(a.num)) - Number(recentMisses.has(b.num)));
+  // A hold only demotes while its own bounded memory is live; expired memory restores normal priority.
+  const knownHold = num => { const h = memory.get(num);
+    return typeof h?.reason === 'string' && !!h.reason && Number.isFinite(h.at) && now >= h.at
+      && now - h.at < Math.min(CATCH_UP_DECLINE_TTL_MS, Number.isFinite(h.ttlMs) && h.ttlMs > 0 ? h.ttlMs : CATCH_UP_DECLINE_TTL_MS); };
+  candidates.sort((a, b) => Number(knownHold(a.num)) - Number(knownHold(b.num)));
   const room = Math.max(0, capacity - queued);
   const plan = { run: candidates.slice(0, room).map(({ num, readyAt }) => ({ num, readyAt })),
     later: candidates.slice(room).map((p) => p.num), skipped };
   // Legacy callers serialize the three-field plan; expiry-aware callers also serialize expired.
   Object.defineProperty(plan, 'expired', { value: expired, enumerable: pendingSince !== undefined });
+  Object.defineProperty(plan, 'skippedUnchanged', { value: skippedUnchanged, enumerable: declines !== undefined });
   return plan;
 }
 
@@ -716,11 +814,16 @@ export function createEnqueueOnEvent({
   };
   const greenEvent = p => p.causes.some(c => /^check_(suite|run)\.completed=success$/.test(c));
   const misses = new Map();
+  const missedAt = new Map(); // num -> time of the last miss: bounds the landable-first reorder (never a permanent demotion)
   const backoff = new Map();
   const missBackoff = new Map();
+  // Intentionally volatile: a restart loses all decline memory and re-checks everything.
+  // This module has no state directory of its own; no persisted unknown state can suppress work.
+  const declines = new Map();
+  let catchUpMainCiRunId;
+  let batchingRetry = null; // a global batching deferral must be rechecked before other admissions
   const missSettings = s => ({ ...ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missBackoff, ...s.catchUp?.missBackoff });
-  const labelsDigest = pr => Array.isArray(pr?.labels) && pr.labels.every(l => typeof l?.name === 'string')
-    ? createHash('sha256').update(JSON.stringify(pr.labels.map(l => l.name).sort())).digest('hex') : null;
+  const labelsDigest = catchUpLabelsDigest;
   const missHold = (num, pr, s) => {
     const held = missBackoff.get(num);
     if (!held) return null;
@@ -879,18 +982,38 @@ export function createEnqueueOnEvent({
         clearSnapshot();
         listingSnapshot = join(tmpdir(), `${snapshotPrefix}-${catchUpRound}.json`);
         listedPrs = result.prs;
+        catchUpMainCiRunId = result.mainCiRunId;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));
+        const liveRounds = s.catchUp?.blockedBackoffRounds ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.blockedBackoffRounds;
+        const liveTtlMs = Math.min(CATCH_UP_DECLINE_TTL_MS, missSettings(s).ttlMinutes * 60_000);
+        for (const [num, stored] of [...declines]) {
+          let held = stored;
+          // Current settings win: disabling, zeroing or shortening the existing bounds applies to stored memory too.
+          if (!missSettings(s).enabled || !(liveRounds > 0) || !(liveTtlMs > 0)) { declines.delete(num); continue; }
+          // A drain code change invalidates remembered declines; unreadable code version fails open.
+          const nowCode = codeVersion();
+          if (!held.codeVersion || !nowCode || held.codeVersion !== nowCode) { declines.delete(num); continue; }
+          if (!(held.ttlMs <= liveTtlMs)) { held = { ...held, ttlMs: liveTtlMs }; declines.set(num, held); }
+          const current = result.prs.find(pr => pr.num === num);
+          if (!current || !unchangedDecline(current, held, now(), result.mainCiRunId)) {
+            // Existing wake backoffs must not mask a dedupe invalidation (including missing evidence).
+            backoff.delete(num);
+            missBackoff.delete(num);
+          }
+          if (!listed.has(num) || now() - held.at >= CATCH_UP_DECLINE_TTL_MS || !(catchUpRound <= held.untilRound)) declines.delete(num);
+        }
         for (const num of backoff.keys()) if (!listed.has(num)) backoff.delete(num);
         for (const num of missBackoff.keys()) if (!listed.has(num)) missBackoff.delete(num);
         const { capacity, source } = await readCapacity(s);
         catchUpRoom = Math.max(0, capacity - result.queued);
         catchUpCapacity = capacity;
         const pendingEntries = [...pending.values()];
-        const pendingSince = new Map(pendingEntries.filter(p => p.catchUp).map(p => [p.num, p.firstAt]));
+        const pendingSince = new Map(pendingEntries.map(p => [p.num, p.firstAt]));
         const planAt = now();
         const priorities = await readPriorities();
-        const inputs = { ...result, defaultBranch, ...priorities, repo: localSlug, now: planAt,
-          order: s.catchUp.order, pendingNums: pendingEntries.map(p => p.num), pendingSince,
+        const inputs = { ...result, declines, defaultBranch, ...priorities, repo: localSlug, now: planAt,
+          order: s.catchUp.order, deprioritize: new Set([...[...missedAt].filter(([num, at]) => misses.has(num) && planAt - at < missSettings(s).ttlMinutes * 60_000).map(([num]) => num)]),
+          pendingNums: pendingEntries.map(p => p.num), pendingSince,
           pendingExpiryMinutes: s.catchUp.pendingExpiryMinutes };
         const expiryPlan = planCatchUp({ ...inputs, capacity });
         for (const num of expiryPlan.expired) {
@@ -900,10 +1023,18 @@ export function createEnqueueOnEvent({
         const reserved = [...pending.values()].filter((p) => p.catchUp).length;
         const plan = planCatchUp({ ...inputs, capacity: capacity - reserved });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
-        log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
+        log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.skippedUnchanged.length ? `; skipped-unchanged: ${plan.skippedUnchanged.map(p => `#${p.num} (${p.reason.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')})`).join(', ')}` : ''}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
         for (const skip of plan.skipped) log(`enqueue-on-event: catch-up #${skip.num} — skipped: ${skip.reason}`);
+        // Resolve existing BLOCKED/timeout timers before spending room on drains. These are cheap
+        // wake checks, not recent enqueue misses: an unchanged timer skips without a child, while
+        // changed evidence must still be re-evaluated this round. A global batching hold likewise
+        // needs its original probe before any other admission; it applies to every candidate.
+        const planned = new Set([...plan.run.map(p => p.num), ...plan.later]);
+        const probes = new Set([...backoff.keys()].filter(num => planned.has(num) && !misses.has(num)));
+        if (planned.has(batchingRetry)) probes.add(batchingRetry);
+        for (const num of probes) queueCatchUp(num);
         for (const { num } of plan.run) queueCatchUp(num);
-        catchUpLater = plan.later.values();
+        catchUpLater = plan.later.filter(num => !probes.has(num)).values();
       }
     }
     const ran = [];
@@ -934,7 +1065,9 @@ export function createEnqueueOnEvent({
       const timeoutRounds = s.catchUp?.timeoutBackoffRounds ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.timeoutBackoffRounds;
       const held = backoff.get(p.num);
       const backoffRounds = held?.reason === 'timeout' ? timeoutRounds : blockedRounds;
-      if (held && (!backoffRounds || !signature || signature !== held.signature || catchUpRound > held.untilRound)) backoff.delete(p.num);
+      if (held && (!backoffRounds || !signature || signature !== held.signature || catchUpRound > held.untilRound
+        || held.reason === 'same-head-failed' && (!missSettings(s).enabled || !digest || digest !== held.labelsDigest
+          || now() - held.at >= missSettings(s).ttlMinutes * 60_000))) backoff.delete(p.num);
       if (pr && (pr.state && pr.state !== 'OPEN' || !pr.labels?.some(l => l?.name === READY_LABEL))) backoff.delete(p.num);
       const stagedGreen = greenEvent(p) && staged(p);
       const hold = pr ? catchUpSkipReason(pr, defaultBranch) : null;
@@ -952,7 +1085,7 @@ export function createEnqueueOnEvent({
       const blocked = p.catchUp && taken.causes.every(c => c === 'catch-up') && backoff.get(p.num);
       if (blocked) {
         const left = Math.min(blocked.rounds, blocked.untilRound - catchUpRound + 1);
-        const what = `backed off: ${blocked.reason === 'timeout' ? 'fast drain TIMED OUT' : 'BLOCKED'} at head ${pr.headRefOid.slice(0, 9)} (${left} of ${blocked.rounds} catch-up(s) left; retried sooner if its head or checks change)`;
+        const what = `backed off: ${blocked.reason === 'timeout' ? 'fast drain TIMED OUT' : blocked.reason === 'same-head-failed' ? 'mq-same-head-failed' : 'BLOCKED'} at head ${pr.headRefOid.slice(0, 9)} (${left} of ${blocked.rounds} catch-up(s) left; retried sooner if its head or checks change${blocked.reason === 'same-head-failed' ? ', labels change or TTL expires' : ''})`;
         log(`${prefix} — ${what}`);
         ran.push({ ...metadata, num: p.num, code: null, what, outcome: 'skipped' });
         refillCatchUp();
@@ -1009,6 +1142,18 @@ export function createEnqueueOnEvent({
             logged: previous?.reason === reason && previous.logged === true });
         }
         if (!r.error && (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed'))) backoff.delete(p.num);
+        // The kind alone also represents missing evidence. Require an affirmative failure reason,
+        // checking the full reason as well as the (truncated) summary so unreadable/incomplete
+        // evidence always retries. This changes retry timing only; the drain still owns admission.
+        if (backoff.get(p.num)?.reason === 'same-head-failed') backoff.delete(p.num);
+        if (!r.error && !r.timedOut && missSettings(s).enabled && blockedRounds > 0 && signature && digest
+          && enqueueOutcome?.outcome === 'not-enqueued' && enqueueOutcome.kind === 'mq-same-head-failed'
+          && summary.startsWith('not enqueued:') && typeof enqueueOutcome.reason === 'string'
+          && /same[- ]head.*failed|failed_checks/i.test(enqueueOutcome.reason)
+          && !/unreadable|incomplete/i.test(`${summary} ${enqueueOutcome.reason}`)) {
+          backoff.set(p.num, { signature, labelsDigest: digest, at: now(), rounds: blockedRounds,
+            untilRound: catchUpRound + blockedRounds, reason: 'same-head-failed' });
+        }
         if (p.catchUp && !r.error && blockedRounds > 0 && signature && summary.startsWith('skipped:') && /merge state BLOCKED|merge-gate hold/.test(summary)) {
           // A listing consumes a round even if capacity/window holds this PR until a later tick.
           backoff.set(p.num, { signature, rounds: blockedRounds, untilRound: catchUpRound + blockedRounds, reason: 'blocked' });
@@ -1041,10 +1186,12 @@ export function createEnqueueOnEvent({
         if (missed) {
           const count = (misses.get(p.num) || 0) + 1;
           misses.set(p.num, count);
+          missedAt.set(p.num, now());
           const threshold = s.catchUp?.missSmellAfter ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missSmellAfter;
           if (count % threshold === 0) log(`enqueue-on-event: SMELL enqueue-not-entering — #${p.num} missed the merge queue ${count} catch-up(s) in a row (last: ${what}); check the fast drain's enqueueOutcomes / adaptive batching state`);
         }
         if (p.catchUp && summary.startsWith('not enqueued: batching-deferred:')) {
+          batchingRetry = p.num;
           batchingDeferred = true;
           let dropped = 0;
           pending = new Map(pending);
@@ -1054,7 +1201,31 @@ export function createEnqueueOnEvent({
           catchUpRoom++;
           refillCatchUp();
         }
+        if (batchingRetry === p.num && !summary.startsWith('not enqueued: batching-deferred:')) batchingRetry = null;
         const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error });
+        declines.delete(p.num); // every actual outcome replaces the previous one, including success/error
+        // Allowlist: only affirmative, head-bound declines are remembered. Transient, infrastructure
+        // and unknown kinds (batching-deferred, merge-lock-held, live-state-unreadable, ...) always retry.
+        const declineReason = outcome === 'timeout' || outcome === 'error' ? null
+          : enqueueOutcome?.kind ? (CATCH_UP_DECLINE_DEDUPE_KINDS.has(enqueueOutcome.kind)
+            // mq-same-head-failed also stands for missing evidence: require the affirmative-failure guard.
+            && (enqueueOutcome.kind !== 'mq-same-head-failed' || (typeof enqueueOutcome.reason === 'string'
+              && /same[- ]head.*failed|failed_checks/i.test(enqueueOutcome.reason)
+              && !/unreadable|incomplete/i.test(`${summary} ${enqueueOutcome.reason}`)))
+            ? enqueueOutcome.kind : null)
+            : null; // untyped skips (e.g. BLOCKED) keep only their existing round-limited backoff
+        // Dedupe never outlives the existing same-head-failed bounds (blockedBackoffRounds, missBackoff TTL); 60 min is the ceiling.
+        const declineRounds = s.catchUp?.blockedBackoffRounds ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.blockedBackoffRounds;
+        if (['not-enqueued', 'skipped', 'refused'].includes(outcome) && declineReason && missSettings(s).enabled && declineRounds > 0) {
+          const listed = listedPrs?.find(candidate => candidate.num === p.num);
+          // Never associate a result with a different head/label snapshot from the listing.
+          if (listed?.headRefOid === pr?.headRefOid && listed?.labelsDigest === digest) {
+            declines.set(p.num, { headSha: pr.headRefOid, labelsDigest: digest,
+              checksDigest: listed.checksDigest, mainCiRunId: catchUpMainCiRunId,
+              reason: declineReason, codeVersion: codeVersion(), ttlMs: Math.min(CATCH_UP_DECLINE_TTL_MS, missSettings(s).ttlMinutes * 60_000), untilRound: catchUpRound + declineRounds,
+              at: startedAt }); // checks completed during the child must cause a retry too
+          }
+        }
         log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]${r.passTimings ? ` · phases: ${r.passTimings}` : ''}`);
         ran.push({ ...metadata, num: p.num, code: r.code, what, verified, outcome });
       };
@@ -1078,6 +1249,7 @@ export function createEnqueueOnEvent({
         if (depth?.ok && capacity > depth.queued) {
           for (const p of listedPrs) {
             if (p.isDraft || p.inQueue || (depth.queuedNums ? depth.queuedNums.includes(p.num) : completed.has(p.num))) continue;
+            if (unchangedDecline(p, declines.get(p.num), now(), catchUpMainCiRunId)) continue;
             let pr;
             try { pr = await readPr({ repo: localSlug, num: p.num }); } catch { continue; }
             const held = backoff.get(p.num);

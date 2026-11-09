@@ -2,9 +2,11 @@
 bornAs: xsg9540
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/lib/tools-root.mjs", "we:scripts/lib/tools-root-guard.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/remote-exec.mjs", "we:scripts/verify-lane.mjs"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-11-07"
+graduatedTo: b2daee14e70362da84f90f48f2d2c249ac46ea0d
 tags: []
 ---
 

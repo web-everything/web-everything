@@ -7,7 +7,7 @@
  * restampAcceptance spawns the CODE clone's review-set-label.
  *
  * Real git and copied production modules prove that the operator CLI re-executes
- * from fresh DATA, still refuses when both clones are stale, and honors knob-off.
+ * from fresh DATA or a leased lane when CODE == DATA, and honors knob-off.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -17,12 +17,25 @@ import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const TOY_CLI = `
-import { realpathSync } from 'node:fs';
+import { realpathSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-try { assertOperatorCliFresh(root, { label: 'toy-cli' }); }
+// Only the pool subprocess is a seam: freshness and CLI execution use real git/Node.
+const laneSpawn = (_cmd, args) => {
+  if (args[1] === 'acquire') return { status: 0, stdout: JSON.stringify({
+    lane: 8, path: process.env.WE_SOAK_FRESH_LANE, holder: 'soak-restamp-holder',
+  }) };
+  if (args[1] === 'release' && args.includes('--session=soak-restamp-holder')) {
+    writeFileSync(process.env.WE_SOAK_RELEASE_MARKER, 'released');
+    return { status: 0 };
+  }
+  throw new Error('unexpected lane operation');
+};
+try { assertOperatorCliFresh(root, { label: 'toy-cli',
+  ...(process.env.WE_SOAK_FRESH_LANE ? { laneSpawn } : {}),
+}); }
 catch (e) { process.stdout.write(e.message + '\\n'); process.exit(3); }
 process.stdout.write('ran-from=' + realpathSync(root) + '\\n');
 process.exit(0);
@@ -33,7 +46,7 @@ const git = (cwd, ...args) => execFileSync('git', args, {
 
 export default {
   id: 'drain-restamp-stale-code-clone',
-  title: 'drain acceptance re-stamp runs current code from fresh DATA when its CODE clone is stale',
+  title: 'drain acceptance re-stamp runs current code from fresh DATA or a leased lane when CODE == DATA',
   card: 'live incident 2026-10-11: drain acceptance re-stamp failed on PR #4880',
   fixedBy: {
     sha: '43c45e58d',
@@ -42,7 +55,7 @@ export default {
   },
   fixPresent(root) {
     const path = join(root, 'scripts/lib/main-staleness.mjs');
-    return existsSync(path) && readFileSync(path, 'utf8').includes('WE_OPERATOR_CLI_FRESH_REEXEC');
+    return existsSync(path) && readFileSync(path, 'utf8').includes('--purpose=operator-cli-fresh');
   },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {
     // Node canonicalizes import.meta.url; keep argv paths on that same macOS /private path.
@@ -60,9 +73,10 @@ export default {
       git(seed, 'config', 'user.name', 'soak');
       git(seed, 'config', 'commit.gpgsign', 'false');
       mkdirSync(join(seed, 'scripts/lib'), { recursive: true });
-      for (const file of ['main-staleness.mjs', 'daemon-last-good.mjs', 'daemon-clone-layout.mjs', 'settings-files.mjs']) {
+      for (const file of ['main-staleness.mjs', 'daemon-last-good.mjs', 'daemon-clone-layout.mjs', 'settings-files.mjs', 'daemon-events.mjs', 'handoff-path.mjs']) {
         copyFileSync(join(sourceRoot, 'scripts/lib', file), join(seed, 'scripts/lib', file));
       }
+      copyFileSync(join(sourceRoot, 'scripts/run-fresh.mjs'), join(seed, 'scripts/run-fresh.mjs'));
       writeFileSync(join(seed, 'scripts/toy-cli.mjs'), TOY_CLI);
       const push = (message) => {
         git(seed, 'add', '.');
@@ -80,9 +94,9 @@ export default {
       for (const key of Object.keys(env)) {
         if (key === 'VITEST' || key === 'WE_DAEMON_MANAGED_CLONE' || key.startsWith('WE_OPERATOR_CLI_FRESH_')) delete env[key];
       }
-      const run = (overrides = {}) => {
+      const run = (overrides = {}, cwd = data) => {
         const result = spawnSync(process.execPath, [join(code, 'scripts/toy-cli.mjs')], {
-          cwd: data, env: { ...env, ...overrides }, encoding: 'utf8', timeout: 30_000,
+          cwd, env: { ...env, ...overrides }, encoding: 'utf8', timeout: 30_000,
         });
         if (result.error || result.signal || ![0, 3].includes(result.status)) {
           throw new Error(`toy CLI crashed: ${result.error?.message || result.signal || result.status}; ${result.stderr}`);
@@ -101,6 +115,20 @@ export default {
       const b = run();
       if (b.status !== 3 || !b.stdout.includes('STALE code from this checkout')) {
         violations.push({ invariant: 'guard-still-refuses-stale', detail: `exit=${b.status}; stdout=${b.stdout}; stderr=${b.stderr}` });
+      }
+
+      const fresh = join(dir, 'fresh-lane');
+      const released = join(dir, 'released');
+      git(dir, 'clone', '-q', origin, fresh);
+      const d = run({ WE_SOAK_FRESH_LANE: fresh, WE_SOAK_RELEASE_MARKER: released }, code);
+      if (d.status !== 0 || d.stdout.trim() !== `ran-from=${realpathSync(fresh)}` || !existsSync(released)) {
+        violations.push({ invariant: 'same-checkout-restamp-leases-and-releases',
+          detail: `exit=${d.status}; stdout=${d.stdout}; stderr=${d.stderr}; released=${existsSync(released)}` });
+      }
+      const e = run({ WE_OPERATOR_CLI_FRESH_FALLBACK: 'off',
+        WE_SOAK_FRESH_LANE: fresh, WE_SOAK_RELEASE_MARKER: released }, code);
+      if (e.status !== 3 || !e.stdout.includes('STALE code from this checkout')) {
+        violations.push({ invariant: 'same-checkout-knob-off-refuses', detail: `exit=${e.status}; stdout=${e.stdout}` });
       }
 
       git(data, 'pull', '--ff-only');

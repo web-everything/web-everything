@@ -124,10 +124,11 @@ export const ROLE_RELEVANCE = Object.freeze({
     || (e.type === 'pull_request_review' && e.action === 'submitted'),
 });
 
-export function isRelevantEvent(event, role, { repos = null } = {}) {
+export function isRelevantEvent(event, role, opts = {}) {
+  const { repos = null } = opts;
   if (!event || typeof event !== 'object') return false;
   if (Array.isArray(repos) && repos.length && !repos.includes(event.repo)) return false;
-  const rule = ROLE_RELEVANCE[role];
+  const rule = typeof opts.rule === 'function' ? opts.rule : ROLE_RELEVANCE[role];
   return rule ? !!rule(event) : true;
 }
 
@@ -172,7 +173,7 @@ export function createEventWaker(o) {
     healthyIntervalMs = PR_EVENTS_DEFAULTS.healthyIntervalMs, pollEveryMs = PR_EVENTS_DEFAULTS.pollEveryMs,
     staleAfterMs = PR_EVENTS_DEFAULTS.staleAfterMs, minWakeGapMs = PR_EVENTS_DEFAULTS.minWakeGapMs,
     poll = pollEvents, now = () => Date.now(), rawSleep = (ms) => new Promise((r) => { setTimeout(r, ms); }),
-    forward = [], localWake = () => false, log = console,
+    forward = [], localWake = () => false, log = console, rule = null,
   } = o;
   const writeStatus = o.writeStatus !== undefined ? o.writeStatus : (stateDir ? (s) => writeStatusFile(stateDir, role, s) : null);
   const st = { cursor: null, lastOkAt: null, lastFailAt: null, lastDeliveryAt: null, lastEventAt: null, lastError: null, initialized: false };
@@ -215,7 +216,7 @@ export function createEventWaker(o) {
       st.cursor = r.cursor;
       for (const e of r.events) {
         all.push(e);
-        if (isRelevantEvent(e, role, { repos })) relevant.push(e);
+        if (isRelevantEvent(e, role, { repos, rule })) relevant.push(e);
       }
       if (!r.more) break;
     }
