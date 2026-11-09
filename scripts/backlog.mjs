@@ -1169,7 +1169,12 @@ function buildQueue() {
     const waitUntil = Date.now() + 30_000;
     for (;;) {
       releaseLock = acquireBuildQueueLock({ file });
-      if (releaseLock) { process.on('exit', releaseLock); break; }
+      if (releaseLock) {
+        // Re-check under the lock: a prior holder may have published our key between our miss and the acquire.
+        const fresh = readBuildQueueCache({ file, key, now: Date.now(), maxAgeMs });
+        if (fresh !== null) { releaseLock(); writeAllSync(1, fresh); process.exit(0); }
+        process.on('exit', releaseLock); break;
+      }
       const cached = waitForBuildQueueCache({ file, key, timeoutMs: 250, maxAgeMs });
       if (cached !== null) { writeAllSync(1, cached); process.exit(0); }
       if (Date.now() >= waitUntil) break;
