@@ -12,12 +12,12 @@ afterEach(()=>{
   for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});
 });
 const now=Date.parse('2026-10-29T12:00:00.000-04:00');
-const settings={backoffMs:120000,maxLoadPerCore:0.8,minFreeRamPct:15};
+const settings={backoffMs:120000,maxLoadPerCore:0.8,minFreeRamPct:15,lastGoodMaxAgeMin:10};
 const sample=(ms=now)=>({sampledAtET:easternTimestamp(ms),cores:8,loadPerCore:0.12,memFreePct:96,activeRuns:0,recent:[]});
 const saved=(telemetry,lastReadAt)=>({v:1,lastReadAt,telemetry,failures:0,backoffUntil:0,trigger:''});
 const persist=(root,state)=>writeFileSync(join(root,'health.json'),JSON.stringify(state));
 const load=root=>JSON.parse(readFileSync(join(root,'health.json'),'utf8'));
-const check=(root,readTelemetry,time=now)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry});
+const check=(root,readTelemetry,time=now)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,sleep:async()=>{}});
 
 describe('Forge health freshness',()=>{
   it.each([now-60000,now-1000])('refreshes stale persisted telemetry exactly once with lastReadAt=%s',async lastReadAt=>{
@@ -26,7 +26,7 @@ describe('Forge health freshness',()=>{
     expect(await check(root,readTelemetry)).toEqual({ok:true});
     expect(readTelemetry).toHaveBeenCalledTimes(1);
     expect(readTelemetry).toHaveBeenCalledWith({host:'forge'});
-    expect(load(root)).toEqual(saved(fresh,now));
+    expect(load(root)).toEqual({...saved(fresh,now),lastGoodAt:now,lastGoodTelemetry:fresh});
   });
 
   it.each([
@@ -48,23 +48,34 @@ describe('Forge health freshness',()=>{
     expect(readTelemetry).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['offline','still-stale'])('refreshes a stale cached sample once and fails closed when %s',async outcome=>{
+  it.each([
+    ['offline','expired last-good'],
+    ['offline','stale legacy telemetry'],
+    ['still-stale','recent last-good'],
+  ])('refreshes a stale cached sample and fails closed when %s with %s',async(outcome,evidence)=>{
     const root=scratch(),readTelemetry=vi.fn(async()=>{
       if(outcome==='offline')throw new Error('offline');
       return sample(now-30001);
     });
-    persist(root,saved(sample(now-60000),now-1000));
+    const state=saved(sample(now-60000),now-1000);
+    if(evidence==='expired last-good'){
+      const lastGoodAt=now-settings.lastGoodMaxAgeMin*60000-1;
+      Object.assign(state,{lastGoodAt,lastGoodTelemetry:sample(lastGoodAt)});
+    }else if(evidence==='recent last-good'){
+      Object.assign(state,{lastGoodAt:now-1000,lastGoodTelemetry:sample(now-1000)});
+    }
+    persist(root,state);
     const reason=outcome==='offline'?'forge-unreachable':'telemetry-stale';
     expect(await check(root,readTelemetry)).toEqual({ok:false,reason});
     expect(load(root)).toMatchObject({lastReadAt:now,trigger:reason,backoffUntil:now+settings.backoffMs});
     expect(await check(root,readTelemetry,now+10000)).toEqual({ok:false,reason:`backoff-${reason}`});
-    expect(readTelemetry).toHaveBeenCalledTimes(1);
+    expect(readTelemetry).toHaveBeenCalledTimes(outcome==='offline'?2:1);
   });
 
   it('reports a cold-start read failure as forge-unreachable',async()=>{
     const readTelemetry=vi.fn(async()=>{throw new Error('offline');});
     expect(await check(scratch(),readTelemetry)).toEqual({ok:false,reason:'forge-unreachable'});
-    expect(readTelemetry).toHaveBeenCalledTimes(1);
+    expect(readTelemetry).toHaveBeenCalledTimes(2);
   });
 
   it('fails closed for a non-finite age without a second read',async()=>{
