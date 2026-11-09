@@ -24,6 +24,7 @@ import { detectRoundCap, judgeRound } from '../lib/round-judge.mjs';
 import { assessPrSweep } from '../operations/pr-sweep-core.mjs';
 import { createPrSweepReader, STALLED_AFTER_ENV, tailOf } from '../operations/pr-sweep-io.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { withFileLock } from '../lib/atomic-json-file.mjs';
 import { resolveRoundJudgeMode } from './round-judge-shadow.mjs';
 import { classifyStall, JUDGED_STATES, CLASSIFY_DEFAULTS, CLASSIFY_VALID } from './pr-stall-classify.mjs';
 import { resolveStallSweepSettings, STALL_SWEEP_DIR_ENV } from './pr-stall-settings.mjs';
@@ -53,9 +54,12 @@ export function stallSweepDir(env = process.env) {
 }
 const monthOf = (now) => new Date(now).toISOString().slice(0, 7);
 const prHeadValid = (v) => typeof v === 'string' && /^[\w.-]+\/[\w.-]+#[1-9]\d*@[0-9a-f]{40}$/.test(v) && !v.includes('\n');
+/** The operator rulings that authorize a restart-counter reset; any other ruling is not an authority. */
+export const RESET_RULINGS = Object.freeze(['R804']);
 const resetValid = (r) => prHeadValid(r.prHead) && r.prHead === `${r.repo}#${r.pr}@${r.head}`
   && Number.isSafeInteger(r.pr) && r.pr > 0
-  && ['actor', 'reason', 'ruling'].every(k => typeof r[k] === 'string' && r[k].trim());
+  && ['actor', 'reason', 'ruling'].every(k => typeof r[k] === 'string' && r[k].trim())
+  && RESET_RULINGS.includes(r.ruling);
 /** A reset clears restart count/spacing/idempotency only, never the hourly spend of other actions. */
 function afterRestartResets(history) {
   const resets = new Map();
@@ -293,11 +297,15 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
 
   // Read the budget, plan and durably record under ONE lock on the audit dir, so two overlapping passes can never both
   // spend the same remaining budget. A lock or write failure plans nothing.
-  // withFileLock is synchronous: retain this exclusive lock across the awaited dispatcher instead.
+  // withFileLock is synchronous, so the lock is held by hand across the awaited dispatcher. A pass killed while
+  // holding it leaves the file behind: first let withFileLock's shared stale takeover reclaim an aged lock whose
+  // holder is dead. It never waits and never steals a live or fresh holder's lock; the wx open below then refuses.
   const lock = join(outDir, '.lock');
+  const reclaimStaleLock = path => { try { withFileLock(path, () => {}, { timeoutMs: 0 }); } catch { /* held: refused below */ } };
   let locked = false;
   try {
     mkdirSync(outDir, { recursive: true });
+    reclaimStaleLock(lock);
     const fd = fs.openSync(lock, 'wx'); locked = true;
     try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
     return await commit();
@@ -379,8 +387,16 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         continue;
       }
       let head;
-      try { head = await readPrHead({ repo: i.repo, pr: i.pr }); } catch { head = null; }
-      if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head) || head !== i.head) {
+      try { head = await readPrHead({ repo: i.repo, pr: i.pr }); } catch (e) { head = null; base.errors.push(`head ${i.repo}#${i.pr}: ${msg(e)}`); }
+      if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) {
+        // An unreadable head is execute-time evidence failure: stop the whole pass, like status and liveness.
+        incomplete = true;
+        if (!base.errors.length) base.errors.push(`head ${i.repo}#${i.pr}: unreadable`);
+        record({ ...i, ts, phase: 'would-skip', held: 'PR head unreadable; operator must inspect' });
+        record({ ...records[0], incomplete: true, readFailed: true, errors: base.errors.slice(0, 5) });
+        break; // An unreadable head stops the pass.
+      }
+      if (head !== i.head) {
         record({ ...i, ts, phase: 'would-skip', held: 'PR head changed or unreadable; operator must inspect' });
         continue;
       }

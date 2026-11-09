@@ -1,6 +1,7 @@
 /** Live restart safety contracts, with isolated mutations proving each assertion detects a removed guard. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -102,6 +103,21 @@ describe('operator restart reset accounting contracts', () => {
     const mutant = await loadCopy('let hour = spending(history).filter(', 'let hour = spending(afterRestartResets(history)).filter(');
     await expect(resetPreservesHourlySpend(mutant, phase)).rejects.toThrow();
   });
+  // Only the ruling that authorizes this reset may clear a cap; any other recorded ruling clears nothing.
+  const unknownRulingKeepsCap = api => {
+    const reset = { phase: 'operator-reset', ...target, prHead: identityKey(target), actor: 'fixture-operator',
+      reason: 'owner inspected', ruling: 'whatever', ts: new Date(NOW - 30 * 60_000).toISOString() };
+    const limits = options(fixture()).settings.value;
+    const out = api.planStallActions([restartItem(target)], { history: [...restartHistory(target), reset], now: NOW, limits });
+    expect(out.act).toEqual([]);
+  };
+  it('a reset recorded under an unknown ruling clears no restart cap', async () => {
+    unknownRulingKeepsCap(await loadCopy());
+  });
+  it('mutation proof: a reset must name an allowed ruling', async () => {
+    const mutant = await loadCopy('&& RESET_RULINGS.includes(r.ruling)', '');
+    expect(() => unknownRulingKeepsCap(mutant)).toThrow();
+  });
 });
 
 function fixture() {
@@ -154,6 +170,41 @@ async function heldLock(run) {
   expect(out.act).toEqual([]);
   expect(records(dir)).toEqual([]);
   expect(fs.readFileSync(join(dir, '.lock'), 'utf8')).toBe('other-owner\n');
+}
+// A pass killed while holding the lock leaves it behind; an aged lock whose recorded holder is dead must self-heal.
+const deadPid = () => spawnSync(process.execPath, ['-e', '']).pid;
+async function agedLock(run, holder) {
+  const dir = fixture();
+  const lock = join(dir, '.lock');
+  fs.writeFileSync(lock, `${holder}\n`);
+  const aged = new Date(Date.now() - 10 * 60_000);
+  fs.utimesSync(lock, aged, aged);
+  const input = options(dir);
+  return { dir, lock, input, out: await run(input) };
+}
+async function deadHolderReclaimed(run) {
+  const { dir, lock, input, out } = await agedLock(run, deadPid());
+  expect(out.incomplete).toBe(false);
+  expect(input.dispatchRestart).toHaveBeenCalledTimes(1);
+  expect(records(dir).map(r => r.phase)).toEqual(['pass', 'intent', 'did']);
+  expect(fs.existsSync(lock)).toBe(false);
+}
+// Any failed or malformed execute-time head read stops every later candidate and marks the pass incomplete.
+async function headReadStops(run, failure = 'throw') {
+  const input = options(fixture(), {
+    read: () => ({ now: NOW, prs: [pr(11), pr(12)], liveJobs: [], unreadable: [], stalledAfterMinutes: 45 }),
+    readPrHead: vi.fn(({ pr: number }) => {
+      if (number !== 11) return HEAD;
+      if (failure === 'throw') throw new Error('head unavailable');
+      return failure === 'null' ? null : 'not-a-sha';
+    }),
+  });
+  const out = await run(input);
+  expect(input.dispatchRestart).not.toHaveBeenCalled();
+  expect(input.readPrHead).toHaveBeenCalledTimes(1);
+  expect(out.incomplete).toBe(true);
+  expect(records(input.dir).filter(r => r.phase === 'pass').at(-1)).toMatchObject({ incomplete: true });
+  expect(records(input.dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', pr: 11, held: expect.stringMatching(/head unreadable.*operator/) }));
 }
 async function durableIntent(run, refuse = false) {
   const dir = fixture();
@@ -228,6 +279,9 @@ const reread = ['const current = readAuditHistory(outDir);', 'const current = { 
 const guarantees = [
   ['unknown ownership refuses execution', unknownOwner, 'if (entry?.ownerAlive !== false)', 'if (false)'],
   ['exclusive lock refuses another owner without an audit write', heldLock, "fs.openSync(lock, 'wx')", "fs.openSync(lock, 'w')"],
+  ['an aged lock whose holder is dead is reclaimed', deadHolderReclaimed, 'reclaimStaleLock(lock);', ''],
+  ['a failed execute-time head read stops later candidates', headReadStops,
+    "if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) {", 'if (false) {'],
   ['durable intent precedes dispatch under the lock', durableIntent, "record({ ...i, ts, phase: 'intent', mode: cfg.mode });", ''],
   ['unwritable intent refuses dispatch', run => durableIntent(run, true), "record({ ...i, ts, phase: 'intent', mode: cfg.mode });", ''],
   ...['maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'maxRedTeamRestartsPerHead']
@@ -256,6 +310,18 @@ describe('live restart execution guarantees', () => {
     const input = options(fixture(), { settings });
     await runStallSweep(input);
     expect(input.dispatchRestart).toHaveBeenCalledTimes(mode === 'on' ? 1 : 0);
+  });
+
+  it('an aged lock whose holder is still alive is never stolen', async () => {
+    const { dir, lock, input, out } = await agedLock(runStallSweep, process.ppid);
+    expect(input.dispatchRestart).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+    expect(records(dir)).toEqual([]);
+    expect(fs.readFileSync(lock, 'utf8')).toBe(`${process.ppid}\n`);
+  });
+
+  it.each(['null', 'malformed'])('a %s execute-time head read stops later candidates', async failure => {
+    await headReadStops(runStallSweep, failure);
   });
 
   it('global off overrides the explicit live action', async () => {

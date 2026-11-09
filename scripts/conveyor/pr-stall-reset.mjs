@@ -6,7 +6,7 @@ import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
-import { appendAudit, stallSweepDir } from './pr-stall-sweep.mjs';
+import { appendAudit, RESET_RULINGS, stallSweepDir } from './pr-stall-sweep.mjs';
 
 export function resetRestartCounter({ dir, repo, pr, head, actor, reason, ruling, now = Date.now() } = {}) {
   const text = v => typeof v === 'string' && v.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(v);
@@ -16,6 +16,7 @@ export function resetRestartCounter({ dir, repo, pr, head, actor, reason, ruling
     || ![actor, reason, ruling].every(text) || !Number.isFinite(now)) {
     throw new Error('reset requires dir, repo, positive pr, 40-hex head, actor, reason, ruling and valid time');
   }
+  if (!RESET_RULINGS.includes(ruling)) throw new Error(`reset ruling must be one of ${RESET_RULINGS.join(', ')}`);
   const record = { phase: 'operator-reset', repo, pr, head, prHead: `${repo}#${pr}@${head}`,
     actor, reason, ruling, ts: new Date(now).toISOString() };
   mkdirSync(dir, { recursive: true });

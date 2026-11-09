@@ -75,6 +75,12 @@ describe('R804 operator reset acceptance', () => {
       await expect(async () => resetRestartCounter({ ...input, head })).rejects.toThrow();
       expect(files(input.dir)).toEqual([]);
     });
+  it.each(['whatever', 'R805', 'r804', ' R804', 'R804 '])('R804 unknown ruling %j throws and writes nothing', async ruling => {
+    const resetRestartCounter = await loadReset();
+    const input = fixture();
+    await expect(async () => resetRestartCounter({ ...input, ruling })).rejects.toThrow(/ruling/);
+    expect(files(input.dir)).toEqual([]);
+  });
   it('R804 rejected reset leaves existing audit history byte-for-byte unchanged', async () => {
     const resetRestartCounter = await loadReset();
     const input = fixture();
@@ -114,6 +120,14 @@ describe('R804 operator reset acceptance', () => {
       expect(result.status).not.toBe(0);
       expect(files(input.dir)).toEqual([]);
     });
+  it('R804 CLI unknown --ruling exits nonzero and writes nothing', async () => {
+    await loadReset();
+    const input = { ...fixture(), ruling: 'whatever' };
+    const result = cli(input);
+    expect(result.error).toBeUndefined();
+    expect(result.status).not.toBe(0);
+    expect(files(input.dir)).toEqual([]);
+  });
   it('R804 CLI bad head exits nonzero and writes nothing', async () => {
     await loadReset();
     const input = { ...fixture(), head: 'not-a-sha' };

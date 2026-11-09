@@ -941,17 +941,20 @@ describe('R804 restart-only live acceptance', () => {
       expect(existsSync(join(dir, '.lock'))).toBe(true);
       return head;
     });
-    const { dispatchRestart } = await run({ dir, readPrHead });
+    const { out, dispatchRestart } = await run({ dir, readPrHead });
     expect(readPrHead).toHaveBeenCalledWith({ repo: REPO, pr: 11 });
     expect(dispatchRestart).not.toHaveBeenCalled();
+    // A readable but moved head only skips that candidate; an unreadable head stops the pass as incomplete.
+    expect(out.incomplete).toBe(head !== 'b'.repeat(40));
     expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', head: HEAD,
-      held: expect.stringMatching(/head changed or unreadable.*operator/) }));
+      held: expect.stringMatching(/head (changed or )?unreadable.*operator/) }));
     expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
   });
   it('execution refuses a failed live-head read without dispatch', async () => {
-    const { dir, dispatchRestart } = await run({ readPrHead: () => { throw new Error('head unavailable'); } });
+    const { out, dir, dispatchRestart } = await run({ readPrHead: () => { throw new Error('head unavailable'); } });
     expect(dispatchRestart).not.toHaveBeenCalled();
-    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/head changed or unreadable.*operator/) }));
+    expect(out.incomplete).toBe(true);
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/head unreadable.*operator/) }));
   });
   it('launch receipts and durable spend carry the assessed expected head', async () => {
     const { dir, dispatchRestart } = await run();
