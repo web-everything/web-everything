@@ -79,10 +79,37 @@ describe('daemon renderer', () => {
     expect(diffPlists(xml, { Label: label, ProgramArguments: [label], EnvironmentVariables: { PATH: host.path } })).toEqual([]);
   });
 
-  // The rendered publisher command runs under /bin/zsh on the macOS host. zsh is absent on Linux CI, so the
-  // production-shell run is explicitly skipped there (visible as skipped) and a /bin/sh run always covers the
-  // POSIX source's quoting.
-  const metacharacterProbe = shellArgv => {
+  // Rendered-output contract (no host shell): the publisher command reads the home from its environment, so a
+  // hostile host.home is carried only as an XML-escaped environment value and is never substituted into the
+  // shell source or interpreted by the renderer.
+  const decode = text => text.replace(/&(amp|lt|gt|quot|apos);/g, (_match, entity) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[entity]);
+  const hostileHome = '/home-$(touch dollar-executed)-`touch backtick-executed`-$HOME-\'"&<>';
+  const renderPublisher = () => {
+    const publisher = readTable().tasks.find(entry => entry.label === 'com.plateau.wip-publisher');
+    const xml = renderPlist(publisher, { ...host, home: hostileHome });
+    const args = [...xml.match(/<array>([\s\S]*?)<\/array>/)[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map(match => decode(match[1]));
+    const env = Object.fromEntries([...xml.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)[1].matchAll(/<key>([^<]*)<\/key>\s*<string>([\s\S]*?)<\/string>/g)].map(match => [decode(match[1]), decode(match[2])]));
+    return { xml, args, env };
+  };
+
+  it('preserves shell metacharacters in host.home verbatim in the rendered environment and never in the command', () => {
+    const { xml, args, env } = renderPublisher();
+    expect(env.WE_WIP_PUBLISH_HOME).toBe(hostileHome);
+    expect(env.WE_STATE_ROOT).toBe(`${hostileHome}/workspace/webeverything`);
+    expect(args).toHaveLength(3);
+    expect(args.slice(0, 2)).toEqual(['/bin/zsh', '-lc']);
+    expect(args[2]).toContain('"$WE_WIP_PUBLISH_HOME/workspace/plateau-app"');
+    for (const fragment of ['dollar-executed', 'backtick-executed', hostileHome]) expect(args[2]).not.toContain(fragment);
+    expect(xml).toContain('&quot;&amp;&lt;&gt;');
+    expect(xml).not.toContain('{home}');
+    expect(xml).toContain(`<string>${hostileHome.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;')}/Library/Logs/plateau-wip-publisher.log</string>`);
+  });
+
+  // Shell-integration test: the ONE test that executes a host shell (the production /bin/zsh). Skipped with a
+  // printed reason where zsh is absent (Linux CI); the contract above is asserted on rendered output regardless.
+  const zshPresent = existsSync('/bin/zsh');
+  if (!zshPresent) console.info('SKIP shell-integration test: /bin/zsh is absent on this host');
+  it.skipIf(!zshPresent)('shell-integration: rendered publisher command runs under /bin/zsh without executing host.home substitutions', () => {
     const root = temp();
     const home = join(root, 'home-$(touch dollar-executed)-`touch backtick-executed`-$HOME-\'"&<>');
     const app = join(home, 'workspace/plateau-app');
@@ -91,29 +118,14 @@ describe('daemon renderer', () => {
     mkdirSync(bin);
     writeFileSync(join(bin, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
     writeFileSync(join(bin, 'npm'), '#!/bin/sh\nprintf "%s\\n" "$PWD"\n', { mode: 0o700 });
-
     const publisher = readTable().tasks.find(entry => entry.label === 'com.plateau.wip-publisher');
     const xml = renderPlist(publisher, { ...host, home, path: `${bin}:/usr/bin:/bin` });
-    const decode = text => text.replace(/&(amp|lt|gt|quot|apos);/g, (_match, entity) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[entity]);
     const args = [...xml.match(/<array>([\s\S]*?)<\/array>/)[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map(match => decode(match[1]));
     const env = Object.fromEntries([...xml.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)[1].matchAll(/<key>([^<]*)<\/key>\s*<string>([\s\S]*?)<\/string>/g)].map(match => [decode(match[1]), decode(match[2])]));
-    expect(env.WE_WIP_PUBLISH_HOME).toBe(home);
-    expect(args.slice(0, 2)).toEqual(['/bin/zsh', '-lc']);
-    expect(args[2]).not.toContain(home);
-    const [shell, flags] = shellArgv(args);
-    const output = execFileSync(shell, [...flags, args[2]], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
+    const output = execFileSync('/bin/zsh', ['-f', '-c', args[2]], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
     expect(output.trim()).toBe(realpathSync(app));
     expect(existsSync(join(root, 'dollar-executed'))).toBe(false);
     expect(existsSync(join(root, 'backtick-executed'))).toBe(false);
-  };
-
-  it.skipIf(!existsSync('/bin/zsh'))('preserves shell metacharacters in host.home without executing substitutions (rendered /bin/zsh)', () => {
-    // Disable startup files for the probe; run the rendered shell source with only rendered env.
-    metacharacterProbe(args => [args[0], ['-f', '-c']]);
-  });
-
-  it('preserves shell metacharacters in host.home without executing substitutions (POSIX /bin/sh)', () => {
-    metacharacterProbe(() => ['/bin/sh', ['-c']]);
   });
 
   it('preserves booleans, intervals, paths and process type and reports leaf differences', () => {
