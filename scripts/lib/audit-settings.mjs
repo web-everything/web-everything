@@ -215,7 +215,9 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/backfill-changed-files.mjs', 'scripts/conveyor/run-scorecard-store.mjs',
   'scripts/conveyor/soak/breaks/daemon-entry-boot-crash.mjs', 'scripts/conveyor/soak/breaks/exhausted-retry-recovery.mjs',
   'scripts/lib/drain-facts-source.mjs', 'scripts/lib/merge-queue-hook.mjs', 'scripts/lib/pr-size-admission.mjs',
-  'scripts/lib/renamed-pr-refresh.mjs', 'scripts/operations/operator-notify-cli.mjs']);
+  'scripts/lib/renamed-pr-refresh.mjs', 'scripts/operations/operator-notify-cli.mjs',
+  // Landed on main since: the daemon self-sync lock user.
+  'scripts/lib/daemon-self-sync.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
@@ -227,6 +229,9 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',
   // Claims and mutexes are locks too (PR #6381 red team: the fix dispatch claim store).
   'scripts/**/*claim*', 'scripts/*claim*', 'scripts/**/*mutex*', 'scripts/*mutex*', ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS,
+  // Hold-scan modules the source-scan floor test found missing (PR #6381 judge).
+  'scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.mjs', 'scripts/lib/archive-closed-review-runs.mjs',
+  'scripts/lib/reap-dead-review-runs.mjs', 'scripts/lib/run-abandoned.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
