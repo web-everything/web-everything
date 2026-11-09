@@ -1,0 +1,279 @@
+// @vitest-environment node
+import {afterEach, beforeEach, describe, expect, it} from 'vitest';
+import * as fs from 'node:fs/promises';
+import {join} from 'node:path';
+import {resolveSettings, planPrune, scanCache, executePrune, readLiveEvidence} from '../forge-cache-prune.mjs';
+
+const HOUR = 3_600_000, GiB = 1024 ** 3, now = Date.UTC(2026, 10, 9);
+const hex = c => c.repeat(64), lock = hex('a');
+let tmp, root, receipts;
+beforeEach(async () => {
+  tmp = await fs.mkdtemp(join(process.env.TMPDIR, 'forge-cache-prune-'));
+  root = join(tmp, 'cache'); receipts = join(tmp, 'receipts');
+  await fs.mkdir(root); await fs.mkdir(receipts);
+});
+afterEach(async () => { if (tmp) await fs.rm(tmp, {recursive: true, force: true}); });
+
+const key = e => `${e.lock}/${e.name}`;
+const keys = entries => entries.map(key).sort();
+const entry = (c, age, bytes = 10) => ({lock, name: `dev-v5-${hex(c)}`,
+  path: join(root, lock, `dev-v5-${hex(c)}`), mtimeMs: now - age * HOUR, bytes});
+// The pure planner receives the same explicit root as the scanner/executor so
+// it can reject paths outside that boundary without accessing the filesystem.
+const plan = (entries, options = {}) => planPrune({root, entries, now,
+  settings: resolveSettings({}), disk: {usedPct: 20, totalBytes: 1000, usedBytes: 200},
+  live: {complete: true, profiles: new Set()}, ...options});
+const settings = overrides => ({...resolveSettings({}), ...overrides});
+function expectDecision(result, prune, keep) {
+  expect(keys(result.prune)).toEqual(keys(prune));
+  expect(keys(result.keep)).toEqual(keys(keep));
+  for (const e of [...result.prune, ...result.keep]) expect(e.reason).toEqual(expect.stringMatching(/\S/));
+  for (const original of [...prune, ...keep]) {
+    expect([...result.prune, ...result.keep].find(e => key(e) === key(original))).toMatchObject(original);
+  }
+}
+async function materialize(c = 'b', age = 20) {
+  const e = entry(c, age);
+  await fs.mkdir(e.path, {recursive: true});
+  await fs.writeFile(join(e.path, 'payload'), 'cache');
+  await fs.utimes(e.path, e.mtimeMs / 1000, e.mtimeMs / 1000);
+  return (await scanCache(root)).find(p => p.name === e.name);
+}
+const exists = async path => fs.lstat(path).then(() => true, e => {
+  if (e.code === 'ENOENT') return false;
+  throw e;
+});
+async function json(path, value) {
+  await fs.mkdir(join(path, '..'), {recursive: true});
+  await fs.writeFile(path, JSON.stringify(value));
+}
+async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active') {
+  await json(join(receipts, worker, 'reservation.json'), {run});
+  return run;
+}
+const record = siblings => ({lock, inputDigest: hex('b'), manifestDigest: hex('c'),
+  manifest: siblings ? {siblings: {frontierui: {sha: 'd'.repeat(40)}}} : {}});
+
+describe('resolveSettings', () => {
+  it('defaults to bounded retention and reports default provenance', () => {
+    expect(resolveSettings({})).toEqual({maxAgeHours: 12, maxBytes: 200 * GiB,
+      highWaterPct: 80, minAgeMs: HOUR,
+      sources: expect.objectContaining({maxAgeHours: 'default', maxBytes: 'default', highWaterPct: 'default'})});
+  });
+  it('reads each environment setting and records its non-default source', () => {
+    const s = resolveSettings({FORGE_CACHE_MAX_AGE_HOURS: '18', FORGE_CACHE_MAX_BYTES: '4096',
+      FORGE_CACHE_HIGH_WATER_PCT: '90'});
+    expect(s).toMatchObject({maxAgeHours: 18, maxBytes: 4096, highWaterPct: 90, minAgeMs: HOUR});
+    for (const k of ['maxAgeHours', 'maxBytes', 'highWaterPct']) {
+      expect(s.sources[k]).toEqual(expect.stringMatching(/\S/));
+      expect(s.sources[k]).not.toBe('default');
+    }
+  });
+  it.each([['1', 6], ['1000000', 24]])('clamps age %s to %i hours', (raw, expected) => {
+    expect(resolveSettings({FORGE_CACHE_MAX_AGE_HOURS: raw}).maxAgeHours).toBe(expected);
+  });
+  it.each(['', 'garbage', '12hours', 'NaN', 'Infinity', '-Infinity'])
+  ('invalid values %j fall back with default provenance', raw => {
+    expect(resolveSettings({FORGE_CACHE_MAX_AGE_HOURS: raw, FORGE_CACHE_MAX_BYTES: raw,
+      FORGE_CACHE_HIGH_WATER_PCT: raw})).toMatchObject({maxAgeHours: 12, maxBytes: 200 * GiB,
+      highWaterPct: 80, sources: {maxAgeHours: 'default', maxBytes: 'default', highWaterPct: 'default'}});
+  });
+  it.each(['0', '-1', '1e999'])('rejects nonpositive or overflowing size caps %s', raw => {
+    expect(resolveSettings({FORGE_CACHE_MAX_BYTES: raw})).toMatchObject({maxBytes: 200 * GiB,
+      sources: {maxBytes: 'default'}});
+  });
+  it.each(['-1', '101'])('rejects out-of-range high water %s', raw => {
+    expect(resolveSettings({FORGE_CACHE_HIGH_WATER_PCT: raw})).toMatchObject({highWaterPct: 80,
+      sources: {highWaterPct: 'default'}});
+  });
+  it('keeps the one-hour hard floor despite an unrecognized minimum-age override', () => {
+    expect(resolveSettings({FORGE_CACHE_MIN_AGE_MS: '0'}).minAgeMs).toBe(HOUR);
+  });
+});
+
+describe('planPrune', () => {
+  it('age: prunes older profiles inside a hot lock while keeping younger profiles', () => {
+    const old = entry('b', 13), young = entry('c', 11), boundary = entry('d', 12);
+    expectDecision(plan([young, old, boundary]), [old], [young, boundary]);
+  });
+  it('size cap: prunes oldest first until retained bytes fit the cap', () => {
+    const oldest = entry('b', 10, 40), middle = entry('c', 8, 40), newest = entry('d', 2, 40);
+    expectDecision(plan([newest, oldest, middle], {settings: settings({maxBytes: 50})}),
+      [oldest, middle], [newest]);
+  });
+  it('high-water: reaches the five-point hysteresis target using oldest eligible profiles', () => {
+    const oldest = entry('b', 10, 60), middle = entry('c', 8, 40), newer = entry('d', 2, 100);
+    const infant = entry('e', 0.5, 500), disk = {usedPct: 85, usedBytes: 850, totalBytes: 1000};
+    const result = plan([infant, newer, middle, oldest], {disk});
+    expectDecision(result, [oldest, middle], [newer, infant]);
+    expect((disk.usedBytes - result.prune.reduce((n, e) => n + e.bytes, 0)) / disk.totalBytes * 100).toBe(75);
+  });
+  it('high-water: does not reclaim at the threshold itself', () => {
+    const e = entry('b', 2, 100);
+    expectDecision(plan([e], {disk: {usedPct: 80, usedBytes: 800, totalBytes: 1000}}), [], [e]);
+  });
+  it.each(['age', 'size', 'high-water'])('live-run exclusion and minimum age survive %s pressure', pressure => {
+    const live = entry('b', 30, 300), infant = entry('c', 0.5, 300), eligible = entry('d', 3, 300);
+    const options = {live: {complete: true, profiles: new Set([key(live)])}};
+    if (pressure === 'age') options.settings = settings({maxAgeHours: 2});
+    if (pressure === 'size') options.settings = settings({maxBytes: 1});
+    if (pressure === 'high-water') options.disk = {usedPct: 99, usedBytes: 990, totalBytes: 1000};
+    expectDecision(plan([infant, live, eligible], options), [eligible], [live, infant]);
+  });
+  it.each([20, 99])('fail closed: incomplete live evidence refuses all deletion at %i%% disk usage', usedPct => {
+    const e = entry('b', 40, 900);
+    const result = plan([e], {settings: settings({maxBytes: 1}),
+      disk: {usedPct, usedBytes: usedPct * 10, totalBytes: 1000}, live: {complete: false, profiles: new Set()}});
+    expectDecision(result, [], [e]);
+    expect(result.refused).toEqual(expect.stringMatching(/\S/));
+  });
+  it('bad input: malformed lock/name or an inexact path can never enter prune', () => {
+    const valid = entry('b', 30);
+    const invalid = [
+      {...valid, lock: 'A'.repeat(64)}, {...valid, lock: 'a'.repeat(63)},
+      {...valid, name: `dev-v5-${'B'.repeat(64)}`}, {...valid, name: `dev-v5-${'b'.repeat(65)}`},
+      {...valid, path: join(tmp, 'elsewhere', lock, valid.name)},
+      {...valid, path: join(root, lock, 'nested', valid.name)},
+      {...valid, path: `${root}/${lock}/../${lock}/${valid.name}`},
+    ];
+    for (const e of invalid) expect(plan([e], {settings: settings({maxBytes: 1}),
+      disk: {usedPct: 99, usedBytes: 990, totalBytes: 1000}}).prune).toEqual([]);
+  });
+  it('is pure: does not mutate input entries, settings, disk or live profiles', () => {
+    const entries = [Object.freeze(entry('b', 20)), Object.freeze(entry('c', 2))];
+    const live = {complete: true, profiles: new Set([key(entries[1])])};
+    const options = {settings: Object.freeze(settings({})), disk: Object.freeze({usedPct: 20,
+      usedBytes: 200, totalBytes: 1000}), live};
+    const before = structuredClone({entries, ...options});
+    Object.freeze(entries);
+    expectDecision(plan(entries, options), [entries[0]], [entries[1]]);
+    expect({entries, ...options}).toEqual(before);
+  });
+});
+
+describe('scanCache', () => {
+  it('scans only matching real profile directories at depth two and sums files without following symlinks', async () => {
+    const e = await materialize();
+    await fs.mkdir(join(e.path, 'nested'));
+    await fs.writeFile(join(e.path, 'nested', 'data'), '1234567');
+    const outside = join(tmp, 'outside'); await fs.mkdir(outside);
+    await fs.writeFile(join(outside, 'secret'), 'x'.repeat(100));
+    await fs.symlink(outside, join(e.path, 'linked-dir'));
+    await fs.symlink(join(outside, 'secret'), join(e.path, 'linked-file'));
+    await fs.symlink(outside, join(root, lock, `dev-v5-${hex('c')}`));
+    await fs.symlink(join(root, lock), join(root, hex('d')));
+    await fs.writeFile(join(root, lock, `dev-v5-${hex('e')}`), 'not a directory');
+    await fs.mkdir(join(root, 'bad-lock', e.name), {recursive: true});
+    await fs.mkdir(join(root, lock, 'bad-profile'));
+    await fs.mkdir(join(root, e.name));
+    await fs.mkdir(join(root, lock, 'extra', `dev-v5-${hex('f')}`), {recursive: true});
+    const found = await scanCache(root);
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({lock, name: e.name, path: e.path, bytes: 12,
+      mtimeMs: (await fs.lstat(e.path)).mtimeMs});
+  });
+});
+
+describe('executePrune', () => {
+  it('dry-run deletes neither profiles nor their warm-input indexes', async () => {
+    const e = await materialize(), marker = join(root, lock, '.warm-inputs-one');
+    await json(marker, {profile: hex('b'), archiveDigest: hex('f')});
+    await executePrune(plan([e]), {root, apply: false});
+    expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
+    expect(await exists(marker)).toBe(true);
+  });
+  it('apply deletes only planned profiles and indexes pointing at those profiles', async () => {
+    const old = await materialize(), young = await materialize('c', 2);
+    const parent = join(root, lock), removed = join(parent, '.warm-inputs-old');
+    await json(removed, {profile: hex('b'), archiveDigest: hex('f')});
+    const retained = join(parent, '.warm-inputs-young');
+    await json(retained, {profile: hex('c'), archiveDigest: hex('f')});
+    const result = plan([old, young]);
+    await executePrune(result, {root, apply: true});
+    expect(await exists(old.path)).toBe(false); expect(await exists(removed)).toBe(false);
+    expect(await exists(young.path)).toBe(true); expect(await exists(retained)).toBe(true);
+  });
+  it('skips a profile whose mtime changed after scan and preserves its index', async () => {
+    const e = await materialize(), result = plan([e]), marker = join(root, lock, '.warm-inputs-old');
+    await json(marker, {profile: hex('b'), archiveDigest: hex('f')});
+    await fs.utimes(e.path, now / 1000, now / 1000);
+    await executePrune(result, {root, apply: true});
+    expect(await exists(e.path)).toBe(true); expect(await exists(marker)).toBe(true);
+  });
+  it('does not follow or delete a symlink swapped in after scan', async () => {
+    const e = await materialize(), result = plan([e]), saved = join(tmp, 'saved');
+    await fs.rename(e.path, saved); await fs.symlink(saved, e.path);
+    await executePrune(result, {root, apply: true});
+    expect((await fs.lstat(e.path)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(join(saved, 'payload'), 'utf8')).toBe('cache');
+  });
+  it('skips a regular file swapped in after scan', async () => {
+    const e = await materialize(), result = plan([e]);
+    await fs.rm(e.path, {recursive: true}); await fs.writeFile(e.path, 'replacement');
+    await executePrune(result, {root, apply: true});
+    expect(await fs.readFile(e.path, 'utf8')).toBe('replacement');
+  });
+  it.each(['traversal', 'outside', 'depth', 'bad-name', 'bad-lock', 'linked-lock'])
+  ('refuses forged %s paths even in an explicitly supplied prune plan', async kind => {
+    const e = await materialize(), outside = join(tmp, 'outside', lock, e.name);
+    await fs.mkdir(outside, {recursive: true}); await fs.writeFile(join(outside, 'payload'), 'outside');
+    let forged = {...e};
+    if (kind === 'traversal') forged.path = `${root}/../outside/${lock}/${e.name}`;
+    if (kind === 'outside') forged.path = outside;
+    if (kind === 'depth') forged.path = join(root, lock, 'nested', e.name);
+    if (kind === 'bad-name') { forged.name = 'unexpected'; forged.path = join(root, lock, forged.name); }
+    if (kind === 'bad-lock') { forged.lock = 'invalid'; forged.path = join(root, forged.lock, e.name); }
+    if (['depth', 'bad-name', 'bad-lock'].includes(kind)) await fs.mkdir(forged.path, {recursive: true});
+    if (kind === 'linked-lock') {
+      await fs.rename(join(root, lock), join(tmp, 'saved-lock'));
+      await fs.symlink(join(tmp, 'saved-lock'), join(root, lock));
+    }
+    // Keep mtime valid so an unrelated stale-entry guard cannot mask a bad path check.
+    await fs.utimes(forged.path, e.mtimeMs / 1000, e.mtimeMs / 1000);
+    // Refusal may be returned as a skip or thrown; neither permits deletion.
+    try { await executePrune({prune: [{...forged, reason: 'age'}], keep: []}, {root, apply: true}); }
+    catch (error) { expect(error).toBeInstanceOf(Error); }
+    expect(await exists(forged.path)).toBe(true);
+    expect(await fs.readFile(join(outside, 'payload'), 'utf8')).toBe('outside');
+    expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
+  });
+});
+
+describe('readLiveEvidence', () => {
+  it('an empty readable receipts directory is complete with no protected profiles', async () => {
+    expect(await readLiveEvidence({receipts})).toMatchObject({complete: true, profiles: new Set()});
+  });
+  it.each(['prepared', 'running', 'receipt'].flatMap(suffix => [false, true].map(siblings => [suffix, siblings])))
+  ('reads %s records and selects the digest with manifest.siblings=%s', async (suffix, siblings) => {
+    const run = await reserve(); await json(join(receipts, `${run}.${suffix}`), record(siblings));
+    const result = await readLiveEvidence({receipts});
+    expect(result.complete).toBe(true);
+    expect(result.profiles).toEqual(new Set([`${lock}/dev-v5-${hex(siblings ? 'c' : 'b')}`]));
+  });
+  it('unions numbered and legacy reservations including warm runs, ignoring inactive records', async () => {
+    const a = await reserve(), b = await reserve(`warm-${'2'.repeat(32)}`, 'worker-active-2');
+    await json(join(receipts, `${a}.running`), record(false));
+    await json(join(receipts, `${b}.prepared`), {...record(true), lock: hex('e')});
+    await json(join(receipts, `r-${'3'.repeat(32)}.receipt`), {...record(false), lock: hex('f')});
+    expect(await readLiveEvidence({receipts})).toMatchObject({complete: true,
+      profiles: new Set([`${lock}/dev-v5-${hex('b')}`, `${hex('e')}/dev-v5-${hex('c')}`])});
+  });
+  it.each(['missing-record', 'malformed-record', 'unreadable-record', 'malformed-reservation',
+    'unreadable-reservation', 'missing-reservation', 'invalid-run', 'invalid-digest'])
+  ('fail closed on %s even when another active run has valid evidence', async fault => {
+    const good = await reserve(); await json(join(receipts, `${good}.running`), record(false));
+    const run = await reserve(`warm-${'2'.repeat(32)}`, 'worker-active-1');
+    const reservation = join(receipts, 'worker-active-1', 'reservation.json'), file = join(receipts, `${run}.prepared`);
+    if (fault === 'malformed-record') await fs.writeFile(file, '{');
+    if (fault === 'unreadable-record') await fs.mkdir(file); // EISDIR, independent of uid/mode.
+    if (fault === 'malformed-reservation') await fs.writeFile(reservation, '{');
+    if (fault === 'unreadable-reservation') { await fs.unlink(reservation); await fs.mkdir(reservation); }
+    if (fault === 'missing-reservation') await fs.unlink(reservation);
+    if (fault === 'invalid-run') await json(reservation, {run: '../escape'});
+    if (fault === 'invalid-digest') await json(file, {...record(false), inputDigest: 'bad'});
+    expect((await readLiveEvidence({receipts})).complete).toBe(false);
+  });
+  it('fail closed when the receipts directory cannot be read', async () => {
+    expect((await readLiveEvidence({receipts: join(tmp, 'missing')})).complete).toBe(false);
+  });
+});
