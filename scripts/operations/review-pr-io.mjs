@@ -45,7 +45,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, openSync, unlinkSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -71,7 +71,7 @@ const MANDATORY_LEDGER_SYNC_PASSES = 3;
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
-import { sharedRunsDir } from './run-store.mjs';
+import { createFileRunStore, sharedRunsDir } from './run-store.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -139,6 +139,50 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
     throw new TypeError(`operations: invalid review write-up file name ${JSON.stringify(bodyFile)} — expected a bare file name`);
   }
   return join(reviewSidecarDir(root), runId, name);
+}
+
+/**
+ * Resume-from-any-lane: make sure the run's staged write-up exists under THIS checkout's sidecar.
+ *
+ * The write-up is staged under the checkout that ran effect 0, but a `--resume` may run from another lane, whose
+ * sidecar has no such file. The durable run record keeps the frozen `WRITE_UP` payload, so a missing file is
+ * regenerated from it (same bytes the first stage wrote), and a staged file that differs from the frozen payload is
+ * rewritten from it. A missing, unreadable or write-up-less record refuses (not-applied): the frozen payload is the only evidence.
+ *
+ * @returns {string} the body path (whether or not it could be recovered).
+ */
+export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
+  const path = reviewBodyPath({ root, runId, bodyFile });
+  // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included.
+  for (const part of [join(root, '.operations'), reviewSidecarDir(root), dirname(path), path]) {
+    let link = false;
+    try { link = lstatSync(part).isSymbolicLink(); } catch { /* not created yet */ }
+    if (link) throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
+  }
+  let record = null;
+  try { record = (runStore ?? createFileRunStore()).read(runId); } catch (e) {
+    // An unreadable or corrupt record is not "no write-up": refuse before anything is published.
+    throw notApplied(`the run record for ${runId} could not be read to verify the staged write-up: ${String((e && e.message) || e)}`, {});
+  }
+  const entry = (record?.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string');
+  // A record that exists but holds no matching write-up gives no evidence the staged bytes are the verdict.
+  if (!entry || !entry.payload.body.trim()) {
+    throw notApplied(`the run record for ${runId} ${record ? 'holds no frozen write-up' : 'was not found'} for ${bodyFile}; refusing to publish an unverified staged file`, {});
+  }
+  // The frozen payload is the durable truth: a missing, truncated or altered staged file is rewritten from it.
+  let current = null;
+  try { current = readFileSync(path, 'utf8'); } catch { current = null; }
+  if (current !== entry.payload.body) {
+    mkdirSync(dirname(path), { recursive: true });
+    // The run directory must really live under this checkout's sidecar: a symlinked directory would redirect the write.
+    const sidecar = realpathSync(reviewSidecarDir(root));
+    const dir = realpathSync(dirname(path));
+    if (dir !== join(sidecar, runId)) throw notApplied(`the staged write-up directory for ${runId} resolves outside the review sidecar`, {});
+    // Never write THROUGH a link: any existing staged file (symlink included) is unlinked and recreated, not followed.
+    try { lstatSync(path); unlinkSync(path); } catch { /* absent */ }
+    writeFileSync(path, entry.payload.body, { encoding: 'utf8', flag: 'wx' });
+  }
+  return path;
 }
 
 /**
@@ -946,6 +990,7 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
  */
 export function createReviewPrSinks({
   root = REPO_ROOT,
+  runStore,
   env = process.env,
   referralJudge = judgeSpawn,
   postRedTeamCheckRun = defaultPostRedTeamCheckRun,
@@ -1631,10 +1676,9 @@ export function createReviewPrSinks({
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
       await assertPublishable(payload);
+      // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
       if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
-      // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
-      // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
-      const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
         String(payload.pr),
@@ -1823,10 +1867,12 @@ export function createReviewPrSinks({
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
       await assertPublishable(payload);
-      if (payload.redTeamOwed) await postPendingRedTeam(payload);
-      const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
+      // Fail closed: no staged body and no recoverable write-up means no note and no marker.
+      if (!staged.trim()) throw notApplied(`stack-hold has no staged or recoverable write-up at ${bodyPath}`, {});
+      if (payload.redTeamOwed) await postPendingRedTeam(payload);
       // The staged write-up quotes juror text, which an attacker's diff can steer. Defuse every HTML-comment opener in it
       // so it cannot carry a forged marker (or hide the real one); the note opens and the marker closes the comment, and
       // `parseStackMarkers` reads only those two ends.
