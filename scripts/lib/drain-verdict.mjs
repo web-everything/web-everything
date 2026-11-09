@@ -58,6 +58,25 @@ const ACTIONS = Object.freeze([
   'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
 ]);
 
+// The whole workflow is pinned: any parsed difference (container, services, paths, new keys, ...) is refused.
+const EXPECTED_WORKFLOW = Object.freeze({
+  name: 'drain-verdict',
+  on: { workflow_dispatch: { inputs: { pr: { description: 'PR number to classify', required: true, type: 'number' } } },
+    schedule: [{ cron: '*/10 * * * *' }] },
+  permissions: { contents: 'read', 'pull-requests': 'read' },
+  concurrency: { group: 'drain-verdict', 'cancel-in-progress': false },
+  env: { GITHUB_TOKEN: '${{ github.token }}' },
+  jobs: { classify: { 'runs-on': 'ubuntu-latest', 'timeout-minutes': 30, steps: [
+    { uses: ACTIONS[0], with: { ref: 'main', 'persist-credentials': false } },
+    { name: 'Install dependencies', run: 'npm ci --ignore-scripts --no-audit --no-fund' },
+    { name: 'Classify', env: { REQUESTED_PR: '${{ inputs.pr }}' }, run: 'node scripts/drain-classify-only.mjs --batch --verdict-dir=verdicts' },
+    { uses: ACTIONS[1], if: 'always()', with: { name: 'drain-verdicts', path: 'verdicts/*.json', 'retention-days': 1, 'if-no-files-found': 'error' } },
+  ] } },
+});
+
+const stable = v => JSON.stringify(v, (_k, x) => (x && typeof x === 'object' && !Array.isArray(x)
+  ? Object.fromEntries(Object.keys(x).sort().map(k => [k, x[k]])) : x));
+
 export function auditWorkflow(yamlText) {
   const problems = [];
   if (typeof yamlText !== 'string') return { ok: false, problems: ['workflow must be YAML text'] };
@@ -122,5 +141,6 @@ export function auditWorkflow(yamlText) {
       job['timeout-minutes'] > 0 && Array.isArray(job.steps) && job.steps.some(step => /^actions\/checkout@/.test(step.uses)))) {
     problems.push('expected one bounded job with checkout');
   }
+  if (stable(doc) !== stable(EXPECTED_WORKFLOW)) problems.push('workflow differs from the pinned shape');
   return { ok: problems.length === 0, problems };
 }
