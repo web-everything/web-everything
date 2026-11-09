@@ -1496,7 +1496,8 @@ function historyQuarantine(repo, n) {
 // not a pushed-work verdict. All local branch/stash tips are walked (without exclusions), so an origin
 // tip cannot hide a missing ancestor. git() bounds time/output; hitting either bound fails closed too.
 function probeLaneHistory(dir) {
-  const read = (args, opts = {}) => git(args, dir, { ...opts, env: releaseEvidenceEnv(args) });
+  // GIT_SHALLOW_FILE=/dev/null: a .git/shallow boundary must not mask a missing ancestor (a shallow lane fails closed here).
+  const read = (args, opts = {}) => git(args, dir, { ...opts, env: { ...releaseEvidenceEnv(args), GIT_SHALLOW_FILE: '/dev/null' } });
   read(['rev-list', '--max-count=200', 'HEAD']);
   const branches = read(['for-each-ref', '--format=%(objectname)', 'refs/heads/']);
   const stash = read(['for-each-ref', '--format=%(objectname)', 'refs/stash']);

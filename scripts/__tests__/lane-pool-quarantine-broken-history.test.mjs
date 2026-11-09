@@ -117,6 +117,16 @@ it('a cached list --acquirable is re-filtered once a lane is quarantined', () =>
   expect(JSON.stringify(second.data)).not.toContain(laneDir);
 });
 
+it('a shallow boundary cannot mask unreadable history', () => {
+  const sha = corruptHistory();
+  writeFileSync(join(laneDir, '.git', 'shallow'), `${sha}\n`);
+  expect(git(['rev-list', '--max-count=200', 'HEAD'], laneDir)).toContain(sha);
+  const result = runPool(['acquire', '--no-reset']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.data.lane).not.toBe(1);
+  expect(existsSync(record)).toBe(true);
+});
+
 it('retries a single transient history failure without quarantining', () => {
   const fault = `if (args.includes('rev-list') && args.includes('--max-count=200')) {
     fs.appendFileSync(${JSON.stringify(join(base, 'probes'))}, 'probe\\n');
