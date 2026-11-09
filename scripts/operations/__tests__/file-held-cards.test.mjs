@@ -44,9 +44,9 @@ it('selects unfiled hashes using raw-line regex and since date', () => {
 
 it('composes a bounded title, full digest and only explicit WE scope', () => {
   expect(composeFileItemInput({ text: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.' })).toMatchObject({
-    title: 'Repair behavior', digest: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.', scope: 'we:scripts/a.mjs,we:scripts/b.mjs',
+    title: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.', digest: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.', scope: 'we:scripts/a.mjs,we:scripts/b.mjs',
   });
-  expect(composeFileItemInput({ text: 'a'.repeat(150) }).title).toHaveLength(120);
+  expect(composeFileItemInput({ text: 'a'.repeat(150) }).title).toHaveLength(111);
   expect(composeFileItemInput({ text: 'No scope' })).not.toHaveProperty('scope');
 });
 
@@ -94,12 +94,18 @@ it('caps batches at ten by default, supports max and leaves overflow for the nex
 
 it('logs and ledgers normalized duplicate titles without filing or retrying them', async () => {
   seed('- [R1] 2026-11-08: Repair behavior; extra details');
-  writeFileSync(join(root, 'backlog', '123-old.md'), '---\ntitle: other\n---\n# REPAIR   behavior\n');
+  writeFileSync(join(root, 'backlog', '123-old.md'), '---\ntitle: other\n---\n# REPAIR   behavior; extra  details\n');
   expect((await run()).duplicates).toHaveLength(1);
   expect(JSON.parse(readFileSync(ledger, 'utf8'))).toMatchObject({ status: 'duplicate', card: '123-old.md' });
   expect(log).toHaveBeenCalledWith(expect.stringContaining('duplicate'));
   expect((await run()).duplicates).toEqual([]);
   expect(fileItem).not.toHaveBeenCalled();
+});
+
+it('ignores legacy untitled backlog cards instead of halting', async () => {
+  seed('- [R1] 2026-11-08: Fresh card');
+  writeFileSync(join(root, 'backlog', '001-legacy.md'), '---\nkind: task\n---\nno heading\n');
+  expect((await run()).filed).toHaveLength(1);
 });
 
 it('fails closed on malformed ledger or missing backlog evidence before filing', async () => {

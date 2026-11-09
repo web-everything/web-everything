@@ -83,8 +83,9 @@ export function selectUnfiled(cards, ledger, { select, since, max = 10 } = {}) {
 }
 
 export function composeFileItemInput(card) {
-  // Only punctuation followed by whitespace ends a clause; dots inside paths remain intact.
-  const title = card.text.split(/(?:[.!?;](?=\s|$)|\s+[—–]\s+)/, 1)[0].trim().slice(0, 120);
+  // Whole text, cut at a word boundary: held cards often lead with a short ref ("#6381 slice 2") that is useless alone.
+  const flat = card.text.replace(/\s+/g, ' ').trim();
+  const title = flat.length <= 110 ? flat : flat.slice(0, 110).replace(/\s+\S*$/, '').replace(/[\s,;:—–-]+$/, '') + '…';
   const paths = [...card.text.matchAll(/\bwe:[A-Za-z0-9_./*-]+/g)].map(m => m[0].replace(/[.,;:!?]+$/, ''));
   return { title, digest: card.text, kind: 'task', size: '1', queue: 'false',
     ...(paths.length ? { scope: [...new Set(paths)].join(',') } : {}) };
@@ -141,7 +142,7 @@ export async function runFileHeldCards({ source = join(homedir(), 'workspace', '
   for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
     const content = readFileSync(join(root, 'backlog', name), 'utf8');
     const title = content.match(/^#\s+(.+)$/m)?.[1];
-    if (!title) throw new Error(`backlog card ${name} has no title; repair it before retrying`);
+    if (!title) continue; // legacy untitled cards cannot be title-matched; they never block a run
     titles.set(titleKey(title), name);
   }
   const result = { planned: [], filed: [], duplicates: [], refused: [] };
