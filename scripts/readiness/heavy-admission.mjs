@@ -173,7 +173,7 @@ import {
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { routeNeedsGit } from './needs-git-route.mjs';
-import { capabilityAdvertisesBundle, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
+import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
@@ -488,8 +488,10 @@ export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = 
 
 /** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
 export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync }) {
-  try { return capabilityAdvertisesBundle(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
-  catch { return false; }
+  // R807: only a fresh "no bundle" record keeps git tests local; unknown (missing/expired/unreadable) goes remote and
+  // prepare decides (an old runner is refused there with a safe local fallback).
+  try { return capabilityBundleVerdict(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }) !== 'no'; }
+  catch { return true; }
 }
 export function writeRunnerCapabilities({ root, host, capabilities, clock = Date.now, write = writeFileSync, mkdir = mkdirSync, rename = renameSync }) {
   try {
