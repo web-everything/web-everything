@@ -290,4 +290,21 @@ describe('reserved priority slot (drain freeze read)', () => {
     expect(r.status).toBe(0);
     expect(String(r.stdout)).toBe('[]');
   });
+  it('a reserved read whose call bound is already spent is refused, never run with a 1 ms allowance', () => {
+    const f = fullPool('red-main-freeze-read');
+    let clock = Date.now();
+    // the points gate sleeps past the whole bound before granting
+    const t = { ...f.throttle, reservedSlot: true, now: () => clock, sleep: vi.fn(ms => { clock += ms; }) };
+    const pre = () => { clock += 3000; };
+    const exec = vi.fn(() => { pre(); return '[]'; });
+    const spent = { ...t, exec, now: () => { clock += 1500; return clock; } };
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 1000, throttle: spent })).toThrow(/throttled/);
+    expect(exec).not.toHaveBeenCalled();
+  });
+  it('a reserved read makes exactly one attempt: a rate-limit failure is thrown, not retried or slept on', () => {
+    const f = fullPool('red-main-freeze-read');
+    const exec = vi.fn(() => { throw Object.assign(new Error('HTTP 403: API rate limit exceeded'), { status: 1, stderr: 'HTTP 403: API rate limit exceeded' }); });
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', throttle: { ...f.throttle, reservedSlot: true, exec } })).toThrow(/rate limit/);
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
 });

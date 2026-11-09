@@ -638,6 +638,7 @@ export function ghSlotWaitMs({ caller, waitClass, settings = GH_SLOT_WAIT_STANDA
 /** The one caller allowed the reserved slot: the drain's shared-freeze read. */
 export const GH_RESERVED_SLOT_CALLER = 'red-main-freeze-read';
 const RESERVED_WAIT_DEFAULT_MS = 20000;
+const reservedThrottledMessage = () => 'gh-throttle: throttled — reserved read exhausted its call bound; retry next tick\n';
 /** A reserved read that cannot be admitted is THROTTLED (fail closed): never the ungated or exception fail-open paths. */
 const RESERVED_CLOSED = Object.freeze({ ok: false, timedOut: true, waitedMs: 0 });
 /**
@@ -2088,6 +2089,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
       // did not already ask for a specific debug mode of its own — never silently overridden. It changes
       // nothing about a SUCCESSFUL call's stdout (see the module header). The #4375 capture, when on, lives
       // inside the real `exec` itself and records what it read in `lastCapture`.
+      if (reserved && now() - reservedStartMs >= reservedCapMs) throw Object.assign(new Error(reservedThrottledMessage()), { status: 1, stdout: '', stderr: reservedThrottledMessage(), ghThrottled: { class: waitClass, waitedMs: reservedCapMs } });
       const routedOpts = effectiveExecOpts();
       const boundedOpts = reserved ? { ...routedOpts, timeout: reservedLeftMs() } : routedOpts;
       const callExecOpts = calibrateHeaders ? withDebugEnv(boundedOpts) : boundedOpts;
@@ -2113,6 +2115,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
       return result;
     }
 
+    // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound; the freeze holds and the next tick re-reads.
+    if (reserved) throw failure;
     const text = `${failure && failure.stderr ? String(failure.stderr) : ''}\n${failure && failure.message ? String(failure.message) : ''}`;
     if (usedPersonalToken && (looksLikeGhAuthFailure(text) || looksLikePersonalAccessDenial(text))) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'personal_token_rejected', caller, w: isWrite, resource, id: identity, auth: ghAuthProvenance(callEnv), inv });
@@ -2360,6 +2364,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});
       if (deferred) return { status: 0, deferred: true, stdout: Buffer.from(JSON.stringify(deferred)), stderr: Buffer.from(deferred.message) };
+      if (reserved && now() - reservedStartMs >= reservedCapMs) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(reservedThrottledMessage()) };
       // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
       r = spawn(bin, argv, ghExecOptions(outerLimits === null ? (reserved ? { ...spawnOpts, timeout: reservedLeftMs() } : spawnOpts) : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
     } finally {
@@ -2403,6 +2408,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // The call ran and spent points, so it is logged above before the overflow is raised.
     if (stdoutOverflow) throw captureStdoutOverflow(bin, argv);
     if (!failed && isWrite) markPrSnapshotDirty({ repo: repoFromGhArgs(argv), env }); // #gh-graphql-budget
+    // A reserved read makes exactly ONE attempt (no retry or backoff past its call bound).
+    if (reserved && !r.error) return { status: r.status == null ? (r.signal ? 128 : 1) : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: (r.stderr || Buffer.alloc(0)) };
     // A nested call leaves the truncated-JSON retry to its outer runGhSync (one retry per logical call).
     const transient = failed && !outer && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(argv, stderrText) : null;
     if (transient) {
