@@ -359,6 +359,8 @@ describe('every policy is a setting, and settings only make it stricter', () => 
   const actionCases = {
     systemActions: {
       'await-ledger-outbox': ['system:ledger-write-miss'],
+      'await-mq-failure-recovery': ['drain-skip:mq-same-head-failed', null, {}, { row: { actor: 'drain' } }],
+      'await-card-group': ['drain-skip:card-grouped', null, {}, { row: { actor: 'drain' } }],
       'resume-stale-hold': ['system:stale-hold', null, { staleHoldAutoResume: true }],
       'rerun-red-team-gate': ['red-team-sent-back-cleared'],
       'ask-review-daemon': ['awaiting-review'],

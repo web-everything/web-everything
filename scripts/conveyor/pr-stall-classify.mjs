@@ -41,7 +41,7 @@ export function demoteNeverAutomatic(item, operatorCommand) {
  */
 export const CLASSIFY_DEFAULTS = Object.freeze({
   maxRedTeamRestartsPerHead: 2, staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
-  systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true, 'restart-red-team': true, 'publish-red-team-result': true }),
+  systemActions: Object.freeze({ 'await-ledger-outbox': true, 'await-mq-failure-recovery': true, 'await-card-group': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true, 'restart-red-team': true, 'publish-red-team-result': true }),
   policyActions: Object.freeze({ grant: true, card: true, block: true }),
 });
 /** Validators for each classifier setting leaf (shared with the sweep's cascade, so a bad value is refused there too). */
@@ -119,8 +119,6 @@ const OPERATOR_STATES = Object.freeze({
   'needs-you': 'the PR carries status:needs-you',
   'human-review': 'the human review is owed',
   'drain-skip:not-certified': 'the drain will not merge it uncertified',
-  'drain-skip:mq-same-head-failed': 'the same-head merge-queue attempt failed; held until the head changes',
-  'drain-skip:card-grouped': 'the PR is grouped into an open card group; waiting for that group to land',
   unclassified: 'no signal says who moves next',
 });
 
@@ -229,6 +227,8 @@ function classifyUnsafe(o = {}) {
     return out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
       { onceKey: `${row.repo}#${row.number}@${head.toLowerCase()}:ask-review-daemon` });
   }
+  if (state === 'drain-skip:mq-same-head-failed') return out('system', 'await-mq-failure-recovery', 'waiting on mq-failure recovery: the same-head merge-queue attempt failed; recovery (R772) retries it, held until the head changes');
+  if (state === 'drain-skip:card-grouped') return out('system', 'await-card-group', 'waiting on the card group: the PR is grouped into an open card group and waits for the group to land');
   if (OPERATOR_STATES[state]) return operator(state, OPERATOR_STATES[state]);
   const smell = TOOLING_SMELL[state] ?? null;
   if (smell) {
