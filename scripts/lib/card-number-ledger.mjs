@@ -11,6 +11,8 @@ export const CARD_LEDGER_REF = 'refs/heads/ops/card-numbers';
 export const CARD_LEDGER_TRUST_PATH = 'scripts/settings/card-ledger-trust.json';
 export const CARD_LEDGER_MAX_BYTES = 8 * 1024 * 1024;
 export const CARD_LEDGER_HISTORY_BUDGET = 256;
+// The numeric-floor read lists every backlog path on main (~574 KB for 7,893 paths in 2026-11); 16 MiB keeps ~25x headroom.
+export const CARD_INVENTORY_MAX_BYTES = 16 * 1024 * 1024;
 const sha = s => typeof s === 'string' && /^[a-f0-9]{40}$/.test(s) && s.length === 40;
 const hash = s => createHash('sha256').update(s).digest('hex');
 const validId = s => typeof s === 'string' && s.length === 7 && HASH_RE.test(s);
@@ -193,6 +195,20 @@ export function readCardLedger(o = {}) {
   } catch (e) { errors.push(failure(e)); }
   return { ...indexRows(trusted, errors, burned), text, trust, quarantinedLines, quarantinedCommits: [...quarantinedCommits] };
 }
+/** List main's backlog paths under an explicit cap; an overflow fails closed and names the operator fallback. */
+function readNumericCardInventory({ run, cwd, maxBytes }) {
+  let text;
+  try {
+    text = String(run(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, maxBuffer: maxBytes + 1, timeout: 15000 }));
+  } catch (e) {
+    if (e?.code === 'ENOBUFS' || /ENOBUFS|maxBuffer/i.test(String(e?.message))) {
+      throw new Error(`backlog inventory exceeds read cap ${maxBytes}; pass numericFiles or raise inventoryMaxBytes after review`);
+    }
+    throw e;
+  }
+  if (Buffer.byteLength(text) > maxBytes) throw new Error(`backlog inventory exceeds read cap ${maxBytes}; pass numericFiles or raise inventoryMaxBytes after review`);
+  return text.split(/\r?\n/);
+}
 export function numericCardFloor(files) {
   let max = 0;
   for (const file of files) { const m = /^backlog\/(\d{1,5})-[^/]+\.md$/.exec(file); if (m) max = Math.max(max, Number(m[1])); }
@@ -267,14 +283,14 @@ export function appendCardLedgerRows(o = {}) {
   });
 }
 export function assignCardNumbers(o = {}) {
-  const { ids = [], floor = 0, pr = null, now = () => new Date().toISOString(), readLedger = readCardLedger } = o;
+  const { ids = [], floor = 0, pr = null, now = () => new Date().toISOString(), readLedger = readCardLedger, inventoryMaxBytes = CARD_INVENTORY_MAX_BYTES } = o;
   if (ids.some(id => !validId(id)) || !Number.isSafeInteger(floor) || floor < 0 || floor >= 100000) throw new Error('invalid card assignment');
+  if (!validCap(inventoryMaxBytes)) throw new Error('invalid backlog inventory read cap');
   return locked(o, () => {
     const initial = readLedger(o); requireReadable(initial);
     if (ids.every(id => initial.byId.has(id))) return new Map(ids.map(id => [id, initial.byId.get(id)]));
     // A caller's floor may include reservations; numeric filenames remain an independent lower bound.
-    const numericFiles = o.numericFiles
-      ?? String((o.run || defaultRun)(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd: o.board || process.cwd() })).split(/\r?\n/);
+    const numericFiles = o.numericFiles ?? readNumericCardInventory({ run: o.run || defaultRun, cwd: o.board || process.cwd(), maxBytes: inventoryMaxBytes });
     const minimum = Math.max(floor, numericCardFloor(numericFiles));
     return appendCardLedgerRows({ ...o, lockHeld: true, allocate: state => {
       let next = minimum;

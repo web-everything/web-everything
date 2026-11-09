@@ -636,6 +636,49 @@ it('explicitReservationFloorDoesNotPermitAllocationWhenNumericFilenamesAreUnread
   expect(run).toHaveBeenCalledTimes(1);
   expect(stage).not.toHaveBeenCalled();
 });
+// Real Git inventory: this repository's backlog listing is already far above 64 KiB.
+describe('numeric backlog inventory read bound', () => {
+  let root, board;
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'card-ledger-inventory-')));
+    board = join(root, 'repo'); mkdirSync(board);
+    const env = { ...process.env, GIT_AUTHOR_NAME: 'drain', GIT_AUTHOR_EMAIL: 'drain@example.test',
+      GIT_COMMITTER_NAME: 'drain', GIT_COMMITTER_EMAIL: 'drain@example.test' };
+    for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) delete env[name];
+    const git = (args, input) => String(execFileSync('git', args,
+      { cwd: board, env, input, encoding: 'utf8', stdio: 'pipe', maxBuffer: 4 * 1024 * 1024 })).trim();
+    git(['init', '-q', '-b', 'main']);
+    const blob = git(['hash-object', '-w', '--stdin'], '');
+    // 3,000 names of ~75 bytes: a ~225 KB listing, well past the former 64 KiB buffer.
+    const names = Array.from({ length: 3000 }, (_, i) => `${String(i + 1).padStart(4, '0')}-${'inventory-card-name-'.repeat(3)}.md`);
+    const backlog = git(['mktree'], names.map(n => `100644 blob ${blob}\t${n}\n`).join(''));
+    const tree = git(['mktree'], `040000 tree ${backlog}\tbacklog\n`);
+    git(['update-ref', 'refs/remotes/origin/main', git(['commit-tree', tree, '-m', 'inventory'])]);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  const writer = () => {
+    let text = '';
+    const stage = vi.fn(options => { text = options.files[0].content({ existing: text }); return { pushed: true }; });
+    return { stage, readLedger: () => parseCardLedger(text) };
+  };
+  it('assignCardNumbersReadsARealBacklogInventoryLargerThan64KiB', () => {
+    const w = writer();
+    const assigned = assignCardNumbers({ repo: 'we', board, ids: ['xabc123'], lock, ...w });
+    expect(assigned.get('xabc123')).toBe(3001);
+    expect(w.stage).toHaveBeenCalledTimes(1);
+  });
+  it('assignCardNumbersFailsClosedWithAFallbackWhenTheInventoryExceedsItsCap', () => {
+    const w = writer();
+    expect(() => assignCardNumbers({ repo: 'we', board, ids: ['xabc123'], lock, inventoryMaxBytes: 4096, ...w }))
+      .toThrow(/backlog inventory exceeds read cap 4096.*numericFiles/);
+    expect(w.stage).not.toHaveBeenCalled();
+  });
+  it.each([0, -1, 1.5, 64 * 1024 * 1024 + 1, '1024'])('assignCardNumbersRefusesAnInvalidInventoryCap (%s)', inventoryMaxBytes => {
+    const w = writer();
+    expect(() => assignCardNumbers({ repo: 'we', board, ids: ['xabc123'], lock, inventoryMaxBytes, ...w })).toThrow(/invalid backlog inventory read cap/);
+    expect(w.stage).not.toHaveBeenCalled();
+  });
+});
 
 // Retained boundary regressions from the former out-of-scope suite.
 describe('card ledger filesystem boundaries', () => {
