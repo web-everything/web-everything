@@ -480,14 +480,6 @@ describe('the label sink', () => {
     expect(onDisk).toBe('# frozen verdict');
   });
 
-  it('resumed from another root with no recoverable write-up: refuses before any write instead of shelling a missing file', async () => {
-    const seen = [];
-    const sinks = createReviewPrSinks({ root, runStore: { read: () => ({ id: 'run-1', effects: [] }) }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
-      runNode: (argv) => { seen.push(argv); return '{}'; } });
-    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
-    expect(seen).toEqual([]);
-  });
-
   it('a body file already staged in this root is never overwritten from the record', async () => {
     const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
     mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'local bytes');

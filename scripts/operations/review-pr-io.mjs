@@ -45,7 +45,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, openSync, unlinkSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -71,7 +71,7 @@ const MANDATORY_LEDGER_SYNC_PASSES = 3;
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
-import { sharedRunsDir } from './run-store.mjs';
+import { createFileRunStore, sharedRunsDir } from './run-store.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -139,6 +139,28 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
     throw new TypeError(`operations: invalid review write-up file name ${JSON.stringify(bodyFile)} — expected a bare file name`);
   }
   return join(reviewSidecarDir(root), runId, name);
+}
+
+/**
+ * Resume-from-any-lane: make sure the run's staged write-up exists under THIS checkout's sidecar.
+ *
+ * The write-up is staged under the checkout that ran effect 0, but a `--resume` may run from another lane, whose
+ * sidecar has no such file. The durable run record keeps the frozen `WRITE_UP` payload, so a missing file is
+ * regenerated from it (same bytes the first stage wrote). A file that is already there is never touched, and a
+ * record with no matching write-up changes nothing.
+ *
+ * @returns {string} the body path (whether or not it could be recovered).
+ */
+export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
+  const path = reviewBodyPath({ root, runId, bodyFile });
+  if (existsSync(path)) return path;
+  let record = null;
+  try { record = (runStore ?? createFileRunStore()).read(runId); } catch { record = null; }
+  const entry = (record?.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string');
+  if (!entry) return path;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, entry.payload.body, 'utf8');
+  return path;
 }
 
 /**
@@ -946,6 +968,7 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
  */
 export function createReviewPrSinks({
   root = REPO_ROOT,
+  runStore,
   env = process.env,
   referralJudge = judgeSpawn,
   postRedTeamCheckRun = defaultPostRedTeamCheckRun,
@@ -1634,7 +1657,7 @@ export function createReviewPrSinks({
       if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
       // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
       // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
-      const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
         String(payload.pr),
@@ -1824,7 +1847,7 @@ export function createReviewPrSinks({
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
       await assertPublishable(payload);
       if (payload.redTeamOwed) await postPendingRedTeam(payload);
-      const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
       // The staged write-up quotes juror text, which an attacker's diff can steer. Defuse every HTML-comment opener in it
