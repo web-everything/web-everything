@@ -77,7 +77,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   // defer or need a fix, and jury-core.mjs / review-escalation.mjs import them directly.
   'scripts/lib/finding-class-policy.mjs', 'scripts/lib/review-care-exempt-paths.mjs',
   // Also added on main since: direct imports of the family (the card dedupe and the citation check).
-  'scripts/lib/card-dedupe.mjs', 'scripts/lib/citation-check.mjs']);
+  'scripts/lib/card-dedupe.mjs', 'scripts/lib/citation-check.mjs',
+  'scripts/lib/human-clearance-mechanical-carry-setting.mjs']);
 /**
  * JSON files the floor modules decide with (PR #6381 self-review: red-team.json was read by red-team-gate.mjs but
  * unprotected). A test reads every floor module and pins each tracked scripts/ JSON file whose NAME it quotes, in any
@@ -162,6 +163,7 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  'scripts/lib/mq-failure-ledger.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.
   'scripts/conveyor/health-watch.mjs', 'scripts/conveyor/liveness-sweep.mjs', 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs',
@@ -233,7 +235,7 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/**/*claim*', 'scripts/*claim*', 'scripts/**/*mutex*', 'scripts/*mutex*', ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS,
   // Hold-scan modules the source-scan floor test found missing (PR #6381 judge).
   'scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.mjs', 'scripts/lib/archive-closed-review-runs.mjs',
-  'scripts/lib/reap-dead-review-runs.mjs', 'scripts/lib/run-abandoned.mjs',
+  'scripts/lib/reap-dead-review-runs.mjs', 'scripts/lib/run-abandoned.mjs', 'scripts/lib/build-queue-cache.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
