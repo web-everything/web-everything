@@ -422,9 +422,18 @@ describe('classifyIdleFinished — PURE core', () => {
   });
 
   it('rowIdle (harness says nothing running) + pending call + silent past the window → finished (dangling call)', () => {
-    const ageMs = THRESHOLD * 8;
-    expect(classifyIdleFinished({ lastActivityMs: NOW - ageMs, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true }))
+    const ageMs = 95 * 60_000;
+    expect(classifyIdleFinished({ lastActivityMs: NOW - ageMs, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true, pendingGraceMs: 90 * 60_000 }))
       .toEqual({ finished: true, reason: 'idle-row-dangling-tool-call', ageMs });
+  });
+
+  it('rowIdle + pending call silent past the idle window but INSIDE the 90-minute pending grace → not finished', () => {
+    expect(classifyIdleFinished({ lastActivityMs: NOW - 75 * 60_000, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true, pendingGraceMs: 90 * 60_000 }))
+      .toEqual({ finished: false, reason: 'pending-tool-call', ageMs: 75 * 60_000 });
+  });
+
+  it('rowIdle + pending call with NO pendingGraceMs given fails closed (not finished)', () => {
+    expect(classifyIdleFinished({ lastActivityMs: NOW - 500 * 60_000, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true }).finished).toBe(false);
   });
 
   it('rowIdle + pending call but still INSIDE the window → not finished', () => {
@@ -495,36 +504,55 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
 
   it('status:idle row + dangling tool call + silent past window → finished', () => {
     const now = Date.now();
-    writeFileSync(transcriptFile, danglingLine(now, 75));
-    const info = readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true });
+    writeFileSync(transcriptFile, danglingLine(now, 100));
+    const info = readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' });
     expect(info.finished).toBe(true);
     expect(info.reason).toBe('idle-row-dangling-tool-call');
   });
 
   it('reaper path unchanged: without trustIdleRow an idle row + dangling call stays unfinished', () => {
     const now = Date.now();
-    writeFileSync(transcriptFile, danglingLine(now, 75));
+    writeFileSync(transcriptFile, danglingLine(now, 100));
     const info = readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000);
     expect(info.finished).toBe(false);
     expect(info.reason).toBe('pending-tool-call');
   });
 
-  it('status:busy row + dangling tool call → not finished', () => {
+  it('dangling call silent only 75 min (inside the 90-minute grace) → not finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 75));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'busy' }, now, 10 * 60_000, { trustIdleRow: true }).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }).finished).toBe(false);
+  });
+
+  it('cached row says idle but the FRESH read says busy → not finished', () => {
+    const now = Date.now();
+    writeFileSync(transcriptFile, danglingLine(now, 100));
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { ...{ trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }, freshStatusFor: () => 'busy' }).finished).toBe(false);
+  });
+
+  it('fresh status read throws or is missing → fails closed, not finished', () => {
+    const now = Date.now();
+    writeFileSync(transcriptFile, danglingLine(now, 100));
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { ...{ trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }, freshStatusFor: () => { throw new Error('boom'); } }).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000 }).finished).toBe(false);
+  });
+
+  it('status:busy row + dangling tool call → not finished', () => {
+    const now = Date.now();
+    writeFileSync(transcriptFile, danglingLine(now, 100));
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'busy' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }).finished).toBe(false);
   });
 
   it('status:waiting (permission) row + dangling tool call → not finished', () => {
     const now = Date.now();
-    writeFileSync(transcriptFile, danglingLine(now, 75));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'waiting' }, now, 10 * 60_000, { trustIdleRow: true }).finished).toBe(false);
+    writeFileSync(transcriptFile, danglingLine(now, 100));
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'waiting' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }).finished).toBe(false);
   });
 
   it('status:idle row + dangling call but within the window → not finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 2));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true }).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }).finished).toBe(false);
   });
 
   it('missing cwd/sessionId, or no transcript on disk, answers no-signal, never a guess', () => {
