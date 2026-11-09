@@ -34,6 +34,7 @@ const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expect
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.mjs';
+import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH } from '../../lib/policy-cascade.mjs';
 import { evaluateRedTeamCheckFact, readRedTeamGateSource } from '../../lib/red-team-check-run.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
@@ -265,10 +266,11 @@ describe('pending red-team check before acceptance', () => {
 
   for (const type of [REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD]) {
     // Historical fixtures carried no comments; the barrier now reads the thread, so the default is an empty one.
-    function setup({ result = { ok: true }, liveHead = head, comments = [], labels = ['review:human'], readComments, env, logs = [] } = {}) {
+    // `env` defaults to an empty one so the gate source never comes from the machine's shell (standard `both`).
+    function setup({ result = { ok: true }, liveHead = head, comments = [], labels = ['review:human'], readComments, env = {}, logs = [] } = {}) {
       const writes = [];
       const post = vi.fn(async args => { writes.push('pending'); return result; });
-      const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, ...(env ? { env, out: line => logs.push(line) } : {}),
+      const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, env, out: line => logs.push(line),
         postComment: () => writes.push('comment'),
         publishGate: () => ({ allowed: true, headSha: head }),
         readPublishHead: () => liveHead,
@@ -355,14 +357,34 @@ describe('pending red-team check before acceptance', () => {
         expect(post).toHaveBeenCalledTimes(1);
         expect(writes).toEqual(['pending']);
       } else {
+        // Posted best effort (as #6535's publish-first still posts there); the failure only logs.
         await apply(payload);
-        expect(post).not.toHaveBeenCalled();
-        expect(writes).toEqual(acceptanceWrites);
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(writes).toEqual(['pending', ...acceptanceWrites]);
+        expect(logs).toContainEqual(expect.stringContaining('checks API down (redTeamGate.source=drain-scan: accept proceeds)'));
       }
       expect(logs).toContainEqual(`policy-cascade · redTeamGate: source="${source}" (env)`);
     });
 
-    it(`${type}: drain-scan reads no PR thread, so an unreadable thread cannot block the accept`, async () => {
+    it(`${type}: drain-scan still posts the pending check when it can`, async () => {
+      const { apply, post, writes } = setup({ env: { WE_RED_TEAM_GATE_SOURCE: 'drain-scan' } });
+      await apply(payload);
+      expect(post).toHaveBeenCalledWith(expect.objectContaining({ headSha: head, payload: expect.objectContaining({ status: 'in_progress' }) }));
+      expect(writes).toEqual(['pending', ...acceptanceWrites]);
+    });
+
+    it(`${type}: binding mode turns a throwing writer into notApplied before any acceptance write`, async () => {
+      const writes = [];
+      const sinks = createReviewPrSinks({ root, env: {}, out: () => {}, postRedTeamCheckRun: () => { throw new Error('socket hang up'); },
+        publishGate: () => ({ allowed: true, headSha: head }), readPublishHead: () => head,
+        postComment: () => writes.push('comment'), runNode: () => { writes.push('script'); return '{"ok":true}'; },
+        labelProvider: { readPrState: () => ({ labels: ['review:human'], headRefOid: head, comments: [] }),
+          ensureLabel: () => writes.push('ensure'), setLabels: () => writes.push('labels') } });
+      await expect(sinks[type](payload, CTX)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('socket hang up') });
+      expect(writes).toEqual([]);
+    });
+
+    it(`${type}: drain-scan proceeds past an unreadable PR thread without posting`, async () => {
       const { apply, post, writes } = setup({ comments: null, env: { WE_RED_TEAM_GATE_SOURCE: 'drain-scan' } });
       await apply(payload);
       expect(post).not.toHaveBeenCalled();
@@ -381,6 +403,12 @@ describe('pending red-team check before acceptance', () => {
   it('redTeamGate.source is not flipped: the shipped settings resolve to the standard both', () => {
     const settings = JSON.parse(readFileSync(RED_TEAM_SETTINGS_FILE, 'utf8'));
     expect(settings.redTeamGate?.source).toBeUndefined();
+    // Nor did it add one to the in-repo platform layer (the operator's own file is outside the repo).
+    for (const path of [PLATFORM_PREFERENCES_PATH, ...LEGACY_PLATFORM_PREFERENCES_PATHS]) {
+      let prefs = {};
+      try { prefs = JSON.parse(readFileSync(path, 'utf8')); } catch { /* absent file adds nothing */ }
+      expect(prefs.redTeamGate?.source).toBeUndefined();
+    }
     expect(readRedTeamGateSource({ env: {}, platform: {} })).toMatchObject({ value: { source: 'both' }, sources: { source: 'standard' } });
   });
 

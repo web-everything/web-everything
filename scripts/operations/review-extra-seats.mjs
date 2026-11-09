@@ -2,7 +2,7 @@
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
-import { readRedTeamGateSource } from '../lib/red-team-check-run.mjs';
+import { redTeamCheckRunIsEvidence } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -222,7 +222,7 @@ export function reserveSeatCalls({ ledger, records, want, dailyCap, now, newId, 
 /** Is the red-team check run merge evidence in this mode? Publish-first binds only then (every mode but the
  * drain-scan rollback). Logs the effective value and its source (policy cascade). */
 function checkRunIsEvidence(env, log = () => {}) {
-  return readRedTeamGateSource({ env, log: line => { try { log(line); } catch { /* logging is best effort */ } } }).value.source !== 'drain-scan';
+  return redTeamCheckRunIsEvidence({ env, log });
 }
 
 /** Drop unspent reservations (a round that never started must not burn the day's budget). PURE. */

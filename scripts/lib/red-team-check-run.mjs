@@ -19,6 +19,12 @@ export function readRedTeamGateSource({ env = process.env,
   return resolved;
 }
 
+/** Does merge-gate read the red-team check run as evidence? Every mode but the `drain-scan` rollback. The one
+ * shared answer for every writer that must publish before acting (publish-first, the review barrier). */
+export function redTeamCheckRunIsEvidence({ env = process.env, log = () => {} } = {}) {
+  return readRedTeamGateSource({ env, log: line => { try { log(line); } catch { /* logging is best effort */ } } }).value.source !== 'drain-scan';
+}
+
 const ioOptions = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] };
 const validHead = head => typeof head === 'string' && /^[a-f0-9]{40}$/i.test(head);
 const validApp = id => /^[1-9]\d*$/.test(String(id ?? '')) && Number.isSafeInteger(Number(id));

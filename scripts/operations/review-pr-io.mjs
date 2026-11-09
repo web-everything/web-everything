@@ -1,4 +1,4 @@
-import { readRedTeamGateSource, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
+import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
@@ -1047,14 +1047,18 @@ export function createReviewPrSinks({
   // complete thread too) posts no second result, so a pending check there would never complete and the result is
   // final for the head, leaving the barrier nothing to supersede. An unreadable or
   // incomplete thread proves nothing either way: refuse before any write and leave the effect retryable.
-  // The barrier binds exactly where #6535's publish-first binds (`review-extra-seats.mjs#checkRunIsEvidence`):
-  // merge-gate reads the red-team check in `both` and `check-run`, so there a failed post stops the accept. In the
-  // `drain-scan` rollback the check is not evidence, so the accept proceeds exactly as before this barrier existed
-  // (no thread read, no post). The effective source and its layer are logged on every call.
+  // The barrier follows #6535's publish-first scope (the shared `redTeamCheckRunIsEvidence`). merge-gate reads the
+  // red-team check in `both` and `check-run`, so there a failed read or post stops the accept. In the `drain-scan`
+  // rollback the check is not evidence: the barrier still posts, best effort (so a later switch back to `both` finds
+  // no older success as the newest check), but a failure only logs and the accept proceeds as before this barrier
+  // existed. The effective source and its layer are logged on every call.
   const postPendingRedTeam = async (payload, liveState) => {
     const { repo, pr, reviewedHead: headSha } = payload;
-    const gateSource = readRedTeamGateSource({ env, log: line => { try { out(line); } catch { /* best effort */ } } }).value.source;
-    if (gateSource === 'drain-scan') return;
+    const binding = redTeamCheckRunIsEvidence({ env, log: out });
+    const refuse = reason => {
+      if (binding) throw notApplied(`red-team pending check not posted: ${reason}; retry/resume review`);
+      out(`review-pr: ${repo}#${pr} red-team pending check not posted: ${reason} (redTeamGate.source=drain-scan: accept proceeds)`);
+    };
     let comments;
     try {
       const state = liveState ?? labelProvider.readPrState(repo, pr);
@@ -1065,15 +1069,18 @@ export function createReviewPrSinks({
       }
       if (!Array.isArray(comments)) throw new Error('comments missing');
     } catch (error) {
-      throw notApplied(`red-team pending check not posted: PR thread unreadable (${String(error?.message ?? error).split('\n')[0].slice(0, 200)}); retry/resume review`);
+      return refuse(`PR thread unreadable (${String(error?.message ?? error).split('\n')[0].slice(0, 200)})`);
     }
     if (redTeamForHead(comments, pr, headSha)) {
       out(`review-pr: ${repo}#${pr} red-team result already on ${String(headSha).slice(0, 12)}; pending check not posted`);
       return;
     }
-    const result = await postRedTeamCheckRun({ repo, pr, headSha,
-      payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'in_progress' }) });
-    if (result?.ok !== true) throw notApplied(`red-team pending check not posted: ${result?.reason ?? 'publication unconfirmed'}; retry/resume review`);
+    let result;
+    try {
+      result = await postRedTeamCheckRun({ repo, pr, headSha,
+        payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'in_progress' }) });
+    } catch (error) { result = { ok: false, reason: String(error?.message ?? error).split('\n')[0].slice(0, 300) }; }
+    if (result?.ok !== true) refuse(String(result?.reason ?? 'publication unconfirmed'));
   };
   // Both publication steps must derive authority from a complete, pinned thread.
   const readReferralState = (repo, pr, head, { pinned = true } = {}) => {
