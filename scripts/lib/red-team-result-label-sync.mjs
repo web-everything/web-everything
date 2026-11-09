@@ -1,9 +1,21 @@
 import { redTeamForHead } from './red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
+import { createGhProvider } from './review-label-provider.mjs';
+
+/** Re-read the live head right before the write: a head that moved after the writer's own check must not be labelled. */
+export function headGuardedProvider(provider, head) {
+  return { ...provider,
+    readPrState: (...a) => provider.readPrState(...a), readComments: (...a) => provider.readComments(...a),
+    ensureLabel: (...a) => provider.ensureLabel(...a),
+    setLabels: (repo, pr, change) => {
+      if (provider.readPrState(repo, pr)?.headRefOid !== head) throw Error('head moved before label write');
+      return provider.setLabels(repo, pr, change);
+    } };
+}
 
 /** Repair derived labels for trusted results on already-reviewed, unchanged heads. */
 export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
-  env = process.env, log = () => {}, sync = syncRedTeamStatusLabels } = {}) {
+  env = process.env, log = () => {}, provider = null, sync = syncRedTeamStatusLabels } = {}) {
   let updated = rawPrs;
   const applied = [], errors = [];
   const labelName = label => typeof label === 'string' ? label : label?.name;
@@ -21,7 +33,7 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
       && (names.includes('red-team:clear') || names.includes('red-team:blocked'))) continue;
     try {
       if (!redTeamForHead(row.comments, pr, head)) continue;
-      const plan = sync({ repo, pr, head, env, log });
+      const plan = sync({ repo, pr, head, env, log, provider: headGuardedProvider(provider ?? createGhProvider(), head) });
       if (plan.skipped || (!plan.add && !plan.remove.length)) continue;
       const labels = row.labels.filter(label => !plan.remove.includes(labelName(label)));
       if (plan.add && !labels.some(label => labelName(label) === plan.add)) labels.push(plan.add);
