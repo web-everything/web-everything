@@ -165,8 +165,8 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   try { current = readFileSync(path, 'utf8'); } catch { current = null; }
   if (current !== entry.payload.body) {
     mkdirSync(dirname(path), { recursive: true });
-    // Never write THROUGH a link: a symlinked staged file is replaced by a regular file, not followed.
-    try { if (lstatSync(path).isSymbolicLink()) unlinkSync(path); } catch { /* absent */ }
+    // Never write THROUGH a link: any existing staged file (symlink included) is unlinked and recreated, not followed.
+    try { lstatSync(path); unlinkSync(path); } catch { /* absent */ }
     writeFileSync(path, entry.payload.body, { encoding: 'utf8', flag: 'wx' });
   }
   return path;
