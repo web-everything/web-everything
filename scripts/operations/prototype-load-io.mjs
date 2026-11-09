@@ -449,18 +449,6 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
-      // P9: inspect the live registry without rebuilding, fetching, recovering or retiring it.
-      // Missing state is an empty registry; corrupt/unreadable state refuses.
-      stage = 'check-unverifiable';
-      const registryText = read(`${cloneState()}.json`);
-      if (registryText) {
-        const registry = JSON.parse(registryText);
-        const rows = registry?.overlays;
-        if (!Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) throw new Error('unreadable registry');
-        if (rows.some((r) => r.ref === input.branch)) {
-          out.registered = 'already'; out.wouldRegister = false; out.ok = true; return out;
-        }
-      }
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
       out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,

@@ -1353,7 +1353,6 @@ describe('prototype-load', () => {
   ])('retains a landed-only registration without a swap failure: %s', async (_, options) => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, ...options });
     const r = await f.run();
-    if (options.list?.includes(BASE.branch)) { expect(r).toMatchObject({ ok: true, registered: 'already', adopted: false }); expect(f.calls).toEqual([]); expect(f.registrations.has('lane/old')).toBe(true); return; }
     expect(r).toMatchObject({ ok: true, adopted: true, stopReason: null, contained: [], swap: { contained: [], removed: [] } });
     expect(r.swap.failed).toBeUndefined();
     expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
@@ -1515,7 +1514,6 @@ describe('prototype-load', () => {
       },
     });
     const r = await f.run();
-    if (already) { expect(r).toMatchObject({ ok: true, registered: 'already', adopted: false, removed: [] }); expect(f.calls).toEqual([]); return; }
     expect(r).toMatchObject({ ok: false, stopReason: 'check-unverifiable', adopted: false, removed: [], error: 'adoption wait interrupted' });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old.');
@@ -1542,7 +1540,6 @@ describe('prototype-load', () => {
     const f = fixture({ behind, list: [...(already ? [BASE.branch] : []), 'lane/old', 'lane/also'],
       contained: ['lane/old', 'lane/also'], changeAfterContainment });
     const r = await f.run();
-    if (already) { expect(r).toMatchObject({ ok: true, registered: 'already', adopted: false, removed: [] }); expect(f.calls).toEqual([]); expect(f.lateChanges).toEqual([]); return; }
     expect(f.lateChanges).toContain(changeAfterContainment);
     expect(r.adopted).toBe(true);
     expect(r.ok).toBe(false);
@@ -1556,9 +1553,9 @@ describe('prototype-load', () => {
     expect([...f.registrations.keys()]).toContain('lane/old');
     if (changeAfterContainment === 'registration replaced') expect(f.registrations.get('lane/old').reason).toBe('concurrent writer');
   });
-  it('leaves containment unchanged when the replacement is already registered', async () => {
+  it('refreshes containment when the replacement is already registered', async () => {
     const f = fixture({ list: [BASE.branch, 'lane/old'], contained: ['lane/old'], advanceEstablishedBeforeSwap: true });
-    expect(await f.run()).toMatchObject({ ok: true, stopReason: null, registered: 'already', removed: [] });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', registered: 'already', removed: [] });
     expect(mutations(f, 'add')).toEqual([]);
     expect(mutations(f, 'remove')).toEqual([]);
   });
@@ -1986,8 +1983,8 @@ describe('prototype-load', () => {
     expect(f.records[0]).toMatchObject({ path: '/home/test/records', daemon: 'control', branch: BASE.branch, sha: SHA, effectiveRef: BASE.branch, effectiveSha: SHA, dryRun: false, ok: true, registered: true, adopted: true, why: 'load tested patch' });
     expect(r.settings.sources['daemons.control.clone']).toBe('tool'); expect(r.settings.log).toContain('wev-control');
   });
-  it('already registered is idempotent without rebuilding or waiting', async () => {
-    const f = fixture({ list: [BASE.branch] }); expect((await f.run()).registered).toBe('already'); expect(mutations(f, 'add')).toHaveLength(0); expect(f.calls).toEqual([]);
+  it('already registered is idempotent but still waits for adoption', async () => {
+    const f = fixture({ list: [BASE.branch] }); expect((await f.run()).registered).toBe('already'); expect(mutations(f, 'add')).toHaveLength(0); expect(f.calls.at(-1).args[0]).toBe('-C');
   });
   it('dry-run checks original ref and records without push/add/remove or adoption', async () => {
     const f = fixture({ behind: true, list: ['lane/old'], contained: ['lane/old'] }); const r = await f.run({ dryRun: true }); expect(r.ok).toBe(true); expect(r.wouldMerge.ref).toBe('lane/new-m1'); expect(r.wouldRegister).toBe(true); expect(r.effectiveRef).toBe(BASE.branch); expect(r.wouldRemove).toEqual([]); expect(r.wouldRetain).toEqual(['lane/old']); expect(r.wouldStopReason).toBe('swap-remove-failed');
@@ -2825,10 +2822,10 @@ describe('refuse-only safety properties P1–P9', () => {
     expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   });
-  it('P9 keeps an already-live unaudited registration, without rebuild/removal/gate or fetch', async () => {
-    const f = auditedFixture('refuse', { ready: '', list: [BASE.branch] });
-    expect(await f.run()).toMatchObject({ ok: true, registered: 'already' });
-    expect(f.calls).toEqual([]); expect(f.readyWrites).toEqual([]); expect(f.retirePlanner).not.toHaveBeenCalled();
+  it('P9 an already-live registration is never removed or rebuilt, and an unaudited re-load is still refused', async () => {
+    const f = auditedFixture('refuse', { ready: '', list: [BASE.branch, 'lane/old'] });
+    expect(await f.run()).toMatchObject({ ok: false });
+    expect(mutations(f, 'add')).toHaveLength(0); expect(mutations(f, 'remove')).toHaveLength(0); expect(f.retirePlanner).not.toHaveBeenCalled();
   });
   it('real settings R786 (#6588), R790 (a7200c728), R796 (166689d) pass the canonical ruled gate using fake IO', async () => {
     const shipped = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
