@@ -33,7 +33,7 @@ const BLOCK = 'review-pr-818f371c-ad92-48f4-909e-c0a52de29c37:0';
 const LOC = 'scripts/conveyor/build-dispatch-orphan-adopt.mjs:393';
 const o = openReferralFindings({ comments: fx.comments, repo: fx.repo, pr: fx.pr, head: fx.headRefOid, body: fx.body,
   createdAt: fx.createdAt, cardReadable: () => true });
-const read = { head: fx.headRefOid, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: CARD,
+const read = { identity: { login: 'chalbert', type: 'User' }, head: fx.headRefOid, open: o.open, ruled: o.ruled, disputed: o.disputed, malformed: o.malformed, card: CARD,
   now: '2026-10-08T11:30:00.000Z', clearerId: 's' };
 const input = (extra = {}) => ({ repo: fx.repo, pr: fx.pr, finding: LOC, ruling: 'card', actor: 'chalbert', channel: 'chat',
   reason: 'Card', ...extra });

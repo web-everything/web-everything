@@ -37,11 +37,25 @@ import { idFromName, normalizeId } from '../backlog/id.mjs';
 import { selectFindings, openReferralFindings, automaticPolicyTargets, describePolicySkip, policyProtectionSnapshot,
   OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, planJudgeNotReal, finishJudgeRuling, planReferralCard } from './record-referral-ruling.mjs';
 import { createChangedLinesReader, changesTouchCitedLines, COMPARE_FILE_CAP } from './review-pr-io.mjs';
+import { readCompletePrComments, LIST_COMMENTS_PAGE_SIZE } from '../conveyor/pr-comments-complete.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const ghJson = (args) => JSON.parse(execFileSyncThrottled('gh', args,
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024 }));
+const ghJson = (args, opts = {}) => JSON.parse(execFileSyncThrottled('gh', args,
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024, ...opts }));
+
+/**
+ * The ONE credential the ruling post AND its identity check use (PR #6529 red team). `gh api user` is a classified
+ * read, so with personal-read routing on the throttle swapped it onto the operator's login while `gh pr comment`
+ * kept the App token: the check passed as the operator and the App posted the ruling. Pin the route off at the
+ * outer throttle and the nested shim, and select the same repository App as the post
+ * (as `we:scripts/lib/review-label-provider.mjs#readPostingIdentity` does).
+ */
+export const posterCredential = (repo) => ({
+  env: { ...process.env, GH_REPO: repo, WE_GH_THROTTLE_PERSONAL_ROUTE: '0' },
+  throttle: { personalRoute: false },
+});
+const readPosterIdentity = (readJson, repo) => readJson(['api', 'user'], posterCredential(repo));
 
 /** The live PR fields the gate reads (`gh pr view` returns each comment's `author.login`). */
 export function readPrThread(repo, pr, { readJson = ghJson } = {}) {
@@ -378,7 +392,8 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
     const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines, env, log });
     return {
       head: thread.headRefOid, ...open,
-      ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }), identity: readJson(['api', 'user']) } : {}),
+      ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
+      ...(actor !== AUTO_POLICY_ACTOR ? { identity: readPosterIdentity(readJson, repo) } : {}),
       ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
         evidence: readJudgeEvidence(evidenceFile, readFile),
         disagreements: referralDisagreements(thread.comments, open, { repo, pr, finding }) } : {}),
@@ -428,7 +443,11 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
   runSetLabel = execFileSync,
   post = (repo, pr, body) => execFileSyncThrottled('gh',
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) } = {}) {
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }),
+  removeComment = (repo, id) => execFileSyncThrottled('gh', ['api', '--method', 'DELETE', `repos/${repo}/issues/comments/${id}`],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, ...posterCredential(repo) }),
+  // The complete, count-proved thread (paginated REST); `gh pr view --json comments` stops at one page of 100.
+  readAllComments = (repo, pr) => readCompletePrComments(Number(pr), { repo }) } = {}) {
   return {
     ['github.referral-ruling-file-card']: rulingCardFilingSink(landCard),
     ['github.referral-ruling-file-card-judge']: judgeRulingSink({ confirm, land: landCard, planCard: planReferralCard }),
@@ -482,8 +501,8 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
         const judgeActorPolicy = readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn });
         for (const row of rulings) assertJudgeAuthority({ judgeActorPolicy }, { actor, ruling: row.result, supersedes: row.supersedes });
-        assertRulingIdentity(readJson(['api', 'user']), actor);
       }
+      const checkedLogin = actor !== AUTO_POLICY_ACTOR ? assertRulingIdentity(readPosterIdentity(readJson, repo), actor) : null;
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
       if (actor === AUTO_POLICY_ACTOR) {
@@ -553,12 +572,54 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         }
         if (miss) throw new Error(`ledger-write-miss: the ruling was not recorded in the verdict ledger, so it does not clear and nothing was posted (${miss}); retry once the ledger is writable`);
       }
-      const already = before.comments.some((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
+      const sameBody = (c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body;
+      const already = before.comments.some(sameBody);
+      // PR #6529: the identity check and the post are separate `gh` calls, so a per-call credential fallback (the App
+      // shim's personal fallback on a token-cache miss) can still split them. A human-actor ruling must be AUTHORED by
+      // the login that passed the check (both sides lower-cased); anything else is refused and compensated below.
+      const strayOf = (comments) => actor === JUDGE_ACTOR || !checkedLogin ? []
+        : comments.filter((c) => sameBody(c) && String(c?.author?.login ?? '').toLowerCase() !== checkedLogin);
+      // Rounds 2-3: the gate reader ignores a human-actor ruling its actor did not author (`parseOperatorRulingComment`),
+      // so a wrong-author copy never clears; it is still removed so the thread does not show a ruling nobody made.
+      // Re-read the thread (the post may have thrown after it landed), delete each wrong-author copy by its own id, and
+      // confirm on a fresh read that it is gone. Never throws: returns the note for the error, naming any copy left.
+      const STRAY_DELETE_CAP = 5;
+      // A page that reaches the list cap may be truncated, and the gate reads the whole thread: re-read it completely
+      // (a failed complete read throws, so it is never taken as "no stray").
+      const wholeThread = () => {
+        const listed = readPrThread(repo, pr, { readJson }).comments;
+        return listed.length >= LIST_COMMENTS_PAGE_SIZE ? readAllComments(repo, pr) : listed;
+      };
+      const removeStrays = () => {
+        let strays;
+        try { strays = strayOf(wholeThread()); } catch (e) {
+          return `could not re-read the thread to check for a wrong-author ruling comment (${String(e?.message ?? e).split('\n')[0]}); one may still be on the thread (the gate ignores it: its actor did not author it) — inspect the thread before retrying`;
+        }
+        if (!strays.length) return '';
+        const ids = strays.map((c) => /#issuecomment-(\d+)$/.exec(String(c?.url ?? ''))?.[1] ?? null);
+        ids.forEach((id, i) => {
+          if (!id || i >= STRAY_DELETE_CAP) return;
+          try { removeComment(repo, id); } catch (e) { warn(`could not delete wrong-author ruling comment ${strays[i].url}: ${String(e?.message ?? e).split('\n')[0]}`); }
+        });
+        let left;
+        try { left = strayOf(wholeThread()); } catch { left = strays; }
+        if (!left.length) return `removed the wrong-author ruling comment${strays.length === 1 ? '' : 's'} ${strays.map((c) => c.url).join(', ')} from the thread`;
+        return `${left.map((c) => c.url || `(a comment by ${String(c?.author?.login ?? '')} with no id)`).join(', ')} is still on the thread `
+          + '(its delete failed or could not be confirmed); the gate ignores it (its actor did not author it), so it clears nothing — delete it to tidy the thread';
+      };
       let seen;
+      // Set only when the comment LANDED but under another login: the thread then holds through the reader (a stamped
+      // copy keeps its block rows), so the ledger must hold too. A failed post records nothing (E1 wiring).
+      let strayLanded = false;
       try {
         if (!already) post(repo, pr, body);
         const after = readPrThread(repo, pr, { readJson });
-        seen = after.comments.filter((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
+        seen = after.comments.filter(sameBody);
+        const strays = strayOf(seen);
+        if (strays.length) {
+          strayLanded = true;
+          throw new Error(`the ruling comment is not readable by the gate after posting: it is authored by ${JSON.stringify(String(strays[0]?.author?.login ?? ''))}, not the checked poster ${checkedLogin}; the hold remains — inspect the thread before retrying`);
+        }
         // A judge row is read back through the gate-visible policy under this sink's env, as the gate will read it.
         const counted = readOperatorRulings(actor === JUDGE_ACTOR ? after.comments : seen,
           { head, ...(actor === JUDGE_ACTOR ? { judgePolicy: () => readJudgeActorPolicy({ env, log: warn }).value } : {}) }).rulings;
@@ -568,8 +629,17 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         }
       } catch (error) {
         // Clearing rows are already recorded (the F4 order) but the comment did not land readable: they must not stay live.
-        if (!clearing.length) throw error;
-        throw new Error(`${String(error?.message ?? error)} [${revertNote(clearing, await revertToHold(clearing))}; ${RERUN}]`);
+        // A holding-only ruling is left alone: a wrong-author block comment can only hold (the reader keeps a stamped
+        // copy's block rows), so deleting it would drop a hold. When such a copy landed, its holding rows are recorded so
+        // the ledger holds too; a post that never landed changes nothing in the ledger.
+        if (!clearing.length) {
+          const holdingRows = strayLanded ? events.filter((e) => !clearsHold(e.ruling)) : [];
+          const holdMiss = holdingRows.length ? await tryAppend(holdingRows) : null;
+          throw new Error(`${String(error?.message ?? error)}${holdMiss ? ` [ledger-write-miss: the block was not recorded in the verdict ledger either: ${holdMiss}]` : ''}`);
+        }
+        // Both compensations run, each independently: the thread (the comment gate) and the ledger (the ledger gate).
+        const removal = removeStrays();
+        throw new Error(`${String(error?.message ?? error)} [${removal ? `${removal}; ` : ''}${revertNote(clearing, await revertToHold(clearing))}; ${RERUN}]`);
       }
       const holding = events.filter((e) => !clearsHold(e.ruling));
       const holdMiss = holding.length ? await tryAppend(holding) : null;
