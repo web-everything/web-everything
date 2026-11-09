@@ -173,14 +173,22 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   let current = null;
   try { current = readFileSync(path, 'utf8'); } catch { current = null; }
   if (current !== entry.payload.body) {
-    mkdirSync(dirname(path), { recursive: true });
-    // The run directory must really live under this checkout's sidecar: a symlinked directory would redirect the write.
-    const sidecar = realpathSync(reviewSidecarDir(root));
-    const dir = realpathSync(dirname(path));
-    if (dir !== join(sidecar, runId)) throw notApplied(`the staged write-up directory for ${runId} resolves outside the review sidecar`, {});
-    // Never write THROUGH a link: any existing staged file (symlink included) is unlinked and recreated, not followed.
-    try { lstatSync(path); unlinkSync(path); } catch { /* absent */ }
-    writeFileSync(path, entry.payload.body, { encoding: 'utf8', flag: 'wx' });
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      // The run directory must really live under this checkout's sidecar: a symlinked directory would redirect the write.
+      const sidecar = realpathSync(reviewSidecarDir(root));
+      const dir = realpathSync(dirname(path));
+      if (dir !== join(sidecar, runId)) throw notApplied(`the staged write-up directory for ${runId} resolves outside the review sidecar`, {});
+      // Never write THROUGH a link: any existing staged file (symlink included) is unlinked and recreated, not followed.
+      try { lstatSync(path); unlinkSync(path); } catch { /* absent */ }
+      writeFileSync(path, entry.payload.body, { encoding: 'utf8', flag: 'wx' });
+    } catch (e) {
+      if (e?.notApplied) throw e;
+      // Every step above is LOCAL and runs before any external write, so a filesystem failure (EACCES, ENOSPC, EEXIST…)
+      // proves nothing was published: refuse as notApplied so the effect stays retryable once the lane is repaired,
+      // instead of an ordinary throw the executor must treat as an UNKNOWN outcome and refuse on every later resume.
+      throw notApplied(`the staged write-up for ${runId} could not be regenerated from the run record: ${String((e && e.message) || e)}`, {});
+    }
   }
   return path;
 }

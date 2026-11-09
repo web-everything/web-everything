@@ -535,6 +535,37 @@ describe('the label sink', () => {
     expect(post).not.toHaveBeenCalled();
   });
 
+  // Recovery runs BEFORE any external write, so a local filesystem failure while regenerating the staged body must be
+  // `notApplied`: the effect stays retryable instead of becoming an UNKNOWN-outcome refusal on every later resume.
+  const gate = async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' });
+  it('a run directory that cannot be created (mkdir fails) is notApplied and retries once the path is repaired', async () => {
+    mkdirSync(reviewSidecarDir(root), { recursive: true });
+    const blocker = join(reviewSidecarDir(root), 'run-1'); writeFileSync(blocker, 'not a directory');
+    const seen = []; const post = vi.fn(async () => ({ ok: true }));
+    const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, runStore: { read: () => runRecord }, publishGate: gate,
+      runNode: (argv) => { seen.push(argv); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
+    const err = await sinks[REVIEW_EFFECTS.LABEL]({ ...payload, redTeamOwed: true }, CTX).catch((e) => e);
+    expect(err).toMatchObject({ notApplied: true, message: expect.stringContaining('could not be regenerated') });
+    expect(seen).toEqual([]);
+    expect(post).not.toHaveBeenCalled();
+    // `notApplied` is the executor's "nothing landed, retry" signal: once the path is repaired, the same effect applies.
+    rmSync(blocker);
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(seen).toHaveLength(1);
+    expect(readFileSync(reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' }), 'utf8')).toBe('# frozen verdict');
+  });
+
+  it('a staged file that cannot be replaced (write fails) is notApplied before any write', async () => {
+    // A directory squatting on the body path: the unlink fails, so the exclusive create fails with EEXIST.
+    const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+    mkdirSync(path, { recursive: true });
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: gate,
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+  });
+
   it('an unreadable run record refuses before any write instead of shelling', async () => {
     const seen = [];
     const sinks = createReviewPrSinks({ root, runStore: { read: () => { throw new Error('corrupt'); } }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
@@ -3451,6 +3482,17 @@ describe('held item 177: the stack-hold sink', () => {
     const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => record }, postComment: (repo, pr, body) => { posted.push(body); } });
     await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' });
     expect(posted[0]).toContain('## Recovered verdict');
+  });
+
+  it('a recovery filesystem failure (mkdir) is notApplied: no note, no marker, retryable', async () => {
+    const posted = [];
+    mkdirSync(reviewSidecarDir(root), { recursive: true });
+    writeFileSync(join(reviewSidecarDir(root), 'run-1'), 'not a directory');
+    const record = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Recovered verdict' } }] };
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => record }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(posted).toEqual([]);
   });
 
   it('refuses when the sidecar root itself is a symlink', async () => {
