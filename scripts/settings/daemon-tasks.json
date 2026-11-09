@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Daemon task table: source for rendered launchd plists. Paths use {home} and {node} tokens; env holds non-sensitive literals only; hostEnvKeys are names whose values come from the host overlay, never committed.",
+  "description": "Daemon task table (a verbatim inventory of the live 2026-11-09 laptop values, so a render reproduces today with no behaviour change; tuning any value is a separate decision): source for rendered launchd plists. Paths use {home} and {node} tokens; env holds non-sensitive literals only; hostEnvKeys are names whose values come from the host overlay, never committed.",
   "tasks": [
     {
       "label": "com.plateau.drain-daemon",
