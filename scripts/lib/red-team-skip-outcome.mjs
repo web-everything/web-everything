@@ -167,7 +167,9 @@ export function settleRedTeamSkip(input = {}) {
     let classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
       : classifyRedTeamSkip(redTeam);
     let rule;
-    if (classified.kind !== 'policy' && realHead && isRealHead(input.readHead)
+    // The carry machine only models a card-only skip, so a carry settlement never takes this rule: it would be
+    // recorded as card-only with the rule unnamed. It keeps its existing refusal instead (fail closed).
+    if (classified.kind !== 'policy' && !input.carry && realHead && isRealHead(input.readHead)
       && input.readHead.toLowerCase() === head.toLowerCase()
       && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam })) {
       classified = { kind: 'policy', reason: 'not owed (stored review)' };
