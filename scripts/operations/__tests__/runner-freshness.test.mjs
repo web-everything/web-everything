@@ -77,6 +77,7 @@ describe('runner freshness policy', () => {
         "docket-refresh",
         "explore",
         "extend-rounds",
+        "file-held-cards",
         "file-item",
         "free-scope",
         "gap-sweep-status",
