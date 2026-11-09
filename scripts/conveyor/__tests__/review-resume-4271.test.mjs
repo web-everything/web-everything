@@ -27,8 +27,11 @@ const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)),
 const repo = fx.repo;
 const head = fx.headRefOid;
 // The thread as it stood when the advisory posted (records + advisory), and after the operator's two rulings.
-const beforeRulings = fx.comments.slice(0, 3);
-const afterRulings = fx.comments;
+// The capture kept no edit metadata; these comments were never edited, as a live `gh pr view --json comments` read
+// reports (`includesCreatedEdit: false`). PR #6529: an unstamped automation-posted ruling clears only with that proof.
+const comments = fx.comments.map((c) => ({ ...c, includesCreatedEdit: false }));
+const beforeRulings = comments.slice(0, 3);
+const afterRulings = comments;
 const pr = (comments, labels = ['review:human', 'advisory:ruling-needed']) => ({
   number: fx.pr, headRefOid: head, body: fx.body, createdAt: fx.createdAt, isDraft: false, baseRefName: 'main',
   labels: labels.map((name) => ({ name })), comments,

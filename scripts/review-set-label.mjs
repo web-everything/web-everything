@@ -71,7 +71,7 @@ import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqu
 // #x9xqexm's base-independent third marker. Independent concerns.
 import {
   REVIEW_PR_CHANNEL, REVIEW_LABELS, hasReviewLabel, buildReviewedShaMarker, buildReviewedDiffMarker,
-  buildReviewedContributionMarker, buildClearedHumanMarker, READY_TO_MERGE_LABEL,
+  buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId, latestHumanClearanceComment, READY_TO_MERGE_LABEL,
   // #3007 — the SAME two digests the markers carry, taken raw so the ledger row records the witnesses
   // themselves rather than re-deriving them from the rendered comment. One computation, two consumers.
   normalizeDiffFingerprint, normalizeContributionFingerprint,
@@ -98,7 +98,7 @@ import {
 } from './lib/review-escalation.mjs';
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
-import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
@@ -846,22 +846,25 @@ export const bodyFileRoots = (cwd = process.cwd(), tmp = tmpdir()) => [cwd, tmp,
  *   --json comments` array. `headSha` is the head this restamp is stamping (post-#x9krtkb bug-2 fix, the
  *   caller-asserted `--new-head` when supplied, never a racy re-read). `headDiff` is the FRESH net diff text (or
  *   precomputed fingerprint) this restamp already computed against that head, reused rather than re-fetched.
- * @returns {{actor:string, sha:string}|null}
+ * @returns {{actor:string, sha:string, sourceId?:string}|null}
  */
 export function decideRestampHumanClearance({ comments, headSha, headDiff } = {}) {
   const humanClearedSha = parseLatestHumanClearedSha(comments);
   if (!humanClearedSha) return null;
+  // The fingerprints and actor come from the comment the shared scan accepted, never a rejected carrier's markers.
+  const accepted = latestHumanClearanceComment(comments);
   const coverage = acceptanceCoversHead({
     acceptedSha: humanClearedSha,
     headSha,
-    acceptedDiff: parseReviewedDiff(comments),
+    acceptedDiff: parseReviewedDiff(accepted ? [accepted] : []),
     headDiff,
-    acceptedContribution: parseReviewedContribution(comments),
+    acceptedContribution: parseReviewedContribution(accepted ? [accepted] : []),
     headContribution: headDiff,
   });
   if (!coverage.covers) return null;
-  const clearance = parseOperatorClearance((Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor));
-  return { actor: clearance ? clearance.actor : 'the operator', sha: humanClearedSha };
+  const clearance = parseOperatorClearance(accepted ? [accepted] : []);
+  const sourceId = latestHumanClearanceSourceId(comments);
+  return { actor: clearance ? clearance.actor : 'the operator', sha: humanClearedSha, ...(sourceId ? { sourceId } : {}) };
 }
 
 // ── APPROVAL-TIME PREVENTION FILING (operator, 2026-09-27) ──────────────────────────────────────────────────
@@ -1071,7 +1074,7 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * @param {{argv?:string[], fixedTo?:string|null, defaultActor:string, repoOptional?:boolean, usage:string,
  *   allowClearHuman?:boolean,
  *   buildComment:(o:{to:string,actor:string,decision:object,headSha:string,reason:string,
- *     humanClearance?:{actor:string,sha:string}|null})=>string,
+ *     humanClearance?:{actor:string,sha:string,sourceId?:string}|null})=>string,
  *   successResult:(o:{pr:number,to:string,decision:object,labels:string[]})=>object,
  *   refusalResult:(o:{pr:number,decision:object})=>object,
  *   emit?:(line:string)=>void}} cfg
@@ -1750,6 +1753,16 @@ export function runReviewLabelCli({
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
     }
+    // R728: the label-level record (`latestAcceptRecord`) reads any `cleared-human` marker, but the shared scan is the
+    // proof. With no citable source (an unproven carrier ended the chain) the clearance cannot be carried, so the lift
+    // must not add `review:accepted` under a plain restamp: hand the hold to the operator, a human re-clear is owed.
+    // The full thread only: a full first page can still cite a source that a carrier past comment 100 has ended.
+    if (clearance && !latestHumanClearanceSourceId(readCarryEvidence().comments)) {
+      const reason = 'the clearance has no proven carry chain to this head (an unproven carrier ended it), so a human must re-clear';
+      handMechanicalHoldToOperator(reason, { overridesLiveClearance: true });
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason, ...(handOffRetryable ? { retryable: true } : {}) } }))}\n`);
+      process.exit(1);
+    }
     carriedHumanClearance = clearance;
     clearReason = `carried from ${humanCarry.from} to ${humanCarry.to}: ${humanCarry.reason}. ${clearReason}`.trim();
   }
@@ -1790,6 +1803,10 @@ export function runReviewLabelCli({
   let humanClearance = null;
   if (to === 'restamp') {
     humanClearance = carriedHumanClearance ?? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff });
+    if (guardedRestamp && parseLatestHumanClearedSha(prComments)
+      && (!humanClearance || parseReviewedDiff([latestHumanClearanceComment(prComments)]) !== normalizeDiffFingerprint(reviewedDiff))) {
+      fail('CI-heal human clearance NOT carried: net reviewed diff changed — a human must re-approve', 1);
+    }
     if (!humanClearance && !guardedRestamp && !restampAcrossHold) {
       const derived = deriveHumanCarry();
       // An unreadable review / full-thread read must not mint this accept WITHOUT its `cleared-human` marker: that would drop
@@ -1825,6 +1842,14 @@ export function runReviewLabelCli({
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — render the durable comment ONCE, here, so the bytes
   // that are size-checked, written and posted are the same bytes.
+  if (to === 'restamp' && humanClearance) {
+    // The full thread only (re-read when the page is full; a short page IS the thread): a page-first answer could cite a
+    // source that a later carrier past comment 100 already ended.
+    const sourceId = latestHumanClearanceSourceId(readCarryEvidence().comments);
+    // R728: with no citable source the clearance cannot be carried. Readers would treat an uncited carrier as a plain
+    // accept that ends the chain, so post exactly that: a plain restamp, never a `cleared-human` record nobody proved.
+    humanClearance = sourceId ? { ...humanClearance, sourceId } : null;
+  }
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
   }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
@@ -1846,6 +1871,27 @@ export function runReviewLabelCli({
   // argv projection stays as belt-and-braces only because it can name the offending flag before any gh call.
   if (commentBody.length > GH_COMMENT_MAX) {
     fail(`the rendered comment is ${commentBody.length} chars, over GitHub's ${GH_COMMENT_MAX} limit — trim the body/--reason/--actor (nothing was changed)`);
+  }
+
+  // PR #6529 round 3 — THE READER AGREES BEFORE ANY WRITE. A restamp that carries the operator's clearance must leave a
+  // record the gate reader (`parseLatestHumanClearedSha`) reads as clearing THIS head. The writer's own proof can be
+  // wider than the reader's (a fingerprint re-derived from git for a clearing comment that has none, a carrier with no
+  // resolvable `cleared-from` source): posting it would lift the hold, and the reader would then still name the old head,
+  // so the next tampering check reparks. So the rendered comment is read back through the reader, as an automation
+  // carrier appended to the COMPLETE thread, before the ledger, the label or the comment is written. A disagreement is a
+  // decided refusal: across the drain's mechanical park the hold goes to the operator; a plain restamp writes nothing.
+  if (to === 'restamp' && humanClearance) {
+    const thread = readCarryEvidence().comments;
+    const selfCheck = { id: 'IC_restamp_reader_self_check', author: { login: AUTOMATION_LOGINS[0] ?? 'web-everything' }, body: commentBody };
+    const readerSha = Array.isArray(thread) ? parseLatestHumanClearedSha([...thread, selfCheck]) : null;
+    if (String(readerSha ?? '') !== String(headSha).toLowerCase()) {
+      const why = `the restamped clearance would not be readable by the gate (it reads the clearance on ${readerSha ? String(readerSha).slice(0, 9) : 'no head'}, not ${String(headSha).slice(0, 9)}): `
+        + 'the operator clearance has no reviewed-diff fingerprint or no citable source comment, so a carrier cannot prove it (R706)';
+      if (restampAcrossHold) handMechanicalHoldToOperator(why);
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason: why,
+        ...(restampAcrossHold && handOffRetryable ? { retryable: true } : {}) } }))}\n`);
+      process.exit(1);
+    }
   }
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -2333,7 +2379,7 @@ export function runReviewLabelCli({
  *
  * @param {{to:string, actor:string, headSha?:string, body?:string, reason?:string, reviewedDiff?:string,
  *   clearerId?:string, independence?:{independent:boolean,status:string,reason:string}|null,
- *   channel?:string, humanClearance?:{actor:string,sha:string}|null}} o -
+ *   channel?:string, humanClearance?:{actor:string,sha:string,sourceId?:string}|null}} o -
  *   #x169fqe: `reviewedDiff` is the raw diff (or a precomputed fingerprint) the verdict was formed against.
  *   Omitted → no diff marker → the gate falls back to SHA identity, i.e. pre-#x169fqe behaviour.
  *   #2898: `channel` is the SURFACE the verdict came through, free text like `actor` (see `normalizeChannel`).
@@ -2379,6 +2425,7 @@ export function buildVerdictComment({
       buildReviewedContributionMarker(reviewedDiff),
       to === 'clear-human' ? buildClearedHumanMarker(actor)
         : carriesHumanClearance ? buildClearedHumanMarker(humanClearance.actor) : '',
+      carriesHumanClearance ? buildClearedFromMarker(humanClearance.sourceId) : '',
       // The shared marker builder refuses only `\n`; a CR or U+2028/9 in the id would still end the marker's line
       // early, so the id is refused (no marker, like an unusable id) before it reaches that builder.
       buildClearerActorMarker(/[\r\n\p{Zl}\p{Zp}]/u.test(String(clearerId)) ? '' : clearerId),
@@ -2621,7 +2668,9 @@ export function projectVerdictCommentLength({ body = '', actor = '', reason = ''
   // a proof — unlike every other branch of this projection, which is exact — but it is strictly better than the
   // blind spot it replaces, and the RENDERED-BYTES guard in `runReviewLabelCli` (checked against the REAL
   // `humanClearance`, before any write) is what actually enforces the cap; this projection is belt-and-braces.
-  const humanClearances = [null, { actor: actor || 'x', sha: 'f'.repeat(40) }];
+  // Source ids are unavailable at preflight too; reserve a GraphQL-id sized citation here.
+  // Longer ids are still checked by the final rendered-byte guard before any write.
+  const humanClearances = [null, { actor: actor || 'x', sha: 'f'.repeat(40), sourceId: 'IC_' + 'x'.repeat(64) }];
   return Math.max(...REVIEW_LABEL_TARGETS.flatMap((to) => outcomes.flatMap((independence) => humanClearances.map(
     (humanClearance) => buildVerdictComment({
       to, actor, headSha: 'f'.repeat(40), body, reason, reviewedDiff: 'f'.repeat(64), clearerId, independence,

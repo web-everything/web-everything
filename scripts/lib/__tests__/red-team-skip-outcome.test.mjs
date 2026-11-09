@@ -6,9 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
 import { parseRedTeamComment, redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
-import { redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { readRecoveryWitness as witness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
+
+vi.mock('../drain-red-team-evidence.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readRecoveryWitness: vi.fn(actual.readRecoveryWitness) };
+});
 
 vi.mock('../atomic-json-file.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -320,5 +325,81 @@ describe('stored-review not-owed rule (R730)', () => {
       expect(f.settle(redTeam, ctx).outcome).toBe('non-policy');
       expect(f.io.postComment).not.toHaveBeenCalled();
     }
+  });
+  const storedReason = 'stored review does not owe a red team';
+  it.each([
+    ['not-owed deferredByGuard', { status: 'not-owed', deferredByGuard: true }],
+    ['not-owed deferredByCap', { status: 'not-owed', deferredByCap: true }],
+    ['skipped deferredByGuard', { status: 'skipped', reason: storedReason, deferredByGuard: true }],
+    ['skipped deferredByCap', { status: 'skipped', reason: storedReason, deferredByCap: true }],
+    ['skipped with a policy field', { status: 'skipped', policy: 'other', reason: storedReason }],
+    ['skipped with a card-only-less policy array', { status: 'skipped', policy: ['x'], reason: storedReason }],
+    ['null', null], ['array', []], ['string', 'not-owed'],
+  ])('%s never reads the stored review and stays with the operator', (_n, redTeam) => {
+    const f = fixture(); f.io.readStoredReview = vi.fn(() => review(head));
+    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.io.readStoredReview).not.toHaveBeenCalled();
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+  });
+  describe('human-required needs-human verdict (advisory lens decides)', () => {
+    const humanReview = extra => review(head, { verdict: 'needs-human', humanRequired: true,
+      lensVerdicts: { correctness: 'changes', security: 'accept' }, lenses: ['correctness', 'security'], ...extra });
+    it('settles, naming the rule, when the advisory lens says changes', () => {
+      const f = fixture(); f.io.readStoredReview = () => humanReview();
+      expect(f.settle({ status: 'not-owed' })).toMatchObject({ outcome: 'policy-clear', rule });
+      expect(f.comments[0].body).toContain(rule);
+      expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+    });
+    it.each([
+      ['pending referrals (no outcome)', { pendingReferrals: [{ key: 'k' }] }],
+      ['advisory lens says accept (red team owed)', { lensVerdicts: { correctness: 'accept', security: 'accept' } }],
+    ])('stays with the operator with %s', (_n, extra) => {
+      const f = fixture(); f.io.readStoredReview = () => humanReview(extra);
+      expect(f.settle({ status: 'not-owed' }).outcome).toBe('non-policy');
+      expect(f.io.postComment).not.toHaveBeenCalled();
+      expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+    });
+    it('stays with the operator when the read is degraded or unpinned', () => {
+      const f = fixture();
+      f.io.readStoredReview = () => { const r = humanReview(); r.newest.findings.read.degraded = true; return r; };
+      expect(f.settle({ status: 'not-owed' }).outcome).toBe('non-policy');
+      expect(f.io.postComment).not.toHaveBeenCalled();
+    });
+  });
+  it('a carry settlement never takes the rule and stays with the operator', () => {
+    const f = fixture(); f.io.readStoredReview = vi.fn(() => review(head));
+    f.io.carry = {};
+    expect(f.settle({ status: 'not-owed' }, { carry: { loopPayload: {} } }).outcome).toBe('non-policy');
+    expect(f.io.readStoredReview).not.toHaveBeenCalled();
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+  });
+  describe('production default reader (io.readStoredReview absent)', () => {
+    it('reads the recovery witness for the exact PR and head, with the io env, and settles', () => {
+      const f = fixture();
+      witness.mockReturnValueOnce(review(head));
+      expect(f.settle({ status: 'not-owed' })).toMatchObject({ outcome: 'policy-clear', rule });
+      expect(witness).toHaveBeenCalledWith({ repo, pr, head, env: f.io.env });
+    });
+    it('fails closed when the witness throws', () => {
+      const f = fixture();
+      witness.mockImplementationOnce(() => { throw Error('unreadable'); });
+      expect(f.settle({ status: 'not-owed' }).outcome).toBe('non-policy');
+      expect(f.io.postComment).not.toHaveBeenCalled();
+    });
+  });
+  describe('head binding', () => {
+    it.each([['unreal head', { head: 'unknown' }], ['null read head', { readHead: null }],
+      ['non-SHA read head', { readHead: 'main' }]])('%s never reads the stored review', (_n, ctx) => {
+      const f = fixture(); f.io.readStoredReview = vi.fn(() => review(head));
+      expect(f.settle({ status: 'not-owed' }, ctx).outcome).toBe('non-policy');
+      expect(f.io.readStoredReview).not.toHaveBeenCalled();
+      expect(f.io.postComment).not.toHaveBeenCalled();
+    });
+    it('an uppercase read head naming the same commit still settles', () => {
+      const f = fixture(); f.io.readStoredReview = () => review(head);
+      expect(f.settle({ status: 'not-owed' }, { readHead: head.toUpperCase() })).toMatchObject({ outcome: 'policy-clear', rule });
+    });
   });
 });

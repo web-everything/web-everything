@@ -1,3 +1,6 @@
+import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
+import { admitMqFailureRoute } from './mq-failure-intake.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 import { runEligibilityShadow, eligibilityShadowDeps, reportShadowError } from './dispatch-eligibility-shadow.mjs';
 /**
@@ -381,6 +384,7 @@ export function concurrentAuthorPauseState({ comments, headRefOid = null, now = 
  * it raises no finding.
  */
 export const BOOKKEEPING_MARKERS = Object.freeze([
+  '<!-- mq-failure-recovery:',
   REFERRAL_HOLD_MARKER,
   REARM_COMMENT_MARKER, CI_HEAL_COMMENT_MARKER, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, OPERATOR_ANSWER_MARKER,
   // #xkmu3gv — the two new completed-round markers. Neither is a reviewer speaking, so neither may ever count as
@@ -2984,6 +2988,31 @@ export function planReconcile({
     // guard / timeout-evidence refusal then held with nobody working it). Authenticated by comment author in
     // {@link operatorFixBudget}, never by text; one-shot; counted against the round grants; the loop guard stays
     // for automatic ci-heals.
+    // Only an authenticated, current-head marker creates this finding. All earlier safety/liveness
+    // holds still win. Diff uncertainty preserves fixer admission but never authorizes refresh.
+    // The holds that are NOT an earlier `continue` are checked here: a PR that is not OPEN, is a draft, is parked
+    // for a human (`review:human`) or is held by red team gets no MQ recovery and falls through to its ordinary rule.
+    const mqHeld = String(pr?.state ?? 'OPEN').toUpperCase() !== 'OPEN' || pr?.isDraft === true
+      || withPhase.labels.some(label => ['review:human', 'red-team:blocked', 'red-team:pending'].includes(label));
+    const mqIdentity = { repo: ghRepoSlug(repo), pr: prNumber, head: pr.headRefOid };
+    const mqRoute = mqHeld ? null : (Array.isArray(pr.comments) ? pr.comments : [])
+      .map(comment => parseMqFailureRoute({ comment, expected: mqIdentity }))
+      .filter(route => route && !route.stale).at(-1);
+    const mqRecovery = admitMqFailureRoute({ ...mqIdentity, route: mqRoute,
+      changedFiles: { ...mqIdentity, files: base.files, complete: Array.isArray(base.files) && pr.filesComplete === true } });
+    if (mqRecovery) {
+      const attempts = roundAttempts();
+      if (attempts >= effectiveRoundCap) {
+        refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: 'MQ failure recovery fix rounds exhausted; operator inspection required' }, { allowTakeover: false });
+      } else {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'mq-failure-recovery', findings: 1,
+          attempts, cap: effectiveRoundCap, mqFailureRecovery: mqRecovery,
+          why: 'Authenticated current-head merge-queue failure evidence requires recovery' });
+      }
+      continue;
+    }
+
     const sendBack = (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
       ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
         ? operatorSendBackRearm(pr, operatorBudget) : null);
