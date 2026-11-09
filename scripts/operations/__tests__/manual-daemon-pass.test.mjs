@@ -68,7 +68,7 @@ describe('manual-daemon-pass admission and audit', () => {
     expect(liveHead.mock.invocationCallOrder[0]).toBeLessThan(selected.mock.invocationCallOrder[0]);
     expect(selected).toHaveBeenCalledTimes(1);
     expect(selected).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env,
-      ...(daemon === 'red-team' ? { redTeamOnly: true } : {}) });
+      ...(daemon === 'red-team' ? { redTeamOnly: true, expectedHead: sha } : {}) });
     expect(daemon === 'red-team' ? dispatchReviewByMode : dispatchReviewJob).not.toHaveBeenCalled();
   });
   it.each(['throws', undefined, null, '', 'not-a-head', 'a'.repeat(39), 'g'.repeat(40)])(

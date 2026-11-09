@@ -450,6 +450,12 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       }
       const assessed = pending.find(p => p.metadata.prHead === i.prHead);
       const entry = assessed ? await pendingEvidence(assessed.context.row, i.head) : null;
+      if (readFailed || base.errors.length) {
+        incomplete = true;
+        record({ ...i, ts, phase: 'would-skip', held: 'red-team status changed or liveness unreadable; operator must inspect' });
+        record({ ...records[0], incomplete: true, readFailed: true, errors: base.errors.slice(0, 5) });
+        break;
+      }
       if (JSON.stringify(entry?.status) !== assessed?.statusSnapshot) {
         record({ ...i, ts, phase: 'would-skip', held: 'red-team status changed; operator must inspect' });
         continue;

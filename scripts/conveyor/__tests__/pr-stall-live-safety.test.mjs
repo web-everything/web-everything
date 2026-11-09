@@ -288,3 +288,26 @@ describe('live restart execution guarantees', () => {
     expect(fs.existsSync(join(dir, '.lock'))).toBe(false);
   });
 });
+
+
+describe('execute-time evidence failure stops the whole pass', () => {
+  it.each(['status', 'liveness'])('unreadable first candidate %s blocks both restarts and records an incomplete pass', async kind => {
+    const input = options(fixture(), {
+      read: () => ({ now: NOW, prs: [pr(11), pr(12)], liveJobs: [], unreadable: [], stalledAfterMinutes: 45 }),
+    });
+    const readStatus = input.readRedTeamStatus;
+    let firstReads = 0, probes = 0;
+    input.readRedTeamStatus = key => {
+      if (key.pr === 11 && ++firstReads === 2 && kind === 'status') throw Error('status unreadable at execute');
+      return readStatus(key);
+    };
+    input.probe.isAlive = () => {
+      if (++probes === 3 && kind === 'liveness') throw Error('liveness unreadable at execute');
+      return false;
+    };
+    const out = await runStallSweep(input);
+    expect(input.dispatchRestart).not.toHaveBeenCalled();
+    expect(out.incomplete).toBe(true);
+    expect(records(input.dir).filter(r => r.phase === 'pass').at(-1)).toMatchObject({ incomplete: true });
+  });
+});
