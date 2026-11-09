@@ -59,7 +59,7 @@ export function prepVerdict(text) {
   return { ok: false, reason: `Prep required (${problems.join('; ')}). Each heading needs a non-placeholder item of at least 8 non-whitespace characters.\n${FORMAT}`, waived: false };
 }
 
-function quotedOk(match[2].replace(/`/g, '')) {
+function quotedOk(value) {
   const m = value.trim().match(/^(?:"([^"]*)"|“([^”]*)”|'([^']*)'|‘([^’]*)’)/);
   const inner = m ? m.slice(1).find((x) => x !== undefined) : '';
   return Boolean(m) && nonTrivial(inner);
