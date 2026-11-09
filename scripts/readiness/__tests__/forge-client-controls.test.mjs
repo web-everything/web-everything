@@ -53,7 +53,7 @@ describe('Forge telemetry contracts', () => {
       expect(args.at(-1)).toBe('sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs telemetry');
       server.telemetry().then(value=>done(null,JSON.stringify(value)),done);
     });
-    const settings={maxLoadPerCore:Number.MAX_VALUE,minFreeRamPct:0,backoffMs:120000};
+    const settings={maxLoadPerCore:Number.MAX_VALUE,minFreeRamPct:0,backoffMs:120000,lastGoodMaxAgeMin:1};
     const check=()=>checkRemoteHealth({root:healthRoot,settings,clock:()=>time,
       readTelemetry:options=>readForgeTelemetry({...options,exec})});
     expect(await check()).toEqual({ok:true});
@@ -63,12 +63,14 @@ describe('Forge telemetry contracts', () => {
     expect(exec).toHaveBeenCalledTimes(2);
     time+=60000;expect(await check()).toEqual({ok:true});
     expect(exec).toHaveBeenCalledTimes(3);
-    exec.mockImplementationOnce((_f,_a,_o,done)=>done(new Error('offline')));
-    time+=10000;expect(await check()).toEqual({ok:false,reason:'forge-unreachable'});
+    exec.mockImplementation((_f,_a,_o,done)=>done(new Error('offline')));
+    // Expire last-good so a failed refresh must still refuse admission.
+    time+=60001;expect(await check()).toEqual({ok:false,reason:'forge-unreachable'});
     time+=119999;expect(await check()).toEqual({ok:false,reason:'backoff-forge-unreachable'});
-    expect(exec).toHaveBeenCalledTimes(4);
-    time++;expect(await check()).toEqual({ok:true});
     expect(exec).toHaveBeenCalledTimes(5);
+    exec.mockImplementation((_f,_a,_o,done)=>server.telemetry().then(value=>done(null,JSON.stringify(value)),done));
+    time++;expect(await check()).toEqual({ok:true});
+    expect(exec).toHaveBeenCalledTimes(6);
   });
   it('fails closed when live sampling finds unreadable run evidence', async () => {
     const root=scratch(),receipts=join(root,'receipts');mkdirSync(receipts,{mode:0o700});
@@ -248,7 +250,7 @@ ${gate?`if(!fs.existsSync(${JSON.stringify(join(root,'release'))})){const watch=
 
 describe('remote controls', () => {
   it('resolves every new default with provenance and rejects invalid values', () => {
-    const defaults={maxConcurrent:8,backoffMs:120000,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15,
+    const defaults={maxConcurrent:8,backoffMs:120000,lastGoodMaxAgeMin:10,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15,
       stuckMinSlots:2,stuckAgeMs:600000,stuckSignalEveryMs:600000};
     const standard=resolveAdmissionPolicy({});
     expect(standard.settings.remote).toMatchObject(defaults);
@@ -363,9 +365,11 @@ describe('remote controls', () => {
     const f=fixture({backoffMs:0});
     f.readTelemetry.mockRejectedValue(new Error('offline'));
     await runWithRemoteDecision(f);await runWithRemoteDecision(f);
-    expect(f.readTelemetry).toHaveBeenCalledTimes(1);
-    await runWithRemoteDecision({...f,clock:()=>now+10000});
     expect(f.readTelemetry).toHaveBeenCalledTimes(2);
+    await runWithRemoteDecision({...f,clock:()=>now+9999});
+    expect(f.readTelemetry).toHaveBeenCalledTimes(2);
+    await runWithRemoteDecision({...f,clock:()=>now+10000});
+    expect(f.readTelemetry).toHaveBeenCalledTimes(4);
     expect(f.remoteExec).not.toHaveBeenCalled();
   });
   it('quarantines unconfirmed slots across client calls instead of reclaiming their capacity', async () => {
@@ -456,9 +460,10 @@ describe('remote controls', () => {
     f.remoteExec.mockResolvedValue(reason==='unconfirmed'?{mode:'unconfirmed'}:{mode:'not-started',terminated:true,reason});
     for(let i=0;i<3;i++)await runWithRemoteDecision(f);
     const count=f.remoteExec.mock.calls.length;
-    expect(count).toBe(3);
+    expect(count).toBe(reason==='copy-failed'?6:3);
+    expect(JSON.parse(readFileSync(join(f.cwd,'remote','health.json'),'utf8')).failures).toBe(3);
     expect(await runWithRemoteDecision(f)).toEqual({handled:false});
-    expect(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect(f.remoteExec).toHaveBeenCalledTimes(count);
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining(reason));
     f.remoteExec.mockResolvedValue({mode:'remote',code:0});
     await runWithRemoteDecision({...f,clock:()=>now+120001,readTelemetry:async()=>sample(now+120001)});
@@ -488,7 +493,8 @@ describe('remote controls', () => {
     ['still-cached health',9000,{},null],
   ])('rechecks health after waiting for a remote slot: %s', async (_name,waitMs,patch,trigger) => {
     vi.useFakeTimers();vi.setSystemTime(now);
-    const f=fixture({maxConcurrent:1});f.clock=Date.now;
+    // Keep the post-wait refusal meaningful: last-good expires before refresh.
+    const f=fixture({maxConcurrent:1,lastGoodMaxAgeMin:0.1});f.clock=Date.now;
     const remoteRoot=join(f.cwd,'remote');
     let release;
     const first=runWithRemoteDecision({...f,remoteExec:()=>new Promise(done=>{release=done;})});
@@ -508,9 +514,10 @@ describe('remote controls', () => {
       });
       release({mode:'remote',code:0});await first;
       await vi.advanceTimersByTimeAsync(1000);
+      if(patch===null)await vi.advanceTimersByTimeAsync(500);
       expect(await waiting).toEqual(trigger?{handled:false}:
         expect.objectContaining({handled:true,exitCode:0,remoteResult:expect.objectContaining({mode:'remote',code:0})}));
-      expect(f.readTelemetry).toHaveBeenCalledTimes(waitMs>=10000?2:1);
+      expect(f.readTelemetry).toHaveBeenCalledTimes(waitMs>=10000?(patch===null?3:2):1);
       expect(f.remoteExec).toHaveBeenCalledTimes(trigger?0:1);
       expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(0);
       expect(existsSync(join(remoteRoot,'slot-0.unconfirmed'))).toBe(false);
@@ -521,7 +528,7 @@ describe('remote controls', () => {
         expect(state.backoffUntil).toBeGreaterThan(Date.now());
         // A subsequent caller observes the persisted refusal without another read.
         expect(await runWithRemoteDecision(f)).toEqual({handled:false});
-        expect(f.readTelemetry).toHaveBeenCalledTimes(2);
+        expect(f.readTelemetry).toHaveBeenCalledTimes(patch===null?3:2);
         expect(f.remoteExec).not.toHaveBeenCalled();
       }
     } finally {

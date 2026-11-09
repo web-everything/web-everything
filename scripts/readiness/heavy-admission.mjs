@@ -248,7 +248,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
-    elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
+    elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, lastGoodMaxAgeMin: 10, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
     stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
@@ -288,6 +288,7 @@ const ADMISSION_VALID = {
   'remote.slotUnitsByKind': (v) => admissionObject(v) && Object.keys(v).length <= ADMISSION_MAX_SLOTS
     && Object.entries(v).every(([key, n]) =>  /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) && (n === 'auto' || admissionInt(1)(n))),
   'remote.backoffMs': isValidRunWaitMs,
+  'remote.lastGoodMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
   'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
   'remote.minFreeRamPct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
@@ -844,13 +845,13 @@ export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmis
 }
 
 // Diagnostic history is best-effort and bounded, including oversized refusal details.
-function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, clock}) {
+function recordRemoteFallback({lockRoot, reason, detail = null, retried = false, cwd, argv, env, clock}) {
   try {
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
     const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
     const row = {ts:new Date(clock()).toISOString(), reason:bounded(reason),
       detail:detail == null ? null : bounded(detail), lane:basename(cwd),
-      kind:classifyCommandKind(argv.map(shellQuoteWord).join(' '), env)};
+      kind:classifyCommandKind(argv.map(shellQuoteWord).join(' '), env), ...(retried ? {retried:true} : {})};
     mkdirSync(lockRoot, {recursive:true});
     const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
     if (existsSync(file) && statSync(file).size > 512 * 1024) writeFileSync(file, tail, 'utf8');
@@ -910,7 +911,7 @@ export async function runWithRemoteDecision({
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
-  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
+  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host,sleep});
   const healthy = await health();
   if (!healthy.ok) return localFallback(healthy.reason);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
@@ -998,7 +999,11 @@ export async function runWithRemoteDecision({
     }
   },60000);
   heartbeat.unref();
+  let resultRecorded = false;
   const record = async result => {
+    // Retry attempts are internal; health tracks only one final outcome per run.
+    if (resultRecorded) return;
+    resultRecorded = true;
     // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).
     try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host}),escalatePromise]);}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
@@ -1017,7 +1022,7 @@ export async function runWithRemoteDecision({
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
   };
-  let reason; let detail; let timer;
+  let reason; let detail; let timer; let retried = false;
   const controller = new AbortController();
   // x40a9dk: a killed client (SIGTERM/SIGINT/SIGHUP) cancels its own remote run and clears its marker only on
   // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
@@ -1062,8 +1067,18 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
-      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
+    const execute = () => remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) });
+    const remote = (async () => {
+      const first = await execute();
+      if (first?.mode === 'not-started' && first.terminated === true && first.reason === 'copy-failed'
+        && !controller.signal.aborted && !cancelController.signal.aborted) {
+        log('heavy-admission: remote copy-failed (termination confirmed) - retrying remote execution once\n');
+        retried = true;
+        return execute();
+      }
+      return first;
+    })();
     const result = await Promise.race([remote, timeout, signalPromise]);
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
@@ -1133,9 +1148,9 @@ export async function runWithRemoteDecision({
       if(!outstanding)releaseUnits();
     }
   }
-  recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
+  recordRemoteFallback({lockRoot, reason, detail, retried, cwd, argv, env, clock});
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
-  log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
+  log(`heavy-admission: remote failed (${failure}${retried ? '; retried' : ''}) - falling back to local admission\n`);
   return { handled: false };
 }
 
