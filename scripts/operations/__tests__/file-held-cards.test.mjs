@@ -339,6 +339,27 @@ it('refuses to proceed while a ledgered card exists nowhere (discarded lane)', a
   await expect(run()).rejects.toThrow(/ledgered card/);
 });
 
+it('resolves a ledgered birth hash to the numbered card that preserves it as bornAs', async () => {
+  seed('- [R1] 2026-11-08: one');
+  await run();
+  rmSync(join(root, 'backlog', 'xtest.md'));
+  writeFileSync(join(root, 'backlog', '4413-renumbered.md'), '---\nbornAs: x56mcj7\nkind: story\n---\n\n# Some other title\n');
+  writeFileSync(ledger, JSON.stringify({ ...JSON.parse(readFileSync(ledger, 'utf8').trim()), card: 'x56mcj7' }) + '\n');
+  seed('- [R1] 2026-11-08: one\n- [R1] 2026-11-08: two');
+  await expect(run({ dryRun: true })).resolves.toBeDefined();
+  await expect(run()).resolves.toBeDefined();
+});
+
+it('still refuses a ledgered hash when only an unrelated bornAs exists', async () => {
+  seed('- [R1] 2026-11-08: one');
+  await run();
+  rmSync(join(root, 'backlog', 'xtest.md'));
+  writeFileSync(ledger, JSON.stringify({ ...JSON.parse(readFileSync(ledger, 'utf8').trim()), card: 'x56mcj7' }) + '\n');
+  writeFileSync(join(root, 'backlog', '4413-other.md'), '---\nbornAs: xabcdef\n---\n\n# Other\n');
+  seed('- [R1] 2026-11-08: one\n- [R1] 2026-11-08: two');
+  await expect(run()).rejects.toThrow(/ledgered card/);
+});
+
 it('the production filing binding never sends an undefined or empty size or scope flag', async () => {
   const run = vi.fn(async () => ({ code: 0, lines: ['{}'] }));
   await fileInCheckout({ title: 't', kind: 'task', digest: 'd', queue: 'q' }, run);

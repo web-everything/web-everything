@@ -79,13 +79,38 @@ export function qualifyBareBasenames(text, trackedFiles) {
   return { text: out, ambiguous };
 }
 
+// A filed card keeps its birth hash as `bornAs` when the drain renumbers it, so a ledgered hash id must also
+// resolve through that front-matter line, here and on origin/main.
+const BIRTH_HASH = /^x[0-9a-z]{6}$/;
+
+function bornAsLocally(root, hash) {
+  const line = `bornAs: ${hash}`;
+  try {
+    for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
+      const head = readFileSync(join(root, 'backlog', name), 'utf8').slice(0, 4096);
+      if (head.split(/\r?\n/).some(text => text === line)) return true;
+    }
+  } catch { /* no backlog dir */ }
+  return false;
+}
+
+function bornAsOnMain(root, hash) {
+  try {
+    // -F: the hash is data, never a pattern; the shape check above already bounds it.
+    return execFileSync('git', ['grep', '-l', '-F', '-x', `bornAs: ${hash}`, 'origin/main', '--', 'backlog/'],
+      { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).trim().length > 0;
+  } catch { return false; } // exit 1 (no match) and any git failure both fail closed
+}
+
 function cardExists(root, num) {
   const matches = name => name === `${num}.md` || name.startsWith(`${num}-`);
   try { if (readdirSync(join(root, 'backlog')).some(matches)) return true; } catch { /* no backlog dir */ }
   try {
-    return execFileSync('git', ['ls-tree', '--name-only', 'origin/main', 'backlog/'], { cwd: root, encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').some(line => matches(line.replace(/^backlog\//, '')));
-  } catch { return false; }
+    if (execFileSync('git', ['ls-tree', '--name-only', 'origin/main', 'backlog/'], { cwd: root, encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').some(line => matches(line.replace(/^backlog\//, '')))) return true;
+  } catch { /* fall through to the bornAs lookup */ }
+  if (!BIRTH_HASH.test(String(num))) return false;
+  return bornAsLocally(root, num) || bornAsOnMain(root, num);
 }
 
 function gitTrackedFiles(root) {
