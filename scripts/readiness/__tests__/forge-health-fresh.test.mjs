@@ -183,7 +183,7 @@ describe('pingForge',()=>{
   it('never throws and returns a boolean',async()=>{
     const {pingForge}=await import('../forge-telemetry.mjs');
     const ok=await pingForge({host:'forge',exec:(c,a,o,cb)=>{cb(null,'');}});
-    const bad=await pingForge({host:'forge',exec:(c,a,o,cb)=>{cb(transportError());}});
+    const bad=await pingForge({host:'forge',exec:(c,a,o,cb)=>{cb(new Error('x'));}});
     const thrown=await pingForge({host:'forge',exec:()=>{throw new Error('boom');}});
     const badHost=await pingForge({host:'-oProxy',exec:()=>{throw new Error('no');}});
     expect([ok,bad,thrown,badHost]).toEqual([true,false,false,false]);
