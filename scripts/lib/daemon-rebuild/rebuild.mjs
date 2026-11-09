@@ -4,9 +4,13 @@
  */
 
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { basename } from 'node:path';
+import { basename, join, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { promisify } from 'node:util';
+import { readOriginRefSha } from '../daemon-self-sync.mjs';
+import { ensureCodeSnapshot, ensureNodeModulesStore, linkNodeModules } from '../daemon-job-snapshots.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
@@ -25,7 +29,51 @@ import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
-import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+import { rebuildCloneAsJob, resolveRebuildAsJob, rebuildJobsDir } from './rebuild-job.mjs';
+
+// Run asynchronously so the daemon event loop remains available during lock waits.
+const execAdopt = promisify(execFile);
+async function runAdoptChild(executable, argv, options) {
+  const result = await execAdopt(executable, argv, options);
+  return { status: 0, ...result };
+}
+
+/** Only reviewed main code may decide adoption. Failure leaves ready evidence for the next tick. */
+async function adoptFromMain({ root, env, log, entries = [], mainOnly, admissionWaitMs, adoptChild }) {
+  try {
+    const codeSha = readOriginRefSha({ root, ref: 'refs/remotes/origin/main' });
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(codeSha ?? '')) throw new Error('origin/main unavailable');
+    const jobsDir = rebuildJobsDir(root, env);
+    const cwd = ensureCodeSnapshot({ jobsDir, codeSha, repoDir: root });
+    // Dependencies also come from the pinned lockfile, never the daemon's moving checkout.
+    if (existsSync(join(cwd, 'package-lock.json'))) {
+      const store = ensureNodeModulesStore({ jobsDir, sourceDir: cwd });
+      linkNodeModules(cwd, store.dir);
+    }
+    const childEnv = { ...env };
+    delete childEnv.NODE_PATH;
+    delete childEnv.NODE_OPTIONS;
+    delete childEnv.PWD;
+    delete childEnv.INIT_CWD;
+    if (admissionWaitMs != null) childEnv.WE_DAEMON_REBUILD_LOCK_WAIT_MS = String(admissionWaitMs);
+    const result = await (adoptChild?.run ?? runAdoptChild)(process.execPath, [
+      join(cwd, 'scripts/lib/daemon-rebuild.mjs'), '--adopt-only', '--json', `--clone=${resolve(root)}`,
+      ...entries.map((entry) => `--entry=${entry}`), ...(mainOnly ? ['--main-only'] : []),
+    ], { cwd, env: childEnv, encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
+      killSignal: 'SIGKILL' });
+    if (result?.error || result?.signal || result?.status !== 0) throw new Error('adopt child failed');
+    const parsed = JSON.parse(String(result.stdout ?? '').trim().split('\n').at(-1));
+    if (!parsed || Array.isArray(parsed) || typeof parsed.moved !== 'boolean'
+      || typeof parsed.reason !== 'string' || !parsed.reason
+      || (parsed.moved && (parsed.adopted !== true || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(parsed.head ?? '')))) {
+      throw new Error('invalid adopt child result');
+    }
+    return parsed;
+  } catch {
+    log.error?.('daemon-rebuild: adopt child result unavailable — refusing further adoption; retrying next tick');
+    return { moved: false, reason: 'adopt-child-failed', alerts: [] };
+  }
+}
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -33,7 +81,7 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
-  'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
+  'adopt-child-failed', 'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
@@ -175,7 +223,7 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners,
+  asJob, admissionWaitMs, adoptChild, spawnerOwners = defaultSpawnerOwners,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -183,10 +231,15 @@ async function rebuildCloneInternal({
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
       root, env, log, mainOnly, entries,
-      adopt: (o = {}) => rebuildCloneInternal({
-        root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
-        dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
-      }),
+      adopt: () => {
+        // With no smoke-passed evidence there is nothing to adopt. Queue the ready-only
+        // builder; it discovers current inputs without moving the checkout. Never run
+        // the loaded planner as a fallback for an unavailable reviewed adopter.
+        if (!readReadyCandidate(root, { ...env, ...(stateOpts?.env || {}) })) {
+          return { moved: false, reason: 'needs-build', alerts: [] };
+        }
+        return adoptFromMain({ root, env, log, entries, mainOnly, admissionWaitMs, adoptChild });
+      },
     });
   }
   // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no

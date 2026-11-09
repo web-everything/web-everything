@@ -9,7 +9,7 @@ import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync,
+  mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -26,6 +26,16 @@ import * as rebuildLease from '../daemon-rebuild/lease.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
+import * as rebuildJobs from '../daemon-rebuild/rebuild-job.mjs';
+import * as snapshots from '../daemon-job-snapshots.mjs';
+import * as prepare from '../daemon-rebuild/prepare.mjs';
+import { writeReadyCandidate } from '../daemon-rebuild/state.mjs';
+
+// R787 proposed IO seam: rebuildClone({ adoptChild: { run } }). `run` has
+// spawnSync's (executable, argv, options) -> {status, stdout, error} contract.
+// Only the child runner is injected; snapshot selection and result validation
+// must remain production behavior. No production seam is implemented here.
+
 
 const tempDirs = [];
 function mktemp(prefix) {
@@ -86,6 +96,7 @@ const quietLog = { error: () => {}, warn: () => {}, log: () => {} };
 
 beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
 });
@@ -293,5 +304,140 @@ describe('detached rebuild lock wait', () => {
     for (const value of ['0', '-1', 'invalid']) {
       expect(wait({ WE_DAEMON_REBUILD_JOB_LOCK_WAIT_MS: value })).toBe(900_000);
     }
+  });
+});
+
+
+describe('R787 — reviewed origin/main owns rebuild job code', () => {
+  it('pins the queued job to origin/main, distinct from both loaded HEAD and candidate', async () => {
+    const { cloneDir, env } = makeFixture();
+    const mainSha = head(cloneDir);
+    writeFile(cloneDir, 'candidate.txt', 'candidate only\n');
+    gitOk(cloneDir, ['add', '-A']);
+    gitOk(cloneDir, ['commit', '-q', '-m', 'candidate']);
+    const candidateSha = head(cloneDir);
+    writeFile(cloneDir, 'loaded.txt', 'loaded tree only\n');
+    gitOk(cloneDir, ['add', '-A']);
+    gitOk(cloneDir, ['commit', '-q', '-m', 'loaded daemon']);
+    const loadedSha = head(cloneDir);
+    const store = createJobStore(mktemp('r787-jobs-'));
+    const reattach = vi.fn(async () => ({ actions: [] }));
+    const result = await rebuildCloneAsJob({
+      root: cloneDir, env, store, reattach, log: quietLog,
+      adopt: async () => ({ moved: false, reason: 'needs-build', plan: { finalSha: candidateSha } }),
+      evict: () => ({ evicted: [] }),
+    });
+    expect(result.reason).toBe('rebuild-job-started');
+    const [record] = store.list().records;
+    expect(record.job.codeSha).toBe(mainSha);
+    expect(record.job.codeSha).not.toBe(loadedSha);
+    expect(record.job.codeSha).not.toBe(candidateSha);
+  });
+});
+
+describe('R787 — adoption is a fail-closed main-snapshot child', () => {
+  async function readyFixture() {
+    const f = makeFixture();
+    const before = head(f.cloneDir);
+    const target = advanceMain(f.originDir, (dir) => {
+      writeFile(dir, 'reviewed.txt', 'main\n');
+      // A tiny reviewed CLI fixture calls the real adopter in a separate process.
+      // Loaded-process Vitest mocks cannot affect its decision or lock handling.
+      const source = new URL('../daemon-rebuild.mjs', import.meta.url).href;
+      writeFile(dir, 'scripts/lib/daemon-rebuild.mjs', `
+        import { rebuildClone } from ${JSON.stringify(source)};
+        if (!process.argv.includes('--adopt-only') || !process.argv.includes('--json')) process.exit(2);
+        const root = process.argv.find(a => a.startsWith('--clone=')).slice(8);
+        const r = await rebuildClone({root, asJob: false, adoptOnly: true,
+          skipCheck: null, log: {error() {}}, prState: async () => null});
+        console.log(JSON.stringify(r));
+      `);
+    });
+    const built = await rebuildClone({
+      root: f.cloneDir, env: f.env, readyOnly: true, asJob: false,
+      runSmoke: async () => PASS, prState: async () => null, lockOpts: LOCK_OPTS, log: quietLog,
+    });
+    expect(built.reason).toBe('ready-recorded');
+    // Exercise the actual production adopt closure without launching a detached build.
+    vi.spyOn(rebuildJobs, 'rebuildCloneAsJob').mockImplementation(({ adopt }) => adopt());
+    return { ...f, before, target, ready: readReadyCandidate(f.cloneDir, f.env) };
+  }
+  const options = (f, run) => ({
+    root: f.cloneDir, env: f.env, asJob: true, log: quietLog,
+    prState: async () => null, lockOpts: LOCK_OPTS, skipCheck: null,
+    adoptChild: { run },
+  });
+
+  it('moves when the loaded in-process adopter refuses but the main child accepts', async () => {
+    const f = await readyFixture();
+    const refusal = vi.spyOn(prepare, 'prepareRebuild').mockResolvedValue({
+      terminal: true, result: { moved: false, reason: 'loaded-code-refused' }, alerts: [],
+    });
+    await expect(rebuildClone({ ...options(f), asJob: false, adoptOnly: true }))
+      .resolves.toMatchObject({ moved: false, reason: 'loaded-code-refused' });
+    expect(head(f.cloneDir)).toBe(f.before);
+    refusal.mockClear();
+    const run = vi.fn(async (executable, argv, childOptions) => spawnSync(executable, argv, {
+      ...childOptions, encoding: 'utf8', timeout: 5000,
+    }));
+    const result = await rebuildClone(options(f, run));
+    expect(result).toMatchObject({ moved: true, adopted: true, reason: 'ready-adopted' });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(refusal).not.toHaveBeenCalled();
+    expect(head(f.cloneDir)).toBe(f.target);
+  });
+
+  it.each([
+    ['timeout', { status: null, stdout: '', error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) }],
+    ['garbage output', { status: 0, stdout: 'not JSON' }],
+    ['nonzero exit with success-looking JSON', { status: 1, stdout: '{"moved":true,"adopted":true}' }],
+    ['missing snapshot', null],
+  ])('%s refuses adoption, preserves ready evidence and retries next tick', async (name, output) => {
+    const f = await readyFixture();
+    const run = vi.fn(async () => output);
+    if (name === 'missing snapshot') {
+      vi.spyOn(snapshots, 'ensureCodeSnapshot').mockImplementation(() => { throw new Error('snapshot unavailable'); });
+    }
+    const result = await rebuildClone(options(f, run));
+    expect.soft(result).toMatchObject({ moved: false, reason: 'adopt-child-failed' });
+    expect.soft(head(f.cloneDir)).toBe(f.before);
+    expect.soft(readReadyCandidate(f.cloneDir, f.env)).toEqual(f.ready);
+    // Still failed next tick: do not consume the ready record or silently fall
+    // back to the loaded adopter after the first child failure.
+    const retry = await rebuildClone(options(f, run));
+    expect.soft(retry).toMatchObject({ moved: false, reason: 'adopt-child-failed' });
+    expect.soft(head(f.cloneDir)).toBe(f.before);
+    expect.soft(readReadyCandidate(f.cloneDir, f.env)).toEqual(f.ready);
+    if (name === 'missing snapshot') expect(run).not.toHaveBeenCalled();
+    else expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it('runs only the origin/main snapshot CLI, with bounded IO, its cwd, and no inherited NODE_PATH', async () => {
+    const f = await readyFixture();
+    // Candidate/loaded HEAD has code that must never become the adopter.
+    writeFile(f.cloneDir, 'candidate-code.txt', 'unreviewed\n');
+    gitOk(f.cloneDir, ['add', '-A']);
+    gitOk(f.cloneDir, ['commit', '-q', '-m', 'candidate code']);
+    const candidateSha = head(f.cloneDir);
+    writeReadyCandidate(f.cloneDir, { ...f.ready, adopt: { ...f.ready.adopt, finalSha: candidateSha } }, f.env);
+    f.env.NODE_PATH = join(f.cloneDir, 'daemon-node-modules');
+    const run = vi.fn(async () => ({ status: 0, stdout: '{"moved":false,"reason":"needs-build"}' }));
+    await rebuildClone(options(f, run));
+    expect(run).toHaveBeenCalledTimes(1);
+    const [executable, argv, child] = run.mock.calls[0];
+    const mainSnapshot = join(rebuildJobs.rebuildJobsDir(f.cloneDir, f.env), '.snapshots', 'code', f.target);
+    expect(executable).toBe(process.execPath);
+    expect(argv).toEqual(expect.arrayContaining([
+      join(mainSnapshot, 'scripts/lib/daemon-rebuild.mjs'), '--adopt-only', '--json', `--clone=${f.cloneDir}`,
+    ]));
+    expect(argv).not.toContain('--ready-only');
+    expect(argv.join(' ')).not.toContain(candidateSha);
+    expect(child.cwd).toBe(mainSnapshot);
+    expect(child.env).not.toHaveProperty('NODE_PATH');
+    expect(child.timeout).toBe(120_000);
+    expect(child.maxBuffer).toBeGreaterThan(0);
+    expect(child.maxBuffer).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(readFileSync(join(mainSnapshot, 'reviewed.txt'), 'utf8')).toBe('main\n');
+    expect(existsSync(join(mainSnapshot, 'candidate-code.txt'))).toBe(false);
   });
 });

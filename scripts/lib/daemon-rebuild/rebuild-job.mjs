@@ -41,7 +41,7 @@ import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { alertsFilePath } from './state.mjs';
-import { readGit } from '../proc-read.mjs';
+import { readOriginRefSha } from '../daemon-self-sync.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -131,12 +131,6 @@ function removeJobFiles(dir, id) {
   try { deleteRun(id, dir); } catch { /* gone */ }
   for (const ext of ['.log', RESULT_SUFFIX, '.json.lock']) rmSync(join(dir, `${id}${ext}`), { force: true });
 }
-function readHead(root) {
-  return readGit(['-C', root, 'rev-parse', 'HEAD'], {
-    timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
-  }).trim();
-}
-
 // One tick clock per daemon process (the sleep rule compares consecutive ticks of the SAME process).
 const CLOCKS = new Map();
 function clockFor(dir) {
@@ -233,8 +227,10 @@ export async function rebuildCloneAsJob({
   }
   let queued;
   try {
+    const pinnedSha = codeSha ?? readOriginRefSha({ root, ref: 'refs/remotes/origin/main' });
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(pinnedSha ?? '')) throw new Error('origin/main unavailable');
     queued = enqueueJob({
-      store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
+      store, kindDef: REBUILD_JOB_KIND, codeSha: pinnedSha, now: now(),
       input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null },
     });
   } catch (e) {

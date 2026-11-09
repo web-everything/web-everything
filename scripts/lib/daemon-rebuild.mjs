@@ -155,7 +155,7 @@ async function runCli(argv) {
   // daemon's scripts, `--main-only` builds plain main. Job mode is always off here: this IS the build.
   const entries = argv.filter((a) => a.startsWith('--entry=')).map((a) => a.slice('--entry='.length)).filter(Boolean);
   const result = await rebuildClone({
-    root, asJob: false, readyOnly: !!flags['ready-only'], mainOnly: !!flags['main-only'],
+    root, asJob: false, readyOnly: !!flags['ready-only'], adoptOnly: !!flags['adopt-only'], mainOnly: !!flags['main-only'],
     ...(entries.length ? { entries } : {}),
   });
   if (flags.json) {

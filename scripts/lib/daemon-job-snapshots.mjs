@@ -67,12 +67,22 @@ function buildOnce(dir, materialize) {
   return dir;
 }
 
-/** Default code materializer: `git archive <sha> | tar -x`, bounded. */
+/** Default code materializer: bounded archive then extraction; either failure rejects the snapshot. */
 export function gitArchiveMaterializer(repoDir, codeSha, { timeoutMs = DEFAULT_CHILD_TIMEOUT_MS } = {}) {
   return (into) => {
-    execFileSync('sh', ['-c', 'git -C "$1" archive --format=tar "$2" | tar -x -C "$3"', 'sh', repoDir, codeSha, into], {
-      stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs,
-    });
+    // A shell pipeline only reports tar's status: a failed git archive can otherwise
+    // publish an empty "complete" snapshot. Keep the archive outside the extracted tree.
+    const archive = `${into}.archive.tar`;
+    try {
+      execFileSync('git', ['-C', repoDir, 'archive', '--format=tar', `--output=${archive}`, codeSha], {
+        stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs,
+      });
+      execFileSync('tar', ['-xf', archive, '-C', into], {
+        stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs,
+      });
+    } finally {
+      rmSync(archive, { force: true });
+    }
   };
 }
 
