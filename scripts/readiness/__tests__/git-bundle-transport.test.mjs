@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { detectTestNeedsGit } from '../remote-exec.mjs';
 import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge, BUNDLE_MAIN_MAX_AGE_CEILING_MS } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
 import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, capabilityBundleVerdict, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
@@ -182,6 +183,12 @@ describe('R593 client and routing', () => {
       expect(external.calls).toHaveLength(0);
       const builtin = await run(null);
       expect(builtin.decisions[0]).toMatchObject({ remote: true });
+    });
+    it('R807: git-need detection fails closed when the source scan throws', () => {
+      const boom = () => { throw new Error('scan failed'); };
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'x.test.mjs'], cwd, route: boom })).toBe(true);
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], cwd })).toBe(true);
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'missing.test.mjs'], cwd })).toBe(false);
     });
     it('verdict is yes/no/unknown', () => {
       const rec = capabilityRecord({ host: 'forge', capabilities: { gitBundle: 1 }, nowMs: 1000 });
