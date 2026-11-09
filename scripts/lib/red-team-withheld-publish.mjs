@@ -101,12 +101,6 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       const comments = listComments ? listComments() : provider.readComments(repo, pr);
       if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
       if (redTeamCommentPosted(comments, pr, head)) {
-        if (legacy) {
-          // A marker alone is not the stored verdict: the existing comment must show every confirmed break.
-          const live = redTeamForHead(comments, pr, head);
-          if (!live || live.findings.filter(f => f.confirmed).length !== result.confirmedMissCount) return holdLegacy();
-          writeStatus({ ...status, result: { ...result, comment: 'posted' } });
-        }
         return { status: 'skipped' };
       }
     } catch { return failedAttempt(); }

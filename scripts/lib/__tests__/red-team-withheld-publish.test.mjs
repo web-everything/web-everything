@@ -89,16 +89,13 @@ describe('legacy bare-string red-team publication', () => {
     expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
     expect(io.status.needsYouPublished).toBe(true);
   });
-  it('persists posted state when a trusted comment already exists without posting again', () => {
+  it('leaves the existing posted comment authoritative and records nothing about it', () => {
     const io = harness(legacy(), { readSeatRow: () => seatRow(),
       listComments: () => [{ author: { login: 'web-everything' },
         body: `${redTeamMarker(42, head)}\n### Post-accept red team — no break found` }] });
     expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
     expect(io.postComment).not.toHaveBeenCalled();
-    expect(io.writeStatus).toHaveBeenCalledWith(expect.objectContaining({
-      result: expect.objectContaining({ status: 'ran', comment: 'posted' }),
-    }));
-    expect(io.status.result).toMatchObject({ status: 'ran', comment: 'posted' });
+    expect(io.writeStatus).not.toHaveBeenCalled();
     expect(io.publishNeedsYou).not.toHaveBeenCalled();
   });
 });
@@ -208,17 +205,5 @@ describe('legacy recovery never publishes an unparseable break', () => {
     const io = harness({ repo: 'o/n', pr: 42, head, status: 'finished', result: 'ran' }, { readSeatRow: () => row });
     expect(publishStoredRedTeamResult(io).status).not.toBe('posted');
     expect(io.postComment).not.toHaveBeenCalled();
-  });
-});
-
-describe('legacy recovery against an existing comment', () => {
-  it('holds and alerts when the posted comment shows no break but the stored verdict has one', () => {
-    const row = { rev: head, foldedVerdict: 'changes', confirmedMissCount: 1, provider: 'p', model: 'm', callId: 'c',
-      findings: [{ summary: 's', file: 'a.mjs', line: 1, category: 'correctness', confirmedByRecheck: true }] };
-    const clean = { body: `${redTeamMarker(42, head)}\n### Post-accept red team\n\nno break found`, user: { login: 'github-actions[bot]' } };
-    const io = harness({ repo: 'o/n', pr: 42, head, status: 'finished', result: 'ran' }, { readSeatRow: () => row, listComments: () => [clean], redTeamCommentPosted: () => true });
-    expect(publishStoredRedTeamResult(io).status).toBe('held');
-    expect(io.postComment).not.toHaveBeenCalled();
-    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
   });
 });
