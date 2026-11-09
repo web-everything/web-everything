@@ -103,6 +103,15 @@ export function qualifyBareBasenames(text, trackedFiles) {
   return { text: out, ambiguous };
 }
 
+function cardExists(root, num) {
+  const matches = name => name === `${num}.md` || name.startsWith(`${num}-`);
+  try { if (readdirSync(join(root, 'backlog')).some(matches)) return true; } catch { /* no backlog dir */ }
+  try {
+    return execFileSync('git', ['ls-tree', '--name-only', 'origin/main', 'backlog/'], { cwd: root, encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').some(line => matches(line.replace(/^backlog\//, '')));
+  } catch { return false; }
+}
+
 function gitTrackedFiles(root) {
   // Not a git checkout (or git failing) means no qualification: bare paths are then simply refused as before.
   try { return execFileSync('git', ['ls-files'], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean); } catch { return []; }
@@ -164,7 +173,13 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   }
   assertLedgerIdentity(realpathSync(root), ledger, source);
   const tracked = deps.trackedFiles ? deps.trackedFiles() : gitTrackedFiles(root);
-  const cards = selectUnfiled(parseCards(readFileSync(source, 'utf8')), readLedger(ledger), { select, since, max: Infinity });
+  const ledgerRows = readLedger(ledger);
+  // A ledger row is only trusted while its card still exists here or on main; a discarded lane must not hide the card.
+  const missing = ledgerRows.filter(row => !row.status && !cardExists(root, row.card));
+  if (missing.length) {
+    throw new Error(`${missing.length} ledgered card(s) are in neither this checkout nor origin/main (unmerged or discarded lane); land that PR or remove those ledger rows before filing more`);
+  }
+  const cards = selectUnfiled(parseCards(readFileSync(source, 'utf8')), ledgerRows, { select, since, max: Infinity });
   const titles = new Map();
   for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
     const content = readFileSync(join(root, 'backlog', name), 'utf8');
@@ -245,18 +260,21 @@ export async function runFileHeldCards(options = {}) {
   const source = resolve(expandHome(options.source || join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md')));
   const lexical = resolve(expandHome(options.ledger || join(dirname(source), 'cards-filed.jsonl')));
   const canonical = resolveLedgerPath(lexical);
-  // Identity-based lock: hard-linked aliases of one ledger share an inode, so they share the lock.
-  let id;
-  try { const { dev, ino } = statSync(canonical); id = `${dev}-${ino}`; } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    id = createHash('sha256').update(canonical).digest('hex').slice(0, 24); // no ledger yet: nothing to alias
+  // Two locks: one by path (exists from the first run, even before the ledger does) and one by inode when the
+  // ledger exists (hard-linked aliases share it). A run holds both through select, filing and append.
+  const ids = [createHash('sha256').update(canonical).digest('hex').slice(0, 24)];
+  try { const { dev, ino } = statSync(canonical); ids.push(`${dev}-${ino}`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const held = [];
+  const release = () => { for (const lock of held) { try { unlinkSync(lock); } catch { /* already gone */ } } };
+  for (const id of ids) {
+    const lock = join(tmpdir(), `file-held-cards-${id}.lock`);
+    try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); held.push(lock); } catch (error) {
+      release();
+      if (error.code === 'EEXIST') throw new Error('another file-held-cards run holds the ledger lock; retry when it finishes');
+      throw error;
+    }
   }
-  const lock = join(tmpdir(), `file-held-cards-${id}.lock`);
-  try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); } catch (error) {
-    if (error.code === 'EEXIST') throw new Error('another file-held-cards run holds the ledger lock; retry when it finishes');
-    throw error;
-  }
-  try { return await runFileHeldCardsLocked(options); } finally { try { unlinkSync(lock); } catch { /* already gone */ } }
+  try { return await runFileHeldCardsLocked(options); } finally { release(); }
 }
 
 export function fileHeldCardsOperation() {
@@ -289,7 +307,7 @@ export function finishFileHeldCards(outcome, json = false) {
   const lines = json ? [JSON.stringify(result)] : Object.entries(result).flatMap(([status, cards]) => cards.map(card =>
     safeLog(`${status} ${card.tag} ${card.date}: ${card.title} [${card.scope || 'unscoped'}]`)));
   // A file-item failure must not look like success to automated callers.
-  return { ...outcome, lines, ...(result.failed?.length ? { code: 1 } : {}) };
+  return { ...outcome, lines, ...(result.failed?.length || (result.refused?.length && !result.filed?.length && !result.duplicates?.length && !result.planned?.length) ? { code: 1 } : {}) };
 }
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr, ...deps } = {}) {

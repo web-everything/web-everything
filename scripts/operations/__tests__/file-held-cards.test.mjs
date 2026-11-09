@@ -20,6 +20,7 @@ beforeEach(() => {
   ledger = join(temp, 'cards-filed.jsonl');
   fileItem = vi.fn(async input => {
     assertPublishableContent('backlog/xtest.md', `# ${input.title}\n\n${input.digest}`);
+    writeFileSync(join(root, 'backlog', 'xtest.md'), 'filed\n');
     return { code: 0, lines: [JSON.stringify({ verdict: { num: 'xtest', rel: 'backlog/xtest.md' } })] };
   });
   log = vi.fn();
@@ -300,4 +301,17 @@ it('a closed card with the same title does not suppress a fresh handoff', async 
 it('a file-item failure makes the finished outcome exit non-zero', () => {
   const outcome = { code: 0, run: { effects: [{ type: 'file-held-cards.file', result: { failed: [{ tag: 'R1', date: 'd', title: 't' }] } }] } };
   expect(finishFileHeldCards(outcome).code).toBe(1);
+});
+
+it('an all-refused batch exits non-zero', () => {
+  const outcome = { code: 0, run: { effects: [{ type: 'file-held-cards.file', result: { refused: [{ tag: 'R1', date: 'd' }], filed: [], duplicates: [], planned: [], failed: [] } }] } };
+  expect(finishFileHeldCards(outcome).code).toBe(1);
+});
+
+it('refuses to proceed while a ledgered card exists nowhere (discarded lane)', async () => {
+  seed('- [R1] 2026-11-08: one');
+  await run();
+  rmSync(join(root, 'backlog', 'xtest.md'));
+  seed('- [R1] 2026-11-08: one\n- [R1] 2026-11-08: two');
+  await expect(run()).rejects.toThrow(/ledgered card/);
 });
