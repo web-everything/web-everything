@@ -179,6 +179,15 @@ describe('world capsule (R649 S1)', () => {
     })).rejects.toThrow();
   });
 
+  it.each(['GH_REPO', 'GH_HOST'])('refuses %s retargeting at record and replay time', async (name) => {
+    const recorder = createCapsuleRecorder();
+    const inner = vi.fn(async () => '{"ok":true}');
+    await recordingRunChild(inner, recorder)('gh', ['api', '--method', 'GET', 'repos/o/r'], { env: {} });
+    await expect(recordingRunChild(inner, recorder)('gh', ['api', '--method', 'GET', 'repos/o/x'], { env: { [name]: 'other' } })).rejects.toThrow();
+    const replay = replayRunChild(finalizeCapsule(recorder, { stateRoots: [] }));
+    await expect(replay('gh', ['api', '--method', 'GET', 'repos/o/r'], { env: { [name]: 'other' } })).rejects.toThrow('world-capsule miss');
+  });
+
   it('does not import readPrsFromFile', () => {
     const source = readFileSync(join(process.cwd(), 'scripts/lib/daemon-rebuild/world-capsule.mjs'), 'utf8');
     expect(source).not.toContain('readPrsFromFile');

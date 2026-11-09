@@ -67,6 +67,9 @@ function readOnlyKey(command, args) {
 // Require a repository in argv when the caller supplies a working directory;
 // execution context is inspected only for admission and is never retained.
 function requireRepositoryContext(args, executionOptions) {
+  // GH_REPO / GH_HOST retarget gh without appearing in argv, so the argv-only key cannot tell targets apart.
+  // Refuse both at record and replay time (the env itself is only inspected, never retained).
+  if (executionOptions.some(option => option?.env?.GH_REPO || option?.env?.GH_HOST)) fail();
   const hasWorkingDirectory = executionOptions.some(option => option?.cwd !== undefined);
   if (!hasWorkingDirectory) return;
   if (args[0] === 'api') {
