@@ -114,7 +114,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // an unusable WEAKENED on base Y). A base with a usable decision is judged by findAudit alone, so a superseded record
   // never blocks forever. A CARRIED head is deliberately not widened: "carry veto follows findAudit" (round 4) pins that
   // an unusable record on a carried head never blocks the carry.
-  if (list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
+  // D2: a record whose runs hold a WEAKENED is WEAKENED too, whatever its verdict field says.
+  const isWeak = (r) => r?.verdict === 'WEAKENED' || (Array.isArray(r?.runs) && r.runs.includes('WEAKENED'));
+  if (list.some((r) => r?.head === sha && r.base !== sha && isWeak(r)
     // An unparsable time cannot place the record outside its window, so it is judged by the hash's own expiry alone
     // (fail closed, matching a current-question record, which blocks whatever its time).
     && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(r.at)) ? r.at : undefined }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
@@ -125,8 +127,6 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // The latest PRIOR-question record for that head+base decides (a later prior NOT WEAKENED re-audit supersedes it), judged
   // with the same already-resolved hashes and clock as the veto above.
   const priorOnly = list.filter((r) => r?.questionHash !== QUESTION_HASH);
-  // D2: a record whose runs hold a WEAKENED is WEAKENED too, whatever its verdict field says.
-  const isWeak = (r) => r?.verdict === 'WEAKENED' || (Array.isArray(r?.runs) && r.runs.includes('WEAKENED'));
   const hiddenWeak = priorOnly.filter((r) => isWeak(r) && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
     && !carried.some((d) => d.record.head === r.head && d.base === r.base)
     && ((got) => got && got.at === r.at && got.head === r.head && got.base === r.base && isWeak(got))(findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }))).map((record) => ({ base: record.base, record }));

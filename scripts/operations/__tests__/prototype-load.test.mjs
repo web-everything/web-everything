@@ -2082,6 +2082,18 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     ])('%s on the carried head blocks the carry (D2: malformed WEAKENED fails closed)', (_, overrides) => {
       expect(carried(old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z', ...overrides }))).toEqual({ ok: false, reason: 'weakened' });
     });
+    it('a runs-WEAKENED prior-question record on the live head is not hidden by a current-question record', () => {
+      const PRIOR2 = 'c'.repeat(64);
+      const o = { priorQuestionHashes: [{ hash: PRIOR2, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-21T00:00:00Z') };
+      const runsWeak = auditRecord({ head: SHA, base: OTHER_BASE, questionHash: PRIOR2, runs: ['NOT WEAKENED', 'WEAKENED'], at: '2026-10-20T12:00:00Z' });
+      const hider = auditRecord({ head: SHA, base: OTHER_BASE, at: '2026-10-21T12:00:00Z', findings: ['WEAKENED'] });
+      expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ at: '2026-10-19T12:00:00Z' }), runsWeak, hider], SHA, () => true, FP, o)).toEqual({ ok: false, reason: 'weakened' });
+    });
+    it('an unknown-time WEAKENED is not masked by an older dated WEAKENED on the carried head', () => {
+      const dated = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z' });
+      const undated = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: 'not-a-date' });
+      expect(carried(dated, undated, auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' }))).toEqual({ ok: false, reason: 'weakened' });
+    });
     it('a WEAKENED verdict is never superseded by a later NOT WEAKENED on the same base (D2: any WEAKENED blocks)', () => {
       const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z' });
       const fixed = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z' });

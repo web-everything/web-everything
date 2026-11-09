@@ -305,6 +305,13 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     } finally { settingsOverride.text = null; }
   });
 
+  it('a WEAKENED with an unknown timestamp is not masked by an older dated WEAKENED, in either order', () => {
+    const dated = rec({ verdict: 'WEAKENED', at: BEFORE });
+    const undated = rec({ verdict: 'WEAKENED', at: 'garbage' });
+    expect(findAudit([dated, undated], Q)).toBe(undated);
+    expect(findAudit([undated, dated], Q)).toBe(undated);
+  });
+
   it('a runs-WEAKENED record with contradictory findings still blocks and hides an older pass', () => {
     const pass = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: '2026-11-01T00:00:00.000Z' };
     const bad = { ...pass, runs: ['NOT WEAKENED', 'WEAKENED'], findings: ['NOT WEAKENED'], at: AT };

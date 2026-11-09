@@ -70,6 +70,8 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   if (typeof base !== 'string' || typeof head !== 'string' || !SHA.test(base) || !SHA.test(head) || questionHash !== QUESTION_HASH) return null;
   let latest = null, prior = null, weakCurrent = null, weakPrior = null, sawCurrent = false;
   const ts = r => { const t = Date.parse(r.at); return Number.isFinite(t) ? t : -Infinity; };
+  // For a negative verdict an unknown time counts as the newest, so it can never be masked by an older dated WEAKENED.
+  const weakTs = r => { const t = Date.parse(r.at); return Number.isFinite(t) ? t : Infinity; };
   for (let record of records) {
     if (record?.head !== head || record.base !== base) continue;
     const runsWeak = Array.isArray(record.runs) && record.runs.includes('WEAKENED');
@@ -80,7 +82,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
     // timestamp or findings are; it is never dropped and never superseded by a later pass.
     if (isCurrent && (record.verdict === 'WEAKENED' || runsWeak)) {
       if (record.verdict !== 'WEAKENED') record = { ...record, verdict: 'WEAKENED' };
-      if (!weakCurrent || ts(record) >= ts(weakCurrent)) weakCurrent = record;
+      if (!weakCurrent || weakTs(record) >= weakTs(weakCurrent)) weakCurrent = record;
       continue;
     }
     if (runsWeak && record.verdict === 'NOT WEAKENED') record = { ...record, verdict: 'WEAKENED' };
