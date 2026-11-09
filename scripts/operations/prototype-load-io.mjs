@@ -7,6 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
+import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import nodeFs from 'node:fs';
@@ -359,6 +360,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const wd = JSON.parse(plist.stdout).WorkingDirectory;
         if (typeof wd !== 'string' || !wd.startsWith('/')) return stop('bad-input', { resolution: 'missing absolute WorkingDirectory' });
         out.clone = wd; out.cloneSource = `plist:${daemon.label}`;
+      }
+      if (input.forceAdopt) {
+        // R508: queue ONE operator-ruled adoption of ONE build. `--sha` is the full 40-hex id of the build the rebuild
+        // will hold (the `target` in the daemon's held / smoke-rejected state — main plus the applied overlays), NOT a
+        // branch tip unless there are no overlays. A smoke failure on any other build never consumes the request. The
+        // smoke still runs and its result is recorded next to the force; refused without a ruling id, a verbatim quote and a sha.
+        const req = requestForceAdopt({ root: out.clone, env, daemon: input.daemon, ruling: input.ruling, quote: input.quote, sha: input.sha, dryRun: input.dryRun });
+        out.forceAdopt = req.ok ? { requested: !input.dryRun, dryRun: !!input.dryRun, ruling: req.record.ruling, sha: req.record.sha } : { requested: false, refused: req.reason };
+        out.ok = req.ok;
+        return req.ok ? out : stop('force-adopt-refused', { forceAdopt: out.forceAdopt });
       }
       if (input.retire) {
         // Retire-only: no candidate, only the registrations proved retired are dropped.

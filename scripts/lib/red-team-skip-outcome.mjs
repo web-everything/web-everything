@@ -166,20 +166,17 @@ export function settleRedTeamSkip(input = {}) {
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
     const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
       : classifyRedTeamSkip(redTeam);
-    let settled = classified;
-    let rule;
-    if (settled.kind !== 'policy' && realHead && isRealHead(input.readHead)
+    // R730: a non-policy skip may still settle when the exact-head stored review owes no red team.
+    const ruleApplies = classified.kind !== 'policy' && realHead && isRealHead(input.readHead)
       && input.readHead.toLowerCase() === head.toLowerCase()
-      && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam })) {
-      settled = { kind: 'policy', reason: 'not owed (stored review)' };
-      rule = STORED_NOT_OWED_RULE;
-    }
-    let { reason } = settled;
+      && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam });
+    const rule = ruleApplies ? STORED_NOT_OWED_RULE : undefined;
+    let { reason } = ruleApplies ? { reason: 'not owed (stored review)' } : classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
-    if (settled.kind === 'policy' && !boundRead) {
+    if ((ruleApplies || classified.kind === 'policy') && !boundRead) {
       reason = 'policy skip head not bound to the reviewed read';
-    } else if (settled.kind === 'policy') {
+    } else if ((ruleApplies || classified.kind === 'policy')) {
       try {
         if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || typeof repo !== 'string' || !repo
           || !isRealHead(head)) throw Error('missing or invalid PR/head');

@@ -44,3 +44,37 @@ describe('red-team advisory with Class / Also class lines is a machine note, not
     expect(rec.laterVerdict).toBe(false);
   });
 });
+
+describe('review-verdict-carried envelope around a non-blocking advisory is a machine note', () => {
+  const NEW = '3a35250ae6aadf6fe7dee8b2420c929e3482c00c';
+  const PATCH = 'f24d967614721e68a1bb02a2560bff7f83b38cd6';
+  const marker = (to = NEW) => `<!-- review-verdict-carried from=${OLD} to=${to} patch-id=${PATCH} -->`;
+  const sentence = 'Review verdict carried across an identical contribution.';
+  // The carry writer re-binds the advisory marker to the new head but keeps the original "Head" label.
+  const carriedAdvisory = (rev = NEW) => advisory().replace(`rev=${OLD}`, `rev=${rev}`);
+  const envelope = (inner, to = NEW) => `${marker(to)}\n${sentence}\n${inner}`;
+
+  it('accepts marker + sentence + advisory bound to the carried-to head', () => {
+    expect(isKnownMachineBody(envelope(carriedAdvisory()), trusted)).toBe(true);
+  });
+  it('accepts marker + sentence alone', () => {
+    expect(isKnownMachineBody(`${marker()}\n${sentence}`, trusted)).toBe(true);
+  });
+  it('refuses an untrusted author', () => {
+    expect(isKnownMachineBody(envelope(carriedAdvisory()), { author: { login: 'mallory' } })).toBe(false);
+  });
+  it('refuses when the advisory is bound to a head other than the carried-to head', () => {
+    expect(isKnownMachineBody(envelope(carriedAdvisory(OLD)), trusted)).toBe(false);
+  });
+  it('refuses when the shown Head label is not the carried-from head', () => {
+    expect(isKnownMachineBody(envelope(carriedAdvisory().replace(`Head \`${OLD.slice(0, 12)}\``, 'Head `aaaaaaaaaaaa`')), trusted)).toBe(false);
+  });
+  it('refuses an appended hold in the envelope', () => {
+    expect(isKnownMachineBody(`${envelope(carriedAdvisory())}\n\n🔁 review — changes requested`, trusted)).toBe(false);
+    expect(isKnownMachineBody(`${marker()}\n${sentence}\nplease do not merge`, trusted)).toBe(false);
+  });
+  it('refuses a blocking advisory inside the envelope', () => {
+    const blocking = carriedAdvisory().replace('[not confirmed]', '[confirmed]').replace('0 confirmed', '1 confirmed');
+    expect(isKnownMachineBody(envelope(blocking), trusted)).toBe(false);
+  });
+});
