@@ -159,8 +159,12 @@ function pathCandidates(file, anchors = new Set()) {
   const raw = pathCandidate(file);
   if (raw === null) return null;
   const out = new Set([raw]);
-  const folded = file.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '');
-  for (const form of new Set([file, folded])) {
+  // Folded with the same set cleanPattern drops (PR #6381 referral: a format or control character that is not
+  // default-ignorable, U+FFF9 or U+0600, split the token, so an explicitly named module matched no glob), plus the
+  // line and paragraph separators and the blank Braille pattern. A second form also drops whitespace, which renders as
+  // a gap inside a name. Each form only adds candidates; the raw report stays one too.
+  const folded = file.normalize('NFKC').replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}⠀]/gu, '');
+  for (const form of new Set([file, folded, folded.replace(/\s/gu, '')])) {
     for (const token of form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []) {
       const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
       for (let i = 0; i < segs.length; i++) {

@@ -931,7 +931,15 @@ describe('R473 structured concurrency evidence', () => {
       'web-everything/scripts/lib/review-independence.mjs', 'a/a/scripts/lib/review-independence.mjs', 'scripts/lib/review-independence.mjs,',
       'scripts/lib/review-independence.mjs.', 'scripts/lib/review-independence.mjs:42-50', 'scripts/lib/review-independence.mjs:L42',
       'scripts/lib/review-independence.mjs (line 42)', 'scripts/lib/review-independence.mjs#42', 'scripts/lib/review-independence.mjs@ec32b86',
-      'scripts\\lib\\review-independence.mjs', 'see (scripts/lib/review-independence.mjs)'])(
+      'scripts\\lib\\review-independence.mjs', 'see (scripts/lib/review-independence.mjs)',
+      // PR #6381 referral (block): a format (Cf) or control (Cc) character that is NOT default-ignorable (U+FFF9, the
+      // Arabic number signs, U+070F, U+110BD, C1 U+0085, DEL) split the folded token, so an explicitly named module matched
+      // no glob. Built from code points: a raw one in source is refused by check:standards.
+      // The same class: a line or paragraph separator, the blank Braille pattern and ordinary or wide spaces render as a
+      // gap, not a character, and split the token too.
+      ...[0xfff9, 0xfffb, 0x600, 0x6dd, 0x70f, 0x110bd, 0x85, 0x7f, 0x9f, 0x2028, 0x2029, 0x2800, 0x20, 0xa0, 0x3000].flatMap(cp => [`scripts/lib/review-${String.fromCodePoint(cp)}independence.mjs`,
+        `scr${String.fromCodePoint(cp)}ipts/lib/review-independence.mjs`, `scripts/lib${String.fromCodePoint(cp)}/review-independence.mjs`,
+        `scripts/lib/git-hook${String.fromCodePoint(cp)}-surface.mjs`])])(
       'a protected file reported as %j still never ships', async file => {
         for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
       });
