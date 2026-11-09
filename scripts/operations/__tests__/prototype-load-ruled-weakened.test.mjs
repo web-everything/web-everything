@@ -62,6 +62,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/rebuild-spawner-reader-thin', 'd2c55f72173c6da0c88612507fc86e144cf176a4', 'R384+R396'],
       ['lane/redteam-dispatch-queue', 'f86f066e17bd0eeb3a8c2f945d4d4f6236d30c75', 'R786'],
       ['lane/redteam-foreign-host', 'df6f584666eecef95c6a0b2c72d393cd8e54dd6d', 'R757'],
+      ['lane/redteam-pending-on-accept-m1', '166689d13b300960fbf2f458ff3ba18f560b097a', 'R796'],
       ['lane/review-early-start', 'bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2', 'R464+R468+R474'],
       ['lane/runs-scan-bound-aff4', 'aff4a567812cd837234ceeadd0cd7d8a0f658fdb', 'R545'],
       ['lane/verify-forge-route', '2b6ac7d67b5e4fc1b7137c6d7e59d202eb45a41b', 'R396'],
