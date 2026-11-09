@@ -2173,6 +2173,14 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       ])('also when the hiding current-question record has %s', (_, over) => {
         expect(carry(livePass(), weak(), hider(over))).toEqual({ ok: false, reason: 'weakened' });
       });
+      it('covers() is asked once per base on the hidden-WEAKENED path, so a flaky second answer cannot drop the newer own pass', () => {
+        const ownPass = auditRecord({ head: SHA, base: C, at: '2026-10-22T12:00:00Z' });
+        const asked = new Map();
+        const flaky = (base) => { const n = (asked.get(base) ?? 0) + 1; asked.set(base, n); return base !== C || n === 1; };
+        const hiddenWeak = weak({ fingerprint: undefined });
+        expect(prototypeLoad.canonicalAuditEvidence([hiddenWeak, hider(), ownPass], SHA, flaky, FP, opts)).toEqual({ ok: true, record: ownPass });
+        expect([...asked.values()].every((n) => n === 1)).toBe(true);
+      });
       it('a prior-question record whose runs hold a WEAKENED (verdict field NOT WEAKENED) hidden by an unusable current record still blocks', () => {
         const runsWeak = weak({ verdict: 'NOT WEAKENED', runs: ['NOT WEAKENED', 'WEAKENED'], findings: [] });
         for (const records of [[livePass(), runsWeak, hider()], [hider(), runsWeak, livePass()]])

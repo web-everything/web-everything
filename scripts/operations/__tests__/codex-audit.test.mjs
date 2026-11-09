@@ -100,12 +100,14 @@ describe('canonical audit', () => {
     expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
   });
 
-  it('fails closed on Codex failure without recording', async () => {
+  it('fails closed on Codex failure, saving a blocking record and printing nothing', async () => {
     const f = fixture();
     f.deps.runCodex.mockRejectedValue(new Error('failed'));
     expect(await main(ARGS, f.deps)).toBe(3);
     expect(f.errors.join('')).toMatch(/UNPARSEABLE/);
-    expect(f.records).toEqual([]);
+    expect(f.output).toEqual([]);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
   });
 
   const conflictingAnswers = [
@@ -285,16 +287,31 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     expect(findAudit([earlier, ...f.records], Q)).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
   });
 
+  it('a thrown Codex failure also saves a blocking record and hides an earlier pass', async () => {
+    const earlier = { at: '2026-11-01T00:00:00.000Z', base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], runs: ['NOT WEAKENED', 'NOT WEAKENED'] };
+    const f = seq('NOT WEAKENED', new Error('boom'));
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.records).toHaveLength(1);
+    expect(findAudit([earlier, ...f.records], Q)).toMatchObject({ verdict: 'WEAKENED', unparseable: true, runs: ['NOT WEAKENED', 'UNPARSEABLE'] });
+  });
+
+  it('the blocking unparseable record carries the head net-diff fingerprint when readable', async () => {
+    const f = seq('garbage');
+    f.deps.fingerprint = async () => 'f'.repeat(64);
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.records[0]).toMatchObject({ unparseable: true, fingerprint: 'f'.repeat(64) });
+  });
+
   it('an unparseable run whose record cannot be saved still exits 3', async () => {
     const f = seq('garbage');
     f.deps.appendRecord.mockRejectedValue(new Error('disk'));
     expect(await main(ARGS, f.deps)).toBe(3);
   });
 
-  it('NOT WEAKENED then a Codex failure exits 3 and records nothing', async () => {
+  it('NOT WEAKENED then a Codex failure exits 3 and prints nothing', async () => {
     const f = seq('NOT WEAKENED', new Error('boom'));
     expect(await main(ARGS, f.deps)).toBe(3);
-    expect(f.records).toEqual([]);
+    expect(f.output).toEqual([]);
   });
 
   it('deps.runs=1 cannot lower the run count below 2', async () => {
