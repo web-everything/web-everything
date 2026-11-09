@@ -382,6 +382,32 @@ describe('red-team check run contract', () => {
       expect(posts(io)).toEqual([]);
     });
 
+    // A verdict carry posts ONE comment: carried marker, prose, then the re-keyed result. The clock evidence must
+    // read the same carried record the disposition reader recognises, or a valid carry can never clear a failure.
+    const carryComment = (created_at, author = { login: 'web-everything', type: 'Bot' }) => ({ author, created_at,
+      body: [`<!-- review-verdict-carried from=${OLD_HEAD} to=${HEAD} patch-id=${'c'.repeat(40)} -->`,
+        'Review verdict carried across an identical contribution.', resultComment().body].join('\n') });
+    it.each([
+      ['a trusted carry newer than the failed check publishes', '2026-11-07T12:00:00Z', undefined, true],
+      ['a trusted carry older than the failed check refuses', '2026-11-07T10:00:00Z', undefined, false],
+      ['a carry with an unreadable time refuses', 'not-a-date', undefined, false],
+      ['an untrusted newer carry refuses', '2026-11-07T12:00:00Z', { login: 'outsider' }, false],
+    ])('%s', async (_, created_at, author, ok) => {
+      const io = fixture();
+      io.readComments.mockReturnValue([carryComment(created_at, author)]);
+      expect(await publish(io)).toMatchObject({ ok });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
+    });
+
+    it('a newer carry to another head cannot date an older live-head result', async () => {
+      const io = fixture();
+      const otherHead = { ...carryComment('2026-11-07T12:00:00Z'),
+        body: carryComment('x').body.replaceAll(HEAD, OLD_HEAD).replace(`from=${OLD_HEAD}`, `from=${'d'.repeat(40)}`) };
+      io.readComments.mockReturnValue([{ ...resultComment(), created_at: '2026-11-07T10:00:00Z' }, otherHead]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
     it.each([false, true])('failed failure supersede posts a second-channel hold and never throws (hold fails=%s)', async holdFails => {
       const io = fixture();
       const baseGh = io.gh.getMockImplementation();

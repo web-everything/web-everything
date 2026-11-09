@@ -526,6 +526,21 @@ const indexedRecords = comments => {
   });
 };
 
+/**
+ * Creation times (ms; NaN when unreadable) of every trusted record holding THIS PR/head's result `resultId`, read
+ * through the same record split as {@link readRedTeamDisposition}, so a result recognised inside a verdict-carry
+ * comment is dated by that carry comment. Untrusted, other-head and other-result records never count. PURE.
+ */
+export function redTeamResultRecordTimes(comments, pr, head, resultId) {
+  const live = String(head ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(live) || !resultId) return [];
+  return threadRecords(comments).flatMap(r => {
+    const parsed = parseRedTeamComment(recordBody(r));
+    return parsed?.pr === Number(pr) && parsed.rev === live && redTeamResultId(parsed) === resultId
+      ? [Date.parse(commentCreatedAt(r.c))] : [];
+  });
+}
+
 /** The newest trusted red-team result for this PR and head among the records, or null. PURE. */
 function latestResult(records, pr, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;

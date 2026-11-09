@@ -7,8 +7,7 @@ import { withFileLock } from './atomic-json-file.mjs';
 import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { readRedTeamDisposition, parseRedTeamComment, redTeamResultId } from './red-team-gate.mjs';
-import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
+import { readRedTeamDisposition, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -174,13 +173,8 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
       if (latest && latest.conclusion !== 'success') {
         // Parsed dispositions omit comment metadata. Bind the clock evidence to the same trusted
         // head/result, never a later unrelated comment. Ambiguous legacy timestamps cannot clear failure.
-        const resultId = redTeamResultId(disposition.result);
-        const dates = comments.filter(comment => {
-          if (!isTrustedMarkerAuthor(comment)) return false;
-          const parsed = parseRedTeamComment(comment?.body);
-          return parsed?.pr === Number(pr) && parsed.rev === headSha.toLowerCase()
-            && redTeamResultId(parsed) === resultId;
-        }).map(comment => Date.parse(commentCreatedAt(comment)));
+        // Read the records exactly as the disposition reader does, so a carried result is dated by its carry.
+        const dates = redTeamResultRecordTimes(comments, pr, headSha, redTeamResultId(disposition.result));
         // A result produced during a round cannot resolve that round's later failure.
         const failedAt = Date.parse(latest.completed_at);
         if (!dates.length || dates.some(date => !Number.isFinite(date)) || !Number.isFinite(failedAt)
