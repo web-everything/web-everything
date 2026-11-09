@@ -211,7 +211,8 @@ describe('real drain pre-stage path', () => {
     expect(body).toMatch(/if\s*\([^)]*\.hold\s*\)\s*(?:\{\s*)?return\s*\{/);
     expect(body).toMatch(/enqueued:\s*false/);
     expect(body).toMatch(/kind:\s*['"]mq-same-head-failed['"]/);
-    expect(body).toMatch(/reason:\s*\w+\.line/);
+    // The hold reason is the guard's short `reason` (#6569), falling back to its full `line`.
+    expect(body).toMatch(/reason:\s*(?:\w+\.reason\s*\?\?\s*)?\w+\.line/);
     expect(body.indexOf('mqSameHeadGuard(')).toBeLessThan(body.indexOf('mergeStrategy.enqueue('));
     expect(body.match(/mergeStrategy\.enqueue\s*\(/g)).toHaveLength(1);
     expect((source.slice(0, definition.index) + source.slice(end)).match(/mergeStrategy\.enqueue\s*\(/g) || []).toHaveLength(0);
