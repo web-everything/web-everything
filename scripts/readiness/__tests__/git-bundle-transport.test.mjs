@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge, BUNDLE_MAIN_MAX_AGE_CEILING_MS } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
 import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, capabilityBundleVerdict, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
-import { decideRemote, resolveAdmissionPolicy, readRunnerBundleCapability, writeRunnerCapabilities } from '../heavy-admission.mjs';
+import { runWithRemoteDecision, decideRemote, resolveAdmissionPolicy, readRunnerBundleCapability, writeRunnerCapabilities } from '../heavy-admission.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
 const git = (cwd, ...args) => {
@@ -165,6 +165,23 @@ describe('R593 client and routing', () => {
       writeRunnerCapabilities({ root: dir, host: 'forge', capabilities: {}, clock });
       expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(false);
       expect(readRunnerBundleCapability({ root: dir, host: 'other', clock })).toBe(true);
+    });
+    it('R807: unknown capability stays local when an external client override is configured (no affirmation possible)', async () => {
+      const lockRoot = join(root, 'locks'); await fs.mkdir(lockRoot, { recursive: true });
+      const policyFor = (clientPath) => resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 3, clientPath,
+        maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15, transport: 'git-bundle' } } });
+      const run = async (clientPath) => {
+        const decisions = []; const calls = [];
+        await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], policy: policyFor(clientPath), cwd, env: {}, lockRoot, loadPerCore: () => 4,
+          hostOverloaded: () => false, log: () => {}, onDecision: d => decisions.push(d),
+          remoteExec: async (o) => { calls.push(o); return { mode: 'not-started', terminated: true, reason: 'forge-runner-too-old' }; } });
+        return { decisions, calls };
+      };
+      const external = await run('/opt/ext/remote-exec.mjs');
+      expect(external.decisions[0]).toMatchObject({ remote: false, needsGit: true });
+      expect(external.calls).toHaveLength(0);
+      const builtin = await run(null);
+      expect(builtin.decisions[0]).toMatchObject({ remote: true });
     });
     it('verdict is yes/no/unknown', () => {
       const rec = capabilityRecord({ host: 'forge', capabilities: { gitBundle: 1 }, nowMs: 1000 });
