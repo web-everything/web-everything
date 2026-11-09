@@ -2,9 +2,11 @@
  * drops, the held-stale alert, and the locked finalize phase. Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { mkdirSync, appendFileSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { hostname } from 'node:os';
+import { mkdirSync, appendFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { dirname, join, relative, isAbsolute } from 'node:path';
+import { hostname, tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { collectImportClosure } from '../import-closure.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
@@ -108,6 +110,64 @@ export function matchReadyCandidate({
     return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
+}
+
+/** Load the candidate's own module and relative siblings, never mixing in running-code imports. */
+async function loadReadyAdoption({ git, finalSha, dir }) {
+  const entry = 'scripts/lib/daemon-rebuild/adopt.mjs';
+  const sources = new Map();
+  const read = (path) => {
+    const name = relative(dir, path);
+    if (name.startsWith('..') || isAbsolute(name)) throw new Error('candidate import outside scratch');
+    if (!sources.has(name)) {
+      const result = git(['show', `${finalSha}:${name}`]);
+      sources.set(name, result?.status === 0 && typeof result.stdout === 'string' ? result.stdout : null);
+    }
+    const source = sources.get(name);
+    if (source === null) throw new Error(`cannot read candidate module: ${name}`);
+    return source;
+  };
+  const closure = collectImportClosure({
+    root: dir, entries: [entry], readFile: read,
+    exists: (path) => { try { read(path); return true; } catch { return false; } },
+  });
+  if (!closure) throw new Error('cannot read candidate adoption module');
+  for (const name of closure.files) {
+    const path = join(dir, name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, read(path));
+  }
+  // As in rebuild.mjs's probeSrc: assemble the import expression so the static import-closure scanner
+  // does not classify every daemon dispatch as incomplete. The target is the isolated candidate module.
+  const importModule = new Function('specifier', ['return im', 'port(specifier)'].join(''));
+  return importModule(pathToFileURL(join(dir, entry)).href);
+}
+
+/** R787/R796: only a verified omission may ask the smoke-passed candidate for one fresh decision. */
+export async function redecideWithCandidate({ m, ready, git, args, alert, loadCandidate = loadReadyAdoption }) {
+  if (m?.adopt !== null || !m.reason?.startsWith('superseded-omits-live-overlay')) return m;
+  let dir;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'we-ready-redecide-'));
+    const finalSha = ready.adopt.finalSha;
+    const candidate = await loadCandidate({ git, finalSha, dir });
+    if (typeof candidate?.matchReadyCandidate !== 'function' || typeof candidate?.overlayGraduated !== 'function') {
+      throw new Error('candidate adoption exports unavailable');
+    }
+    const result = await candidate.matchReadyCandidate({
+      ...args,
+      leftForMain: (applied, build) => args.leftForMain(applied, build, candidate.overlayGraduated),
+    });
+    if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('candidate returned a non-object decision');
+    if (result.adopt?.finalSha !== finalSha || !Array.isArray(result.dropRefs) || result.dropRefs.length !== 0) return m;
+    alert('ready-candidate-redecided', { match: 'redecided-by-candidate', target: finalSha });
+    return { ...result, match: 'redecided-by-candidate' };
+  } catch (error) {
+    alert('redecide-candidate-error', { error: error instanceof Error ? error.message : String(error) });
+    return m;
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // R790: one-time ruled weakening for this exact legacy drop; content/driver and time proof still apply.

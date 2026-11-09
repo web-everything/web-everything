@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import * as adoption from '../daemon-rebuild/adopt.mjs';
 import { readOverlayEventLog, prMergedDropEvidence } from '../daemon-rebuild/prepare.mjs';
 import { overlayFilePath } from '../daemon-overlays.mjs';
@@ -478,5 +480,170 @@ describe('reportDiscardedCandidate', () => {
     const detail = { target: ready.adopt.finalSha, reason, refs: omitted ?? liveApplied.map(({ ref }) => ref) };
     expect(alert.mock.calls).toEqual([['ready-candidate-discarded', detail]]);
     expect(needsYou.mock.calls).toEqual([[{ kind: 'ready-candidate-discarded', ...detail }]]);
+  });
+});
+
+
+describe('redecideWithCandidate (R787/R796)', () => {
+  function setup(overrides = {}) {
+    const evidence = graduation();
+    const args = { ...fixture(), ...overrides };
+    // Model the older running daemon: its graduation rule refuses this evidence.
+    const oldGraduation = vi.fn(() => false);
+    args.leftForMain = (applied, build, graduate = oldGraduation) => graduate({
+      ...evidence, ...applied, build, readyAt: args.ready.at,
+    });
+    const candidate = {
+      matchReadyCandidate: vi.fn(adoption.matchReadyCandidate),
+      overlayGraduated: vi.fn(adoption.overlayGraduated),
+    };
+    return {
+      m: adoption.matchReadyCandidate(args), ready: args.ready, args, git: evidence.git,
+      alert: vi.fn(), loadCandidate: vi.fn(async () => candidate), candidate,
+    };
+  }
+
+  it('re-decides the #6592 omission with candidate graduation, exactly once', async () => {
+    const o = setup();
+    expect(o.m.reason).toMatch(/^superseded-omits-live-overlay/);
+    const result = await adoption.redecideWithCandidate(o);
+    expect(result).toEqual({ adopt: o.ready.adopt, dropRefs: [], match: 'redecided-by-candidate' });
+    expect(o.loadCandidate).toHaveBeenCalledTimes(1);
+    expect(o.candidate.matchReadyCandidate).toHaveBeenCalledTimes(1);
+    expect(o.candidate.matchReadyCandidate.mock.calls[0][0]).toEqual({
+      ...o.args, leftForMain: expect.any(Function),
+    });
+    expect(o.candidate.overlayGraduated).toHaveBeenCalledTimes(liveApplied.length);
+    expect(o.alert).toHaveBeenCalledWith('ready-candidate-redecided', {
+      match: 'redecided-by-candidate', target: o.ready.adopt.finalSha,
+    });
+  });
+
+  it('retains the original refusal and cleans scratch when the loader throws', async () => {
+    const o = setup();
+    let scratch;
+    o.loadCandidate.mockImplementation(async ({ dir }) => { scratch = dir; throw new Error('cannot load candidate'); });
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.alert).toHaveBeenCalledWith('redecide-candidate-error', { error: 'cannot load candidate' });
+    expect(existsSync(scratch)).toBe(false);
+  });
+
+  it.each([
+    ['other finalSha', { adopt: { finalSha: 'OTHER' }, dropRefs: [] }],
+    ['nonempty dropRefs', { adopt: fixture().ready.adopt, dropRefs: [{ ref: 'lane/drop' }] }],
+    ['missing dropRefs', { adopt: fixture().ready.adopt }],
+    ['candidate refusal', { adopt: null, reason: 'superseded-omits-live-overlay: still missing' }],
+  ])('retains the original refusal for %s, without retry', async (_name, result) => {
+    const o = setup();
+    o.candidate.matchReadyCandidate.mockReturnValue(result);
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.loadCandidate).toHaveBeenCalledTimes(1);
+    expect(o.candidate.matchReadyCandidate).toHaveBeenCalledTimes(1);
+    expect(o.alert).not.toHaveBeenCalled();
+  });
+
+  it.each([null, undefined, false, 'adopt'])('fails closed and alerts for non-object result %s', async (result) => {
+    const o = setup();
+    o.candidate.matchReadyCandidate.mockReturnValue(result);
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.alert).toHaveBeenCalledWith('redecide-candidate-error', { error: expect.any(String) });
+  });
+
+  it('fails closed and alerts when candidate matching throws', async () => {
+    const o = setup();
+    o.candidate.matchReadyCandidate.mockImplementation(() => { throw new Error('candidate failed'); });
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.alert).toHaveBeenCalledWith('redecide-candidate-error', { error: 'candidate failed' });
+  });
+
+  it.each([
+    ['unverified-build', { verifyBuilt: () => false }],
+    ['rejected-since', { rejected: { inputsKey: 'K1', at: new Date(1_001_000).toISOString() } }],
+    ['expired', { nowMs: 9_000_000 }],
+    ['other-base', { prevHead: 'OTHER' }],
+    ['forced-sha-pinned', { ready: { ...fixture().ready, forced: true } }],
+  ])('never loads a candidate after %s', async (reason, overrides) => {
+    const o = setup(overrides);
+    expect(o.m.reason).toBe(reason);
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.loadCandidate).not.toHaveBeenCalled();
+    expect(o.alert).not.toHaveBeenCalled();
+  });
+
+  it('never re-decides an existing adoption even if a reason is present', async () => {
+    const o = setup();
+    o.m = { ...o.m, adopt: o.ready.adopt };
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.loadCandidate).not.toHaveBeenCalled();
+  });
+
+  // Happy DOM evaluates Function in a VM without Node's dynamic-import callback. Exercise the
+  // production loader in native Node, with hermetic Git blobs and a private task-temp directory.
+  function nativeDecision(source) {
+    const root = mkdtempSync(join(tmpdir(), 'candidate-loader-test-'));
+    const input = { args: fixture(), sources: [
+      ['scripts/lib/daemon-rebuild/adopt.mjs', source],
+      ['scripts/lib/candidate-rule.mjs', 'export const graduated = () => true;'],
+    ] };
+    const driver = `
+      import { redecideWithCandidate } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/daemon-rebuild/adopt.mjs')).href)};
+      import { existsSync } from 'node:fs';
+      const { args, sources } = JSON.parse(process.argv[1]);
+      const blobs = new Map(sources);
+      Object.assign(args, {
+        treeOf: () => 'T2', stillWanted: () => true, verifyBuilt: () => true,
+        carries: () => false, leftForMain: (applied, build, graduate = () => false) => graduate({ ...applied, build }),
+      });
+      const m = { adopt: null, reason: 'superseded-omits-live-overlay: lane/base' };
+      const alerts = [], calls = [];
+      const git = (argv) => {
+        calls.push(argv);
+        const name = argv[1]?.slice('S1:'.length);
+        return argv[0] === 'show' && argv[1].startsWith('S1:') && blobs.has(name) && blobs.get(name) !== null
+          ? { status: 0, stdout: blobs.get(name) } : { status: 1, stdout: '' };
+      };
+      const result = await redecideWithCandidate({ m, ready: args.ready, args, git,
+        alert: (...args) => alerts.push(args) });
+      process.stdout.write(JSON.stringify({ result, alerts, sameOriginal: result === m,
+        scratchRemoved: result.sourceUrl ? !existsSync(new URL(result.sourceUrl)) : null,
+        allFromReadySha: calls.length > 0 && calls.every(([cmd, spec]) => cmd === 'show' && spec.startsWith('S1:')) }));
+    `;
+    try {
+      const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', driver, JSON.stringify(input)], {
+        env: { ...process.env, TMPDIR: root }, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+      }));
+      expect(readdirSync(root)).toEqual([]);
+      return result;
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+
+  it('loads only the ready SHA module and its relative sibling, then removes scratch', () => {
+    const { result, alerts, scratchRemoved, allFromReadySha } = nativeDecision(`
+      import { graduated } from '../candidate-rule.mjs';
+      export const overlayGraduated = graduated;
+      export function matchReadyCandidate(args) {
+        if (!args.leftForMain(args.liveApplied[0], args.ready.adopt.finalSha)) return { adopt: null };
+        return { adopt: args.ready.adopt, dropRefs: [], sourceUrl: import.meta.url };
+      }
+    `);
+    expect(result.match).toBe('redecided-by-candidate');
+    expect(result.adopt.finalSha).toBe(fixture().ready.adopt.finalSha);
+    expect(alerts).toEqual([['ready-candidate-redecided', {
+      match: 'redecided-by-candidate', target: fixture().ready.adopt.finalSha,
+    }]]);
+    expect(scratchRemoved).toBe(true);
+    expect(allFromReadySha).toBe(true);
+  });
+
+  it.each([
+    ['unimportable', 'export const = syntax error'],
+    ['missing exports', 'export const unrelated = true;'],
+    ['unreadable git source', null],
+    ['missing sibling', "import './missing.mjs'; export const overlayGraduated = () => true;"],
+    ['top-level throw', "throw new Error('module failed');"],
+  ])('retains the original refusal, cleans scratch and alerts for %s', (_name, source) => {
+    const { sameOriginal, alerts } = nativeDecision(source);
+    expect(sameOriginal).toBe(true);
+    expect(alerts).toEqual([['redecide-candidate-error', { error: expect.any(String) }]]);
   });
 });

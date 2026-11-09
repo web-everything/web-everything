@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, reportDiscardedCandidate,
+  overlayGraduated, reportDiscardedCandidate, redecideWithCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -545,7 +545,7 @@ export async function prepareRebuild({
         }
         return overlayEvents;
       };
-      const m = matchReadyCandidate({
+      const matchArgs = {
         ready,
         plan,
         prevHead,
@@ -565,7 +565,7 @@ export async function prepareRebuild({
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
-        leftForMain: (a, build) => overlayGraduated({
+        leftForMain: (a, build, graduate = overlayGraduated) => graduate({
           readyAt: ready.at ?? ready.passedAt,
           ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
         }),
@@ -573,7 +573,9 @@ export async function prepareRebuild({
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
-      });
+      };
+      const m0 = matchReadyCandidate(matchArgs);
+      const m = await redecideWithCandidate({ m: m0, ready, git, args: matchArgs, alert });
       if (!m.adopt) {
         // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
         // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
