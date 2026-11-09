@@ -80,6 +80,12 @@ export function auditWorkflow(yamlText) {
     if (Object.hasOwn(value, 'uses')) {
       if (typeof value.uses !== 'string' || !/^[\w./-]+@[a-f0-9]{40}$/i.test(value.uses)) problems.push('action must be SHA pinned');
       if (/app-token/i.test(value.uses)) problems.push('App token action forbidden');
+      const allowed = /^actions\/upload-artifact@/.test(value.uses) ? ['name', 'path', 'retention-days', 'if-no-files-found'] :
+        /^actions\/checkout@/.test(value.uses) ? ['ref', 'persist-credentials'] : [];
+      for (const key of Object.keys(record(value.with) ? value.with : {})) {
+        if (!allowed.includes(key) || /token|key|secret/i.test(key.replace(/^persist-credentials$/, ''))) problems.push('action input not allowed');
+      }
+      if (/^actions\/upload-artifact@/.test(value.uses) && value.with?.['if-no-files-found'] !== 'error') problems.push('artifact upload must error on no files');
       if (/^actions\/checkout@/.test(value.uses) &&
           (!exact(value.with, ['ref', 'persist-credentials']) || value.with.ref !== 'main' ||
            value.with['persist-credentials'] !== false)) problems.push('unsafe checkout');
@@ -87,6 +93,8 @@ export function auditWorkflow(yamlText) {
     Object.values(value).forEach(walk);
   };
   walk(doc);
+  const loop = JSON.stringify(doc.jobs ?? {});
+  if (!/failed=1/.test(loop) || !/exit \\\"\$\{failed:-0\}\\\"/.test(loop)) problems.push('scheduled classification failures must fail the job');
   const jobs = record(doc.jobs) ? Object.values(doc.jobs) : [];
   if (jobs.length !== 1 || !jobs.every(job => record(job) && Number.isFinite(job['timeout-minutes']) &&
       job['timeout-minutes'] > 0 && Array.isArray(job.steps) && job.steps.some(step => /^actions\/checkout@/.test(step.uses)))) {

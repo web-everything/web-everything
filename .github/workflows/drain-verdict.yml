@@ -41,16 +41,20 @@ jobs:
         shell: bash
         run: |
           mkdir -p verdicts
+          failed=0
           gh pr list --repo "$GITHUB_REPOSITORY" --state open --search 'sort:updated-desc' --limit 10 --json number --jq '.[].number' > "$RUNNER_TEMP/drain-verdict-prs"
           while IFS= read -r pr; do
             if ! node scripts/drain-classify-only.mjs "--only=$pr" "--verdict-out=verdicts/pr-$pr.json"; then
-              echo '::warning::Classification failed; use the local drain for this PR.'
+              echo "::warning::Classification failed for #$pr; use the local drain."
+              failed=1
             fi
           done < "$RUNNER_TEMP/drain-verdict-prs"
+          # Every PR still gets its attempt; the job fails afterwards if any classification failed.
+          exit "${failed:-0}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: drain-verdicts
           path: verdicts/*.json
           retention-days: 1
-          if-no-files-found: warn
+          if-no-files-found: error
