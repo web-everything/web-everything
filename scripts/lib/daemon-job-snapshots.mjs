@@ -275,10 +275,18 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
 /** Link a store's `node_modules` into a code snapshot (idempotent). */
 export function linkNodeModules(snapshotDir, storeDir, { replace = false } = {}) {
   const link = join(snapshotDir, 'node_modules');
+  const target = join(storeDir, 'node_modules');
+  if (!lstatSync(target).isDirectory()) throw new Error('dependency store tree unavailable');
+  let existing;
+  try { existing = lstatSync(link); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
+  if (existing?.isSymbolicLink()) {
+    try { if (realpathSync(link) === realpathSync(target)) return link; } catch { /* refuse or replace below */ }
+  }
+  if (existing && !replace) throw new Error('unverified existing dependency resolution; retry with a verified replacement');
   // Remove the link itself (including a dangling link), never its target store.
   if (replace) rmSync(link, { recursive: true, force: true });
-  if (existsSync(link)) return link;
-  symlinkSync(join(storeDir, 'node_modules'), link, 'dir');
+  symlinkSync(target, link, 'dir');
+  if (realpathSync(link) !== realpathSync(target)) throw new Error('dependency link verification failed');
   return link;
 }
 

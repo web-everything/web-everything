@@ -7,7 +7,7 @@ import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFile, execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { existsSync, lstatSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { readOriginRefSha } from '../daemon-self-sync.mjs';
 import { ensureCodeSnapshot, ensureNodeModulesStore, linkNodeModules } from '../daemon-job-snapshots.mjs';
@@ -39,27 +39,48 @@ async function runAdoptChild(executable, argv, options) {
 }
 
 /** Only reviewed main code may decide adoption. Failure leaves ready evidence for the next tick. */
-async function adoptFromMain({ root, env, log, entries = [], mainOnly, admissionWaitMs, adoptChild }) {
+async function adoptFromMain({ root, env, log, entries = [], mainOnly, admissionWaitMs, lockOpts, adoptChild }) {
   try {
     const codeSha = readOriginRefSha({ root, ref: 'refs/remotes/origin/main' });
     if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(codeSha ?? '')) throw new Error('origin/main unavailable');
     const jobsDir = rebuildJobsDir(root, env);
     const cwd = ensureCodeSnapshot({ jobsDir, codeSha, repoDir: root });
     // Dependencies also come from the pinned lockfile, never the daemon's moving checkout.
-    if (existsSync(join(cwd, 'package-lock.json'))) {
+    const absent = (path) => {
+      try { lstatSync(path); return false; } catch (e) { if (e?.code === 'ENOENT') return true; throw e; }
+    };
+    if (!absent(join(cwd, 'package-lock.json'))) {
       const store = ensureNodeModulesStore({ jobsDir, sourceDir: cwd, adopter: true });
       linkNodeModules(cwd, store.dir, { replace: true });
+    } else if (!absent(join(cwd, 'package.json')) || !absent(join(cwd, 'node_modules'))) {
+      // A standalone archived script tree has no package resolution to install.
+      // A package or existing dependency tree requires pinned lockfile evidence.
+      throw new Error('adoption requires a pinned dependency lockfile');
     }
     const childEnv = { ...env };
     delete childEnv.NODE_PATH;
     delete childEnv.NODE_OPTIONS;
     delete childEnv.PWD;
     delete childEnv.INIT_CWD;
+    if (lockOpts?.waitMs != null) {
+      childEnv[REBUILD_LOCK_WAIT_ENV] = String(lockOpts.waitMs);
+      childEnv[FINALIZE_LOCK_WAIT_ENV] = String(lockOpts.waitMs);
+    }
     if (admissionWaitMs != null) childEnv.WE_DAEMON_REBUILD_LOCK_WAIT_MS = String(admissionWaitMs);
+    const waitMs = rebuildLockWaitMs({ env: childEnv, starvedCount: readRebuildStarvation(root, env) });
+    const finalizeMs = Number(childEnv[FINALIZE_LOCK_WAIT_ENV]) > 0
+      ? Number(childEnv[FINALIZE_LOCK_WAIT_ENV]) : DEFAULT_FINALIZE_LOCK_WAIT_MS;
+    const timeout = Math.max(120_000, Math.max(waitMs, finalizeMs, admissionWaitMs ?? 0) + 30_000);
+    // Node timers cannot represent larger deadlines. Refuse this tick rather than
+    // overflowing to an immediate kill or running an unbounded child.
+    if (!Number.isSafeInteger(timeout) || timeout > 2_147_483_647) {
+      log.error?.('daemon-rebuild: adopt child deadline unsupported — reduce configured lock waits before retrying');
+      throw new Error('adopt child deadline unsupported; reduce lock waits before retrying');
+    }
     const result = await (adoptChild?.run ?? runAdoptChild)(process.execPath, [
       join(cwd, 'scripts/lib/daemon-rebuild.mjs'), '--adopt-only', '--json', `--clone=${resolve(root)}`,
       ...entries.map((entry) => `--entry=${entry}`), ...(mainOnly ? ['--main-only'] : []),
-    ], { cwd, env: childEnv, encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
+    ], { cwd, env: childEnv, encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024,
       killSignal: 'SIGKILL' });
     if (result?.error || result?.signal || result?.status !== 0) throw new Error('adopt child failed');
     const parsed = JSON.parse(String(result.stdout ?? '').trim().split('\n').at(-1));
@@ -168,10 +189,11 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
 }
 
 /** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
- *  clone to the last-good build on a failed check or a crash loop. Never throws; the job process (readyOnly) skips it. */
+ *  clone to the last-good build on a failed check or a crash loop. Never throws; ready/adopt-only children skip it
+ *  because the parent daemon tick owns the health check. */
 async function forceWatch(options, emitEvent, startedAtMs) {
   const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false } = options;
-  if (!root || readyOnly) return;
+  if (!root || readyOnly || options.adoptOnly) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
     await runForceWatchTick({
@@ -241,7 +263,7 @@ async function rebuildCloneInternal({
         if (absent(rebuildStatePath(root, stEnv)) && absent(readyCandidatePath(root, stEnv))) {
           return { moved: false, reason: 'needs-build', alerts: [] };
         }
-        return adoptFromMain({ root, env, log, entries, mainOnly, admissionWaitMs, adoptChild });
+        return adoptFromMain({ root, env, log, entries, mainOnly, admissionWaitMs, lockOpts, adoptChild });
       },
     });
   }
