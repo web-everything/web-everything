@@ -113,7 +113,7 @@ export function pinnedGhEnv(env = process.env) {
   return { ...out, GH_HOST: 'github.com' };
 }
 
-export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env = process.env, slug, repo, remote = 'origin', git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now } = {}) {
+export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env = process.env, slug, repo, remote = 'origin', git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now, priority = false } = {}) {
   return {
     read(kind, key) {
       if (kind !== 'json') return unreadable('unsupported-kind', now, kind);
@@ -126,7 +126,7 @@ export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env 
       } catch (e) { return unreadable(e?.reason ?? 'repo-pin', now, e?.message); }
       const cleanEnv = pinnedGhEnv(env);
       // gh-throttle's read memo is keyed off throttle.env (default process.env), not the child env: hand it the allowlisted env too.
-      const pinnedExec = (file, args, opts = {}) => exec(file, args, { ...opts, throttle: { ...opts.throttle, env: cleanEnv } });
+      const pinnedExec = (file, args, opts = {}) => exec(file, args, { ...opts, throttle: { ...opts.throttle, env: cleanEnv, ...(priority ? { reservedSlot: true, caller: 'red-main-freeze-read' } : {}) } });
       let res;
       try {
         res = (rest ?? ghRestGetJson)(key.replace('{owner}/{repo}', pinned), {

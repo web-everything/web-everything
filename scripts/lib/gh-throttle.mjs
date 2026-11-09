@@ -1977,6 +1977,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
     ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
     : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
   const slotTimeoutMs = slotWaitPick.waitMs;
+  // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
+  const slotCap = cap + (throttle.reservedSlot === true && !isWrite ? 1 : 0);
   // #gh-graphql-budget — the shared primary-budget backoff (see that section above).
   const resource = classifyGhResource(args);
   // The credential the child really uses: the caller's explicit env, else — a config-only `throttle.env` carries
@@ -2031,7 +2033,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
@@ -2242,6 +2244,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
     : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
   const slotTimeoutMs = slotWaitPick.waitMs;
+  // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
+  const slotCap = cap + (throttle.reservedSlot === true && !isWrite ? 1 : 0);
   // #gh-graphql-budget — the shared primary-budget backoff (see runGhSync's identical wiring).
   const resource = classifyGhResource(argv);
 
@@ -2306,7 +2310,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
