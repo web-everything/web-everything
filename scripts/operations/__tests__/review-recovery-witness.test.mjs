@@ -694,9 +694,13 @@ describe('foreign-host stale window setting reaches every recovery entry point',
     abandon: () => ({ ok: true }), setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(), now: Date.now,
     capacity: { lanes: 1 }, dispatch });
 
+  // Admission refuses a plan that still owes an abandonment (`abandon: true`) with 'recovery evidence changed'; a plan held as
+  // alive refuses with 'owner live or age unknown'. So the two messages tell apart "the setting was read" from "it was dropped".
   it('review-job admission honours the setting', () => {
     const f = windowed(true);
-    expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+    const before = readFileSync(f.path, 'utf8');
+    expect(() => f.admit()).toThrow('recovery evidence changed');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
   });
   it('review-job admission holds the record inside the default window', () => {
     const f = windowed(false);
