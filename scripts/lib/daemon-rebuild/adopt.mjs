@@ -122,8 +122,11 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
     // still has to agree independently; anything else refuses (live 2026-11-04 author-lookup-defer-m2).
     const retiredWithProof = last?.kind === 'auto-retired' && ['pr-merged', 'in-main'].includes(last.reason)
       && last.tip === sha && last.evidence?.contentInMain === true && last.evidence?.cleanMerges === true;
-    // Both auto-drop reasons require a pre-ready event and the independent content/driver checks below.
-    if ((last?.kind === 'auto-dropped' && ['in-main', 'pr-merged'].includes(last.reason)) || retiredWithProof) {
+    // `pr-merged` (the PR may have merged into a stacked branch, not main) is bound to its PR number and, like every
+    // route here, graduates only through the independent content/driver checks below: nothing the build lacks is dropped.
+    const droppedForMain = last?.kind === 'auto-dropped'
+      && (last.reason === 'in-main' || (last.reason === 'pr-merged' && Number.isInteger(last.pr) && last.pr > 0));
+    if (droppedForMain || retiredWithProof) {
       const droppedMs = timeMs(last.at);
       const readyMs = timeMs(readyAt);
       if (!Number.isFinite(droppedMs) || !Number.isFinite(readyMs) || droppedMs >= readyMs) return false;

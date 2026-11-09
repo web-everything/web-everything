@@ -226,7 +226,7 @@ describe('overlayGraduated auto-dropped in-main evidence', () => {
 });
 
 describe('overlayGraduated auto-dropped pr-merged evidence', () => {
-  const prMerged = (overrides = {}) => autoDropped({ event: { reason: 'pr-merged' }, ...overrides });
+  const prMerged = (overrides = {}) => autoDropped({ event: { reason: 'pr-merged', pr: 6554 }, ...overrides });
 
   it('accepts pr-merged before readyAt with independent content proof', () => {
     const evidence = prMerged();
@@ -234,6 +234,10 @@ describe('overlayGraduated auto-dropped pr-merged evidence', () => {
     expect(evidence.git).toHaveBeenCalledWith([
       'merge-tree', '--write-tree', '--no-messages', evidence.build, evidence.sha,
     ]);
+  });
+
+  it.each([['no pr number', undefined], ['non-integer pr', '6554'], ['zero pr', 0]])('refuses pr-merged with %s', (_n, pr) => {
+    expect(adoption.overlayGraduated(prMerged({ event: { reason: 'pr-merged', pr } }))).toBe(false);
   });
 
   it('refuses pr-merged when overlay content is not in the candidate build', () => {
