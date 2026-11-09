@@ -274,6 +274,31 @@ describe.each([
   });
 });
 
+describe('informational referral resolution is not a decision request', () => {
+  const oldInfo = c('plateau-worker[bot]', '2026-10-21T06:00:00Z',
+    '🔔 conveyor — needs your decision\n\nneeds your decision: referral-hold-auto-resolved');
+  const realNote = c('plateau-worker[bot]', '2026-10-21T05:00:00Z',
+    '🔔 conveyor — needs your decision\n\nneeds your decision: fix attempts exhausted');
+
+  it('ignores the persisted old decision-header format for a no-ask kind', () => {
+    expect(needsDecisionOpen([oldInfo])).toBeNull();
+  });
+  it('ignores the new informational header', () => {
+    expect(needsDecisionOpen([c('plateau-worker[bot]', '2026-10-21T06:00:00Z',
+      'ℹ️ conveyor — note\n\nreferral-hold-auto-resolved')])).toBeNull();
+  });
+  it('keeps a real decision note open', () => {
+    expect(needsDecisionOpen([realNote])).toEqual({
+      at: Date.parse(realNote.createdAt), dispute: false, text: 'needs your decision: fix attempts exhausted',
+    });
+  });
+  it('a later old no-ask note does not mask the latest real ask', () => {
+    expect(needsDecisionOpen([realNote, oldInfo])).toEqual({
+      at: Date.parse(realNote.createdAt), dispute: false, text: 'needs your decision: fix attempts exhausted',
+    });
+  });
+});
+
 describe('draft-withdrawn (#5787)', () => {
   it('a draft with the withdrawn hold waits on the operator with a release command', () => {
     const r = row(sweep([mkPr({ number: 5787, isDraft: true, labels: L('review-status:draft-withdrawn') })]), 5787);

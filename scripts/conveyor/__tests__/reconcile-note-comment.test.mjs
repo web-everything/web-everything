@@ -4,8 +4,11 @@
  *   reconcile note episode: stable episode keys, an unforgeable marker, and the ONE IO shell that actually posts.
  */
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import * as commentPolicy from '../../lib/pr-comment-policy.mjs';
 import {
-  NOTE_COMMENT_MARKER, noteEpisodeKey, noteHeadline, buildNoteComment, hasPostedNoteComment, planNoteComment,
+  NOTE_COMMENT_MARKER, INFO_NOTE_COMMENT_MARKER, noteEpisodeKey, noteHeadline, buildNoteComment, hasPostedNoteComment, planNoteComment,
   postNoteComment,
 } from '../reconcile-note-comment.mjs';
 
@@ -76,6 +79,13 @@ describe('noteHeadline — the operator\'s own rule', () => {
 });
 
 describe('buildNoteComment', () => {
+  it('referral-hold-auto-resolved posts an informational marker without a decision header', () => {
+    const body = buildNoteComment({ kind: 'referral-hold-auto-resolved', prNumber: 7, text: 'all referrals already ruled' });
+    expect(body.startsWith(INFO_NOTE_COMMENT_MARKER)).toBe(true);
+    expect(body).not.toContain(NOTE_COMMENT_MARKER);
+    expect(body).not.toMatch(/conveyor\s+—\s+needs your decision/i);
+  });
+
   it('first line is the stable marker; carries the headline, the note text, and the episode key', () => {
     const note = { kind: 'ci-heal-exhausted', prNumber: 2636, attempts: 3, cap: 3, text: 'auto-heal exhausted' };
     const body = buildNoteComment(note);
@@ -222,6 +232,20 @@ describe('postNoteComment — the IO shell', () => {
 });
 
 describe('informational note kinds (conveyor.notes.informationalKinds)', async () => {
+  it('exports referral-hold-auto-resolved as a built-in no-ask kind', () => {
+    expect(commentPolicy.NO_ASK_NOTE_KINDS).toContain('referral-hold-auto-resolved');
+  });
+  it('unions built-in no-ask kinds with an empty settings list', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR, 'no-ask-note-'));
+    try {
+      const path = join(dir, 'settings.json');
+      writeFileSync(path, JSON.stringify({ conveyor: { notes: { informationalKinds: [] } } }));
+      const kinds = commentPolicy.loadInformationalNoteKinds({ path });
+      expect(commentPolicy.isInformationalNote({ kind: 'referral-hold-auto-resolved' }, { kinds })).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   const { latestUnresolvedPersonNote } = await import('../../operations/operator-queue-needs-person.mjs');
   const { loadInformationalNoteKinds } = await import('../../lib/pr-comment-policy.mjs');
   const asComment = (note) => ({ body: buildNoteComment(note), createdAt: '2026-11-03T10:00:00Z', viewerDidAuthor: true, author: { login: 'x' } });
