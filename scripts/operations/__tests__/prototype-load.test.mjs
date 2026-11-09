@@ -2861,6 +2861,21 @@ describe('test check-run evidence bounds (P8)', () => {
     expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [{ ...pass, conclusion: 'failure' }, { ...pass, id: 2 }] }, SHA)).toMatchObject({ id: 2, conclusion: 'success' });
     expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, check_suite: undefined }] }, SHA)).toBeNull();
   });
+  it('binds the test suite to the expected workflow file and fails closed on any gap', () => {
+    const ev = prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [pass] }, SHA);
+    expect(ev.suiteIds).toEqual([7]);
+    const run = { check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml' };
+    const ok = (runs, path) => prototypeLoad.testWorkflowBound(ev, { total_count: runs.length, workflow_runs: runs }, SHA, path);
+    expect(ok([run])).toBe(true);
+    expect(ok([{ ...run, path: '.github/workflows/ci.yml@refs/heads/x' }])).toBe(true);
+    expect(ok([{ ...run, path: '.github/workflows/other.yml' }])).toBe(false);
+    expect(ok([{ ...run, check_suite_id: 8 }])).toBe(false);
+    expect(ok([{ ...run, head_sha: TREE }])).toBe(false);
+    expect(ok([])).toBe(false);
+    expect(ok([run], '')).toBe(false);
+    expect(prototypeLoad.testWorkflowBound(ev, { total_count: 2, workflow_runs: [run] }, SHA)).toBe(false);
+    expect(prototypeLoad.testWorkflowBound(null, { total_count: 1, workflow_runs: [run] }, SHA)).toBe(false);
+  });
   it('refuses an oversized or incomplete page rather than treating a truncated success as evidence', () => {
     for (const total_count of [101, -1, null, 2]) expect(prototypeLoad.testCheckEvidence({ total_count, check_runs: [pass] }, SHA)).toBeNull();
     expect(prototypeLoad.testCheckEvidence({ total_count: 100, check_runs: Array.from({ length: 100 }, (_, i) => ({ ...pass, id: i })) }, SHA)).toMatchObject({ sha: SHA, conclusion: 'success' });

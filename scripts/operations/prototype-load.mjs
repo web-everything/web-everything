@@ -31,7 +31,16 @@ export function testCheckEvidence(data, sha) {
   for (const r of runs) if (!bySuite.has(r.check_suite.id) || r.id > bySuite.get(r.check_suite.id).id) bySuite.set(r.check_suite.id, r);
   const latests = [...bySuite.values()];
   const latest = latests.find((r) => r.status !== 'completed' || r.conclusion !== 'success') ?? latests.sort((x, y) => y.id - x.id)[0];
-  return { sha: latest.head_sha, name: latest.name, status: latest.status, conclusion: latest.conclusion, id: latest.id, appId: latest.app.id };
+  return { sha: latest.head_sha, name: latest.name, status: latest.status, conclusion: latest.conclusion, id: latest.id, appId: latest.app.id, suiteIds: [...bySuite.keys()].sort((a, b) => a - b) };
+}
+/** Every suite behind the `test` evidence must belong to a workflow run of the expected workflow file on this exact sha.
+ *  Unreadable, truncated or foreign evidence is false (fail closed). */
+export const TEST_WORKFLOW_PATH = '.github/workflows/ci.yml';
+export function testWorkflowBound(evidence, runsData, sha, path = TEST_WORKFLOW_PATH) {
+  if (!evidence || !Array.isArray(evidence.suiteIds) || !evidence.suiteIds.length || typeof path !== 'string' || !path) return false;
+  if (!Number.isInteger(runsData?.total_count) || !Array.isArray(runsData.workflow_runs) || runsData.workflow_runs.length !== runsData.total_count || runsData.total_count > 100) return false;
+  return evidence.suiteIds.every((id) => runsData.workflow_runs.some((r) => r?.check_suite_id === id && r.head_sha === sha
+    && typeof r.path === 'string' && r.path.split('@')[0] === path));
 }
 /** A WEAKENED fix-ready record loads ONLY as a ruled exception (operator R396): the record must carry
  *  `auditRuling` and a non-empty `auditDisclosed`, AND the settings allowlist `ruledWeakened` must hold an entry whose

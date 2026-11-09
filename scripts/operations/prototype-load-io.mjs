@@ -21,7 +21,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, TEST_CHECK_APP_ID, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -483,7 +483,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
         if (result.code !== 0) return null;
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
-        return testCheckEvidence(JSON.parse(result.stdout), sha);
+        const evidence = testCheckEvidence(JSON.parse(result.stdout), sha);
+        if (!evidence) return null;
+        // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
+        const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
+        if (runs.code !== 0) return null;
+        return testWorkflowBound(evidence, JSON.parse(runs.stdout), sha, config.testWorkflowPath) ? evidence : null;
       });
       const checkRun = await readTestCheck({ sha: input.sha, branch: input.branch });
       if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success')
