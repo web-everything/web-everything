@@ -4,7 +4,7 @@ size: 2
 status: active
 scaffoldedBy: "fix-6319"
 dateScaffolded: "2026-11-04"
-scope: ["we:scripts/lane-drain.mjs", "we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/conveyor/build-dispatch-orphan-adopt.mjs"]
+scope: ["we:scripts/lane-drain.mjs", "we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/conveyor/build-dispatch-orphan-adopt.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/operations/__tests__/dispatch-lane-io.test.mjs", "we:scripts/conveyor/__tests__/build-dispatch-orphan-adopt.test.mjs"]
 dateOpened: "2026-11-04"
 tags: []
 ---
