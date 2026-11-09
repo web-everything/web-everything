@@ -480,13 +480,21 @@ describe('the label sink', () => {
     expect(onDisk).toBe('# frozen verdict');
   });
 
-  it('a body file already staged in this root is never overwritten from the record', async () => {
+  it('a staged file that differs from the frozen write-up is rewritten from the record; one that matches is left alone', async () => {
     const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
-    mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'local bytes');
+    mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'truncated');
     const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
       runNode: () => '{"ok":true,"pr":7,"to":"accepted"}' });
     await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
-    expect(readFileSync(path, 'utf8')).toBe('local bytes');
+    expect(readFileSync(path, 'utf8')).toBe('# frozen verdict');
+  });
+
+  it('an unreadable run record refuses before any write instead of shelling', async () => {
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => { throw new Error('corrupt'); } }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
   });
 
   // #2898 — the single home renders the attribution it is GIVEN. Before this the CLI hardcoded "via the

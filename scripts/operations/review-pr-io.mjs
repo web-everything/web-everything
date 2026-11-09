@@ -146,20 +146,27 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
  *
  * The write-up is staged under the checkout that ran effect 0, but a `--resume` may run from another lane, whose
  * sidecar has no such file. The durable run record keeps the frozen `WRITE_UP` payload, so a missing file is
- * regenerated from it (same bytes the first stage wrote). A file that is already there is never touched, and a
- * record with no matching write-up changes nothing.
+ * regenerated from it (same bytes the first stage wrote), and a staged file that differs from the frozen payload is
+ * rewritten from it. A record with no matching write-up changes nothing; an unreadable record refuses (not-applied).
  *
  * @returns {string} the body path (whether or not it could be recovered).
  */
 export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   const path = reviewBodyPath({ root, runId, bodyFile });
-  if (existsSync(path)) return path;
   let record = null;
-  try { record = (runStore ?? createFileRunStore()).read(runId); } catch { record = null; }
+  try { record = (runStore ?? createFileRunStore()).read(runId); } catch (e) {
+    // An unreadable or corrupt record is not "no write-up": refuse before anything is published.
+    throw notApplied(`the run record for ${runId} could not be read to verify the staged write-up: ${String((e && e.message) || e)}`, {});
+  }
   const entry = (record?.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string');
   if (!entry) return path;
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, entry.payload.body, 'utf8');
+  // The frozen payload is the durable truth: a missing, truncated or altered staged file is rewritten from it.
+  let current = null;
+  try { current = readFileSync(path, 'utf8'); } catch { current = null; }
+  if (current !== entry.payload.body) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, entry.payload.body, 'utf8');
+  }
   return path;
 }
 
