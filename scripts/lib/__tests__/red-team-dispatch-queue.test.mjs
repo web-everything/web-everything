@@ -497,15 +497,29 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
       expect(numbers(f.queue.admit(repo, 0))).toEqual([]); // fail closed: no probe at zero admission
     });
-    it('does not spend a retry while probing, and stops being blocked once dispatched', async () => {
+    it('bounds probes per tick and rotates a head that stays blocked to the tail after maxAttempts', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3, 4]));
+      for (const pr of [1, 2, 3]) {
+        f.queue.admit(repo, 3);
+        await f.queue.settle(repo, { rows: [1, 2, 3].map(n => ({ prNumber: n, action: 'skip', why: 'review-unfinished' })),
+          dispatched: [], notStarted: [1, 2, 3].map(n => ({ prNumber: n, reason: 'review-unfinished' })) });
+        break;
+      }
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 4]); // 2 probes max, 1 runnable slot; #3 held
+      for (let tick = 0; tick < 3; tick++) {
+        const ids = numbers(f.queue.admit(repo, 1));
+        const why = n => (n === 4 ? 'no review capacity left' : 'review-unfinished');
+        await f.queue.settle(repo, { rows: ids.map(n => ({ prNumber: n, action: 'skip', why: why(n) })),
+          dispatched: [], notStarted: ids.map(n => ({ prNumber: n, reason: why(n) })) });
+      }
+      expect(numbers(f.queue.entries()).slice(-2)).toEqual([1, 2]); // rotated behind #3/#4
+      expect(numbers(f.queue.entries())).toContain(3);
+    });
+    it('a dispatched blocked head leaves the queue', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2]));
       await block(f, 1);
-      const before = f.queue.entries()[0].attempts;
-      f.queue.admit(repo, 1);
-      await f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'review-unfinished' }, { prNumber: 2, action: 'dispatch' }],
-        dispatched: [{ prNumber: 2 }], notStarted: [{ prNumber: 1, reason: 'review-unfinished' }] });
-      expect(f.queue.entries().find(entry => entry.pr === 1).attempts).toBe(before);
       f.queue.admit(repo, 1);
       await f.queue.settle(repo, started({ plan: { refusals: [{ prNumber: 1, kind: 'already-reviewed-head' }] } }));
       expect(numbers(f.queue.entries())).not.toContain(1);

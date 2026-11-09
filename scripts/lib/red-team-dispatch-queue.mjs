@@ -8,6 +8,9 @@ const transactions = new WeakMap();
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // still probed every tick, but it must not occupy one of the capacity-bound admissions.
 const NON_RUNNABLE_REASONS = new Set(['review-unfinished']);
+// At most this many probes ride along per repo per tick; attempts rotation (maxAttempts) moves a probe that stays
+// blocked to the tail, so every blocked entry is re-checked in turn.
+const MAX_PROBES = 2;
 const copy = entries => entries.map(entry => ({ ...entry }));
 const note = (log, message) => {
   try { log(`review-daemon: red-team queue ${message}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')); }
@@ -91,8 +94,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
       const mine = entries.filter(entry => entry.repo === repo);
       // Zero admission (unreadable capacity, fail closed) admits no probe either.
-      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0).map(entry => entry.key));
-      const runnable = mine.filter(entry => !probes.has(entry.key)).slice(0, bound);
+      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0).slice(0, MAX_PROBES).map(entry => entry.key));
+      const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
       for (const entry of mine) {
@@ -114,9 +117,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
           if (NON_RUNNABLE_REASONS.has(failure.reason)) {
-            // No retry is spent and the slot is released: the entry stays queued, flagged, and is re-probed.
-            if (entry.blocked !== failure.reason) { entry.blocked = failure.reason; changed(`blocked ${entry.key}: ${failure.reason}`); }
-            continue;
+            // The slot is released (see admit); the normal attempts rotation still bounds how long it stays in front.
+            entry.blocked = failure.reason;
           }
           entry.attempts++;
           if (entry.attempts >= limit) {
