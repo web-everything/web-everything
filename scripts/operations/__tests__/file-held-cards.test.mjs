@@ -241,3 +241,13 @@ it('allows a hard-linked ledger when all file identities are outside the reposit
   expect(fileItem).toHaveBeenCalledTimes(1);
   expect(JSON.parse(readFileSync(ledger, 'utf8')).card).toBe('xtest');
 });
+
+it('keeps truncated-title cards distinct and refuses an overlapping run via the ledger lock', async () => {
+  const long = 'z'.repeat(130);
+  seed(`- [R1] 2026-11-08: ${long} one\n- [R1] 2026-11-08: ${long} two`);
+  expect((await run()).filed).toHaveLength(2);
+  seed('- [R2] 2026-11-08: Lock probe');
+  writeFileSync(`${ledger}.lock`, '1');
+  await expect(run()).rejects.toThrow(/ledger lock/);
+  expect(fileItem).toHaveBeenCalledTimes(2);
+});
