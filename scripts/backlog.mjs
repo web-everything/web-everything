@@ -65,7 +65,7 @@ import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
 import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildPrioritySettings, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
-import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
+import { acquireBuildQueueLock, buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
 import { readQueueFile, resolveQueuePath, resolveQueueSource, normNum, bornAsIndexFromItems, resolveBornAsRefs } from './conveyor/queue-store.mjs';
 import { DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
 import { readSettings, SETTINGS_DIR } from './lib/settings-files.mjs';
@@ -1160,14 +1160,31 @@ function buildQueue() {
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
   const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
   const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
+  let releaseLock;
   if (key !== null) {
     const stdout = readBuildQueueCache({ file, key, now: at, maxAgeMs });
     if (stdout !== null) { writeAllSync(1, stdout); process.exit(0); }
+    // Single-flight: the lock winner computes; losers poll the cache in short slices and re-try the lock, so a winner
+    // that finishes (or dies) without writing OUR key hands over within a slice instead of stalling 30 s.
+    const waitUntil = Date.now() + 30_000;
+    for (;;) {
+      releaseLock = acquireBuildQueueLock({ file });
+      if (releaseLock) {
+        // Re-check under the lock: a prior holder may have published our key between our miss and the acquire.
+        const fresh = readBuildQueueCache({ file, key, now: Date.now(), maxAgeMs });
+        if (fresh !== null) { releaseLock(); writeAllSync(1, fresh); process.exit(0); }
+        process.on('exit', releaseLock); break;
+      }
+      const cached = waitForBuildQueueCache({ file, key, timeoutMs: 250, maxAgeMs });
+      if (cached !== null) { writeAllSync(1, cached); process.exit(0); }
+      if (Date.now() >= waitUntil) break;
+    }
   }
   const emit = (payload, human) => {
     if (key === null) return ok(payload, human);
     const stdout = `${JSON.stringify({ ok: true, ...payload })}\n`;
     writeBuildQueueCache({ file, key, at, stdout });
+    releaseLock?.();
     writeAllSync(1, stdout);
     process.exit(0);
   };
