@@ -278,6 +278,13 @@ function resolvePending(run, declaration, resume) {
     }
     const outstanding = unappliedEffects(run, stepIndex);
     if (outstanding.length > 0) {
+      // A guard refusal ends the run only when no other attempted effect is unresolved.
+      // Declared effects may follow the refusal; none may precede it.
+      if (outstanding[0].status === 'refused'
+        && outstanding.every((entry) => entry.status === 'refused' || entry.status === 'declared')) {
+        return { ...withFinding(run, declaration, stepName, effectFinding(run, stepIndex)),
+          pending: null, cursor: declaration.steps.length, outcome: 'refused' };
+      }
       return run; // still waiting — idempotent no-op, exactly like a judge with no answer yet.
     }
     // THE STEP RECORDS WHAT IT PRODUCED, like every other kind (#3082). Before this an effect step was the

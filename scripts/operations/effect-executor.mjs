@@ -70,6 +70,14 @@ export function notApplied(message, extra = {}) {
   return Object.assign(new Error(message), { ...extra, notApplied: true });
 }
 
+const PERMANENT_GUARD_REFUSAL_MARKERS = Object.freeze(['SELF-CLEAR REFUSED']);
+
+/** A permanent guard refusal proves nothing landed and names a recognized guard. */
+export function isPermanentGuardRefusal(error) {
+  return error?.notApplied === true && typeof error.message === 'string'
+    && PERMANENT_GUARD_REFUSAL_MARKERS.some((marker) => error.message.includes(marker));
+}
+
 /**
  * The marker a sink returns to say **"I started something that outlives this run"** (#3073).
  *
@@ -405,7 +413,7 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
       // never mistaken for healthy running work.
       const indeterminate = live.dispatch ? 'in-flight' : 'pending';
       current = withEntry(current, live.key, {
-        status: certainlyNotApplied ? 'failed' : indeterminate,
+        status: isPermanentGuardRefusal(e) ? 'refused' : certainlyNotApplied ? 'failed' : indeterminate,
         error: String(e?.message ?? e),
       });
       store.write(current);
