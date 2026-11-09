@@ -4874,7 +4874,7 @@ async function runCli() {
       } });
     const guard = mqSameHeadGuard({ refresh, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
-    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
+    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.reason ?? guard.line };
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
