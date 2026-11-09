@@ -203,6 +203,14 @@ describe('soak scope', () => {
     ['an escaped quote inside an import specifier', "import '../../../fixture/dep\\'s.mjs';", "fixture/dep's.mjs"],
     ['the other quote inside an import specifier', `import "../../../fixture/dep's.mjs";`, "fixture/dep's.mjs"],
     ['the other quote inside a repo-root literal', `copy("fixture/dep's.mjs");`, "fixture/dep's.mjs"],
+    // Then the URL parser: it drops tab/LF/CR, trims spaces and controls, and reads `\` as `/`.
+    ['an escaped tab inside an import specifier', "import '../../../fixture/de\\tp.mjs';"],
+    ['an escaped newline inside an import specifier', "import '../../../fixture/de\\np.mjs';"],
+    ['a raw tab inside an import specifier', "import '../../../fixture/de\tp.mjs';"],
+    ['a trailing space in an import specifier', "import '../../../fixture/dep.mjs ';"],
+    ['backslash separators in an import specifier', "import '../..\\\\..\\\\fixture\\\\dep.mjs';"],
+    ['a raw newline inside a template dynamic import', 'await import(`../../../fixture/\ndep.mjs`);'],
+    ['an escaped tab in a new URL literal', "new URL('../../../fixture/de\\tp.mjs', import.meta.url);"],
   ])('follows %s', (_name, source, expectedTarget) => {
     const root = fixtureRoot();
     soakFixture(root);
@@ -244,6 +252,62 @@ describe('soak scope', () => {
     expect(closure.has('fixture/\\u0064ep.mjs')).toBe(true);
     expect(closure.has('fixture/\\u{110000}.mjs')).toBe(true);
   });
+
+  // Escape-aware starts skip escaped quotes, so one long escaped line stays linear. The
+  // previous shape took about 23 s on this 20 KB line, against a 5-minute CI job (#6573 review).
+  it.each([
+    ['escaped single quotes', `const s = '${"\\'".repeat(10_000)}';`],
+    ['embedded JSON', `const s = "${'{\\"k\\":1},'.repeat(2_000)}";`],
+    ['escaped backticks', `const s = \`${'\\`'.repeat(10_000)}\`;`],
+  ])('scans a long line of %s in linear time', (_name, line) => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', `${line}\nimport '../../../fixture/dep.mjs';\n`);
+    writeFixture(root, 'fixture/dep.mjs', 'export const x = 1;\n');
+
+    const start = performance.now();
+    const closure = computeSoakClosure({ root });
+    expect(performance.now() - start).toBeLessThan(5_000);
+    expect(closure.has('fixture/dep.mjs')).toBe(true);
+  }, 30_000);
+
+  // A template body spanning many lines is a path candidate longer than any file name; the
+  // fs call refuses it with ENAMETOOLONG, which must not turn every PR into run=true.
+  it('ignores a candidate longer than any file name instead of failing the whole scan', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs',
+      `const t = \`scripts/${'x'.repeat(5_000)}\`;\nimport '../../../fixture/dep.mjs';\n`);
+    writeFixture(root, 'fixture/dep.mjs', 'export const x = 1;\n');
+
+    expect(computeSoakClosure({ root }).has('fixture/dep.mjs')).toBe(true);
+    expect(soakScopeRun({ root, changed: ['backlog/1-x.md'] })).toBe(false);
+  });
+
+  // git C-quotes a changed path holding `"`, `\` or a control character even with
+  // core.quotePath=false, so the quoted line can never equal a scope key (#6573 review).
+  it.each([
+    ['"fixture/dep\\"s.mjs"'],
+    ['"fixture/dep\\\\s.mjs"'],
+    ['"fixture/de\\tp.mjs"'],
+  ])('CLI selects the soak for the git-quoted changed path %s', (path) => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    expect(soakScopeRun({ root, changed: [path] })).toBe(true);
+    expectCliOutput(runCli(`${path}\n`, root), 'run=true');
+  }, 30_000);
+
+  it('git really quotes such a path under core.quotePath=false', () => {
+    const root = fixtureRoot();
+    const git = (...args) => spawnSync('git', ['-C', root, '-c', 'user.name=t', '-c', 'user.email=t@t',
+      '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' });
+    expect(git('init', '-q').status).toBe(0);
+    writeFixture(root, 'fixture/dep"s.mjs', 'export const x = 1;\n');
+    expect(git('add', '-A').status).toBe(0);
+    expect(git('commit', '-qm', 'x').status).toBe(0);
+    const listed = git('-c', 'core.quotePath=false', 'show', '--name-only', '--format=', 'HEAD').stdout.trim();
+    expect(listed).toBe('"fixture/dep\\"s.mjs"');
+  }, 30_000);
 
   // `\0` and `%00` decode to NUL, which makes the fs calls throw: that must not turn every
   // PR into run=true, and it must not hide a later real import (#6573 review).
@@ -465,6 +529,11 @@ describe('ci.yml daemon-soak scope step wiring', () => {
     ['scripts/review-set-label.mjs'],
   ])('runs the soak for the legacy-only path %s when the derived scope says run=false', (files) => {
     expect(runStep({ files, node: 'node() { cat >/dev/null; echo run=false; }' })).toBe('run=true');
+  }, 30_000);
+
+  // Real node: a quoted line from git reaches the script, which must select the soak.
+  it('runs the soak when git lists a C-quoted changed path', () => {
+    expect(runStep({ files: '"fixture/dep\\"s.mjs"' })).toBe('run=true');
   }, 30_000);
 
   it('skips the soak when the derived scope says run=false and the legacy grep has no hit', () => {

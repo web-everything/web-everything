@@ -13,9 +13,10 @@ const SOURCE = /\.(?:[cm]?[jt]sx?)$/;
 // Code folders: a named path here is followed even when missing (a deleted dependency).
 const CODE_ROOT = /^(?:scripts|src|tools|skills-src)\//;
 
-// Decode JavaScript string escapes in one left-to-right pass (so `\\u0064` stays `d`):
-// `\u{…}`, `\uXXXX`, `\xXX`, legacy octal (CommonJS sloppy mode), line continuations, the
-// single-letter controls and identity escapes (`\/`, `\'`). An out-of-range `\u{…}` stays raw.
+// Decode JavaScript string escapes in one left-to-right pass, so an escaped backslash before
+// `u0064` is never read as a Unicode escape: `\u{…}`, `\uXXXX`, `\xXX`, legacy octal (CommonJS
+// sloppy mode), line continuations, the single-letter controls and identity escapes (`\/`,
+// `\'`). An out-of-range `\u{…}` stays raw.
 const JS_ESCAPE = /\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|([0-3][0-7]{0,2}|[4-7][0-7]?)|(\r\n|[\n\r\p{Zl}\p{Zp}])|([^]))/gu;
 const CONTROL = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' };
 function unescapeJs(text) {
@@ -29,6 +30,37 @@ function unescapeJs(text) {
     if (continuation !== undefined) return '';
     return CONTROL[other] ?? other;
   });
+}
+
+// Literal shapes. Each regex has exactly two groups (quote, body) and starts in a lookahead,
+// so a quoted keyword (`'import'`) or a stray apostrophe cannot consume a real literal after it.
+// PLAIN is the original shape (no quote of any kind inside). STRING and TEMPLATE add the other
+// quote, `\'`, escapes, line continuations and (templates only) raw newlines; `forms` decodes
+// their bodies. All shapes are scanned and unioned, so scope only widens.
+// Linear cost: an escape-aware start is a quote with no backslash right before it, so it is
+// never an escaped quote, and it ends at the next unescaped quote of its kind; two starts of
+// one kind never scan the same text.
+const PLAIN = /(?=(['"`])([^'"`\r\n]+)\1)/.source;
+const STRING = /(?=(['"])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/.source;
+const TEMPLATE = /(?=(`)((?:[^`\\]|\\[^])+)\1)/.source;
+const shapes = (prefix, escapedPrefix = prefix) => [
+  new RegExp(prefix + PLAIN, 'g'),
+  new RegExp(escapedPrefix + STRING, 'g'),
+  new RegExp(escapedPrefix + TEMPLATE, 'g'),
+];
+// `import'x'`, `export*from"x"` and `import(\`x\`)` are valid: whitespace is optional, and
+// dynamic import/require may take a template literal. A keyword start is never escaped.
+const IMPORT_SHAPES = shapes(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*/.source);
+const URL_SHAPES = shapes(/\bnew\s+URL\s*\(\s*/.source);
+const LITERAL_SHAPES = [/(['"`])([^'"`\r\n]+)\1/g, ...shapes('', /(?<!\\)/.source).slice(1)];
+
+// The URL parser trims leading and trailing C0 controls and spaces (code points 0-32) only.
+function urlTrim(text) {
+  let start = 0;
+  let end = text.length;
+  while (start < end && text.charCodeAt(start) <= 0x20) start += 1;
+  while (end > start && text.charCodeAt(end - 1) <= 0x20) end -= 1;
+  return text.slice(start, end);
 }
 
 export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
@@ -61,18 +93,27 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   // Any top-level folder or file can be a runtime dependency (the soak world copies
   // `schemas/…`, `package.json`, `.gitignore` by name), not only the code folders.
   const topLevel = new Set(readdirSync(root).filter((name) => name !== '.git' && name !== 'node_modules'));
-  // The language decodes string escapes first: `'./dep.mjs'` names `./dep.mjs`. Then an
-  // import specifier is a URL: `./x.mjs?fresh=1#v` and `./a%20b.mjs` load `x.mjs` and `a b.mjs`.
-  // Keep the raw forms too (a plain path may legitimately contain `\`, `?`, `#` or `%`).
+  // What the engine loads, in its order: the language decodes string escapes first (`\x64ep`
+  // is `dep`). Then an import specifier goes through the URL parser, which drops tab/LF/CR,
+  // trims C0 controls and spaces, and reads `\` as `/`. Then `?`/`#` end the path and `%xx`
+  // decodes: `./x.mjs?fresh=1#v` and `./a%20b.mjs` load `x.mjs` and `a b.mjs`. Keep every
+  // intermediate form too (a plain fs path may legitimately contain `\`, `?`, `#`, `%` or spaces).
   const forms = (specifier) => {
     // Fast path: without these characters every form below equals the specifier itself.
-    if (!/[\\?#%\0]/.test(specifier)) return [specifier];
+    if (!/[\\?#%\x00-\x1f]|^\x20|\x20$/.test(specifier)) return [specifier];
     const all = new Set();
     for (const text of [specifier, unescapeJs(specifier)]) {
-      const bare = text.replace(/[?#].*$/, '');
-      let decoded = bare;
-      try { decoded = decodeURIComponent(bare); } catch { /* malformed escape: keep the raw form */ }
-      all.add(text).add(bare).add(decoded);
+      const url = urlTrim(text.replace(/[\t\n\r]/g, '')).replaceAll('\\', '/');
+      for (const value of [text, url]) {
+        const cut = value.search(/[?#]/);
+        const bare = cut < 0 ? value : value.slice(0, cut);
+        let decoded = bare;
+        // Guarded: a thrown URIError (a stray `%` in a long body) is costly at scan scale.
+        if (/%[0-9a-fA-F]{2}/.test(bare)) {
+          try { decoded = decodeURIComponent(bare); } catch { /* malformed escape: keep the raw form */ }
+        }
+        all.add(value).add(bare).add(decoded);
+      }
     }
     // A NUL (`\0`, `%00`) cannot name a file, and the fs calls throw on it rather than ENOENT.
     return [...all].filter((form) => form && !form.includes('\0'));
@@ -80,11 +121,12 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   const isFile = (path) => {
     try { return statSync(path).isFile(); }
     catch (error) {
-      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+      // A name too long for the filesystem cannot exist (a multi-line template literal body).
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR' || error.code === 'ENAMETOOLONG') return false;
       throw error;
     }
   };
-  // Both literal shapes name most literals twice; the outcome depends only on `base`.
+  // Several literal shapes name most literals more than once; the outcome depends only on `base`.
   const followed = new Set();
   const follow = (base) => {
     if (followed.has(base)) return;
@@ -136,37 +178,19 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     const source = readFileSync(file, 'utf8');
     // Over-approximate: literals in comments/fixtures may widen scope too.
     const isRelative = (specifier) => specifier.startsWith('./') || specifier.startsWith('../');
-    // `import'x'`, `export*from"x"` and `import(\`x\`)` are valid: whitespace is optional, and
-    // dynamic import/require may take a template literal. The specifier is matched in a
-    // lookahead so a quoted keyword (`'import'`) cannot consume a real import after it.
-    // Each scan runs two literal shapes and unions them, so scope only widens: the plain one
-    // (no quote of any kind inside) and the escape-aware one (the other quote, `\'`, `d`,
-    // a line continuation), whose body `forms` decodes. Each pattern has exactly two groups.
     const matches = (patterns) => patterns.flatMap((pattern) => [...source.matchAll(pattern)]);
-    for (const match of matches([
-      /(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])([^'"`\r\n]+)\1)/g,
-      /(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/g,
-    ])) {
+    for (const match of matches(IMPORT_SHAPES)) {
       for (const form of forms(match[2])) {
         if (isRelative(form)) follow(resolve(dirname(file), form));
       }
     }
     // `new URL('data.json', import.meta.url)` is file-relative without a `./` prefix.
-    for (const match of matches([
-      /\bnew\s+URL\s*\(\s*(?=(['"`])([^'"`\r\n]+)\1)/g,
-      /\bnew\s+URL\s*\(\s*(?=(['"`])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/g,
-    ])) {
+    for (const match of matches(URL_SHAPES)) {
       for (const form of forms(match[2])) {
         if (!/^[a-z][a-z0-9+.-]*:|^\/|\$\{/i.test(form)) follow(resolve(dirname(file), form));
       }
     }
-    // The escape-aware shape is a lookahead, so every quote starts a candidate (a stray
-    // apostrophe in a comment cannot swallow a real literal). Each start stops at the next
-    // unescaped quote of its own kind on the line, which keeps the scan linear.
-    for (const match of matches([
-      /(['"`])([^'"`\r\n]+)\1/g,
-      /(?=(['"`])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/g,
-    ])) {
+    for (const match of matches(LITERAL_SHAPES)) {
       // Non-import literals: file-relative (`setupFiles: ['./x']`, `new URL('../x', import.meta.url)`)
       // and repo-root (spawn/readFile/copy targets, `new URL('./scripts/x', ROOT_URL)`).
       for (const form of forms(match[2])) {
@@ -188,6 +212,9 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
 export function soakScopeRun({ root = DEFAULT_ROOT, changed } = {}) {
   try {
     if (!Array.isArray(changed) || changed.some((path) => typeof path !== 'string')) return true;
+    // Even with core.quotePath=false, git C-quotes a path holding `"`, `\` or a control
+    // character (`"fixture/dep\"s.mjs"`). Such a line never equals a scope key: run the soak.
+    if (changed.some((path) => path.startsWith('"'))) return true;
     const closure = computeSoakClosure({ root });
     return changed.some((path) => closure.has(path));
   } catch {
@@ -265,8 +292,9 @@ async function selfTest() {
     writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/dependency.mjs?fresh=1#v';");
   }, dependency, true);
   await scopeCase('an escaped import specifier still reaches the dependency', ({ seed }) => {
-    writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/\\u0064ependency.mjs';");
+    writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/\\x64ependency.mjs';");
   }, dependency, true);
+  await scopeCase('a git-quoted changed path requests the soak', () => {}, '"fixture/dep\\"s.mjs"', true);
   await scopeCase('an unreadable runtime copy list requests the soak', ({ seed }) => {
     writeFileSync(join(seed, 'red-green.mjs'), 'export const RUNTIME_PATHS = computed();');
   }, 'backlog/unrelated.md', true);
