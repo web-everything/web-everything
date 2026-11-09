@@ -5,21 +5,9 @@ import { randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
-import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
+import { laneGitHardeningEnv, redactUrlCredentials, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 
-/** Strip URL credentials from text bound for logs, the lane journal or `--json` (a failed git transport call's
- *  message carries its argv, origin URL included). An ssh:// URL keeps its user name, which is not a secret and
- *  which the operator's push needs; every other scheme drops its whole userinfo, since a token often stands alone
- *  there (`https://<token>@host`). Greedy up to the host, so a raw `@` inside a password is stripped too. scp-style
- *  `user@host:path` holds no secret and is left as is. */
-export function redactUrlCredentials(text) {
-  return String(text).replace(/\b([a-z][a-z0-9+.-]*):\/\/([^\s/?#]*)@/gi, (_, scheme, userinfo) => {
-    // An ssh user ends at the first ':' (the password) and never contains '@'; anything else drops whole.
-    const user = /^[^:@]*/.exec(userinfo)[0];
-    const keep = /^(?:ssh|git\+ssh|ssh\+git)$/i.test(scheme) && user && (userinfo === user || userinfo[user.length] === ':');
-    return keep ? `${scheme}://${user}@` : `${scheme}://`;
-  });
-}
+export { redactUrlCredentials };
 
 /** The canonical origin as an operator push target: a local path is made absolute; a URL keeps its scheme and host,
  *  with credentials stripped as `redactUrlCredentials` does. */

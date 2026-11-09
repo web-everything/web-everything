@@ -2129,7 +2129,10 @@ function scrubClaimedLaneConfig(dir, reason) {
   let dietConfig;
   // Reuse an unchanged scrub read for the next fetch. Removing an include can also remove diet settings.
   const { removed, kept } = scrubRiskyLaneConfig(dir, { log, onConfig: (output) => { dietConfig = laneDietConfigState(output); } });
-  if (removed.length) journalLaneEvent(dir, { action: 'config-scrub', removed, kept, reason });
+  // A lane config key can embed a credentialed URL (url.<base>.insteadOf, http.<url>.*): journal it redacted.
+  if (removed.length) {
+    journalLaneEvent(dir, { action: 'config-scrub', removed: removed.map(redactUrlCredentials), kept: kept.map(redactUrlCredentials), reason });
+  }
   return removed.length ? undefined : dietConfig;
 }
 

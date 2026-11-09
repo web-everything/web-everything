@@ -31,6 +31,13 @@ describe('releasePushTarget / redactUrlCredentials', () => {
     const text = "Command failed: git ls-remote https://u:s3cret@host/x.git refs/heads/*\nfatal: unable to access 'https://s3cret@host/x.git/'";
     expect(redactUrlCredentials(text)).toBe("Command failed: git ls-remote https://host/x.git refs/heads/*\nfatal: unable to access 'https://host/x.git/'");
   });
+  it.each([
+    ['a config key with an insteadOf URL', 'url.https://oauth2:s3cret@gitlab.com/.insteadof', 'url.https://gitlab.com/.insteadof'],
+    ['a scheme glued to a word character', 'x_https://u:s3cret@h/x', 'x_https://h/x'],
+    ['a scheme glued to a digit', '1https://s3cret@h/x', '1https://h/x'],
+  ])('redacts %s', (_, text, expected) => {
+    expect(redactUrlCredentials(text)).toBe(expected);
+  });
   it('redacts a failed salvage push reason', async () => {
     const io = { aheadShas: async () => { throw new Error('git push https://u:s3cret@host/x.git failed'); } };
     const result = await salvagePushLane({ lane: 1, laneDir: 'lane', io });

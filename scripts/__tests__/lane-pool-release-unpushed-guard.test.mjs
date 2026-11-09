@@ -135,6 +135,16 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(journal).toContain('https://127.0.0.1:9/origin.git');
     for (const text of [result.stderr, result.stdout, journal]) expect(text).not.toContain('S3CRET-TOKEN');
   });
+  // A lane config key can itself embed a credentialed URL; release scrubs it and must report it redacted.
+  it('scrubs a credentialed url.<base>.insteadOf key and never echoes its token', () => {
+    git(['config', 'url.https://oauth2:S3CRET-TOKEN@gitlab.example/.insteadOf', 'https://gitlab.example/'], laneDir);
+    const result = release();
+    released(result);
+    expect(git(['config', '--local', '--list'], laneDir)).not.toContain('S3CRET-TOKEN');
+    const journal = JSON.stringify(readLaneJournal(join(poolRoot, 'releaseguard')).filter(e => e.lane === 1 && e.action === 'config-scrub'));
+    expect(journal).toContain('url.https://gitlab.example/.insteadof');
+    for (const text of [result.stderr, result.stdout, journal]) expect(text).not.toContain('S3CRET-TOKEN');
+  });
   // `--ignore-missing` (for unfetched origin tips) must not drop a LOCAL tip: a branch whose commit object the lane
   // deleted proves nothing, so the guard fails closed instead of releasing.
   it('fails closed when a local branch tip has no object', () => {
@@ -675,10 +685,18 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     released(release());
     expect(readFileSync(join(laneDir, 'notes.txt'), 'utf8')).toBe('notes\n');
   });
-  it.each(['unreadable status', 'unreadable commits', 'oversized commits'])(
+  // Each commit-evidence read the guard makes: the local branch listing, HEAD, the tip-object check and the proof.
+  const evidenceReads = {
+    'unreadable status': "args.includes('--untracked-files=no')",
+    'unreadable commits': "args.includes('rev-list') && args.includes('--stdin')",
+    'oversized commits': "args.includes('rev-list') && args.includes('--stdin')",
+    'unreadable local branches': "args.includes('for-each-ref') && args.includes('--format=%(objectname)') && args.includes('refs/heads/')",
+    'unreadable HEAD': "args.includes('rev-parse') && args.includes('--verify') && args.includes('--quiet') && args.at(-1) === 'HEAD'",
+    'unreadable tip objects': "args.includes('cat-file') && args.some(arg => arg.startsWith('--batch-check'))",
+  };
+  it.each(Object.keys(evidenceReads))(
     'fails closed on %s and names manual inspection and --discard as fallbacks', failure => {
-      const condition = failure === 'unreadable status' ? "args.includes('--untracked-files=no')"
-        : "args.includes('--branches')";
+      const condition = evidenceReads[failure];
       const fault = `if (${condition}) { const error = new Error('forced evidence failure');
         error.code = ${JSON.stringify(failure === 'oversized commits' ? 'ENOBUFS' : 'EIO')}; throw error; }`;
       const result = release([], fault);

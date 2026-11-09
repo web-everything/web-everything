@@ -2,6 +2,21 @@ import { execFileSync } from 'node:child_process';
 import { userInfo } from 'node:os';
 import { basename } from 'node:path';
 
+/** Strip URL credentials from text bound for logs, the lane journal or `--json`: a failed git transport call's
+ *  message carries its argv (origin URL included), and a lane config key can embed a URL
+ *  (`url.https://oauth2:<token>@host/.insteadof`). An ssh:// URL keeps its user name, which is not a secret and which
+ *  the operator's push needs; every other scheme drops its whole userinfo, since a token often stands alone there
+ *  (`https://<token>@host`). Greedy up to the host, so a raw `@` inside a password is stripped too. No word boundary
+ *  before the scheme, so `x_https://…` is caught. scp-style `user@host:path` holds no secret and is left as is. */
+export function redactUrlCredentials(text) {
+  return String(text).replace(/([a-z][a-z0-9+.-]*):\/\/([^\s/?#]*)@/gi, (_, scheme, userinfo) => {
+    // An ssh user ends at the first ':' (the password) and never contains '@'; anything else drops whole.
+    const user = /^[^:@]*/.exec(userinfo)[0];
+    const keep = /^(?:ssh|git\+ssh|ssh\+git)$/i.test(scheme) && user && (userinfo === user || userinfo[user.length] === ':');
+    return keep ? `${scheme}://${user}@` : `${scheme}://`;
+  });
+}
+
 const accountHome = () => { try { return userInfo().homedir || ''; } catch { return ''; } };
 
 /**
@@ -333,7 +348,8 @@ export function scrubRiskyLaneConfig(dir, {
   } catch (e) { kept.push(`config list failed (${String(e?.message ?? e).split('\n')[0]})`); }
   if (removed.length || kept.length) {
     try {
-      log(`${basename(dir)}: scrubbed unsafe git config keys (${removed.join(', ')}) before hand-out${kept.length ? `; kept (${kept.join(', ')})` : ''}`);
+      // Keys stay raw in the returned lists (callers act on them); every report of them is redacted.
+      log(redactUrlCredentials(`${basename(dir)}: scrubbed unsafe git config keys (${removed.join(', ')}) before hand-out${kept.length ? `; kept (${kept.join(', ')})` : ''}`));
     } catch { /* diagnostics must not interrupt acquisition */ }
   }
   return { removed, kept };
