@@ -186,7 +186,7 @@ describe('renderWorkerBrief', () => {
     expect(audit).toBeGreaterThan(verify);
     expect(openPr).toBeGreaterThan(audit);
     const text = step.slice(audit, openPr);
-    expect(text).toMatch(/node \S*scripts\/operations\/codex-audit\.mjs\S* --base=origin\/main --head=<40-hex sha of your lane HEAD>/);
+    expect(text).toMatch(/node \S*scripts\/operations\/run\.mjs\S* codex-audit --base=origin\/main --head=<full 40-hex sha>/);
     expect(text).not.toContain('node scripts/operations/codex-audit.mjs');
     expect(text).toContain('lane as the working directory');
     expect(text).toContain('NOT WEAKENED');
@@ -271,6 +271,20 @@ describe('renderWorkerBrief', () => {
     expect(brief).toContain('WARNING: --edge-clone /tmp/edge matches no daemon clone');
   });
 
+  it('pins the canonical audit, prototype-load-only and fix-ready-from-record rules', () => {
+    const brief = renderWorkerBrief({ ...params });
+    for (const text of [
+      'operations/run.mjs codex-audit --base=origin/main --head=<full 40-hex sha>',
+      'ONLY acceptable audit',
+      'codex review', 'codex exec', 'no findings',
+      'never counts',
+      'Load a daemon ONLY via `prototype-load`',
+      'never `daemon-overlay add` or `daemon-load-overlay` directly',
+      'Write the fix-ready line only from the canonical audit record',
+      'never assert a verdict by hand',
+    ]) expect(brief).toContain(text);
+  });
+
   it('omits the daemon list without an edge clone', () => {
     expect(renderWorkerBrief({ ...params })).not.toContain('merge-queue drain (drain-queue-safety');
   });
@@ -278,10 +292,11 @@ describe('renderWorkerBrief', () => {
   it('includes the optional edge section as the last numbered rule', () => {
     const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
     expect(brief).toContain('8. **Edge.**');
-    expect(brief).toContain('daemon-overlay.mjs add --clone=/tmp/edge --ref=lane/');
-    expect(brief).toContain('--by=chalbert');
-    expect(brief).toContain('WE_DAEMON_REBUILD_LOCK_WAIT_MS=900000 node scripts/lib/daemon-load-overlay.mjs --clone=/tmp/edge --ref=lane/');
-    expect(brief).toContain('(gated; run once, foreground)');
+    expect(brief).toContain('node scripts/operations/run.mjs prototype-load --branch=lane/');
+    expect(brief).toContain('--daemon=<key from the daemon list>');
+    expect(brief).not.toContain('daemon-overlay.mjs add --clone=');
+    expect(brief).not.toContain('daemon-load-overlay.mjs --clone=');
+    expect(brief).toContain('FIRST run the same command with `--dry-run`');
     expect(brief).toContain('git -C /tmp/edge merge-base --is-ancestor <sha> HEAD');
     expect(brief.indexOf('8. **Edge.**')).toBeLessThan(brief.indexOf('**Proof.**'));
   });
@@ -548,7 +563,7 @@ describe('worker-brief hardening (items 90, 92)', () => {
       expect(() => renderWorkerBrief({ ...params, files: `ok.mjs,${bad}` }), bad).toThrow(/unsafe/);
     }
     expect(() => renderWorkerBrief({ ...params, edgeClone: '/tmp/x; id' })).toThrow(/unsafe/);
-    expect(renderWorkerBrief({ ...params, edgeClone: '/tmp/clone-1' })).toContain('--clone=/tmp/clone-1');
+    expect(renderWorkerBrief({ ...params, edgeClone: '/tmp/clone-1' })).toContain('git -C /tmp/clone-1 merge-base');
   });
 
   it('step 2 and the SKILL both say to stop when register exits non-zero', () => {

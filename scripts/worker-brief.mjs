@@ -8,7 +8,7 @@ import { shellQuoteWord } from './readiness/heavy-admission.mjs';
 import { redTeamBrief as defaultRedTeamBrief, readBriefRedTeamPolicy, renderRedTeamSection,
   isBriefRedTeamTouchSet, readPrepFile, boundedRead } from './lib/brief-red-team.mjs';
 // Trusted checkout's audit script (like VERIFY_LANE_CLI), so the lane under audit cannot alter its own auditor.
-const CODEX_AUDIT_CLI = join(dirname(fileURLToPath(import.meta.url)), 'operations', 'codex-audit.mjs');
+const RUN_CLI = join(dirname(fileURLToPath(import.meta.url)), 'operations', 'run.mjs');
 const PURPOSE_TOKEN = /^[a-z0-9][a-z0-9-]*(?![\s\S])/;
 const OWNER_TOKEN = /^[A-Za-z0-9][A-Za-z0-9-]*(?![\s\S])/;
 
@@ -179,7 +179,10 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    if observation cannot recover, escalate for supervised termination before cleanup. Open a PR only after green;
    never end the turn while a task is running.
    6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
-   \`node ${shellQuoteWord(CODEX_AUDIT_CLI)} --base=origin/main --head=<40-hex sha of your lane HEAD>\`, run with the lane as the working directory.
+   **Canonical audit.** The ONLY acceptable audit is \`node ${shellQuoteWord(RUN_CLI)} codex-audit --base=origin/main --head=<full 40-hex sha>\` (the trusted checkout's runner, run with the lane as the working directory).
+   Its verdict is the one that goes in your report and any fix-ready line. A plain \`codex review\`, a \`codex exec\`, or "no findings" never counts.
+   Load a daemon ONLY via \`prototype-load\` (never \`daemon-overlay add\` or \`daemon-load-overlay\` directly).
+   Write the fix-ready line only from the canonical audit record; never assert a verdict by hand.
    Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
    If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.
    Then open exactly one PR:
@@ -218,9 +221,10 @@ with its check command. If writing a report file: \`${scratchDir}/report.md\`.
 /** Shared post-build blocks for worker and delivery briefs. Pure. */
 export const OPERATOR_REPORT_MARKER = '<!-- operator-task-report -->';
 export function renderEdgeStep({ edgeClone, ref, step = 8 }) {
-  return edgeClone ? `${step}. **Edge.** Overlay the fix onto the daemon clone and load it:
-   \`node scripts/daemon-overlay.mjs add --clone=${edgeClone} --ref=${ref} --pr=<N> --by=chalbert\`, then
-   \`WE_DAEMON_REBUILD_LOCK_WAIT_MS=900000 node scripts/lib/daemon-load-overlay.mjs --clone=${edgeClone} --ref=${ref} --pr=<N>\` (gated; run once, foreground).
+  return edgeClone ? `${step}. **Edge.** Load the fix on the daemon prototype, ONLY via the declared operation:
+   \`node scripts/operations/run.mjs prototype-load --branch=${ref} --sha=<sha> --daemon=<key from the daemon list>\` (run once, foreground).
+   Never run \`daemon-overlay add\` or \`daemon-load-overlay\` yourself.
+   FIRST run the same command with \`--dry-run\`; if it warns about, or cannot find, the canonical audit record for this exact sha, STOP: do not run the real load, report the warning.
    Confirm adoption with \`git -C ${edgeClone} merge-base --is-ancestor <sha> HEAD\`. Being on the overlay list is not enough.
 ` : '';
 }
