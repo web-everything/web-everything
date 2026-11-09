@@ -597,14 +597,21 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   const rows = [], dispatched = [], notStarted = [];
   // PR #6535: a policy-clear settlement here runs no round, so it publishes the head's red-team check itself, BEFORE
   // its result comment. A failed check post throws, so no comment is posted and the next pass retries the row.
-  // Under `redTeamGate.source=drain-scan` (the rollback) no gate reads the check, so the carry must not depend on App
-  // credentials there. Test runs need explicit IO for this channel, as recordRedTeamStatus does.
+  // Under `redTeamGate.source=drain-scan` (the rollback) no gate reads the check, so the post is best-effort there: it is
+  // still attempted (as round writers publish in every mode), so a head settled during a rollback is not stranded
+  // once the source switches back, but a failure does not block the settlement. Test runs need explicit IO for this
+  // channel, as recordRedTeamStatus does.
   const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : args => publishRedTeamPolicyClearCheck({
     ...args, appId: env.WE_APP_ID, gh: (ghArgs, options) => runGhSync(ghArgs, { ...options, env }) }));
   const publishPolicyClearCheck = (pr, head) => {
-    if (!publisher || readRedTeamGateSource({ env }).value.source === 'drain-scan') return;
-    const posted = publisher({ repo, pr, headSha: head });
-    if (posted?.ok !== true) throw Error(`red-team check not published: ${posted?.reason ?? 'unknown error'}`);
+    if (!publisher) return;
+    let posted;
+    try { posted = publisher({ repo, pr, headSha: head }); }
+    catch (error) { posted = { ok: false, reason: safeErrorText(error) }; }
+    if (posted?.ok === true) return;
+    const reason = `red-team check not published: ${posted?.reason ?? 'unknown error'}`;
+    if (readRedTeamGateSource({ env }).value.source !== 'drain-scan') throw Error(reason);
+    note(`review-daemon: ${repo}#${pr} ${reason} (redTeamGate.source=drain-scan: settlement continues)`);
   };
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {

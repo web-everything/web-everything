@@ -655,7 +655,7 @@ describe('daemon rows without formal reviews', () => {
     } finally { runGhSync.mockReset(); }
   });
 
-  it('under the drain-scan rollback the carry needs no check (no gate reads it)', () => {
+  it('under the drain-scan rollback the check is still attempted, but its failure does not block the carry', () => {
     const o = daemonOptions(5929), raw = o.rawPrs[0];
     o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'drain-scan' };
     o.publishCheck = vi.fn(() => ({ ok: false, reason: 'no App credentials' }));
@@ -663,8 +663,12 @@ describe('daemon rows without formal reviews', () => {
     runGhSync.mockImplementation((_args, options) => { raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
     try {
       expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
-      expect(o.publishCheck).not.toHaveBeenCalled();
+      // Attempted, so a head settled during the rollback is not stranded when the source switches back.
+      expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr: 5929, headSha: raw.headRefOid });
       expect(runGhSync).toHaveBeenCalledOnce();
+      const ok = daemonOptions(5929);
+      ok.env = o.env; ok.publishCheck = vi.fn(() => { throw Error('offline'); });
+      expect(runRedTeamOnSkip(ok).rows[0]).toMatchObject({ action: 'carry' });
     } finally { runGhSync.mockReset(); }
   });
 
