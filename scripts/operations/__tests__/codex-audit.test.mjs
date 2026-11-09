@@ -231,6 +231,74 @@ function adapter(report = { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAK
   return { deps, fs, spawnSync };
 }
 
+describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wins (D2)', () => {
+  const seq = (...answers) => {
+    const f = fixture();
+    f.deps.runCodex = vi.fn(async () => { const a = answers.shift(); if (a instanceof Error) throw a; return a; });
+    return f;
+  };
+
+  it('NOT WEAKENED then WEAKENED exits 1 and records WEAKENED with both runs', async () => {
+    const f = seq('NOT WEAKENED', 'WEAKENED\nx.mjs:1 bypass');
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.runCodex).toHaveBeenCalledTimes(2);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: ['x.mjs:1 bypass'], runs: ['NOT WEAKENED', 'WEAKENED'] });
+  });
+
+  it('a first WEAKENED stops after one Codex call', async () => {
+    const f = seq('WEAKENED\nx.mjs:2 gate removed', 'NOT WEAKENED');
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.runCodex).toHaveBeenCalledTimes(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', runs: ['WEAKENED'] });
+  });
+
+  it('two NOT WEAKENED runs exit 0 and record both runs', async () => {
+    const f = seq('NOT WEAKENED', 'NOT WEAKENED');
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.records[0]).toMatchObject({ verdict: 'NOT WEAKENED', runs: ['NOT WEAKENED', 'NOT WEAKENED'] });
+  });
+
+  it('NOT WEAKENED then garbage exits 3 and records nothing', async () => {
+    const f = seq('NOT WEAKENED', 'looks fine to me');
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.errors.join('')).toMatch(/UNPARSEABLE/);
+    expect(f.records).toEqual([]);
+    expect(f.output).toEqual([]);
+  });
+
+  it('NOT WEAKENED then a Codex failure exits 3 and records nothing', async () => {
+    const f = seq('NOT WEAKENED', new Error('boom'));
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.records).toEqual([]);
+  });
+
+  it('deps.runs=1 keeps the single-run behaviour', async () => {
+    const f = seq('NOT WEAKENED', 'WEAKENED');
+    f.deps.runs = 1;
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex).toHaveBeenCalledTimes(1);
+  });
+
+  it('findAudit returns a WEAKENED record even when a later NOT WEAKENED exists for the same head, base and question', () => {
+    const weak = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'WEAKENED', at: '2026-11-01T12:00:00.000Z' };
+    const pass = { ...weak, verdict: 'NOT WEAKENED', at: '2026-11-02T12:00:00.000Z' };
+    expect(findAudit([weak, pass], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(weak);
+    expect(findAudit([pass, weak], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(weak);
+  });
+
+  it('findAudit still accepts a legacy single-run NOT WEAKENED record without runs', () => {
+    const legacy = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
+    expect(findAudit([legacy], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(legacy);
+  });
+
+  it('findAudit does not let a WEAKENED of another head or base block', () => {
+    const pass = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
+    const other = { ...pass, verdict: 'WEAKENED', head: BASE };
+    expect(findAudit([other, pass], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(pass);
+  });
+});
+
 describe('audit IO with injected filesystem and subprocesses', () => {
   it('refuses a contradictory launcher report before the persistence adapter runs', async () => {
     const f = adapter({ exitCode: 0, timedOut: false,
