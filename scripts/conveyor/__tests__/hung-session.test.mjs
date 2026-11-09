@@ -496,27 +496,35 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
   it('status:idle row + dangling tool call + silent past window → finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 75));
-    const info = readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000);
+    const info = readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true });
     expect(info.finished).toBe(true);
     expect(info.reason).toBe('idle-row-dangling-tool-call');
+  });
+
+  it('reaper path unchanged: without trustIdleRow an idle row + dangling call stays unfinished', () => {
+    const now = Date.now();
+    writeFileSync(transcriptFile, danglingLine(now, 75));
+    const info = readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000);
+    expect(info.finished).toBe(false);
+    expect(info.reason).toBe('pending-tool-call');
   });
 
   it('status:busy row + dangling tool call → not finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 75));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'busy' }, now, 10 * 60_000).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'busy' }, now, 10 * 60_000, { trustIdleRow: true }).finished).toBe(false);
   });
 
   it('status:waiting (permission) row + dangling tool call → not finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 75));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'waiting' }, now, 10 * 60_000).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'waiting' }, now, 10 * 60_000, { trustIdleRow: true }).finished).toBe(false);
   });
 
   it('status:idle row + dangling call but within the window → not finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 2));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true }).finished).toBe(false);
   });
 
   it('missing cwd/sessionId, or no transcript on disk, answers no-signal, never a guess', () => {

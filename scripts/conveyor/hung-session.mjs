@@ -223,7 +223,7 @@ export function readHungInfo(agent, nowMs, thresholdMs) {
   if (!tail || tail.hadUnparseableLine) return { hung: false, reason: 'no-signal', ageMs: null };
 
   const pendingToolUse = detectBlockedOnChild(tail.entries).pending === true;
-  const verdict = classifyHungSession({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse, rowIdle: agent?.status === 'idle' });
+  const verdict = classifyHungSession({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse });
   return { ...verdict, transcriptPath: tail.file };
 }
 
@@ -465,14 +465,15 @@ export function resolveIdleFinishedThresholdMs(env = process.env) {
  * @param {{cwd?:string, sessionId?:string}} agent
  * @param {number} nowMs
  * @param {number} thresholdMs
+ * @param {{trustIdleRow?:boolean}} [opts] opt-in (reconcile only): an idle listing row overrides a dangling tool call; the reaper never sets it
  * @returns {{finished:boolean, reason:string, ageMs:number|null, transcriptPath?:string}}
  */
-export function readIdleFinishedInfo(agent, nowMs, thresholdMs) {
+export function readIdleFinishedInfo(agent, nowMs, thresholdMs, { trustIdleRow = false } = {}) {
   const tail = readTranscriptTailActivity(agent, { tailLines: READ_TAIL_LINES, maxBytes: READ_MAX_BYTES, fieldMax: READ_FIELD_MAX });
   if (!tail || tail.hadUnparseableLine) return { finished: false, reason: 'no-signal', ageMs: null };
 
   const pendingToolUse = detectBlockedOnChild(tail.entries).pending === true;
-  const verdict = classifyIdleFinished({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse, rowIdle: agent?.status === 'idle' });
+  const verdict = classifyIdleFinished({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse, rowIdle: trustIdleRow === true && agent?.status === 'idle' });
   return { ...verdict, transcriptPath: tail.file };
 }
 
