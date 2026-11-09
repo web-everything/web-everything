@@ -8,8 +8,50 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { decide, fullSuiteEscapeUsed, heavyRunHeads, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { classifyCommand } from '../operations/agent-command-audit.mjs';
 
 const queue = 'node scripts/readiness/heavy-admission.mjs run -- ';
+describe('executable heads behind redirections and command options', () => {
+  const redirectedRuns = [
+    '2>/dev/null npx vitest run scripts/__tests__/a.test.mjs',
+    '>/dev/null vitest run a',
+    '<in.txt 2>&1 npx vitest run a',
+  ];
+  it.each(redirectedRuns)('denies a test run after leading redirections: %s', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  it.each(redirectedRuns)('classifies a test run after leading redirections: %s', cmd => {
+    expect(classifyCommand(cmd)).toContainEqual(expect.objectContaining({ category: 'vitest', queued: false }));
+  });
+  it('denies the same test run with a trailing redirection', () => {
+    expect(decide('npx vitest run scripts/__tests__/a.test.mjs 2>/dev/null', {}))
+      .toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  const flockRuns = [
+    "flock -c 'npx vitest run a' /tmp/l",
+    "flock --command 'npx vitest run a' /tmp/l",
+    "flock --command='npx vitest run a' /tmp/l",
+    "flock -n -c 'npx vitest run a' /tmp/l",
+  ];
+  it.each(flockRuns)('denies flock command options before the lock path: %s', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  it.each(flockRuns)('classifies flock command options before the lock path: %s', cmd => {
+    expect(classifyCommand(cmd)).toContainEqual(expect.objectContaining({ category: 'vitest', queued: false }));
+  });
+  it('allows shell punctuation as echo arguments in an env split string', () => {
+    expect(decide("env -S 'echo ok; npx vitest run a'", {})).toBeNull();
+  });
+  it('does not classify echo arguments in an env split string as vitest', () => {
+    expect(classifyCommand("env -S 'echo ok; npx vitest run a'").some(row => row.category === 'vitest')).toBe(false);
+  });
+  it('still denies and classifies a real test run in an env split string', () => {
+    const cmd = "env -S 'npx vitest run a'";
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+    expect(classifyCommand(cmd)).toContainEqual(expect.objectContaining({ category: 'vitest', queued: false }));
+  });
+});
+
 const execVitestRuns = [
   'npm x vitest run', 'npm x -- vitest run',
   'npm exec vitest run', 'npm exec -- vitest run',

@@ -229,6 +229,11 @@ describe('daemon heavy spawn admission lint', () => {
   it('rejects an allowance mentioned in a string rather than a comment', () => {
     expect(findUngatedHeavySpawns(cp + "const text = '// heavy-admission-allow: fake'; spawnSync('vitest');")).toHaveLength(1);
   });
+  it('flags a real npx spawn after a fake allowance in a multiline template literal', () => {
+    const source = "import { spawn } from 'node:child_process';\n"
+      + "const text = `\n// heavy-admission-allow: x\n`;\nspawn('npx', ['vitest', 'run']);";
+    expect(findUngatedHeavySpawns(source)).toHaveLength(1);
+  });
   // Review #6461 round 2: comment ranges come from the whole source, so text that only LOOKS like a line
   // comment when one line is read alone (inside a multiline template, a block comment or a continued string)
   // never allows the spawn on the next line.

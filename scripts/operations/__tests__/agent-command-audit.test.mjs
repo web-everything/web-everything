@@ -259,6 +259,12 @@ describe('agent command audit', () => {
     expect(redact('sort -u file')).toBe('sort -u file');
     expect(redact('git clone https://github.com/a/b')).toBe('git clone https://github.com/a/b');
   });
+  it.each([
+    String.raw`htpasswd -nb user "pa\"ss word"`,
+    String.raw`htpasswd -nb user 'pa'\''ss word'`,
+  ])('redacts the whole htpasswd password containing an escaped quote: %s', command => {
+    expect(redact(command)).toBe('htpasswd -nb user [REDACTED]');
+  });
   it('redacts an over-long htpasswd password whole, before the length bound can cut it', () => {
     // The password is found on the full text, so nothing is left to cut: no part of it survives and no cut mark is owed.
     const out = redact(`htpasswd -nb user 'firstPart ${'x'.repeat(20000)} secondPart'`);

@@ -772,7 +772,7 @@ function optionWidth(opt, short, long, stop = '') {
  *  Peels `VAR=val`, `env [VAR=v…]`, `time`/`command`/`builtin`/`nice`, `sudo [-n] [-u <user>]`,
  *  `xargs [opts]` and `npx`/`bunx` `[opts]`. Bounded — every branch advances by ≥1 token. Callers pass
  *  `' '` for a token that must never count as a wrapper (a quoted word, a redirect operator). */
-function wrapperPrefixLength(words) {
+function wrapperPrefixLength(words, commandString = () => {}) {
   let i = 0;
   /** Walk `name`'s options from `i` (its PEEL_OPTIONS table), stopping after `--` or at the first operand. */
   const peel = (name) => {
@@ -790,9 +790,10 @@ function wrapperPrefixLength(words) {
     // A path-qualified wrapper runs the same program (`/usr/bin/time`, `/usr/bin/caffeinate`, round 5).
     const name = w.replace(/^.*\//, '');
     if (name === 'timeout' || name === 'gtimeout') { i += 1; peel(name); i += 1; continue; } // then the duration
-    if (name === 'flock') {                                                  // flock [opts] <lock> [-c <cmd> | <cmd>]
-      i += 1; peel(name); i += 1;
-      if (words[i] === '-c' || words[i] === '--command') { i += 1; break; } // the command string is the head
+    if (name === 'flock') {
+      const invocation = flockInvocation(words, i + 1);
+      i = invocation.head;
+      if (invocation.command) { commandString(invocation); break; }
       continue;
     }
     if (name === 'taskset' || name === 'chrt') { i += 1; peel(name); i += 1; continue; } // then the mask / priority
@@ -833,6 +834,39 @@ function wrapperPrefixLength(words) {
   return i;
 }
 
+/** flock options may precede or follow the lock operand. Only -w/-E consume an ordinary value;
+ *  -c/--command consumes a shell command string, which is never the lock or part of its argv. */
+function flockInvocation(words, from) {
+  let i = from;
+  let lock = false;
+  let command = null;
+  while (i < words.length) {
+    const opt = words[i];
+    if (opt === '--') { i += 1; break; }
+    if (!opt.startsWith('-') || opt === '-') {
+      if (lock) break;
+      lock = true; i += 1; continue;
+    }
+    if (opt.startsWith('--')) {
+      const eq = opt.indexOf('=');
+      const name = eq < 0 ? opt : opt.slice(0, eq);
+      if (name.length >= 3 && '--command'.startsWith(name)) {
+        command = { head: eq < 0 ? i + 1 : i, offset: eq < 0 ? 0 : eq + 1, command: true };
+      }
+    } else {
+      for (let k = 1; k < opt.length; k += 1) {
+        if ('wE'.includes(opt[k])) break;
+        if (opt[k] === 'c') {
+          command = { head: k + 1 < opt.length ? i : i + 1, offset: k + 1 < opt.length ? k + 1 : 0, command: true };
+          break;
+        }
+      }
+    }
+    i += optionWidth(opt, 'wEc', ['--timeout', '--conflict-exit-code', '--command']);
+  }
+  return command || { head: lock ? i : i + 1 };
+}
+
 /** Normalize a raw command segment to `<program-basename> <args…>`, or '' when there is no program word.
  *  Pure. Peels the wrapper prefix (`wrapperPrefixLength`), strips surrounding quotes / a leading backslash
  *  off the program word and resolves a path-qualified program to its basename
@@ -862,9 +896,15 @@ export function canonicalCommand(segment) {
     c = next;
   }
   if (!c) return '';
-  const words = headWords(c);
-  const k = wrapperPrefixLength(words.map((w) => w.text));
+  const words = headWords(c, true);
+  let commandString;
+  const k = wrapperPrefixLength(words.map((w) => w.text), (invocation) => { commandString = invocation; });
   if (k >= words.length) return '';
+  if (commandString) {
+    const word = words[k];
+    const text = word.text.slice(commandString.offset);
+    return word.dq ? text.replace(/\\(["\\$`])/g, '$1') : text;
+  }
   // A COMMAND LINE the peel stopped at (`npx -c "<line>"`, `--call=<line>`, `flock f -c "<line>"`, `watch
   // "<line>"`, self-review of #6461 round 5) keeps its words: only its first word's directory is dropped, so a
   // slash later in the line (`npx vitest run scripts/a.test.mjs`) cannot reduce it to its last path segment.
@@ -952,7 +992,7 @@ const RUNNER_CALL_FLAGS = new Set(['--call', '-c']);
  *  rejoining unquoted words would drop a `sed -i ''` empty argument and re-open #2986/1. Shares the ONE
  *  low-level run scanner below (`scanRun`), so `\"`, a `#` comment and a `\`+newline continuation are all
  *  read the way bash reads them and can never desync a word boundary. */
-function headWords(s) {
+function headWords(s, skipRedirections = false) {
   const out = [];
   let cur = '';
   let start = -1;
@@ -967,8 +1007,8 @@ function headWords(s) {
     const run = inComment ? null : scanRun(s, i, start < 0);
     if (run && run.kind === 'continuation') { i = run.end; continue; }   // `\`+newline: spliced away entirely
     if (run && run.kind === 'comment') inComment = true;                 // quoting is OFF from here to EOL
-    if (start < 0) start = i;
     if (run && run.kind !== 'comment') {
+      if (start < 0) start = i;
       cur += run.body;
       if (run.kind === 'quote' || run.kind === 'unterminated') quoted = true;
       // …and WHICH quote kind. A `"…"`/`$"…"` run resolves `\"`→`"` when bash reads the word; a `'…'` run
@@ -979,10 +1019,26 @@ function headWords(s) {
       i = run.end;
       continue;
     }
+    if (skipRedirections && !inComment && (ch === '<' || ch === '>')) {
+      // Tokenize redirects before wrapper peeling, including attached fd prefixes and targets.
+      if (start >= 0 && !quoted && /^(?:[0-9]+|&)$/.test(cur)) {
+        cur = ''; start = -1; end = -1;
+      }
+      flush();
+      let j = i + 1;
+      if (s[j] === ch) j += 1;
+      if (ch === '<' && s[j - 1] === '<' && s[j] === '<') j += 1;
+      if (s[j] === '|' || s[j] === '&' || (ch === '<' && s[j] === '>') || (ch === '<' && s[j] === '-')) j += 1;
+      out.push({ op: true });
+      i = j - 1;
+      continue;
+    }
+    if (start < 0) start = i;
     cur += ch;
     end = i + 1;
   }
   flush();
+  if (skipRedirections) return out.filter((word, i) => !word.op && !out[i - 1]?.op);
   return out;
 }
 
@@ -1577,9 +1633,9 @@ export function nestedCommandStrings(segment) {
   const tail = trailingGroupTail(s);
   if (tail !== null && tail.trim()) out.push(tail);
 
-  // `env -S '<cmd>'` splits its string into argv and runs it, so the string is a command line too (r3 #6461).
+  // env splits argv, not shell syntax. Recurse only on the safely serialized words, never the raw string.
   const split = envSplitString(s);
-  if (split !== null && split.trim()) out.push(split);
+  if (split !== null) { if (split.trim()) out.push(split); return out; }
   // Compound-command syntax (case arms, function heads, coproc) is peeled so `case x in x) bash -c '…';; esac`
   // reaches the `-c` re-execution below like a bare `bash -c '…'` does.
   // The segment itself without that syntax goes to every arm too (`case x in x) npm run build;; esac`).
@@ -3596,7 +3652,7 @@ export function stripShellControl(segment) {
  *  head the heavy classifiers must see. Pure. */
 export function envSplitString(segment) {
   const src = stripShellControl(segment).replace(/^[({]\s*/, '');
-  const words = headWords(src);
+  const words = headWords(src, true);
   const w = words.map((word) => word.text);
   const isEnv = (word) => /(?:^|\/)env$/.test(word);
   /** The next env word at or after `from` with only wrapper noise (assignments, `nice`, another env's options…)
@@ -3671,7 +3727,13 @@ function envSplitText(text, tail = '') {
     out += ch;
   }
   // The escapes belong to the split string only; `tail` is the shell text after it, kept raw.
-  const split = out + (tail ? ' ' + tail : '');
+  // Keep every split word an argv word when downstream shell readers inspect it: punctuation such as
+  // `;`, `>` or `$()` is literal data here. A real shell -c/eval can still explicitly re-execute its argument.
+  const argv = headWords(out).map(word => {
+    const value = word.dq ? word.text.replace(/\\(["\\$`])/g, '$1') : word.text;
+    return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : "'" + value.replace(/'/g, "'\\''") + "'";
+  }).join(' ');
+  const split = argv + (tail ? ' ' + tail : '');
   // env reads options inside the split string too (`env -S "-i npx vitest run a"`), so a string that starts with
   // one is classified as the env command it is (review #6461 r4).
   return /^\s*-/.test(split) ? 'env ' + split.trimStart() : split;
