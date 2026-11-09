@@ -59,7 +59,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/platform-settings-reach-verify', '33b0209818ac4016f8428bc3e880e327a183328e', 'R606'],
       ['lane/r452-restart-ceiling', 'be8f9f26291bad2acfd3cc45c458efed18d1c998', 'R452'],
       ['lane/rebuild-spawner-reader-thin', 'd2c55f72173c6da0c88612507fc86e144cf176a4', 'R384+R396'],
-      ['lane/redteam-check-run', 'd80516a2372362aba35876cd26e0a32d23105e37', 'R787+R773'],
+      ['lane/redteam-check-run', 'dc7a0efb1c64862460b26d141815dbaf84c55d36', 'R787+R773'],
       ['lane/redteam-foreign-host', 'df6f584666eecef95c6a0b2c72d393cd8e54dd6d', 'R757'],
       ['lane/review-early-start', 'bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2', 'R464+R468+R474'],
       ['lane/runs-scan-bound-aff4', 'aff4a567812cd837234ceeadd0cd7d8a0f658fdb', 'R545'],
