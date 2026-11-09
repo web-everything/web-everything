@@ -4876,15 +4876,7 @@ async function runCli() {
       log: line => process.stderr.write(`${line}\n`) });
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
     const shown = { line: guard.reason ?? guard.line };
-    if (guard.hold) {
-      // R772 mq-failure-recovery: route a real (non-infra) merge-queue failure to the fixer once per head.
-      // Best-effort and fire-and-forget; an absent module or any failure leaves the decline unchanged.
-      void import('./lib/drain-mq-failure-recovery-io.mjs')
-        .then(m => m.routeMqFailureOnHold({ repo: c.repo ?? localSlug, pr: c.num, head: sha, guard, dryRun: DRY_RUN,
-          log: line => process.stderr.write(`${line}\n`) }))
-        .catch(() => {});
-      return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
-    }
+    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
