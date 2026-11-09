@@ -125,10 +125,12 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // The latest PRIOR-question record for that head+base decides (a later prior NOT WEAKENED re-audit supersedes it), judged
   // with the same already-resolved hashes and clock as the veto above.
   const priorOnly = list.filter((r) => r?.questionHash !== QUESTION_HASH);
-  const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
+  // D2: a record whose runs hold a WEAKENED is WEAKENED too, whatever its verdict field says.
+  const isWeak = (r) => r?.verdict === 'WEAKENED' || (Array.isArray(r?.runs) && r.runs.includes('WEAKENED'));
+  const hiddenWeak = priorOnly.filter((r) => isWeak(r) && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
     && !carried.some((d) => d.record.head === r.head && d.base === r.base)
-    && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
-  const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED');
+    && ((got) => got && got.at === r.at && got.head === r.head && got.base === r.base && isWeak(got))(findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }))).map((record) => ({ base: record.base, record }));
+  const carriedWeak = [...carried, ...hiddenWeak].filter((d) => isWeak(d.record));
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
     if (carriedWeak.some((d) => !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };

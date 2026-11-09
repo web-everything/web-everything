@@ -100,11 +100,12 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
 export const DEFAULT_AUDIT_RUNS = 2;
 const MAX_AUDIT_RUNS = 5;
 /** audit.runs: how many sequential Codex runs one audit may take (stops at the first WEAKENED). Invalid or unreadable
- * values, and any value below the default of 2, resolve to 2: the setting can raise the run count, never lower it. */
+ * values, and any value below the default of 2, resolve to 2; values above the maximum clamp to it. The setting can
+ * raise the run count, never lower it. */
 export function resolveAuditRuns({ readFile = readFileSync } = {}) {
   try {
     const n = JSON.parse(readFile(SETTINGS_FILE, 'utf8'))?.audit?.runs;
-    return Number.isInteger(n) && n >= DEFAULT_AUDIT_RUNS && n <= MAX_AUDIT_RUNS ? n : DEFAULT_AUDIT_RUNS;
+    return Number.isInteger(n) && n >= DEFAULT_AUDIT_RUNS ? Math.min(n, MAX_AUDIT_RUNS) : DEFAULT_AUDIT_RUNS;
   } catch { return DEFAULT_AUDIT_RUNS; }
 }
 

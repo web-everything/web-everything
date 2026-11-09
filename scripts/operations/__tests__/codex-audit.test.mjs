@@ -296,6 +296,15 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     } finally { settingsOverride.text = null; }
   });
 
+  it('audit.runs above the maximum clamps to the maximum, never down to the default', async () => {
+    settingsOverride.text = JSON.stringify({ audit: { runs: 6 } });
+    try {
+      const f = fixture('NOT WEAKENED');
+      expect(await main(ARGS, f.deps)).toBe(0);
+      expect(f.deps.runCodex).toHaveBeenCalledTimes(5);
+    } finally { settingsOverride.text = null; }
+  });
+
   it('a runs-WEAKENED record with contradictory findings still blocks and hides an older pass', () => {
     const pass = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: '2026-11-01T00:00:00.000Z' };
     const bad = { ...pass, runs: ['NOT WEAKENED', 'WEAKENED'], findings: ['NOT WEAKENED'], at: AT };

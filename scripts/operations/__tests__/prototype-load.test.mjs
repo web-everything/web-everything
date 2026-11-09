@@ -2156,6 +2156,11 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       ])('also when the hiding current-question record has %s', (_, over) => {
         expect(carry(livePass(), weak(), hider(over))).toEqual({ ok: false, reason: 'weakened' });
       });
+      it('a prior-question record whose runs hold a WEAKENED (verdict field NOT WEAKENED) hidden by an unusable current record still blocks', () => {
+        const runsWeak = weak({ verdict: 'NOT WEAKENED', runs: ['NOT WEAKENED', 'WEAKENED'], findings: [] });
+        for (const records of [[livePass(), runsWeak, hider()], [hider(), runsWeak, livePass()]])
+          expect(carry(...records)).toEqual({ ok: false, reason: 'weakened' });
+      });
       it('a prior-question NOT WEAKENED re-audit of that base, newer or older, never supersedes it (D2)', () => {
         const fixed = (at) => old({ base: C, questionHash: PRIOR, at, findings: [] });
         expect(carry(livePass(), weak(), fixed('2026-10-20T18:00:00Z'), hider())).toEqual({ ok: false, reason: 'weakened' });
