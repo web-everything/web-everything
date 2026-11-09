@@ -108,17 +108,26 @@ describe('every state x every verdict', () => {
 });
 
 describe('known drain waits explain what releases them', () => {
-  it('same-head merge-queue failure is held until the head changes', () => {
+  it('same-head merge-queue failure waits for system recovery', () => {
     const result = at('drain-skip:mq-same-head-failed', { row: { actor: 'drain' } });
-    expect(result.reason).not.toContain('unknown waiting state');
-    expect(result.reason).toMatch(/same.head.*merge.queue.*fail/i);
-    expect(result.reason).toMatch(/until.*head.*chang/i);
+    expect(result.lane).toBe('system');
+    expect(result.action).toBe('await-mq-failure-recovery');
+    expect(result.reason).toMatch(/waiting on mq-failure recovery/i);
+    expect(result.reason).toMatch(/same.head/i);
   });
   it('a PR grouped into an open card group waits for that group', () => {
     const result = at('drain-skip:card-grouped', { row: { actor: 'drain' } });
-    expect(result.reason).not.toContain('unknown waiting state');
-    expect(result.reason).toMatch(/grouped.*open card group/i);
-    expect(result.reason).toMatch(/wait.*group/i);
+    expect(result.lane).toBe('system');
+    expect(result.action).toBe('await-card-group');
+    expect(result.reason).toMatch(/waiting on the card group/i);
+  });
+  it.each([
+    ['drain-skip:mq-same-head-failed', 'await-mq-failure-recovery'],
+    ['drain-skip:card-grouped', 'await-card-group'],
+  ])('%s goes to the operator when systemActions.%s is off', (state, action) => {
+    const result = at(state, { row: { actor: 'drain' }, settings: { systemActions: { [action]: false } } });
+    expect(result).toMatchObject({ lane: 'operator', action, command: expect.any(String) });
+    expect(result.reason).toContain(`systemActions.${action}`);
   });
 });
 
