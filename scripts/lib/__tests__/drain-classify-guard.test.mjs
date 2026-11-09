@@ -134,7 +134,8 @@ describe('classify write guard', () => {
         await promisify(cp.execFile)(cmd, args);
       }
       assert.equal(calls, ${reads.length} * 7);
-      assert.throws(() => cp.spawn('gh', ['pr', 'view', '7; gh pr merge 7'], { shell: true }), /shell/);
+      const ghBin = 'gh'; // guarded child process: the stubbed spawn never runs a real gh
+      assert.throws(() => cp.spawn(ghBin, ['pr', 'view', '7; gh pr merge 7'], { shell: true }), /shell/);
       assert.throws(() => cp.exec('gh pr view 7 && gh pr merge 7'), /shell/);
       process.stdout.write('guard verified');
     `;
@@ -144,7 +145,8 @@ describe('classify write guard', () => {
   });
   it('activates automatically as a node --import preload', () => {
     const source = `import { execFileSync } from 'node:child_process';
-      try { execFileSync('gh', ['pr', 'merge', '7']); } catch (e) {
+      const ghBin = 'gh'; // the preload guard throws before any process starts
+      try { execFileSync(ghBin, ['pr', 'merge', '7']); } catch (e) {
         if (!e.message.includes('DRAIN_CLASSIFY_ONLY')) throw e;
         process.stdout.write('blocked');
       }`;
