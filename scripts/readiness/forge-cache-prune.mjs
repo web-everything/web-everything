@@ -9,7 +9,7 @@ import {promisify} from 'node:util';
 
 const HOUR = 3_600_000;
 const HEX = /^[a-f0-9]{64}(?![\s\S])/;
-const PROFILE = /^dev-v5-[a-f0-9]{64}(?![\s\S])/;
+const PROFILE = /^dev-v[0-9]+-[a-f0-9]{64}(?![\s\S])/;
 const WORKER = /^worker-active(?:-[1-9][0-9]*)?(?![\s\S])/;
 const RUN = /^(?:r-|warm-)[a-f0-9]{32}(?![\s\S])/;
 const LIMIT = 4 * 1024 * 1024;
@@ -294,7 +294,8 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
   const result = {deleted: [], skipped: []};
   if (plan.refused) throw new Error(plan.refused);
   if (!apply) return result;
-  const leases = receipts ? await writerLeases(receipts, spawnProcess) : [];
+  if (!receipts) throw new Error(`Apply requires receipts for writer leases and live evidence; ${repair}`);
+  const leases = await writerLeases(receipts, spawnProcess);
   let rootHandle;
   try {
     rootHandle = await fs.open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -307,11 +308,9 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
         // this pathname check is only an early refusal, not authorization.
         const expected = await rootHandle.stat(), actual = await fs.stat(join(parent, '..'));
         if (expected.dev !== actual.dev || expected.ino !== actual.ino) throw new Error(`Cache root changed; ${repair}`);
-        if (receipts) {
-          const live = await readLiveEvidence({receipts});
-          if (!live.complete) throw new Error(live.refused);
-          if (live.profiles.has(`${e.lock}/${e.name}`)) { result.skipped.push(e); continue; }
-        }
+        const live = await readLiveEvidence({receipts});
+        if (!live.complete) throw new Error(live.refused);
+        if (live.profiles.has(`${e.lock}/${e.name}`)) { result.skipped.push(e); continue; }
         const st = await fs.lstat(e.path);
         if (!st.isDirectory() || st.mtimeMs !== e.mtimeMs
           || (e.ino !== undefined && (st.ino !== e.ino || st.dev !== e.dev))

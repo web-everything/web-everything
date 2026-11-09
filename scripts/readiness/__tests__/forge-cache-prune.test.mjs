@@ -18,8 +18,8 @@ afterEach(async () => { if (tmp) await fs.rm(tmp, {recursive: true, force: true}
 
 const key = e => `${e.lock}/${e.name}`;
 const keys = entries => entries.map(key).sort();
-const entry = (c, age, bytes = 10) => ({lock, name: `dev-v5-${hex(c)}`,
-  path: join(root, lock, `dev-v5-${hex(c)}`), mtimeMs: now - age * HOUR, bytes});
+const entry = (c, age, bytes = 10, version = 5) => ({lock, name: `dev-v${version}-${hex(c)}`,
+  path: join(root, lock, `dev-v${version}-${hex(c)}`), mtimeMs: now - age * HOUR, bytes});
 // The pure planner receives the same explicit root as the scanner/executor so
 // it can reject paths outside that boundary without accessing the filesystem.
 const plan = (entries, options = {}) => planPrune({root, entries, now,
@@ -34,8 +34,8 @@ function expectDecision(result, prune, keep) {
     expect([...result.prune, ...result.keep].find(e => key(e) === key(original))).toMatchObject(original);
   }
 }
-async function materialize(c = 'b', age = 20) {
-  const e = entry(c, age);
+async function materialize(c = 'b', age = 20, version = 5) {
+  const e = entry(c, age, 10, version);
   await fs.mkdir(e.path, {recursive: true});
   await fs.writeFile(join(e.path, 'payload'), 'cache');
   await fs.utimes(e.path, e.mtimeMs / 1000, e.mtimeMs / 1000);
@@ -94,6 +94,18 @@ describe('resolveSettings', () => {
 });
 
 describe('planPrune', () => {
+  it.each([3, 4, 12])('dev-v%i profiles obey age, size, high-water, minimum-age and exact live-name protection', version => {
+    const old = entry('b', 20, 100, version), eligible = entry('c', 3, 300, version);
+    const infant = entry('d', 0.5, 300, version), protectedProfile = entry('e', 20, 300, version);
+    const current = entry('b', 20);
+    const live = {complete: true, profiles: new Set([key(current), key(protectedProfile)])};
+    const entries = [old, eligible, infant, protectedProfile, current];
+    expectDecision(plan(entries, {live}), [old], [eligible, infant, protectedProfile, current]);
+    for (const pressure of [
+      {settings: settings({maxBytes: 1})},
+      {disk: {usedPct: 99, usedBytes: 990, totalBytes: 1000}},
+    ]) expectDecision(plan(entries, {live, ...pressure}), [old, eligible], [infant, protectedProfile, current]);
+  });
   it('age: prunes older profiles inside a hot lock while keeping younger profiles', () => {
     const old = entry('b', 13), young = entry('c', 11), boundary = entry('d', 12);
     expectDecision(plan([young, old, boundary]), [old], [young, boundary]);
@@ -154,6 +166,21 @@ describe('planPrune', () => {
 });
 
 describe('scanCache', () => {
+  it('scans legacy numeric versions while rejecting malformed names and legacy profiles outside depth two', async () => {
+    const legacy = [await materialize('b', 20, 3), await materialize('c', 20, 4), await materialize('d', 20, 12)];
+    for (const name of [`dev-v-${hex('e')}`, `dev-vx-${hex('e')}`, `dev-v3-${'E'.repeat(64)}`,
+      `dev-v4-${'e'.repeat(63)}`, `dev-v4-${'e'.repeat(65)}`, `dev-v3-${hex('e')}\n`,
+      `dev-v3-${hex('e')}-extra`, `other-v3-${hex('e')}`]) {
+      await fs.mkdir(join(root, lock, name));
+      const invalid = {...entry('e', 20), name, path: join(root, lock, name)};
+      expectDecision(plan([invalid]), [], [invalid]);
+    }
+    await fs.mkdir(join(root, legacy[0].name));
+    await fs.mkdir(join(root, 'invalid-lock', legacy[0].name), {recursive: true});
+    await fs.mkdir(join(root, lock, 'nested', legacy[0].name), {recursive: true});
+    await fs.symlink(legacy[0].path, join(root, lock, `dev-v3-${hex('f')}`));
+    expect(keys(await scanCache(root))).toEqual(keys(legacy));
+  });
   it('scans only matching real profile directories at depth two and sums files without following symlinks', async () => {
     const e = await materialize();
     await fs.mkdir(join(e.path, 'nested'));
@@ -178,10 +205,37 @@ describe('scanCache', () => {
 
 describe('executePrune', () => {
   // Forge uses util-linux flock. Darwin fixtures use the same kernel flock
-  // protocol through Python, just as the existing Forge runner does.
+  // protocol through Python, just as the existing Forge runner does. Applying
+  // acquires all 129 leases, so allow these real subprocesses 20 seconds.
   const leaseSpawn = (command, args, options) => command === '/usr/bin/flock' && process.platform === 'darwin'
     ? spawn('/usr/bin/python3', ['-I', '-c', 'import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'], options)
     : spawn(command, args, options);
+
+  it('fails closed when apply omits receipts, preserving profiles and indexes without spawning', async () => {
+    const e = await materialize(), marker = join(root, lock, '.warm-inputs-one');
+    await json(marker, {profile: hex('b'), archiveDigest: hex('f')});
+    let spawned = false;
+    await expect(executePrune(plan([e]), {root, apply: true, spawnProcess() {
+      spawned = true;
+      throw new Error('Must refuse before spawning');
+    }})).rejects.toThrow(/Apply requires receipts.*preserving cache.*repair/);
+    expect(spawned).toBe(false);
+    expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
+    expect(await exists(marker)).toBe(true);
+  }, 20_000);
+
+  it('applies retention to legacy profiles without protecting them through a current profile with the same digest', async () => {
+    const legacy = [await materialize('b', 20, 3), await materialize('b', 20, 4), await materialize('b', 20, 12)];
+    const current = await materialize();
+    const run = await reserve();
+    await json(join(receipts, `${run}.running`), record(false));
+    // Plan before reservation evidence to also exercise the executor's live-name check.
+    const result = await executePrune(plan([...legacy, current]), {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(keys(result.deleted)).toEqual(keys(legacy));
+    expect(keys(result.skipped)).toEqual(keys([current]));
+    for (const e of legacy) expect(await exists(e.path)).toBe(false);
+    expect(await fs.readFile(join(current.path, 'payload'), 'utf8')).toBe('cache');
+  }, 20_000);
 
   it('anchors deletion when the checked parent is replaced by an outside symlink before delete', async () => {
     const e = await materialize();
@@ -193,7 +247,8 @@ describe('executePrune', () => {
     await fs.utimes(target, e.mtimeMs / 1000, e.mtimeMs / 1000);
     const saved = join(tmp, 'saved-lock');
     let substituted = false;
-    await expect(executePrune(plan([e]), {root, apply: true, spawnProcess(command, args, options) {
+    await expect(executePrune(plan([e]), {root, receipts, apply: true, spawnProcess(command, args, options) {
+      if (command !== process.execPath) return leaseSpawn(command, args, options);
       substituted = true;
       renameSync(join(root, lock), saved);
       symlinkSync(outside, join(root, lock));
@@ -202,7 +257,7 @@ describe('executePrune', () => {
     expect(substituted).toBe(true);
     expect(await fs.readFile(join(target, 'sentinel'), 'utf8')).toBe('outside');
     expect(await fs.readFile(join(saved, e.name, 'payload'), 'utf8')).toBe('cache');
-  });
+  }, 20_000);
 
   it('preserves a newly reserved profile between planning evidence and deletion', async () => {
     const e = await materialize();
@@ -218,7 +273,7 @@ describe('executePrune', () => {
       await expect(executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn})).rejects.toThrow(/refused/);
       expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
     } finally { closeSync(guard); }
-  });
+  }, 20_000);
 
   it('excludes reservation writers after live evidence until deletion finishes and then releases them', async () => {
     const e = await materialize(), result = plan([e]);
@@ -250,7 +305,7 @@ describe('executePrune', () => {
     await fs.symlink(join(tmp, 'untrusted'), join(receipts, '.worker-active.writer'));
     await expect(executePrune(plan([e]), {root, receipts, apply: true, spawnProcess: leaseSpawn})).rejects.toThrow();
     expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
-  });
+  }, 20_000);
 
   it('dry-run deletes neither profiles nor their warm-input indexes', async () => {
     const e = await materialize(), marker = join(root, lock, '.warm-inputs-one');
@@ -258,7 +313,7 @@ describe('executePrune', () => {
     await executePrune(plan([e]), {root, apply: false});
     expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
     expect(await exists(marker)).toBe(true);
-  });
+  }, 20_000);
   it('apply deletes only planned profiles and indexes pointing at those profiles', async () => {
     const old = await materialize(), young = await materialize('c', 2);
     const parent = join(root, lock), removed = join(parent, '.warm-inputs-old');
@@ -266,30 +321,30 @@ describe('executePrune', () => {
     const retained = join(parent, '.warm-inputs-young');
     await json(retained, {profile: hex('c'), archiveDigest: hex('f')});
     const result = plan([old, young]);
-    await executePrune(result, {root, apply: true});
+    await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
     expect(await exists(old.path)).toBe(false); expect(await exists(removed)).toBe(false);
     expect(await exists(young.path)).toBe(true); expect(await exists(retained)).toBe(true);
-  });
+  }, 20_000);
   it('skips a profile whose mtime changed after scan and preserves its index', async () => {
     const e = await materialize(), result = plan([e]), marker = join(root, lock, '.warm-inputs-old');
     await json(marker, {profile: hex('b'), archiveDigest: hex('f')});
     await fs.utimes(e.path, now / 1000, now / 1000);
-    await executePrune(result, {root, apply: true});
+    await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
     expect(await exists(e.path)).toBe(true); expect(await exists(marker)).toBe(true);
-  });
+  }, 20_000);
   it('does not follow or delete a symlink swapped in after scan', async () => {
     const e = await materialize(), result = plan([e]), saved = join(tmp, 'saved');
     await fs.rename(e.path, saved); await fs.symlink(saved, e.path);
-    await executePrune(result, {root, apply: true});
+    await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
     expect((await fs.lstat(e.path)).isSymbolicLink()).toBe(true);
     expect(await fs.readFile(join(saved, 'payload'), 'utf8')).toBe('cache');
-  });
+  }, 20_000);
   it('skips a regular file swapped in after scan', async () => {
     const e = await materialize(), result = plan([e]);
     await fs.rm(e.path, {recursive: true}); await fs.writeFile(e.path, 'replacement');
-    await executePrune(result, {root, apply: true});
+    await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
     expect(await fs.readFile(e.path, 'utf8')).toBe('replacement');
-  });
+  }, 20_000);
   it.each(['traversal', 'outside', 'depth', 'bad-name', 'bad-lock', 'linked-lock'])
   ('refuses forged %s paths even in an explicitly supplied prune plan', async kind => {
     const e = await materialize(), outside = join(tmp, 'outside', lock, e.name);
@@ -308,12 +363,12 @@ describe('executePrune', () => {
     // Keep mtime valid so an unrelated stale-entry guard cannot mask a bad path check.
     await fs.utimes(forged.path, e.mtimeMs / 1000, e.mtimeMs / 1000);
     // Refusal may be returned as a skip or thrown; neither permits deletion.
-    try { await executePrune({prune: [{...forged, reason: 'age'}], keep: []}, {root, apply: true}); }
+    try { await executePrune({prune: [{...forged, reason: 'age'}], keep: []}, {root, receipts, apply: true, spawnProcess: leaseSpawn}); }
     catch (error) { expect(error).toBeInstanceOf(Error); }
     expect(await exists(forged.path)).toBe(true);
     expect(await fs.readFile(join(outside, 'payload'), 'utf8')).toBe('outside');
     expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
-  });
+  }, 20_000);
 });
 
 describe('readLiveEvidence', () => {
