@@ -95,11 +95,11 @@ export function planOperatorControl(name, read, input) {
     steps.push(`post verified round extension +${input.n ?? 1} via github.round-extension; kind=${input.kind ?? 'fix'} (raises every cap today)`);
   } else if (name === 'ci-heal-reset') {
     const matches = sha => typeof sha === 'string' && /^[a-f\d]{40}$(?![\s\S])/i.test(sha) && sha.toLowerCase().startsWith(input.head.toLowerCase());
-    if (!matches(read.head)) throw new Error('head moved');
+    if (!matches(read.head)) throw new Error('head moved: state changed since the exhausted record');
     if (!Array.isArray(read.awaitVerify)) throw new Error('await-verify records unavailable');
     const rows = read.awaitVerify.filter(({ record }) => record.repo === input.repo && record.pr === input.pr);
     const matching = rows.filter(({ record }) => matches(record.sha));
-    if (rows.length && !matching.length) throw new Error('head moved');
+    if (rows.length && !matching.length) throw new Error('head moved: state changed since the exhausted record');
     resets = matching.filter(({ record }) => previousCiFailurePending(record) && Number.isSafeInteger(record.resumeFailures) && record.resumeFailures >= AWAIT_VERIFY_LIMITS.maxResumeFailures);
     undo = 'restore each record’s previousResumeFailures through an operator-reviewed store repair; the normal resume failure cap still applies';
     if (!resets.length) why = 'no matching exhausted await-verify record';
