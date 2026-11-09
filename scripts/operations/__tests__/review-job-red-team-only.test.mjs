@@ -195,7 +195,7 @@ function runSharedRecovery(input, { status, records = [], recordsUnreadable = fa
   `;
   return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
     input: JSON.stringify({ input, status, records, recordsUnreadable, commentsUnreadable, comments, env, probeFresh, failAppend, staleStatus, capDeferred }), encoding: 'utf8',
-    timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+    timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '', WE_UNDER_TEST: '1' },
   }));
 }
 
@@ -227,7 +227,7 @@ function runStoredRecovery(input, { status, prior, saved, failComment = false, f
   `;
   return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
     input: JSON.stringify({ input, status, prior, saved, failComment, failStore }), encoding: 'utf8',
-    timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+    timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '', WE_UNDER_TEST: '1' },
   }));
 }
 
