@@ -33,8 +33,8 @@ import {
 const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
-import { redTeamMarker } from '../../lib/red-team-gate.mjs';
-import { evaluateRedTeamCheckFact } from '../../lib/red-team-check-run.mjs';
+import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.mjs';
+import { evaluateRedTeamCheckFact, readRedTeamGateSource } from '../../lib/red-team-check-run.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
@@ -265,10 +265,10 @@ describe('pending red-team check before acceptance', () => {
 
   for (const type of [REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD]) {
     // Historical fixtures carried no comments; the barrier now reads the thread, so the default is an empty one.
-    function setup({ result = { ok: true }, liveHead = head, comments = [], labels = ['review:human'], readComments } = {}) {
+    function setup({ result = { ok: true }, liveHead = head, comments = [], labels = ['review:human'], readComments, env, logs = [] } = {}) {
       const writes = [];
       const post = vi.fn(async args => { writes.push('pending'); return result; });
-      const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post,
+      const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, ...(env ? { env, out: line => logs.push(line) } : {}),
         postComment: () => writes.push('comment'),
         publishGate: () => ({ allowed: true, headSha: head }),
         readPublishHead: () => liveHead,
@@ -344,6 +344,31 @@ describe('pending red-team check before acceptance', () => {
       expect(writes).toEqual(['pending']);
     });
 
+    // Round 3: the barrier binds exactly where #6535's publish-first binds (`checkRunIsEvidence`): merge-gate reads
+    // the red-team check in `both` and `check-run`, so a failed post must stop the accept there; in the
+    // `drain-scan` rollback the check is not evidence, so the accept is unchanged from before this PR.
+    it.each([['both', true], ['check-run', true], ['drain-scan', false]])(`${type}: redTeamGate.source=%s — the barrier binds = %s`, async (source, binds) => {
+      const logs = [];
+      const { apply, post, writes } = setup({ result: { ok: false, reason: 'checks API down' }, env: { WE_RED_TEAM_GATE_SOURCE: source }, logs });
+      if (binds) {
+        await expect(apply(payload)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('checks API down') });
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(writes).toEqual(['pending']);
+      } else {
+        await apply(payload);
+        expect(post).not.toHaveBeenCalled();
+        expect(writes).toEqual(acceptanceWrites);
+      }
+      expect(logs).toContainEqual(`policy-cascade · redTeamGate: source="${source}" (env)`);
+    });
+
+    it(`${type}: drain-scan reads no PR thread, so an unreadable thread cannot block the accept`, async () => {
+      const { apply, post, writes } = setup({ comments: null, env: { WE_RED_TEAM_GATE_SOURCE: 'drain-scan' } });
+      await apply(payload);
+      expect(post).not.toHaveBeenCalled();
+      expect(writes).toEqual(acceptanceWrites);
+    });
+
     it(`${type}: moved head never posts a check or writes acceptance`, async () => {
       const { apply, post, writes } = setup({ liveHead: 'c'.repeat(40) });
       await apply(payload).catch(() => {});
@@ -351,6 +376,13 @@ describe('pending red-team check before acceptance', () => {
       expect(writes).toEqual([]);
     });
   }
+
+  // Round 3: this PR adds no source to the tool settings, so the effective default stays the standard `both`.
+  it('redTeamGate.source is not flipped: the shipped settings resolve to the standard both', () => {
+    const settings = JSON.parse(readFileSync(RED_TEAM_SETTINGS_FILE, 'utf8'));
+    expect(settings.redTeamGate?.source).toBeUndefined();
+    expect(readRedTeamGateSource({ env: {}, platform: {} })).toMatchObject({ value: { source: 'both' }, sources: { source: 'standard' } });
+  });
 
   // The round 2 scenario end to end: the posted runs are fed to the real check evaluator.
   const advisorySinks = ({ labels, post, setLabels = vi.fn() }) => createReviewPrSinks({ root, postRedTeamCheckRun: post,

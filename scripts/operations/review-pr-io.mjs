@@ -1,4 +1,4 @@
-import { redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
+import { readRedTeamGateSource, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
@@ -1047,8 +1047,14 @@ export function createReviewPrSinks({
   // complete thread too) posts no second result, so a pending check there would never complete and the result is
   // final for the head, leaving the barrier nothing to supersede. An unreadable or
   // incomplete thread proves nothing either way: refuse before any write and leave the effect retryable.
+  // The barrier binds exactly where #6535's publish-first binds (`review-extra-seats.mjs#checkRunIsEvidence`):
+  // merge-gate reads the red-team check in `both` and `check-run`, so there a failed post stops the accept. In the
+  // `drain-scan` rollback the check is not evidence, so the accept proceeds exactly as before this barrier existed
+  // (no thread read, no post). The effective source and its layer are logged on every call.
   const postPendingRedTeam = async (payload, liveState) => {
     const { repo, pr, reviewedHead: headSha } = payload;
+    const gateSource = readRedTeamGateSource({ env, log: line => { try { out(line); } catch { /* best effort */ } } }).value.source;
+    if (gateSource === 'drain-scan') return;
     let comments;
     try {
       const state = liveState ?? labelProvider.readPrState(repo, pr);
@@ -1861,9 +1867,11 @@ export function createReviewPrSinks({
       const plan = planAdvisoryLabels({ outcome: payload.outcome, currentLabels: labels });
       if (plan.reason) return { applied: false, reason: plan.reason };
       if (!plan.add && plan.remove.length === 0) return { applied: false, reason: 'already-current' };
-      // Retain the barrier for saved runs resuming after an advisory note posted by an older version, but only
-      // when this write makes the accept visible: a refused, already-current or removal-only plan adds no
-      // acceptance, and a check posted then would replace a finished result with one nothing completes.
+      // The label is a second acceptance write, so it carries the barrier too, but only when this write makes the
+      // accept visible: a refused, already-current or removal-only plan adds no acceptance, and a check posted then
+      // would replace a finished result with one nothing completes. A payload declared before `redTeamOwed`
+      // existed carries no owed-ness and skips the barrier, the same as the note it was declared with (ruled
+      // `not-real` as a defect: such a run is unchanged from the code that declared it).
       if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed && plan.add === ADVISORY_LABELS.ACCEPTED) {
         await postPendingRedTeam(payload, state);
       }
