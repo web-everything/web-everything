@@ -221,6 +221,7 @@ describe('renderWorkerBrief', () => {
       'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=full',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
+      'committed and its PR opened BEFORE you release the lane', '~/.claude/lane-salvage',
       `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,
       defaultProof, 'report it as PENDING', 'exact command', '10\nminutes',
       '`pkill`, `killall`', 'operator\'s dev server', 'No `--force`', 'no `--no-verify`',
