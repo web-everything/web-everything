@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, symlinkSync, linkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { qualifyBareBasenames } from '../file-held-cards.mjs';
 import { sizeRefusal } from '../../backlog/scaffold.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
 import { parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards, main } from '../file-held-cards.mjs';
@@ -265,4 +266,23 @@ it('dry-run validates first and never echoes a refused card text', async () => {
   expect(JSON.stringify(result)).not.toContain('ghp_');
   expect(result.refused).toHaveLength(1);
   expect(result.planned).toHaveLength(1);
+});
+
+it('qualifies a bare basename only when exactly one tracked file matches', () => {
+  const tracked = ['scripts/a/audit-settings.mjs', 'x/dup.mjs', 'y/dup.mjs'];
+  expect(qualifyBareBasenames('fix audit-settings.mjs now', tracked).text).toBe('fix we:scripts/a/audit-settings.mjs now');
+  expect(qualifyBareBasenames('fix we:scripts/a/audit-settings.mjs', tracked).text).toBe('fix we:scripts/a/audit-settings.mjs');
+  const several = qualifyBareBasenames('see dup.mjs and none.mjs', tracked);
+  expect(several.text).toBe('see dup.mjs and none.mjs');
+  expect(several.ambiguous).toEqual({ 'dup.mjs': ['x/dup.mjs', 'y/dup.mjs'] });
+});
+
+it('files a card with a unique bare basename and refuses an ambiguous one, listing candidates', async () => {
+  seed('- [R1] 2026-11-08: fix audit-settings.mjs\n- [R1] 2026-11-08: fix dup.mjs');
+  const result = await runFileHeldCards({ source, deps: { root, fileItem, log, now: () => '2026-11-09T12:00:00Z',
+    trackedFiles: () => ['scripts/audit-settings.mjs', 'a/dup.mjs', 'b/dup.mjs'] } });
+  expect(result.filed).toHaveLength(1);
+  expect(fileItem.mock.calls[0][0].scope).toBe('we:scripts/audit-settings.mjs');
+  expect(result.refused).toHaveLength(1);
+  expect(log).toHaveBeenCalledWith(expect.stringContaining('we:a/dup.mjs'));
 });

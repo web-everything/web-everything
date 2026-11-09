@@ -1,5 +1,6 @@
 /** File held handoff cards through file-item in this checkout; never mutate the handoff. */
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
@@ -82,6 +83,31 @@ export function selectUnfiled(cards, ledger, { select, since, max = 10 } = {}) {
   }).slice(0, max);
 }
 
+const BARE_FILE = /(?<![\w./:~@-])([\w][\w.-]*\.(?:mjs|cjs|js|ts|json|md|css|html|yml|yaml))(?![\w/-])/g;
+
+/** A bare basename matching exactly ONE tracked file becomes `we:<path>`; zero or several matches stay bare
+ *  (the scrub then refuses them) and the several-match candidates are returned so the caller can list them. */
+export function qualifyBareBasenames(text, trackedFiles) {
+  const byBase = new Map();
+  for (const file of trackedFiles) {
+    const base = file.slice(file.lastIndexOf('/') + 1);
+    byBase.set(base, [...(byBase.get(base) ?? []), file]);
+  }
+  const ambiguous = {};
+  const out = text.replace(BARE_FILE, (match, name) => {
+    const found = byBase.get(name) ?? [];
+    if (found.length === 1) return `we:${found[0]}`;
+    if (found.length > 1) ambiguous[name] = found;
+    return match;
+  });
+  return { text: out, ambiguous };
+}
+
+function gitTrackedFiles(root) {
+  // Not a git checkout (or git failing) means no qualification: bare paths are then simply refused as before.
+  try { return execFileSync('git', ['ls-files'], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean); } catch { return []; }
+}
+
 export function composeFileItemInput(card) {
   // Whole text, cut at a word boundary: held cards often lead with a short ref ("#6381 slice 2") that is useless alone.
   const flat = card.text.replace(/\s+/g, ' ').trim();
@@ -137,6 +163,7 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     throw new Error('--ledger must be outside the repository and distinct from --source');
   }
   assertLedgerIdentity(realpathSync(root), ledger, source);
+  const tracked = deps.trackedFiles ? deps.trackedFiles() : gitTrackedFiles(root);
   const cards = selectUnfiled(parseCards(readFileSync(source, 'utf8')), readLedger(ledger), { select, since, max: Infinity });
   const titles = new Map();
   for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
@@ -149,7 +176,11 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   for (const card of cards) {
     // Refusals stay retryable but do not use the budget, so they cannot starve later valid cards.
     if (result.planned.length + result.filed.length + result.duplicates.length >= max) break;
-    const input = composeFileItemInput(card);
+    const qualified = qualifyBareBasenames(card.text, tracked);
+    for (const [name, found] of Object.entries(qualified.ambiguous)) {
+      log(safeLog(`ambiguous ${card.tag}: ${name} matches ${found.slice(0, 5).map(f => `we:${f}`).join(', ')}${found.length > 5 ? ', ...' : ''}`));
+    }
+    const input = composeFileItemInput({ ...card, text: qualified.text });
     const summary = { tag: card.tag, date: card.date, title: input.title, ...(input.scope ? { scope: input.scope } : {}) };
     try {
       // Reuse file-item's own content guard; never rewrite a bare path into an approved one.
