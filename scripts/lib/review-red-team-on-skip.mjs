@@ -79,7 +79,8 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
         // marker still binds this exact writer AND evidence stays proven dead (it was proven under the claim). It is still
         // probed: a pid that is alive here with its recorded birth time keeps the record held, and a throwing probe holds it.
         const m = w.markers.redispatch;
-        const boundAbandonment = Boolean(raw.staleAbandoned && raw.host && raw.host !== probe.host && m?.writer === w.rawWriter.sha256 && m?.evidence === w.evidenceSha256);
+        const boundAbandonment = Boolean(raw.staleAbandoned && raw.host && raw.host !== probe.host
+          && (raw.pidNamespace == null || raw.pidNamespace === probe.namespace) && m?.writer === w.rawWriter.sha256 && m?.evidence === w.evidenceSha256);
         dead = (boundAbandonment && !localPidLive(raw, { isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) }))
           || foreignStaleOwnerDead(raw, { host: probe.host, namespace: probe.namespace, statusAt: w.statusAt, now, env, isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) });
       } catch { dead = false; }
