@@ -17,7 +17,7 @@ const sample=(ms=now)=>({sampledAtET:easternTimestamp(ms),cores:8,loadPerCore:0.
 const saved=(telemetry,lastReadAt)=>({v:1,lastReadAt,telemetry,failures:0,backoffUntil:0,trigger:''});
 const persist=(root,state)=>writeFileSync(join(root,'health.json'),JSON.stringify(state));
 const load=root=>JSON.parse(readFileSync(join(root,'health.json'),'utf8'));
-const check=(root,readTelemetry,time=now,ping)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,...(ping?{ping}:{})});
+const check=(root,readTelemetry,time=now,ping=async()=>false)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,ping});
 
 describe('Forge health freshness',()=>{
   it.each([now-60000,now-1000])('refreshes stale persisted telemetry exactly once with lastReadAt=%s',async lastReadAt=>{

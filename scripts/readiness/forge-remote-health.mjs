@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {randomBytes, createHash} from 'node:crypto';
 import {reserve, readLockEntry, releaseLockDir} from './file-locks.mjs';
 import {parseTelemetry} from './forge-exec-run.mjs';
-import {readForgeTelemetry} from './forge-telemetry.mjs';
+import {readForgeTelemetry, pingForge} from './forge-telemetry.mjs';
 
 const freshState=()=>({v:1,lastReadAt:null,telemetry:null,failures:0,backoffUntil:0,trigger:''});
 const integer=v=>Number.isSafeInteger(v)&&v>=0;
@@ -41,7 +41,7 @@ async function transaction(root,action,host='forge') {
     return result;
   } finally {rmSync(pending,{force:true});releaseLockDir(root,key);}
 }
-export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge'}) {
+export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',ping=pingForge}) {
   try{return await transaction(root,async state=>{
     const now=clock();
     if(now<state.backoffUntil)return {ok:false,reason:`backoff-${state.trigger}`};
@@ -55,7 +55,17 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     if(state.lastReadAt===null || now-state.lastReadAt>=10000 || (state.telemetry && stale())) {
       state.lastReadAt=now;
       try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
-      catch{state.telemetry=null;}
+      catch{
+        // A reachable host (quick ping) earns exactly ONE fresh re-read. The ping is never health evidence; the retry
+        // still passes the freshness/skew and load/RAM checks below. No last-good sample is ever kept.
+        state.telemetry=null;
+        let reachable=false;
+        try{reachable=(await ping({host}))===true;}catch{reachable=false;}
+        if(reachable){
+          try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
+          catch{state.telemetry=null;}
+        }
+      }
     }
     let trigger;
     if(!state.telemetry)trigger='forge-unreachable';

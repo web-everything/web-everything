@@ -20,6 +20,17 @@ export async function readForgeTelemetry({host='forge',exec=execFile}={}) {
   });
   return parseTelemetry(output);
 }
+/** Quick reachability probe. Never health evidence: a true result only permits one more full telemetry read. Never throws. */
+export async function pingForge({host='forge',exec=execFile}={}) {
+  try{
+    if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))return false;
+    return await new Promise(resolve=>{
+      try{
+        exec('ssh',['-o','BatchMode=yes','-o','ConnectTimeout=2',host,'true'],{encoding:'utf8',maxBuffer:4096,timeout:3000},error=>resolve(!error));
+      }catch{resolve(false);}
+    });
+  }catch{return false;}
+}
 export async function main(args,{read=readForgeTelemetry,write=text=>process.stdout.write(text)}={}) {
   let host='forge',json=false;
   const seen=new Set();
