@@ -53,6 +53,11 @@ export const forbiddenCredential = name => /PRIVATE_KEY|APP_ID|SECRET|_PAT/i.tes
   (/_TOKEN$/i.test(name) && !['GITHUB_TOKEN', 'GH_TOKEN'].includes(name));
 
 /** Audit parsed structure and raw text: comments and expressions also carry credential references. */
+const ACTIONS = Object.freeze([
+  'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683',
+  'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+]);
+
 export function auditWorkflow(yamlText) {
   const problems = [];
   if (typeof yamlText !== 'string') return { ok: false, problems: ['workflow must be YAML text'] };
@@ -69,17 +74,20 @@ export function auditWorkflow(yamlText) {
     if (Array.isArray(value)) { value.forEach(walk); return; }
     if (!record(value)) return;
     if (Object.hasOwn(value, 'permissions') && !permissions(value.permissions)) problems.push('unsafe permissions');
+    if (Object.hasOwn(value, 'defaults')) problems.push('defaults (inherited shell) not allowed');
+    if (Object.hasOwn(value, 'shell')) problems.push('shell override not allowed');
     if (Object.hasOwn(value, 'continue-on-error')) problems.push('continue-on-error would suppress failures');
     if (Object.hasOwn(value, 'env')) {
+      // Only these exact variables may be set: anything else (NODE_OPTIONS, NODE_PATH, GH_TOKEN, ...) can inject code or credentials.
+      const okEnv = value === doc ? { GITHUB_TOKEN: '${{ github.token }}' }
+        : Object.hasOwn(value, 'run') ? { REQUESTED_PR: '${{ inputs.pr }}' } : {};
       if (!record(value.env)) problems.push('invalid environment');
       else for (const [name, token] of Object.entries(value.env)) {
-        if (forbiddenCredential(name) || (['GITHUB_TOKEN', 'GH_TOKEN'].includes(name) && token !== '${{ github.token }}')) {
-          problems.push('unsafe credential environment');
-        }
+        if (okEnv[name] !== token) problems.push('environment variable not allowed');
       }
     }
     if (Object.hasOwn(value, 'uses')) {
-      if (typeof value.uses !== 'string' || !/^[\w./-]+@[a-f0-9]{40}$/i.test(value.uses)) problems.push('action must be SHA pinned');
+      if (!ACTIONS.includes(value.uses)) problems.push('action must be one of the audited pinned actions');
       if (/app-token/i.test(value.uses)) problems.push('App token action forbidden');
       const allowed = /^actions\/upload-artifact@/.test(value.uses) ? ['name', 'path', 'retention-days', 'if-no-files-found'] :
         /^actions\/checkout@/.test(value.uses) ? ['ref', 'persist-credentials'] : [];
