@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, symlinkSync, linkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { sizeRefusal } from '../../backlog/scaffold.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
 import { parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards, main } from '../file-held-cards.mjs';
 import { operatorControlCliPolicy, resolveOperation } from '../run.mjs';
@@ -46,6 +47,8 @@ it('composes a bounded title, full digest and only explicit WE scope', () => {
   expect(composeFileItemInput({ text: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.' })).toMatchObject({
     title: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.', digest: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.', scope: 'we:scripts/a.mjs,we:scripts/b.mjs',
   });
+  expect(composeFileItemInput({ text: 'x' })).not.toHaveProperty('size');
+  expect(sizeRefusal(composeFileItemInput({ text: 'x' }).kind, composeFileItemInput({ text: 'x' }).size)).toBeNull();
   expect(composeFileItemInput({ text: 'a'.repeat(150) }).title).toHaveLength(111);
   expect(composeFileItemInput({ text: 'No scope' })).not.toHaveProperty('scope');
 });
