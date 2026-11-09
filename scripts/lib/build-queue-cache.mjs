@@ -31,11 +31,10 @@ export function readBuildQueueCache({ file, key, now = Date.now(), maxAgeMs = 60
   return null;
 }
 
-/** Null means contention; filesystem errors allow the caller to compute unlocked. */
-export function acquireBuildQueueLock({ file, now = Date.now(), staleMs = 60_000, pid = process.pid,
+/** Null means not owner; the caller bounds retries before computing unlocked. */
+export function acquireBuildQueueLock({ file, now = Date.now(), staleMs = 600_000, pid = process.pid,
   io = { mkdirSync, readFileSync, writeFileSync, rmSync, rmdirSync } }) {
   const { mkdirSync: mkdir, readFileSync: read, writeFileSync: write, rmSync: remove, rmdirSync: rmdir } = io;
-  const unlocked = () => {};
   const lock = `${file}.lock`;
   const guard = `${lock}.guard`;
   const ownerFile = join(lock, 'owner.json');
@@ -52,6 +51,8 @@ export function acquireBuildQueueLock({ file, now = Date.now(), staleMs = 60_000
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
       const held = JSON.parse(read(ownerFile, 'utf8'));
+      if (!held || !Number.isInteger(held.pid) || held.pid <= 0 || !Number.isFinite(held.at) ||
+          typeof held.token !== 'string' || held.token.length === 0) return null;
       let dead = false;
       try { process.kill(held.pid, 0); }
       catch (error) { dead = error.code === 'ESRCH'; }
@@ -78,7 +79,7 @@ export function acquireBuildQueueLock({ file, now = Date.now(), staleMs = 60_000
     };
   } catch {
     if (created) { try { remove(lock, { recursive: true }); } catch { /* best-effort cleanup */ } }
-    return unlocked;
+    return null;
   } finally {
     if (guarded) { try { rmdir(guard); } catch { /* best-effort cleanup */ } }
   }

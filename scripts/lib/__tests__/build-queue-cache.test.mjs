@@ -2,7 +2,9 @@ import { afterEach, expect, it } from 'vitest';
 import fs from 'node:fs';
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { acquireBuildQueueLock, buildQueueCacheKey, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache } from '../build-queue-cache.mjs';
 const dirs = [];
 function setup() {
@@ -78,14 +80,17 @@ it('fails open on a corrupt cache file with null from read and timed-out wait', 
   expect(Date.now() - started).toBeGreaterThanOrEqual(25);
 });
 
-it('reclaims a lock older than staleMs even when its recorded pid is alive', () => {
+it('keeps a live owner at 120 seconds and reclaims it past the default 10 minute hard cap', () => {
   const { dir } = setup(); const file = join(dir, 'cache.json');
-  expect(acquireBuildQueueLock({ file, now: 1_000, staleMs: 100, pid: process.pid })).toBeTypeOf('function');
-  expect(acquireBuildQueueLock({ file, now: 1_099, staleMs: 100 })).toBeNull();
-  const release = acquireBuildQueueLock({ file, now: 1_101, staleMs: 100 });
+  expect(acquireBuildQueueLock({ file, now: 1_000, pid: process.pid })).toBeTypeOf('function');
+  const owner = fs.readFileSync(`${file}.lock/owner.json`, 'utf8');
+  expect(acquireBuildQueueLock({ file, now: 121_000 })).toBeNull();
+  expect(acquireBuildQueueLock({ file, now: 600_999 })).toBeNull();
+  expect(fs.readFileSync(`${file}.lock/owner.json`, 'utf8')).toBe(owner);
+  const release = acquireBuildQueueLock({ file, now: 701_000 });
   expect(release).toBeTypeOf('function');
   try {
-    expect(acquireBuildQueueLock({ file, now: 1_102, staleMs: 100 })).toBeNull();
+    expect(acquireBuildQueueLock({ file, now: 701_001 })).toBeNull();
   } finally { release(); }
 });
 
@@ -121,18 +126,18 @@ it('returns null for live-owner contention without changing lock ownership', () 
   release();
 });
 
-it('fails open with a no-op release on filesystem acquisition errors', () => {
+it('returns null without leaving a lock on filesystem acquisition errors', () => {
   const { dir } = setup(); const parent = join(dir, 'not-a-directory');
   writeFileSync(parent, 'unchanged');
   const file = join(parent, 'cache.json');
   const release = acquireBuildQueueLock({ file });
-  expect(release).toBeTypeOf('function');
-  expect(() => release()).not.toThrow();
+  expect(release).toBeNull();
   expect(fs.readFileSync(parent, 'utf8')).toBe('unchanged');
   expect(existsSync(`${file}.lock`)).toBe(false);
+  expect(existsSync(`${file}.lock.guard`)).toBe(false);
 });
 
-it('fails open and cleans up when writing the lock owner fails', () => {
+it('returns null and cleans up when writing the lock owner fails', () => {
   const { dir } = setup(); const file = join(dir, 'cache.json');
   let attempted = false;
   const release = acquireBuildQueueLock({ file, io: { ...fs, writeFileSync(path, ...args) {
@@ -142,11 +147,46 @@ it('fails open and cleans up when writing the lock owner fails', () => {
     }
     return fs.writeFileSync(path, ...args);
   } } });
-  expect(release).toBeTypeOf('function');
-  expect(() => release()).not.toThrow();
+  expect(release).toBeNull();
   expect(attempted).toBe(true);
   expect(existsSync(`${file}.lock`)).toBe(false);
   expect(existsSync(`${file}.lock.guard`)).toBe(false);
+});
+
+it.each([undefined, '{invalid', 'null', '{}',
+  JSON.stringify({ pid: process.pid, at: 'old', token: 'owner' }),
+  JSON.stringify({ pid: 0, at: 0, token: 'owner' }),
+  JSON.stringify({ pid: process.pid, at: 0 }),
+])('returns null and preserves existing ownership for missing or malformed owner data: %s', content => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  mkdirSync(`${file}.lock`);
+  const ownerFile = `${file}.lock/owner.json`;
+  if (content !== undefined) writeFileSync(ownerFile, content);
+  expect(acquireBuildQueueLock({ file })).toBeNull();
+  expect(existsSync(`${file}.lock`)).toBe(true);
+  expect(existsSync(`${file}.lock.guard`)).toBe(false);
+  if (content === undefined) expect(existsSync(ownerFile)).toBe(false);
+  else expect(fs.readFileSync(ownerFile, 'utf8')).toBe(content);
+});
+
+it('returns null on an owner read error without changing the existing lock', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const release = acquireBuildQueueLock({ file });
+  const owner = fs.readFileSync(`${file}.lock/owner.json`, 'utf8');
+  expect(acquireBuildQueueLock({ file, io: { ...fs, readFileSync() {
+    throw Object.assign(new Error('denied'), { code: 'EACCES' });
+  } } })).toBeNull();
+  expect(fs.readFileSync(`${file}.lock/owner.json`, 'utf8')).toBe(owner);
+  expect(existsSync(`${file}.lock.guard`)).toBe(false);
+  release();
+});
+
+it('returns null on guard contention without creating a lock or removing the other guard', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  mkdirSync(`${file}.lock.guard`);
+  expect(acquireBuildQueueLock({ file })).toBeNull();
+  expect(existsSync(`${file}.lock`)).toBe(false);
+  expect(existsSync(`${file}.lock.guard`)).toBe(true);
 });
 
 it('serializes concurrent stale-lock recovery before a second contender can inspect the old owner', () => {
@@ -184,3 +224,98 @@ it('an old owner release cannot remove a replacement owner lock', () => {
   release();
   expect(existsSync(`${file}.lock`)).toBe(false);
 });
+
+it('single-flights real concurrent child processes so both print cached stdout after exactly one compute', async () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const counter = join(dir, 'computes.txt');
+  const stdout = '{"builds":[1]}\n';
+  const script = `
+    import { once } from 'node:events';
+    import { appendFileSync } from 'node:fs';
+    import { acquireBuildQueueLock, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache }
+      from ${JSON.stringify(pathToFileURL(resolve('scripts/lib/build-queue-cache.mjs')).href)};
+    const file = ${JSON.stringify(file)};
+    const key = 'shared-key';
+    const initial = readBuildQueueCache({ file, key });
+    // Both children must observe a miss before either starts acquisition.
+    const start = once(process, 'message');
+    process.send({ initial });
+    await start;
+    process.disconnect();
+    if (initial !== null) { process.stdout.write(initial); process.exit(0); }
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const release = acquireBuildQueueLock({ file });
+      if (release) {
+        try {
+          let fresh = readBuildQueueCache({ file, key });
+          if (fresh === null) {
+            appendFileSync(${JSON.stringify(counter)}, 'compute\\n');
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+            fresh = ${JSON.stringify(stdout)};
+            writeBuildQueueCache({ file, key, stdout: fresh });
+          }
+          process.stdout.write(fresh);
+        } finally { release(); }
+        break;
+      }
+      const cached = waitForBuildQueueCache({ file, key, timeoutMs: 100 });
+      if (cached !== null) { process.stdout.write(cached); break; }
+      if (Date.now() >= deadline) throw new Error('single-flight wait timed out');
+    }
+  `;
+  function startChild() {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    let output = ''; let errors = ''; let bytes = 0;
+    const ready = new Promise((resolve, reject) => {
+      child.once('message', resolve);
+      child.once('error', reject);
+      child.once('close', (code, signal) => reject(new Error('child exited before ready: ' + code + ' ' + signal + ' ' + errors)));
+    });
+    const result = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error('child timed out'));
+      }, 8_000);
+      for (const [stream, stderr] of [[child.stdout, false], [child.stderr, true]]) {
+        stream.on('data', chunk => {
+          bytes += chunk.length;
+          if (bytes > 64 * 1024) {
+            child.kill('SIGKILL');
+            reject(new Error('child output exceeded limit'));
+            return;
+          }
+          if (stderr) errors += chunk;
+          else output += chunk;
+        });
+      }
+      child.once('error', reject);
+      child.once('close', (code, signal) => {
+        clearTimeout(timer);
+        if (code === 0) resolve({ output, errors });
+        else reject(new Error('child failed: ' + code + ' ' + signal + ' ' + errors));
+      });
+    });
+    // Attach rejection handlers immediately, including while waiting for the ready barrier.
+    ready.catch(() => {});
+    result.catch(() => {});
+    return { child, ready, result };
+  }
+  const children = [startChild(), startChild()];
+  try {
+    expect(await Promise.all(children.map(({ ready }) => ready))).toEqual([{ initial: null }, { initial: null }]);
+    for (const { child } of children) child.send('start');
+    const results = await Promise.all(children.map(({ result }) => result));
+    expect(results).toEqual([{ output: stdout, errors: '' }, { output: stdout, errors: '' }]);
+    expect(fs.readFileSync(counter, 'utf8').split('\n')).toEqual(['compute', '']);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(existsSync(`${file}.lock.guard`)).toBe(false);
+  } finally {
+    for (const { child } of children) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+    await Promise.allSettled(children.map(({ result }) => result));
+  }
+}, 15_000);
