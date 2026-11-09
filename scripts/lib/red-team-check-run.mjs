@@ -1,6 +1,7 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
 import { runGhSync } from './gh-throttle.mjs';
 import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readRedTeamDisposition, parseRedTeamComment, redTeamResultId } from './red-team-gate.mjs';
@@ -104,6 +105,7 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
   holdFn = redTeamEnqueueHold } = {}) {
   let published = false;
   let clearingAttempted = false;
+  let ownershipUnconfirmed = false;
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
       return failure('invalid red-team check identity or WE_APP_ID; operator must inspect configuration');
@@ -161,8 +163,9 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
     // with our temporary hold and later clear that writer's protection.
     const existingHold = readRedTeamPublicationHoldFact({ repo, pr, headSha, gh });
     if (existingHold.ok !== true) throw Error(existingHold.reason);
+    const holdReason = `nonce=${randomUUID()} validating live red-team check publication`;
     const held = postRedTeamPublicationHold({ repo, pr, headSha, held: true,
-      reason: 'validating live red-team check publication', gh });
+      reason: holdReason, gh });
     if (!held.ok) throw Error(held.reason);
     let postedId;
     const posted = postRedTeamCheckRun({ repo, pr, headSha,
@@ -183,6 +186,18 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
     if (after[0] !== postedId || after.length !== before.length + 1
       || before.some((id, index) => after[index + 1] !== id))
       throw Error('another red-team check raced publication');
+    // This shared context may have been replaced during inspection. A nonce identifies our write;
+    // never clear (or overwrite on recovery) an absent, unreadable, or differently owned hold.
+    ownershipUnconfirmed = true;
+    const statuses = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions));
+    if (!Array.isArray(statuses) || statuses.length >= 100
+      || statuses.some(status => !Number.isSafeInteger(status?.id) || status.id <= 0))
+      throw Error('publication hold ownership unreadable or incomplete at 100-status bound; operator must inspect commit statuses');
+    const currentHold = statuses.filter(status => status.context === redTeamPublicationContext(pr))
+      .sort((a, b) => b.id - a.id)[0];
+    if (currentHold?.state !== 'failure' || currentHold.description !== `held: ${holdReason}`)
+      throw Error('publication hold ownership changed or absent; operator must inspect commit statuses');
+    ownershipUnconfirmed = false;
     clearingAttempted = true;
     const cleared = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh });
     if (!cleared.ok) throw Error(cleared.reason);
@@ -195,6 +210,7 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
       if (!supersede.ok || clearingAttempted) {
         // A lost clear response may have removed the hold, so restore it even if supersession worked.
         const failures = supersede.ok ? reason : `${reason}; ${supersede.reason}`;
+        if (ownershipUnconfirmed) return failure(failures);
         const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
         return failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}`);
       }

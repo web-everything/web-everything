@@ -49,13 +49,14 @@ describe('red-team check run contract', () => {
     // Check history stays behind the injected gh boundary; no test can reach GitHub.
     function fixture() {
       const checkRuns = [run({ conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' })];
-      return { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, env: {},
+      const io = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, env: {},
         readLive: vi.fn(() => ({ headRefOid: HEAD, labels: [] })),
         readComments: vi.fn(() => [resultComment()]),
         readStandingRuling: vi.fn(() => null),
         holdFn: vi.fn(() => null),
         gh: vi.fn((args, options) => {
-          if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
+          if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
+        if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
           if (args.includes('POST')) {
             checkRuns.push(run({ ...JSON.parse(options.input), id: 20 }));
@@ -66,12 +67,66 @@ describe('red-team check run contract', () => {
           throw Error(`unexpected GitHub read: ${JSON.stringify(args)}`);
         }),
       };
+      return io;
     }
     const allPosts = io => io.gh.mock.calls.filter(([args]) => args.includes('POST'));
     const posts = io => allPosts(io).filter(([args]) => args.includes('repos/o/r/check-runs'));
     const statusPosts = io => allPosts(io).filter(([args]) => args.includes(`repos/o/r/statuses/${HEAD}`));
     const payloads = io => posts(io).map(([, options]) => JSON.parse(options.input));
+    const publicationStatuses = io => statusPosts(io).map(([, options], index) => ({
+      ...JSON.parse(options.input), id: 50 + index, creator: { login: 'web-everything' },
+    })).reverse();
     const publish = io => api.publishRedTeamCheckFromLive(io);
+
+    it.each(['replaced', 'replaced-supersede-fails', 'absent', 'unreadable', 'read-error', 'wrong-state', 'full-page', 'oversized'])
+    ('does not clear a hold changed during inspection: %s', async mode => {
+      const io = fixture();
+      const gh = io.gh.getMockImplementation();
+      let inspected = false;
+      io.readLive.mockImplementation(() => {
+        if (posts(io).length) inspected = true;
+        return { headRefOid: HEAD, labels: [] };
+      });
+      io.gh.mockImplementation((args, options) => {
+        if (mode === 'replaced-supersede-fails' && args.includes('repos/o/r/check-runs')
+          && args.includes('POST') && JSON.parse(options.input).conclusion === 'failure')
+          throw Error('supersede denied');
+        if (inspected && args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) {
+          const own = publicationStatuses(io)[0];
+          if (mode === 'absent') return '[]';
+          if (mode === 'unreadable') return 'null';
+          if (mode === 'read-error') throw Error('hold history unavailable');
+          if (mode === 'wrong-state') return JSON.stringify([{ ...own, state: 'success' }]);
+          if (mode === 'oversized' || mode === 'full-page')
+            return JSON.stringify(Array.from({ length: mode === 'full-page' ? 100 : 101 }, (_, i) => ({ ...own, id: i + 1 })));
+          // Another writer's newer hold wins even though our nonce remains in history.
+          return JSON.stringify([own, { ...own, id: own.id + 1, description: 'held: another round owns this hold' }]);
+        }
+        return gh(args, options);
+      });
+      const out = await publish(io);
+      expect(out).toMatchObject({ ok: false });
+      if (mode === 'oversized' || mode === 'full-page') expect(out.reason).toMatch(/operator must inspect/i);
+      if (mode === 'replaced-supersede-fails') expect(out.reason).toContain('supersede denied');
+      expect(inspected).toBe(true);
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      expect(statusPosts(io).map(([, options]) => JSON.parse(options.input).state)).toEqual(['failure']);
+    });
+
+    it('sets a different identifying nonce for each call and checks its own hold after inspection', async () => {
+      const first = fixture(), second = fixture();
+      expect(await publish(first)).toMatchObject({ ok: true });
+      expect(await publish(second)).toMatchObject({ ok: true });
+      const description = io => JSON.parse(statusPosts(io)[0][1].input).description;
+      expect(description(first)).toMatch(/nonce=[a-f0-9-]+/);
+      expect(description(first)).not.toBe(description(second));
+      const calls = first.gh.mock.calls;
+      const clearIndex = calls.indexOf(statusPosts(first)[1]);
+      const ownReadIndex = calls.findLastIndex(([args]) => args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`));
+      expect(ownReadIndex).toBeGreaterThan(calls.indexOf(posts(first)[0]));
+      expect(ownReadIndex).toBeLessThan(clearIndex);
+      expect(first.gh.mock.invocationCallOrder[ownReadIndex]).toBeGreaterThan(first.readLive.mock.invocationCallOrder[1]);
+    });
 
     it.each(['failure', 'pending', 'unreadable-summary', 'unreadable-history', 'incomplete-summary', 'read-error'])
     ('refuses an existing or unreadable publication hold without any POSTs: %s', async mode => {
@@ -100,7 +155,7 @@ describe('red-team check run contract', () => {
       io.gh.mockImplementation((args, options) => {
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`))
           return JSON.stringify({ total_count: 1, statuses: [cleared] });
-        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify([cleared]);
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(statusPosts(io).length ? publicationStatuses(io) : [cleared]);
         return gh(args, options);
       });
       expect(await publish(io)).toMatchObject({ ok: true });
@@ -142,6 +197,7 @@ describe('red-team check run contract', () => {
       const io = fixture();
       const gh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) throw Error('hold denied');
         return gh(args, options);
@@ -179,7 +235,8 @@ describe('red-team check run contract', () => {
         let posted = false;
         const prior = beforeId === null ? [] : [run({ id: beforeId })];
         io.gh.mockImplementation(args => {
-          if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
+          if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
+        if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
           if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
           const check_runs = posted ? [...prior, intervening, run({ id: 20 })] : prior;
@@ -194,7 +251,8 @@ describe('red-team check run contract', () => {
       let posted = false;
       const prior = beforeId === null ? [] : [run({ id: beforeId })];
       io.gh.mockImplementation(args => {
-          if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
+          if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
+        if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
         if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
         const check_runs = posted ? [...prior, run({ id: 20 })] : prior;
@@ -225,6 +283,7 @@ describe('red-team check run contract', () => {
       const readGh = io.gh.getMockImplementation();
       let statusAttempts = 0;
       io.gh.mockImplementation((args, options) => {
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
           if (++statusAttempts > 1 && mode === 'both-fail') throw Error('hold response timed out');
@@ -270,6 +329,7 @@ describe('red-team check run contract', () => {
       io.readComments.mockReturnValue([{ ...resultComment(), created_at }]);
       const check_runs = [run({ conclusion: 'failure', completed_at, started_at })];
       io.gh.mockImplementation((args, options) => {
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
         if (args.includes('POST')) {
@@ -299,6 +359,7 @@ describe('red-team check run contract', () => {
       let statusAttempts = 0;
       io.gh.mockImplementation((args, options) => {
         if (!args.includes('POST')) return readGh(args, options);
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
           if (++statusAttempts > 1 && holdFails) throw Error('status write denied');
@@ -392,6 +453,7 @@ describe('red-team check run contract', () => {
       const readGh = io.gh.getMockImplementation();
       let posted = false;
       io.gh.mockImplementation((args, options) => {
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
         if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 + posts(io).length }); }
@@ -414,6 +476,7 @@ describe('red-team check run contract', () => {
       let posted = false;
       const readGh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
         if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
@@ -460,6 +523,7 @@ describe('red-team check run contract', () => {
       const io = fixture();
       const readGh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
+        if (args.includes(`repos/o/r/commits/${HEAD}/statuses?per_page=100`)) return JSON.stringify(publicationStatuses(io));
         if (args.includes(`repos/o/r/commits/${HEAD}/status?per_page=100`)) return JSON.stringify({ total_count: 0, statuses: [] });
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
         if (args.includes('POST')) throw Error('HTTP 403: check write denied');
