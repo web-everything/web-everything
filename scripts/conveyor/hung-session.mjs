@@ -425,10 +425,10 @@ export const DEFAULT_IDLE_FINISHED_THRESHOLD_MS = 10 * 60 * 1000;
  * period: this axis exists specifically for "the turn ended and nothing followed", so a session still mid a
  * tool call never counts as finished by this axis, at any age (the hung axis, with its own longer threshold and
  * grace multiplier, is still what eventually catches a session genuinely stuck mid a long call).
- * @param {{lastActivityMs:number, nowMs:number, thresholdMs:number, pendingToolUse?:boolean, rowIdle?:boolean}} o
+ * @param {{lastActivityMs:number, nowMs:number, thresholdMs:number, pendingToolUse?:boolean, rowIdle?:boolean, pendingGraceMs?:number}} o
  * @returns {{finished:boolean, reason:string, ageMs:number|null}}
  */
-export function classifyIdleFinished({ lastActivityMs, nowMs, thresholdMs, pendingToolUse = false, rowIdle = false } = {}) {
+export function classifyIdleFinished({ lastActivityMs, nowMs, thresholdMs, pendingToolUse = false, rowIdle = false, pendingGraceMs = null } = {}) {
   if (!Number.isFinite(lastActivityMs) || !Number.isFinite(nowMs) || !Number.isFinite(thresholdMs) || thresholdMs <= 0) {
     return { finished: false, reason: 'no-signal', ageMs: null };
   }
@@ -437,7 +437,9 @@ export function classifyIdleFinished({ lastActivityMs, nowMs, thresholdMs, pendi
   // A dangling (never-settling) tool call is overridden ONLY when the listing row itself says status:'idle' (the
   // harness reports nothing running; a genuinely mid-call session is busy, a permission wait is 'waiting') AND the
   // transcript has been silent past the window.
-  if (pendingToolUse) return rowIdle === true
+  // R794: the override also needs silence past the hung detector's full pending-call grace (`pendingGraceMs`);
+  // a missing/invalid grace fails closed.
+  if (pendingToolUse) return rowIdle === true && Number.isFinite(pendingGraceMs) && ageMs >= pendingGraceMs
     ? { finished: true, reason: 'idle-row-dangling-tool-call', ageMs }
     : { finished: false, reason: 'pending-tool-call', ageMs };
   return { finished: true, reason: 'turn-ended-idle', ageMs };
@@ -465,15 +467,21 @@ export function resolveIdleFinishedThresholdMs(env = process.env) {
  * @param {{cwd?:string, sessionId?:string}} agent
  * @param {number} nowMs
  * @param {number} thresholdMs
- * @param {{trustIdleRow?:boolean}} [opts] opt-in (reconcile only): an idle listing row overrides a dangling tool call; the reaper never sets it
+ * @param {{trustIdleRow?:boolean, pendingGraceMs?:number, freshStatusFor?:(agent:object)=>string}} [opts] (freshStatusFor = UNCACHED status read at decision time; missing/throwing fails closed) opt-in (reconcile only): an idle listing row overrides a dangling tool call; the reaper never sets it
  * @returns {{finished:boolean, reason:string, ageMs:number|null, transcriptPath?:string}}
  */
-export function readIdleFinishedInfo(agent, nowMs, thresholdMs, { trustIdleRow = false } = {}) {
+export function readIdleFinishedInfo(agent, nowMs, thresholdMs, { trustIdleRow = false, pendingGraceMs = null, freshStatusFor = null } = {}) {
   const tail = readTranscriptTailActivity(agent, { tailLines: READ_TAIL_LINES, maxBytes: READ_MAX_BYTES, fieldMax: READ_FIELD_MAX });
   if (!tail || tail.hadUnparseableLine) return { finished: false, reason: 'no-signal', ageMs: null };
 
   const pendingToolUse = detectBlockedOnChild(tail.entries).pending === true;
-  const verdict = classifyIdleFinished({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse, rowIdle: trustIdleRow === true && agent?.status === 'idle' });
+  const verdict = classifyIdleFinished({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse, pendingGraceMs, rowIdle: trustIdleRow === true && agent?.status === 'idle' });
+  if (verdict.reason === 'idle-row-dangling-tool-call') {
+    // Decision time: the cached listing is not enough; re-read the status uncached and fail closed.
+    let fresh = null;
+    try { fresh = typeof freshStatusFor === 'function' ? freshStatusFor(agent) : null; } catch { fresh = null; }
+    if (fresh !== 'idle') return { finished: false, reason: 'pending-tool-call', ageMs: verdict.ageMs, transcriptPath: tail.file };
+  }
   return { ...verdict, transcriptPath: tail.file };
 }
 

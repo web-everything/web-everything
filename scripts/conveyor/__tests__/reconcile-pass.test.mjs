@@ -1709,3 +1709,13 @@ it('holderStartedBy: null for a wrapped worker, the parsed start for any other r
   expect(holderStartedBy({ startedAt: 'nope' }, startedAtMs)).toBeNull();
   expect(holderStartedBy(null, startedAtMs)).toBeNull();
 });
+
+describe('freshAgentStatus — uncached status read at decision time', () => {
+  it('returns the row status for the matching sessionId; unreadable/absent fails closed to null', async () => {
+    const { freshAgentStatus } = await import('../reconcile-pass.mjs');
+    const exec = () => JSON.stringify([{ sessionId: 'a', status: 'busy' }, { sessionId: 'b', status: 'idle' }]);
+    expect(freshAgentStatus({ sessionId: 'b' }, exec)).toBe('idle');
+    expect(freshAgentStatus({ sessionId: 'zzz' }, exec)).toBeNull();
+    expect(freshAgentStatus({ sessionId: 'b' }, () => { throw new Error('x'); })).toBeNull();
+  });
+});
