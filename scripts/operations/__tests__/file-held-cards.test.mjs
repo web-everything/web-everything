@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync, linkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync, linkSync, chmodSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -285,6 +286,55 @@ it('a closed card with the same title does not suppress a fresh handoff', async 
   const result = await run();
   expect(result.duplicates).toHaveLength(0);
   expect(result.filed).toHaveLength(1);
+});
+
+it('body status examples do not suppress live-card duplicate detection', async () => {
+  seed('- [R1] 2026-11-08: Repair behavior');
+  // Open front matter; the resolved status appears only as a quoted example in the body (LF and CRLF files).
+  writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: open\n---\n# Repair behavior\n\nExample:\n\nstatus: resolved\n');
+  writeFileSync(join(root, 'backlog', '8-live-crlf.md'), '---\r\nstatus: open\r\n---\r\n# Other thing\r\n\r\nstatus: closed\r\n');
+  // A card with no front matter at all is live, even with a status-looking body line.
+  writeFileSync(join(root, 'backlog', '7-bare.md'), '# Bare card\n\nstatus: dropped\n');
+  seed('- [R1] 2026-11-08: Repair behavior\n- [R2] 2026-11-08: Other thing\n- [R3] 2026-11-08: Bare card');
+  const result = await run();
+  expect(fileItem).not.toHaveBeenCalled();
+  expect(result.filed).toHaveLength(0);
+  expect(result.duplicates.map(entry => entry.tag).sort()).toEqual(['R1', 'R2', 'R3']);
+});
+
+it.skipIf(process.getuid?.() === 0)('stops before filing the next card when the ledger append fails', async () => {
+  seed('- [R1] 2026-11-08: one');
+  await run();
+  expect(fileItem).toHaveBeenCalledTimes(1);
+  // The ledger can be read but not appended to: the first card of the next batch files, then the append fails.
+  chmodSync(ledger, 0o444);
+  seed('- [R2] 2026-11-08: two\n- [R3] 2026-11-08: three');
+  await expect(run()).rejects.toThrow(/EACCES|EPERM|permission/i);
+  expect(fileItem).toHaveBeenCalledTimes(2);
+  chmodSync(ledger, 0o644);
+  expect(readFileSync(ledger, 'utf8').trim().split('\n')).toHaveLength(1);
+});
+
+it('resolves a ledgered birth hash through bornAs only on origin/main, and refuses an unrelated remote bornAs', async () => {
+  seed('- [R1] 2026-11-08: one');
+  await run();
+  rmSync(join(root, 'backlog', 'xtest.md'));
+  writeFileSync(ledger, JSON.stringify({ ...JSON.parse(readFileSync(ledger, 'utf8').trim()), card: 'x56mcj7' }) + '\n');
+  seed('- [R1] 2026-11-08: one\n- [R1] 2026-11-08: two');
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd: root, stdio: 'ignore' });
+  git('init', '-q');
+  writeFileSync(join(root, 'backlog', '4413-other.md'), '---\nbornAs: xabcdef\n---\n\n# Other\n');
+  git('add', 'backlog/4413-other.md');
+  git('commit', '-q', '-m', 'unrelated');
+  git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  rmSync(join(root, 'backlog', '4413-other.md')); // committed on origin/main only, not in the checkout
+  await expect(run()).rejects.toThrow(/ledgered card/);
+  writeFileSync(join(root, 'backlog', '4414-real.md'), '---\nbornAs: x56mcj7\n---\n\n# Real\n');
+  git('add', 'backlog/4414-real.md');
+  git('commit', '-q', '-m', 'renumbered');
+  git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  rmSync(join(root, 'backlog', '4414-real.md'));
+  await expect(run({ dryRun: true })).resolves.toBeDefined();
 });
 
 it('one filed plus one refused card exits non-zero', () => {

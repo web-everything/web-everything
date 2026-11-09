@@ -83,11 +83,22 @@ export function qualifyBareBasenames(text, trackedFiles) {
 // resolve through that front-matter line, here and on origin/main.
 const BIRTH_HASH = /^x[0-9a-z]{6}$/;
 
+/** A card's leading front-matter block (between the first two `---` lines), or null; body lines never count. */
+function frontMatterBlock(text) {
+  return text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] ?? null;
+}
+
+/** The finished-card `status:` inside the leading front-matter block only; a body example never counts. */
+function isFinishedCard(text) {
+  const block = frontMatterBlock(text);
+  return block !== null && /^status:\s*["']?(resolved|closed|dropped|rejected|superseded|wontfix)/m.test(block);
+}
+
 /** The `bornAs` value inside a card's leading front-matter block only; a body line quoting one never counts. */
 function frontMatterBornAs(text) {
-  const block = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-  if (!block) return null;
-  const line = block[1].split(/\r?\n/).find(text => /^bornAs:/.test(text));
+  const block = frontMatterBlock(text);
+  if (block === null) return null;
+  const line = block.split(/\r?\n/).find(text => /^bornAs:/.test(text));
   return line ? line.replace(/^bornAs:\s*/, '').trim().replace(/^["']|["']$/g, '') : null;
 }
 
@@ -211,7 +222,7 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     const title = content.match(/^#\s+(.+)$/m)?.[1];
     if (!title) continue; // legacy untitled cards cannot be title-matched; they never block a run
     // A finished card does not cover a fresh handoff: only live cards suppress a same-titled line.
-    if (/^status:\s*["']?(resolved|closed|dropped|rejected|superseded|wontfix)/m.test(content)) continue;
+    if (isFinishedCard(content)) continue;
     titles.set(titleKey(title), name);
   }
   const result = { planned: [], filed: [], duplicates: [], refused: [], failed: [] };
