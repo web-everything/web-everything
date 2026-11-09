@@ -170,6 +170,21 @@ function pathCandidates(file, anchors = new Set()) {
   const raw = pathCandidate(file);
   if (raw === null) return null;
   const out = new Set([raw]);
+  // PR #6381 self-review: a model may escape a character inside a name (markdown `review\-x.mjs`, `%2B`, `&#43;`), so the
+  // report is also read with those ASCII escapes decoded. Like every other form, it only adds candidates.
+  for (const text of new Set([file, unescapeAscii(file)])) if (!addCandidates(text, anchors, out)) return null;
+  return [...out];
+}
+/** ASCII-only decoding of the escapes a model writes inside a name: `%XX`, numeric HTML entities, a markdown `\` escape. */
+const unescapeAscii = s => s
+  .replace(/%([0-7][0-9A-Fa-f])/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+  .replace(/&#(?:[xX]([0-9A-Fa-f]{1,2})|(\d{1,3}));/g, (m, h, d) => {
+    const n = h ? parseInt(h, 16) : Number(d);
+    return n < 0x80 ? String.fromCharCode(n) : m;
+  })
+  .replace(/\\([!-/:-@[-`{-~])/g, '$1');
+/** Adds every candidate `file` yields to `out`; false when the report cannot be established (callers fail closed). */
+function addCandidates(file, anchors, out) {
   // PR #6381 referral (block): a character that NFKC keeps split the folded token, so an explicitly named module
   // matched no glob. Listing such characters always misses the next one (a format character, then a lookalike dash,
   // then a combining mark), so the fold maps the separators a path uses and then REFUSES what is left: a token that
@@ -182,7 +197,7 @@ function pathCandidates(file, anchors = new Set()) {
   // bracket inside a name, a box-drawing slash in place of every `/`). Non-ASCII prose (no ASCII letter) still passes.
   const folded = foldPathText(file);
   const cores = folded.split(/\s+/u).map(run => run.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, ''));
-  if (cores.some(core => /[^\x00-\x7f]/.test(core) && /[A-Za-z]/.test(core))) return null;
+  if (cores.some(core => /[^\x00-\x7f]/.test(core) && /[A-Za-z]/.test(core))) return false;
   // Forms: the raw report, the fold, the fold without whitespace, and the fold keeping only path characters, so any
   // splitter inside a name (a gap, a bracket, `,`, `!`, `:`, a symbol stripped above as an edge) joins it up again.
   const joined = folded.replace(/\s/gu, '');
@@ -194,36 +209,38 @@ function pathCandidates(file, anchors = new Set()) {
   // legal name such as custom/a+b.mjs never matched once quoted, line-suffixed or diff-prefixed. Adding characters to
   // the regex always misses the next one, so the cores are tokens too: only their edges were trimmed, so every
   // interior character stays. Wrapping prose may still sit inside a core (`"a+b.mjs":12`, `[x](a+b.mjs)`, `a+b.mjs?x=1`,
-  // two names joined by `,`), and no list of those characters is complete either, so the core is cut at EVERY
-  // punctuation or symbol that is not a path character, and every run between two cuts, edges trimmed again, is a
-  // token. The cores are taken from a second fold too, where a dropped invisible or line separator is a gap rather than
-  // nothing, so prose it glued onto a name is cut off. More candidates than the bound still fail closed.
+  // two names joined by `,`), and no list of those characters is complete either, so each whitespace run is cut at
+  // EVERY punctuation or symbol that is not a path character, and every span between two cuts that reads as a path (a
+  // letter and a `/`, `\` or `.`) is a token; a span of prose (`render(`, `label,`) only spends the candidate bound. The run is cut untrimmed, so a name that itself starts or ends with such a character (`+a.mjs`, `a.mjs+`)
+  // keeps it in some span. The runs are taken from a second fold too, where a dropped invisible or line separator is a
+  // gap rather than nothing, so prose it glued onto a name is cut off. The whitespace-joined form is a token as it
+  // stands, never cut: cutting a whole report would pair every two marks in it. More candidates still fail closed.
   const edges = s => s.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
-  const spacedCores = foldPathText(file, ' ').split(/\s+/u).map(edges);
-  for (const core of new Set([...cores, ...spacedCores, edges(joined)])) {
-    if (core === '') continue;
+  tokens.push(...cores, edges(joined));
+  for (const run of new Set([...folded.split(/\s+/u), ...foldPathText(file, ' ').split(/\s+/u)])) {
     const cuts = [-1];
-    for (let i = 0; i < core.length; i++) if (/[^\p{L}\p{N}\p{M}_.\-/\\]/u.test(core[i])) cuts.push(i);
-    // Runs grow with the square of the cuts: a core with more cuts than the candidate bound fails closed (protected).
-    if (cuts.length > MAX_CANDIDATES + 1) return null;
-    cuts.push(core.length);
+    for (let i = 0; i < run.length; i++) if (/[^\p{L}\p{N}\p{M}_.\-/\\]/u.test(run[i])) cuts.push(i);
+    // Spans grow with the square of the cuts: a run with more cuts than the candidate bound fails closed (protected).
+    if (cuts.length > MAX_CANDIDATES + 1) return false;
+    cuts.push(run.length);
     for (let a = 0; a < cuts.length - 1; a++) {
       for (let b = a + 1; b < cuts.length; b++) {
-        const span = edges(core.slice(cuts[a] + 1, cuts[b]));
-        if (span !== '') tokens.push(span);
+        const span = run.slice(cuts[a] + 1, cuts[b]);
+        if (/[./\\]/.test(span) && /\p{L}/u.test(span)) tokens.push(span);
       }
     }
   }
   for (const token of tokens) {
+    if (token === '') continue;
     const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
     for (let i = 0; i < segs.length; i++) {
       if (i > 0 && !anchors.has(segs[i].toLowerCase())) continue;
       const c = pathCandidate(segs.slice(i).join('/'));
       if (c !== null) out.add(c);
-      if (out.size > MAX_CANDIDATES) return null;
+      if (out.size > MAX_CANDIDATES) return false;
     }
   }
-  return [...out];
+  return true;
 }
 /** The literal first folder of each glob (`scripts` of `scripts/**\/x`); a glob that starts with a wildcard names none. */
 const anchorsOf = patterns => new Set(patterns.map(p => p.toLowerCase().split('/')[0]).filter(s => s !== '' && !s.includes('*')));

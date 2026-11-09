@@ -283,8 +283,8 @@ describe('R473 pure classified verdict', () => {
       expect(layered.verdict).toBe('WEAKENED');
       expect(layered.ships).toEqual([]);
       // A report cut so often that its runs pass the candidate bound fails closed into recheck (X2, human adjudication)
-      // instead of a block: still protected, never shipped. Every PLUS and QUOTED form stays within the bound.
-      expect([...ids(layered.blocks), ...(file.includes(MIXED) ? ids(layered.recheck) : [])]).toContain('f1');
+      // instead of a block: still protected, never shipped. Every PLUS form stays within the bound.
+      expect([...ids(layered.blocks), ...(file.includes(PLUS) ? [] : ids(layered.recheck))]).toContain('f1');
       expect((await compute([f], options('prerelease', { guardFloorPaths: GUARDED }))).verdict).toBe('WEAKENED');
     });
     it.each(['custom/a.mjs', 'custom/b.mjs', 'custom/x@y.mjs', 'custom/it.mjs', ...wrapped('custom/ab.mjs')])(
@@ -292,7 +292,34 @@ describe('R473 pure classified verdict', () => {
         expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
           .toBe('NOT WEAKENED');
       });
-    // The runs between cuts grow with the square of the cuts, so a core cut more often than the candidate bound allows
+    // Second self-review: a protected name that itself starts or ends with punctuation lost that character to the edge
+    // trim once wrapped, and an escaped character inside a name (markdown `\-`, `%2B`, `&#43;`) split it.
+    it.each([['custom/a.mjs+', ['"custom/a.mjs+":12', 'custom/a.mjs+:12', '`custom/a.mjs+`', '+++ b/custom/a.mjs+', '(custom/a.mjs+)', 'custom/a.mjs+ ']],
+      ['.custom/a+b.mjs', ['.custom/a+b.mjs:12', '".custom/a+b.mjs"']], ['+a.mjs', ['+a.mjs:12', '"+a.mjs"']], ['_a+b.mjs', ['_a+b.mjs:12']],
+      ['custom/a+b.mjs_', ['"custom/a+b.mjs_":3']],
+      ['custom/a+b.mjs', ['custom/a\\+b.mjs', 'custom/a%2Bb.mjs', 'custom/a%2bb.mjs:12', 'custom/a&#43;b.mjs', 'custom/a&#x2B;b.mjs', '"custom/a&#43;b.mjs":12']],
+      ['custom/a_b.mjs', ['custom/a\\_b.mjs']]])('a protected %j stays WEAKENED in every wrapper', async (guard, files) => {
+      for (const file of files) {
+        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: [guard] }))).verdict, file).toBe('WEAKENED');
+      }
+    });
+    it.each(['scripts/lib/review\\-independence.mjs', 'scripts/lib/review%2Dindependence.mjs', 'scripts/lib/review&#45;independence.mjs',
+      '"scripts/lib/review\\-independence.mjs":12'])('the guard-floor module escaped as %j still never ships', async file => {
+      const r = await compute([finding({ class: 'E2', file })], options('prerelease'));
+      expect(r.verdict).toBe('WEAKENED');
+      expect(r.ships).toEqual([]);
+    });
+    // Second self-review: cutting the whole whitespace-joined report paired every two marks in it, so an ordinary
+    // multi-file or prose report passed the candidate bound and failed closed. Only whitespace runs are cut.
+    it.each(['src/a.ts:12:4, src/b.ts:13:5, src/c.ts:14:6',
+      'src/lib/format.ts (the function formatDate, called from render(), returns the wrong value when the label is empty, see line 12, col 4)',
+      'In src/lib/format.ts, the helper (formatLabel) drops the label; it is called by renderRow, renderCell, and renderHeader.',
+      'src/components/merge-button.ts:12', 'a/b/c-d-e-f-g.test.mjs:10:5', 'src/x.ts (lines 12-14, 20-22, 30-31)'])(
+      'an ordinary unprotected report %j still ships', async file => {
+        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
+          .toBe('NOT WEAKENED');
+      });
+    // The spans between cuts grow with the square of the cuts, so a core cut more often than the candidate bound allows
     // fails closed (protected, an operator-visible block), at bounded cost; one just under it is still judged.
     it('a core with more cuts than the candidate bound fails closed at bounded cost', async () => {
       const started = Date.now();
