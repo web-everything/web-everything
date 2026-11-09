@@ -623,9 +623,9 @@ describe('repairCloneRefs cost and noise', () => {
 });
 
 describe('fetch paths call the repair first', () => {
-  it('selfSyncCheckout prunes a dangling remote-tracking ref', () => {
+  it('selfSyncCheckout prunes a dangling remote-tracking ref', async () => {
     plant('refs/remotes/origin/lane/gone');
-    selfSyncCheckout({ root: clone });
+    await selfSyncCheckout({ root: clone });
     expect(existsSync(join(clone, '.git/refs/remotes/origin/lane/gone'))).toBe(false);
   });
   it('mergeOverlayRef prunes a dangling remote-tracking ref before fetching the overlay', () => {
@@ -633,9 +633,9 @@ describe('fetch paths call the repair first', () => {
     mergeOverlayRef({ root: clone, ref: 'main' });
     expect(existsSync(join(clone, '.git/refs/remotes/origin/lane/gone'))).toBe(false);
   });
-  it('selfSyncCheckoutPoc prunes a dangling remote-tracking ref', () => {
+  it('selfSyncCheckoutPoc prunes a dangling remote-tracking ref', async () => {
     plant('refs/remotes/origin/lane/gone');
-    selfSyncCheckoutPoc({ root: clone, pocBranch: 'main' });
+    await selfSyncCheckoutPoc({ root: clone, pocBranch: 'main' });
     expect(existsSync(join(clone, '.git/refs/remotes/origin/lane/gone'))).toBe(false);
   });
 });
@@ -660,7 +660,7 @@ describe('every daemon fetch site repairs first', () => {
     ['scripts/lib/daemon-rebuild/prepare.mjs', /Step 2: fetch/],
     ['scripts/lane-drain.mjs', /function syncMain\(/],
     ['scripts/lane-drain.mjs', /function readResolveReachable\(/],
-    ['scripts/lib/daemon-self-sync.mjs', /export function selfSyncCheckoutPoc\(/],
+    ['scripts/lib/daemon-self-sync.mjs', /export async function selfSyncCheckoutPoc\(/],
   ])('%s %s', (file, re) => {
     expect(repairsBeforeFetch(body(file, re))).toBe(true);
   });

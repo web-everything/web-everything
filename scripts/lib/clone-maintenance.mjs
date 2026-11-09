@@ -1,7 +1,7 @@
 /** Idle, serialized maintenance of one daemon clone. Never prunes recent objects. */
-import { execFile } from 'node:child_process';
-import { lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { execFileSync, spawn } from 'node:child_process';
+import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { basename, join, resolve, sep } from 'node:path';
 import { cloneLockKey, inspectCloneLock, withWriteLock } from './daemon-clone-lock.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
@@ -10,6 +10,52 @@ import { readSettings } from './settings-files.mjs';
 import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-rebuild/rebuild-job.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
+
+/** Resolve linked worktrees too; unreadable evidence must stop object maintenance. */
+export function maintenanceGitDir(root) {
+  const dot = join(root, '.git');
+  const entry = lstatSync(dot);
+  if (entry.isSymbolicLink()) {
+    try { return realpathSync(dot); } catch { throw new Error('unreadable linked git directory'); }
+  }
+  if (entry.isDirectory()) return realpathSync(dot);
+  const target = /^gitdir: (.+)$/m.exec(readFileSync(dot, 'utf8'))?.[1];
+  if (!target) throw new Error('unreadable git directory');
+  try { return realpathSync(resolve(root, target)); } catch { throw new Error('unreadable worktree git directory'); }
+}
+
+/** A lock or a live Git cwd blocks maintenance. Missing process evidence is not idle. */
+export function cloneGitIsBusy(root, { exec = execFileSync } = {}) {
+  const gitDir = maintenanceGitDir(root);
+  try { statSync(join(gitDir, 'index.lock')); return true; }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const opts = { encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 };
+  const processes = exec('ps', ['-axo', 'pid=,comm='], opts);
+  if (!String(processes).trim()) throw new Error('unreadable process table');
+  const pids = String(processes).split('\n').flatMap(line => {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (line.trim() && !match) throw new Error('incomplete process table');
+    return match && /^git(?:-|$)/.test(basename(match[2].trim())) ? [match[1]] : [];
+  });
+  if (!pids.length) return false;
+  const output = exec('lsof', ['-n', '-a', '-p', pids.join(','), '-d', 'cwd', '-Fn'], opts);
+  if (!String(output).includes('\nn')) throw new Error('unreadable Git cwd evidence');
+  const checkout = realpathSync(root);
+  const prefix = checkout.endsWith(sep) ? checkout : `${checkout}${sep}`;
+  const pending = new Set(pids);
+  let pid = null;
+  let busy = false;
+  for (const line of String(output).split('\n')) {
+    if (line.startsWith('p')) { pid = line.slice(1); continue; }
+    if (!line.startsWith('n') || !pending.has(pid)) continue;
+    const cwd = realpathSync(line.slice(1));
+    pending.delete(pid);
+    if (cwd === checkout || cwd.startsWith(prefix)) busy = true;
+  }
+  // lsof may succeed with partial results (for example, if a process exited).
+  // Only complete cwd evidence can establish that every Git process is elsewhere.
+  return busy || pending.size > 0;
+}
 
 export const CLONE_MAINTENANCE_INTERVAL_ENV = 'WE_DAEMON_CLONE_MAINTENANCE_INTERVAL_MS';
 const DAY = 24 * 60 * 60 * 1000;
@@ -38,7 +84,7 @@ export function cloneHasRebuildJob(root, env = process.env) {
 }
 
 // Async so the lock's heartbeat remains live during a large pack. Bound output and runtime.
-function git(args, opts) {
+export function runMaintenanceGit(args, opts) {
   return new Promise((resolve) => {
     // Git forks repack/prune. Kill the entire group on timeout/output overflow, so
     // a surviving repack cannot write after this callback releases the clone lock.
@@ -46,13 +92,32 @@ function git(args, opts) {
     const killGroup = () => {
       if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already exited */ } }
     };
-    const child = execFile('git', args, { ...opts, detached: true, encoding: 'utf8', maxBuffer: 64 * 1024, killSignal: 'SIGKILL' },
-      (error, stdout) => {
-        clearTimeout(timer);
-        if (error) killGroup();
-        resolve({ status: error ? 1 : 0, stdout });
-      });
-    timer = setTimeout(killGroup, 30 * 60_000);
+    // execFile does not forward detached to spawn; use spawn directly so the
+    // child's PID really is the process-group ID targeted by killGroup.
+    const child = spawn('git', args, { ...opts, timeout: 0, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const chunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let failed = false;
+    const stop = () => { failed = true; killGroup(); };
+    child.stdout.on('data', chunk => {
+      if (failed) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > 64 * 1024) { stop(); return; }
+      chunks.push(chunk);
+    });
+    child.stderr.on('data', chunk => {
+      if (failed) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > 64 * 1024) stop();
+    });
+    child.on('error', () => { failed = true; });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (failed || code !== 0) killGroup();
+      resolve({ status: failed || code !== 0 ? 1 : 0, stdout: Buffer.concat(chunks).toString('utf8') });
+    });
+    timer = setTimeout(stop, opts.timeout ?? 30 * 60_000);
     timer.unref();
   });
 }
@@ -75,7 +140,7 @@ function readStamp(path) {
  * `hasRebuildJob` must return exactly false to authorize maintenance and is checked again under lock.
  */
 export async function maybeMaintainClone({
-  root, env = process.env, now = Date.now, run = git, emitEvent = appendDaemonEvent,
+  root, env = process.env, now = Date.now, run = runMaintenanceGit, emitEvent = appendDaemonEvent,
   settings, hasRebuildJob = () => cloneHasRebuildJob(root, env), withLock = withWriteLock,
 } = {}) {
   const start = now();

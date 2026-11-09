@@ -13,6 +13,7 @@ import { createReviewJobIo, dispatchReviewJob, runReviewJob, runReviewJobCli } f
 import { newRunRecord, resolveRunsDir } from '../run-store.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { runRedTeam, runExtraSeatsCli } from '../review-extra-seats.mjs';
+import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { resumeRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 
 const interruption = vi.hoisted(() => ({ boundary: null }));
@@ -620,7 +621,8 @@ it.each(['stale-recovery', 'failed-seat-retry'].flatMap(kind => [false, true].ma
     readStatus: () => evidence.readRedTeamStatus(f.key), readEvidence: () => ({ loopPayload: f.readWitness().newest,
       inFlight: false, queued: false, recorded: f.seats.length > 0, seatRecorded: f.seats.length > 0,
       completedRecorded: false, failedSeatCount: f.seats.length }),
-    setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(),
+    // Pin the historical cooldown: a freshly superseding writer has not earned a refill.
+    setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
     recoveryOptions: { now: Date.now(), probe: f.probe, deadlineMs: 1000 } });
   expect(next[0].action).toBe(superseded ? 'skip' : 'dispatch');
   if (!superseded) expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
@@ -728,4 +730,117 @@ describe('foreign-host stale window setting reaches every recovery entry point',
     expect(result.rows[0]).toMatchObject({ action: 'skip', why: 'owner live or age unknown' });
     expect(dispatch).not.toHaveBeenCalled();
   });
+});
+
+// R754: an old marker represents one abandonment; refills retain that history.
+function spentRecovery() {
+  const f = fixture();
+  expect(f.abandon().ok).toBe(true);
+  f.admit();
+  const now = Date.now(), abandonedAt = new Date(now - 31 * 60_000).toISOString();
+  const markerPath = `${f.path}.stale-redispatch-1`;
+  const { abandonments: _history, ...legacy } = JSON.parse(readFileSync(markerPath, 'utf8'));
+  const marker = { ...legacy, abandonedAt };
+  writeFileSync(markerPath, JSON.stringify(marker));
+  const options = { now, probe: f.probe, deadlineMs: 1000,
+    setting: { retryCooldownMin: 30, staleRedispatchDailyCap: 3 } };
+  return { ...f, now, marker, markerPath, options,
+    plan: () => recovery.planRedTeamRecovery(f.readWitness(), options) };
+}
+
+it('R754 refills a stale no-result writer past cooldown and appends legacy history', () => {
+  const f = spentRecovery();
+  expect(f.plan()).toMatchObject({ mode: 'fresh', abandon: true, refill: true });
+  expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, now: () => f.now,
+    probe: f.probe, deadlineMs: 1000, setting: f.options.setting }).ok).toBe(true);
+  expect(JSON.parse(readFileSync(f.markerPath, 'utf8')).abandonments)
+    .toEqual([f.marker.abandonedAt, new Date(f.now).toISOString()]);
+  expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+});
+
+it('R754 holds a spent stale writer within cooldown', () => {
+  const f = spentRecovery(); f.options.now -= 2 * 60_000;
+  expect(f.plan()).toMatchObject({ mode: 'skip', why: 'stale re-dispatch cooldown active' });
+});
+
+it.each(['writer findings', 'seat findings', 'completed seat', 'result'])('R754 never refills with %s', kind => {
+  const f = spentRecovery();
+  if (kind === 'seat findings' || kind === 'completed seat') f.seats.push({ dispatchKind: 'review-seat', seat: 'red-team',
+    repo, pr, rev: head, status: kind === 'completed seat' ? 'ok' : 'unparseable',
+    ...(kind === 'seat findings' ? { findings: [{ text: 'found' }] } : {}) });
+  else writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed,
+    ...(kind === 'result' ? { result: 'failed' } : { findings: [{ text: 'found' }] }) }));
+  expect(f.plan()).toMatchObject({ mode: 'skip', why: 'stale re-dispatch already spent' });
+});
+
+it('R754 daily cap escalates through the existing mechanism once per head across ticks', () => {
+  const f = spentRecovery(), publishNeedsYou = vi.fn();
+  writeFileSync(f.markerPath, JSON.stringify({ ...f.marker,
+    abandonments: [f.marker.abandonedAt, f.marker.abandonedAt, f.marker.abandonedAt] }));
+  for (let tick = 0; tick < 2; tick++) {
+    const [row] = recovery.planRedTeamOnSkip({ repo,
+      refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+      rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readWitness: f.readWitness,
+      setting: { enabled: true, ...f.options.setting }, lastDispatch: new Map(), recoveryOptions: f.options });
+    expect(row).toMatchObject({ action: 'skip', why: 'stale re-dispatch daily cap reached',
+      escalate: true, escalationContext: expect.any(String) });
+    settleRedTeamSkip({ repo, pr, head, redTeam: { status: 'skipped', reason: row.why },
+      io: { env: f.env, publishNeedsYou } });
+  }
+  expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+});
+
+it.each(['timestamp', 'history timestamp', 'shape', 'missing now', 'run unreadable', 'marker unreadable'])(
+  'R754 holds on %s', kind => {
+    const f = spentRecovery();
+    if (kind === 'timestamp') writeFileSync(f.markerPath, JSON.stringify({ ...f.marker, abandonedAt: 'invalid' }));
+    if (kind === 'history timestamp') writeFileSync(f.markerPath, JSON.stringify({ ...f.marker, abandonments: ['invalid', f.marker.abandonedAt] }));
+    if (kind === 'shape') writeFileSync(f.markerPath, JSON.stringify({ abandonedAt: f.marker.abandonedAt }));
+    if (kind === 'missing now') delete f.options.now;
+    if (kind === 'run unreadable') writeFileSync(f.run, '{');
+    if (kind === 'marker unreadable') writeFileSync(f.markerPath, '{');
+    expect(recovery.planRedTeamOnSkip({ repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+      rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readWitness: f.readWitness,
+      setting: { enabled: true, ...f.options.setting }, lastDispatch: new Map(), recoveryOptions: f.options })[0].action).toBe('skip');
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, now: () => f.options.now,
+      probe: f.probe, deadlineMs: 1000, setting: f.options.setting }).ok).toBe(false);
+  });
+
+it('R754 allows refill at the exact cooldown boundary', () => {
+  const f = spentRecovery(); f.options.now = Date.parse(f.marker.abandonedAt) + 30 * 60_000;
+  expect(f.plan()).toMatchObject({ mode: 'fresh', refill: true });
+});
+
+it('R754 expires abandonments at the 24-hour boundary', () => {
+  const f = spentRecovery();
+  const old = new Date(f.now - 86_400_000).toISOString();
+  writeFileSync(f.markerPath, JSON.stringify({ ...f.marker, abandonments: [old, old, f.marker.abandonedAt] }));
+  expect(f.plan()).toMatchObject({ mode: 'fresh', refill: true });
+});
+
+it.each(['before marker', 'after marker', 'before writer', 'after writer'])(
+  'R754 refill preserves one spend across interruption %s', boundary => {
+    const f = spentRecovery();
+    const abandon = () => recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness,
+      now: () => f.now, probe: f.probe, deadlineMs: 1000, setting: f.options.setting });
+    interruption.boundary = boundary;
+    expect(abandon().ok).toBe(false);
+    interruption.boundary = null;
+    expect(abandon().ok).toBe(true);
+    expect(JSON.parse(readFileSync(f.markerPath, 'utf8')).abandonments)
+      .toEqual([f.marker.abandonedAt, new Date(f.now).toISOString()]);
+    expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+  });
+
+it.each(['after marker', 'after writer'])('R754 holds an interrupted refill whose history is unreadable (%s)', boundary => {
+  const f = spentRecovery();
+  const abandon = () => recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness,
+    now: () => f.now, probe: f.probe, deadlineMs: 1000, setting: f.options.setting });
+  interruption.boundary = boundary;
+  expect(abandon().ok).toBe(false);
+  interruption.boundary = null;
+  const marker = JSON.parse(readFileSync(f.markerPath, 'utf8'));
+  writeFileSync(f.markerPath, JSON.stringify({ ...marker, abandonments: ['unreadable'] }));
+  expect(f.plan()).toMatchObject({ mode: 'skip', why: 'stale re-dispatch evidence unreadable; inspect stored evidence' });
+  expect(abandon().ok).toBe(false);
 });

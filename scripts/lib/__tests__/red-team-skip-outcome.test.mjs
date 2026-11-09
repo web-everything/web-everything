@@ -277,3 +277,48 @@ describe('stored-review not-owed settlement context', () => {
     expect(f.io.postComment).not.toHaveBeenCalled();
   });
 });
+
+
+describe('stored-review not-owed rule (R730)', () => {
+  const rule = 'stored-review-not-owed';
+  const review = (rev, verdict = { verdict: 'changes', humanRequired: false }) =>
+    ({ newest: { verdict, findings: { read: { netBasis: { rev } } } } });
+  const reasons = [
+    ['reported not-owed', { status: 'not-owed' }],
+    ['stored review does not owe', { status: 'skipped', reason: 'stored review does not owe a red team' }],
+  ];
+  it.each(reasons)('%s settles when the exact-head stored review owes none, naming the rule', (_n, redTeam) => {
+    const f = fixture(); f.io.readStoredReview = vi.fn(() => review(head));
+    expect(f.settle(redTeam)).toMatchObject({ outcome: 'policy-clear', rule });
+    expect(f.io.readStoredReview).toHaveBeenCalledWith({ repo, pr, head });
+    expect(f.comments[0].body).toContain(rule);
+    expect(redTeamForHead(f.comments, pr, head)).not.toBeNull();
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+  it.each(reasons)('%s with an older-head review stays with the operator', (_n, redTeam) => {
+    const f = fixture(); f.io.readStoredReview = () => review('b'.repeat(40));
+    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+  });
+  it.each([['missing', () => null], ['no verdict', () => review(head, null)], ['throws', () => { throw Error('x'); }],
+    ['empty verdict', () => review(head, {})], ['array verdict', () => review(head, [])],
+    ['bogus verdict', () => review(head, { verdict: 'bogus' })],
+    ['incomplete advisory evidence', () => review(head, { verdict: 'needs-human', humanRequired: true })],
+    ['owed', () => review(head, { verdict: 'accept' })], ['reader failed', () => ({ ok: false })]])(
+    'a %s stored review stays with the operator', (_n, read) => {
+      const f = fixture(); f.io.readStoredReview = read;
+      expect(f.settle({ status: 'not-owed' }).outcome).toBe('non-policy');
+      expect(f.io.postComment).not.toHaveBeenCalled();
+      expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+    });
+  it('unbound read head, deferral and other reasons never use the rule', () => {
+    for (const [redTeam, ctx] of [[{ status: 'not-owed' }, { readHead: 'b'.repeat(40) }],
+      [{ status: 'not-owed', deferredByCap: true }, {}],
+      [{ status: 'skipped', reason: 'provider unavailable' }, {}]]) {
+      const f = fixture(); f.io.readStoredReview = vi.fn(() => review(head));
+      expect(f.settle(redTeam, ctx).outcome).toBe('non-policy');
+      expect(f.io.postComment).not.toHaveBeenCalled();
+    }
+  });
+});
