@@ -826,6 +826,8 @@ describe('wakeRun settles a permanent guard refusal exactly as driveRun does', (
     const report = await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
     expect(report.advanced).toBe(true);
     expect(report.status).toBe('complete');
+    // Not silent: the refusal is reported once so the wake CLI exits non-zero, as driveRun's effect-refused does.
+    expect(report.errors.map((e) => e.error)).toEqual([REFUSAL]);
     const saved = store.read('run-r');
     expect(saved.outcome).toBe('refused');
     expect(saved.pending).toBeNull();
@@ -833,6 +835,7 @@ describe('wakeRun settles a permanent guard refusal exactly as driveRun does', (
 
     const again = await wakeRun(saved, { observers, store, registry: reg, sinks: sinksFor(guard) });
     expect(again.status).toBe('complete');
+    expect(again.errors).toEqual([]);
     expect(store.read('run-r').outcome).toBe('refused');
   });
 
