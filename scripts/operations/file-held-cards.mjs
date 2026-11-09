@@ -87,7 +87,7 @@ export function composeFileItemInput(card) {
   const flat = card.text.replace(/\s+/g, ' ').trim();
   const title = flat.length <= 110 ? flat : flat.slice(0, 110).replace(/\s+\S*$/, '').replace(/[\s,;:—–-]+$/, '') + '…';
   const paths = [...card.text.matchAll(/\bwe:[A-Za-z0-9_./*-]+/g)].map(m => m[0].replace(/[.,;:!?]+$/, ''));
-  return { title, digest: card.text, kind: 'task', size: '1', queue: 'false',
+  return { title, digest: card.text, kind: 'task', queue: 'false',
     ...(paths.length ? { scope: [...new Set(paths)].join(',') } : {}) };
 }
 
