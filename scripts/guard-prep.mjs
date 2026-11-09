@@ -2,7 +2,7 @@
 /** PreToolUse(Agent|Task) prep gate. Decisions are pure; the stdin boundary fails OPEN. */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { isPrepExempt, logPrepEvent, PREP_BUILD_VERB, prepVerdict } from './lib/prep-block.mjs';
+import { isPrepExempt, logPrepEvent, PREP_BUILD_VERB, prepVerdict, slotVerdict } from './lib/prep-block.mjs';
 
 function applies(event) {
   const type = event?.tool_input?.subagent_type;
@@ -18,8 +18,10 @@ function applies(event) {
 function evaluatePrep(event) {
   if (!applies(event)) return { decision: null, verdict: null };
   const verdict = prepVerdict(event.tool_input.prompt);
-  const decision = verdict.ok ? null : { hookSpecificOutput: {
-    hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: verdict.reason,
+  const slot = slotVerdict(event.tool_input.prompt);
+  const reasons = [verdict, slot].filter((result) => !result.ok).map((result) => result.reason);
+  const decision = reasons.length === 0 ? null : { hookSpecificOutput: {
+    hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reasons.join('\n'),
   } };
   return { decision, verdict };
 }

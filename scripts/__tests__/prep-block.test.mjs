@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isPrepExempt, logPrepEvent, parsePrep, prepVerdict } from '../lib/prep-block.mjs';
+import { isPrepExempt, logPrepEvent, parsePrep, prepVerdict, slotVerdict } from '../lib/prep-block.mjs';
 
 const prep = 'PREP:\nAcceptance: observable outcome\nPre-mortem: parser may fail\nFiles: scripts/example.mjs\nTests: focused unit tests';
 
@@ -155,5 +155,38 @@ describe('prep block', () => {
       expect(Number.isNaN(Date.parse(entries[0].ts))).toBe(false);
       expect(() => logPrepEvent({ kind: 'waiver', detail: 'x' }, { logPath: dir })).not.toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('slot verdict', () => {
+  it.each([undefined, null, 123, {}, '', 'Slot:', 'Slot: unknown: concrete placement', 'Slot: plan:x'])('refuses missing, empty or invalid Slot %j with all accepted forms', (text) => {
+    expect(slotVerdict(text)).toEqual({ ok: false, waived: false, reason: expect.stringMatching(/^Slot required \(.*\)/) });
+    for (const form of ['Slot: plan:<item>', 'Slot: blocker:<what it unblocks>', 'Slot: operator:<quoted placement>', 'Slot: waived — <reason>']) {
+      expect(slotVerdict(text).reason).toContain(form);
+    }
+  });
+  it.each(['plan:backlog item 123', 'blocker:unblocks parser work', 'operator:"place after parser"'])('accepts Slot: %s', (value) => {
+    expect(slotVerdict(`Slot: ${value}`)).toEqual({ ok: true, reason: '', waived: false });
+  });
+  it.each(['Slot:', '**sLoT:**', '- **SLOT:**', '* Slot:', '+ Slot:', '## - **Slot:**'])('accepts case and PREP markdown syntax %s', (key) => {
+    expect(slotVerdict(`Brief prose\r\n${key} plan:incident\r\nMore prose`).ok).toBe(true);
+  });
+  it.each(['plan:', 'blocker:', 'operator:', 'waived — '])('requires a non-placeholder eight-character value after %s', (prefix) => {
+    for (const value of ['', 'x', 'a b c d e f g', '**blocked**', 'tbd', 'TODO', 'n/a', 'none', '........', '<placement>', '**<placement>**', '<item> <other item>']) {
+      expect(slotVerdict(`Slot: ${prefix}${value}`).ok).toBe(false);
+    }
+    expect(slotVerdict(`Slot: ${prefix}a b c d e f g h`).ok).toBe(true);
+    expect(slotVerdict(`Slot: ${prefix}**incident**`).ok).toBe(true);
+  });
+  it.each(['—', '–', '-'])('accepts a reasoned Slot waiver with %s', (dash) => {
+    expect(slotVerdict(`- **sLoT:** waived ${dash} urgent incident`)).toEqual({ ok: true, reason: 'urgent incident', waived: true });
+  });
+  it.each(['Slot: waived', 'Slot: waived urgent incident', 'Slot: plan:\nconcrete item', 'Prose Slot: plan:concrete item'])('refuses malformed or non-line Slot %j', (text) => {
+    expect(slotVerdict(text).ok).toBe(false);
+  });
+  it('keeps prepVerdict independent of Slot for PR bodies', () => {
+    expect(prepVerdict(prep)).toEqual({ ok: true, reason: '', waived: false });
+    expect(prepVerdict('Slot: plan:concrete item').ok).toBe(false);
   });
 });

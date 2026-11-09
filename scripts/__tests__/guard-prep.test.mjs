@@ -9,11 +9,33 @@ import * as prepBlock from '../lib/prep-block.mjs';
 
 const prompt = 'Build the feature and open-pr';
 const event = (text = prompt, subagent_type = 'worker') => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { prompt: text, subagent_type } });
-const prep = '\nPREP:\nAcceptance: visible outcome\nPre-mortem: missing events\nFiles: scripts/example.mjs\nTests: focused unit tests';
+const slot = '\nSlot: plan:backlog item 123';
+const prepOnly = '\nPREP:\nAcceptance: visible outcome\nPre-mortem: missing events\nFiles: scripts/example.mjs\nTests: focused unit tests';
+const prep = slot + prepOnly;
 const here = dirname(fileURLToPath(import.meta.url));
 const guard = join(here, '..', 'guard-prep.mjs');
 
 describe('guard-prep', () => {
+  it('refuses complete PREP without Slot', () => {
+    expect(decide(event(prompt + prepOnly))).toMatchObject({ hookSpecificOutput: {
+      permissionDecision: 'deny', permissionDecisionReason: expect.stringMatching(/^Slot required/),
+    } });
+  });
+  it.each(['plan:backlog item 123', 'blocker:unblocks parser work', 'operator:"place after parser"', 'waived — urgent incident', 'waived - urgent incident', 'waived – urgent incident'])('allows complete PREP and Slot: %s', (value) => {
+    expect(decide(event(`${prompt}\nSlot: ${value}${prepOnly}`))).toBeNull();
+  });
+  it('refuses Slot: plan:x despite complete PREP', () => {
+    expect(decide(event(`${prompt}\nSlot: plan:x${prepOnly}`))?.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+  it('combines failed PREP and Slot reasons in evaluation order', () => {
+    expect(decide(event()).hookSpecificOutput.permissionDecisionReason)
+      .toBe(`${prepBlock.prepVerdict(prompt).reason}\n${prepBlock.slotVerdict(prompt).reason}`);
+  });
+  it('still requires PREP with a valid Slot and Slot with a PREP waiver', () => {
+    expect(decide(event(prompt + slot))?.hookSpecificOutput.permissionDecisionReason).toMatch(/^Prep required/);
+    expect(decide(event(prompt + '\nprep: waived — urgent incident'))?.hookSpecificOutput.permissionDecisionReason).toMatch(/^Slot required/);
+  });
+
   it.each(['Build locally', 'Fix the parser bug', 'Implement retry logic and commit'])('denies build/fix dispatch without publication wording: %s', (text) => {
     expect(decide(event(text))?.hookSpecificOutput.permissionDecision).toBe('deny');
   });
@@ -45,7 +67,7 @@ describe('guard-prep', () => {
   });
   it('allows complete prep and a reasoned waiver', () => {
     expect(decide(event(prompt + prep))).toBeNull();
-    expect(decide(event(prompt + '\nprep: waived — urgent incident'))).toBeNull();
+    expect(decide(event(prompt + slot + '\nprep: waived — urgent incident'))).toBeNull();
   });
   it.each(['', 'TODO', '........'])('denies empty/placeholder heading %j', (text) => {
     expect(decide(event(prompt + prep.replace('visible outcome', text)))).not.toBeNull();
@@ -113,10 +135,10 @@ describe('guard-prep', () => {
         .mockImplementation(() => { throw new Error('verdict computed twice'); });
       const exemption = vi.spyOn(prepBlock, 'isPrepExempt');
       try {
-        runHook({ read: () => JSON.stringify(event(prompt + '\nprep: waived — urgent incident')), logPath, stdout: (text) => output.push(text) });
+        runHook({ read: () => JSON.stringify(event(prompt + slot + '\nprep: waived — urgent incident')), logPath, stdout: (text) => output.push(text) });
         expect(output).toEqual([]);
         expect(JSON.parse(readFileSync(logPath, 'utf8'))).toMatchObject({ kind: 'waiver', detail: 'urgent incident' });
-        expect(verdict.mock.calls).toEqual([[prompt + '\nprep: waived — urgent incident']]);
+        expect(verdict.mock.calls).toEqual([[prompt + slot + '\nprep: waived — urgent incident']]);
         expect(exemption).toHaveBeenCalledOnce();
       } finally { verdict.mockRestore(); exemption.mockRestore(); }
     } finally { rmSync(dir, { recursive: true, force: true }); }
