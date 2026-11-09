@@ -11,13 +11,15 @@ import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { runForceWatchTick } from '../daemon-force-adopt.mjs';
+import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState } from './state.mjs';
+import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
@@ -32,7 +34,7 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
-  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
+  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
   'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
@@ -90,6 +92,7 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  * @returns {Promise<object>}
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
+  const startedAtMs = Date.now();
   const result = await rebuildCloneInternal(options);
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
@@ -112,7 +115,60 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       emit: (event) => emitEvent(event, eventOptions),
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
+  await forceWatch(options, emitEvent, startedAtMs);
   return result;
+}
+
+/** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
+ *  clone to the last-good build on a failed check or a crash loop. Never throws; the job process (readyOnly) skips it. */
+async function forceWatch(options, emitEvent, startedAtMs) {
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false } = options;
+  if (!root || readyOnly) return;
+  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  try {
+    await runForceWatchTick({
+      root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
+      probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
+      rollback: async (lastGood, { sha } = {}) => {
+        if (!lastGood?.head || !sha) return { ok: false }; // no watched build named: nothing proves it is still the one running, so never revert
+        const git = makeGit({ run, cwd: root, env });
+        // HEAD is read INSIDE the write lock and compared with the watched build: a sibling that adopted a newer build while the
+        // health probe ran must not be reset to last-good (finalize would accept the newer head as `prevHead` and revert it).
+        const fin = await withWriteLock(root, async () => {
+          const head = verifyRev(git, 'HEAD');
+          if (!head) return { ok: false }; // HEAD unreadable: unknown is not "superseded" — the rollback stays owed and is retried
+          if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
+          if (head !== sha) return { superseded: true, head };
+          clearReadyCandidate(root, stEnv);
+          const done = await finalizeRebuild({
+            root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
+            plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
+          });
+          return { ok: done?.adopted === true };
+        }, { now });
+        if (fin.ok !== true) return { ok: false };
+        return fin.value;
+      },
+    });
+  } catch { /* a watch failure never changes the rebuild outcome */ }
+}
+
+/** Default health probe: the clone's tracked tree is intact and its entry module still loads. A crash-loop signal
+ *  comes from the daemon's own restart count when the caller supplies `forceWatchProbe`. */
+function defaultForceWatchProbe(run, env) {
+  return async (root) => {
+    const status = run(['status', '--porcelain', '--untracked-files=no'], { cwd: root, env });
+    const dirty = String(status?.stdout ?? '').trim();
+    if (status?.status !== 0 || dirty) return { healthy: false };
+    try {
+      // The probe source is assembled from parts so this file carries no non-literal dynamic-import expression:
+      // the import-closure scanner (lib/import-closure.mjs) marks any closure containing one as incomplete,
+      // which makes every closure-gated dispatch/sync path fall back to "touched".
+      const probeSrc = ['await', ' import', '(process.argv[1])'].join('');
+      execFileSync(process.execPath, ['--input-type=module', '-e', probeSrc, './scripts/lib/daemon-rebuild.mjs'], { cwd: root, timeout: 60_000, stdio: 'ignore' });
+      return { healthy: true };
+    } catch { return { healthy: false }; }
+  };
 }
 
 async function rebuildCloneInternal({

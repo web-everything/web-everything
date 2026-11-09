@@ -95,6 +95,7 @@ import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operation
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
+import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -618,6 +619,7 @@ export function runReviewTick({
   const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
   const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
     ? Math.max(0, liveReviewBudget.left) : Infinity;
+  const initialReviewCapacity = remainingReviewCapacity();
   const dispatchable = [];
   let occupiedLanes = 0;
   const dispatched = [];
@@ -662,6 +664,36 @@ export function runReviewTick({
       scopeBloatRefreshed.push({ prNumber: row.prNumber, ok: result?.ok === true, action: result?.action ?? null });
     }
   }
+  let redTeamOnSkipResult;
+  const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
+  const recoverRedTeam = (recoveryStarts) => {
+    if (paused || typeof redTeamOnSkip !== 'function') return;
+    const recoveryLanes = Math.max(0, acquirable - occupiedLanes);
+    let taken = 0;
+    const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
+      take: () => { taken++; if (typeof host.take === 'function') host.take(1); } };
+    try {
+      // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
+      // guard. For red-team recovery they are also already reviewed; the recovery planner still
+      // requires an accepting, head-bound payload and checks comments, status and cooldown.
+      // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
+      const recoveryRefusals = (plan.refusals ?? []).map(row =>
+        row.kind === 'nothing-owed' && row.phase === 'queued'
+          ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
+          : row);
+      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
+        capacity, paused });
+    } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
+    finally {
+      // Recovery reports the same start through multiple counters; count it only once, even on error.
+      // An unbounded budget (Infinity) minus itself is NaN, which would poison every later `>=` limit check
+      // and silently disable host-start enforcement; an unbounded or garbage reading spent nothing.
+      const spent = (before, after) => { const n = before - after; return Number.isFinite(n) ? Math.max(0, n) : 0; };
+      occupiedLanes += Math.max(taken, spent(recoveryStarts, capacity.remainingStarts), spent(recoveryLanes, capacity.lanes));
+    }
+  };
+  // Reserve recovery-first capacity only when ordinary reviews can still get a host start.
+  if (reservedRecoveryStarts > 0) recoverRedTeam(reservedRecoveryStarts);
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,
   // and `onTick` reads both shapes.
   const notStarted = [];
@@ -707,38 +739,26 @@ export function runReviewTick({
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
   }
-  let redTeamOnSkipResult;
-  if (!paused && typeof redTeamOnSkip === 'function') {
-    try {
-      // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
-      // guard. For red-team recovery they are also already reviewed; the recovery planner still
-      // requires an accepting, head-bound payload and checks comments, status and cooldown.
-      // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
-      const recoveryRefusals = (plan.refusals ?? []).map(row =>
-        row.kind === 'nothing-owed' && row.phase === 'queued'
-          ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
-          : row);
-      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
-        capacity: { lanes: Math.max(0, acquirable - occupiedLanes), budget: liveReviewBudget,
-          remainingStarts: Math.max(0, hostLimit - occupiedLanes),
-          take: () => { if (typeof host.take === 'function') host.take(1); } }, paused });
-    } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
-  }
+  if (reservedRecoveryStarts === 0) recoverRedTeam(Math.max(0, hostLimit - occupiedLanes));
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
-  const hostBound = !paused && (!host.admitted || (hostLimit < acquirable && hostLimit - occupiedLanes <= liveCap));
-  const capBound = !paused && !hostBound && liveCap < acquirable - occupiedLanes;
+  const live = liveReviewBudget?.live + (initialReviewCapacity - liveCap);
+  const capReason = Number.isFinite(live)
+    ? liveReviewBudget?.reason?.replace(/live review rounds \d+ of /, `live review rounds ${live} of `)
+    : liveReviewBudget?.reason;
+  const hostBound = !paused && (!host.admitted || hostLimit - occupiedLanes <= 0);
+  const capBound = !paused && !hostBound && liveCap === 0;
   const deferredTotal = reviews.length - dispatchable.length;
   const deferredForHost = hostBound ? deferredTotal : 0;
   const deferredForCap = capBound ? deferredTotal : 0;
   const deferredForLanes = paused || hostBound || capBound ? 0 : deferredTotal;
   const deferredForAuth = paused ? deferredTotal : 0;
   const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
-    : hostBound ? `review owed, but held by host admission (${host.reason ?? 'per-tick dispatch budget exhausted'})`
-    : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
+    : hostBound ? `review owed, but held by host admission (${host.reason ?? 'host start budget exhausted'})`
+    : capBound ? `review owed, but held by the live-review cap (${capReason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
       : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
-  if (deferredForCap && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${liveReviewBudget.reason}\n`);
+  if (deferredForCap && capReason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${capReason}\n`);
   if (deferredForHost) process.stderr.write(`review-daemon: ${deferredForHost} owed review(s) queued — ${deferReason}\n`);
   if (poolExhaustion && !paused) {
     try {
@@ -787,7 +807,7 @@ export function runReviewTick({
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
     }),
-    reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (liveReviewBudget?.reason ?? null) : null,
+    reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (capReason ?? null) : null,
     deferredForAuth, deferredForHost, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
@@ -1242,8 +1262,15 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
     acquirableLanes: defaultAcquirableLaneNumbers, readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     liveReviewBudget: liveReviewRoundBudget(),
-    redTeamOnSkip: o => runRedTeamOnSkip({ ...o,
-      dispatch: d => dispatchReviewJob(d), log: line => log.error(line) }),
+    redTeamOnSkip: o => {
+      let rawPrs = o.rawPrs;
+      try {
+        ({ rawPrs } = syncResultOnHeadLabels({ repo: o.repo, refusals: o.plan?.refusals,
+          rawPrs, log: line => log.error(line) }));
+      } catch { /* Label repair must never block red-team recovery. */ }
+      return runRedTeamOnSkip({ ...o, rawPrs,
+        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) });
+    },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,
     postRefreshMarker: defaultPostRebaseComment,
