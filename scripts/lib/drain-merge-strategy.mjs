@@ -332,6 +332,27 @@ export function createDrainMergeStrategy({
   const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels,reviews'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
   const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
+  // A successful check is a snapshot: live rulings and comments can restore a break hold on the same head.
+  // Check-run mode needs this disposition decision at each admission boundary, without legacy waits or label sync.
+  const checkRunDispositionHold = (c, head, live) => {
+    let reason;
+    try {
+      let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head, env });
+      if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) throw new Error('unreadable evidence');
+      const pages = readThreadPages(c.repo, c.num);
+      if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error('unreadable complete comments');
+      const comments = pages.flat();
+      const standingRuling = grantScopeFor(c, head, comments);
+      evidence = settleUnknownEvidenceByComment(evidence, comments, c.num, head, live.reviews);
+      reason = redTeamEnqueueHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
+      // The check owns pending/wait states; confirmed breaks and unknown evidence still fail closed.
+      if (!reason || (!reason.includes('requiring send-back') && evidence.ok !== false)) return null;
+    } catch {
+      reason = 'red-team evidence unreadable; hold and inspect run evidence and complete comments';
+    }
+    say(`  merge-queue: defer #${c.num}: ${reason}`);
+    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason, healthSmell: false };
+  };
   const removeSentBack = (repo, num, labels) => {
     if (dryRun || !safety.value.dequeueOnSendBack || !Array.isArray(labels)) return;
     const reason = sendBackReason(labels);
@@ -435,7 +456,7 @@ export function createDrainMergeStrategy({
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
       if (checkRunOnly) {
-        const hold = checkRunAdmission(c, headSha, before);
+        const hold = checkRunAdmission(c, headSha, before) || checkRunDispositionHold(c, headSha, live);
         if (hold) return hold;
       }
       let admissionLabels = queueLabels(live.labels);
@@ -632,8 +653,8 @@ export function createDrainMergeStrategy({
       if (poison) return poison;
       if (checkRunOnly) {
         // One fresh check read closes the gap since the initial success observation.
-        // This also rechecks the publication marker without scanning status or runs.
-        const hold = checkRunAdmission(c, headSha, before);
+        // Recheck the publication marker and live disposition before the enqueue mutation.
+        const hold = checkRunAdmission(c, headSha, before) || checkRunDispositionHold(c, headSha, fresh);
         if (hold) return hold;
       }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
