@@ -136,6 +136,10 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     // A carried WEAKENED with the live head's own net-diff fingerprint is the same change: a newer pass cannot supersede it.
     if (carriedWeak.some((d) => carriesAcross(d.record.fingerprint, liveFp) || !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
   }
+  // D2: EVERY WEAKENED on a carried head with the live fingerprint counts, not only the one findAudit picks per base, so
+  // a later fingerprint-less WEAKENED can never hide an earlier matching one. Current question only: a prior-question
+  // WEAKENED is judged by findAudit's newer-than-the-pass rule above.
+  if (list.some((r) => typeof r?.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head && r.questionHash === QUESTION_HASH && isWeak(r) && carriesAcross(r.fingerprint, liveFp))) return { ok: false, reason: 'weakened' };
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;

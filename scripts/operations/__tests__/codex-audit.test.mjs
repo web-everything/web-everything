@@ -306,6 +306,8 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     const f = seq('garbage');
     f.deps.appendRecord.mockRejectedValue(new Error('disk'));
     expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.errors.join('')).toMatch(/Audit record write failed/);
+    expect(f.output).toEqual([]);
   });
 
   it('NOT WEAKENED then a Codex failure exits 3 and prints nothing', async () => {

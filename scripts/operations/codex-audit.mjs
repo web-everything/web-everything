@@ -157,7 +157,7 @@ export async function main(argv, deps) {
         try {
           await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base, questionHash: QUESTION_HASH,
             verdict: 'WEAKENED', findings: [note], runs, unparseable: true, ...(fp ? { fingerprint: fp } : {}) });
-        } catch { /* exit 3 below either way */ }
+        } catch { deps.stderr('Audit record write failed; repair the record path and retry.\n'); }
         throw new Error('unparseable run');
       }
       runs.push(parsed.verdict);

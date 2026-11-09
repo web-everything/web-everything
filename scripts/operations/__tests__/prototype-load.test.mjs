@@ -2094,6 +2094,13 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
       expect(carried(weak, newer)).toEqual({ ok: false, reason: 'weakened' });
     });
+    it('a later fingerprint-less WEAKENED never hides an earlier matching-fingerprint WEAKENED (every WEAKENED counts)', () => {
+      const matching = old({ base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z' });
+      const later = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z' });
+      const live = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
+      expect(carried(matching, later, live)).toEqual({ ok: false, reason: 'weakened' });
+      expect(carried(later, matching, live)).toEqual({ ok: false, reason: 'weakened' });
+    });
     it('an unknown-time WEAKENED is not masked by an older dated WEAKENED on the carried head', () => {
       const dated = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z' });
       const undated = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: 'not-a-date' });
