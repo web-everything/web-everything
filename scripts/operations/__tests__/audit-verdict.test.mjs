@@ -953,7 +953,14 @@ describe('R473 structured concurrency evidence', () => {
         `scripts/lib/git-hook${String.fromCodePoint(cp)}surface.mjs`, `scripts/lib/git-hook-surface${String.fromCodePoint(cp)}.mjs`]),
       ['scripts', 'lib', 'review-independence'].join(String.fromCodePoint(0x2571)) + `${String.fromCodePoint(0xa4f8)}mjs`,
       ['scripts', 'lib', 'git-hook-surface'].join(String.fromCodePoint(0x2571)) + `${String.fromCodePoint(0xa60e)}mjs`,
-      ['.github', 'workflows', 'ci.yml'].join(String.fromCodePoint(0x2571))])(
+      ['.github', 'workflows', 'ci.yml'].join(String.fromCodePoint(0x2571)),
+      // Third self-review: a punctuation or symbol character beside an inserted space was stripped as a run edge but
+      // still split the joined forms; ASCII splitters (`,`, `!`, `:`, `<`) split a name the same way.
+      ...[0xa1, 0xa9, 0xb1, 0xa7, 0xbf].flatMap(cp => [`scripts/lib/review- ${String.fromCodePoint(cp)}independence.mjs`,
+        `scripts/lib/review-${String.fromCodePoint(cp)} independence.mjs`, `scripts/lib/review- ${String.fromCodePoint(cp)} independence.mjs`,
+        `.claude/settings${String.fromCodePoint(cp)} .json`, `.github ${String.fromCodePoint(cp)}/workflows/x.yml`]),
+      'scripts/lib/review,-independence.mjs', 'scripts/lib/review!-independence.mjs', '.claude/settings:.json', '.github/work<flows/x.yml',
+      'scripts/lib/review- !independence.mjs', 'scripts/lib/git-hook;-surface.mjs'])(
       'a protected file reported as %j still never ships', async file => {
         for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
       });

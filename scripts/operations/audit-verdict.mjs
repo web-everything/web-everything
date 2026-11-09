@@ -183,10 +183,10 @@ function pathCandidates(file, anchors = new Set()) {
   const folded = foldPathText(file);
   const cores = folded.split(/\s+/u).map(run => run.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, ''));
   if (cores.some(core => /[^\x00-\x7f]/.test(core) && /[A-Za-z]/.test(core))) return null;
-  // Forms: the raw report, the fold, and the fold without whitespace, and also without quotes and brackets (a gap or a
-  // bracket inside a name joins up again).
+  // Forms: the raw report, the fold, the fold without whitespace, and the fold keeping only path characters, so any
+  // splitter inside a name (a gap, a bracket, `,`, `!`, `:`, a symbol stripped above as an edge) joins it up again.
   const joined = folded.replace(/\s/gu, '');
-  for (const form of new Set([file, folded, joined, joined.replace(/[\p{Pi}\p{Pf}\p{Ps}\p{Pe}"'`]/gu, '')])) {
+  for (const form of new Set([file, folded, joined, folded.replace(/[^\p{L}\p{N}\p{M}_.\-/\\]/gu, '')])) {
     for (const token of form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []) {
       const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
       for (let i = 0; i < segs.length; i++) {
