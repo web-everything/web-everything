@@ -68,13 +68,15 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   for (let record of records) {
     if (record?.head !== head || record.base !== base) continue;
     // D2: a record whose own runs list holds a WEAKENED is WEAKENED, whatever its verdict field says.
-    if (record.verdict === 'NOT WEAKENED' && Array.isArray(record.runs) && record.runs.includes('WEAKENED')) record = { ...record, verdict: 'WEAKENED' };
+    // Its findings are not checked for contradictions: the runs already establish WEAKENED, so it must block.
+    let runsWeak = false;
+    if (record.verdict === 'NOT WEAKENED' && Array.isArray(record.runs) && record.runs.includes('WEAKENED')) { record = { ...record, verdict: 'WEAKENED' }; runsWeak = true; }
     const isCurrent = record.questionHash === QUESTION_HASH;
     // Any matching current-question record, usable or not (bad timestamp, unknown verdict), blocks the prior fallback.
     if (isCurrent) sawCurrent = true;
     if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
-    if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
+    if (!runsWeak && Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
     // D2: a WEAKENED for this head/base/question is never superseded by a later pass.
     if (record.verdict === 'WEAKENED') {
       if (isCurrent && (!weakCurrent || Date.parse(record.at) >= Date.parse(weakCurrent.at))) weakCurrent = record;

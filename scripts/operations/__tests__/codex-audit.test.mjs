@@ -290,6 +290,12 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     } finally { settingsOverride.text = null; }
   });
 
+  it('a runs-WEAKENED record with contradictory findings still blocks and hides an older pass', () => {
+    const pass = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: '2026-11-01T00:00:00.000Z' };
+    const bad = { ...pass, runs: ['NOT WEAKENED', 'WEAKENED'], findings: ['NOT WEAKENED'], at: AT };
+    expect(findAudit([pass, bad], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toMatchObject({ verdict: 'WEAKENED', at: AT });
+  });
+
   it('findAudit treats a NOT WEAKENED record whose runs hold a WEAKENED as WEAKENED', () => {
     const bad = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', runs: ['NOT WEAKENED', 'WEAKENED'], at: AT };
     expect(findAudit([bad], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toMatchObject({ verdict: 'WEAKENED' });
