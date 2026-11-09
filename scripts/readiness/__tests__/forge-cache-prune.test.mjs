@@ -1,5 +1,5 @@
 // @vitest-environment node
-import {afterEach, beforeEach, describe, expect, it} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {renameSync, symlinkSync, openSync, closeSync} from 'node:fs';
 import {spawn, spawnSync} from 'node:child_process';
@@ -14,8 +14,18 @@ beforeEach(async () => {
   root = join(tmp, 'cache'); receipts = join(tmp, 'receipts');
   await fs.mkdir(root); await fs.mkdir(receipts);
 });
-afterEach(async () => { if (tmp) await fs.rm(tmp, {recursive: true, force: true}); });
+afterEach(async () => { vi.unstubAllEnvs(); if (tmp) await fs.rm(tmp, {recursive: true, force: true}); });
 
+const validEnv = {FORGE_CACHE_MAX_AGE_HOURS: '12', FORGE_CACHE_MAX_BYTES: String(200 * GiB),
+  FORGE_CACHE_HIGH_WATER_PCT: '80'};
+const settingFaults = Object.keys(validEnv).flatMap(variable =>
+  ['missing', 'invalid'].map(fault => ({variable, fault})));
+const faultyEnv = ({variable, fault}) => {
+  const env = {...validEnv};
+  if (fault === 'missing') delete env[variable];
+  else env[variable] = 'garbage';
+  return env;
+};
 const key = e => `${e.lock}/${e.name}`;
 const keys = entries => entries.map(key).sort();
 const entry = (c, age, bytes = 10, version = 5) => ({lock, name: `dev-v${version}-${hex(c)}`,
@@ -23,9 +33,9 @@ const entry = (c, age, bytes = 10, version = 5) => ({lock, name: `dev-v${version
 // The pure planner receives the same explicit root as the scanner/executor so
 // it can reject paths outside that boundary without accessing the filesystem.
 const plan = (entries, options = {}) => planPrune({root, entries, now,
-  settings: resolveSettings({}), disk: {usedPct: 20, totalBytes: 1000, usedBytes: 200},
+  settings: resolveSettings(validEnv), disk: {usedPct: 20, totalBytes: 1000, usedBytes: 200},
   live: {complete: true, profiles: new Set()}, ...options});
-const settings = overrides => ({...resolveSettings({}), ...overrides});
+const settings = overrides => ({...resolveSettings(validEnv), ...overrides});
 function expectDecision(result, prune, keep) {
   expect(keys(result.prune)).toEqual(keys(prune));
   expect(keys(result.keep)).toEqual(keys(keep));
@@ -49,6 +59,20 @@ async function json(path, value) {
   await fs.mkdir(join(path, '..'), {recursive: true});
   await fs.writeFile(path, JSON.stringify(value));
 }
+async function child(name, age, kind = 'file', contents = '1234567890') {
+  const path = join(root, lock, name);
+  await fs.mkdir(join(root, lock), {recursive: true});
+  if (kind === 'directory') {
+    await fs.mkdir(path);
+    await fs.writeFile(join(path, 'payload'), contents);
+  } else if (kind === 'symlink') await fs.symlink(contents, path);
+  else await fs.writeFile(path, contents);
+  const mtime = (now - age * HOUR) / 1000;
+  if (kind === 'symlink') await fs.lutimes(path, mtime, mtime);
+  else await fs.utimes(path, mtime, mtime);
+  return {lock, name, path, mtimeMs: (await fs.lstat(path)).mtimeMs,
+    bytes: kind === 'symlink' ? (await fs.lstat(path)).size : Buffer.byteLength(contents)};
+}
 async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active') {
   await json(join(receipts, worker, 'reservation.json'), {run});
   return run;
@@ -57,10 +81,11 @@ const record = siblings => ({lock, inputDigest: hex('b'), manifestDigest: hex('c
   manifest: siblings ? {siblings: {frontierui: {sha: 'd'.repeat(40)}}} : {}});
 
 describe('resolveSettings', () => {
-  it('defaults to bounded retention and reports default provenance', () => {
-    expect(resolveSettings({})).toEqual({maxAgeHours: 12, maxBytes: 200 * GiB,
-      highWaterPct: 80, minAgeMs: HOUR,
-      sources: expect.objectContaining({maxAgeHours: 'default', maxBytes: 'default', highWaterPct: 'default'})});
+  it('refuses entirely missing bounds and names the first missing variable', () => {
+    expect(() => resolveSettings({})).toThrow(/FORGE_CACHE_MAX_AGE_HOURS/);
+  });
+  it.each(settingFaults)('fails closed for $fault $variable', fault => {
+    expect(() => resolveSettings(faultyEnv(fault))).toThrow(fault.variable);
   });
   it('reads each environment setting and records its non-default source', () => {
     const s = resolveSettings({FORGE_CACHE_MAX_AGE_HOURS: '18', FORGE_CACHE_MAX_BYTES: '4096',
@@ -72,28 +97,77 @@ describe('resolveSettings', () => {
     }
   });
   it.each([['1', 6], ['1000000', 24]])('clamps age %s to %i hours', (raw, expected) => {
-    expect(resolveSettings({FORGE_CACHE_MAX_AGE_HOURS: raw}).maxAgeHours).toBe(expected);
+    expect(resolveSettings({...validEnv, FORGE_CACHE_MAX_AGE_HOURS: raw}).maxAgeHours).toBe(expected);
   });
-  it.each(['', 'garbage', '12hours', 'NaN', 'Infinity', '-Infinity'])
-  ('invalid values %j fall back with default provenance', raw => {
-    expect(resolveSettings({FORGE_CACHE_MAX_AGE_HOURS: raw, FORGE_CACHE_MAX_BYTES: raw,
-      FORGE_CACHE_HIGH_WATER_PCT: raw})).toMatchObject({maxAgeHours: 12, maxBytes: 200 * GiB,
-      highWaterPct: 80, sources: {maxAgeHours: 'default', maxBytes: 'default', highWaterPct: 'default'}});
+  it.each(Object.keys(validEnv).flatMap(variable =>
+    ['', ' ', 'garbage', '12hours', 'NaN', 'Infinity', '-Infinity'].map(raw => ({variable, raw}))))
+  ('rejects $variable=$raw without a default', ({variable, raw}) => {
+    expect(() => resolveSettings({...validEnv, [variable]: raw})).toThrow(variable);
   });
-  it.each(['0', '-1', '1e999'])('rejects nonpositive or overflowing size caps %s', raw => {
-    expect(resolveSettings({FORGE_CACHE_MAX_BYTES: raw})).toMatchObject({maxBytes: 200 * GiB,
-      sources: {maxBytes: 'default'}});
+  it.each(['0', '-1', '1e999', String(Number.MAX_SAFE_INTEGER + 1)])
+  ('rejects nonpositive, overflowing or unsafe size caps %s', raw => {
+    expect(() => resolveSettings({...validEnv, FORGE_CACHE_MAX_BYTES: raw})).toThrow('FORGE_CACHE_MAX_BYTES');
   });
   it.each(['-1', '101'])('rejects out-of-range high water %s', raw => {
-    expect(resolveSettings({FORGE_CACHE_HIGH_WATER_PCT: raw})).toMatchObject({highWaterPct: 80,
-      sources: {highWaterPct: 'default'}});
+    expect(() => resolveSettings({...validEnv, FORGE_CACHE_HIGH_WATER_PCT: raw})).toThrow('FORGE_CACHE_HIGH_WATER_PCT');
   });
   it('keeps the one-hour hard floor despite an unrecognized minimum-age override', () => {
-    expect(resolveSettings({FORGE_CACHE_MIN_AGE_MS: '0'}).minAgeMs).toBe(HOUR);
+    expect(resolveSettings({...validEnv, FORGE_CACHE_MIN_AGE_MS: '0'}).minAgeMs).toBe(HOUR);
   });
 });
 
 describe('planPrune', () => {
+  it.each(settingFaults)('refuses planning with $fault $variable in the environment', fault => {
+    const env = faultyEnv(fault);
+    for (const variable of Object.keys(validEnv)) vi.stubEnv(variable, env[variable]);
+    const old = entry('b', 30);
+    let result, error;
+    try {
+      result = planPrune({root, entries: [old], now,
+        disk: {usedPct: 99, usedBytes: 990, totalBytes: 1000},
+        live: {complete: true, profiles: new Set()}});
+    } catch (caught) { error = caught; }
+    if (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain(fault.variable);
+    } else {
+      expectDecision(result, [], [old]);
+      expect(result.refused).toContain(fault.variable);
+    }
+  });
+  it.each(['age', 'size', 'high-water'])('all direct-child names obey %s and exact live/minimum-age protection', pressure => {
+    const named = (name, age, bytes) => ({...entry('b', age, bytes), name, path: join(root, lock, name)});
+    const old = named('dev-v3-x', 20, 30), eligible = named('junk', 3, 30);
+    const liveEntry = named('.unknown-live', 30, 30), infant = named('.unknown-young', 0.5, 30);
+    const options = {live: {complete: true, profiles: new Set([key(liveEntry)])}};
+    if (pressure === 'size') options.settings = settings({maxBytes: 1});
+    if (pressure === 'high-water') options.disk = {usedPct: 99, usedBytes: 990, totalBytes: 1000};
+    expectDecision(plan([old, eligible, liveEntry, infant], options),
+      pressure === 'age' ? [old] : [old, eligible], pressure === 'age' ? [eligible, liveEntry, infant] : [liveEntry, infant]);
+  });
+  it.each(['junk', '.warm-inputs-orphan'])('counts protected %s bytes toward maxBytes', async name => {
+    const eligible = entry('b', 3, 10);
+    await child(name, 0.5, 'file', JSON.stringify({profile: hex('f')}));
+    const protectedEntries = await scanCache(root);
+    expectDecision(plan([eligible, ...protectedEntries], {settings: settings({maxBytes: 50})}),
+      [eligible], protectedEntries);
+  });
+  it.each(['age', 'size', 'high-water'])('old indexes inherit live/young v5 protection under %s pressure', async pressure => {
+    const liveProfile = await materialize('b', 30), youngProfile = await materialize('c', 0.5);
+    const liveIndex = await child('.warm-inputs-live', 30, 'file', JSON.stringify({profile: hex('b')}));
+    const youngIndex = await child('.warm-inputs-young', 30, 'file', JSON.stringify({profile: hex('c')}));
+    const orphan = await child('.warm-inputs-orphan', 30, 'file', JSON.stringify({profile: hex('f')}));
+    const malformed = await child('.warm-inputs-malformed', 30, 'file', '{');
+    const options = {live: {complete: true, profiles: new Set([key(liveProfile)])}};
+    if (pressure === 'size') options.settings = settings({maxBytes: 1});
+    if (pressure === 'high-water') options.disk = {usedPct: 99, usedBytes: 990, totalBytes: 1000};
+    const entries = await scanCache(root);
+    expect(keys(entries)).toEqual(keys([liveProfile, youngProfile, liveIndex, youngIndex, orphan, malformed]));
+    // Use scanned metadata, without imposing a new public index representation.
+    const selected = names => entries.filter(e => names.includes(e.name));
+    expectDecision(plan(entries, options), selected([orphan.name, malformed.name]),
+      selected([liveProfile.name, youngProfile.name, liveIndex.name, youngIndex.name]));
+  });
   it.each([3, 4, 12])('dev-v%i profiles obey age, size, high-water, minimum-age and exact live-name protection', version => {
     const old = entry('b', 20, 100, version), eligible = entry('c', 3, 300, version);
     const infant = entry('d', 0.5, 300, version), protectedProfile = entry('e', 20, 300, version);
@@ -141,11 +215,11 @@ describe('planPrune', () => {
     expectDecision(result, [], [e]);
     expect(result.refused).toEqual(expect.stringMatching(/\S/));
   });
-  it('bad input: malformed lock/name or an inexact path can never enter prune', () => {
+  it('bad input: malformed lock, traversal name or an inexact path can never enter prune', () => {
     const valid = entry('b', 30);
     const invalid = [
       {...valid, lock: 'A'.repeat(64)}, {...valid, lock: 'a'.repeat(63)},
-      {...valid, name: `dev-v5-${'B'.repeat(64)}`}, {...valid, name: `dev-v5-${'b'.repeat(65)}`},
+      ...['.', '..', '../escape', 'nested/child'].map(name => ({...valid, name, path: join(root, lock, name)})),
       {...valid, path: join(tmp, 'elsewhere', lock, valid.name)},
       {...valid, path: join(root, lock, 'nested', valid.name)},
       {...valid, path: `${root}/${lock}/../${lock}/${valid.name}`},
@@ -166,22 +240,30 @@ describe('planPrune', () => {
 });
 
 describe('scanCache', () => {
-  it('scans legacy numeric versions while rejecting malformed names and legacy profiles outside depth two', async () => {
+  it('scans every direct child of a real lock, including unknown names, files, indexes and symlinks', async () => {
     const legacy = [await materialize('b', 20, 3), await materialize('c', 20, 4), await materialize('d', 20, 12)];
-    for (const name of [`dev-v-${hex('e')}`, `dev-vx-${hex('e')}`, `dev-v3-${'E'.repeat(64)}`,
+    const names = [`dev-v-${hex('e')}`, `dev-vx-${hex('e')}`, `dev-v3-${'E'.repeat(64)}`,
       `dev-v4-${'e'.repeat(63)}`, `dev-v4-${'e'.repeat(65)}`, `dev-v3-${hex('e')}\n`,
-      `dev-v3-${hex('e')}-extra`, `other-v3-${hex('e')}`]) {
+      `dev-v3-${hex('e')}-extra`, `other-v3-${hex('e')}`, 'dev-v3-x', 'junk', '.hidden'];
+    for (const name of names) {
       await fs.mkdir(join(root, lock, name));
-      const invalid = {...entry('e', 20), name, path: join(root, lock, name)};
-      expectDecision(plan([invalid]), [], [invalid]);
+      const unknown = {...entry('e', 20), name, path: join(root, lock, name)};
+      expectDecision(plan([unknown]), [unknown], []);
     }
     await fs.mkdir(join(root, legacy[0].name));
     await fs.mkdir(join(root, 'invalid-lock', legacy[0].name), {recursive: true});
     await fs.mkdir(join(root, lock, 'nested', legacy[0].name), {recursive: true});
-    await fs.symlink(legacy[0].path, join(root, lock, `dev-v3-${hex('f')}`));
-    expect(keys(await scanCache(root))).toEqual(keys(legacy));
+    await fs.symlink(legacy[0].path, join(root, lock, 'linked'));
+    await fs.writeFile(join(root, lock, 'plain-file'), '1234567');
+    await json(join(root, lock, '.warm-inputs-orphan'), {profile: hex('f')});
+    const found = await scanCache(root);
+    expect(keys(found)).toEqual([...legacy.map(key), ...names.concat('nested', 'linked', 'plain-file',
+      '.warm-inputs-orphan').map(name => `${lock}/${name}`)].sort());
+    expect(found.find(e => e.name === 'plain-file').bytes).toBe(7);
+    expect(found.find(e => e.name === '.warm-inputs-orphan').bytes)
+      .toBe((await fs.lstat(join(root, lock, '.warm-inputs-orphan'))).size);
   });
-  it('scans only matching real profile directories at depth two and sums files without following symlinks', async () => {
+  it('sums nested payloads without following symlinks and never enters root-level symlink locks', async () => {
     const e = await materialize();
     await fs.mkdir(join(e.path, 'nested'));
     await fs.writeFile(join(e.path, 'nested', 'data'), '1234567');
@@ -197,8 +279,10 @@ describe('scanCache', () => {
     await fs.mkdir(join(root, e.name));
     await fs.mkdir(join(root, lock, 'extra', `dev-v5-${hex('f')}`), {recursive: true});
     const found = await scanCache(root);
-    expect(found).toHaveLength(1);
-    expect(found[0]).toMatchObject({lock, name: e.name, path: e.path, bytes: 12,
+    expect(keys(found)).toEqual([e.name, `dev-v5-${hex('c')}`, `dev-v5-${hex('e')}`,
+      'bad-profile', 'extra'].map(name => `${lock}/${name}`).sort());
+    expect(found.find(p => p.name === `dev-v5-${hex('e')}`).bytes).toBe(15);
+    expect(found.find(p => p.name === e.name)).toMatchObject({lock, name: e.name, path: e.path, bytes: 12,
       mtimeMs: (await fs.lstat(e.path)).mtimeMs});
   });
 });
@@ -210,6 +294,71 @@ describe('executePrune', () => {
   const leaseSpawn = (command, args, options) => command === '/usr/bin/flock' && process.platform === 'darwin'
     ? spawn('/usr/bin/python3', ['-I', '-c', 'import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'], options)
     : spawn(command, args, options);
+
+  it('applies to aged arbitrary files, directories and orphan indexes, leaving root-level non-lock entries untouched', async () => {
+    const candidates = [await child('junk', 30), await child('dev-v3-x', 30, 'directory'),
+      await child('.hidden', 30), await child('.warm-inputs-orphan', 30, 'file', '{')];
+    const topFile = join(root, 'top-level-junk'), topDir = join(root, 'not-a-lock');
+    await fs.writeFile(topFile, 'root sentinel');
+    await fs.mkdir(topDir); await fs.writeFile(join(topDir, 'payload'), 'root directory sentinel');
+    const result = await executePrune(plan(candidates), {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(keys(result.deleted)).toEqual(keys(candidates));
+    for (const e of candidates) expect(await exists(e.path)).toBe(false);
+    expect(await fs.readFile(topFile, 'utf8')).toBe('root sentinel');
+    expect(await fs.readFile(join(topDir, 'payload'), 'utf8')).toBe('root directory sentinel');
+  }, 20_000);
+
+  it('unlinks aged direct-child symlinks without traversing targets and preserves young symlinks', async () => {
+    const outside = join(tmp, 'outside'); await fs.mkdir(outside);
+    const sentinel = join(outside, 'sentinel'); await fs.writeFile(sentinel, 'outside');
+    const oldDirLink = await child(`dev-v5-${hex('b')}`, 30, 'symlink', outside);
+    const oldFileLink = await child('linked-file', 30, 'symlink', sentinel);
+    const dangling = await child('dangling', 30, 'symlink', join(tmp, 'missing'));
+    const youngLink = await child('young-link', 0.5, 'symlink', outside);
+    const result = await executePrune(plan([oldDirLink, oldFileLink, dangling, youngLink]),
+      {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(keys(result.deleted)).toEqual(keys([oldDirLink, oldFileLink, dangling]));
+    for (const e of [oldDirLink, oldFileLink, dangling]) expect(await exists(e.path)).toBe(false);
+    expect((await fs.lstat(youngLink.path)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(sentinel, 'utf8')).toBe('outside');
+  }, 20_000);
+
+  it.each([3, 4, 12])('pruning dev-v%i never removes the index of a live v5 profile with the same digest', async version => {
+    const legacy = await materialize('b', 30, version), current = await materialize('b', 30);
+    const marker = await child('.warm-inputs-live', 30, 'file', JSON.stringify({profile: hex('b')}));
+    const run = await reserve(); await json(join(receipts, `${run}.running`), record(false));
+    const live = await readLiveEvidence({receipts});
+    const result = await executePrune(plan([legacy, current], {live}),
+      {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(keys(result.deleted)).toEqual(keys([legacy]));
+    expect(await exists(legacy.path)).toBe(false);
+    expect(await fs.readFile(join(current.path, 'payload'), 'utf8')).toBe('cache');
+    expect(await fs.readFile(marker.path, 'utf8')).toBe(JSON.stringify({profile: hex('b')}));
+  }, 20_000);
+
+  it('pruning a legacy profile preserves the index pointing to a young v5 profile with the same digest', async () => {
+    const legacy = await materialize('b', 30, 3), current = await materialize('b', 0.5);
+    const marker = await child('.warm-inputs-young', 30, 'file', JSON.stringify({profile: hex('b')}));
+    const result = await executePrune(plan([legacy, current]),
+      {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(keys(result.deleted)).toEqual(keys([legacy]));
+    expect(await exists(current.path)).toBe(true);
+    expect(await exists(marker.path)).toBe(true);
+  }, 20_000);
+
+  it('rechecks live protection for an aged index when a reservation appears after planning', async () => {
+    const current = await materialize('b', 30);
+    const marker = await child('.warm-inputs-newly-live', 30, 'file', JSON.stringify({profile: hex('b')}));
+    const result = plan([marker]);
+    // An explicit candidate exercises executor protection independently of scanner/planner filtering.
+    result.prune = [{...marker, reason: 'Expired age'}]; result.keep = [];
+    const run = await reserve(); await json(join(receipts, `${run}.running`), record(false));
+    const applied = await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(applied.deleted).toEqual([]);
+    expect(keys(applied.skipped)).toEqual(keys([marker]));
+    expect(await exists(marker.path)).toBe(true);
+    expect(await fs.readFile(join(current.path, 'payload'), 'utf8')).toBe('cache');
+  }, 20_000);
 
   it('fails closed when apply omits receipts, preserving profiles and indexes without spawning', async () => {
     const e = await materialize(), marker = join(root, lock, '.warm-inputs-one');
@@ -345,7 +494,7 @@ describe('executePrune', () => {
     await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
     expect(await fs.readFile(e.path, 'utf8')).toBe('replacement');
   }, 20_000);
-  it.each(['traversal', 'outside', 'depth', 'bad-name', 'bad-lock', 'linked-lock'])
+  it.each(['traversal', 'outside', 'depth', 'traversal-name', 'bad-lock', 'linked-lock'])
   ('refuses forged %s paths even in an explicitly supplied prune plan', async kind => {
     const e = await materialize(), outside = join(tmp, 'outside', lock, e.name);
     await fs.mkdir(outside, {recursive: true}); await fs.writeFile(join(outside, 'payload'), 'outside');
@@ -353,9 +502,9 @@ describe('executePrune', () => {
     if (kind === 'traversal') forged.path = `${root}/../outside/${lock}/${e.name}`;
     if (kind === 'outside') forged.path = outside;
     if (kind === 'depth') forged.path = join(root, lock, 'nested', e.name);
-    if (kind === 'bad-name') { forged.name = 'unexpected'; forged.path = join(root, lock, forged.name); }
+    if (kind === 'traversal-name') { forged.name = '../unexpected'; forged.path = join(root, lock, forged.name); }
     if (kind === 'bad-lock') { forged.lock = 'invalid'; forged.path = join(root, forged.lock, e.name); }
-    if (['depth', 'bad-name', 'bad-lock'].includes(kind)) await fs.mkdir(forged.path, {recursive: true});
+    if (['depth', 'traversal-name', 'bad-lock'].includes(kind)) await fs.mkdir(forged.path, {recursive: true});
     if (kind === 'linked-lock') {
       await fs.rename(join(root, lock), join(tmp, 'saved-lock'));
       await fs.symlink(join(tmp, 'saved-lock'), join(root, lock));
@@ -368,6 +517,25 @@ describe('executePrune', () => {
     expect(await exists(forged.path)).toBe(true);
     expect(await fs.readFile(join(outside, 'payload'), 'utf8')).toBe('outside');
     expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
+  }, 20_000);
+});
+
+describe('CLI settings refusal', () => {
+  it.each(settingFaults)('exits nonzero and preserves cache for $fault $variable', async fault => {
+    const old = await materialize('b', 30);
+    const marker = await child('.warm-inputs-old', 30, 'file', JSON.stringify({profile: hex('b')}));
+    const env = {...process.env, ...validEnv};
+    if (fault.fault === 'missing') delete env[fault.variable];
+    else env[fault.variable] = 'garbage';
+    const cli = spawnSync(process.execPath, [new URL('../forge-cache-prune.mjs', import.meta.url).pathname,
+      `--root=${root}`, `--receipts=${receipts}`, '--apply', '--json'],
+    {env, encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024});
+    expect(cli.error).toBeUndefined();
+    expect(cli.signal).toBeNull();
+    expect(await fs.readFile(join(old.path, 'payload'), 'utf8')).toBe('cache');
+    expect(await exists(marker.path)).toBe(true);
+    expect(cli.status).not.toBe(0);
+    expect(cli.stderr).toContain(fault.variable);
   }, 20_000);
 });
 
