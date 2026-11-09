@@ -24,6 +24,11 @@ export function resultToVerdictInputs(result, ctx) {
   const heads = new Set(rows.map(r => r.headSha));
   if (heads.size !== 1 || !rows[0].headSha || rows.some(r => rowRepo(r) !== repo)) throw new Error('ambiguous headSha/repo; run the local drain');
   if (merge.length && (skipped.length || parked.length)) throw new Error('contradictory classification; run the local drain');
+  // `toMerge` is captured before dependency planning: a deferred or skip-reasoned candidate is NOT admitted.
+  if (merge.length && ((result.deferred || []).some(d => typeof d === 'object' ? matches(d) : false) ||
+      (result.skipReasons || []).some(r => Number(r.num) === ctx.pr && rowRepo(r) === repo))) {
+    throw new Error('toMerge candidate deferred or skip-reasoned; run the local drain');
+  }
   const reasons = rows.flatMap(r => [r.reason, ...(r.reasons || [])]).filter(Boolean);
   const skipRows = (result.skipReasons || []).filter(r => Number(r.num) === ctx.pr && rowRepo(r) === repo);
   const hold = rows.some(r => r.humanRequired || r.hold) ||

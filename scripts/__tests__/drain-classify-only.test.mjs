@@ -113,3 +113,11 @@ describe('local-repo rows (repo:null)', () => {
     expect(resultToVerdictInputs(r, ctx)).toMatchObject({ decision: 'enqueue', repo: ctx.repo });
   });
 });
+
+describe('toMerge candidates later deferred by planning', () => {
+  it('refuses to enqueue when a deferred row or blocked-by skip reason covers the PR', () => {
+    const t = { ...base(), toMerge: [row] };
+    expect(() => resultToVerdictInputs({ ...t, deferred: [{ ...row, reason: 'blocked-by' }] }, ctx)).toThrow(/local drain/);
+    expect(() => resultToVerdictInputs({ ...t, skipReasons: [{ ...row, kind: 'blocked-by', reason: 'blocked-by #1' }] }, ctx)).toThrow(/local drain/);
+  });
+});
