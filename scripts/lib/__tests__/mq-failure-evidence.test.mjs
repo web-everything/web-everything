@@ -498,6 +498,12 @@ describe('mq failure evidence: real vitest output shapes', () => {
     const text = ' FAIL  tests/x.test.mjs > a > b\nsome unrelated runner chatter\nAssertionError: expected 2 to be 3\n';
     expect((await one(text)).complete).toBe(false);
   });
+  it.each([' ❯ Proxy.<anonymous> tests/x.test.mjs:5:3', ' ❯ Module.helper tests/x.test.mjs:5:3',
+    ' ❯ new Widget tests/x.test.mjs:5:3', ' ❯ node_modules/vitest/dist/runner.js:1:2'])(
+    'a named stack-frame row keeps a single outside-diff failure complete: %s', async frame => {
+      const text = ` FAIL  tests/x.test.mjs > t\nAssertionError: expected 1 to be 2\n\n${frame}\n\n Test Files  1 failed (1)\n      Tests  1 failed (1)\n`;
+      expect(await one(text)).toMatchObject({ testFiles: ['tests/x.test.mjs'], complete: true });
+    });
   it('an echoed source frame quoting FAIL is not a failure marker', async () => {
     const text = ' FAIL  tests/x.test.mjs > a\nAssertionError: x\n  3| expect(status).toBe("FAIL");\n   |                    ^\n';
     expect(await one(text)).toMatchObject({ testFiles: ['tests/x.test.mjs'], complete: true });
@@ -511,6 +517,11 @@ describe('mq failure evidence: real vitest output shapes', () => {
     ['single-quoted', " FAIL  'tests/my widget.test.mjs' > example"],
     ['Windows directory', ' FAIL  C:\\my dir\\widget.test.mjs > example'],
     ['progress row', ' ❯ tests/my widget.test.mjs  (1 test | 1 failed) 5ms\n FAIL  tests/x.test.mjs > ok'],
+    // Whitespace AFTER a "(" / "[" / " > " cut must still be seen; no vitest summary is present to rescue these.
+    ['space after a parenthesis', ' FAIL  dir (x) z/a.test.mjs > t1'],
+    ['space after a bracket', ' FAIL  dir [x] a.test.mjs > t1'],
+    ['glued parenthesis', ' FAIL  foo(a.test.mjs > t'],
+    ['named frame with a spaced path', ' FAIL  tests/x.test.mjs > ok\n ❯ Proxy.<anonymous> tests/my widget.test.mjs:5:3'],
   ])('space-containing failure paths cannot authorize an outside-diff refresh: %s', async (_name, heading) => {
     const evidence = await one(`${heading}\nAssertionError: expected 2 to be 3\n`);
     expect(evidence.complete).toBe(false);

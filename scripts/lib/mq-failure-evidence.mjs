@@ -49,13 +49,21 @@ function failurePaths(text, repo) {
   let complete = true;
   // A heading (`FAIL <path> > ...`, `❯ <path> ...`) names exactly ONE path token. A path with a space (tab, NBSP,
   // quotes, a Windows directory) would otherwise be read as its last space-free word, a different file that may
-  // sit outside the PR diff. Whatever sits between the keyword and the suite separator must be one clean token.
-  const lead = /^(?:FAIL(?:ED)?|❯)\s+([\s\S]*)$/.exec(text);
+  // sit outside the PR diff. Cut only at the suite separator (" > ") or a trailing "[ file ]" suffix; whatever
+  // remains, parentheses and brackets included, must be ONE token, the shape the FAIL-heading counter also requires.
+  // The words found in an ambiguous heading stay only as a hint for the fixer; the incomplete flag keeps them from
+  // ever authorizing a refresh.
+  const lead = /^(?:FAIL(?:ED)?|(❯))\s+([\s\S]*)$/.exec(text);
   if (lead) {
-    const candidate = lead[1].split(/\s+>\s|\s+[[(]|\s{2,}/, 1)[0].replace(/:\d+(?::\d+)?$/, '');
-    // The words found in an ambiguous heading are only a hint for the fixer; the incomplete flag keeps them from
-    // ever authorizing a refresh.
-    if (/[\s"'`]/.test(candidate)) complete = false;
+    let candidate = lead[2].split(/\s+>\s/, 1)[0].replace(/\s+\[[^\]]*\]\s*$/, '');
+    if (lead[1]) {
+      // "❯" rows: strip a progress suffix "(4 tests | 1 failed) 31ms" and an optional leading stack-frame function
+      // token ("Proxy.<anonymous> test/a.test.mjs:5:3"); a bare word is NOT a function token.
+      candidate = candidate.replace(/\s+\(\d+ tests?\b.*$/, '')
+        .replace(/^(?:(?:new|async)\s+[\w$@-]+(?:\.[\w$<>@-]+)*|[\w$@-]+(?:\.[\w$<>@-]+)+)\s+(?=\S+$)/, '');
+    }
+    candidate = candidate.replace(/:\d+(?::\d+)?$/, '');
+    if (!/^[^\s"'`()[\]]+$/.test(candidate)) complete = false;
   }
   for (const match of text.matchAll(/(?:^|[\s(])((?:[A-Za-z]:)?[\w@./\\-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=[:\s)]|$)/g)) {
     let path = match[1].replace(/\\/g, '/');
