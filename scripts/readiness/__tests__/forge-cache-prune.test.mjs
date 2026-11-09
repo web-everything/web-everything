@@ -1,6 +1,8 @@
 // @vitest-environment node
 import {afterEach, beforeEach, describe, expect, it} from 'vitest';
 import * as fs from 'node:fs/promises';
+import {renameSync, symlinkSync, openSync, closeSync} from 'node:fs';
+import {spawn, spawnSync} from 'node:child_process';
 import {join} from 'node:path';
 import {resolveSettings, planPrune, scanCache, executePrune, readLiveEvidence} from '../forge-cache-prune.mjs';
 
@@ -175,6 +177,81 @@ describe('scanCache', () => {
 });
 
 describe('executePrune', () => {
+  // Forge uses util-linux flock. Darwin fixtures use the same kernel flock
+  // protocol through Python, just as the existing Forge runner does.
+  const leaseSpawn = (command, args, options) => command === '/usr/bin/flock' && process.platform === 'darwin'
+    ? spawn('/usr/bin/python3', ['-I', '-c', 'import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'], options)
+    : spawn(command, args, options);
+
+  it('anchors deletion when the checked parent is replaced by an outside symlink before delete', async () => {
+    const e = await materialize();
+    // Match metadata outside too: only the directory anchor should defend this.
+    delete e.ino; delete e.dev;
+    const outside = join(tmp, 'outside'), target = join(outside, e.name);
+    await fs.mkdir(target, {recursive: true});
+    await fs.writeFile(join(target, 'sentinel'), 'outside');
+    await fs.utimes(target, e.mtimeMs / 1000, e.mtimeMs / 1000);
+    const saved = join(tmp, 'saved-lock');
+    let substituted = false;
+    await expect(executePrune(plan([e]), {root, apply: true, spawnProcess(command, args, options) {
+      substituted = true;
+      renameSync(join(root, lock), saved);
+      symlinkSync(outside, join(root, lock));
+      return spawn(command, args, options);
+    }})).rejects.toThrow(/refused/);
+    expect(substituted).toBe(true);
+    expect(await fs.readFile(join(target, 'sentinel'), 'utf8')).toBe('outside');
+    expect(await fs.readFile(join(saved, e.name, 'payload'), 'utf8')).toBe('cache');
+  });
+
+  it('preserves a newly reserved profile between planning evidence and deletion', async () => {
+    const e = await materialize();
+    const result = plan([e], {live: await readLiveEvidence({receipts})});
+    const guard = openSync(join(receipts, '.worker-active-1.writer'), 'w+', 0o600);
+    try {
+      const held = spawnSync('/usr/bin/python3', ['-I', '-c',
+        'import fcntl; fcntl.flock(3, fcntl.LOCK_SH | fcntl.LOCK_NB)'],
+      {stdio: ['ignore', 'pipe', 'pipe', guard]});
+      expect(held.status).toBe(0);
+      const run = await reserve(`r-${'2'.repeat(32)}`, 'worker-active-1');
+      await json(join(receipts, `${run}.running`), record(false));
+      await expect(executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn})).rejects.toThrow(/refused/);
+      expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
+    } finally { closeSync(guard); }
+  });
+
+  it('excludes reservation writers after live evidence until deletion finishes and then releases them', async () => {
+    const e = await materialize(), result = plan([e]);
+    let attempted = false;
+    const guardPath = join(receipts, '.worker-active-128.writer');
+    const attempt = () => {
+      const fd = openSync(guardPath, 'r+');
+      try {
+        return spawnSync('/usr/bin/python3', ['-I', '-c',
+          'import fcntl,os,sys; fcntl.flock(3, fcntl.LOCK_SH | fcntl.LOCK_NB); os.mkdir(sys.argv[1])',
+          join(receipts, 'worker-active-128')], {stdio: ['ignore', 'pipe', 'pipe', fd]}).status;
+      } finally { closeSync(fd); }
+    };
+    await executePrune(result, {root, receipts, apply: true, spawnProcess(command, args, options) {
+      if (command === process.execPath) {
+        attempted = true;
+        expect(attempt()).not.toBe(0);
+      }
+      return leaseSpawn(command, args, options);
+    }});
+    expect(attempted).toBe(true);
+    expect(await exists(e.path)).toBe(false);
+    expect(await exists(join(receipts, 'worker-active-128'))).toBe(false);
+    expect(attempt()).toBe(0);
+  }, 20_000);
+
+  it('refuses an unsafe writer guard without deleting cache', async () => {
+    const e = await materialize();
+    await fs.symlink(join(tmp, 'untrusted'), join(receipts, '.worker-active.writer'));
+    await expect(executePrune(plan([e]), {root, receipts, apply: true, spawnProcess: leaseSpawn})).rejects.toThrow();
+    expect(await fs.readFile(join(e.path, 'payload'), 'utf8')).toBe('cache');
+  });
+
   it('dry-run deletes neither profiles nor their warm-input indexes', async () => {
     const e = await materialize(), marker = join(root, lock, '.warm-inputs-one');
     await json(marker, {profile: hex('b'), archiveDigest: hex('f')});
