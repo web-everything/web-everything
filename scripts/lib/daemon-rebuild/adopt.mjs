@@ -170,11 +170,20 @@ export function reportDiscardedCandidate({ ready, match, alert, needsYou }) {
   }
 }
 
+/** Merging `sha` into `build` changes nothing (its content is already in build's tree). Unreadable or custom merge
+ *  drivers fail closed. Same check as prepare.mjs contentContainedInBuild (not imported: prepare imports this file). */
+function contentInTree(git, sha, build) {
+  if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
+  const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+  const t = String(m.stdout ?? '').split('\n')[0].trim();
+  return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
+}
+
 /** Where the running head sits on main: skip the rebuild-committed overlay merges at the top of its first-parent
  *  chain (committer is the rebuild identity, subject `daemon-rebuild: merge overlay …`, 2-3 parents), then take the
  *  merge-base of the first other commit with `mainTip`. A head with no rebuild merges uses the plain merge-base.
  *  Unreadable history returns '' (the caller refuses: fail closed). */
-function trueMainBase(git, head, mainTip, isAncestor) {
+function trueMainBase(git, head, mainTip, isAncestor, contained) {
   const log = git(['log', '--first-parent', '--format=%H%x09%P%x09%ce%x09%s', head]);
   if (log.status !== 0) return '';
   let base = head;
@@ -188,8 +197,8 @@ function trueMainBase(git, head, mainTip, isAncestor) {
     stripped.push(...ps.slice(1));
     base = ps[0];
   }
-  // An overlay (or approved edge parent) not (yet) in main keeps the strict floor: use the plain merge-base of the head.
-  if (stripped.some((o) => !isAncestor(o, mainTip))) base = head;
+  // An overlay (or approved edge parent) not in main, or whose content is not provably in the candidate, keeps the strict floor: use the plain merge-base of the head.
+  if (stripped.some((o) => !isAncestor(o, mainTip) || !contained(o))) base = head;
   if (!/^[0-9a-f]{40}$/.test(base ?? '')) return '';
   const mb = git(['merge-base', base, mainTip]);
   return mb.status === 0 ? String(mb.stdout ?? '').trim() : '';
@@ -214,11 +223,11 @@ export function readyBuildVerified({
   // The head's TRUE main base: an overlay the head carries may have merged into main since, which would make a plain
   // merge-base(head, mainTip) the (newer) overlay commit and read a good older plain-main fallback as a rollback.
   // So walk the head's first-parent chain across rebuild-committed overlay merges to the main commit they sit on.
-  // The floor is lowered below the plain merge-base ONLY when every overlay stripped from the head is itself
-  // already an ancestor of `mainTip` (its content is in main, so the next tick's live plan carries it): then the
+  // The floor is lowered below the plain merge-base ONLY when every overlay stripped from the head is already an
+  // ancestor of `mainTip` AND its content is provably in the candidate's own tree (merge changes nothing): then the
   // floor is the main commit the head was BUILT on. Any stripped overlay not in main keeps the strict plain
   // merge-base. Candidates below the head's base are refused either way.
-  const headBase = prevHead ? trueMainBase(git, prevHead, mainTip, isAncestor) : '';
+  const headBase = prevHead ? trueMainBase(git, prevHead, mainTip, isAncestor, (o) => contentInTree(git, o, adopt.finalSha)) : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
   const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
   let cur = adopt.finalSha;

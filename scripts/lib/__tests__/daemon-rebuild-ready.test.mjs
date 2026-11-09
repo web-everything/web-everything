@@ -255,6 +255,7 @@ describe('readyBuildVerified rollback check uses the head\'s true main base acro
     g(['merge', '-q', '--no-ff', '-m', 'daemon-rebuild: merge overlay lane/ov2 (pr 2)', OV2], rebuildEnv);
     const head2 = g(['rev-parse', 'HEAD']);
     g(['checkout', '-q', 'main']);
+    const C = commit('ov.txt'); // same content as the overlay, landed directly on main before the PR merge
     g(['merge', '-q', '--no-ff', '-m', 'Merge PR ov', OV]);
     const M2 = g(['rev-parse', 'HEAD']);
     const M3 = commit('m3.txt');
@@ -262,13 +263,15 @@ describe('readyBuildVerified rollback check uses the head\'s true main base acro
     const verify = (mainSha, prevHead = head) => readyBuildVerified({
       git: (args) => git(dir, args), adopt: { finalSha: mainSha, mainSha, applied: [] }, prevHead, mainTip,
     });
-    return { M0, M1, OV, M2, M3, head, head2, verify };
+    return { M0, M1, C, OV, M2, M3, head, head2, verify };
   }
 
-  it('accepts a plain-main candidate at/after M1 even though the merged overlay commit is newer', () => {
+  it('accepts a plain-main candidate older than the merged overlay commit only when the overlay content is in its tree', () => {
     const f = fixture();
-    expect(f.verify(f.M1)).toBe(true);
+    expect(f.verify(f.C)).toBe(true);
     expect(f.verify(f.M3)).toBe(true);
+    // At/after the base but missing the overlay's content: refused (would silently drop running overlay content).
+    expect(f.verify(f.M1)).toBe(false);
   });
 
   it('still refuses a genuinely older candidate (before the head\'s true main base)', () => {
@@ -278,7 +281,7 @@ describe('readyBuildVerified rollback check uses the head\'s true main base acro
 
   it('keeps the strict floor when any stripped overlay is not in main (no lowering)', () => {
     const f = fixture();
-    expect(f.verify(f.M1, f.head2)).toBe(false);
+    expect(f.verify(f.C, f.head2)).toBe(false);
     expect(f.verify(f.M3, f.head2)).toBe(true);
   });
 
