@@ -1714,6 +1714,20 @@ export function isRetryableGhJsonFailure(args, text) {
   return ghTransientRetryReason(args, text) !== null;
 }
 
+// ── wait log (R795): one small JSONL line per throttled call, to attribute `freeze-read: deadline` misses to
+// slot waits. Records ONLY the low-cardinality op label (ghOpLabel of the argv, never throttle.op or args), so no
+// token-bearing argument can reach it. Append-only, rotated to `<log>.1` past 5 MB, and a failure never fails a call.
+export const GH_WAITLOG_FILENAME = 'gh-waitlog.jsonl';
+export const GH_WAITLOG_MAX_BYTES = 5 * 1024 * 1024;
+export function recordGhWaitLogEntry(logPath, entry) {
+  try {
+    try { if (statSync(logPath).size > GH_WAITLOG_MAX_BYTES) renameSync(logPath, `${logPath}.1`); } catch { /* missing log */ }
+    appendFileSync(logPath, JSON.stringify(entry) + '\n', 'utf8');
+  } catch {
+    /* best-effort — logging must never fail the call */
+  }
+}
+
 export function recordGhCallLogEntry(logPath, entry) {
   try {
     rotateGhCallLogIfLarge(logPath);
@@ -2002,6 +2016,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // The write-budget gate (writes only) and the points-budget gate both run BEFORE the concurrency slot — a
     // call waiting out either budget must not hold a scarce concurrency slot idle while it waits (same
     // reasoning as releasing the slot before a backoff sleep, below).
+    const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
@@ -2009,10 +2024,13 @@ function runGhSyncUnmemoized(args, opts = {}) {
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
+      recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(waitStartedMs).toISOString(), caller, op: ghOpLabel(args), waitMs: Date.now() - waitStartedMs, durMs: 0, ok: false });
       const error = new Error(throttledMessage);
       Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
       throw error;
     }
+    const waitMs = Date.now() - waitStartedMs;
+    const execStartedMs = Date.now();
     let result;
     let failure = null;
     try {
@@ -2032,6 +2050,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
       if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
     }
     if (!failure && isGhDeferred(result)) return result; // nested CLI deferral is not a landed write
+    recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(execStartedMs).toISOString(), caller, op: ghOpLabel(args), waitMs, durMs: Date.now() - execStartedMs, ok: !failure });
     const captured = lastCapture;
     if (captured) recordGhHeadroom(lockRoot, identity, rateLimitRecords(captured.responses));
     recordGhCallLogEntry(logPath, {
