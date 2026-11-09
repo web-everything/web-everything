@@ -638,6 +638,8 @@ export function ghSlotWaitMs({ caller, waitClass, settings = GH_SLOT_WAIT_STANDA
 /** The one caller allowed the reserved slot: the drain's shared-freeze read. */
 export const GH_RESERVED_SLOT_CALLER = 'red-main-freeze-read';
 const RESERVED_WAIT_DEFAULT_MS = 20000;
+/** A reserved read that cannot be admitted is THROTTLED (fail closed): never the ungated or exception fail-open paths. */
+const RESERVED_CLOSED = Object.freeze({ ok: false, timedOut: true, waitedMs: 0 });
 /**
  * PURE: may this call take the ONE reserved slot above the cap? Only the named freeze-read caller, only a plain
  * `gh api -i [-H hdr] repos/{o}/{r}/(git/ref/heads|git/commits|git/trees|contents)/...` GET (no method override, no body/field flags, no other endpoint), never a write.
@@ -2007,6 +2009,9 @@ function runGhSyncUnmemoized(args, opts = {}) {
   // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
   const reserved = ghReservedSlotEligible({ throttle, caller, args: args, isWrite });
   const slotCap = cap + (reserved ? 1 : 0);
+  // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
+  const reservedCapMs = reserved ? ghReservedWaitCapMs(execOpts) : 0, reservedStartMs = reserved ? now() : 0;
+  const reservedLeftMs = () => Math.max(1, reservedCapMs - (now() - reservedStartMs));
   // #gh-graphql-budget — the shared primary-budget backoff (see that section above).
   const resource = classifyGhResource(args);
   // The credential the child really uses: the caller's explicit env, else — a config-only `throttle.env` carries
@@ -2060,13 +2065,12 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      const reservedCapMs = reserved ? ghReservedWaitCapMs(execOpts) : 0, reservedStartMs = reserved ? now() : 0;
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
       return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
-    }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn, slotWaitPick);
+    }, { ...gateOpts, fallback: reserved ? RESERVED_CLOSED : { ok: false } }) : (reserved ? RESERVED_CLOSED : { ok: false });
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, reserved ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
       recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(waitStartedMs).toISOString(), caller: ghWaitLogCaller(caller), op: ghOpLabel(args), waitMs: Date.now() - waitStartedMs, durMs: 0, ok: false });
       const error = new Error(throttledMessage);
@@ -2085,7 +2089,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
       // nothing about a SUCCESSFUL call's stdout (see the module header). The #4375 capture, when on, lives
       // inside the real `exec` itself and records what it read in `lastCapture`.
       const routedOpts = effectiveExecOpts();
-      const callExecOpts = calibrateHeaders ? withDebugEnv(routedOpts) : routedOpts;
+      const boundedOpts = reserved ? { ...routedOpts, timeout: reservedLeftMs() } : routedOpts;
+      const callExecOpts = calibrateHeaders ? withDebugEnv(boundedOpts) : boundedOpts;
       lastCapture = null;
       result = exec(args, callExecOpts);
     } catch (e) {
@@ -2278,6 +2283,9 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
   const reserved = ghReservedSlotEligible({ throttle, caller, args: argv, isWrite });
   const slotCap = cap + (reserved ? 1 : 0);
+  // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
+  const reservedCapMs = reserved ? ghReservedWaitCapMs(spawnOpts) : 0, reservedStartMs = reserved ? now() : 0;
+  const reservedLeftMs = () => Math.max(1, reservedCapMs - (now() - reservedStartMs));
   // #gh-graphql-budget — the shared primary-budget backoff (see runGhSync's identical wiring).
   const resource = classifyGhResource(argv);
 
@@ -2341,20 +2349,19 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      const reservedCapMs = reserved ? ghReservedWaitCapMs(spawnOpts) : 0, reservedStartMs = reserved ? now() : 0;
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
       return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
-    }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn, slotWaitPick);
+    }, { ...gateOpts, fallback: reserved ? RESERVED_CLOSED : { ok: false } }) : (reserved ? RESERVED_CLOSED : { ok: false });
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, reserved ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
     let r;
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});
       if (deferred) return { status: 0, deferred: true, stdout: Buffer.from(JSON.stringify(deferred)), stderr: Buffer.from(deferred.message) };
       // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
-      r = spawn(bin, argv, ghExecOptions(outerLimits === null ? spawnOpts : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
+      r = spawn(bin, argv, ghExecOptions(outerLimits === null ? (reserved ? { ...spawnOpts, timeout: reservedLeftMs() } : spawnOpts) : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
     } finally {
       if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap: slotCap, owner }), gateOpts);
     }

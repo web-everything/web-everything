@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireGhSlotSync, ghSlotWaitClass, ghSlotWaitMs, GH_SLOT_WAIT_STANDARD, resolveGhSlotWait, runGhSync, runGhCliPassthrough, isGhThrottled } from '../gh-throttle.mjs';
+import { releaseGhSlotSync, acquireGhSlotSync, ghSlotWaitClass, ghSlotWaitMs, GH_SLOT_WAIT_STANDARD, resolveGhSlotWait, runGhSync, runGhCliPassthrough, isGhThrottled } from '../gh-throttle.mjs';
 import { isGhThrottled as sharedIsGhThrottled } from '../gh-deferred.mjs';
 
 const dirs = [];
@@ -233,5 +233,35 @@ describe('reserved priority slot (drain freeze read)', () => {
     expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 2000, throttle: { ...f.throttle, reservedSlot: true, budgetPerMin: 0 } })).toThrow(/throttled/);
     expect(f.throttle.exec).not.toHaveBeenCalled();
     expect(f.elapsed()).toBeLessThanOrEqual(2000);
+  });
+  it('the child exec timeout is shrunk by the time already spent waiting, so wait + run stays inside the call bound', () => {
+    const f = fullPool('red-main-freeze-read');
+    const reservedOwner = `${process.pid}:r1`;
+    expect(acquireGhSlotSync({ lockRoot: f.throttle.lockRoot, cap: 2, owner: reservedOwner, pid: process.pid, now: f.throttle.now, timeoutMs: 0 }).ok).toBe(true);
+    const seen = [];
+    let clock = Date.now();
+    let freed = false;
+    const sleep = vi.fn(ms => { clock += ms; if (!freed && clock - f.throttle.now() >= -1 && sleep.mock.calls.length >= 5) { freed = true; releaseGhSlotSync({ lockRoot: f.throttle.lockRoot, cap: 2, owner: reservedOwner }); } });
+    const exec = vi.fn((_a, o) => { seen.push(o.timeout); return '[]'; });
+    expect(runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 20000, throttle: { ...f.throttle, reservedSlot: true, exec, now: () => clock, sleep } })).toBe('[]');
+    expect(seen[0]).toBeLessThan(20000);
+    expect(seen[0]).toBeGreaterThanOrEqual(1);
+  });
+  it.each([
+    ['ungated override', { WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'ungated' }],
+  ])('a reserved read on the %s is still throttled, never run ungated', (_n, env) => {
+    const f = fullPool('red-main-freeze-read', env);
+    expect(acquireGhSlotSync({ lockRoot: f.throttle.lockRoot, cap: 2, owner: `${process.pid}:r3`, pid: process.pid, now: f.throttle.now, timeoutMs: 0 }).ok).toBe(true);
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 2000, throttle: { ...f.throttle, reservedSlot: true } })).toThrow(/throttled/);
+    expect(f.throttle.exec).not.toHaveBeenCalled();
+  });
+  it('a reserved read is throttled, not run ungated, when slot admission itself throws', () => {
+    const f = fullPool('red-main-freeze-read');
+    const t = { ...f.throttle, reservedSlot: true, lockRoot: join(f.throttle.lockRoot, 'file-not-dir') };
+    writeFileSync(t.lockRoot, 'x');
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', throttle: t })).toThrow(/throttled/);
+    expect(f.throttle.exec).not.toHaveBeenCalled();
+    // the ordinary caller keeps the old fail-open behaviour
+    expect(runGhSync(READ, { encoding: 'utf8', throttle: { ...f.throttle, lockRoot: t.lockRoot } })).toBe('[]');
   });
 });
