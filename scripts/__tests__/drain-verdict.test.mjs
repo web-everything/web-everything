@@ -209,12 +209,9 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
     ['upload-artifact with token-like input', doc => { for (const step of jobs(doc)[0].steps) if (/upload-artifact/.test(step.uses ?? '')) step.with['api-key'] = 'x'; }],
     ['upload-artifact tolerates empty uploads', doc => { for (const step of jobs(doc)[0].steps) if (/upload-artifact/.test(step.uses ?? '')) step.with['if-no-files-found'] = 'warn'; }],
     ['upload-artifact ignore', doc => { for (const step of jobs(doc)[0].steps) if (/upload-artifact/.test(step.uses ?? '')) step.with['if-no-files-found'] = 'ignore'; }],
-    ['classification failures swallowed', doc => { for (const step of jobs(doc)[0].steps) if (step.run?.includes('failed=1')) step.run = step.run.replace('failed=1', ':').replace(/exit "\$\{failed:-0\}"/, 'exit 0'); }],
     ['continue-on-error on job', doc => { jobs(doc)[0]['continue-on-error'] = true; }],
     ['continue-on-error on classify step', doc => { for (const step of jobs(doc)[0].steps) if (step.run?.includes('drain-classify-only')) step['continue-on-error'] = true; }],
     ['continue-on-error expression', doc => { jobs(doc)[0]['continue-on-error'] = '${{ true }}'; }],
-    ['classify step disabled with if false', doc => { for (const step of jobs(doc)[0].steps) if (step.run?.includes('failed=1')) step.if = 'false'; }],
-    ['dispatch step disabled', doc => { for (const step of jobs(doc)[0].steps) if (step.run?.includes('REQUESTED_PR')) step.if = 'false'; }],
     ['job disabled', doc => { jobs(doc)[0].if = 'false'; }],
     ['extra conditional step', doc => { jobs(doc)[0].steps.push({ if: 'false', run: 'echo failed=1; exit "${failed:-0}"' }); }],
     ['foreign repository checkout', doc => { for (const step of checkouts(doc)) step.with = { ...step.with, repository: 'attacker/foreign-code' }; }],
@@ -323,4 +320,85 @@ describe('T5b: review-escalation pass is kept on in the real drain call', () => 
     const src = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
     expect(src).toMatch(/const REVIEW_ESCALATION = label && !escalationRelief\.passWide;/);
   });
+});
+
+import { runBatch } from '../drain-classify-only.mjs';
+
+describe('T6: --batch owns the loop, the counting and the exit code', () => {
+  const batchArgv = ['--batch', '--verdict-dir=verdicts'];
+  function batchIo({ prs = '7\n8\n', failPr = null, event = 'schedule', requested } = {}) {
+    const io = ioFor();
+    io.env.GITHUB_EVENT_NAME = event;
+    if (requested !== undefined) io.env.REQUESTED_PR = requested;
+    io.mkdirSync = vi.fn();
+    const inner = io.execFileSync;
+    io.execFileSync = vi.fn((cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'pr') return prs;
+      if (cmd === process.execPath && failPr && args.includes(`--only=${failPr}`)) throw new Error('boom');
+      if (cmd === process.execPath) {
+        const n = args.find(a => a.startsWith('--only=')).slice(7);
+        return JSON.stringify({ ...base(), toMerge: [{ ...row, num: Number(n) }] });
+      }
+      return inner(cmd, args, opts);
+    });
+    return io;
+  }
+  it('schedule: writes one verdict per PR and succeeds', () => {
+    const io = batchIo();
+    const out = runBatch(batchArgv, io);
+    expect(out).toMatchObject({ written: 2, failed: 0 });
+    expect(io.writeFileSync.mock.calls.map(c => c[0])).toEqual(['verdicts/pr-7.json', 'verdicts/pr-8.json']);
+  });
+  it('one failing PR still attempts the others, then reports failure', () => {
+    const io = batchIo({ failPr: 7 });
+    const out = runBatch(batchArgv, io);
+    expect(out).toMatchObject({ written: 1, failed: 1 });
+    expect(io.writeFileSync).toHaveBeenCalledTimes(1);
+  });
+  it('zero verdicts (no open PRs) is a failure', () => {
+    expect(runBatch(batchArgv, batchIo({ prs: '' }))).toMatchObject({ written: 0, failed: 1 });
+  });
+  it('all failing is a failure', () => {
+    const io = batchIo({ prs: '7\n', failPr: 7 });
+    expect(runBatch(batchArgv, io)).toMatchObject({ written: 0, failed: 1 });
+  });
+  it('dispatch classifies only the requested PR', () => {
+    const io = batchIo({ event: 'workflow_dispatch', requested: '9' });
+    expect(runBatch(batchArgv, io)).toMatchObject({ written: 1, failed: 0 });
+    expect(io.writeFileSync.mock.calls[0][0]).toBe('verdicts/pr-9.json');
+    expect(io.execFileSync.mock.calls.some(c => c[0] === 'gh' && c[1][0] === 'pr')).toBe(false);
+  });
+  it.each(['', 'abc', '0', '9; rm -rf /', '1 2'])('dispatch refuses bad requested PR %j', requested => {
+    expect(runBatch(batchArgv, batchIo({ event: 'workflow_dispatch', requested }))).toMatchObject({ written: 0, failed: 1 });
+  });
+  it.each(['9; echo', '-1', 'x', '0'])('schedule ignores non-numeric PR list entry %j as a failure', bad => {
+    expect(runBatch(batchArgv, batchIo({ prs: `${bad}\n` }))).toMatchObject({ written: 0, failed: 1 });
+  });
+  it('refuses unsafe env before any process', () => {
+    const io = batchIo(); io.env.GITHUB_REF = 'refs/heads/feature';
+    expect(() => runBatch(batchArgv, io)).toThrow();
+    expect(io.execFileSync).not.toHaveBeenCalled();
+  });
+  it.each([[['--batch']], [['--batch', '--verdict-dir=a', '--verdict-dir=b']], [['--batch', '--only=7', '--verdict-dir=a']], [['--verdict-dir=a']]])
+  ('refuses bad batch args %j', args => {
+    expect(() => runBatch(args, batchIo())).toThrow();
+  });
+});
+
+describe('T6b: workflow pins the exact command', () => {
+  const CMD = 'node scripts/drain-classify-only.mjs --batch --verdict-dir=verdicts';
+  const classify = doc => jobs(doc)[0].steps.find(st => /drain-classify-only/.test(st.run ?? ''));
+  it('real workflow runs exactly the batch command', () => {
+    expect(classify(yaml.safeLoad(workflowText())).run.trim()).toBe(CMD);
+  });
+  it.each([
+    ['|| true', c => `${c} || true`], ['appended line', c => `${c}\necho ok`], ['semicolon', c => `${c}; true`],
+    ['&&', c => `${c} && true`], ['altered flag', c => c.replace('--batch', '--batch --x')], ['altered command', c => c.replace('drain-classify-only', 'other')],
+    ['pipe', c => `${c} | cat`], ['subshell', c => `${c} $(id)`],
+  ])('rejects %s', (_n, change) => rejectedWorkflow(mutateWorkflow(doc => { const st = classify(doc); st.run = change(st.run.trim()); })));
+  it('rejects a continue-on-error step and an if guard on the step', () => {
+    rejectedWorkflow(mutateWorkflow(doc => { classify(doc)['continue-on-error'] = true; }));
+    rejectedWorkflow(mutateWorkflow(doc => { classify(doc).if = 'false'; }));
+  });
+  it('rejects a second run step', () => rejectedWorkflow(mutateWorkflow(doc => { jobs(doc)[0].steps.push({ run: 'true' }); })));
 });

@@ -94,16 +94,20 @@ export function auditWorkflow(yamlText) {
     Object.values(value).forEach(walk);
   };
   walk(doc);
+  // The loop, counting and exit code live in the tested --batch mode; the workflow may only run that exact command.
   const steps = Object.values(record(doc.jobs) ? doc.jobs : {}).flatMap(job => (record(job) && Array.isArray(job.steps) ? job.steps : []));
-  const guards = { classify: "github.event_name == 'schedule'", dispatch: "github.event_name == 'workflow_dispatch'", upload: 'always()' };
-  const sched = steps.filter(st => typeof st?.run === 'string' && st.run.includes('failed=1'));
-  const disp = steps.filter(st => typeof st?.run === 'string' && st.run.includes('drain-classify-only') && !st.run.includes('failed=1'));
+  const RUNS = ['npm ci --ignore-scripts --no-audit --no-fund', 'node scripts/drain-classify-only.mjs --batch --verdict-dir=verdicts'];
+  const runs = steps.filter(st => Object.hasOwn(st ?? {}, 'run'));
+  const classify = runs.filter(st => st.run === RUNS[1]);
+  if (runs.length !== 2 || runs[0].run !== RUNS[0] || runs[1].run !== RUNS[1] || classify.length !== 1 ||
+      runs.some(st => Object.hasOwn(st, 'if') || Object.hasOwn(st, 'shell') || Object.hasOwn(st, 'continue-on-error')) ||
+      !exact(classify[0].env, ['REQUESTED_PR']) || classify[0].env.REQUESTED_PR !== '${{ inputs.pr }}') {
+    problems.push('run steps must be exactly the pinned commands');
+  }
   const up = steps.filter(st => /^actions\/upload-artifact@/.test(st?.uses ?? ''));
-  if (sched.length !== 1 || !/exit "\$\{failed:-0\}"/.test(sched[0].run) || sched[0].if !== guards.classify ||
-      disp.length !== 1 || disp[0].if !== guards.dispatch || up.length !== 1 || up[0].if !== guards.upload ||
-      steps.some(st => Object.hasOwn(st, 'if') && ![sched[0], disp[0], up[0]].includes(st)) ||
-      Object.values(doc.jobs).some(job => Object.hasOwn(job, 'if'))) {
-    problems.push('scheduled classification failures must fail the job');
+  if (up.length !== 1 || up[0].if !== 'always()' || steps.some(st => Object.hasOwn(st ?? {}, 'if') && st !== up[0]) ||
+      Object.values(record(doc.jobs) ? doc.jobs : {}).some(job => Object.hasOwn(job ?? {}, 'if'))) {
+    problems.push('only the artifact upload may be conditional');
   }
   const jobs = record(doc.jobs) ? Object.values(doc.jobs) : [];
   if (jobs.length !== 1 || !jobs.every(job => record(job) && Number.isFinite(job['timeout-minutes']) &&

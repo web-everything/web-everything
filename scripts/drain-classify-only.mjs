@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build, verify, forbiddenCredential } from './lib/drain-verdict.mjs';
 
@@ -48,6 +48,15 @@ export function resultToVerdictInputs(result, ctx) {
     computedAt: ctx.computedAt, provenance: ctx.provenance, decision: merge.length ? 'enqueue' : 'local' };
 }
 
+function assertSafeEnv(env) {
+  if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_REF !== 'refs/heads/main' ||
+      !['schedule', 'workflow_dispatch'].includes(env.GITHUB_EVENT_NAME) || !/^[1-9]\d*$/.test(env.GITHUB_RUN_ID || '') ||
+      !env.GITHUB_TOKEN || Object.keys(env).some(forbiddenCredential) ||
+      (Object.hasOwn(env, 'GH_TOKEN') && env.GH_TOKEN !== env.GITHUB_TOKEN)) {
+    throw new Error('unsafe Actions environment; run the local drain');
+  }
+}
+
 export function runCli(argv = process.argv.slice(2), io = {}) {
   const flags = Object.create(null);
   for (const arg of argv) {
@@ -60,12 +69,7 @@ export function runCli(argv = process.argv.slice(2), io = {}) {
     throw new Error('usage: --only=N --verdict-out=path [--repo=owner/repo]; run the local drain');
   }
   const env = { ...(io.env || process.env) };
-  if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_REF !== 'refs/heads/main' ||
-      !['schedule', 'workflow_dispatch'].includes(env.GITHUB_EVENT_NAME) || !/^[1-9]\d*$/.test(env.GITHUB_RUN_ID || '') ||
-      !env.GITHUB_TOKEN || Object.keys(env).some(forbiddenCredential) ||
-      (Object.hasOwn(env, 'GH_TOKEN') && env.GH_TOKEN !== env.GITHUB_TOKEN)) {
-    throw new Error('unsafe Actions environment; run the local drain');
-  }
+  assertSafeEnv(env);
   const repoSlug = flags.repo || env.GITHUB_REPOSITORY;
   if (!/^[\w.-]+\/[\w.-]+$/.test(repoSlug || '') ||
       (flags.repo && flags.repo !== env.GITHUB_REPOSITORY)) throw new Error('unbound repository; run the local drain');
@@ -95,8 +99,55 @@ export function runCli(argv = process.argv.slice(2), io = {}) {
   return verdict;
 }
 
+/** Owns the loop, the counting and the exit code: any failure, or zero verdicts, is a failure. */
+export function runBatch(argv = process.argv.slice(2), io = {}) {
+  const flags = Object.create(null);
+  for (const arg of argv) {
+    const match = /^--(batch|verdict-dir|repo)(?:=(.*))?$/.exec(arg);
+    if (!match || Object.hasOwn(flags, match[1]) || (match[1] === 'batch') !== (match[2] === undefined)) {
+      throw new Error('invalid or repeated argument; run the local drain');
+    }
+    flags[match[1]] = match[2] ?? true;
+  }
+  if (flags.batch !== true || !/^[\w./-]+$/.test(flags['verdict-dir'] || '') || flags['verdict-dir'].includes('..')) {
+    throw new Error('usage: --batch --verdict-dir=dir [--repo=owner/repo]; run the local drain');
+  }
+  const env = { ...(io.env || process.env) };
+  assertSafeEnv(env);
+  const fail = reason => { process.stderr.write(`${reason}; run the local drain\n`); return { written: 0, failed: 1 }; };
+  let prs;
+  if (env.GITHUB_EVENT_NAME === 'workflow_dispatch') prs = [env.REQUESTED_PR ?? ''];
+  else {
+    try {
+      prs = String((io.execFileSync || execFileSync)('gh', ['pr', 'list', '--repo', flags.repo || env.GITHUB_REPOSITORY,
+        '--state', 'open', '--search', 'sort:updated-desc', '--limit', '10', '--json', 'number', '--jq', '.[].number'],
+      { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 60_000, env })).split('\n').filter(Boolean);
+    } catch { return fail('open PR list unreadable'); }
+  }
+  if (!prs.length) return fail('no PRs to classify');
+  (io.mkdirSync || mkdirSync)(flags['verdict-dir'], { recursive: true });
+  let written = 0, failed = 0;
+  for (const pr of prs) {
+    try {
+      if (!/^[1-9]\d*$/.test(pr)) throw new Error('invalid PR number');
+      runCli([`--only=${pr}`, `--verdict-out=${flags['verdict-dir']}/pr-${pr}.json`, ...(flags.repo ? [`--repo=${flags.repo}`] : [])], io);
+      written++;
+    } catch (error) {
+      failed++;
+      process.stderr.write(`#${String(pr).replace(/[^\w-]/g, '?')}: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, ' ')}\n`);
+    }
+  }
+  if (!written && !failed) failed = 1;
+  return { written, failed };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  try { runCli(); } catch (error) {
+  try {
+    if (process.argv.includes('--batch')) {
+      const { failed } = runBatch();
+      if (failed) process.exitCode = 1;
+    } else runCli();
+  } catch (error) {
     process.stderr.write(`${String(error.message).replace(/[\x00-\x1f\x7f]/g, ' ')}\n`);
     process.exitCode = 1;
   }
