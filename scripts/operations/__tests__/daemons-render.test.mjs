@@ -97,8 +97,10 @@ describe('daemon renderer', () => {
     expect(env.WE_WIP_PUBLISH_HOME).toBe(home);
     expect(args[2]).not.toContain(home);
     expect(args.slice(0, 2)).toEqual(['/bin/zsh', '-lc']);
-    // The rendered source is POSIX; probe it with /bin/sh (zsh is absent on Linux CI) and only rendered env.
-    const output = execFileSync('/bin/sh', ['-c', args[2]], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
+    // Execute through the rendered shell when the host has it (startup files off); zsh is absent on Linux CI,
+    // where the POSIX source is probed with /bin/sh instead.
+    const shell = existsSync(args[0]) ? [args[0], ['-f', '-c', args[2]]] : ['/bin/sh', ['-c', args[2]]];
+    const output = execFileSync(shell[0], shell[1], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
     expect(output.trim()).toBe(realpathSync(app));
     expect(existsSync(join(root, 'dollar-executed'))).toBe(false);
     expect(existsSync(join(root, 'backtick-executed'))).toBe(false);
