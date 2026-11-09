@@ -674,3 +674,54 @@ describe('stale record owned by a foreign host name', () => {
     expect(stale(f)).toMatchObject({ mode: 'skip' });
   });
 });
+
+// The stale window setting reaches recovery only through `env` at each planner call site (review-job admission, the abandon
+// step and the red-team-on-skip dispatcher). A record 12 minutes old is inside the 30 minute default but past a 10 minute
+// setting, so each entry point must honour the setting (and hold the record when it is absent). Dropping `env` at any one
+// site makes that site fall back to the default and these tests redden.
+describe('foreign-host stale window setting reaches every recovery entry point', () => {
+  const windowed = (set) => {
+    const f = fixture({ foreign: true });
+    if (set) f.env.WE_RED_TEAM_FOREIGN_HOST_STALE_MS = '600000';
+    writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, pidNamespace: null, pidStart: null }));
+    const at = new Date(Date.now() - 12 * 60_000);
+    utimesSync(f.path, at, at);
+    return f;
+  };
+  const skipRun = (f, dispatch) => recovery.runRedTeamOnSkip({ repo, env: f.env, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+    rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readWitness: f.readWitness,
+    readEvidence: () => ({ loopPayload: f.readWitness().newest, inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+    abandon: () => ({ ok: true }), setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(), now: Date.now,
+    capacity: { lanes: 1 }, dispatch });
+
+  it('review-job admission honours the setting', () => {
+    const f = windowed(true);
+    expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+  });
+  it('review-job admission holds the record inside the default window', () => {
+    const f = windowed(false);
+    const before = readFileSync(f.path, 'utf8');
+    expect(() => f.admit()).toThrow('owner live or age unknown');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+  it('the abandon step honours the setting', () => {
+    const f = windowed(true);
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+  });
+  it('the abandon step holds the record inside the default window', () => {
+    const f = windowed(false);
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(false);
+  });
+  it('the red-team-on-skip dispatcher honours the setting', () => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    expect(skipRun(windowed(true), dispatch).dispatched).toMatchObject([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+  it('the red-team-on-skip dispatcher holds the record inside the default window', () => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    const result = skipRun(windowed(false), dispatch);
+    expect(result.dispatched).toEqual([]);
+    expect(result.rows[0]).toMatchObject({ action: 'skip', why: 'owner live or age unknown' });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+});
