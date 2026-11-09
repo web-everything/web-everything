@@ -248,6 +248,16 @@
             "scripts/lib/drain-merge-strategy.mjs:432 — Check-run mode skips live evidence and disposition validation. An older successful check can authorize enqueue despite a later confirmed-break comment, operator block, or revoked deferral when blocking labels are absent.",
             "scripts/merge-gate-check.mjs:194 — Publication holds do not prevent stale-success admission: after the check read, a writer can publish a newer pending check and clear its publication hold before the status read. An injected read-only probe returned success while the latest check was in progress."
         ]
+    },
+    {
+        "ref": "lane/bound-session-stale",
+        "sha": "95d22a251a5389eb5b703b66cc705cb569743f8f",
+        "ruling": "R810+R794",
+        "findings": [
+            "scripts/conveyor/hung-session.mjs:444 — Replaces the absolute pending-tool-call veto with an age-and-idle override, allowing unfinished calls to be classified as finished without observing completion.",
+            "scripts/conveyor/reconcile-core.mjs:1167 — Already-hung rows skip the new fresh-status check. The preceding hung detector releases pending calls at the same grace threshold, so even a fresh busy/waiting status cannot enforce the claimed protection.",
+            "scripts/conveyor/soak/breaks/idle-row-dangling-call-holds-pr.mjs:57 — fixPresent runs the same scenario as the test; a behavioral regression returns false and selects it.fails in defineBreakTest, allowing the regression to pass as an expected failure."
+        ]
     }
   ]
 }
