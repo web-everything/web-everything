@@ -1516,12 +1516,34 @@ function probeLaneHistory(dir) {
   read(['rev-list', '--ignore-missing', '--stdin'], opts);
 }
 
-function requireReadableLaneHistory(repo, n) {
+function requireReadableLaneHistory(repo, n, { allowRepair = !flags['no-reset'] } = {}) {
+  const dir = laneDir(repo, n);
   let firstError;
   // Exactly one retry, including timeouts/output-limit errors. Preserve the initial diagnostic.
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { probeLaneHistory(laneDir(repo, n)); return; } catch (e) {
+    try { probeLaneHistory(dir); return; } catch (e) {
       firstError ??= msgOf(e).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 2000);
+    }
+    if (attempt === 0) {
+      const sha = tryGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
+      const evidence = {
+        lane: n, at: new Date().toISOString(), firstError,
+        head: tryGit(['symbolic-ref', '-q', 'HEAD'], dir) || 'HEAD', sha,
+        refs: tryGit(['for-each-ref', '--format=%(objectname) %(refname)'], dir),
+      };
+      // Keep evidence outside the clone (it may be re-cloned), separate from the active quarantine.
+      // Flush BEFORE any repair; a failed evidence write refuses acquisition without healing anything.
+      mkdirSync(join(repo.poolDir, '.quarantine-state'), { recursive: true });
+      writeFileSync(historyQuarantinePath(repo, n).replace(/\.json$/, '.evidence.jsonl'),
+        JSON.stringify(evidence) + '\n', { flag: 'a', flush: true });
+      if (allowRepair) {
+        healLaneRefs(dir, { log });
+        // A missing HEAD object already used the corrupt-clone recovery path before this gate.
+        // A present tip with missing ancestors must instead fail the second honest-history probe.
+        if (sha && tryGit(['cat-file', '-e', `${sha}^{commit}`], dir) === null) {
+          recloneLane(repo, n, `HEAD ${sha} missing or not a commit; ${firstError}`);
+        }
+      }
     }
   }
   const file = historyQuarantinePath(repo, n);
@@ -2800,7 +2822,7 @@ async function cmdAcquire(repo) {
   // would silently re-run `fetchOriginPruneWithRetry`/`checkout -B`/`ensureDeps` a second time for no reason.
   if (flags.lane !== undefined) {
     try {
-      requireReadableLaneHistory(repo, chosen);
+      requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       provisionClaimedLane(repo, chosen, targetWasReserved);
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
