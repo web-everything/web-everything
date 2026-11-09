@@ -69,6 +69,8 @@ describe('legacy bare-string red-team publication', () => {
     ['missing folded verdict', () => seatRow({ foldedVerdict: undefined })],
     ['invalid folded verdict', () => seatRow({ foldedVerdict: 'clear' })],
     ['count exceeds confirmed findings', () => seatRow({ confirmedMissCount: 1 })],
+    ['changes verdict with zero confirmed findings', () => seatRow({ foldedVerdict: 'changes', confirmedMissCount: 0, findings: [] })],
+    ['needs-human verdict with zero confirmed findings', () => seatRow({ foldedVerdict: 'needs-human', confirmedMissCount: 0, findings: [] })],
     ['count omits a confirmed finding', () => seatRow({ foldedVerdict: 'changes',
       confirmedMissCount: 0, findings: [confirmedFinding] })],
   ])('holds unreadable legacy evidence and alerts only once: %s', (_name, readSeatRow) => {

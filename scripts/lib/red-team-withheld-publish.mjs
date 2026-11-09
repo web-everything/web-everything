@@ -61,7 +61,8 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
         if (!row || row.rev !== head || !Array.isArray(row.findings)
           || !['accept', 'changes', 'needs-human'].includes(row.foldedVerdict)
           || !Number.isInteger(row.confirmedMissCount) || row.confirmedMissCount < 0
-          || row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck === true).length) {
+          || row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck === true).length
+          || (row.foldedVerdict !== 'accept' && row.confirmedMissCount === 0)) {
           throw Error('invalid legacy red-team evidence');
         }
         result = { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
