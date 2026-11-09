@@ -947,7 +947,13 @@ describe('R473 structured concurrency evidence', () => {
       ...[0x3002, 0xff61, 0x2027, 0xb7, 0x589].map(cp => `scripts/lib/review-independence${String.fromCodePoint(cp)}mjs`),
       ...[0x301, 0x20dd, 0x488, 0xfffd, 0xfffc, 0x2423, 0x203f].map(cp => `scripts/lib/review-indep${String.fromCodePoint(cp)}endence.mjs`),
       `${String.fromCodePoint(0x455)}cripts/lib/review-independence.mjs`, `scripts/lib/r${String.fromCodePoint(0x435)}view-independence.mjs`,
-      `scripts/lib/review-independence${String.fromCodePoint(0x2e)}m${String.fromCodePoint(0x458)}s`])(
+      `scripts/lib/review-independence${String.fromCodePoint(0x2e)}m${String.fromCodePoint(0x458)}s`,
+      // Second self-review: a quote or bracket INSIDE a name, and an unmapped lookalike in place of every separator.
+      ...[0x300c, 0x201a, 0x2019, 0x169b, 0x2e1c, 0xab, 0x2e28, 0xfd3e].flatMap(cp => [`scripts/lib/review${String.fromCodePoint(cp)}-independence.mjs`,
+        `scripts/lib/git-hook${String.fromCodePoint(cp)}surface.mjs`, `scripts/lib/git-hook-surface${String.fromCodePoint(cp)}.mjs`]),
+      ['scripts', 'lib', 'review-independence'].join(String.fromCodePoint(0x2571)) + `${String.fromCodePoint(0xa4f8)}mjs`,
+      ['scripts', 'lib', 'git-hook-surface'].join(String.fromCodePoint(0x2571)) + `${String.fromCodePoint(0xa60e)}mjs`,
+      ['.github', 'workflows', 'ci.yml'].join(String.fromCodePoint(0x2571))])(
       'a protected file reported as %j still never ships', async file => {
         for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
       });
@@ -966,7 +972,9 @@ describe('R473 structured concurrency evidence', () => {
       '+++ b/scripts/output.mjs', 'src/components/merge-button.ts',
       // Quotes, brackets and a dash between words stay prose: they never refuse an unprotected report.
       `${String.fromCodePoint(0x2018)}scripts/output.mjs${String.fromCodePoint(0x2019)}`, `${String.fromCodePoint(0x201c)}scripts/output.mjs${String.fromCodePoint(0x201d)}`,
-      `scripts/output.mjs ${String.fromCodePoint(0x2014)} line 12`, `scripts/output.mjs${String.fromCodePoint(0x2013)}12`, `${String.fromCodePoint(0x300c)}scripts/output.mjs${String.fromCodePoint(0x300d)}`])(
+      `scripts/output.mjs ${String.fromCodePoint(0x2014)} line 12`, `scripts/output.mjs${String.fromCodePoint(0x2013)}12`, `${String.fromCodePoint(0x300c)}scripts/output.mjs${String.fromCodePoint(0x300d)}`,
+      `scripts/output.mjs${String.fromCodePoint(0x3002)}`, `scripts/output.mjs ${String.fromCodePoint(0x7b2c)}42${String.fromCodePoint(0x884c)}`,
+      `scripts/output.mjs ${String.fromCodePoint(0x2192)} scripts/other.mjs`])(
       'an unprotected file reported as %j still ships as debt (the stripped forms add protection, never remove a path)', async file => {
         expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('NOT WEAKENED');
       });

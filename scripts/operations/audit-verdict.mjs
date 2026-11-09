@@ -176,11 +176,17 @@ function pathCandidates(file, anchors = new Set()) {
   // still holds a non-ASCII letter, number, mark or symbol next to a path character cannot be established, and the
   // path fails closed (protected). Every tracked file name is ASCII, so no real path is refused. A second form also
   // drops whitespace, which renders as a gap inside a name. Each form only adds candidates; the raw report stays one.
-  // A run is what sits between whitespace, quotes and brackets (a curly-quoted or bracketed `(x.mjs)` stays prose); one holding a
-  // `.`, `/` or `\` names a path, so a non-ASCII character left in it refuses the report.
+  // A run is what sits between whitespace. Punctuation and symbols at its edges are prose (a curly-quoted or bracketed
+  // path, a trailing ideographic full stop); what is left is the run's core. A core that still mixes a non-ASCII
+  // character with an ASCII letter refuses the report, wherever the character sits and whatever it looks like (a
+  // bracket inside a name, a box-drawing slash in place of every `/`). Non-ASCII prose (no ASCII letter) still passes.
   const folded = foldPathText(file);
-  if ((folded.match(/[^\s\p{Pi}\p{Pf}\p{Ps}\p{Pe}]+/gu) ?? []).some(run => /[^\x00-\x7f]/.test(run) && /[./\\]/.test(run))) return null;
-  for (const form of new Set([file, folded, folded.replace(/\s/gu, '')])) {
+  const cores = folded.split(/\s+/u).map(run => run.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, ''));
+  if (cores.some(core => /[^\x00-\x7f]/.test(core) && /[A-Za-z]/.test(core))) return null;
+  // Forms: the raw report, the fold, and the fold without whitespace, and also without quotes and brackets (a gap or a
+  // bracket inside a name joins up again).
+  const joined = folded.replace(/\s/gu, '');
+  for (const form of new Set([file, folded, joined, joined.replace(/[\p{Pi}\p{Pf}\p{Ps}\p{Pe}"'`]/gu, '')])) {
     for (const token of form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []) {
       const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
       for (let i = 0; i < segs.length; i++) {
