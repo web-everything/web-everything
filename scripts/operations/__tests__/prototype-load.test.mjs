@@ -2659,4 +2659,20 @@ describe('prototype-load daemon key resolution (R502 item 1)', () => {
     const g = fixture(); const r = await g.run({ daemon: 'nope' });
     expect(r.stopReason).toBe('unknown-daemon'); expect(r.validDaemons).toEqual(['control', 'review', 'drain']); expect(JSON.stringify(r)).toContain('control, review, drain');
   });
+  it.each(['mergewatch', 'com.we.mw', 'mw-alias'])('refuses a daemon marked unsupported (%s) before reading a plist or touching git, and records it', async (name) => {
+    const f = fixture({ settings: {
+      daemons: { control: { label: 'com.we.control', clone: 'wev-control' }, mergewatch: { label: 'com.we.mw', clone: 'wev-mw', unsupported: 'its self-sync runs main-only, so overlays are never adopted' } },
+      daemonAliases: { 'mw-alias': 'mergewatch' },
+    } });
+    const r = await f.run({ daemon: name });
+    expect(r).toMatchObject({ ok: false, stopReason: 'unsupported-daemon', detail: 'unsupported-daemon:mergewatch' });
+    expect(r.fallback).toContain('main-only');
+    expect(f.calls).toHaveLength(0); expect(mutations(f, 'add')).toHaveLength(0); expect(f.records).toHaveLength(1);
+  });
+  it('refuses an unsupported daemon even in retire-only and dry-run modes', async () => {
+    const settings = { daemons: { mergewatch: { label: 'com.we.mw', clone: 'wev-mw', unsupported: 'main-only self-sync' } } };
+    for (const extra of [{ retire: true }, { dryRun: true }]) {
+      const f = fixture({ settings }); expect((await f.run({ daemon: 'mergewatch', ...extra })).stopReason).toBe('unsupported-daemon'); expect(f.calls).toHaveLength(0);
+    }
+  });
 });

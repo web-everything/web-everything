@@ -345,6 +345,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       if (resolved.key !== input.daemon) { out.requestedDaemon = input.daemon; input = { ...input, daemon: resolved.key }; out.daemon = resolved.key; }
       const daemon = config.daemons[resolved.key];
+      // A daemon whose self-sync can never adopt an overlay (e.g. main-only) refuses up front, before any plist/git work or registration.
+      if (typeof daemon.unsupported === 'string' && daemon.unsupported) {
+        return stop('unsupported-daemon', { detail: `unsupported-daemon:${resolved.key}`,
+          fallback: `Daemon "${resolved.key}" cannot adopt prototype loads: ${daemon.unsupported}` });
+      }
       if (daemon.clone) {
         out.clone = resolve(expand(config.workspaceRoot), expand(daemon.clone));
         out.cloneSource = `settings:prototype-load.json#daemons.${input.daemon}.clone`;
