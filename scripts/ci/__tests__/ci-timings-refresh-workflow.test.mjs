@@ -19,7 +19,7 @@ const PUSH = 'git push --force-with-lease=refs/heads/ci/refresh-test-timings: or
 const PUBLICATION_GATE = "steps.branch.outputs.exists == 'true' || steps.timings.outputs.changed == 'true'";
 
 // Execute the workflow's actual shell with stateful Git/GitHub doubles; never touch a checkout or network.
-function publicationProbe({ exists = false, open = false, failCreate = false, failLookup = false, appears = false } = {}) {
+function publicationProbe({ exists = false, open = false, failCreate = false, failLookup = false, appears = false, held = 0 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'timings-publication-'));
   const output = join(root, 'output');
   const prelude = `
@@ -40,7 +40,8 @@ function publicationProbe({ exists = false, open = false, failCreate = false, fa
         'pr list')
           echo 'LOOKUP' >&2
           if [ "\${FAIL_LOOKUP:-0}" = 1 ]; then return 1; fi
-          echo "$open" ;;
+          case "$*" in *labels*) echo "\${HELD:-0}" ;; *) echo "$open" ;; esac ;;
+        'pr edit') echo "EDIT $*" ;;
         'pr create')
           echo "CREATE $*"
           if [ "\${FAIL_CREATE:-0}" = 1 ]; then return 1; fi
@@ -73,7 +74,7 @@ function publicationProbe({ exists = false, open = false, failCreate = false, fa
     const second = evaluate(publish.if, outputs)
       ? spawnSync('bash', ['-e', '-c', `${prelude}\nexists=${Number(retained || appears)}\n${publish.run}`], {
         encoding: 'utf8', timeout: 5_000,
-        env: { ...process.env, FAIL_CREATE: '0', FAIL_LOOKUP: String(Number(failLookup)) },
+        env: { ...process.env, FAIL_CREATE: '0', FAIL_LOOKUP: String(Number(failLookup)), HELD: String(held) },
       })
       : { status: 0, stdout: '', stderr: '' };
     return { first, second, refreshed, token };
@@ -105,6 +106,15 @@ describe('CI timing refresh publication recovery', () => {
     expect(second.stdout).not.toContain('review:pending');
     expect(second.stdout).not.toContain('authored-by-actor');
     expect(second.stdout).not.toContain('PUSH');
+  });
+
+  it('holds an already-open unlabelled refresh PR for a human, and leaves a held one alone', () => {
+    const bare = publicationProbe({ exists: true, open: true, held: 0 }).second;
+    expect(bare.status, bare.stderr).toBe(0);
+    expect(bare.stdout).toMatch(/EDIT pr edit ci\/refresh-test-timings --add-label review:human/);
+    const held = publicationProbe({ exists: true, open: true, held: 1 }).second;
+    expect(held.status, held.stderr).toBe(0);
+    expect(held.stdout).not.toContain('EDIT');
   });
 
   it('does not create or emit a review label or author stamp when the PR is already open', () => {
