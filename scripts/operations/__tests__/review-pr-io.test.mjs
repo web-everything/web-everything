@@ -593,6 +593,25 @@ describe('the label sink', () => {
     expect(seen[0].some((a) => a.startsWith('--channel='))).toBe(false);
   });
 
+  // A child that never started (spawn refused) wrote nothing; one that ran and was killed or exited stays UNKNOWN.
+  const gateOk = async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' });
+  it.each(['ENOENT', 'EAGAIN', 'ENOMEM', 'E2BIG'])('a single home that could not be started (%s) is notApplied', async (code) => {
+    const sinks = createReviewPrSinks({ root, publishGate: gateOk,
+      runNode: () => { throw Object.assign(new Error(`spawnSync node ${code}`), { code, status: null, signal: null }); } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining(code) });
+  });
+  it.each([
+    ['a timeout kill', { code: 'ETIMEDOUT', status: null, signal: 'SIGTERM' }],
+    ['an output overflow', { code: 'ENOBUFS', status: null, signal: 'SIGTERM' }],
+    ['a child that ran and exited', { code: 'ENOENT', status: 1, signal: null }],
+  ])('%s after the child started stays UNKNOWN, never retried', async (_label, fields) => {
+    const sinks = createReviewPrSinks({ root, publishGate: gateOk,
+      runNode: () => { throw Object.assign(new Error('child failed'), fields); } });
+    const err = await sinks[REVIEW_EFFECTS.LABEL](payload, CTX).catch((e) => e);
+    expect(err.message).toContain('outcome is UNKNOWN');
+    expect(err.notApplied).toBeUndefined();
+  });
+
   it('maps a PROVEN pre-write refusal to `notApplied`, so it is retried rather than refused', async () => {
     const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }),
       root,

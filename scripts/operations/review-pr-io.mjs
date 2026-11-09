@@ -851,6 +851,16 @@ export function createReviewPrReader({
  * unrecognised failure is how a comment gets double-posted. This list only ever narrows the refusal; it never
  * widens what counts as safe.
  */
+/**
+ * Spawn errors that mean the child process never started, so it cannot have written anything. A child that ran and
+ * then failed carries an exit `status` or a `signal` (a timeout kills with SIGTERM, ENOBUFS kills a running child),
+ * and those stay indeterminate.
+ */
+const SPAWN_NEVER_STARTED = Object.freeze(new Set(['ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'ENOMEM', 'E2BIG', 'EMFILE', 'ENFILE']));
+function childNeverStarted(e) {
+  return !!e && e.status == null && !e.signal && SPAWN_NEVER_STARTED.has(e.code);
+}
+
 const PRE_WRITE_REFUSALS = Object.freeze([
   'usage: review-set-label.mjs',
   'invalid --repo',
@@ -1708,6 +1718,10 @@ export function createReviewPrSinks({
         if (isPreWriteRefusal(text)) {
           // PROVABLY nothing landed → `failed`, retried on the next pass.
           throw notApplied(`review-set-label.mjs refused before any write: ${text}`, { argv });
+        }
+        if (childNeverStarted(e)) {
+          // The single home never ran (spawn refused: no exit status, no signal), so it wrote nothing → retryable.
+          throw notApplied(`review-set-label.mjs could not be started, nothing was written: ${e.code}`, { argv });
         }
         // INDETERMINATE. A plain throw leaves the entry `pending`; the effect is declared NON-idempotent, so
         // the executor REFUSES to replay it and a person decides. That is the fail-closed answer, and it is
