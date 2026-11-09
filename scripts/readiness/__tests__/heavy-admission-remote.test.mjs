@@ -480,6 +480,37 @@ describe('runWithRemoteDecision', () => {
     expect(f.log.mock.calls.some(([line]) => line.includes('exit 124'))).toBe(false);
   });
 
+  // PR 6589 red team: a confirmed copy-failed non-start that lands just before the run timeout must not be lost to a
+  // slow post-copy health refresh racing that timeout. No health read may follow the execution; the marker and the
+  // reservation are released and local fallback is permitted.
+  it('keeps a confirmed copy-failed termination when it lands near the run timeout (no post-copy health read)', async () => {
+    const f = fixture();
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    let now = Date.now();
+    let execDone = false;
+    let readsAfterExec = 0;
+    f.readTelemetry = async () => {
+      if (execDone) { readsAfterExec++; await new Promise(resolve => setTimeout(resolve, 1500)); }
+      return healthyRead();
+    };
+    f.remoteExec = vi.fn(async () => {
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      now += 10_050; // past the 10 s health cache, so any post-copy refresh would read Forge again
+      execDone = true;
+      return { mode: 'not-started', terminated: true, reason: 'copy-failed' };
+    });
+    const outcome = await runWithRemoteDecision({ ...f, clock: () => now, timeoutMs: 2000 });
+    expect(outcome).toEqual({ handled: false });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(readsAfterExec).toBe(0);
+    expect(existsSync(join(remoteRoot, 'slot-0.unconfirmed'))).toBe(false);
+    expect(heldSlots({ lockRoot: remoteRoot, cap: 8 })).toHaveLength(0);
+    expect(f.log.mock.calls.some(([line]) => line.includes('exit 124') || line.includes('unconfirmed'))).toBe(false);
+    const rows = readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ reason: 'copy-failed' });
+  }, 15_000);
+
   describe.each(['not-started', 'cancelled'])('%s', (mode) => {
     it.each([undefined, false, 1, 'true'])('without terminated=true refuses local rerun: %s', async (terminated) => {
       const f = fixture({ result: { mode, terminated } });
