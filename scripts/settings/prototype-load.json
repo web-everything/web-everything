@@ -286,6 +286,14 @@
         "scripts/conveyor/missing-run-push.mjs:73 \u2014 Writer admission is optional, and the production trigger at ci-red-recovery-watch.mjs:1525 supplies none of its enabling inputs. Writer tests explicitly inject those inputs, so they cannot detect production bypassing evidence and cap checks.",
         "scripts/conveyor/fix-claim-store.mjs:92 \u2014 The claim reader treats directory-read errors as no claims and skips unreadable or corrupt entries. Both new admission and existing writer checks therefore accept an unreadable claim store as unclaimed, despite their fail-closed assertions."
       ]
+    },
+    {
+      "ref": "lane/redteam-ran-verdict",
+      "sha": "e9cce536ad8cfebb3b343b52ee58de387d9b3a78",
+      "ruling": "R813+R813b",
+      "findings": [
+        "scripts/lib/red-team-withheld-publish.mjs:103 \u2014 Legacy recovery relies on marker-only deduplication without comparing the posted comment against recovered findings. Reproduced: a seat row containing one confirmed break plus an existing trusted \u201cno break found\u201d comment returns `skipped`, writes nothing, raises no alert, and leaves the gate seeing zero findings. Conflicting evidence silently bypasses the hold."
+      ]
     }
   ]
 }

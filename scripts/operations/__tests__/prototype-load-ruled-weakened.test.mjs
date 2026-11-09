@@ -41,7 +41,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
   it('NOT WEAKENED records are unchanged', () => {
     expect(readyEvidence([{ ref: REF, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' }], input, [])).toMatchObject({ source: 'ready-record' });
   });
-  it('ships exactly the twenty-two ruled entries with pinned refs, full shas and rulings', () => {
+  it('ships exactly the twenty-three ruled entries with pinned refs, full shas and rulings', () => {
     const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped.ruledWeakened.map(({ ref, sha, ruling }) => [ref, sha, ruling])
       .sort(([a], [b]) => a.localeCompare(b))).toEqual([
@@ -66,6 +66,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/redteam-dispatch-queue', 'f86f066e17bd0eeb3a8c2f945d4d4f6236d30c75', 'R786'],
       ['lane/redteam-foreign-host', 'df6f584666eecef95c6a0b2c72d393cd8e54dd6d', 'R757'],
       ['lane/redteam-pending-on-accept-m1', '166689d13b300960fbf2f458ff3ba18f560b097a', 'R796'],
+      ['lane/redteam-ran-verdict', 'e9cce536ad8cfebb3b343b52ee58de387d9b3a78', 'R813+R813b'],
       ['lane/review-early-start', 'bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2', 'R464+R468+R474'],
       ['lane/runs-scan-bound-aff4', 'aff4a567812cd837234ceeadd0cd7d8a0f658fdb', 'R545'],
       ['lane/stall-sweep-live', 'c305b4d9990be329d41d4577cf193ef729282899', 'R803+R804'],
