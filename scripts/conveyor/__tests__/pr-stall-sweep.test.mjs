@@ -463,7 +463,7 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     const probe = { host: owner.host, namespace: owner.pidNamespace, isAlive: vi.fn(() => alive),
       readPidStart: vi.fn(() => owner.pidStart) };
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow({ maxActionsPerPrHead: 3 }), gh, read: reader(gh),
-      dir, log, readRedTeamStatus, probe, ...options,
+      dir, log, readRedTeamStatus, probe, readStatusAt: () => NOW, ...options,
       // Advance the assessment clock together with the sweep clock on repeated passes.
       read: options.read ?? (input => ({ ...reader(gh)(input), now: options.now ?? NOW })) });
     return { out, dir, calls, log, readRedTeamStatus, probe };
@@ -520,6 +520,53 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
     expect(out.items).toEqual([]);
     expect(out.act).toEqual([]);
+  });
+  const foreignStatus = (patch = {}) => statusFor({ host: 'renamed-mac', startedAt: 'unreadable', ...patch });
+  const staleStatusAt = () => NOW - 31 * 60_000;
+  it.each(['queued', 'running'])('a stale foreign-named %s owner with a dead pid restarts despite unreadable run age', async status => {
+    const { out, probe } = await sweep({ status: foreignStatus({ status }), readStatusAt: staleStatusAt });
+    expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
+    expect(out.incomplete).toBe(false);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a stale foreign-named owner with a live matching pidStart holds without restarting', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus(), alive: true, readStatusAt: staleStatusAt });
+    expect(probe.readPidStart).toHaveBeenCalledWith(owner.pid);
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a stale foreign-named owner with a reused live pid restarts', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus({ pidStart: 'previous-owner-start' }),
+      alive: true, readStatusAt: staleStatusAt });
+    expect(probe.readPidStart).toHaveBeenCalledWith(owner.pid);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a foreign-named owner with fresh statusAt holds without restarting', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus(), readStatusAt: () => NOW - 29 * 60_000 });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('an unreadable foreign-owner statusAt records an error and holds without restarting', async () => {
+    const { out } = await sweep({ status: foreignStatus(),
+      readStatusAt: () => { throw new Error('status mtime unreadable'); } });
+    expect(out.errors).toContain(`red-team owner ${REPO}#11: status mtime unreadable`);
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a stale foreign-named owner in a different pid namespace holds without restarting', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus({ pidNamespace: 'other-ns' }), readStatusAt: staleStatusAt });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a stale dead foreign-named owner at the restart cap is exhausted rather than restarted', async () => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(150), restartRecord(70, { key: `${prHead}:red-team-pending:restart-2` })]);
+    const { out } = await sweep({ dir, status: foreignStatus(), readStatusAt: staleStatusAt,
+      settings: shadow({ maxRedTeamRestartsPerHead: 2 }) });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted' }]);
   });
   it('an owner on another host waits before the stale deadline and escalates after it', async () => {
     const ninetyMinutesAgo = new Date(NOW - 90 * 60_000).toISOString();
