@@ -1,7 +1,7 @@
 /** File held handoff cards through file-item in this checkout; never mutate the handoff. */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync } from 'node:fs';
+import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { op } from './registry.mjs';
@@ -83,22 +83,41 @@ export function qualifyBareBasenames(text, trackedFiles) {
 // resolve through that front-matter line, here and on origin/main.
 const BIRTH_HASH = /^x[0-9a-z]{6}$/;
 
+/** The `bornAs` value inside a card's leading front-matter block only; a body line quoting one never counts. */
+function frontMatterBornAs(text) {
+  const block = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!block) return null;
+  const line = block[1].split(/\r?\n/).find(text => /^bornAs:/.test(text));
+  return line ? line.replace(/^bornAs:\s*/, '').trim().replace(/^["']|["']$/g, '') : null;
+}
+
+const FRONT_MATTER_BYTES = 16 * 1024;
+
+function readHead(path) {
+  const fd = openSync(path, 'r');
+  try {
+    const buffer = Buffer.alloc(FRONT_MATTER_BYTES);
+    return buffer.toString('utf8', 0, readSync(fd, buffer, 0, FRONT_MATTER_BYTES, 0));
+  } finally { closeSync(fd); }
+}
+
 function bornAsLocally(root, hash) {
-  const line = `bornAs: ${hash}`;
   try {
     for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
-      const head = readFileSync(join(root, 'backlog', name), 'utf8').slice(0, 4096);
-      if (head.split(/\r?\n/).some(text => text === line)) return true;
+      if (frontMatterBornAs(readHead(join(root, 'backlog', name))) === hash) return true;
     }
   } catch { /* no backlog dir */ }
   return false;
 }
 
 function bornAsOnMain(root, hash) {
+  const opts = { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] };
   try {
-    // -F: the hash is data, never a pattern; the shape check above already bounds it.
-    return execFileSync('git', ['grep', '-l', '-F', '-x', `bornAs: ${hash}`, 'origin/main', '--', 'backlog/'],
-      { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).trim().length > 0;
+    // The hash is shape-checked to [x0-9a-z]{7}, so it is safe inside the pattern; grep only narrows candidates,
+    // the front-matter parse below decides.
+    const hits = execFileSync('git', ['grep', '-l', '-E', `^bornAs:[[:space:]]*["']?${hash}["']?[[:space:]]*$`, 'origin/main', '--', 'backlog/'], opts)
+      .split('\n').filter(line => line.startsWith('origin/main:backlog/')).slice(0, 20);
+    return hits.some(hit => frontMatterBornAs(execFileSync('git', ['show', hit], opts).slice(0, FRONT_MATTER_BYTES)) === hash);
   } catch { return false; } // exit 1 (no match) and any git failure both fail closed
 }
 

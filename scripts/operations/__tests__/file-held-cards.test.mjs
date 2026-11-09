@@ -360,6 +360,18 @@ it('still refuses a ledgered hash when only an unrelated bornAs exists', async (
   await expect(run()).rejects.toThrow(/ledgered card/);
 });
 
+it('a body line quoting bornAs does not count as the ledgered card; a quoted CRLF front-matter value does', async () => {
+  seed('- [R1] 2026-11-08: one');
+  await run();
+  rmSync(join(root, 'backlog', 'xtest.md'));
+  writeFileSync(ledger, JSON.stringify({ ...JSON.parse(readFileSync(ledger, 'utf8').trim()), card: 'x56mcj7' }) + '\n');
+  seed('- [R1] 2026-11-08: one\n- [R1] 2026-11-08: two');
+  writeFileSync(join(root, 'backlog', '4413-quote.md'), '---\nkind: story\n---\n\n# Quote\n\nbornAs: x56mcj7\n');
+  await expect(run()).rejects.toThrow(/ledgered card/);
+  writeFileSync(join(root, 'backlog', '4414-real.md'), '---\r\nbornAs: "x56mcj7"\r\nkind: story\r\n---\r\n\r\n# Real\r\n');
+  await expect(run({ dryRun: true })).resolves.toBeDefined();
+});
+
 it('the production filing binding never sends an undefined or empty size or scope flag', async () => {
   const run = vi.fn(async () => ({ code: 0, lines: ['{}'] }));
   await fileInCheckout({ title: 't', kind: 'task', digest: 'd', queue: 'q' }, run);
