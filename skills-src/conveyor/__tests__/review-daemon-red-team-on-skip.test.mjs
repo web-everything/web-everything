@@ -26,6 +26,7 @@ it('CLI label repair exception preserves original PRs and still dispatches red-t
   vi.spyOn(redTeamEvidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', `${process.env.TMPDIR ?? '/tmp'}/we-rtq-test-${process.pid}.json`);
   try {
     const production = cliReviewTickOpts({ log: { error: vi.fn() } });
     const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
@@ -55,6 +56,7 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
   const witness = vi.spyOn(redTeamEvidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', `${process.env.TMPDIR ?? '/tmp'}/we-rtq-test-${process.pid}.json`);
   try {
     const production = cliReviewTickOpts({ log: { error: vi.fn() } });
     const take = vi.fn();

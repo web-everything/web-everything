@@ -165,7 +165,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
     let index = 0;
     const options = { repo, plan: { ...plan, refusals: refusals.map(row =>
       row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
-    rawPrs: rawPrs?.filter(pr => !held.has(Number(pr.number))), capacity, log, ...rest };
+    rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
     const finish = result => {
       queue.settle(repo, result);
       transaction?.commit();
