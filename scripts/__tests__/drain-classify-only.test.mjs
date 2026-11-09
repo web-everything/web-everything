@@ -98,3 +98,10 @@ describe('additive classify-only entry', () => {
     expect(io.writeFileSync).not.toHaveBeenCalled();
   });
 });
+
+describe('real settings reader digest', () => {
+  it('digests the default readDeclaredSettings() result (null-prototype owners map)', async () => {
+    const { readDeclaredSettings } = await import('../lib/settings-files.mjs');
+    expect(() => digest({ settings: readDeclaredSettings(), env: {} })).not.toThrow();
+  });
+});

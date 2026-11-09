@@ -11,7 +11,7 @@ export function canonicalJson(value) {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
   if (Array.isArray(value)) return `[${Array.from(value, canonicalJson).join(',')}]`;
-  if (value && Object.getPrototypeOf(value) === Object.prototype) {
+  if (value && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
     return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
   }
   throw new TypeError('non-JSON verdict evidence');
