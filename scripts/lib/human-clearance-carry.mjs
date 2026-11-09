@@ -42,6 +42,7 @@
  */
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
 import { resolveMechanicalCarrySetting } from './human-clearance-mechanical-carry-setting.mjs';
+import { AUTOMATION_LOGINS } from './marker-authorship.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -394,7 +395,7 @@ export function applyHumanClearanceCarry({
     return null;
   }
   const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason, sourceId });
-  const recordedDiff = parseReviewedDiff([{ author: { login: 'web-everything' }, body }]);
+  const recordedDiff = parseReviewedDiff([{ author: { login: AUTOMATION_LOGINS[0] }, body }]);
   if (!recordedDiff || (mechanical.value !== 'trust-drain-record' && recordedDiff !== evidence.humanClearance.diff)) {
     log(`  human-clearance-carry ${tag}: NOT carried (humanClearance.mechanicalCarry=refuse) — reviewed diff changed; a human must re-approve\n`);
     return null;

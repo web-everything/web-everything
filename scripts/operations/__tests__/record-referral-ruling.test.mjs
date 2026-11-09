@@ -1800,6 +1800,23 @@ describe('R671 v1 acting judge referral blocks', () => {
       expect(h.events[0].actor.declared).toBe('chalbert');
     });
 
+    it('POST refuses an unregistered human poster before any writes', async () => {
+      const mallory = { login: 'mallory', type: 'User' };
+      const h = postHarness({ identity: mallory, login: mallory.login });
+      const plan = planOperatorRuling(operatorSnapshot(human), operatorRequest());
+      await expect(h.sink(payloadOf(plan))).rejects.toThrow(/not a registered operator/i);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
+    it('POST refuses a human poster who does not match the declared actor before any writes', async () => {
+      const h = postHarness({ identity: human, login: human.login });
+      const plan = planOperatorRuling(operatorSnapshot(human), operatorRequest());
+      await expect(h.sink({ ...payloadOf(plan), actor: 'mallory' })).rejects.toThrow(/not a registered operator|does not match/i);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
     it('POST fails closed on an unreadable poster identity before any writes', async () => {
       const h = postHarness({ identity: human, login: human.login });
       const readJson = h.readJson.getMockImplementation();

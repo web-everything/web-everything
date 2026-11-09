@@ -858,6 +858,20 @@ describe('R711 writer and parser agree on mechanical carry policy', () => {
     expect(f.posted).toHaveLength(1);
     expect(parseLatestHumanClearedSha([f.comment, { author: { login: 'web-everything' }, body: f.posted[0] }])).toBe(HEAD);
   });
+  it('a configured automation login (WE_AUTOMATION_LOGINS=custom-conveyor) still records a strict unchanged carry', async () => {
+    vi.stubEnv('WE_AUTOMATION_LOGINS', 'custom-conveyor');
+    vi.resetModules();
+    try {
+      const carry = await import('../human-clearance-carry.mjs');
+      const escalation = await import('../review-escalation.mjs');
+      const f = fixture('strict');
+      expect(carry.proveHumanClearanceCarry({ ...f.options, enabled: true })).toMatchObject({ carry: true, tier: 'strict' });
+      expect(carry.applyHumanClearanceCarry(f.options)).toMatchObject({ carried: { tier: 'strict', fromSha: CLEARED, toSha: HEAD, recorded: true } });
+      expect(f.posted).toHaveLength(1);
+      expect(f.logs.some(s => s.includes('reviewed diff changed'))).toBe(false);
+      expect(escalation.parseLatestHumanClearedSha([f.comment, { author: { login: 'custom-conveyor' }, body: f.posted[0] }])).toBe(HEAD);
+    } finally { vi.unstubAllEnvs(); vi.resetModules(); }
+  });
   it.each(['tree', 'net-patch', 'contribution', 'numbering'])('trust-drain-record posts tier %s and parser requires the cited human source and exact endpoints', tier => {
     const f = fixture(tier);
     expect(applyHumanClearanceCarry({ ...f.options, mechanicalCarry: TRUST_DRAIN })).toMatchObject({ carried: { tier, recorded: true } });
