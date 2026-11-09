@@ -667,12 +667,11 @@ export async function smokeAndAdopt({
     return state;
   };
 
-  // Fail closed: with the dispatch-smoke module unresolvable, a build carrying a NEW or MOVED overlay cannot be proven, so hold
+  // Fail closed: with the dispatch-smoke module unresolvable, a build carrying ANY overlay (even one adopted at the same sha, possibly adopted with the setting off) cannot be proven, so hold
   // BEFORE any smoke runs (overlays kept, nothing rejected; the next tick retries and the alert above keeps firing). Main-only
-  // builds and overlays already adopted at the same sha are unaffected, so recovery is never blocked.
+  // builds are unaffected, so recovery is never blocked.
   if (dsm.unavailable) {
-    const known = Array.isArray(adoptedApplied) ? new Map(adoptedApplied.map((x) => [x?.ref, x?.sha])) : null;
-    const fresh = (plan.applied || []).filter((ap) => ap?.ref && !(known && ap.sha && known.get(ap.ref) === ap.sha));
+    const fresh = (plan.applied || []).filter((ap) => ap?.ref);
     if (fresh.length) {
       await hold('dispatch-smoke-unavailable', [], { detail: { refs: fresh.map((x) => x.ref), error: dsm.unavailable } });
       return { moved: false, reason: 'dispatch-smoke-unavailable', plan, alerts: [...prepAlerts, ...alertsList] };
