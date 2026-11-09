@@ -290,7 +290,7 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     ['missing run ID', env => { delete env.GITHUB_RUN_ID; }],
     ['empty run ID', env => { env.GITHUB_RUN_ID = ''; }],
     ...['APP_PRIVATE_KEY', 'MY_APP_ID', 'SOME_SECRET', 'BOT_PAT', 'GH_TOKEN', 'EXTRA_TOKEN', 'private_key', 'app_id', 'secret', 'bot_pat',
-      'PAT', 'GITHUB_PAT', 'PAT_VALUE', 'MY_PAT_VALUE', 'BOT_PATS', 'gh_pat', 'GITHUB_PATH_PAT']
+      'PAT', 'GITHUB_PAT', 'PAT_VALUE', 'MY_PAT_VALUE', 'BOT_PATS', 'gh_pat', 'GITHUB_PATH_PAT', 'GH_PAT1', 'BOT_PAT2', 'gh_pats2', 'RELEASE_PATV2']
       .map(name => [`credential ${name}`, env => { env[name] = 'foreign-credential'; }]),
     ['empty forbidden credential still present', env => { env.APP_PRIVATE_KEY = ''; }],
   ])('refuses %s before any process or write', async (_name, mutate) => {
@@ -329,6 +329,11 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     expect(args.some(arg => arg === '--import' || arg.startsWith('--import='))).toBe(false);
     expect(options.env).not.toHaveProperty('DRAIN_CLASSIFY_ONLY');
     expect(options.env.NODE_OPTIONS || '').not.toMatch(/--import|drain-classify-guard/);
+  });
+  it('names the credential-like variable, never its value', async () => {
+    const io = ioFor(); Object.assign(io.env, RUNNER_ENV, { GH_PAT1: 'value-must-not-leak' });
+    await expect(async () => runCli(argv, io)).rejects.toThrow(/credential-like variable "GH_PAT1"/);
+    await expect(async () => runCli(argv, io)).rejects.not.toThrow(/value-must-not-leak/);
   });
   it('accepts a real GitHub-hosted runner environment (GITHUB_PATH, RUNNER_*, image tool paths)', async () => {
     const io = ioFor(); Object.assign(io.env, RUNNER_ENV);

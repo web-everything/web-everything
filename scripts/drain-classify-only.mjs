@@ -51,9 +51,13 @@ export function resultToVerdictInputs(result, ctx) {
 function assertSafeEnv(env) {
   if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_REF !== 'refs/heads/main' ||
       !['schedule', 'workflow_dispatch'].includes(env.GITHUB_EVENT_NAME) || !/^[1-9]\d*$/.test(env.GITHUB_RUN_ID || '') ||
-      !env.GITHUB_TOKEN || Object.keys(env).some(forbiddenCredential) ||
-      (Object.hasOwn(env, 'GH_TOKEN') && env.GH_TOKEN !== env.GITHUB_TOKEN)) {
+      !env.GITHUB_TOKEN || (Object.hasOwn(env, 'GH_TOKEN') && env.GH_TOKEN !== env.GITHUB_TOKEN)) {
     throw new Error('unsafe Actions environment; run the local drain');
+  }
+  // Name only, never the value: a runner image that adds a matching variable must be diagnosable from the log.
+  const credential = Object.keys(env).find(forbiddenCredential);
+  if (credential !== undefined) {
+    throw new Error(`unsafe Actions environment: credential-like variable ${JSON.stringify(credential)}; run the local drain`);
   }
 }
 
