@@ -251,3 +251,10 @@ it('keeps truncated-title cards distinct and refuses an overlapping run via the 
   await expect(run()).rejects.toThrow(/ledger lock/);
   expect(fileItem).toHaveBeenCalledTimes(2);
 });
+
+it('refused cards do not consume the batch budget', async () => {
+  seed('- [R1] 2026-11-08: bad /Users/x/y\n- [R1] 2026-11-08: bad2 /Users/x/z\n- [R1] 2026-11-08: good one');
+  const result = await run({ max: 1 });
+  expect(result.refused).toHaveLength(2);
+  expect(result.filed).toHaveLength(1);
+});
