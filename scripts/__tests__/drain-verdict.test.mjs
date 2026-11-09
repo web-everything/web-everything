@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 import { SCHEMA, LOCAL_ONLY, build, verify, auditWorkflow } from '../lib/drain-verdict.mjs';
+import { DRAIN_GATES } from '../lib/merge-gate-inventory.mjs';
 import { resultToVerdictInputs, runCli } from '../drain-classify-only.mjs';
 
 const computedAt = '2026-11-09T12:00:00.000Z';
@@ -13,24 +14,43 @@ const ctx = { pr: 7, repo: 'o/r', mainSha, computedAt, provenance };
 const inputs = () => ({ ...structuredClone(ctx), headSha, decision: 'enqueue' });
 const live = () => ({ repo: ctx.repo, pr: ctx.pr, headSha, mainSha, provenance: { ...provenance } });
 const valid = () => ({ schema: 'drain-verdict/2', ...inputs(),
-  localOnly: { 'red-main-freeze': 'unknown', 'card-group': 'unknown' } });
+  localOnly: { 'red-main-freeze': 'unknown', 'card-group': 'unknown',
+    'manifest-baseline': 'unknown', 'couple-whole': 'unknown' } });
 const refuse = (v, lookup = live(), opts = {}) => {
   const result = verify(v, lookup, { now, ...opts });
   expect(result).toEqual({ ok: false, reason: expect.any(String) });
   expect(result.reason.trim()).not.toBe('');
 };
 const row = { num: 7, repo: 'o/r', headSha };
-const base = () => ({ ok: true, dryRun: true, toMerge: [], skipped: [], parked: [], skipReasons: [] });
+const base = () => ({ ok: true, dryRun: true, heldCoupleMembers: 0, toMerge: [], skipped: [], parked: [], skipReasons: [] });
 
 describe('T1: strict v2 shape and forged verdict refusals', () => {
   it('builds exactly the v2 contract and verifies a valid verdict', () => {
     expect(SCHEMA).toBe('drain-verdict/2');
-    expect(LOCAL_ONLY).toEqual(['red-main-freeze', 'card-group']);
+    expect(LOCAL_ONLY).toEqual(['red-main-freeze', 'card-group', 'manifest-baseline', 'couple-whole']);
     expect(build(inputs())).toEqual(valid());
     expect(build({ ...inputs(), localOnly: { 'red-main-freeze': 'pass', 'card-group': 'fail' } }))
       .toEqual(valid());
     expect(verify(valid(), live(), { now })).toEqual({ ok: true });
     expect(verify({ ...valid(), decision: 'local' }, live(), { now })).toEqual({ ok: true });
+  });
+
+  it('keeps every inventory local-only gate as a drain-side re-check', () => {
+    for (const gate of DRAIN_GATES.filter(gate => gate.input === 'local-only')) {
+      expect(LOCAL_ONLY).toContain(gate.id);
+    }
+  });
+
+  it.each(['manifest-baseline', 'couple-whole'])('build always marks %s unknown despite a supplied pass', id => {
+    expect(build({ ...inputs(), localOnly: { ...valid().localOnly, [id]: 'pass' } })).toEqual(valid());
+  });
+
+  it.each(['manifest-baseline', 'couple-whole'])('verify refuses a %s pass claim', id => {
+    const v = valid(); v.localOnly[id] = 'pass'; refuse(v);
+  });
+
+  it.each(['manifest-baseline', 'couple-whole'])('verify refuses missing %s', id => {
+    const v = valid(); delete v.localOnly[id]; refuse(v);
   });
 
   const mutants = [
@@ -104,6 +124,24 @@ describe('T2: freshness and live SHA binding', () => {
 });
 
 describe('T3: result mapping preserves local fallback', () => {
+  it.each([
+    ['coupleHeld flag', { coupleHeld: true }],
+    ['coupleHeld rows', { coupleHeld: [{ ...row, role: 'carrier', reason: 'partner held' }] }],
+    ['heldCoupleMembers count', { heldCoupleMembers: 1 }],
+    ['unknown heldCoupleMembers count', { heldCoupleMembers: null }],
+    ['coupleSplit rows', { coupleSplit: [row] }],
+    ['couple field', { couple: {} }],
+    ['couples field', { couples: [] }],
+    ['target coupleHeld', { toMerge: [{ ...row, coupleHeld: true }] }],
+    ['target coupleCarrier', { toMerge: [{ ...row, coupleCarrier: 'we#8' }] }],
+    ['target couples', { toMerge: [{ ...row, couples: [8] }] }],
+    ['nested target couple', { toMerge: [{ ...row, mergeGateInputs: { couple: { refs: [8] } } }] }],
+    ['mixed-case couple key', { toMerge: [{ ...row, COUPLE: false }] }],
+    ['skip-reason couple metadata', { skipReasons: [{ ...row, coupleDeferReason: 'held' }] }],
+  ])('refuses enqueue for %s with an explicit local drain fallback', (_name, signal) => {
+    expect(() => resultToVerdictInputs({ ...base(), toMerge: [row], ...signal }, ctx)).toThrow(/local drain/);
+  });
+
   it.each([
     ['enqueue', 'toMerge', { ...base(), toMerge: [row] }],
     ['local', 'skipped', { ...base(), skipped: [{ ...row, reason: 'not ready' }] }],

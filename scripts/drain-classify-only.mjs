@@ -13,6 +13,21 @@ export function resultToVerdictInputs(result, ctx) {
     if (!Array.isArray(result[key])) throw new Error(`missing ${key}; run the local drain`);
   }
   if (result.deferred !== undefined && !Array.isArray(result.deferred)) throw new Error('invalid deferred; run the local drain');
+  // Couple evidence may be an aggregate (heldCoupleMembers), a result list (coupleHeld /
+  // coupleSplit), or nested candidate metadata. Conservatively refuse even unscoped signals.
+  const pending = [result], seen = new Set();
+  while (pending.length) {
+    const value = pending.pop();
+    if (value === null || typeof value !== 'object' || seen.has(value)) continue;
+    seen.add(value);
+    for (const [key, child] of Object.entries(value)) {
+      // The real JSON producer always emits this count, including when none are held.
+      if (/couple/i.test(key) && !(value === result && key === 'heldCoupleMembers' && child === 0)) {
+        throw new Error('couple evidence requires the local drain');
+      }
+      if (child !== null && typeof child === 'object') pending.push(child);
+    }
+  }
   const rowRepo = row => row.repo ?? ctx.repo;
   const matches = row => row && Number(row.num) === ctx.pr && rowRepo(row) === ctx.repo;
   const merge = result.toMerge.filter(matches);
@@ -27,6 +42,8 @@ export function resultToVerdictInputs(result, ctx) {
   if (merge.length && ((result.deferred || []).some(matches) || result.skipReasons.some(matches))) {
     throw new Error('toMerge candidate deferred or skip-reasoned; run the local drain');
   }
+  // --dry-run --json skips planCoupleCascadeStep and cannot detect separated couples:
+  // enqueue is only a hint; the local drain must re-check couple-whole before admission.
   return { repo: ctx.repo, pr: ctx.pr, headSha: rows[0].headSha, mainSha: ctx.mainSha,
     computedAt: ctx.computedAt, provenance: ctx.provenance, decision: merge.length ? 'enqueue' : 'local' };
 }

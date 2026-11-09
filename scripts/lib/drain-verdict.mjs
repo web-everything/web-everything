@@ -1,7 +1,8 @@
 import yaml from 'js-yaml';
 
 export const SCHEMA = 'drain-verdict/2';
-export const LOCAL_ONLY = Object.freeze(['red-main-freeze', 'card-group']);
+// The dry-run cannot reproduce the drain's persisted baseline or live couple cascade.
+export const LOCAL_ONLY = Object.freeze(['red-main-freeze', 'card-group', 'manifest-baseline', 'couple-whole']);
 const fields = ['schema', 'repo', 'pr', 'headSha', 'mainSha', 'computedAt', 'decision', 'localOnly', 'provenance'];
 const provenanceFields = ['runId', 'event', 'ref', 'workflow'];
 const record = value => value !== null && typeof value === 'object' &&
