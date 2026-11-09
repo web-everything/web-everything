@@ -41,7 +41,7 @@ export const RUN_RECORD_VERSION = 1;
  * a spawned session — and a replay must RESUME it. One status cannot carry both without the replay guard being
  * wrong half the time.
  */
-export const EFFECT_STATUSES = Object.freeze(['declared', 'pending', 'in-flight', 'applied', 'failed']);
+export const EFFECT_STATUSES = Object.freeze(['declared', 'pending', 'in-flight', 'applied', 'failed', 'refused']);
 
 /** Ids are used as filenames, so the character set is closed — no separators, no traversal, no surprises. */
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
