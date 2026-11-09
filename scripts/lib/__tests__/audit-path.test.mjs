@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { canonicalPaths } from '../audit-path.mjs';
 import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern, oracleMatchesPath } from './fixtures/audit-path-old-oracle.mjs';
 
-const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/', 'guard-*.mjs', 'custom/x.mjs42', 'scripts/guard-bash.mjs4', '4-9', 'L3-L9', '1', 'L42', '42-50'];
+const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/', 'guard-*.mjs', 'scripts/x.mjs42', 'scripts/x.mjs-', 'custom/x.mjs42', 'scripts/guard-bash.mjs4', '4-9', 'L3-L9', '1', 'L42', '42-50'];
 const lower = a => a.map(x => x.toLowerCase());
 const globOk = (p, pat) => {
   if (pat.endsWith('/')) return p.startsWith(pat);
@@ -92,7 +92,10 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
     expect(canonicalPaths('+++ b/scripts/x.mjs')).toEqual(['b/scripts/x.mjs', 'scripts/x.mjs', '+++ b/scripts/x.mjs']);
     expect(canonicalPaths('a/x.mjs#L3-L9')).toEqual(['a/x.mjs', 'x.mjs', 'a/x.mjs#L3-L9', 'a/x.mjsL3-L9', 'L3-L9', '3', '9']);
     expect(canonicalPaths('scripts/x.mjs:1:2')).toEqual(['scripts/x.mjs', 'scripts/x.mjs:1:2', 'scripts/x.mjs12', '1:2', '1', '2']);
-    expect(canonicalPaths('scripts/x.mjs.')).toEqual(['scripts/x.mjs.', 'scripts/x.mjs']);
+    expect(canonicalPaths('scripts/x.mjs.')).toBeNull();
+    expect(canonicalPaths('scripts/x.mjs-.')).toBeNull();
+    expect(canonicalPaths('scripts/')).toBeNull();
+    expect(canonicalPaths('x/../scripts/y.mjs')).toBeNull();
     expect(canonicalPaths('-docs/a.md')).toEqual(['-docs/a.md', 'docs/a.md']);
     expect(canonicalPaths('./x.mjs')).toEqual(['x.mjs']);
   });
@@ -131,12 +134,16 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
       expect(protects(f)).toBe(true);
     }
   });
-  it('anchored sub-paths are cut before ".." resolves (round-2 audit finding)', () => {
-    const pats = ['scripts/**', 'guard-*.mjs'];
+  it('round-6 rows: anchors reach every canonical form; punctuation-ended and dotdot paths are refused', () => {
+    const pats = ['scripts/**', 'guard-*.mjs', 'scripts/x.mjs42', 'scripts/x.mjs-'];
     const anchors = oracleAnchorsOf(pats.map(oracleCleanPattern));
-    expect(oracleMatchesSome('repo/scripts/../guard-x.mjs', pats)).toBe(true);
-    expect(canonicalPaths('repo/scripts/../guard-x.mjs', anchors)).toContain('guard-x.mjs');
-    expect(canonicalPaths('repo/scripts/../guard-x.mjs', anchors).some(c => globOk(c, 'guard-*.mjs'))).toBe(true);
+    const protectedByNew = f => { const c = canonicalPaths(f, anchors); return c === null || c.some(x => pats.some(p => globOk(x, p))); };
+    for (const f of ['repo/scripts/x.mjs:42', 'repo/scripts/../guard-x.mjs', 'scripts/x.mjs-.', 'scripts/x.mjs-', 'repo/scripts/x.mjs#L42']) {
+      expect(oracleMatchesSome(f, pats), f).toBe(true);
+      expect(protectedByNew(f), f).toBe(true);
+    }
+    expect(canonicalPaths('repo/scripts/x.mjs:42', anchors)).toContain('scripts/x.mjs42');
+    expect(canonicalPaths('repo/scripts/x.mjs:42', anchors)).toContain('scripts/x.mjs');
   });
   it('audit findings: candidate bound fails closed; line digits and the raw report stay candidates', () => {
     const pats = ['scripts/secret.mjs'];
@@ -184,7 +191,7 @@ describe('P4 total and bounded', () => {
     const t0 = performance.now();
     for (const h of hostile) {
       const c = canonicalPaths(h);
-      expect(c === null || (Array.isArray(c) && c.length >= 1 && c.length <= 8)).toBe(true);
+      expect(c === null || (Array.isArray(c) && c.length >= 1 && c.length <= 32)).toBe(true);
     }
     expect(performance.now() - t0).toBeLessThan(2000);
   });

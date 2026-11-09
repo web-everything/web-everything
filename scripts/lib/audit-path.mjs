@@ -15,22 +15,26 @@ export const MAX_AUDIT_PATH = 512;
 export const MAX_AUDIT_CANDIDATES = 32;
 const GRAMMAR = /^(?:(?:\+\+\+|---) )?(?:(["'`])([A-Za-z0-9._/-]+)\1|([A-Za-z0-9._/-]+))(:\d+(?:-\d+|:\d+)?|#L\d+(?:-L\d+)?)?$/;
 
-/** Collapses `.`, empty and `..` segments; null for an empty path or one that climbs above the root. */
+/** Collapses `.` and empty segments; null for an empty path, a rooted one, or one holding a `..` segment. */
 function normalise(path) {
   if (path.startsWith('/')) return null;
   const parts = [];
   for (const seg of path.split('/')) {
     if (seg === '' || seg === '.') continue;
-    if (seg === '..') { if (!parts.length) return null; parts.pop(); continue; }
+    if (seg === '..') return null;
     parts.push(seg);
   }
   return parts.length ? parts.join('/') : null;
 }
 
 /**
- * `anchors` (optional, lower-case): the first folder of each protected glob (`scripts` of `scripts/**`). A report that
- * sits under a folder above the repo (`repo/scripts/x.mjs`) also yields each trailing sub-path that starts at an anchor,
- * as the old matcher did, so the nested form is never less protected. Without anchors only the path itself is read.
+ * `anchors` (optional, lower-case): the first folder of each protected glob (`scripts` of `scripts/**`). EVERY form
+ * the report yields (as written, side-prefix stripped, line suffix stripped, joined, ...) also yields each trailing
+ * sub-path that starts at an anchor, as the old matcher did, so `repo/scripts/x.mjs:42` still reaches `scripts/x.mjs`.
+ * Without anchors only the path itself is read.
+ *
+ * A PATH that ends in punctuation (`.` `-` `_` `/`) or holds a `..` segment is refused: no tracked name does either, and
+ * the old matcher's trimmed and joined readings of such a name are not worth chasing one by one.
  */
 export function canonicalPaths(file, anchors = null) {
   if (typeof file !== 'string' || file.length > MAX_AUDIT_PATH) return null;
@@ -40,45 +44,32 @@ export function canonicalPaths(file, anchors = null) {
   const m = GRAMMAR.exec(text);
   if (!m) return null;
   const path = m[2] ?? m[3];
-  const out = new Set();
-  // A git diff side prefix (`a/ b/ c/ i/ w/ o/`) may be a real folder, so the path is read both with and without it.
-  const forms = [path];
-  if (/^[abciwo]\//.test(path)) forms.push(path.slice(2));
-  // Prose wraps a name in edge punctuation (a bullet `-docs/a.md`, a sentence-final `x.mjs.`, a hidden-folder dot),
-  // so the name with its leading and trailing `-`, `_`, `.` and `/` runs trimmed is a candidate too. Extra candidates only
-  // ever protect more; the first candidate is always the path exactly as reported.
-  for (const f of [...forms]) {
-    const t = f.replace(/^[-_./]+/, '').replace(/[-_./]+$/, '');
-    if (t !== f) forms.push(t);
-  }
-  const first = normalise(forms[0]);
+  if (/[._/-]$/.test(path)) return null;
+  const first = normalise(path);
   if (first === null) return null;
-  out.add(first);
-  for (const f of forms.slice(1)) {
-    const c = normalise(f);
+  const out = new Set([first]);
+  // A git diff side prefix (`a/ b/ c/ i/ w/ o/`) may be a real folder, so the path is read both with and without it.
+  if (/^[abciwo]\//.test(path)) { const c = normalise(path.slice(2)); if (c !== null) out.add(c); }
+  // A leading run of `-`, `_` or `.` is a bullet or a hidden-folder dot in prose (`-docs/a.md`): the trimmed name too.
+  for (const f of [...out]) {
+    const t = f.replace(/^[-_.]+/, '');
+    const c = t !== f ? normalise(t) : null;
     if (c !== null) out.add(c);
   }
-  // Anchored sub-paths are cut from the report's own segments BEFORE `..` is resolved, as the old matcher did:
-  // `repo/scripts/../guard-x.mjs` must still yield `scripts/../guard-x.mjs` -> `guard-x.mjs`.
+  // The old matcher also matched the report as written, with every non-path character removed (`custom/x.mjs:42` read
+  // as `custom/x.mjs42`), and the line-suffix pieces; kept, so nothing it protected is lost.
+  for (const c of [normalise(text), normalise(text.replace(/[^A-Za-z0-9._/-]/g, ''))]) if (c !== null) out.add(c);
+  const loc = (m[4] ?? '').slice(1);
+  if (loc) for (const d of [loc, ...loc.split(':'), ...(loc.match(/\d+/g) ?? [])]) out.add(d);
   if (anchors && anchors.size) {
-    for (const f of forms) {
-      const segs = f.split('/').filter(x => x !== '' && x !== '.');
+    for (const c of [...out]) {
+      const segs = c.split('/');
       for (let i = 1; i < segs.length; i++) {
         if (!anchors.has(segs[i].toLowerCase())) continue;
-        const c = normalise(segs.slice(i).join('/'));
-        if (c !== null) out.add(c);
+        const sub = normalise(segs.slice(i).join('/'));
+        if (sub !== null) out.add(sub);
       }
     }
   }
-  // The old matcher also matched the report as written and the digits of its line suffix; kept, so nothing it
-  // protected is lost. Both are extra candidates only: they can protect more, never less.
-  const raw = normalise(text);
-  if (raw !== null) out.add(raw);
-  // The old matcher also joined the report with everything but path characters removed (`custom/x.mjs:42` read as
-  // `custom/x.mjs42`); kept for the same reason.
-  const joined = normalise(text.replace(/[^A-Za-z0-9._/-]/g, ''));
-  if (joined !== null) out.add(joined);
-  const loc = (m[4] ?? '').slice(1);
-  if (loc) for (const d of [loc, ...loc.split(':'), ...(loc.match(/\d+/g) ?? [])]) out.add(d);
   return out.size > MAX_AUDIT_CANDIDATES ? null : [...out];
 }
