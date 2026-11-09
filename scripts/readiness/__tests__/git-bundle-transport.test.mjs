@@ -189,12 +189,14 @@ describe('R593 client and routing', () => {
       const boom = () => { throw new Error('scan failed'); };
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'x.test.mjs'], cwd, route: boom })).toBe(true);
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], cwd })).toBe(true);
-      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'missing.test.mjs'], cwd })).toBe(false);
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'pure2.test.mjs'], cwd })).toBe(false);
     });
     it('R807: routeNeedsGit fails closed on unreadable files and directory/glob selections', async () => {
       await fs.mkdir(join(cwd, 'sub'), { recursive: true });
       const route = (arg) => routeNeedsGit({ argv: ['npx', 'vitest', 'run', arg], cwd });
-      expect(route('missing.test.mjs')).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(route('missing.test.mjs')).toEqual({ local: false });
+      await fs.writeFile(join(root, 'outside.test.mjs'), 'export {};\n');
+      expect(route('../outside.test.mjs')).toMatchObject({ local: true, reason: 'needs-git' });
       expect(route('sub')).toMatchObject({ local: true, reason: 'needs-git' });
       expect(route('sub/**/*.test.mjs')).toMatchObject({ local: true, reason: 'needs-git' });
       expect(routeNeedsGit({ argv: ['npx', 'vitest', 'run'], cwd })).toEqual({ local: false });
