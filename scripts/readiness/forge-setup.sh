@@ -298,11 +298,12 @@ WantedBy=timers.target
 TIMER
 systemctl daemon-reload
 systemctl enable --now forge-warm-base.timer
-# Cache settings (defaults -> environment, logged with provenance):
+# Required cache settings (explicit service environment, logged with provenance):
 # FORGE_CACHE_MAX_AGE_HOURS=12 (clamped 6..24), FORGE_CACHE_MAX_BYTES=214748364800,
 # FORGE_CACHE_HIGH_WATER_PCT=80 (0..100; reclaim to five percentage points below).
-# Minimum age is always at least one hour. Set overrides in a systemd service
-# drop-in using Environment=, then daemon-reload. Incomplete evidence refuses
+# Minimum age is always at least one hour. Edit the Environment= values below
+# (or override in a service drop-in), then daemon-reload. Missing/invalid settings
+# refuse all pruning; restore valid values before retrying. Incomplete evidence refuses
 # deletion: inspect/repair reservations and records before retrying the service.
 # The pruner uses the existing /usr/bin/flock utility to hold all numbered and
 # legacy reservation writer leases through evidence reads and anchored deletion.
@@ -313,6 +314,9 @@ After=local-fs.target
 [Service]
 Type=oneshot
 User=root
+Environment=FORGE_CACHE_MAX_AGE_HOURS=12
+Environment=FORGE_CACHE_MAX_BYTES=214748364800
+Environment=FORGE_CACHE_HIGH_WATER_PCT=80
 ExecStart=/usr/bin/env node /usr/local/libexec/forge-cache-prune.mjs --apply
 Nice=19
 IOSchedulingClass=idle

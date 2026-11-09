@@ -9,7 +9,6 @@ import {promisify} from 'node:util';
 
 const HOUR = 3_600_000;
 const HEX = /^[a-f0-9]{64}(?![\s\S])/;
-const PROFILE = /^dev-v[0-9]+-[a-f0-9]{64}(?![\s\S])/;
 const WORKER = /^worker-active(?:-[1-9][0-9]*)?(?![\s\S])/;
 const RUN = /^(?:r-|warm-)[a-f0-9]{32}(?![\s\S])/;
 const LIMIT = 4 * 1024 * 1024;
@@ -17,19 +16,20 @@ const repair = 'preserving cache; inspect evidence and repair it before retrying
 
 export function resolveSettings(env = process.env) {
   const sources = {};
-  const setting = (key, variable, fallback, valid, transform = x => x) => {
+  const setting = (key, variable, valid, transform = x => x) => {
     const raw = env[variable];
     const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
     const accepted = Number.isFinite(n) && valid(n);
-    sources[key] = accepted ? `environment:${variable}` : 'default';
-    return accepted ? transform(n) : fallback;
+    if (!accepted) throw new Error(`Missing or invalid ${variable}; set a valid service Environment= value before retrying; ${repair}`);
+    sources[key] = `environment:${variable}`;
+    return transform(n);
   };
   return {
-    maxAgeHours: setting('maxAgeHours', 'FORGE_CACHE_MAX_AGE_HOURS', 12, () => true,
+    maxAgeHours: setting('maxAgeHours', 'FORGE_CACHE_MAX_AGE_HOURS', () => true,
       n => Math.max(6, Math.min(24, n))),
-    maxBytes: setting('maxBytes', 'FORGE_CACHE_MAX_BYTES', 200 * 1024 ** 3,
+    maxBytes: setting('maxBytes', 'FORGE_CACHE_MAX_BYTES',
       n => n > 0 && n <= Number.MAX_SAFE_INTEGER),
-    highWaterPct: setting('highWaterPct', 'FORGE_CACHE_HIGH_WATER_PCT', 80, n => n >= 0 && n <= 100),
+    highWaterPct: setting('highWaterPct', 'FORGE_CACHE_HIGH_WATER_PCT', n => n >= 0 && n <= 100),
     minAgeMs: HOUR,
     sources,
   };
@@ -37,7 +37,8 @@ export function resolveSettings(env = process.env) {
 
 function validEntry(root, e) {
   return typeof root === 'string' && root === resolve(root) && HEX.test(e.lock)
-    && PROFILE.test(e.name) && e.path === join(root, e.lock, e.name)
+    && typeof e.name === 'string' && e.name.length > 0 && !['.', '..'].includes(e.name)
+    && !e.name.includes('/') && !e.name.includes('\0') && e.path === join(root, e.lock, e.name)
     && Number.isFinite(e.mtimeMs) && Number.isSafeInteger(e.bytes) && e.bytes >= 0;
 }
 
@@ -56,6 +57,10 @@ export function planPrune({root, entries, now = Date.now(), settings = resolveSe
   }
   let retained = entries.reduce((sum, e) => sum + (validEntry(root, e) ? e.bytes : 0), 0);
   let reclaimed = 0;
+  const protectedProfiles = new Set(live?.profiles);
+  for (const e of entries) {
+    if (validEntry(root, e) && now - e.mtimeMs < result.minAgeMs) protectedProfiles.add(`${e.lock}/${e.name}`);
+  }
   const pressure = disk?.usedPct > settings.highWaterPct;
   const target = Math.max(0, settings.highWaterPct - 5) / 100 * (disk?.totalBytes ?? 0);
   for (const e of [...entries].sort((a, b) => a.mtimeMs - b.mtimeMs || String(a.path).localeCompare(String(b.path)))) {
@@ -64,6 +69,7 @@ export function planPrune({root, entries, now = Date.now(), settings = resolveSe
     if (result.refused) reason = result.refused;
     else if (!validEntry(root, e)) reason = 'Invalid cache boundary or metadata';
     else if (live.profiles.has(`${e.lock}/${e.name}`)) reason = 'Protected by live reservation';
+    else if (e.indexProfile && protectedProfiles.has(`${e.lock}/${e.indexProfile}`)) reason = 'Index of protected profile';
     else if (now - e.mtimeMs < result.minAgeMs) reason = 'Younger than minimum age';
     else if (now - e.mtimeMs > settings.maxAgeHours * HOUR) { reason = 'Expired age'; prune = true; }
     else if (retained > settings.maxBytes) { reason = 'Cache size cap'; prune = true; }
@@ -155,14 +161,27 @@ export async function scanCache(root) {
     if (!(await fs.lstat(parent)).isDirectory()) continue;
     await directory(parent);
     for (const name of await fs.readdir(parent)) {
-      if (!PROFILE.test(name)) continue;
       const path = join(parent, name), st = await fs.lstat(path);
-      if (!st.isDirectory()) continue;
-      await directory(path);
-      entries.push({lock, name, path, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino, bytes: await bytes(path)});
+      const indexProfile = await readIndexProfile(path, name, st);
+      entries.push({lock, name, path, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino,
+        bytes: st.isDirectory() ? await bytes(path) : st.size, ...(indexProfile ? {indexProfile} : {})});
     }
   }
   return entries;
+}
+
+// Warm-input indexes store v5 digests. Expand them before comparing names so
+// older profile versions with the same digest cannot inherit or remove an index.
+async function readIndexProfile(path, name, st) {
+  if (!name.startsWith('.warm-inputs-') || !st.isFile()) return undefined;
+  try {
+    const marker = await readJson(path);
+    return typeof marker.profile === 'string' && HEX.test(marker.profile) ? `dev-v5-${marker.profile}` : undefined;
+  } catch (error) {
+    if (error instanceof SyntaxError || error.message === 'Invalid evidence object'
+      || error.message.startsWith('Invalid or oversized evidence') || error.message.startsWith('Oversized evidence')) return undefined;
+    throw error;
+  }
 }
 
 // The child starts in the parent's directory, then compares its actual cwd to
@@ -200,11 +219,13 @@ function empty(fd, depth = 0) {
 cwd(3);
 if (!same(fs.statSync('..'), fs.fstatSync(4))) throw new Error('Cache root substituted; preserving cache');
 const st = fs.lstatSync(e.name);
-if (!st.isDirectory() || st.mtimeMs !== e.mtimeMs
+if (st.mtimeMs !== e.mtimeMs
   || (e.ino !== undefined && (st.ino !== e.ino || st.dev !== e.dev))
   || e.now - st.mtimeMs < e.minAgeMs) {
   process.stdout.write('skipped');
 } else {
+  if (!st.isDirectory()) fs.unlinkSync(e.name);
+  else {
   const fd = fs.openSync(e.name, flags);
   try {
     if (!same(st, fs.fstatSync(fd))) throw new Error('Profile changed before removal');
@@ -216,8 +237,9 @@ if (!st.isDirectory() || st.mtimeMs !== e.mtimeMs
     if (!same(fs.lstatSync(e.name), fs.fstatSync(fd))) throw new Error('Profile changed before removal');
     fs.rmdirSync(e.name);
   } finally { fs.closeSync(fd); }
+  }
   for (const name of fs.readdirSync('.')) {
-    if (!/^\.warm-inputs-[a-zA-Z0-9_-]+(?![\s\S])/.test(name)) continue;
+    if (!name.startsWith('.warm-inputs-')) continue;
     let fd;
     try {
       fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
@@ -228,7 +250,8 @@ if (!st.isDirectory() || st.mtimeMs !== e.mtimeMs
       while (length < buffer.length && (count = fs.readSync(fd, buffer, length, buffer.length - length, null))) length += count;
       if (length > 4 * 1024 * 1024) continue;
       const marker = JSON.parse(buffer.subarray(0, length).toString('utf8'));
-      if (marker.profile === e.name.slice(7) && same(st, fs.lstatSync(name))) fs.unlinkSync(name);
+      if (typeof marker.profile === 'string' && /^[a-f0-9]{64}(?![\s\S])/.test(marker.profile)
+        && 'dev-v5-' + marker.profile === e.name && same(st, fs.lstatSync(name))) fs.unlinkSync(name);
     } catch { /* Unknown or concurrently changed indexes survive. */ }
     finally { if (fd !== undefined) fs.closeSync(fd); }
   }
@@ -311,11 +334,25 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
         const live = await readLiveEvidence({receipts});
         if (!live.complete) throw new Error(live.refused);
         if (live.profiles.has(`${e.lock}/${e.name}`)) { result.skipped.push(e); continue; }
-        const st = await fs.lstat(e.path);
-        if (!st.isDirectory() || st.mtimeMs !== e.mtimeMs
+        let st;
+        try { st = await fs.lstat(e.path); }
+        catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          result.skipped.push(e); continue;
+        }
+        if (st.mtimeMs !== e.mtimeMs
           || (e.ino !== undefined && (st.ino !== e.ino || st.dev !== e.dev))
           || (plan.now ?? Date.now()) - st.mtimeMs < Math.max(HOUR, plan.minAgeMs ?? HOUR)) {
           result.skipped.push(e); continue;
+        }
+        const indexProfile = await readIndexProfile(e.path, e.name, st);
+        if (indexProfile) {
+          let protectedProfile = live.profiles.has(`${e.lock}/${indexProfile}`);
+          try {
+            const profile = await fs.lstat(join(parent, indexProfile));
+            protectedProfile ||= (plan.now ?? Date.now()) - profile.mtimeMs < Math.max(HOUR, plan.minAgeMs ?? HOUR);
+          } catch (error) { if (error.code !== 'ENOENT') throw error; }
+          if (protectedProfile) { result.skipped.push(e); continue; }
         }
         const outcome = await childResult(spawnProcess, process.execPath,
           ['--input-type=module', '-e', DELETE_TREE, JSON.stringify({...e,
