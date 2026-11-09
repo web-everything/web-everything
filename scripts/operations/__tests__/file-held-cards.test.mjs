@@ -302,6 +302,28 @@ it('body status examples do not suppress live-card duplicate detection', async (
   expect(result.duplicates.map(entry => entry.tag).sort()).toEqual(['R1', 'R2', 'R3']);
 });
 
+it('a comment line inside front matter is not read as the card title', async () => {
+  writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: open\n# note: not a title\n---\n# Repair behavior\n');
+  seed('- [R1] 2026-11-08: Repair behavior\n- [R2] 2026-11-08: note: not a title');
+  const result = await run();
+  expect(result.duplicates.map(entry => entry.tag)).toEqual(['R1']);
+  expect(result.filed.map(entry => entry.tag)).toEqual(['R2']);
+});
+
+it('files every card of a batch through the same file-item binding with no per-card destination', async () => {
+  const calls = [];
+  const spy = vi.fn(async args => { calls.push(args); return { code: 0, lines: ['{}'] }; });
+  await fileInCheckout({ title: 'a', kind: 'task', digest: 'd1', queue: 'false' }, spy);
+  await fileInCheckout({ title: 'b', kind: 'task', digest: 'd2', queue: 'false', scope: 'we:scripts/x.mjs' }, spy);
+  const flags = argv => argv.map(arg => arg.split('=')[0]);
+  expect(calls.map(call => call.declaration.name)).toEqual(['file-item', 'file-item']);
+  for (const { argv } of calls) {
+    expect(flags(argv).filter(flag => /^--(pr|branch|lane|repo|checkout)$/.test(flag))).toEqual([]);
+  }
+  // This checkout is the one place every card lands, so the batch rides this lane's single PR.
+  expect(flags(calls[0].argv)).toEqual(expect.arrayContaining(['--title', '--kind', '--digest', '--queue']));
+});
+
 it.skipIf(process.getuid?.() === 0)('stops before filing the next card when the ledger append fails', async () => {
   seed('- [R1] 2026-11-08: one');
   await run();
@@ -321,7 +343,7 @@ it('resolves a ledgered birth hash through bornAs only on origin/main, and refus
   rmSync(join(root, 'backlog', 'xtest.md'));
   writeFileSync(ledger, JSON.stringify({ ...JSON.parse(readFileSync(ledger, 'utf8').trim()), card: 'x56mcj7' }) + '\n');
   seed('- [R1] 2026-11-08: one\n- [R1] 2026-11-08: two');
-  const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd: root, stdio: 'ignore' });
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args], { cwd: root, stdio: 'ignore' });
   git('init', '-q');
   writeFileSync(join(root, 'backlog', '4413-other.md'), '---\nbornAs: xabcdef\n---\n\n# Other\n');
   git('add', 'backlog/4413-other.md');

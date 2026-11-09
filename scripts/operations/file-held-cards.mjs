@@ -83,9 +83,16 @@ export function qualifyBareBasenames(text, trackedFiles) {
 // resolve through that front-matter line, here and on origin/main.
 const BIRTH_HASH = /^x[0-9a-z]{6}$/;
 
+const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
+
 /** A card's leading front-matter block (between the first two `---` lines), or null; body lines never count. */
 function frontMatterBlock(text) {
-  return text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] ?? null;
+  return text.match(FRONT_MATTER)?.[1] ?? null;
+}
+
+/** Offset where the body starts: 0 when the card has no front matter. */
+function frontMatterEnd(text) {
+  return text.match(FRONT_MATTER)?.[0].length ?? 0;
 }
 
 /** The finished-card `status:` inside the leading front-matter block only; a body example never counts. */
@@ -219,7 +226,8 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   const titles = new Map();
   for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
     const content = readFileSync(join(root, 'backlog', name), 'utf8');
-    const title = content.match(/^#\s+(.+)$/m)?.[1];
+    // The title is the first heading AFTER the front matter: a `# comment` line inside it is not a title.
+    const title = content.slice(frontMatterEnd(content)).match(/^#\s+(.+)$/m)?.[1];
     if (!title) continue; // legacy untitled cards cannot be title-matched; they never block a run
     // A finished card does not cover a fresh handoff: only live cards suppress a same-titled line.
     if (isFinishedCard(content)) continue;
