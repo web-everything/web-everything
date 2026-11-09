@@ -312,7 +312,7 @@ describe('CAS allocation and seed', () => {
     expect(buildSeedRows({ cards: [cards[1]], legacy })).toMatchObject({ rows: [expect.objectContaining({ num: 11 })], warnings: [expect.any(String)] });
     expect(buildSeedRows({ cards: [...cards, { ...cards[0], path: 'backlog/013-third.md' }], legacy }).errors.length).toBeGreaterThan(0);
     const append = vi.fn(); const run = vi.fn(() => JSON.stringify({ we: [] }));
-    expect(() => seedCardNumberLedger({ repo: 'we', cards, run, append, apply: true })).toThrow(/duplicate/);
+    expect(() => seedCardNumberLedger({ repo: 'we', cards, run, append, apply: true, env: {} })).toThrow(/duplicate/);
     expect(append).not.toHaveBeenCalled(); expect(run.mock.calls[0][0]).toEqual(['show', `origin/main:${LEGACY_IDENTITIES_PATH}`]);
   });
 });
