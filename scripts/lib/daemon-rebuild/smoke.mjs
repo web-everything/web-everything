@@ -298,7 +298,7 @@ async function resolveDispatchSmoke(opt, env) {
   let mod = null;
   let loadError = null;
   if (!opt?.settings || !opt?.run || !opt?.match) {
-    try { mod = await import('../daemon-load-overlay.mjs'); } catch (e) { loadError = e; }
+    try { mod = await (opt?.loadModule ?? (() => import('../daemon-load-overlay.mjs')))(); } catch (e) { loadError = e; }
   }
   const settings = opt?.settings ?? mod?.overlaySafetySettings?.(env) ?? null;
   const run = opt?.run ?? mod?.runRealDispatchSmoke ?? null;
@@ -666,6 +666,18 @@ export async function smokeAndAdopt({
     if (staleDetail) alert('clone-held-stale', staleDetail);
     return state;
   };
+
+  // Fail closed: with the dispatch-smoke module unresolvable, a build carrying a NEW or MOVED overlay cannot be proven, so hold
+  // BEFORE any smoke runs (overlays kept, nothing rejected; the next tick retries and the alert above keeps firing). Main-only
+  // builds and overlays already adopted at the same sha are unaffected, so recovery is never blocked.
+  if (dsm.unavailable) {
+    const known = Array.isArray(adoptedApplied) ? new Map(adoptedApplied.map((x) => [x?.ref, x?.sha])) : null;
+    const fresh = (plan.applied || []).filter((ap) => ap?.ref && !(known && ap.sha && known.get(ap.ref) === ap.sha));
+    if (fresh.length) {
+      await hold('dispatch-smoke-unavailable', [], { detail: { refs: fresh.map((x) => x.ref), error: dsm.unavailable } });
+      return { moved: false, reason: 'dispatch-smoke-unavailable', plan, alerts: [...prepAlerts, ...alertsList] };
+    }
+  }
 
   // ── Candidate A: main + every overlay ──────────────────────────────────────────────────────────────────
   const aSuspects = suspectsFor(plan.applied);
