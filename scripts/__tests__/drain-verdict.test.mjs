@@ -252,14 +252,17 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
 
 const argv = ['--only=7', '--verdict-out=verdict.json', '--repo=o/r'];
 // Variables the runner sets for every `run:` step (plus common image vars): none is a credential.
+// Fixture root is a neutral stand-in (no literal host-local path, per the host-path ratchet); only the
+// variable NAMES matter to the credential check, never these values.
+const RT = '/srv/runner';
 const RUNNER_STEP_ENV = Object.freeze({
-  CI: 'true', HOME: '/home/runner', PATH: '/usr/bin:/bin',
-  GITHUB_PATH: '/home/runner/work/_temp/_runner_file_commands/add_path_x', GITHUB_ENV: '/home/runner/work/_temp/set_env_x',
-  GITHUB_OUTPUT: '/home/runner/work/_temp/set_output_x', GITHUB_STEP_SUMMARY: '/home/runner/work/_temp/step_summary_x',
-  GITHUB_STATE: '/home/runner/work/_temp/save_state_x', GITHUB_EVENT_PATH: '/home/runner/work/_temp/_github_workflow/event.json',
-  GITHUB_WORKSPACE: '/home/runner/work/r/r', GITHUB_ACTION_PATH: '', GITHUB_API_URL: 'https://api.github.com',
-  RUNNER_TEMP: '/home/runner/work/_temp', RUNNER_OS: 'Linux', RUNNER_ARCH: 'X64', RUNNER_NAME: 'GitHub Actions 1',
-  RUNNER_TOOL_CACHE: '/opt/hostedtoolcache', RUNNER_WORKSPACE: '/home/runner/work/r', RUNNER_ENVIRONMENT: 'github-hosted',
+  CI: 'true', HOME: RT, PATH: '/usr/bin:/bin',
+  GITHUB_PATH: `${RT}/work/_temp/_runner_file_commands/add_path_x`, GITHUB_ENV: `${RT}/work/_temp/set_env_x`,
+  GITHUB_OUTPUT: `${RT}/work/_temp/set_output_x`, GITHUB_STEP_SUMMARY: `${RT}/work/_temp/step_summary_x`,
+  GITHUB_STATE: `${RT}/work/_temp/save_state_x`, GITHUB_EVENT_PATH: `${RT}/work/_temp/_github_workflow/event.json`,
+  GITHUB_WORKSPACE: `${RT}/work/r/r`, GITHUB_ACTION_PATH: '', GITHUB_API_URL: 'https://api.github.com',
+  RUNNER_TEMP: `${RT}/work/_temp`, RUNNER_OS: 'Linux', RUNNER_ARCH: 'X64', RUNNER_NAME: 'GitHub Actions 1',
+  RUNNER_TOOL_CACHE: '/opt/hostedtoolcache', RUNNER_WORKSPACE: `${RT}/work/r`, RUNNER_ENVIRONMENT: 'github-hosted',
   SELENIUM_JAR_PATH: '/usr/share/java/selenium-server.jar', SWIFT_PATH: '/usr/share/swift/usr/bin',
 });
 function ioFor() {
