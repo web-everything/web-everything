@@ -151,7 +151,6 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     if (result.planned.length + result.filed.length + result.duplicates.length >= max) break;
     const input = composeFileItemInput(card);
     const summary = { tag: card.tag, date: card.date, title: input.title, ...(input.scope ? { scope: input.scope } : {}) };
-    if (dryRun) { result.planned.push(summary); continue; }
     try {
       // Reuse file-item's own content guard; never rewrite a bare path into an approved one.
       assertPublishableContent('backlog/held-card.md', `# ${input.title}\n\n${input.digest}`);
@@ -163,10 +162,12 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
         throw new Error('local path in held card');
       }
     } catch {
-      result.refused.push(summary);
+      // Sanitized: a refused card's title may carry the very secret or path that got it refused.
+      result.refused.push({ tag: card.tag, date: card.date });
       log(safeLog(`refused ${card.tag}: remove secrets and use explicit WE path prefixes before retrying`));
       continue;
     }
+    if (dryRun) { result.planned.push(summary); continue; }
     const row = { hash: card.hash, ...summary, card: null, filedAt: now() };
     // A truncated title is not a full identity: two distinct cards can share its first 110 chars.
     const duplicate = input.title.endsWith('…') ? undefined : titles.get(titleKey(input.title));

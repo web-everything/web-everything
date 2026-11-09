@@ -258,3 +258,11 @@ it('refused cards do not consume the batch budget', async () => {
   expect(result.refused).toHaveLength(2);
   expect(result.filed).toHaveLength(1);
 });
+
+it('dry-run validates first and never echoes a refused card text', async () => {
+  seed('- [R1] 2026-11-08: leak ghp_abcdefghijklmnopqrstuvwxyz0123456789 end\n- [R1] 2026-11-08: fine');
+  const result = await run({ dryRun: true });
+  expect(JSON.stringify(result)).not.toContain('ghp_');
+  expect(result.refused).toHaveLength(1);
+  expect(result.planned).toHaveLength(1);
+});
