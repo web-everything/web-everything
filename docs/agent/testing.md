@@ -3949,6 +3949,9 @@ That fetch is object-only: it writes into a fresh `refs/release-verify/<nonce>/*
 A symbolic ref under `refs/remotes/origin/` other than the ordinary `origin/HEAD` alias refuses before
 any fetch (the salvage fetch too), and if any local branch, the stash or HEAD moved during the fetch,
 release refuses naming the ref instead of recomputing the proof.
+Each snapshotted ref kind has a named mutation scenario: a branch moved or deleted, a detached HEAD moved,
+HEAD switched to a twin branch, and the stash moved or dropped. Rows whose move hides the work then release
+with no fault, so only the movement check kept it.
 An unresolved origin or an unreadable listing refuses; every named pool in a fixture therefore needs
 its primary checkout (a sibling of the reference) so release can resolve that origin.
 The listing checks the primary's config with a primary-only rule: ordinary extra remotes (`upstream`, a fork)

@@ -393,19 +393,46 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(git(['rev-parse', 'refs/heads/work/keep'], laneDir)).toBe(sha);
     refused(result, sha);
   });
-  // Defense in depth: whatever the fetch does, a local branch or stash that moved during it refuses the release.
-  it('refuses when a local branch moves during the verification fetch', () => {
-    const pushed = git(['rev-parse', 'HEAD'], laneDir);
-    const sha = commitWork();
-    git(['branch', 'work/keep', sha], laneDir);
+  // Defense in depth: whatever the fetch does, a local branch, the stash or HEAD that moved during it refuses the
+  // release naming the ref. One named mutation per snapshotted ref kind (PR #6319 referral): the work is an empty
+  // commit (or a stash), so moving a ref never leaves a tracked edit behind. `losesWork` rows then release with no
+  // fault, proving the moved state passes the recomputed proof: only the movement check kept that work.
+  const emptyCommit = () => {
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '--allow-empty', '-m', 'unpushed work'], laneDir);
+    return git(['rev-parse', 'HEAD'], laneDir);
+  };
+  const keepBranch = pushed => {
+    git(['branch', 'work/keep', emptyCommit()], laneDir);
     git(['reset', '--quiet', '--hard', pushed], laneDir);
+  };
+  const stashEdit = () => {
+    writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+  };
+  it.each([
+    ['a local branch is moved', 'refs/heads/work/keep', true, keepBranch, pushed => ['update-ref', 'refs/heads/work/keep', pushed]],
+    ['a local branch is deleted', 'refs/heads/work/keep', true, keepBranch, () => ['update-ref', '-d', 'refs/heads/work/keep']],
+    ['a detached HEAD is moved', 'HEAD', true, pushed => {
+      emptyCommit();
+      git(['switch', '--quiet', '--detach'], laneDir);
+      git(['branch', '--quiet', '-f', 'main', pushed], laneDir);
+    }, pushed => ['update-ref', '--no-deref', 'HEAD', pushed]],
+    ['HEAD is switched to another branch at the same commit', 'HEAD', false, () => {
+      git(['branch', 'work/twin', emptyCommit()], laneDir);
+    }, () => ['symbolic-ref', 'HEAD', 'refs/heads/work/twin']],
+    ['the stash is moved', 'refs/stash', false, stashEdit, pushed => ['update-ref', 'refs/stash', pushed]],
+    ['the stash is dropped with its reflog', 'refs/stash', true, stashEdit, () => ['update-ref', '-d', 'refs/stash']],
+  ])('refuses when %s during the verification fetch', (_shape, ref, losesWork, setup, mutation) => {
+    const pushed = git(['rev-parse', 'HEAD'], laneDir);
+    setup(pushed);
     const fault = `if (args.includes('fetch')) { const out = original(cmd, args, opts);
-      original('git', ['update-ref', 'refs/heads/work/keep', ${JSON.stringify(pushed)}], { cwd: opts.cwd }); return out; }`;
+      original('git', ${JSON.stringify(mutation(pushed))}, { cwd: opts.cwd }); return out; }`;
     const result = release([], fault);
     expect(result.status, result.stderr).toBe(1);
     expect(result.data.released).toBe(0);
-    expect(result.stderr).toContain('refs/heads/work/keep changed during the verification fetch');
+    expect(result.stderr).toContain(`${ref} changed during the verification fetch`);
     expect(readFileSync(marker, 'utf8')).toBe(lease);
+    if (losesWork) released(release());
   });
   it('verification fetch writes no ref and no FETCH_HEAD in the lane', () => {
     const other = join(base, 'other');
