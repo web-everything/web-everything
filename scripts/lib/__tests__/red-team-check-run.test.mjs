@@ -313,14 +313,14 @@ describe('red-team check run contract', () => {
     it.each(['supersede-succeeds', 'supersede-fails', 'both-fail'])
     ('a lost success response attempts failure supersession and falls back to a hold: %s', async mode => {
       const io = fixture();
-      const readGh = io.gh.getMockImplementation();
+      const baseGh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
 
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
           if (mode === 'both-fail') throw Error('hold response timed out');
           return '{}';
         }
-        if (!args.includes('POST')) return readGh(args, options);
+        if (!args.includes('POST')) return baseGh(args, options);
         const payload = JSON.parse(options.input);
         if (payload.conclusion === 'success') throw Error('success response timed out');
         if (payload.conclusion === 'failure') {
@@ -384,10 +384,10 @@ describe('red-team check run contract', () => {
 
     it.each([false, true])('failed failure supersede posts a second-channel hold and never throws (hold fails=%s)', async holdFails => {
       const io = fixture();
-      const readGh = io.gh.getMockImplementation();
+      const baseGh = io.gh.getMockImplementation();
       let posted = false;
       io.gh.mockImplementation((args, options) => {
-        if (!args.includes('POST')) return readGh(args, options);
+        if (!args.includes('POST')) return baseGh(args, options);
 
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
           if (holdFails) throw Error('status write denied');
@@ -478,7 +478,7 @@ describe('red-team check run contract', () => {
 
     it.each(['blocking-label', 'new-run'])('supersedes its success with failure when a %s races publication', async mode => {
       const io = fixture();
-      const readGh = io.gh.getMockImplementation();
+      const baseGh = io.gh.getMockImplementation();
       let posted = false;
       io.gh.mockImplementation((args, options) => {
 
@@ -486,7 +486,7 @@ describe('red-team check run contract', () => {
         if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 + posts(io).length }); }
         if (posted && mode === 'new-run') return JSON.stringify({ total_count: 1,
           check_runs: [run({ id: 99, status: 'in_progress', conclusion: null })] });
-        return readGh(args, options);
+        return baseGh(args, options);
       });
       io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
         labels: posted && mode === 'blocking-label' ? [{ name: 'red-team:blocked' }] : [] }));
@@ -501,7 +501,7 @@ describe('red-team check run contract', () => {
     ('supersedes success with failure when post-publication evidence is %s', async mode => {
       const io = fixture();
       let posted = false;
-      const readGh = io.gh.getMockImplementation();
+      const baseGh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
 
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
@@ -509,7 +509,7 @@ describe('red-team check run contract', () => {
         if (posted && mode === 'history-unreadable') throw Error('check history unavailable');
         if (posted && mode === 'completed-run') return JSON.stringify({ total_count: 1,
           check_runs: [run({ id: 99 })] });
-        return readGh(args, options);
+        return baseGh(args, options);
       });
       io.readLive.mockImplementation(() => !posted ? { headRefOid: HEAD, labels: [] }
         : mode === 'live-unreadable' ? null
@@ -547,12 +547,12 @@ describe('red-team check run contract', () => {
 
     it('a failed success POST returns ok:false without throwing', async () => {
       const io = fixture();
-      const readGh = io.gh.getMockImplementation();
+      const baseGh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
 
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
         if (args.includes('POST')) throw Error('HTTP 403: check write denied');
-        return readGh(args, options);
+        return baseGh(args, options);
       });
       expect(await publish(io)).toMatchObject({ ok: false });
       expect(posts(io).length).toBeGreaterThanOrEqual(1);
