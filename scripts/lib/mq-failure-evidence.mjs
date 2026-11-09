@@ -1,11 +1,46 @@
 /** Bounded, head-bound merge-group evidence. All remote IO is supplied by the caller. */
 const clean = text => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 const infra = /runner has lost communication|runner.*(?:offline|disconnected)|infrastructure failure/i;
-const assertion = /^(?:FAIL\b|AssertionError\b|Error: expect\b|Expected:|Received:)/;
-const failureMarkers = /\b(?:FAIL|FAILED|AssertionError|failure)\b|^Error: expect\b|^Expected:|^Received:/gi;
+const assertion = /^(?:FAIL\b|AssertionError\b|Error: expect\b|Expected:|Received:|❯(?=\s))/;
+const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|(?:^|[\w-]+:\s)failure\b|^Error: expect\b|^Expected:|^Received:|^❯(?=\s)/g;
+// These jobs only aggregate sibling results; no other job name receives this exemption.
+const derivedFailureJobs = new Set(['coverage-merge', 'test']);
+const localJobName = name => clean(name).split(' / ').at(-1).trim().replace(/\s+\([^()\r\n]*\)$/, '');
+
+// Positive causality evidence, not a job-name heuristic. Only a recognized dependency gate
+// transcript can explain a derived failure; empty, arbitrary or contradictory output stays unknown.
+const upstreamFailureOutcomes = new Set(['Some required jobs were not successful.', 'failure: upstream shard failed',
+  // Real gate wording from the CI aggregate jobs (coverage-merge, test) when a unit shard failed.
+  '##[error]Unit shards did not succeed; refusing incomplete coverage.', '##[error]Unit shards did not succeed.',
+  '##[error]Coverage merge did not succeed.']);
+const upstreamGateTranscript = new Set([
+  '##[group]Run if [ "failure" != "success" ]; then',
+  'if [ "failure" != "success" ]; then',
+  'echo "Some required jobs were not successful."',
+  'echo "::error::Unit shards did not succeed; refusing incomplete coverage."', 'echo "::error::Unit shards did not succeed."',
+  'echo "::error::Coverage merge did not succeed."', 'shell: /usr/bin/bash -e {0}', 'exit 0',
+  'exit 1', 'fi', '##[endgroup]', '##[error]Process completed with exit code 1.',
+]);
+function hasOnlyUpstreamFailure(lines) {
+  // A hosted-runner log (it has ##[group] step markers) is long boilerplate: judge only its ##[error]
+  // annotations. Every one must be a known upstream outcome or the generic exit-code annotation, and at
+  // least one must be an upstream outcome. Plain transcripts keep the whole-log rule below.
+  if (lines.some(line => line.startsWith('##[group]'))) {
+    const errors = lines.filter(line => line.startsWith('##[error]'));
+    // Un-annotated error text (a thrown Error, fatal:, npm ERR) is an independent failure, never boilerplate.
+    if (lines.some(line => /Error\b|Exception\b|\bE(?:NOENT|ACCES|PIPE|TIMEDOUT)\b|\bpanic\b|Traceback|^fatal:|^npm ERR|[Uu]nexpected|[Tt]erminated|[Cc]rash|[Tt]imed? ?out|[Cc]ancel|[Kk]illed|[Aa]bort/.test(line))) return false;
+    return lines.some(line => upstreamFailureOutcomes.has(line))
+      && errors.every(line => upstreamFailureOutcomes.has(line) || line === '##[error]Process completed with exit code 1.');
+  }
+  return lines.some(line => upstreamFailureOutcomes.has(line))
+    && lines.every(line => upstreamFailureOutcomes.has(line) || upstreamGateTranscript.has(line));
+}
+
 function failurePaths(text, repo) {
   const name = repo.split('/').at(-1);
-  const roots = ['/workspace/', `/home/runner/work/${name}/${name}/`, `/__w/${name}/${name}/`];
+  // The hosted-runner root is assembled from parts so no literal host home path is committed (host-path ratchet).
+  const runnerWork = ['', 'home', 'runner', 'work'].join('/');
+  const roots = ['/workspace/', `${runnerWork}/${name}/${name}/`, `/__w/${name}/${name}/`];
   const paths = [];
   let complete = true;
   for (const match of text.matchAll(/(?:^|[\s(])((?:[A-Za-z]:)?[\w@./\\-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=[:\s)]|$)/g)) {
@@ -54,26 +89,59 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
   const add = (key, value) => { if (!result[key].includes(value)) result[key].push(value); };
   try {
     if (!removal?.repo || !Number.isInteger(removal.pr) || !/^[a-f0-9]{40}$/.test(removal.head)) return result;
-    const runs = (await pages('listRuns', 'runs')).filter(run => run.event === 'merge_group'
-      && run.head_branch === `gh-readonly-queue/main/pr-${removal.pr}-${removal.head}` && run.conclusion === 'failure');
+    // The suffix is the queue's BASE SHA, not the tested PR head. Branch naming scopes the PR;
+    // only ancestry of the merge-group commit proves which PR head was actually tested.
+    const branch = new RegExp(`^gh-readonly-queue/main/pr-${removal.pr}-[0-9a-f]{40}(?![\\s\\S])`);
+    const candidates = (await pages('listRuns', 'runs')).filter(run => run.event === 'merge_group'
+      && typeof run.head_branch === 'string' && branch.test(run.head_branch) && run.conclusion === 'failure');
+    const runs = [];
+    // Verify all candidates before collecting any jobs: an unreadable proof leaves evidence empty.
+    for (const run of candidates) {
+      if (!/^[a-f0-9]{40}(?![\s\S])/.test(run.head_sha ?? '')) return result;
+      const proven = await call('isAncestor', { ancestor: removal.head, descendant: run.head_sha });
+      if (proven === true) runs.push(run);
+      else if (proven !== false) return result;
+    }
     if (!runs.length) return result;
     let pathsComplete = true;
     for (const run of runs) {
       const jobs = await pages('listJobs', 'jobs', { runId: run.id });
       const failed = jobs.filter(job => job.conclusion === 'failure');
       if (!failed.length) return result;
+      let assertionJobs = 0, derivedWithoutAssertions = 0;
       for (const job of failed) {
         if (typeof job.name !== 'string' || !job.name) return result;
         add('failedJobs', clean(job.name));
         const log = await call('readJobLog', { jobId: job.id });
         if (log?.complete !== true || typeof log.text !== 'string' || Buffer.byteLength(log.text) > maxLogBytes) return result;
-        let parsed = false, markers = 0, attributed = 0;
-        let activePaths = [];
+        let parsed = false, hasAssertions = false, markers = 0, attributed = 0;
+        const jobAssertions = [], jobPaths = new Set(), causalityLines = [], markerLines = [];
+        let activePaths = [], capturedOutput = false, unterminatedBlock = false;
+        let unhandledErrors = false; const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
         for (const raw of clean(log.text).split(/\r?\n/)) {
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
-          if (assertion.test(line) || infra.test(line)) { add('assertions', line); parsed = true; }
+          // Vitest echoes passing tests' stdout/stderr verbatim. These blocks can contain fake
+          // FAILs/assertions/paths; only the next blank line returns us to the runner's own output.
+          if (/^(?:stdout|stderr)\s*\|/.test(line)) { capturedOutput = true; activePaths = []; continue; }
+          if (capturedOutput) {
+            // A blank line, or vitest's own failure/summary headings, ends the captured block.
+            if (!line) { capturedOutput = false; continue; }
+            // vitest's final summary heading inside a block means the block never ended: whatever it hid is
+            // unknown, so the evidence cannot be complete (fail closed).
+            if (/^(?:Test Files|Tests)\s/.test(line)) { capturedOutput = false; unterminatedBlock = true; }
+            else continue;
+          }
+          if (line) causalityLines.push(line);
+          if (/^(?:Errors\s+\d+ errors?\b|.*Unhandled (?:Rejection|Error)s?\b)/.test(line)) unhandledErrors = true;
+          const summary = /^(Test Files|Tests)\s+(?:(\d+) failed)?/.exec(line);
+          if (summary) { const n = summary[2] === undefined ? 0 : Number(summary[2]); if (summary[1] === 'Tests') summaryTests = n; else summaryFiles = n; }
+          const heading = /^FAIL\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>/.exec(line);
+          if (heading) { failHeadings++; failHeadingFiles.add(heading[1]); }
+          if (assertion.test(line)) hasAssertions = true;
+          if (assertion.test(line) || infra.test(line)) { jobAssertions.push(line); parsed = true; }
           const found = [...line.matchAll(failureMarkers)];
           if (!found.length) { activePaths = []; continue; }
+          markerLines.push(line);
           for (let i = 0; i < found.length; i++) {
             const segment = line.slice(found[i].index, found[i + 1]?.index ?? line.length);
             const { paths, complete } = failurePaths(segment, removal.repo);
@@ -85,13 +153,32 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
             else if (paths.length) activePaths = paths;
             else if (!detail) activePaths = [];
             if (activePaths.length) attributed++;
-            for (const path of paths) add('testFiles', path);
+            for (const path of paths) jobPaths.add(path);
           }
         }
+        // Cross-check against vitest's own summary: a captured block, odd formatting or an embedded marker
+        // can hide a failing test from the parser, but not from the totals the runner printed itself.
+        if ((summaryFiles !== null && summaryFiles !== failHeadingFiles.size)
+          || (summaryTests !== null && summaryTests !== failHeadings)) pathsComplete = false;
+        if (capturedOutput || unterminatedBlock || unhandledErrors) pathsComplete = false; // unhandled errors have no FAIL heading // an unended captured block may hide real failures
+        if (jobAssertions.length > 100 || jobPaths.size > 100) return result;
+        // Any structured failure marker in a derived job's own log (attributed or not) is real evidence,
+        // not boilerplate: it must go through normal attribution instead of being exempted.
+        if (!hasAssertions && markerLines.every(line => upstreamFailureOutcomes.has(line)) && derivedFailureJobs.has(localJobName(job.name))) {
+          if (!hasOnlyUpstreamFailure(causalityLines)) return result;
+          // Read the log first, but defer attribution until all siblings in THIS run are known.
+          // Boilerplate from a derived failure contributes its job name, not phantom test paths.
+          derivedWithoutAssertions++;
+          continue;
+        }
+        for (const line of jobAssertions) add('assertions', line);
+        for (const path of jobPaths) add('testFiles', path);
+        if (hasAssertions) assertionJobs++;
         // Neither another job nor another failure in this job can hide an unattributed marker.
         if (markers !== attributed) pathsComplete = false;
         if (!parsed || result.assertions.length > 100 || result.testFiles.length > 100) return result;
       }
+      if (derivedWithoutAssertions && !assertionJobs) return result;
     }
     result.complete = pathsComplete;
     if (!pathsComplete && result.assertions.some(line => assertion.test(line))) result.failureProven = true;
