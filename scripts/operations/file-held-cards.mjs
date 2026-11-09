@@ -212,7 +212,7 @@ export async function runFileHeldCards(options = {}) {
   const source = resolve(expandHome(options.source || join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md')));
   const lexical = resolve(expandHome(options.ledger || join(dirname(source), 'cards-filed.jsonl')));
   const canonical = resolveLedgerPath(lexical);
-  try { if (statSync(canonical).nlink > 1) throw new Error('--ledger must not be a hard-linked file (its lock could not be shared)'); }
+  try { if (statSync(canonical).nlink > 1) throw new Error('--ledger must be outside the repository and not hard-linked (its lock could not be shared)'); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const lock = `${canonical}.lock`;
   try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); } catch (error) {
