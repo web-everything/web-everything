@@ -91,6 +91,16 @@ describe('permanent guard refusals', () => {
     expect(outcome.halted).toMatchObject({ key: 'run-guard#0#0', status: 'refused', error: error.message });
     expect(outcome.run.effects.map((e) => e.status)).toEqual(['refused', 'declared']);
     expect(store.read(run.id).effects).toEqual(outcome.run.effects);
+
+    // A restart preserves the refusal even when its sink is no longer registered.
+    const replay = await applyPendingEffects(store.read(run.id), { store, sinks: {
+      'note.write': async () => { calls.push('note.write'); },
+    } });
+    expect(replay.run).toEqual(outcome.run);
+    expect(replay.halted).toEqual(outcome.halted);
+    expect(replay.error.message).toBe(error.message);
+    expect(replay.applied).toEqual([]);
+    expect(calls).toEqual(['guard.clear']);
   });
 });
 

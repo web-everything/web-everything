@@ -1199,7 +1199,10 @@ export async function driveRun({
       const outcome = await applyPendingEffects(current, { sinks, store, attemptedBy });
       current = outcome.run;
       applied.push(...outcome.applied);
-      if (outcome.error) return { run: current, stopped: 'effect-halted', error: outcome.error, applied };
+      // Permanent guard refusals must reach advance so the engine can settle the run.
+      if (outcome.error && outcome.halted?.status !== 'refused') {
+        return { run: current, stopped: 'effect-halted', error: outcome.error, applied };
+      }
       // PARKED ON A DISPATCH (#3073). An in-flight halt is a SUCCESSFUL stop, not an error: the sink started
       // work that outlives this process, so `error` is null and the halt reports itself through `inFlight`.
       // Without this branch the loop falls through to `advance`, which returns the run UNCHANGED (in-flight
