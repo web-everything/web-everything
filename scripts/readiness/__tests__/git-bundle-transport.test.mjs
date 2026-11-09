@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge, BUNDLE_MAIN_MAX_AGE_CEILING_MS } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
-import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
+import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, capabilityBundleVerdict, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
 import { decideRemote, resolveAdmissionPolicy, readRunnerBundleCapability, writeRunnerCapabilities } from '../heavy-admission.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
@@ -152,11 +152,27 @@ describe('R593 client and routing', () => {
     it('git-bundle + capability keeps remote', () => expect(decide(mk('git-bundle'), true)).toMatchObject({ remote: true }));
     it('git-bundle without capability stays local', () => expect(decide(mk('git-bundle'), false)).toMatchObject({ remote: false, needsGit: true }));
     it('rsync stays local even with the capability', () => expect(decide(mk('rsync'), true)).toMatchObject({ remote: false, needsGit: true }));
-    it('capability cache round-trips and unreadable means no', () => {
-      const dir = join(root, 'remote'); const clock = () => 5000;
-      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(false);
+    it('capability cache round-trips; missing/unreadable/expired means unknown (go remote, prepare re-checks)', () => {
+      const dir = join(root, 'remote'); let now = 5000; const clock = () => now;
+      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(true);
       writeRunnerCapabilities({ root: dir, host: 'forge', capabilities: { gitBundle: 1 }, clock });
       expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(true);
+      now = 5000 + 61 * 60_000; // expired
+      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(true);
+    });
+    it('a fresh record saying no bundle stays local; another host record is unknown', () => {
+      const dir = join(root, 'remote2'); const clock = () => 5000;
+      writeRunnerCapabilities({ root: dir, host: 'forge', capabilities: {}, clock });
+      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(false);
+      expect(readRunnerBundleCapability({ root: dir, host: 'other', clock })).toBe(true);
+    });
+    it('verdict is yes/no/unknown', () => {
+      const rec = capabilityRecord({ host: 'forge', capabilities: { gitBundle: 1 }, nowMs: 1000 });
+      expect(capabilityBundleVerdict(rec, { host: 'forge', nowMs: 2000 })).toBe('yes');
+      expect(capabilityBundleVerdict({ ...rec, gitBundle: 0 }, { host: 'forge', nowMs: 2000 })).toBe('no');
+      expect(capabilityBundleVerdict(rec, { host: 'forge', nowMs: 1000 + 61 * 60_000 })).toBe('unknown');
+      expect(capabilityBundleVerdict(null, { host: 'forge', nowMs: 2000 })).toBe('unknown');
+      expect(capabilityBundleVerdict({ ...rec, gitBundle: 0, atMs: 5000 }, { host: 'forge', nowMs: 2000 })).toBe('unknown');
     });
   });
 });
