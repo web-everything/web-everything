@@ -223,6 +223,14 @@
       "findings": [
         "scripts/lib/drain-red-team-evidence.mjs:541 — Replaces the foreign-host fail-closed hold with an age-based local PID check. Different machines can both have null PID namespaces; an absent or mismatched local PID cannot prove the remote writer stopped. After 30 minutes (configurable down to 10), a live remote review can lose its in-flight/queued protection, allowing review-job.mjs:387 to admit a replacement writer and overwrite its status."
       ]
+    },
+    {
+        "ref": "lane/redteam-dispatch-queue",
+        "sha": "f86f066e17bd0eeb3a8c2f945d4d4f6236d30c75",
+        "ruling": "R786",
+        "findings": [
+            "scripts/lib/review-red-team-on-skip.mjs:791 — Pre-existing limitation relied on by scripts/lib/red-team-dispatch-queue.mjs:171: worker-free `carry` publishes policy-clear without revalidating live holds or complete formal reviews. A read-only probe selected `carry` with zero live-state or complete-review reads despite readers configured to report a hold; a hold arriving after the snapshot can therefore be bypassed."
+        ]
     }
   ]
 }
