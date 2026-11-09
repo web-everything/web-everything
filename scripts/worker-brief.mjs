@@ -141,7 +141,9 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    Stack on an unmerged PR ONLY when your declared files overlap that PR's changed files. Check first:
    \`gh pr view <N> --json files --jq '.files[].path'\` and compare with your --files list. No overlap => base on origin/main.
    Never stack just to get edge-loaded: daemon-overlay add is stack-aware and a main-based lane loads on its own.
-   Work only in the lane path it prints. Never branch or edit the primary checkout. Release the lane at the end:
+   Work only in the lane path it prints. Never branch or edit the primary checkout.
+   Any file-item card must be committed and its PR opened BEFORE you release the lane. Releasing with uncommitted cards
+   sends them to ~/.claude/lane-salvage and they never land. Release the lane at the end:
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
 4. **Codex for larger builds.** Larger coding sub-tasks (a new feature, a multi-file change, a test suite) go to Codex:
    \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.

@@ -61,6 +61,9 @@ beforeAll(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  // The pool's primary checkout (a sibling of the reference): an --all-pools release proves lane work against that
+  // primary's canonical origin and refuses when it cannot resolve one.
+  git(['clone', '--quiet', originDir, join(fixtureRoot, 'ownerscope')]);
   ghStubDir = join(fixtureRoot, 'ghstub');
   mkdirSync(ghStubDir, { recursive: true });
   writeFileSync(join(ghStubDir, 'gh'), '#!/bin/sh\necho "gh stub: unavailable in this test" >&2\nexit 1\n', { mode: 0o755 });
