@@ -30,8 +30,15 @@ export function isMutatingGhCall(cmd, args = []) {
     // Diff-producing commands can execute configured helpers even without an
     // explicit enabling flag. Require the protections first, before options that
     // could consume them as values or a pathspec separator could hide them.
-    if (['diff', 'show', 'log'].includes(a[0]) &&
-        !(a.slice(1, 3).includes('--no-ext-diff') && a.slice(1, 3).includes('--no-textconv'))) return true;
+    // The drain's own reads are `diff --numstat ...` (stat only, no content/driver) and
+    // `diff --no-ext-diff --end-of-options ...`; textconv commands exist only in local trusted git config.
+    if (['diff', 'show', 'log'].includes(a[0])) {
+      const head = a.slice(1, a.findIndex((x, i) => i > 0 && (x === '--' || x === '--end-of-options')) > 0 ? a.findIndex((x, i) => i > 0 && (x === '--' || x === '--end-of-options')) : a.length);
+      const statOnly = a[0] === 'diff' && head.some(x => ['--numstat', '--name-only', '--name-status', '--shortstat', '--stat'].includes(x));
+      const both = head.includes('--no-ext-diff') && head.includes('--no-textconv');
+      // Only `diff` gets the relaxed forms (the drain's own calls); show/log keep requiring both protections.
+      if (!statOnly && !(a[0] === 'diff' ? head.includes('--no-ext-diff') : both)) return true;
+    }
     // Read commands can still write files or invoke external programs. Git accepts
     // unambiguous long-option abbreviations, so reject their prefixes as well.
     const unsafe = ['--output', '--ext-diff', '--textconv', '--filters', '--open-files-in-pager', '--exec'];

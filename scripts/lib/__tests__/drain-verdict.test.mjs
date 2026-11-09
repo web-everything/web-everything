@@ -64,3 +64,14 @@ describe('drain-verdict/1', () => {
     expect(verify(build(inputs()), inputs(), { now: now + 300_001 }).ok).toBe(false);
   });
 });
+
+describe('codeSha presence', () => {
+  it('refuses a verdict whose codeSha was removed', async () => {
+    const { verify } = await import('../drain-verdict.mjs');
+    const v = { schema: 'drain-verdict/1', decision: 'local', localRequired: ['red-main-freeze', 'card-group'], repo: 'o/r', pr: 1,
+      headSha: 'h', mainSha: 'm', gateTree: 't', settingsDigest: 's', inputsDigest: 'i', computedAt: new Date(0).toISOString() };
+    const live = { repo: 'o/r', pr: 1, headSha: 'h', mainSha: 'm', gateTree: 't', settingsDigest: 's', inputsDigest: 'i' };
+    expect(verify(v, live, { now: 1000 })).toMatchObject({ ok: false, reason: 'codeSha' });
+    expect(verify({ ...v, codeSha: 'c' }, live, { now: 1000 }).ok).toBe(true);
+  });
+});

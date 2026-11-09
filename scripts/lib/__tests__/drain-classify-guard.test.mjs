@@ -22,7 +22,7 @@ const writes = [
 const gitWriteOptions = [
   ...['diff', 'show', 'log'].flatMap(command => [
     ['git', [command]],
-    ['git', [command, '--no-ext-diff']],
+    ...(command === 'diff' ? [] : [['git', [command, '--no-ext-diff']]]), // diff alone is the drain's real read; admitted below
     ['git', [command, '--no-textconv']],
     ['git', [command, '--', '--no-ext-diff', '--no-textconv']],
     ['git', [command, '--no-ext-diff', '--no-textconv', '--ext-diff']],
@@ -161,5 +161,14 @@ describe('git fetch admission', () => {
     expect(isMutatingGhCall('git', ['fetch', '--upload-pack=sh', 'origin'])).toBe(true);
     expect(isMutatingGhCall('git', ['fetch', 'ext::sh -c x'])).toBe(true);
     expect(isMutatingGhCall('git', ['push', 'origin', 'x'])).toBe(true);
+  });
+});
+
+describe('the drain\'s real diff reads stay admitted', () => {
+  it('admits numstat and --no-ext-diff --end-of-options diffs, still refuses ext-diff', () => {
+    expect(isMutatingGhCall('git', ['diff', '--numstat', 'a...b'])).toBe(false);
+    expect(isMutatingGhCall('git', ['diff', '--no-ext-diff', '--end-of-options', 'a...b'])).toBe(false);
+    expect(isMutatingGhCall('git', ['diff', '--no-ext-diff', '--ext-diff', 'a'])).toBe(true);
+    expect(isMutatingGhCall('git', ['diff', '--end-of-options', 'a'])).toBe(true);
   });
 });

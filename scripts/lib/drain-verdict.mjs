@@ -54,6 +54,8 @@ export function verify(verdict, live, { maxAgeMinutes = 10, now = Date.now() } =
   for (const field of BINDINGS) {
     if (typeof verdict[field] !== 'string' || !verdict[field] || verdict[field] !== live?.[field]) return refuse(field);
   }
+  // codeSha is informational (every main commit changes it); gateTree is the binding. It must still be present.
+  if (typeof verdict.codeSha !== 'string' || !verdict.codeSha) return refuse('codeSha');
   const age = Number(new Date(now)) - Date.parse(verdict.computedAt);
   if (!Number.isFinite(age) || age < 0 || !Number.isFinite(maxAgeMinutes) || maxAgeMinutes < 0 || age > maxAgeMinutes * 60_000) return refuse('computedAt');
   return { ok: true, reason: 'verified' };
