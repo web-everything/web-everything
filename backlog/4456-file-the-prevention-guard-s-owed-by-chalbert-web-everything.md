@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-05"
-preparedAgainstSha: "27e2ab3d9d75ad000ae8e4b99410dcf2135de56c"
+preparedDate: "2026-11-08"
+preparedAgainstSha: "7cf64add2e939aa00bb940bdd61ca428c0b16937"
 tags: []
 ---
 
@@ -27,6 +27,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Size remains 3: approximately 20–35 changed lines in the pure rule, 30–50 in gate wiring (including the up-front readability probe and routing the backlog readers through its filtered listing), 70–100 in pure regressions, 130–190 in disposable gate regressions (A5 adds about 30–40), up to 10 in shared gate fixtures, and one removed corpus line (six-file touch set, about 251–386 lines). The A5 addition reuses the A2 fixture; size 3 still holds at that range. Integration setup and full/local gate coverage dominate the estimate. This is a story; no estimatedLoc is added. Preparation stamps are left to the runner. No implementation or passing regression is claimed.
 
 - Re-prepare 2026-11-05 against origin/main 27e2ab3d: premise still open (no `backlog-retired-field` guard on main; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). Only drift: later-scan citations shifted about 8 lines (now :1482, :1525, :1567, :1748, :1805, :1962); raw loop (:1058-1061) and parse scan (:999-1000) unchanged. No scope, size or goal change.
+
+- Re-prepare 2026-11-08 against origin/main 7cf64add: premise still open (no `backlog-retired-field` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 27e2ab3d..HEAD` shows no change to we:scripts/check-standards.mjs, we:scripts/check-standards-rules.mjs or the 1683 card, so every citation above holds. No scope, size or goal change; only the stamp is refreshed.
 
 ## Design
 

@@ -2,8 +2,10 @@
 bornAs: x8oo9hx
 kind: story
 size: 3
-status: open
+status: resolved
 dateOpened: "2026-11-04"
+dateResolved: "2026-11-07"
+graduatedTo: b155a88804d349b7ae6729e0cb2bb20bbc315a5f
 tags: []
 ---
 

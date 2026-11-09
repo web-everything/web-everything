@@ -29,7 +29,7 @@ import { performance } from 'node:perf_hooks';
 
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import {
-  DEFAULT_BACKOFF_BASE_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_LAUNCH_GRACE_MS,
+  DEFAULT_BACKOFF_BASE_MS, DEFAULT_FOREIGN_STALE_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_LAUNCH_GRACE_MS,
   SLEEP_GAP_THRESHOLD_MS, admitJobs, classifyJob, detectSleep, markClaimed, markCheckpoint, markFailed,
   markHeartbeat, markLaunching, markQueued, markRequeued, markSpawned, markStepError, markStopped, markSucceeded,
   planReattach, taskDeadlineDecision,
@@ -469,6 +469,21 @@ export function reapDeadGroup(handle, {
 }
 
 /**
+ * READ-ONLY confirmation that a handle's process and process group are gone on this machine. For a handle whose
+ * host name is not recognised (a renamed host: the job store is per-machine, so its pid still lives here). Never
+ * signals anything except signal 0. True only on confirmed absence; a live or reused pid, an existing group,
+ * unreadable evidence or an unexpected error all return false so the caller retains its claim.
+ */
+export function confirmHandleAbsent(handle, { readStart = readProcStart, kill = (pid, sig) => process.kill(pid, sig) } = {}) {
+  const h = parseJobHandle(handle);
+  if (!h?.pid) return false;
+  // Any process at the pid is unconfirmed: `ps lstart` is local-time with no zone, so a differing start string
+  // can be the same live owner read under another TZ, not a reused pid.
+  try { if (readStart(h.pid)) return false; } catch { return false; }
+  try { kill(-h.pid, 0); return false; } catch (error) { return error?.code === 'ESRCH'; } // a member of its group lives
+}
+
+/**
  * Tick clock for the sleep rule: each `observe()` compares the wall and monotonic gaps since the last call.
  */
 export function createTickClock({ wallNow = Date.now, monoNow = () => performance.now(), thresholdMs = SLEEP_GAP_THRESHOLD_MS } = {}) {
@@ -522,7 +537,7 @@ function completeTaskResult(r, { at, now, backoffBaseMs }) {
 /**
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
- *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, reapGroup?: Function,
+ *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, foreignStaleMs?: number, reapGroup?: Function,
  *   // reapGroup(handle, cutoff, { requireConfirmedDeath: true }) must return true only for confirmed absence.
  *   releaseTaskClaim?: (record: object) => void, // synchronous, attempt-scoped port; must throw on refusal
  *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
@@ -531,9 +546,11 @@ function completeTaskResult(r, { at, now, backoffBaseMs }) {
 export async function reattachTick({
   store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
+  foreignStaleMs = DEFAULT_FOREIGN_STALE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
   releaseTaskClaim = () => {},
   reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs }),
+  confirmForeignGone = (h) => confirmHandleAbsent(h), // read-only; true only on confirmed absence
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -545,8 +562,17 @@ export async function reattachTick({
   };
   if (slept) log(`daemon-jobs: host slept (wall-vs-monotonic gap ${Math.round(gapMs)}ms) — skipping the staleness check this tick`);
   const actions = [];
-  const confirmTaskGroupGone = (record, state) => {
+  const confirmTaskGroupGone = (record, state, { foreign = false } = {}) => {
     if (!record.job.handle) return true; // unclaimed launch; no process group was recorded
+    if (foreign) {
+      // Stale heartbeat alone is not death: confirm read-only (never signalling) before releasing exclusion.
+      let gone = false;
+      try { gone = confirmForeignGone(record.job.handle) === true; } catch { /* unreadable evidence retains exclusion */ }
+      if (gone) return true;
+      actions.push({ id: record.id, state, action: 'stop-failed' });
+      log(`daemon-jobs: stale foreign owner ${record.id} (${record.job.handle}) is not confirmed gone — retains claim and slot; inspect owner before recovery`);
+      return false;
+    }
     const lastAliveMs = Date.parse(record.job.heartbeatAt ?? record.job.startedAt ?? '');
     try {
       if (reapGroup(record.job.handle, lastAliveMs + staleMs, { requireConfirmedDeath: true }) === true) return true;
@@ -569,16 +595,18 @@ export async function reattachTick({
       }
     };
     const liveness = r.job.handle ? observeOwner() : null;
-    const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, sleepDetected: slept });
+    const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, foreignStaleMs, sleepDetected: slept });
+    // A stale foreign heartbeat permits record recovery, never local PID/group cleanup.
+    const staleForeignDead = liveness === 'foreign' && state === 'dead';
     const taskDeadline = isTask ? taskDeadlineDecision(r, { now }) : null;
     const deadline = isTask ? taskDeadline?.deadlineAt : deadlineAt(r);
     const expired = Number.isFinite(deadline) && now >= deadline && state !== 'terminal' && (isTask || state !== 'foreign');
     const savedResult = r.job.task?.execution?.results?.[r.job.attempts];
-    if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || !expired)) {
-      if (liveness !== 'dead') continue; // publication does not revoke a live/unknown owner
-      if (!confirmTaskGroupGone(r, state)) continue;
+    if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || staleForeignDead || !expired)) {
+      if (liveness !== 'dead' && !staleForeignDead) continue; // publication does not revoke a live/unknown owner
+      if (!confirmTaskGroupGone(r, state, { foreign: staleForeignDead })) continue;
       store.update(r.id, f => {
-        if (!sameGeneration(f, r)) return null;
+        if (!sameGeneration(f, r) || (staleForeignDead && f.job.heartbeatAt !== r.job.heartbeatAt)) return null;
         if (!tryReleaseTaskClaim(f)) return null;
         return completeTaskResult(f, { at: iso(now), now, backoffBaseMs });
       });
@@ -592,8 +620,8 @@ export async function reattachTick({
       : expired ? { type: 'fail', stopFirst: liveness === 'alive',
         reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
         : planReattach(r, state, { kindDef });
-    // Unknown task ownership never enters the unclaimed-launch recovery path.
-    if (isTask && r.job.handle && state !== 'terminal' && liveness !== 'alive' && liveness !== 'dead') {
+    // Unknown ownership retains exclusion; classified stale foreign owners may recover.
+    if (isTask && r.job.handle && state !== 'terminal' && liveness !== 'alive' && liveness !== 'dead' && !staleForeignDead) {
       actions.push({ id: r.id, state, action: 'stop-failed' });
       log(`daemon-jobs: cannot confirm task owner ${r.id} (${r.job.handle}) — retains claim and slot; inspect owner before recovery`);
       continue;
@@ -601,7 +629,7 @@ export async function reattachTick({
     if (plan.type === 'none') continue;
     const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
     let stopped;
-    if (plan.stopFirst) {
+    if (plan.stopFirst && liveness !== 'foreign') {
       const res = await stop(r.job.handle, {
         ...(kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {}),
         ...(isTask ? { requireConfirmedDeath: true } : {}),
@@ -616,14 +644,15 @@ export async function reattachTick({
     }
     // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
     // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
-    if (isTask) {
-      if (!confirmTaskGroupGone(r, state)) continue;
+    if (isTask || staleForeignDead) {
+      // A stale foreign heartbeat is never proof of death, task or not: a still-alive local pid must not be relaunched.
+      if (!confirmTaskGroupGone(r, state, { foreign: staleForeignDead })) continue;
     } else if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) {
       log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     }
     const at = iso(Date.now());
     const written = store.update(r.id, (f) => {
-      if (!sameGeneration(f, r)) return null; // the child claimed or finished since we looked — re-judge next tick
+      if (!sameGeneration(f, r) || (staleForeignDead && f.job.heartbeatAt !== r.job.heartbeatAt)) return null; // the child claimed or finished since we looked — re-judge next tick
       if (isTask) {
         // Synchronous claim port under the record lock: a concurrent finish/new attempt wins.
         if (!tryReleaseTaskClaim(f)) return null;

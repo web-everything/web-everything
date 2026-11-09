@@ -160,6 +160,7 @@ describe('renderWorkerBrief', () => {
 
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
     const brief = renderWorkerBrief(params);
+    expect(brief).toContain('Search the backlog before designing or building: `node scripts/capability-search.mjs "<concept>"`');
     const speed = brief.slice(brief.indexOf('**Speed.**'), brief.indexOf('1. **Free-scope pre-check.**'));
     for (const rule of [
       'For Forge/remote work, do a real live Forge run in the first 15 minutes.',
@@ -243,6 +244,35 @@ describe('renderWorkerBrief', () => {
 
   it('tells the worker to stop and report when open-pr is refused by the PR limit, never to self-allow (xfaz7ho)', () => {
     expect(renderWorkerBrief(params)).toContain('If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.');
+  });
+
+  it('lists every daemon with what it runs when an edge clone is given', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep)');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)');
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that. Does not accept prototype loads (unsupported) [prototype load UNSUPPORTED]');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)\n');
+  });
+
+  it('warns instead of confirming when the edge clone matches a daemon that cannot adopt prototype loads', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('WARNING: --edge-clone /ws/wev-merge-daemon matches daemon key merge-watch, which cannot adopt prototype loads');
+    expect(brief).not.toContain('matches daemon key merge-watch.');
+  });
+
+  it('confirms a supported daemon match without a warning', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-control' });
+    expect(brief).toContain('--edge-clone /ws/wev-control matches daemon key control.');
+    expect(brief).not.toContain('WARNING: --edge-clone');
+  });
+
+  it('warns when the edge clone matches no daemon clone', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
+    expect(brief).toContain('WARNING: --edge-clone /tmp/edge matches no daemon clone');
+  });
+
+  it('omits the daemon list without an edge clone', () => {
+    expect(renderWorkerBrief({ ...params })).not.toContain('merge-queue drain (drain-queue-safety');
   });
 
   it('includes the optional edge section as the last numbered rule', () => {

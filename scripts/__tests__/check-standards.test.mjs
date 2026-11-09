@@ -33,6 +33,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const DATA = join(ROOT, 'src/_data');
 const loadJson = (rel) => JSON.parse(readFileSync(join(DATA, rel), 'utf8'));
 
+function cloneFixture(src, dest) {
+  // CI partial clones disable lazy fetch: depth 1 needs only HEAD's checked-out tree,
+  // avoiding missing historical blobs that a shared clone would try to fetch.
+  execFileSync('git', ['clone', '--quiet', '--no-local', '--depth=1', `file://${src}`, dest], { stdio: 'pipe' });
+}
+
 // ── Synthetic fixtures ────────────────────────────────────────────────────────
 // A compact registry so resolution is deterministic: `intent:droplist` / `intent:motion` and
 // `block:data-grid` resolve; everything else does not.
@@ -636,7 +642,7 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
     try {
       // A private checkout gives the CLI real Git/index/untracked state without touching
       // the developer's backlog, refs or index. Only the shipped runner is overlaid.
-      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      cloneFixture(ROOT, repo);
       // Seed legacy debt in this fixture's baseline, so paying down the real corpus
       // never breaks this regression. Plumbing creates no commit in the source checkout.
       const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
@@ -717,7 +723,7 @@ Add a probe.
 ${note}
 `;
     try {
-      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      cloneFixture(ROOT, repo);
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
       for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'scripts/lib/tests-first-policy.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/under-test.mjs', 'scripts/lib/under-test.cjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md', 'backlog/4397-salvagelane-aborts-forever-on-a-socket-fifo-device-file-unde.md']) copyFileSync(join(ROOT, f), join(repo, f));
@@ -757,7 +763,7 @@ Add a probe.
 ${note}
 `;
     try {
-      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      cloneFixture(ROOT, repo);
       // The backlog guards need a base ref. A CI checkout is detached, so the shared clone has no
       // origin/main of its own: pin one to HEAD instead of relying on the developer's local branches.
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo, stdio: 'pipe' });

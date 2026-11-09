@@ -20,7 +20,7 @@ import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDI
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
-import { planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
+import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -169,8 +169,14 @@ async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, en
 }
 
 /** Real retirement proof: refresh each registered ref's tracking ref, then decide with git and GitHub evidence. */
-function defaultRetirePlanner({ rows, git, gh }) {
-  const fetched = rows.filter((row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0);
+function defaultRetirePlanner({ rows, proofRows = [], git, gh }) {
+  const refresh = (row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0;
+  const fetched = rows.filter(refresh);
+  // Registrations withheld from `rows` (the candidate being loaded) can still be the base a sibling is redundant with.
+  // Each is cited only after its own tracking ref was refreshed: a stale tip is no proof, and a base gone from origin is not cited.
+  const listed = new Set(rows.map((row) => row.ref));
+  const wantedBases = new Set(fetched.map((row) => mergeRefBase(row.ref)).filter(Boolean));
+  const proof = proofRows.filter((row) => wantedBases.has(row.ref) && !listed.has(row.ref) && refresh(row));
   const unfetchedRows = rows.filter((row) => !fetched.includes(row));
   if (!unfetchedRows.length && !fetched.length) return [];
   // GitHub evidence is bound to origin's repository and host, for fetched and unfetched registrations alike.
@@ -178,7 +184,7 @@ function defaultRetirePlanner({ rows, git, gh }) {
   // A deleted branch retires only on proof of its last tip (planFetchFailed); everything else is kept.
   const unfetched = unfetchedRows.map((row) => planFetchFailed({ row, git, gh: originGh, repo }));
   if (!fetched.length) return unfetched;
-  return [...planRetirements({ rows: fetched, git, gh: originGh, repo }), ...unfetched];
+  return [...planRetirements({ rows: fetched, proofRows: proof, git, gh: originGh, repo }), ...unfetched];
 }
 
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
@@ -312,7 +318,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     const retireStep = (rows, exclude) => {
       const candidates = rows.filter((row) => !exclude.includes(row.ref));
       if (!candidates.length) { out.retirePlan = []; return []; }
-      const plan = retirePlanner({ rows: candidates, git: (args) => git(...args), gh: (args) => execute('gh', args) });
+      // `rows` is the FULL registry: the candidate itself is withheld from deletion (`candidates`) but stays proof context.
+      const plan = retirePlanner({ rows: candidates, proofRows: rows, git: (args) => git(...args), gh: (args) => execute('gh', args) });
       if (!Array.isArray(plan)) throw new Error('retirement plan unreadable');
       out.retirePlan = plan;
       // Only a decision for a listed candidate with a full tip can retire anything.
@@ -338,6 +345,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       if (resolved.key !== input.daemon) { out.requestedDaemon = input.daemon; input = { ...input, daemon: resolved.key }; out.daemon = resolved.key; }
       const daemon = config.daemons[resolved.key];
+      // A daemon whose self-sync can never adopt an overlay (e.g. main-only) refuses up front, before any plist/git work or registration.
+      if (typeof daemon.unsupported === 'string' && daemon.unsupported) {
+        return stop('unsupported-daemon', { detail: `unsupported-daemon:${resolved.key}`,
+          fallback: `Daemon "${resolved.key}" cannot adopt prototype loads: ${daemon.unsupported}` });
+      }
       if (daemon.clone) {
         out.clone = resolve(expand(config.workspaceRoot), expand(daemon.clone));
         out.cloneSource = `settings:prototype-load.json#daemons.${input.daemon}.clone`;

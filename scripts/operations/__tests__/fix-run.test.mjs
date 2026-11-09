@@ -939,7 +939,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
-        expect(['title,body,baseRefName,mergeable,headRefOid', 'headRefOid,labels,statusCheckRollup']).toContain(args[args.indexOf('--json') + 1]);
+        expect(['title,body,baseRefName,mergeable,headRefOid', 'headRefOid,labels,statusCheckRollup,changedFiles']).toContain(args[args.indexOf('--json') + 1]);
         m.calls.push([cmd, ...args]);
         return JSON.stringify({ title: 'T', body: 'B', headRefOid: 'aaa', baseRefName: base });
       }
@@ -1785,7 +1785,7 @@ describe('runFixCli', () => {
     const writeErr = vi.fn();
     const run = vi.fn((cmd, args, opts) => {
       if (cmd === 'gh' && args[0] === 'label') { m.calls.push([cmd, ...args]); throw new Error('HTTP 403: rate limit'); }
-      if (cmd === 'gh' && args.includes('headRefOid,labels,statusCheckRollup')) { m.calls.push([cmd, ...args]); return JSON.stringify({ headRefOid: 'bbb', labels: [] }); }
+      if (cmd === 'gh' && args.includes('headRefOid,labels,statusCheckRollup,changedFiles')) { m.calls.push([cmd, ...args]); return JSON.stringify({ headRefOid: 'bbb', labels: [], changedFiles: 0 }); }
       return base(cmd, args, opts);
     });
     const { code, result } = await runFixCli(argv, { ...m.io, run, writeErr });

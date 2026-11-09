@@ -837,8 +837,13 @@ describe('merge-queue same-head failure admission', () => {
           if (f.mainError) throw new Error('main runs unavailable');
           if (f.mainPages) return JSON.stringify({ total_count: f.mainTotal,
             workflow_runs: f.mainPages[f.mainReads - 1] });
-          const runs = endpoint?.includes('status=completed')
+          const query = new URLSearchParams(endpoint?.split('?')[1] ?? '');
+          let runs = endpoint?.includes('status=completed')
             ? f.runs.filter(run => run.status === 'completed') : f.runs;
+          const before = (query.get('created') ?? '').replace(/^</, '');
+          if (before) runs = runs.filter(run => Date.parse(run.created_at) < Date.parse(before));
+          if (query.get('per_page') === '1') runs = [...runs].sort((a, b) =>
+            Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id).slice(0, 1);
           return f.mainJson ?? JSON.stringify(args[0] === 'run'
             ? f.runs.map(r => ({ ...r, databaseId: r.id, createdAt: r.created_at, headBranch: r.head_branch,
               workflowName: 'CI' }))
@@ -985,13 +990,11 @@ describe('merge-queue same-head failure admission', () => {
         ({ ...f.runs[0], id: page * 100 + index + 1 })));
       f.expectHeld();
       expect(f.checkReads).toBe(5);
-      expect(f.mainReads).toBe(5);
-      expect(f.exec).toHaveBeenCalledTimes(12); // Queue, timeline, then ten shared REST pages.
-      for (const kind of ['/check-runs', '/actions/']) {
-        const endpoints = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => arg.includes(kind)));
-        expect(endpoints.map(endpoint => new URLSearchParams(endpoint.split('?')[1]).get('page')))
-          .toEqual(['1', '2', '3', '4', '5']);
-      }
+      expect(f.mainReads).toBe(1); // Targeted main lookup: the first oversized page fails closed.
+      expect(f.exec).toHaveBeenCalledTimes(8); // Queue, timeline, five check pages, one main read.
+      const endpoints = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => arg.includes('/check-runs')));
+      expect(endpoints.map(endpoint => new URLSearchParams(endpoint.split('?')[1]).get('page')))
+        .toEqual(['1', '2', '3', '4', '5']);
     }));
     it.each(['check-runs throws', 'check-runs bad JSON', 'main runs throws', 'main runs bad JSON',
       'missing check conclusion', 'no check-runs', 'no failed check-runs', 'truncated check-runs',
