@@ -97,10 +97,11 @@ describe('CI timing refresh publication recovery', () => {
     expect(readAuthorActorStamps(body)).toEqual(['github-actions:ci-refresh-test-timings']);
   });
 
-  it('never stamps the automation as author for a branch this run did not create', () => {
+  it('never labels or stamps the automation as author for a branch this run did not create', () => {
     const { second } = publicationProbe({ appears: true });
     expect(second.status, second.stderr).toBe(0);
-    expect(second.stdout).toMatch(/^CREATE pr create .* --label review:pending/m);
+    expect(second.stdout).toContain('CREATE pr create');
+    expect(second.stdout).not.toContain('review:pending');
     expect(second.stdout).not.toContain('authored-by-actor');
     expect(second.stdout).not.toContain('PUSH');
   });
@@ -221,7 +222,7 @@ describe('CI timing refresh workflow never overwrites an existing refresh branch
     expect(recheck).toBeGreaterThan(-1);
     expect(recheck).toBeLessThan(publish.run.indexOf('git switch -c'));
     const beforeLookup = publish.run.split('open_prs=$(gh pr list')[0];
-    expect(beforeLookup).toMatch(/if \[ -z "\$refs" \]; then[\s\S]*git switch -c[\s\S]*git push[^\n]*\nfi/);
+    expect(beforeLookup).toMatch(/if \[ -z "\$refs" \]; then[\s\S]*git switch -c[\s\S]*git push[^\n]*\n(?:\s*created=1\n)?fi/);
     expect(publish.run).toContain("gh pr list --head ci/refresh-test-timings --state open --json number --jq 'length'");
   });
 
