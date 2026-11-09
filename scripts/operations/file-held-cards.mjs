@@ -149,6 +149,10 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   if (!lexicalOutside || !outsideRepository(realpathSync(root), ledger) || ledger === realpathSync(source)) {
     throw new Error('--ledger must be outside the repository and distinct from --source');
   }
+  // A hard-linked ledger could be a repository file under another name; a one-link ledger cannot be.
+  let linked = false;
+  try { linked = lstatSync(ledger).nlink > 1; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (linked) throw new Error('ledger has more than one hard link; use a plain ledger file outside the repository');
   const tracked = deps.trackedFiles ? deps.trackedFiles() : gitTrackedFiles(root);
   const ledgerRows = readLedger(ledger);
   // A ledger row is only trusted while its card still exists here or on main; a discarded lane must not hide the card.

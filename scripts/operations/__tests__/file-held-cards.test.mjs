@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync, linkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -356,4 +356,14 @@ it('a failed or refused card fails the run itself, not only the CLI finisher', a
   seed('- [R2] 2026-11-08: Next one');
   fileItem.mockResolvedValue({ code: 1, lines: ['refused'] });
   await expect(sink({ source, max: 10, 'dry-run': false })).rejects.toThrow(/1 failed/);
+});
+
+it('refuses a hard-linked ledger without changing the linked file or calling fileItem', async () => {
+  seed('- [R1] 2026-11-08: Repair behavior');
+  const target = join(root, 'backlog', 'cards-filed.jsonl');
+  writeFileSync(target, '');
+  linkSync(target, ledger);
+  await expect(run()).rejects.toThrow(/hard link/);
+  expect(readFileSync(target, 'utf8')).toBe('');
+  expect(fileItem).not.toHaveBeenCalled();
 });
