@@ -53,7 +53,7 @@ export function seedCardNumberLedger({ repo = 'we', board = process.cwd(), cards
   cardLedgerPath(repo);
   const root = JSON.parse(run(['show', `${cardLedgerBase({ base, env })}:${LEGACY_IDENTITIES_PATH}`], { cwd: board }));
   if (!root || !Object.hasOwn(root, repo)) throw new Error('missing base legacy identities for repo');
-  if (!cards) cards = readdirSync(join(board, 'backlog')).filter(n => /^\d{1,5}-.+\.md$/.test(n)).map(name => ({ path: `backlog/${name}`, text: readFileSync(join(board, 'backlog', name), 'utf8') }));
+  if (!cards) cards = readdirSync(join(board, 'backlog')).filter(n => /^\d{1,5}-[^/]+\.md$/.test(n)).map(name => ({ path: `backlog/${name}`, text: readFileSync(join(board, 'backlog', name), 'utf8') }));
   const result = buildSeedRows({ cards, legacy: root[repo] });
   if (apply && result.errors.length) throw new Error(`seed refused: ${result.errors.join('; ')}`);
   if (apply && result.rows.length) append({ ...options, board, repo, rows: result.rows, attempts: 1, env, base });

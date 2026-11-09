@@ -474,6 +474,16 @@ it('assigner takes its floor from numeric filenames and skips legacy alias numbe
     stage, readLedger: () => parseCardLedger(text), lock });
   expect(assigned.get('xabc123')).toBe(43);
 });
+it('seedReadsCardNamesContainingLineBreaksFromTheBoard', () => {
+  const board = mkdtempSync(join(tmpdir(), 'card-ledger-seed-names-'));
+  try {
+    mkdirSync(join(board, 'backlog'));
+    writeFileSync(join(board, 'backlog', '011-a\nb.md'), '---\nbornAs: xabc123\n---\n');
+    writeFileSync(join(board, 'backlog', `012-c${String.fromCodePoint(0x2028)}d.md`), '---\nbornAs: xdef456\n---\n');
+    const result = seedCardNumberLedger({ repo: 'we', board, run: () => '{"we":[]}', append: vi.fn(), env: {} });
+    expect(result.rows.map(r => [r.id, r.num]).sort()).toEqual([['xabc123', 11], ['xdef456', 12]]);
+  } finally { rmSync(board, { recursive: true, force: true }); }
+});
 it('none-mode seed apply needs no signing bootstrap and pushes once; dry run never writes', () => {
   const cards = [{ path: 'backlog/011-a.md', text: '---\nbornAs: xabc123\n---\n' }];
   const run = vi.fn(() => '{"we":[]}'), append = vi.fn();

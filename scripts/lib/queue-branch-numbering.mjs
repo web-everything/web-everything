@@ -174,9 +174,17 @@ export function withHooksDisabled(fn) {
 }
 
 const numberingStatePath = () => join(dirname(queueStatePath()), 'drain-merge-queue-numbering.json');
-const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => String(exec('git', args, {
-  cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env, ...hooksDisabledEnv },
-})).trim();
+// A NUL-delimited (-z) path list is returned untrimmed: trim() would strip a leading-whitespace name
+// (sorted first) into a different path. Explicit maxBuffer: the full ls-files list nears Node's 1 MiB default.
+const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => {
+  const out = String(exec('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+    env: { ...process.env, ...env, ...hooksDisabledEnv } }));
+  return args.includes('-z') ? out : out.trim();
+};
+// Card names from a PR branch are untrusted: strip controls, line separators and bidi overrides before logging.
+const UNSAFE_SHOWN = (n) => n < 0x20 || n === 0x7f || n === 0x2028 || n === 0x2029 || n === 0x200e || n === 0x200f
+  || (n >= 0x202a && n <= 0x202e) || (n >= 0x2066 && n <= 0x2069);
+const shownPaths = (files) => files.map((f) => [...String(f)].map((c) => UNSAFE_SHOWN(c.codePointAt(0)) ? ' ' : c).join('')).join(', ');
 
 /** Caller holds the numbering mutex and has refreshed origin/main. Unknown PRs retain reservations. */
 export function fallbackMinNext({ cwd = process.cwd(), exec = execFileSync, fs = nodeFs, statePath = numberingStatePath() } = {}) {
@@ -233,7 +241,7 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
         if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/', '-z'], worktree)).length)
           throw new Error(n.error || 'hash numbering did not commit a complete repair');
         git(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main'], worktree, { MAIN_PUSH_OK: '1' });
-        log.write(`  ⚠ FALLBACK: hash card(s) ${files.join(', ')} on main — numbered and pushed to main so the queue is not blocked\n`);
+        log.write(`  ⚠ FALLBACK: hash card(s) ${shownPaths(files)} on main — numbered and pushed to main so the queue is not blocked\n`);
         return { ...n, pushed: true, files };
       }, { runUnlockedOnContention: false });
       if (outcome.ran === false) throw new Error('numbering mutex refused — retry next pass');
@@ -366,7 +374,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
     result.skipped.push({ num, reason });
     event('queue-dequeue-skipped', num, { reason });
     if ((reason === 'human-only' || reason === 'human-enqueued') && files.length) {
-      event('needs-you', num, `PR #${num} was queued by a human while its backlog card(s) ${files.join(', ')} are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.`);
+      event('needs-you', num, `PR #${num} was queued by a human while its backlog card(s) ${shownPaths(files)} are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.`);
     }
     log.write(`  ⇠ PR ${num} dequeue skipped: ${reason} — left queued${reason === 'changed-files-unreadable' ? '; retry on next pass' : ''}\n`);
   };
@@ -415,7 +423,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
         graphql('mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', [`id=${pr.id}`]);
         result.dequeued.push(pr.number);
         event('queue-dequeued', pr.number, { reason: 'hash-cards-numbering', files });
-        log.write(`  ⇠ PR ${pr.number} DEQUEUED: carries hash card(s) ${files.join(', ')} — numbering on its branch, re-enqueued after CI\n`);
+        log.write(`  ⇠ PR ${pr.number} DEQUEUED: carries hash card(s) ${shownPaths(files)} — numbering on its branch, re-enqueued after CI\n`);
         const out = prepare({ c: { num: pr.number, repo: null, headRef: pr.headRefName, item: null, hasManifest: false }, traceHeadSha: pr.headRefOid, cwd, isLocal: true, isOpen });
         log.write(`  ↻ PR ${pr.number} queue branch preparation: ${out.action}${out.reason ? ` — ${out.reason}` : ''}${out.newHead ? ` → ${out.newHead}` : ''}\n`);
         if (out.action === 'numbered') result.numbered.push(pr.number);
@@ -432,7 +440,7 @@ export function probeQueuedLand(cwd, { exec = execFileSync, log = process.stderr
     exec('git', ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const files = hashBacklogFiles(exec('git', LS_BACKLOG('origin/main'), { cwd, encoding: 'utf8' }));
     if (!files.length) return { assigned, committed: false, files };
-    const warning = `hash card(s) ${files.join(', ')} on main after a queued land — not pushed; the merge_group gate should have refused it`;
+    const warning = `hash card(s) ${shownPaths(files)} on main after a queued land — not pushed; the merge_group gate should have refused it`;
     log.write(`  ⚠ WARNING: ${warning}\n`);
     return { assigned, committed: false, files, warning };
   } catch (e) {

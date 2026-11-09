@@ -754,9 +754,36 @@ it('fallback allocation retains queue reservations above main', () => {
   expect(fallbackMinNext({ cwd: '/clone', exec, fs, statePath: '/state' })).toBe(102);
 });
 
+it('checksALeadingWhitespaceTrackedPathAsItselfNotItsTrimmedTwin', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-leading-space-'));
+  try {
+    const temporary = join(root, 'temporary');
+    const tree = join(temporary, 'tree');
+    mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(root, 'outside'));
+    writeFileSync(join(tree, 'backlog/xabc123-card.md'), '---\nstatus: open\n---\n');
+    writeFileSync(join(tree, 'x'), 'regular');
+    symlinkSync(join(root, 'outside'), join(tree, ' x'));
+    const number = vi.fn(() => ({ assigned: [], committed: true }));
+    const lock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      // Byte order puts ' x' first in a real `ls-files -z` listing.
+      if (args[0] === 'ls-files') return args.includes('backlog/') ? 'backlog/xabc123-card.md\0' : ' x\0backlog/xabc123-card.md\0x\0';
+      return '';
+    });
+    const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example', num: 1 }, traceHeadSha: 'head', exec,
+      fs: { ...realFs, mkdtempSync: () => temporary }, statePath: join(root, 'reservations.json'), lock, number });
+    // The refusal names ' x' itself (two spaces after the colon), not the regular file 'x'.
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('symlinked tracked path refused:  x') });
+    expect(number).not.toHaveBeenCalled();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 // Git C-quotes non-ASCII and special-character paths in line output; every path list must still see them.
 describe('Git-quoted backlog names', () => {
-  const special = ['101-café.md', '102-a"b.md', '103-a\tb.md', '104-a\nb.md', 'xabc123-café.md'];
+  const RLO = String.fromCodePoint(0x202e); // bidi override, built at runtime: no literal invisible character
+  const forged = `xdef456-a\nFORGED${RLO}.md`;
+  const special = ['101-café.md', '102-a"b.md', '103-a\tb.md', '104-a\nb.md', 'xabc123-café.md', forged];
   let root, board;
   const git = (args, input) => String(execFileSync('git', args, { cwd: board, input, encoding: 'utf8', stdio: 'pipe',
     env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined,
@@ -776,8 +803,14 @@ describe('Git-quoted backlog names', () => {
   });
   it('probeQueuedLandSeesAGitQuotedHashCard', () => {
     const exec = (cmd, args, opts) => args[0] === 'fetch' ? '' : execFileSync(cmd, args, opts);
-    const result = probeQueuedLand(board, { exec, log: { write: () => {} } });
-    expect(result.files).toEqual(['backlog/xabc123-café.md']);
+    const log = { write: vi.fn() };
+    const result = probeQueuedLand(board, { exec, log });
+    expect(result.files).toEqual(['backlog/xabc123-café.md', `backlog/${forged}`]);
+    // The untrusted name reaches the operator log on one line, without its bidi override.
+    const written = log.write.mock.calls.map(([text]) => text);
+    expect(written.join('')).toContain('xdef456-a FORGED .md');
+    for (const text of written) expect(text.replace(/\n$/, '')).not.toMatch(new RegExp(`[\n${RLO}]`));
+    expect(result.warning).not.toMatch(new RegExp(`[\n${RLO}]`));
   });
 });
 
