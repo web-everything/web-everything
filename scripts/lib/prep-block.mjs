@@ -70,7 +70,7 @@ export function slotVerdict(text) {
   const lines = (typeof text === 'string' ? text : '').split(/\r?\n/);
   for (const line of lines) {
     const match = stripMarkdown(line).match(/^Slot:\s*(?:(plan|blocker|operator):\s*|waived\s*[—–-]\s*)(.*)$/i);
-    const value = match ? match[2].replace(/`/g, '') : '';
+    const value = match ? match[2].replace(/[`"“”‘’]/g, '') : '';
     if (match && nonTrivial(value) && (match[1]?.toLowerCase() !== 'operator' || quotedOk(value))) {
       const waived = !match[1];
       return { ok: true, reason: waived ? match[2].trim() : '', waived };
