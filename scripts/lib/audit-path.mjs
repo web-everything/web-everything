@@ -74,6 +74,10 @@ export function canonicalPaths(file, anchors = null) {
   // protected is lost. Both are extra candidates only: they can protect more, never less.
   const raw = normalise(text);
   if (raw !== null) out.add(raw);
+  // The old matcher also joined the report with everything but path characters removed (`custom/x.mjs:42` read as
+  // `custom/x.mjs42`); kept for the same reason.
+  const joined = normalise(text.replace(/[^A-Za-z0-9._/-]/g, ''));
+  if (joined !== null) out.add(joined);
   const loc = (m[4] ?? '').slice(1);
   if (loc) for (const d of [loc, ...loc.split(':'), ...(loc.match(/\d+/g) ?? [])]) out.add(d);
   return out.size > MAX_AUDIT_CANDIDATES ? null : [...out];
