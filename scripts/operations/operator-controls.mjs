@@ -7,8 +7,10 @@ import { planRoundExtension } from './extend-rounds.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
 import { decideRearm } from '../conveyor/rearm-review.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { previousCiFailurePending } from '../conveyor/await-verify.mjs';
+import { AWAIT_VERIFY_LIMITS } from '../conveyor/await-verify-pass.mjs';
 
-export const CONTROL_OPS = Object.freeze(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim']);
+export const CONTROL_OPS = Object.freeze(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset']);
 export const OPERATOR_CONTROL_EFFECT = 'operator.control';
 export function validateOperatorAttribution({ actor, channel, reason }) {
   if (typeof actor !== 'string' || !OPERATOR_LOGINS.includes(actor.toLowerCase())) throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this action is the operator's`);
@@ -37,6 +39,7 @@ export const isPrepareHold = h => ['prepare-unstamped', 'prepare-stamp-pending']
 export function controlFingerprint(name, read, input) {
   if (input.item) return stateDigest({ holds: read.holds ?? [], failures: read.failures ?? [] });
   if (name === 'clear-claim') return stateDigest(read.claims ?? []);
+  if (name === 'ci-heal-reset') return stateDigest({ head: read.head, awaitVerify: read.awaitVerify });
   return stateDigest({ head: read.head, state: read.state, labels: [...(read.labels ?? [])].sort(),
     ...(name === 'refresh' ? { main: read.main, containsMain: read.containsMain, crossRepo: read.crossRepo, headRef: read.headRef, requiredCheck: read.requiredCheck } : {}),
     ...(name === 'grant-rounds' ? { granted: countGrantedRoundExtensions(read.comments, input) } : {}) });
@@ -54,11 +57,12 @@ export function validateControlInput(name, input) {
   if (file && (name !== 'clear-claim' || file.startsWith('/') || file.split('/').includes('..') || /[\r\n]/.test(file))) throw new Error('--file must be a repo path for clear-claim');
   if (name === 'grant-rounds' && !['fix', 'review'].includes(input.kind ?? 'fix')) throw new Error('--kind must be fix or review');
   if (name === 'clear-claim' && !['fix', 'ci-heal'].includes(input.kind ?? 'fix')) throw new Error('--kind must be fix or ci-heal');
+  if (name === 'ci-heal-reset' && (!pr || typeof input.head !== 'string' || !/^[a-f\d]{7,40}$(?![\s\S])/i.test(input.head))) throw new Error('ci-heal-reset requires --pr and --head (7–40 hexadecimal characters)');
 }
 export function planOperatorControl(name, read, input) {
   validateControlInput(name, input);
   const attribution = validateOperatorAttribution(input), target = input.item ? `item:${input.item}` : input.file ? `file:${input.file}` : `pr:${input.pr}`;
-  let why = '', steps = [], undo = '', extension;
+  let why = '', steps = [], undo = '', extension, resets;
   if (name === 'unpark') {
     undo = input.item ? 'the daemon re-parks on the next failure; to re-hold now: placeBuildDispatchHold' : 'restore review:human through the review ceremony';
     if (input.item) {
@@ -89,6 +93,17 @@ export function planOperatorControl(name, read, input) {
     undo = 'round grants are append-only; there is no supported revocation';
     extension = planRoundExtension({ ...read, now: read.now }, { ...input, by: input.n ?? 1 });
     steps.push(`post verified round extension +${input.n ?? 1} via github.round-extension; kind=${input.kind ?? 'fix'} (raises every cap today)`);
+  } else if (name === 'ci-heal-reset') {
+    const matches = sha => typeof sha === 'string' && /^[a-f\d]{40}$(?![\s\S])/i.test(sha) && sha.toLowerCase().startsWith(input.head.toLowerCase());
+    if (!matches(read.head)) throw new Error('head moved');
+    if (!Array.isArray(read.awaitVerify)) throw new Error('await-verify records unavailable');
+    const rows = read.awaitVerify.filter(({ record }) => record.repo === input.repo && record.pr === input.pr);
+    const matching = rows.filter(({ record }) => matches(record.sha));
+    if (rows.length && !matching.length) throw new Error('head moved');
+    resets = matching.filter(({ record }) => previousCiFailurePending(record) && Number.isSafeInteger(record.resumeFailures) && record.resumeFailures >= AWAIT_VERIFY_LIMITS.maxResumeFailures);
+    undo = 'restore each record’s previousResumeFailures through an operator-reviewed store repair; the normal resume failure cap still applies';
+    if (!resets.length) why = 'no matching exhausted await-verify record';
+    steps = resets.map(({ key }) => `writeStoredAwaitVerify(${key}) with resumeFailures:0; preserve every other field`);
   } else {
     undo = 'the next eligible daemon tick reacquires a claim; a released stale owner is not resurrected';
     if (!read.claims?.length) why = 'no matching fix claim';
@@ -101,10 +116,13 @@ export function planOperatorControl(name, read, input) {
   const planKey = digest => `${digest}@${read.now}`;
   const record = { version: 1, op: name, repo: input.repo, ...(input.pr ? { pr: input.pr } : {}), ...(input.item ? { item: input.item } : {}),
     ...attribution, at: read.now, key: `${name}:${input.repo}:${target}:${planKey(fingerprint)}`, details: { undo, ...(['grant-rounds', 'clear-claim'].includes(name) ? { kind: input.kind ?? 'fix' } : {}), ...(name === 'grant-rounds' ? { n: input.n ?? 1 } : {}), ...(name === 'refresh' ? { previousHead: read.head, headRef: read.headRef, main: read.main } : {}), ...(input.file ? { file: input.file } : {}) } };
+  if (name === 'ci-heal-reset') record.details = { ...record.details, pr: input.pr, head: read.head,
+    previousResumeFailures: resets[0]?.record.resumeFailures,
+    records: resets.map(({ key, record: r }) => ({ key, head: r.sha, previousResumeFailures: r.resumeFailures })) };
   const records = name === 'clear-claim' ? (read.claims ?? []).map(c => ({ ...record, pr: c.meta.pr, key: `${name}:${input.repo}:pr:${c.meta.pr}:${planKey(stateDigest(c))}`, details: { ...record.details, kind: c.meta.kind } })) : [record];
   if (!why) steps.push(input.item ? 'append operator-action record to operator-actions.jsonl' : 'post one operator-action comment per PR target');
   return { op: name, target, action: why ? 'noop' : 'apply', ...(why ? { why } : {}), steps, undo, record, records,
-    body: buildOperatorActionComment(record), fingerprint, input, claims: read.claims, extension };
+    body: buildOperatorActionComment(record), fingerprint, input, claims: read.claims, extension, ...(resets ? { resets } : {}) };
 }
 export function operatorControlOperation(name, { readContext } = {}) {
   const optional = (type, value) => ({ type, required: false, default: value });
@@ -112,6 +130,7 @@ export function operatorControlOperation(name, { readContext } = {}) {
     actor: 'string', channel: 'string', reason: 'string', preview: optional('boolean', false) };
   if (['unpark', 'retry-prepare'].includes(name)) input.item = optional('string', '');
   if (name === 'clear-claim') input.file = optional('string', '');
+  if (name === 'ci-heal-reset') { input.pr = 'number'; input.head = 'string'; }
   if (['grant-rounds', 'clear-claim'].includes(name)) input.kind = { ...optional('string', 'fix'), enum: name === 'grant-rounds' ? ['fix', 'review'] : ['fix', 'ci-heal'] };
   if (name === 'grant-rounds') input.n = optional('number', 1);
   if (name === 'refresh') input.checkout = optional('string', '');
