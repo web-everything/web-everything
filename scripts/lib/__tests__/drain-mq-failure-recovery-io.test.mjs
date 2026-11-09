@@ -50,8 +50,11 @@ function fixture(mode = 'real') {
     if (endpoint?.includes('/actions/runs?')) return JSON.stringify({ total_count: mode === 'oversized runs' ? 1001 : 1,
       workflow_runs: [{ id: 701, event: 'merge_group', head_sha: mode === 'wrong run commit' ? 'd'.repeat(40) : mergeHead,
         head_branch: branch, conclusion: 'failure' }] });
-    if (endpoint?.includes('/actions/runs/701/jobs?')) return JSON.stringify({ total_count: 1,
-      jobs: [{ id: 901, name: 'unit', status: 'completed', conclusion: 'failure' }] });
+    if (endpoint?.includes('/actions/runs/701/jobs?')) {
+      const sibling = mode === 'cancelled sibling' ? 'cancelled' : mode === 'timed out sibling' ? 'timed_out' : null;
+      return JSON.stringify({ total_count: sibling ? 2 : 1, jobs: [{ id: 901, name: 'unit', status: 'completed', conclusion: 'failure' },
+        ...(sibling ? [{ id: 902, name: 'e2e', status: 'completed', conclusion: sibling }] : [])] });
+    }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
       if (mode === 'expired log') throw new Error('410 expired');
       return mode === 'infra' ? 'The runner has lost communication with the server.'
@@ -153,6 +156,21 @@ describe('drain proven real failure routing', () => {
   });
 });
 
+
+describe('drain sibling job conclusions', () => {
+  it('a cancelled sibling (fail-fast) does not block routing the fully read failed job', async () => {
+    const f = fixture('cancelled sibling');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    expect(f.writes()).toHaveLength(2);
+    // Only the failed job's log is read; the cancelled sibling contributes nothing.
+    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => String(arg).endsWith('/actions/jobs/902/logs')))).toBe(false);
+  });
+  it('a timed_out sibling stays incomplete: the collector would skip it, so it can never be proven away', async () => {
+    const f = fixture('timed out sibling');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toEqual([]);
+  });
+});
 
 describe('drain production ancestry proof', () => {
   it.each(['real', 'identical ancestor'])('base-SHA branch routes only with positive compare proof: %s', async mode => {

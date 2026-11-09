@@ -78,3 +78,83 @@ describe('mq failure once-per-head ledger', () => {
     expect(io.atomicUpdate).not.toHaveBeenCalled();
   });
 });
+
+
+// ── The production file-backed storage, against a real temp directory ─────────────────────────────────────
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach } from 'vitest';
+import { mqFailureLedgerStorage } from '../mq-failure-ledger.mjs';
+import { acquireLockDir } from '../../readiness/file-locks.mjs';
+
+describe('mq failure ledger production storage (real filesystem)', () => {
+  const roots = [];
+  const freshRoot = () => { const root = mkdtempSync(join(tmpdir(), 'mq-ledger-test-')); roots.push(root); return root; };
+  afterEach(() => { while (roots.length) rmSync(roots.pop(), { recursive: true, force: true }); });
+  const files = root => ({ dir: join(root, 'mq-failure-recovery'), file: join(root, 'mq-failure-recovery', 'ledger.json'),
+    locks: join(root, 'mq-failure-recovery', 'locks') });
+  const seed = (root, bytes) => { const { dir, file } = files(root); mkdirSync(dir, { recursive: true }); writeFileSync(file, bytes); };
+
+  it('persists a claim durably and refuses the same head from an independent ledger instance', async () => {
+    const root = freshRoot();
+    const first = createMqFailureLedger({ io: mqFailureLedgerStorage(root) });
+    const second = createMqFailureLedger({ io: mqFailureLedgerStorage(root) });
+    expect(await claim(first)).toEqual({ claimed: true });
+    expect(await claim(second)).toMatchObject({ claimed: false });
+    expect(Object.values(JSON.parse(readFileSync(files(root).file, 'utf8')))).toEqual([true]);
+    expect(readdirSync(files(root).dir).filter(name => name.startsWith('ledger-'))).toEqual([]); // no temp left behind
+    expect(readdirSync(files(root).locks)).toEqual([]); // lock released
+  });
+
+  it('production storage refuses an existing lock without reclaiming it', async () => {
+    const root = freshRoot();
+    const { dir, file, locks } = files(root);
+    const ledger = createMqFailureLedger({ io: mqFailureLedgerStorage(root) });
+    expect(await claim(ledger, 'route', { pr: 7 })).toEqual({ claimed: true });
+    const bytesBefore = readFileSync(file);
+    mkdirSync(dir, { recursive: true });
+    expect(acquireLockDir(locks, 'ledger', { owner: 'other-dispatcher', pid: 1, heartbeatAt: '2000-01-01T00:00:00.000Z' })).toBe(true);
+    const lockBefore = readFileSync(join(locks, readdirSync(locks)[0], 'lock.json'), 'utf8');
+    await expect(claim(ledger, 'route', { pr: 8 })).rejects.toThrow(/busy/);
+    // An old heartbeat is still not reclaimed: the held lock and the ledger are byte-for-byte unchanged.
+    expect(readFileSync(join(locks, readdirSync(locks)[0], 'lock.json'), 'utf8')).toBe(lockBefore);
+    expect(readFileSync(file).equals(bytesBefore)).toBe(true);
+  });
+
+  it.each([
+    ['unparseable JSON', Buffer.from('{not json')],
+    ['a non-true value', Buffer.from('{"k":1}')],
+    ['an array', Buffer.from('[]')],
+    ['null', Buffer.from('null')],
+  ])('a corrupt ledger (%s) is rejected and left untouched, with the lock released', async (_name, bytes) => {
+    const root = freshRoot();
+    seed(root, bytes);
+    const ledger = createMqFailureLedger({ io: mqFailureLedgerStorage(root) });
+    await expect(claim(ledger)).rejects.toThrow();
+    expect(readFileSync(files(root).file).equals(bytes)).toBe(true);
+    expect(readdirSync(files(root).locks)).toEqual([]);
+  });
+
+  it('a ledger file over 8 MB is rejected before it is read', async () => {
+    const root = freshRoot();
+    seed(root, Buffer.alloc(8 * 1024 * 1024 + 1, 0x20));
+    const ledger = createMqFailureLedger({ io: mqFailureLedgerStorage(root) });
+    await expect(claim(ledger)).rejects.toThrow(/oversized/);
+    expect(readdirSync(files(root).locks)).toEqual([]);
+  });
+
+  it('a transaction that would grow the ledger past 8 MB is rejected and nothing is written', async () => {
+    const root = freshRoot();
+    const storage = mqFailureLedgerStorage(root);
+    expect(() => storage.atomicUpdate(state => ({ state: { ...state, ['k'.repeat(8 * 1024 * 1024)]: true }, result: 1 }))).toThrow(/oversized/);
+    expect(existsSync(files(root).file)).toBe(false);
+  });
+
+  it('exactly one of many claims for the same head wins across independent ledgers', async () => {
+    const root = freshRoot();
+    const ledgers = Array.from({ length: 6 }, () => createMqFailureLedger({ io: mqFailureLedgerStorage(root) }));
+    const results = await Promise.all(ledgers.map(ledger => claim(ledger, 'refresh')));
+    expect(results.filter(result => result.claimed)).toHaveLength(1);
+  });
+});

@@ -135,3 +135,88 @@ describe('mq no-op refresh fallback', () => {
     expect(pushes(options)).toHaveLength(0);
   });
 });
+
+
+describe('mq failure refresh ordering', () => {
+  it('successor reservation is persisted before push begins', async () => {
+    const options = fixture();
+    let reservedAtPush = null;
+    options.io.git = vi.fn(async ({ args }) => {
+      if (args[0] === 'push') reservedAtPush = (await options.ledger.claim({ ...identity, head: newHead, kind: 'refresh' })).claimed === false;
+      return args[0] === 'merge' ? { ok: true, head: newHead } : { ok: true };
+    });
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'refreshed' });
+    expect(reservedAtPush).toBe(true); // the successor was already claimed (reserved) when the push ran
+  });
+
+  it('a failed successor reservation prevents the push', async () => {
+    const options = fixture();
+    options.ledger = { ...options.ledger, recordRefresh: vi.fn(async () => { throw new Error('disk full'); }) };
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop' });
+    expect(pushes(options)).toHaveLength(0);
+    expect(options.io.removeCheckout).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+// ── The default adapter, with every subprocess captured (no real git or gh runs) ─────────────────────────────
+import { existsSync } from 'node:fs';
+import { mqFailureRefreshIo } from '../mq-failure-refresh.mjs';
+
+describe('mq failure default refresh IO', () => {
+  const root = 'fixture/dispatch-checkout';
+  let execFileSync, execFileSyncThrottled;
+  function wire({ remote = 'https://example.test/acme/web.git', pr = {} } = {}) {
+    execFileSyncThrottled = vi.fn(() => JSON.stringify({ headRefOid: identity.head, headRefName: 'topic', isCrossRepository: false, ...pr }));
+    execFileSync = vi.fn((file, args) => {
+      if (args[0] === 'remote') return `${remote}\n`;
+      if (args[0] === 'rev-parse') return `${newHead}\n`;
+      return '';
+    });
+    return mqFailureRefreshIo(root, { exec: execFileSync, throttled: execFileSyncThrottled });
+  }
+  const gitCalls = () => execFileSync.mock.calls.map(([file, args, options]) => ({ file, args, options }));
+  const mutating = new Set(['merge', 'push', 'checkout', 'fetch', 'reset', 'clean', 'commit', 'rebase']);
+
+  it('default refresh IO confines mutations to its temporary clone and bounds subprocesses', () => {
+    const io = wire();
+    const made = io.createCheckout({ repo: identity.repo, pr: identity.pr, head: identity.head });
+    try {
+      expect(made.branch).toBe('topic');
+      expect(made.cwd).not.toBe(root);
+      expect(io.git({ cwd: made.cwd, args: ['merge', 'origin/main'] })).toEqual({ ok: true, head: newHead });
+      expect(io.git({ cwd: made.cwd, args: ['push', 'origin', 'HEAD:refs/heads/topic'] })).toEqual({ ok: true });
+      const calls = gitCalls();
+      expect(calls.every(call => call.file === 'git' && Array.isArray(call.args))).toBe(true); // argv-only, never a shell string
+      expect(calls.every(call => Number.isFinite(call.options.timeout) && call.options.timeout > 0
+        && Number.isFinite(call.options.maxBuffer) && call.options.maxBuffer > 0)).toBe(true);
+      // Nothing that changes a checkout ever runs in the dispatch checkout; only clone/read-only calls do.
+      expect(calls.filter(call => call.options.cwd === root).map(call => call.args[0]).sort())
+        .toEqual(['check-ref-format', 'clone', 'remote']);
+      expect(calls.filter(call => mutating.has(call.args[0])).every(call => call.options.cwd === made.cwd)).toBe(true);
+      expect(calls.find(call => call.args[0] === 'clone').args).toEqual(['clone', '--no-checkout', '--shared', '--', root, made.cwd]);
+      expect(calls.find(call => call.args[0] === 'fetch').args.slice(0, 3)).toEqual(['fetch', '--no-tags', 'origin']);
+      expect(calls.find(call => call.args[0] === 'checkout').args).toEqual(['checkout', '--detach', identity.head]);
+      expect(execFileSyncThrottled.mock.calls.every(([file, args, options]) => file === 'gh' && Array.isArray(args)
+        && Number.isFinite(options.timeout) && Number.isFinite(options.maxBuffer))).toBe(true);
+    } finally { io.removeCheckout(made); }
+    expect(existsSync(made.cwd)).toBe(false);
+  });
+
+  it('a failing merge or push in the clone reports not-ok (conflict only for merge) and never throws', () => {
+    const io = wire();
+    execFileSync.mockImplementation(() => { throw new Error('boom'); });
+    expect(io.git({ cwd: 'fixture/clone', args: ['merge', 'origin/main'] })).toEqual({ ok: false, conflict: true });
+    expect(io.git({ cwd: 'fixture/clone', args: ['push', 'origin', 'HEAD:refs/heads/topic'] })).toEqual({ ok: false, conflict: false });
+  });
+
+  it.each([
+    ['a stale head', { pr: { headRefOid: 'd'.repeat(40) } }],
+    ['a fork head', { pr: { isCrossRepository: true } }],
+    ['an origin for another repository', { remote: 'https://example.test/acme/other.git' }],
+  ])('refuses %s before any clone is made', (_name, options) => {
+    const io = wire(options);
+    expect(() => io.createCheckout({ repo: identity.repo, pr: identity.pr, head: identity.head })).toThrow();
+    expect(gitCalls().some(call => call.args[0] === 'clone')).toBe(false);
+  });
+});

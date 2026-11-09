@@ -4,10 +4,10 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 
-/** Default IO is bounded and argv-only. It never modifies the dispatch checkout. */
-export function mqFailureRefreshIo(root) {
-  const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 120000, maxBuffer: 2 * 1024 * 1024 });
-  const pr = (repo, number, fields) => JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(number), '--repo', repo, '--json', fields],
+/** Default IO is bounded and argv-only. It never modifies the dispatch checkout. `exec`/`throttled` are injectable for hermetic tests. */
+export function mqFailureRefreshIo(root, { exec = execFileSync, throttled = execFileSyncThrottled } = {}) {
+  const git = (cwd, args) => exec('git', args, { cwd, encoding: 'utf8', timeout: 120000, maxBuffer: 2 * 1024 * 1024 });
+  const pr = (repo, number, fields) => JSON.parse(throttled('gh', ['pr', 'view', String(number), '--repo', repo, '--json', fields],
     { cwd: root, encoding: 'utf8', timeout: 30000, maxBuffer: 128 * 1024 }));
   return {
     readHead: ({ repo, pr: number }) => pr(repo, number, 'headRefOid').headRefOid,

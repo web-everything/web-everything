@@ -452,3 +452,70 @@ describe('mq failure evidence: real #6499 log shapes', () => {
     expect(evidence.complete).toBe(false);
   });
 });
+
+// Real-shape vitest failure output (ANSI-stripped): blank separators, the "- Expected / + Received" diff body, an echoed
+// source frame, "❯" stack/progress rows and the runner's own summary. Paths are repo-relative.
+const vitestGolden = [
+  ' ❯ scripts/lib/__tests__/widget.test.mjs  (4 tests | 1 failed) 31ms',
+  '   × widget > preserves state 4ms',
+  '',
+  '⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯',
+  '',
+  ' FAIL  scripts/lib/__tests__/widget.test.mjs > widget > preserves state',
+  '',
+  'AssertionError: expected 2 to be 3 // Object.is equality',
+  '',
+  '- Expected',
+  '+ Received',
+  '',
+  '- 3',
+  '+ 2',
+  '',
+  ' ❯ scripts/lib/__tests__/widget.test.mjs:12:19',
+  '     10|   it(\'preserves state\', () => {',
+  '     11|     const state = build();',
+  '     12|     expect(state.n).toBe(3); // FAIL when n drifts',
+  '       |                     ^',
+  '     13|   });',
+  ' ❯ node_modules/vitest/dist/chunks/runner.js:123:9',
+  '',
+  '⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯',
+  '',
+  ' Test Files  1 failed | 3 passed (4)',
+  '      Tests  1 failed | 10 passed (11)',
+].join('\n');
+
+describe('mq failure evidence: real vitest output shapes', () => {
+  const one = text => { const f = fixture(); f.readJobLog.mockResolvedValue({ text, complete: true }); return collect(f); };
+  it('a single outside-diff vitest failure with summary, diff body, code frame and stack rows is complete', async () => {
+    expect(await one(vitestGolden)).toMatchObject({ testFiles: ['scripts/lib/__tests__/widget.test.mjs'], complete: true });
+  });
+  it('blank lines and the diff body between FAIL and its assertion detail do not break attribution', async () => {
+    const text = ' FAIL  tests/x.test.mjs > a > b\n\nAssertionError: expected 2 to be 3\n\n- Expected\n+ Received\n\nExpected: 3\nReceived: 2\n';
+    expect(await one(text)).toMatchObject({ testFiles: ['tests/x.test.mjs'], complete: true });
+  });
+  it('an unknown line between FAIL and its detail still ends attribution (no inherited path)', async () => {
+    const text = ' FAIL  tests/x.test.mjs > a > b\nsome unrelated runner chatter\nAssertionError: expected 2 to be 3\n';
+    expect((await one(text)).complete).toBe(false);
+  });
+  it('an echoed source frame quoting FAIL is not a failure marker', async () => {
+    const text = ' FAIL  tests/x.test.mjs > a\nAssertionError: x\n  3| expect(status).toBe("FAIL");\n   |                    ^\n';
+    expect(await one(text)).toMatchObject({ testFiles: ['tests/x.test.mjs'], complete: true });
+  });
+  // The lone "my" + "widget.test.mjs" split is the whole-token rule: no summary totals are present to rescue it.
+  it.each([
+    ['space', ' FAIL  tests/my widget.test.mjs > example'],
+    ['tab', ' FAIL  tests/my\twidget.test.mjs > example'],
+    ['no-break space', ' FAIL  tests/my\u00a0widget.test.mjs > example'],
+    ['double-quoted', ' FAIL  "tests/my widget.test.mjs" > example'],
+    ['single-quoted', " FAIL  'tests/my widget.test.mjs' > example"],
+    ['Windows directory', ' FAIL  C:\\my dir\\widget.test.mjs > example'],
+    ['progress row', ' ❯ tests/my widget.test.mjs  (1 test | 1 failed) 5ms\n FAIL  tests/x.test.mjs > ok'],
+  ])('space-containing failure paths cannot authorize an outside-diff refresh: %s', async (_name, heading) => {
+    const evidence = await one(`${heading}\nAssertionError: expected 2 to be 3\n`);
+    expect(evidence.complete).toBe(false);
+    const decision = classifyMqFailureIntake({ ...removal, route: { ...removal, ...evidence, stale: false },
+      changedFiles: { ...removal, complete: true, files: ['tests/my widget.test.mjs'] } });
+    expect(decision).toBe('fix');
+  });
+});

@@ -3,7 +3,7 @@ import { classifyMqFailureIntake, admitMqFailureRoute } from '../mq-failure-inta
 import { refreshMqFailureHead } from '../../lib/mq-failure-refresh.mjs';
 import { collectMqFailureEvidence } from '../../lib/mq-failure-evidence.mjs';
 import { buildMqFailureRoute, parseMqFailureRoute } from '../../lib/mq-failure-route.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile, BOOKKEEPING_MARKERS } from '../reconcile-core.mjs';
 import { runReconcileFixDispatch, fetchPrDiffPaths } from '../reconcile-fix-dispatch.mjs';
 import { createMqFailureLedger } from '../../lib/mq-failure-ledger.mjs';
 
@@ -244,4 +244,138 @@ describe('mq failure production changed-files intake', () => {
         expect(dispatch.mock.calls[0][0]).toMatchObject({ mqFailureRecovery: { recoveryAction: 'fix' } });
       }
     });
+});
+
+
+// ── Reconcile precedence and cap, and the dispatcher's fail-closed guards ────────────────────────────────────
+const wePrRepo = 'web-everything/web-everything';
+const routedPr = (overrides = {}) => ({
+  number: identity.pr, state: 'OPEN', headRefName: 'lane/mq-recovery', headRefOid: identity.head,
+  labels: [{ name: 'review:changes' }], mergeStateStatus: 'CLEAN',
+  statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+  comments: [{ body: buildMqFailureRoute({ ...route, repo: wePrRepo }), author: { login: 'chalbert' } }],
+  files: [{ path: 'src/unrelated.mjs' }], filesComplete: true, ...overrides,
+});
+const plan = (pr, extra = {}) => planReconcile({ repo: 'we', prs: [pr], agents: [], durableCounts: {}, ...extra });
+const mqRows = result => result.dispatch.filter(row => row.mode === 'mq-failure-recovery');
+
+describe('mq recovery admission precedence and cap', () => {
+  it('admits an OPEN, ready, unheld PR (baseline for the hold matrix)', () => {
+    expect(mqRows(plan(routedPr()))).toHaveLength(1);
+  });
+
+  it.each([
+    ['review:human', { labels: [{ name: 'review:human' }] }],
+    ['red-team:blocked', { labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }],
+    ['red-team:pending', { labels: [{ name: 'review:changes' }, { name: 'red-team:pending' }] }],
+    ['not OPEN (merged)', { state: 'MERGED' }],
+    ['not OPEN (closed)', { state: 'CLOSED' }],
+    ['draft', { isDraft: true, statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure' }] }],
+  ])('existing holds override authenticated MQ recovery: %s', (_name, overrides) => {
+    const withRoute = plan(routedPr(overrides));
+    expect(mqRows(withRoute)).toEqual([]);
+    // The route comment changes nothing: the plan is exactly what the same PR gets without it.
+    const without = plan(routedPr({ ...overrides, comments: [] }));
+    expect(withRoute.dispatch.map(row => row.kind)).toEqual(without.dispatch.map(row => row.kind));
+    expect(withRoute.refusals.map(row => row.kind)).toEqual(without.refusals.map(row => row.kind));
+  });
+
+  it.each([
+    ['a held fix claim', { fixClaim: { who: 'fix-42', claimedAt: '2026-11-09T00:00:00Z' } }],
+    ['an unvetted truncated comment list', { comments: Array.from({ length: 100 }, (_, i) => ({ body: `c${i}`, author: { login: 'x' } })) }],
+  ])('an earlier liveness/safety hold wins over a valid route: %s', (_name, overrides) => {
+    const pr = routedPr(overrides);
+    if (overrides.comments) pr.comments[99] = routedPr().comments[0];
+    expect(mqRows(plan(pr))).toEqual([]);
+  });
+
+  it('mq recovery respects the fix round cap: exhausted rounds refuse instead of dispatching', () => {
+    const open = plan(routedPr(), { durableCounts: { [identity.pr]: 0 } });
+    expect(mqRows(open)).toHaveLength(1);
+    const capped = plan(routedPr(), { durableCounts: { [identity.pr]: 99 } });
+    expect(mqRows(capped)).toEqual([]);
+    expect(capped.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', prNumber: identity.pr,
+      why: expect.stringMatching(/MQ failure recovery fix rounds exhausted/) }));
+  });
+
+  it('the route marker is bookkeeping, never a reviewer finding that counts a round', () => {
+    const comment = routedPr().comments[0];
+    const marker = comment.body.split('\n')[0];
+    expect(BOOKKEEPING_MARKERS.some(prefix => marker.startsWith(prefix))).toBe(true);
+  });
+});
+
+describe('mq recovery dispatcher guards', () => {
+  const entry = (overrides = {}) => ({ kind: 'fix', prNumber: identity.pr, headRefName: 'topic', headRefOid: identity.head,
+    files: ['src/unrelated.mjs'], mqFailureRecovery: admitMqFailureRoute({ ...identity, repo: wePrRepo,
+      route: { ...route, repo: wePrRepo }, changedFiles: { ...changedFiles, repo: wePrRepo } }), ...overrides });
+  function run({ entries = [entry()], ledger = { readFixFallback: () => false }, dryRun = false, readHead, refresh, lanes = [5] } = {}) {
+    const dispatch = vi.fn(planned => ({ pr: planned.pr, sessionId: 'fixture-fixer' }));
+    const fetchFiles = vi.fn(() => ['src/unrelated.mjs']);
+    const head = readHead ?? vi.fn(() => identity.head);
+    const refreshMqFailure = refresh ?? vi.fn(() => ({ action: 'refreshed', head: 'b'.repeat(40) }));
+    const result = runReconcileFixDispatch({ root: 'fixture/dispatch', repo: 'we', dryRun,
+      reconcile: () => ({ dispatch: entries, refusals: [] }),
+      checkStaleness: () => ({ fresh: true, behind: 0 }),
+      mqFailureIo: { readHead: head }, mqFailureLedger: ledger, refreshMqFailure,
+      fetchItemlessDiffPaths: fetchFiles, loadItems: () => [], findItemFn: () => null, pickFreeLanes: () => lanes,
+      tryResume: () => ({ resumed: false }), tryResumeRound: null,
+      listFixClaims: () => [], listBuildClaims: () => [], priorityShadow: null, dispatch });
+    return { result, dispatch, fetchFiles, readHead: head, refreshMqFailure };
+  }
+
+  it.each([
+    ['repo', { repo: 'web-everything/other' }],
+    ['PR', { pr: 43 }],
+    ['head', { head: 'b'.repeat(40) }],
+  ])('misbound direct hints never invoke refresh and never reach the fixer: %s', (_name, mismatch) => {
+    const base = entry();
+    const f = run({ entries: [{ ...base, mqFailureRecovery: { ...base.mqFailureRecovery, ...mismatch } }] });
+    expect(f.refreshMqFailure).not.toHaveBeenCalled();
+    expect(f.readHead).not.toHaveBeenCalled();
+    expect(f.dispatch).toHaveBeenCalledTimes(1);
+    expect(f.dispatch.mock.calls[0][0].mqFailureRecovery).toBeUndefined();
+  });
+
+  it('incomplete evidence is forwarded to the fixer as a plain fix and never refreshed', () => {
+    const base = entry();
+    const incomplete = { ...base.mqFailureRecovery, recoveryAction: 'refresh', evidence: { ...base.mqFailureRecovery.evidence, complete: false } };
+    const f = run({ entries: [{ ...base, mqFailureRecovery: incomplete }] });
+    expect(f.refreshMqFailure).not.toHaveBeenCalled();
+    expect(f.dispatch.mock.calls[0][0].mqFailureRecovery).toMatchObject({ recoveryAction: 'fix', evidence: { complete: false } });
+  });
+
+  it('dryRun reads no diff and passes dryRun to the executor, which can claim and push nothing', () => {
+    const refresh = vi.fn(() => ({ action: 'stop', note: 'Dry-run: no refresh' }));
+    const f = run({ dryRun: true, refresh });
+    expect(f.fetchFiles).not.toHaveBeenCalled();
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('one pass reads at most eight MQ diffs; entries past the bound keep fixer admission', () => {
+    const entries = Array.from({ length: 9 }, (_, i) => {
+      const pr = 100 + i;
+      return { kind: 'fix', prNumber: pr, headRefName: `topic-${i}`, headRefOid: identity.head, files: ['src/unrelated.mjs'],
+        mqFailureRecovery: admitMqFailureRoute({ ...identity, pr, repo: wePrRepo,
+          route: { ...route, pr, repo: wePrRepo }, changedFiles: { ...changedFiles, pr, repo: wePrRepo } }) };
+    });
+    const f = run({ entries, lanes: [5] });
+    expect(f.refreshMqFailure).toHaveBeenCalledTimes(8);
+    expect(f.readHead).toHaveBeenCalledTimes(16); // two bracketing head reads per bounded diff read, none for the ninth
+    const ninth = f.dispatch.mock.calls.map(([planned]) => planned).find(planned => planned.pr === 108);
+    expect(ninth?.mqFailureRecovery).toMatchObject({ recoveryAction: 'fix', refreshNote: expect.stringMatching(/normal fix required/) });
+  });
+
+  it.each([
+    ['rejecting async ledger', { readFixFallback: () => Promise.reject(new Error('ledger down')) }],
+    ['throwing ledger', { readFixFallback: () => { throw new Error('ledger down'); } }],
+    ['non-boolean ledger answer', { readFixFallback: () => 'yes' }],
+  ])('%s stops the pass for that PR without refresh or dispatch', (_name, ledger) => {
+    const f = run({ ledger });
+    expect(f.refreshMqFailure).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.result.refusals).toContainEqual(expect.objectContaining({ kind: 'mq-failure-refresh', pr: identity.pr,
+      why: expect.stringMatching(/operator inspection required/) }));
+  });
 });

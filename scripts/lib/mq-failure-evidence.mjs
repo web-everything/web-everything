@@ -2,8 +2,12 @@
 const clean = text => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 const infra = /runner has lost communication|runner.*(?:offline|disconnected)|infrastructure failure/i;
 const assertion = /^(?:FAIL\b|AssertionError\b|Error: expect\b|Expected:|Received:|❯(?=\s))/;
-const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|(?:^|[\w-]+:\s)failure\b|^Error: expect\b|^Expected:|^Received:|^❯(?=\s)/g;
+const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|(?:^|[\w-]+:\s)failure\b|^Error: expect\b|^Expected:|^Received:/g;
 // These jobs only aggregate sibling results; no other job name receives this exemption.
+// Lines inside a runner's own failure block that carry no failure identity: blank separators, the
+// "- Expected / + Received" diff body and echoed source code frames ("12|   expect(...)", "  |   ^"). They neither
+// start nor end a failure block, and their text (which may quote 'FAIL') is never scanned for markers.
+const blockNoise = line => !line || /^[-+](?:\s|$)/.test(line) || /^\d+\|/.test(line) || /^\|(?:\s|$)/.test(line);
 const derivedFailureJobs = new Set(['coverage-merge', 'test']);
 const localJobName = name => clean(name).split(' / ').at(-1).trim().replace(/\s+\([^()\r\n]*\)$/, '');
 
@@ -43,6 +47,16 @@ function failurePaths(text, repo) {
   const roots = ['/workspace/', `${runnerWork}/${name}/${name}/`, `/__w/${name}/${name}/`];
   const paths = [];
   let complete = true;
+  // A heading (`FAIL <path> > ...`, `❯ <path> ...`) names exactly ONE path token. A path with a space (tab, NBSP,
+  // quotes, a Windows directory) would otherwise be read as its last space-free word, a different file that may
+  // sit outside the PR diff. Whatever sits between the keyword and the suite separator must be one clean token.
+  const lead = /^(?:FAIL(?:ED)?|❯)\s+([\s\S]*)$/.exec(text);
+  if (lead) {
+    const candidate = lead[1].split(/\s+>\s|\s+[[(]|\s{2,}/, 1)[0].replace(/:\d+(?::\d+)?$/, '');
+    // The words found in an ambiguous heading are only a hint for the fixer; the incomplete flag keeps them from
+    // ever authorizing a refresh.
+    if (/[\s"'`]/.test(candidate)) complete = false;
+  }
   for (const match of text.matchAll(/(?:^|[\s(])((?:[A-Za-z]:)?[\w@./\\-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=[:\s)]|$)/g)) {
     let path = match[1].replace(/\\/g, '/');
     if (path.startsWith('/') || /^[A-Za-z]:/.test(path)) {
@@ -117,7 +131,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         let parsed = false, hasAssertions = false, markers = 0, attributed = 0;
         const jobAssertions = [], jobPaths = new Set(), causalityLines = [], markerLines = [];
         let activePaths = [], capturedOutput = false, unterminatedBlock = false;
-        let unhandledErrors = false; const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
+        let pathIncomplete = false, blankSince = false, headlineUsed = false, unhandledErrors = false; const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
         for (const raw of clean(log.text).split(/\r?\n/)) {
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
           // Vitest echoes passing tests' stdout/stderr verbatim. These blocks can contain fake
@@ -132,20 +146,35 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
             else continue;
           }
           if (line) causalityLines.push(line);
+          const noise = blockNoise(line);
+          const afterBlank = blankSince;
+          if (!line) blankSince = true; else if (!noise) blankSince = false;
           if (/^(?:Errors\s+\d+ errors?\b|.*Unhandled (?:Rejection|Error)s?\b)/.test(line)) unhandledErrors = true;
           const summary = /^(Test Files|Tests)\s+(?:(\d+) failed)?/.exec(line);
           if (summary) { const n = summary[2] === undefined ? 0 : Number(summary[2]); if (summary[1] === 'Tests') summaryTests = n; else summaryFiles = n; }
           const heading = /^FAIL\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>/.exec(line);
           if (heading) { failHeadings++; failHeadingFiles.add(heading[1]); }
+          if (/^❯\s/.test(line)) {
+            // A "❯ path" frame or progress row is a path source, not a failure of its own; the FAIL heading owns that.
+            const frame = failurePaths(line, removal.repo);
+            if (!frame.complete) pathIncomplete = true;
+            for (const path of frame.paths) jobPaths.add(path);
+          }
           if (assertion.test(line)) hasAssertions = true;
           if (assertion.test(line) || infra.test(line)) { jobAssertions.push(line); parsed = true; }
-          const found = [...line.matchAll(failureMarkers)];
-          if (!found.length) { activePaths = []; continue; }
+          const found = noise ? [] : [...line.matchAll(failureMarkers)];
+          if (!found.length) { if (!noise) activePaths = []; continue; }
           markerLines.push(line);
           for (let i = 0; i < found.length; i++) {
             const segment = line.slice(found[i].index, found[i + 1]?.index ?? line.length);
             const { paths, complete } = failurePaths(segment, removal.repo);
             const detail = /^(?:AssertionError\b|Error: expect\b|Expected:|Received:)/i.test(segment);
+            // A blank line may separate a FAIL heading from its error headline, and that headline from its
+            // "Expected:/Received:" detail. But a SECOND headline after a blank line is a new error: it must
+            // carry its own path or stay unattributed, never inherit the previous test's.
+            const headline = /^(?:AssertionError\b|Error: expect\b)/i.test(segment);
+            if (headline && afterBlank && headlineUsed) activePaths = [];
+            if (headline) headlineUsed = true; else if (!detail) headlineUsed = false;
             markers++;
             // Only assertion detail in the same failure block may inherit its preceding FAIL's path.
             // A new FAIL/failure marker always starts a new attribution, even within the same job.
@@ -160,7 +189,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         // can hide a failing test from the parser, but not from the totals the runner printed itself.
         if ((summaryFiles !== null && summaryFiles !== failHeadingFiles.size)
           || (summaryTests !== null && summaryTests !== failHeadings)) pathsComplete = false;
-        if (capturedOutput || unterminatedBlock || unhandledErrors) pathsComplete = false; // unhandled errors have no FAIL heading // an unended captured block may hide real failures
+        if (capturedOutput || unterminatedBlock || unhandledErrors || pathIncomplete) pathsComplete = false; // unhandled errors have no FAIL heading // an unended captured block may hide real failures
         if (jobAssertions.length > 100 || jobPaths.size > 100) return result;
         // Any structured failure marker in a derived job's own log (attributed or not) is real evidence,
         // not boilerplate: it must go through normal attribution instead of being exempted.

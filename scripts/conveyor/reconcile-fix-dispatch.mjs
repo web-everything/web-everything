@@ -1945,9 +1945,15 @@ export function runReconcileFixDispatch({
   dispatchEntries = dispatchEntries.filter(entry => {
     let recovery = entry.mqFailureRecovery;
     if (entry.kind !== 'fix' || !recovery) return true;
-    // Refuse a misbound hint even if an upstream caller supplied it directly.
+    // Refuse a misbound hint even if an upstream caller supplied it directly: another PR's or head's evidence is
+    // wrong-PR data, so it is dropped from the entry and never reaches the fixer brief.
     if (recovery.repo !== ghRepoSlug(repoKey) || recovery.pr !== Number(entry.prNumber)
-        || recovery.head !== entry.headRefOid || recovery.evidence?.complete !== true) return true;
+        || recovery.head !== entry.headRefOid) { delete entry.mqFailureRecovery; return true; }
+    // Incomplete evidence is the normal fixer's input but never authorizes a mechanical refresh.
+    if (recovery.evidence?.complete !== true) {
+      entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix' };
+      return true;
+    }
     let result;
     try {
       const identity = { repo: recovery.repo, pr: recovery.pr, head: recovery.head };

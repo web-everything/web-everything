@@ -70,8 +70,11 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
         },
         listJobs({ repo, runId, page }) {
           const result = countPage(`repos/${repo}/actions/runs/${runId}/jobs`, 'jobs', page);
+          // `cancelled` is a sibling that fail-fast or concurrency stopped after another job failed. It is
+          // unambiguous, and the collector only reads jobs concluded `failure`, so it never hides evidence.
+          // `timed_out` (and every other conclusion) stays incomplete: it is a failure the collector would skip.
           return { ...result, complete: result.jobs.every(job => job.status === 'completed'
-            && ['success', 'skipped', 'neutral', 'failure'].includes(job.conclusion)) };
+            && ['success', 'skipped', 'neutral', 'cancelled', 'failure'].includes(job.conclusion)) };
         },
         readJobLog({ repo, jobId }) {
           const text = request('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], { maxBuffer: 256 * 1024 });

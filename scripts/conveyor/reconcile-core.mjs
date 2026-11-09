@@ -2990,8 +2990,12 @@ export function planReconcile({
     // for automatic ci-heals.
     // Only an authenticated, current-head marker creates this finding. All earlier safety/liveness
     // holds still win. Diff uncertainty preserves fixer admission but never authorizes refresh.
+    // The holds that are NOT an earlier `continue` are checked here: a PR that is not OPEN, is a draft, is parked
+    // for a human (`review:human`) or is held by red team gets no MQ recovery and falls through to its ordinary rule.
+    const mqHeld = String(pr?.state ?? 'OPEN').toUpperCase() !== 'OPEN' || pr?.isDraft === true
+      || withPhase.labels.some(label => ['review:human', 'red-team:blocked', 'red-team:pending'].includes(label));
     const mqIdentity = { repo: ghRepoSlug(repo), pr: prNumber, head: pr.headRefOid };
-    const mqRoute = (Array.isArray(pr.comments) ? pr.comments : [])
+    const mqRoute = mqHeld ? null : (Array.isArray(pr.comments) ? pr.comments : [])
       .map(comment => parseMqFailureRoute({ comment, expected: mqIdentity }))
       .filter(route => route && !route.stale).at(-1);
     const mqRecovery = admitMqFailureRoute({ ...mqIdentity, route: mqRoute,
