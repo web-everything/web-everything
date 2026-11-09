@@ -164,23 +164,21 @@ export function settleRedTeamSkip(input = {}) {
     // Ordinary job settlement retains its contradictory-not-owed refusal.
     const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
-    let classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
+    const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
       : classifyRedTeamSkip(redTeam);
-    let rule;
+    // R730: a non-policy skip may still settle when the exact-head stored review owes no red team.
     // The carry machine only models a card-only skip, so a carry settlement never takes this rule: it would be
     // recorded as card-only with the rule unnamed. It keeps its existing refusal instead (fail closed).
-    if (classified.kind !== 'policy' && !input.carry && realHead && isRealHead(input.readHead)
+    const ruleApplies = classified.kind !== 'policy' && !input.carry && realHead && isRealHead(input.readHead)
       && input.readHead.toLowerCase() === head.toLowerCase()
-      && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam })) {
-      classified = { kind: 'policy', reason: 'not owed (stored review)' };
-      rule = STORED_NOT_OWED_RULE;
-    }
-    let { reason } = classified;
+      && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam });
+    const rule = ruleApplies ? STORED_NOT_OWED_RULE : undefined;
+    let { reason } = ruleApplies ? { reason: 'not owed (stored review)' } : classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
-    if (classified.kind === 'policy' && !boundRead) {
+    if ((ruleApplies || classified.kind === 'policy') && !boundRead) {
       reason = 'policy skip head not bound to the reviewed read';
-    } else if (classified.kind === 'policy') {
+    } else if ((ruleApplies || classified.kind === 'policy')) {
       try {
         if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || typeof repo !== 'string' || !repo
           || !isRealHead(head)) throw Error('missing or invalid PR/head');
