@@ -27,6 +27,8 @@ function hasOnlyUpstreamFailure(lines) {
   // least one must be an upstream outcome. Plain transcripts keep the whole-log rule below.
   if (lines.some(line => line.startsWith('##[group]'))) {
     const errors = lines.filter(line => line.startsWith('##[error]'));
+    // Un-annotated error text (a thrown Error, fatal:, npm ERR) is an independent failure, never boilerplate.
+    if (lines.some(line => /^(?:Error\b|fatal:|npm ERR)/.test(line))) return false;
     return lines.some(line => upstreamFailureOutcomes.has(line))
       && errors.every(line => upstreamFailureOutcomes.has(line) || line === '##[error]Process completed with exit code 1.');
   }
@@ -113,7 +115,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         const log = await call('readJobLog', { jobId: job.id });
         if (log?.complete !== true || typeof log.text !== 'string' || Buffer.byteLength(log.text) > maxLogBytes) return result;
         let parsed = false, hasAssertions = false, markers = 0, attributed = 0;
-        const jobAssertions = [], jobPaths = new Set(), causalityLines = [];
+        const jobAssertions = [], jobPaths = new Set(), causalityLines = [], markerLines = [];
         let activePaths = [], capturedOutput = false;
         for (const raw of clean(log.text).split(/\r?\n/)) {
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
@@ -129,6 +131,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
           if (assertion.test(line) || infra.test(line)) { jobAssertions.push(line); parsed = true; }
           const found = [...line.matchAll(failureMarkers)];
           if (!found.length) { activePaths = []; continue; }
+          markerLines.push(line);
           for (let i = 0; i < found.length; i++) {
             const segment = line.slice(found[i].index, found[i + 1]?.index ?? line.length);
             const { paths, complete } = failurePaths(segment, removal.repo);
@@ -144,7 +147,9 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
           }
         }
         if (jobAssertions.length > 100 || jobPaths.size > 100) return result;
-        if (!hasAssertions && derivedFailureJobs.has(localJobName(job.name))) {
+        // Any structured failure marker in a derived job's own log (attributed or not) is real evidence,
+        // not boilerplate: it must go through normal attribution instead of being exempted.
+        if (!hasAssertions && markerLines.every(line => upstreamFailureOutcomes.has(line)) && derivedFailureJobs.has(localJobName(job.name))) {
           if (!hasOnlyUpstreamFailure(causalityLines)) return result;
           // Read the log first, but defer attribution until all siblings in THIS run are known.
           // Boilerplate from a derived failure contributes its job name, not phantom test paths.

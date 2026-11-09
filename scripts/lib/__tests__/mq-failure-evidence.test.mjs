@@ -402,4 +402,11 @@ describe('mq failure evidence: real #6499 log shapes', () => {
       903: ghAggregate('Unit shards did not succeed.') }));
     expect(evidence.complete).toBe(false);
   });
+  it.each(['Error: ENOENT: missing artifact', 'runner: FAIL unidentified test', 'failure: independent artifact failure'])(
+    'a hosted aggregate log carrying independent failure text %j never authorizes refresh', async extra => {
+      const evidence = await collect(io({ 901: shardLog,
+        902: `${ghAggregate('Unit shards did not succeed; refusing incomplete coverage.')}\n${extra}`,
+        903: ghAggregate('Unit shards did not succeed.') }));
+      expect(evidence.complete).toBe(false);
+    });
 });
