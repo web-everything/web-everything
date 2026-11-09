@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
 import { hostname } from 'node:os';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
-import { verifyRev, makeGit } from './shared.mjs';
+import { verifyRev, makeGit, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
@@ -170,6 +170,27 @@ export function reportDiscardedCandidate({ ready, match, alert, needsYou }) {
   }
 }
 
+/** Where the running head sits on main: skip the rebuild-committed overlay merges at the top of its first-parent
+ *  chain (committer is the rebuild identity, subject `daemon-rebuild: merge overlay …`, 2-3 parents), then take the
+ *  merge-base of the first other commit with `mainTip`. A head with no rebuild merges uses the plain merge-base.
+ *  Unreadable history returns '' (the caller refuses: fail closed). */
+function trueMainBase(git, head, mainTip) {
+  const log = git(['log', '--first-parent', '--format=%H%x09%P%x09%ce%x09%s', head]);
+  if (log.status !== 0) return '';
+  let base = head;
+  for (const l of String(log.stdout ?? '').split('\n').filter(Boolean)) {
+    const [sha, parents, committer, ...rest] = l.split('\t');
+    const ps = String(parents ?? '').split(' ').filter(Boolean);
+    const rebuildMerge = /^daemon-rebuild: merge overlay /.test(rest.join('\t'))
+      && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length);
+    if (!rebuildMerge) { base = sha; break; }
+    base = ps[0];
+  }
+  if (!/^[0-9a-f]{40}$/.test(base ?? '')) return '';
+  const mb = git(['merge-base', base, mainTip]);
+  return mb.status === 0 ? String(mb.stdout ?? '').trim() : '';
+}
+
 /**
  * Is a ready record's `adopt` provably a build {@link planRebuild} could have minted — never an arbitrary commit
  * someone wrote into the state file? All of: its `mainSha` is on the current main history (an ancestor of, or
@@ -186,7 +207,10 @@ export function readyBuildVerified({
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
   // Never a rollback: the record's main must be at or past the main the current head was built on.
-  const headBase = prevHead ? String(git(['merge-base', prevHead, mainTip]).stdout ?? '').trim() : '';
+  // The head's TRUE main base: an overlay the head carries may have merged into main since, which would make a plain
+  // merge-base(head, mainTip) the (newer) overlay commit and read a good older plain-main fallback as a rollback.
+  // So walk the head's first-parent chain across rebuild-committed overlay merges to the main commit they sit on.
+  const headBase = prevHead ? trueMainBase(git, prevHead, mainTip) : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
   const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
   let cur = adopt.finalSha;
