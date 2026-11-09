@@ -60,30 +60,38 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
   return priorQuestionHashes.some(e => e?.hash === hash && Number.isFinite(Date.parse(e.acceptUntil)) && now <= Date.parse(e.acceptUntil) && recordInWindow(e, at));
 }
 
+/** A pass made after this instant needs at least two recorded NOT WEAKENED runs; earlier single-run passes still count. */
+export const SINGLE_RUN_PASS_CUTOFF = '2026-11-09T16:12:00.000Z';
+const hasTwoPassRuns = r => Array.isArray(r.runs) && r.runs.length >= 2 && r.runs.every(v => v === 'NOT WEAKENED');
+
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
   if (typeof base !== 'string' || typeof head !== 'string' || !SHA.test(base) || !SHA.test(head) || questionHash !== QUESTION_HASH) return null;
   let latest = null, prior = null, weakCurrent = null, weakPrior = null, sawCurrent = false;
+  const ts = r => { const t = Date.parse(r.at); return Number.isFinite(t) ? t : -Infinity; };
   for (let record of records) {
     if (record?.head !== head || record.base !== base) continue;
-    // D2: a record whose own runs list holds a WEAKENED is WEAKENED, whatever its verdict field says.
-    // Its findings are not checked for contradictions: the runs already establish WEAKENED, so it must block.
-    let runsWeak = false;
-    if (record.verdict === 'NOT WEAKENED' && Array.isArray(record.runs) && record.runs.includes('WEAKENED')) { record = { ...record, verdict: 'WEAKENED' }; runsWeak = true; }
+    const runsWeak = Array.isArray(record.runs) && record.runs.includes('WEAKENED');
     const isCurrent = record.questionHash === QUESTION_HASH;
     // Any matching current-question record, usable or not (bad timestamp, unknown verdict), blocks the prior fallback.
     if (isCurrent) sawCurrent = true;
+    // D2 fail closed: a current-question record whose verdict or runs say WEAKENED blocks, however malformed its
+    // timestamp or findings are; it is never dropped and never superseded by a later pass.
+    if (isCurrent && (record.verdict === 'WEAKENED' || runsWeak)) {
+      if (record.verdict !== 'WEAKENED') record = { ...record, verdict: 'WEAKENED' };
+      if (!weakCurrent || ts(record) >= ts(weakCurrent)) weakCurrent = record;
+      continue;
+    }
+    if (runsWeak && record.verdict === 'NOT WEAKENED') record = { ...record, verdict: 'WEAKENED' };
     if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (!runsWeak && Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
-    // D2: a WEAKENED for this head/base/question is never superseded by a later pass.
-    if (record.verdict === 'WEAKENED') {
-      if (isCurrent && (!weakCurrent || Date.parse(record.at) >= Date.parse(weakCurrent.at))) weakCurrent = record;
-      if (!isCurrent && (!weakPrior || Date.parse(record.at) >= Date.parse(weakPrior.at))) weakPrior = record;
-    }
-    if (isCurrent && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
-    if (!isCurrent && (!prior || Date.parse(record.at) >= Date.parse(prior.at))) prior = record;
+    // A pass needs two runs, unless it is a legacy single-run pass made before the cutoff.
+    if (record.verdict === 'NOT WEAKENED' && !hasTwoPassRuns(record) && !(Date.parse(record.at) < Date.parse(SINGLE_RUN_PASS_CUTOFF))) continue;
+    if (record.verdict === 'WEAKENED' && !isCurrent && (!weakPrior || ts(record) >= ts(weakPrior))) weakPrior = record;
+    if (isCurrent && (!latest || ts(record) >= ts(latest))) latest = record;
+    if (!isCurrent && (!prior || ts(record) >= ts(prior))) prior = record;
   }
   // A current-question record always decides; a prior-question record only speaks when no current-question record exists (even an unusable one blocks the fallback).
   return sawCurrent ? (weakCurrent ?? latest) : (weakPrior ?? prior);

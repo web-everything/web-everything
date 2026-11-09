@@ -321,8 +321,10 @@ describe('canonicalAuditEvidence', () => {
     expect(prototypeLoad.canonicalAuditEvidence([record,
       auditRecord({ ...newer, questionHash: 'foreign-question' }),
       auditRecord({ ...newer, head: MERGE }),
-      auditRecord({ ...newer, at: 'not-a-date' }),
     ], SHA)).toEqual({ ok: true, record });
+    // D2: a same-head, same-question WEAKENED with an unparseable timestamp blocks instead of being ignored.
+    expect(prototypeLoad.canonicalAuditEvidence([record, auditRecord({ ...newer, at: 'not-a-date' })], SHA))
+      .toMatchObject({ ok: false, reason: 'weakened' });
   });
 });
 
@@ -2068,13 +2070,17 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     const OTHER_BASE = 'f'.repeat(40);
     const carried = (...extra) => prototypeLoad.canonicalAuditEvidence([old(), ...extra], SHA, () => true, FP);
     it.each([
-      ['a contradictory-findings WEAKENED record', { verdict: 'WEAKENED', findings: ['NOT WEAKENED'] }],
-      ['a contradictory-findings WEAKENED record (zero-width and line-break shapes)', { verdict: 'WEAKENED', findings: ['note\n\u200BNOT WEAKENED'] }],
-      ['a WEAKENED record with an unparseable timestamp', { verdict: 'WEAKENED', at: 'not-a-date' }],
       ['a WEAKENED record with a malformed base', { verdict: 'WEAKENED', base: 'zz' }],
       ['a WEAKENED empty-diff record (base equals head)', { verdict: 'WEAKENED', base: OLD }],
     ])('%s on the carried head does not block the carry', (_, overrides) => {
       expect(carried(old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z', ...overrides })).ok).toBe(true);
+    });
+    it.each([
+      ['a contradictory-findings WEAKENED record', { verdict: 'WEAKENED', findings: ['NOT WEAKENED'] }],
+      ['a contradictory-findings WEAKENED record (zero-width and line-break shapes)', { verdict: 'WEAKENED', findings: ['note\n\u200BNOT WEAKENED'] }],
+      ['a WEAKENED record with an unparseable timestamp', { verdict: 'WEAKENED', at: 'not-a-date' }],
+    ])('%s on the carried head blocks the carry (D2: malformed WEAKENED fails closed)', (_, overrides) => {
+      expect(carried(old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z', ...overrides }))).toEqual({ ok: false, reason: 'weakened' });
     });
     it('a WEAKENED verdict is never superseded by a later NOT WEAKENED on the same base (D2: any WEAKENED blocks)', () => {
       const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z' });

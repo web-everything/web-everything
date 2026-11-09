@@ -150,6 +150,12 @@ describe('canonical audit', () => {
     const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
     for (const findings of [answer.slice(verdict.length).split(/\r?\n/), [answer]]) {
       const invalid = { ...valid, at: AT, findings };
+      if (verdict === 'WEAKENED') {
+        // D2: a WEAKENED record fails closed, however malformed its findings.
+        expect(findAudit([invalid], query)).toBe(invalid);
+        expect(findAudit([valid, invalid], query)).toBe(invalid);
+        continue;
+      }
       expect(findAudit([invalid], query)).toBeNull();
       expect(findAudit([valid, invalid], query)).toBe(valid);
     }
@@ -612,7 +618,7 @@ describe('prior question hashes (AU1 PR-B)', () => {
   it('findAudit accepts configured prior hashes when options omit priorQuestionHashes', () => {
     // The default parameter resolves the tool-layer setting; feed it a nonempty value through the mocked read.
     const list = [{ hash: PRIOR, acceptUntil: '2099-01-01T00:00:00.000Z' }];
-    const prior = rec('NOT WEAKENED', { at: '2098-12-20T00:00:00.000Z' });
+    const prior = rec('NOT WEAKENED', { at: '2098-12-20T00:00:00.000Z', runs: ['NOT WEAKENED', 'NOT WEAKENED'] });
     const omit = records => findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, now: Date.parse('2098-12-25T00:00:00.000Z') });
     try {
       settingsOverride.text = JSON.stringify({ audit: { priorQuestionHashes: list } });
