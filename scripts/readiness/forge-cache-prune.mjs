@@ -67,24 +67,38 @@ export function planPrune({root, entries, now = Date.now(), settings = resolveSe
   let reclaimed = 0;
   const protectedProfiles = new Set(live?.profiles);
   for (const e of entries) {
-    if (validEntry(root, e) && now - e.mtimeMs < result.minAgeMs) protectedProfiles.add(`${e.lock}/${e.name}`);
+    if (validEntry(root, e) && now - e.mtimeMs < result.minAgeMs) {
+      protectedProfiles.add(`${e.lock}/${e.name}`);
+      if (e.indexProfile) protectedProfiles.add(`${e.lock}/${e.indexProfile}`);
+    }
   }
+  const retainedProfiles = new Set();
+  const prunedProfiles = new Set();
   const pressure = disk?.usedPct > settings.highWaterPct;
   const target = Math.max(0, settings.highWaterPct - 5) / 100 * (disk?.totalBytes ?? 0);
-  for (const e of [...entries].sort((a, b) => a.mtimeMs - b.mtimeMs || String(a.path).localeCompare(String(b.path)))) {
+  // Decide profiles first: an index belongs to its full profile name, and
+  // cannot be selected independently while that profile is retained.
+  for (const e of [...entries].sort((a, b) => Number(!!a.indexProfile) - Number(!!b.indexProfile)
+    || a.mtimeMs - b.mtimeMs || String(a.path).localeCompare(String(b.path)))) {
     let reason;
     let prune = false;
     if (result.refused) reason = result.refused;
     else if (!validEntry(root, e)) reason = 'Invalid cache boundary or metadata';
     else if (liveProtects(live, e.lock, e.name)) reason = 'Protected by live reservation';
+    else if (protectedProfiles.has(`${e.lock}/${e.name}`)) reason = 'Protected by minimum age or young index';
     else if (e.indexProfile && (liveProtects(live, e.lock, e.indexProfile)
-      || protectedProfiles.has(`${e.lock}/${e.indexProfile}`))) reason = 'Index of protected profile';
+      || protectedProfiles.has(`${e.lock}/${e.indexProfile}`)
+      || retainedProfiles.has(`${e.lock}/${e.indexProfile}`))) reason = 'Index of protected profile';
     else if (now - e.mtimeMs < result.minAgeMs) reason = 'Younger than minimum age';
+    else if (e.indexProfile && prunedProfiles.has(`${e.lock}/${e.indexProfile}`)) {
+      reason = 'Index of pruned profile'; prune = true;
+    }
     else if (now - e.mtimeMs > settings.maxAgeHours * HOUR) { reason = 'Expired age'; prune = true; }
     else if (retained > settings.maxBytes) { reason = 'Cache size cap'; prune = true; }
     else if (pressure && disk.usedBytes - reclaimed > target) { reason = 'Disk high-water hysteresis'; prune = true; }
     else reason = 'Within retention bounds';
     (prune ? result.prune : result.keep).push({...e, reason});
+    (prune ? prunedProfiles : retainedProfiles).add(`${e.lock}/${e.name}`);
     if (prune) { retained -= e.bytes; reclaimed += e.bytes; }
   }
   return result;
@@ -319,7 +333,9 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
   let rootHandle;
   try {
     rootHandle = await fs.open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-    for (const e of plan.prune) {
+    // Also enforce order for externally supplied plans or changed index data.
+    for (const e of [...plan.prune].sort((a, b) => Number(a.name.startsWith('.warm-inputs-'))
+      - Number(b.name.startsWith('.warm-inputs-')))) {
       if (!validEntry(root, e)) throw new Error(`Invalid planned path; ${repair}`);
       const parent = join(root, e.lock);
       const parentHandle = await fs.open(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -337,8 +353,7 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
           if (error.code !== 'ENOENT') throw error;
           result.skipped.push(e); continue;
         }
-        // Indexes are independent planned entries, never a side effect of
-        // profile deletion. Revalidate their type along with scan metadata.
+        // Indexes must be planned, and retain their scan-time metadata.
         if ((e.name.startsWith('.warm-inputs-') && !st.isFile())
           || st.mtimeMs !== e.mtimeMs
           || (e.ino !== undefined && (st.ino !== e.ino || st.dev !== e.dev))
@@ -349,11 +364,24 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
         if (indexProfile) {
           let protectedProfile = liveProtects(live, e.lock, indexProfile);
           try {
-            const profile = await fs.lstat(join(parent, indexProfile));
-            protectedProfile ||= (plan.now ?? Date.now()) - profile.mtimeMs < Math.max(HOUR, plan.minAgeMs ?? HOUR);
+            await fs.lstat(join(parent, indexProfile));
+            // Any remaining profile (including a skipped deletion) owns its index.
+            protectedProfile = true;
           } catch (error) { if (error.code !== 'ENOENT') throw error; }
           if (protectedProfile) { result.skipped.push(e); continue; }
         }
+        // A warm input can be published/refreshed after planning. Re-read all
+        // sibling indexes under the writer leases before removing this profile.
+        let youngIndex = false;
+        for (const name of await fs.readdir(parent)) {
+          if (!name.startsWith('.warm-inputs-')) continue;
+          const path = join(parent, name), index = await fs.lstat(path);
+          if ((plan.now ?? Date.now()) - index.mtimeMs < Math.max(HOUR, plan.minAgeMs ?? HOUR)
+            && await readIndexProfile(path, name, index) === e.name) {
+            youngIndex = true; break;
+          }
+        }
+        if (youngIndex) { result.skipped.push(e); continue; }
         const outcome = await childResult(spawnProcess, process.execPath,
           ['--input-type=module', '-e', DELETE_TREE, JSON.stringify({...e,
             now: plan.now ?? Date.now(), minAgeMs: Math.max(HOUR, plan.minAgeMs ?? HOUR)})],

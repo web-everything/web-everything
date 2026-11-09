@@ -493,15 +493,55 @@ describe('executePrune', () => {
     expect(await exists(young.path)).toBe(true); expect(await exists(retained.path)).toBe(true);
     expect(await exists(unplanned.path)).toBe(true);
   }, 20_000);
-  it('preserves a young index pointing at a pruned profile', async () => {
-    const old = await materialize();
+  it('a 30-minute index protects its 30-hour profile and every index pointing at it', async () => {
+    const old = await materialize('b', 30);
     const marker = await child('.warm-inputs-young', 0.5, 'file', JSON.stringify({profile: hex('b')}));
+    const aged = await child('.warm-inputs-aged', 40, 'file', JSON.stringify({profile: hex('b')}));
     const result = plan(await scanCache(root));
-    expect(keys(result.prune)).toEqual(keys([old]));
-    expect(keys(result.keep)).toEqual(keys([marker]));
+    expectDecision(result, [], [old, marker, aged]);
     const applied = await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
-    expect(keys(applied.deleted)).toEqual(keys([old]));
+    expect(applied.deleted).toEqual([]);
+    expect(await exists(old.path)).toBe(true);
+    expect(await exists(marker.path)).toBe(true);
+    expect(await exists(aged.path)).toBe(true);
+  }, 20_000);
+  it.each([2, 40])('removes a %ih index only after its 30-hour profile in the same apply', async age => {
+    const old = await materialize('b', 30);
+    const marker = await child('.warm-inputs-aged', age, 'file', JSON.stringify({profile: hex('b')}));
+    const result = plan(await scanCache(root));
+    expectDecision(result, [old, marker], []);
+    const applied = await executePrune(result, {root, receipts, apply: true, spawnProcess(command, args, options) {
+      if (command === process.execPath && JSON.parse(args.at(-1)).name === marker.name) {
+        expect(() => openSync(old.path, 'r')).toThrow(/ENOENT/);
+      }
+      return leaseSpawn(command, args, options);
+    }});
+    expect(applied.deleted.map(e => e.name)).toEqual([old.name, marker.name]);
     expect(await exists(old.path)).toBe(false);
+    expect(await exists(marker.path)).toBe(false);
+  }, 20_000);
+  it.each(['young', 'live', 'within-bounds', 'changed-after-scan'])
+  ('keeps an old index while its profile is retained: %s', async retention => {
+    const profile = await materialize('b', retention === 'young' ? 0.5 : retention === 'within-bounds' ? 2 : 30);
+    const marker = await child('.warm-inputs-old', 40, 'file', JSON.stringify({profile: hex('b')}));
+    const result = plan(await scanCache(root), retention === 'live'
+      ? {live: {complete: true, profiles: new Set([key(profile)])}} : {});
+    if (retention === 'changed-after-scan') {
+      await fs.utimes(profile.path, (now - 29 * HOUR) / 1000, (now - 29 * HOUR) / 1000);
+    } else expectDecision(result, [], [profile, marker]);
+    const applied = await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(applied.deleted).toEqual([]);
+    expect(await exists(profile.path)).toBe(true);
+    expect(await exists(marker.path)).toBe(true);
+  }, 20_000);
+  it('rechecks young indexes added after planning before deleting their profile', async () => {
+    const old = await materialize('b', 30);
+    const result = plan(await scanCache(root));
+    const marker = await child('.warm-inputs-new', 0.5, 'file', JSON.stringify({profile: hex('b')}));
+    const applied = await executePrune(result, {root, receipts, apply: true, spawnProcess: leaseSpawn});
+    expect(applied.deleted).toEqual([]);
+    expect(keys(applied.skipped)).toEqual(keys([old]));
+    expect(await exists(old.path)).toBe(true);
     expect(await exists(marker.path)).toBe(true);
   }, 20_000);
   it('preserves a planned index whose mtime changed since scan even when still aged', async () => {
