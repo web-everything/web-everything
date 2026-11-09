@@ -438,6 +438,14 @@ describe('classifyIdleFinished — PURE core', () => {
     }
   });
 
+  it('grace boundaries are inclusive: exactly at the grace finishes, one ms before does not; grace exactly at the idle window is accepted', () => {
+    const g = 90 * 60_000;
+    const at = (ageMs, pendingGraceMs = g) => classifyIdleFinished({ lastActivityMs: NOW - ageMs, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true, pendingGraceMs }).finished;
+    expect(at(g)).toBe(true);
+    expect(at(g - 1)).toBe(false);
+    expect(at(THRESHOLD, THRESHOLD)).toBe(true);
+  });
+
   it('rowIdle + pending call with NO pendingGraceMs given fails closed (not finished)', () => {
     expect(classifyIdleFinished({ lastActivityMs: NOW - 500 * 60_000, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true }).finished).toBe(false);
   });
@@ -514,6 +522,13 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
     const info = readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' });
     expect(info.finished).toBe(true);
     expect(info.reason).toBe('idle-row-dangling-tool-call');
+  });
+
+  it('the session reaper call site (makeIdleFinishedResolver) never opts in: idle row + dangling call stays unfinished', async () => {
+    const now = Date.now();
+    writeFileSync(transcriptFile, danglingLine(now, 500));
+    const { makeIdleFinishedResolver } = await import('../session-reaper.mjs');
+    expect(makeIdleFinishedResolver({ thresholdMs: 10 * 60_000, now: () => now })({ cwd, sessionId, status: 'idle' }).finished).toBe(false);
   });
 
   it('reaper path unchanged: without trustIdleRow an idle row + dangling call stays unfinished', () => {
