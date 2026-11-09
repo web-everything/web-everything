@@ -1,7 +1,10 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
 import { runGhSync } from './gh-throttle.mjs';
-import { readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { readFileSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { withFileLock } from './atomic-json-file.mjs';
+import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readRedTeamDisposition, parseRedTeamComment, redTeamResultId } from './red-team-gate.mjs';
@@ -40,6 +43,24 @@ const prIdentity = (repo, pr) => /^[\w.-]+\/[\w.-]+$/.test(repo ?? '')
 const failure = reason => ({ ok: false, reason });
 const message = error => String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
 
+/** Host-local serialization shared by every red-team writer, across lane checkouts.
+ * Synchronous callbacks only: withFileLock releases the lock when the callback returns. */
+export function withRedTeamCheckLock({ repo, pr, headSha, env = process.env,
+  lockTimeoutMs = 3_000, lock = withFileLock } = {}, fn) {
+  try {
+    if (!prIdentity(repo, pr) || !validHead(headSha)) throw Error('invalid red-team lock identity');
+    if (!Number.isSafeInteger(lockTimeoutMs) || lockTimeoutMs < 0) throw Error('invalid red-team lock timeout');
+    const dir = env.WE_RED_TEAM_CHECK_LOCK_DIR ?? join(homedir(), '.cache', 'web-everything', 'red-team-check-locks');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // GitHub identities are case-insensitive; equivalent spellings must share a lock.
+    const key = `${repo.toLowerCase()}#${Number(pr)}@${headSha.toLowerCase()}`;
+    const name = createHash('sha256').update(key).digest('hex');
+    return lock(join(dir, `${name}.lock`), fn, { timeoutMs: lockTimeoutMs });
+  } catch (error) {
+    return failure(`red-team check lock failed: ${message(error)}; retry publication or ask an operator to inspect the host lock`);
+  }
+}
+
 export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId } = {}) {
   if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
   if (!validHead(headSha)) return failure('red-team head missing or invalid');
@@ -72,7 +93,11 @@ export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBa
 }
 
 /** Publication is best effort; callers must persist local status before calling. */
-export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync } = {}) {
+export function postRedTeamCheckRun(options = {}) {
+  return withRedTeamCheckLock(options, () => postRedTeamCheckRunUnlocked(options));
+}
+
+function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSync } = {}) {
   try {
     if (!validHead(headSha) || payload?.head_sha !== headSha || !prIdentity(repo, pr)
       || payload.external_id !== prIdentity(repo, pr)) throw Error('invalid red-team check identity or external_id');
@@ -90,22 +115,28 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  * existing success needs nothing, and any other run (in progress, failed, unreadable) belongs to a real round and
  * is never overridden. Any refusal or failed post returns `ok:false`; the caller posts no comment and retries.
  */
-export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
+export function publishRedTeamPolicyClearCheck(options = {}) {
+  return withRedTeamCheckLock(options, () => publishRedTeamPolicyClearCheckUnlocked(options));
+}
+
+function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
   const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
   if (fact.ok === true) return { ok: true, reason: 'red-team check already clear on head' };
   if (fact.reason !== 'no red-team check run on head') return failure(`policy-clear check not posted: ${fact.reason}`);
-  return postRedTeamCheckRun({ repo, pr, headSha, gh,
+  return postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false }) });
 }
 
 /** Re-derive a carried/ruling settlement from live gate evidence; never override a live round.
  * Recheck after publication and supersede our success if evidence changed or became unreadable. */
-export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = runGhSync,
+export function publishRedTeamCheckFromLive(options = {}) {
+  return withRedTeamCheckLock(options, () => publishRedTeamCheckFromLiveUnlocked(options));
+}
+
+function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
   holdFn = redTeamEnqueueHold } = {}) {
   let published = false;
-  let clearingAttempted = false;
-  let ownershipUnconfirmed = false;
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
       return failure('invalid red-team check identity or WE_APP_ID; operator must inspect configuration');
@@ -159,16 +190,8 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
       return runs.map(run => run.id);
     };
     const before = inspect();
-    // A hold left by another publication belongs to its recovery path. Do not overwrite it
-    // with our temporary hold and later clear that writer's protection.
-    const existingHold = readRedTeamPublicationHoldFact({ repo, pr, headSha, gh });
-    if (existingHold.ok !== true) throw Error(existingHold.reason);
-    const holdReason = `nonce=${randomUUID()} validating live red-team check publication`;
-    const held = postRedTeamPublicationHold({ repo, pr, headSha, held: true,
-      reason: holdReason, gh });
-    if (!held.ok) throw Error(held.reason);
     let postedId;
-    const posted = postRedTeamCheckRun({ repo, pr, headSha,
+    const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha,
       gh: (args, options) => {
         // A timeout can lose the response after GitHub accepted the success. Treat every attempted
         // write as potentially published so errors still supersede it (or set the publication hold).
@@ -186,32 +209,15 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
     if (after[0] !== postedId || after.length !== before.length + 1
       || before.some((id, index) => after[index + 1] !== id))
       throw Error('another red-team check raced publication');
-    // This shared context may have been replaced during inspection. A nonce identifies our write;
-    // never clear (or overwrite on recovery) an absent, unreadable, or differently owned hold.
-    ownershipUnconfirmed = true;
-    const statuses = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions));
-    if (!Array.isArray(statuses) || statuses.length >= 100
-      || statuses.some(status => !Number.isSafeInteger(status?.id) || status.id <= 0))
-      throw Error('publication hold ownership unreadable or incomplete at 100-status bound; operator must inspect commit statuses');
-    const currentHold = statuses.filter(status => status.context === redTeamPublicationContext(pr))
-      .sort((a, b) => b.id - a.id)[0];
-    if (currentHold?.state !== 'failure' || currentHold.description !== `held: ${holdReason}`)
-      throw Error('publication hold ownership changed or absent; operator must inspect commit statuses');
-    ownershipUnconfirmed = false;
-    clearingAttempted = true;
-    const cleared = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh });
-    if (!cleared.ok) throw Error(cleared.reason);
     return { ok: true };
   } catch (error) {
     const reason = `live red-team check not clear: ${message(error)}`;
     if (published) {
-      const supersede = postRedTeamCheckRun({ repo, pr, headSha, gh,
+      const supersede = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh,
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason }) });
-      if (!supersede.ok || clearingAttempted) {
-        // A lost clear response may have removed the hold, so restore it even if supersession worked.
-        const failures = supersede.ok ? reason : `${reason}; ${supersede.reason}`;
-        if (ownershipUnconfirmed) return failure(failures);
-        const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
+      if (!supersede.ok) {
+        const failures = `${reason}; ${supersede.reason}`;
+        const hold = postRedTeamPublicationHoldUnlocked({ repo, pr, headSha, held: true, reason: failures, gh });
         return failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}`);
       }
     }
@@ -231,7 +237,11 @@ export const RED_TEAM_PUBLICATION_CONTEXT = 'red-team/publication';
 export const redTeamPublicationContext = pr => /^[1-9]\d*$/.test(String(pr ?? '')) && Number.isSafeInteger(Number(pr))
   ? `${RED_TEAM_PUBLICATION_CONTEXT} #${Number(pr)}` : null;
 
-export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '', gh = runGhSync } = {}) {
+export function postRedTeamPublicationHold(options = {}) {
+  return withRedTeamCheckLock(options, () => postRedTeamPublicationHoldUnlocked(options));
+}
+
+function postRedTeamPublicationHoldUnlocked({ repo, pr, headSha, held, reason = '', gh = runGhSync } = {}) {
   try {
     const context = redTeamPublicationContext(pr);
     if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context) throw Error('invalid red-team publication hold identity (repo, PR number and head required)');
