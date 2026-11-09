@@ -55,12 +55,13 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     if(state.lastReadAt===null || now-state.lastReadAt>=10000 || (state.telemetry && stale())) {
       state.lastReadAt=now;
       try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
-      catch{
+      catch(error){
         // A reachable host (quick ping) earns exactly ONE fresh re-read. The ping is never health evidence; the retry
         // still passes the freshness/skew and load/RAM checks below. No last-good sample is ever kept.
         state.telemetry=null;
+        // Only a transport failure qualifies; malformed or invalid telemetry keeps today's fail-closed backoff.
         let reachable=false;
-        try{reachable=(await ping({host}))===true;}catch{reachable=false;}
+        try{reachable=error?.message==='forge-unreachable'&&(await ping({host}))===true;}catch{reachable=false;}
         if(reachable){
           try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
           catch{state.telemetry=null;}
