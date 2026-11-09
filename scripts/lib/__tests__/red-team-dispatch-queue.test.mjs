@@ -1,0 +1,479 @@
+import { describe, expect, it, vi } from 'vitest';
+import { dirname, join } from 'node:path';
+import {
+  createRedTeamDispatchQueue,
+  defaultQueueFile,
+  redTeamQueueAdmitCount,
+  runWithRedTeamQueue,
+} from '../red-team-dispatch-queue.mjs';
+
+const repo = 'example/project';
+const otherRepo = 'example/other';
+const head = pr => pr.toString(16).padStart(40, '0');
+const candidates = prs => prs.map(pr => ({ pr, head: head(pr) }));
+const numbers = entries => entries.map(entry => entry.pr);
+const capacity = count => ({ lanes: count, remainingStarts: count, budget: { left: count } });
+const prefix = 'review-daemon: red-team queue ';
+
+// Sync IO doubles match node:fs semantics without touching the operator's queue.
+// No persisted envelope is assumed: restart assertions exercise the public reader.
+// maxAttempts is deliberately NOT defaulted here: omitting it exercises the production default (3).
+function fixture({ maxAttempts, logger } = {}) {
+  const file = join('queue-fixture', 'queue.json');
+  const files = new Map();
+  const operations = [];
+  const logs = [];
+  let clock = Date.parse('2026-11-09T12:00:00Z');
+  const readFile = vi.fn(path => {
+    if (!files.has(path)) throw Object.assign(new Error('missing fixture file'), { code: 'ENOENT' });
+    return files.get(path);
+  });
+  const writeFile = vi.fn((path, data) => {
+    operations.push({ type: 'write', path, data: String(data), visible: files.get(file) });
+    files.set(path, String(data));
+  });
+  const rename = vi.fn((from, to) => {
+    if (!files.has(from)) throw new Error('rename source missing');
+    if (from.endsWith('.tmp')) JSON.parse(files.get(from));
+    operations.push({ type: 'rename', from, to, visible: files.get(to) });
+    files.set(to, files.get(from));
+    files.delete(from);
+  });
+  const unlink = vi.fn(path => { files.delete(path); });
+  const log = logger ?? ((...parts) => logs.push(parts.join(' ')));
+  const open = () => createRedTeamDispatchQueue({
+    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts,
+  });
+  return {
+    file, files, operations, logs, log, readFile, writeFile, rename, unlink, open,
+    queue: open(), advance: () => { clock += 1000; },
+  };
+}
+
+function inputs(prs, extra = {}) {
+  return {
+    repo,
+    plan: { refusals: prs.map(prNumber => ({
+      prNumber, kind: 'already-reviewed-head', headSha: head(prNumber),
+    })) },
+    rawPrs: prs.map(number => ({ number, headRefOid: head(number) })),
+    capacity: capacity(2),
+    ...extra,
+  };
+}
+
+function started(options) {
+  const prs = options.plan.refusals.filter(row => row.kind === 'already-reviewed-head');
+  return {
+    rows: prs.map(row => ({ prNumber: row.prNumber, action: 'dispatch' })),
+    dispatched: prs.map(row => ({ prNumber: row.prNumber, jobPid: 1000 + row.prNumber })),
+    notStarted: [],
+  };
+}
+
+function refused(pr, reason) {
+  return {
+    rows: [{ prNumber: pr, action: 'skip', why: reason }],
+    dispatched: [], notStarted: [{ prNumber: pr, reason }],
+  };
+}
+
+describe('FIFO red-team dispatch queue (R752/R785)', () => {
+  it('FIFO order under a burst of N owed PRs with capacity 2 over multiple ticks', async () => {
+    const f = fixture();
+    const pending = [1, 2, 3, 4, 5, 6, 7];
+    const batches = [];
+    const run = vi.fn(options => {
+      batches.push(options.plan.refusals.map(row => row.prNumber));
+      return started(options);
+    });
+    // Later planner order changes must not displace the first-seen FIFO order.
+    for (const order of [pending, [7, 6, 5, 4, 3], [7, 6, 5], [7]]) {
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs(order), run, log: f.log });
+    }
+    expect(batches).toEqual([[1, 2], [3, 4], [5, 6], [7]]);
+    expect(f.queue.entries()).toEqual([]);
+    for (const verb of ['enqueue', 'hold', 'admit', 'remove']) {
+      expect(f.logs.some(line => line.startsWith(prefix) && line.includes(verb))).toBe(true);
+    }
+    expect(f.logs.some(line => line.includes('remove') && /dispatch|start/.test(line))).toBe(true);
+  });
+
+  it.each([
+    [{ lanes: 2, remainingStarts: 5, budget: { left: 4 } }, 2],
+    [{ lanes: 5, remainingStarts: 1, budget: { left: 4 } }, 1],
+    [{ lanes: 5, remainingStarts: 4, budget: { left: 2 } }, 2],
+    [{ lanes: 2.9, remainingStarts: 8, budget: { left: 9 } }, 2],
+    [{ lanes: Infinity, remainingStarts: null, budget: { left: Infinity } }, Infinity],
+    [{ lanes: Infinity }, Infinity],
+    [{ lanes: 9, remainingStarts: null }, 9],
+    [{ lanes: -1, remainingStarts: 9 }, 0],
+    [{ lanes: 9, remainingStarts: 0, budget: { left: 9 } }, 0],
+    [{ lanes: 9, budget: { left: 0 } }, 0],
+  ])('capacity bound never admits more than min(lanes, remainingStarts, budget.left): %j', async (bound, expected) => {
+    expect(redTeamQueueAdmitCount(bound)).toBe(expected);
+    const f = fixture();
+    const run = vi.fn(started);
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5]), capacity: bound, run });
+    expect(run).toHaveBeenCalledOnce();
+    // Exhausted but readable capacity passes everything through (the runner refuses before any retry is spent,
+    // and worker-free settlement must not wait); unreadable capacity holds all (separate test).
+    const passThrough = expected === 0;
+    expect(run.mock.calls[0][0].plan.refusals).toHaveLength(passThrough ? 5 : Math.min(5, expected));
+  });
+
+  it('exhausted readable capacity still lets worker-free settlement (clear) reach the runner', async () => {
+    const f = fixture();
+    const run = vi.fn(() => ({ rows: [{ prNumber: 1, action: 'clear' }], dispatched: [], notStarted: [] }));
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1]), capacity: capacity(0), run, log: f.log });
+    expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1]);
+    expect(numbers(f.queue.entries())).toEqual([]);
+  });
+
+  it('no retry spend while queued: run never receives held-out PRs', async () => {
+    const f = fixture();
+    const spentRetries = new Set();
+    const run = vi.fn(options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2]);
+      expect(options.rawPrs.map(row => row.number)).toEqual([1, 2]);
+      for (const row of options.plan.refusals) spentRetries.add(row.prNumber);
+      return started(options);
+    });
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4]), run });
+    expect([...spentRetries]).toEqual([1, 2]);
+    expect(numbers(f.queue.entries())).toEqual([3, 4]);
+    expect(f.queue.entries().map(entry => entry.attempts)).toEqual([0, 0]);
+  });
+
+  it('head change re-enqueues at tail with attempts reset', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1, 2, 3]));
+    await f.queue.admit(repo, 1);
+    await f.queue.settle(repo, refused(1, 'lane temporarily unavailable'));
+    expect(f.queue.entries()[0].attempts).toBe(1);
+    f.advance();
+    const changedHead = 'f'.repeat(40);
+    await f.queue.sync(repo, [{ pr: 1, head: changedHead }, ...candidates([2, 3])]);
+    expect(numbers(f.queue.entries())).toEqual([2, 3, 1]);
+    expect(f.queue.entries()[2]).toMatchObject({ key: `${repo}#1`, repo, pr: 1, head: changedHead, attempts: 0 });
+    expect(f.queue.entries()[2].enqueuedAt).toBeDefined();
+    expect(f.open().entries()).toEqual(f.queue.entries());
+  });
+
+  it('closed/merged PR absent from plan is removed without disturbing another repo', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1, 2]));
+    await f.queue.sync(otherRepo, candidates([1]));
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([2]), capacity: capacity(0), log: f.log,
+      run: () => ({ rows: [{ prNumber: 2, action: 'skip', why: 'no review capacity left' }], dispatched: [],
+        notStarted: [{ prNumber: 2, reason: 'no review capacity left' }] }) });
+    expect(f.queue.entries().map(entry => entry.key)).toEqual([`${repo}#2`, `${otherRepo}#1`]);
+    expect(f.logs.some(line => line.startsWith(prefix) && line.includes('remove') && /closed|merged|absent|candidate/.test(line))).toBe(true);
+    await f.queue.sync(repo, []);
+    expect(f.open().entries().map(entry => entry.key)).toEqual([`${otherRepo}#1`]);
+  });
+
+  it('restart persistence: a new queue instance on the same file continues order and attempts', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([3, 1, 2]));
+    await f.queue.admit(repo, 1);
+    await f.queue.settle(repo, refused(3, 'lane busy'));
+    const restarted = f.open();
+    expect(restarted.entries()).toEqual(f.queue.entries());
+    expect(numbers(await restarted.admit(repo, 1))).toEqual([3]);
+    expect(restarted.entries()[0].attempts).toBe(1);
+    await restarted.settle(repo, {
+      rows: [{ prNumber: 3, action: 'dispatch' }], dispatched: [{ prNumber: 3, jobPid: 42 }], notStarted: [],
+    });
+    expect(numbers(f.open().entries())).toEqual([1, 2]);
+  });
+
+  it('planner skip rows (not in notStarted) count as attempts so a non-dispatchable head rotates', async () => {
+    const f = fixture({ maxAttempts: 2 });
+    const reason = 'stale re-dispatch already spent';
+    const run = options => {
+      const pr = options.plan.refusals[0].prNumber;
+      return pr === 1
+        ? { rows: [{ prNumber: 1, action: 'skip', why: reason }], dispatched: [], notStarted: [] }
+        : started(options);
+    };
+    for (let tick = 0; tick < 2; tick++) {
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
+    }
+    expect(numbers(f.queue.entries())).toEqual([2, 1]);
+    expect(f.logs.some(line => line.includes('requeue') && line.includes(reason))).toBe(true);
+  });
+
+  it('stuck head skip-and-requeue after K attempts logs reason and lets the rest dispatch', async () => {
+    const f = fixture({ maxAttempts: 2 });
+    const reason = 'dispatch refused before start: lane busy';
+    const received = [];
+    const run = options => {
+      const pr = options.plan.refusals[0].prNumber;
+      received.push(pr);
+      return pr === 1 ? refused(1, reason) : started(options);
+    };
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3]), capacity: capacity(1), run, log: f.log });
+    expect(f.queue.entries()[0].attempts).toBe(1);
+    expect(numbers(f.queue.entries())).toEqual([1, 2, 3]);
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3]), capacity: capacity(1), run, log: f.log });
+    expect(numbers(f.queue.entries())).toEqual([2, 3, 1]);
+    expect(f.queue.entries()[2].attempts).toBe(0);
+    expect(f.logs.some(line => line.startsWith(prefix) && line.includes('requeue') && line.includes(reason))).toBe(true);
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3]), capacity: capacity(2), run: options => {
+      received.push(...options.plan.refusals.map(row => row.prNumber));
+      return started(options);
+    } });
+    expect(received).toEqual([1, 1, 2, 3]);
+    expect(numbers(f.open().entries())).toEqual([1]);
+  });
+
+  it('no-capacity notStarted does not increment attempts or move the head', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1, 2]));
+    await f.queue.admit(repo, 1);
+    await f.queue.settle(repo, refused(1, 'lane busy'));
+    const before = f.queue.entries().map(entry => ({ ...entry }));
+    for (let tick = 0; tick < 4; tick++) {
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1),
+        run: () => refused(1, 'no review capacity left') });
+    }
+    expect(f.queue.entries()).toEqual(before);
+    expect(f.open().entries()).toEqual(before);
+  });
+
+  it('corrupt file is preserved for inspection, not overwritten', () => {
+    const f = fixture();
+    f.files.set(f.file, '{ truncated');
+    f.open();
+    expect(f.files.has(f.file)).toBe(false);
+    expect([...f.files.entries()].some(([name, text]) => name.includes('.corrupt-') && text === '{ truncated')).toBe(true);
+    expect(f.logs.some(line => line.startsWith(prefix) && line.includes('preserved'))).toBe(true);
+  });
+
+  it.each(['corrupt', 'unreadable'])('%s file => empty queue plus log, never throw', kind => {
+    const f = fixture();
+    if (kind === 'corrupt') f.files.set(f.file, '{ truncated');
+    else f.readFile.mockImplementation(() => { throw Object.assign(new Error('fixture denied'), { code: 'EACCES' }); });
+    f.logs.length = 0;
+    const restored = f.open();
+    expect(restored.entries()).toEqual([]);
+    expect(f.logs.some(line => line.startsWith(prefix) && /corrupt|unreadable|read|load|invalid/.test(line))).toBe(true);
+  });
+
+  it('atomic write: same-directory temp plus rename, no partial queue file visible', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1]));
+    const oldFile = f.files.get(f.file);
+    f.operations.length = 0;
+    await f.queue.sync(repo, candidates([1, 2]));
+    expect(f.operations.length).toBeGreaterThanOrEqual(2);
+    expect(f.operations.every(op => op.type !== 'write' || op.path !== f.file)).toBe(true);
+    const commits = f.operations.filter(op => op.type === 'rename');
+    expect(commits.length).toBeGreaterThan(0);
+    for (const commit of commits) {
+      expect(commit.to).toBe(f.file);
+      expect(commit.from).not.toBe(f.file);
+      expect(dirname(commit.from)).toBe(dirname(f.file));
+      const write = f.operations.find(op => op.type === 'write' && op.path === commit.from);
+      expect(write).toBeDefined();
+      expect(() => JSON.parse(write.data)).not.toThrow();
+      expect(write.visible).toBe(oldFile);
+      expect(commit.visible).toBe(oldFile);
+    }
+    expect(numbers(f.open().entries())).toEqual([1, 2]);
+  });
+
+  it.each([undefined, null, {}, { lanes: NaN }, { lanes: '2' }, { lanes: 2, remainingStarts: NaN }])(
+    'missing/invalid capacity => admits 0 and logs a hold: %j', async bound => {
+      const f = fixture();
+      expect(redTeamQueueAdmitCount(bound)).toBe(0);
+      const run = vi.fn(options => {
+        expect(options.plan.refusals).toEqual([]);
+        expect(options.rawPrs).toEqual([]);
+        return { rows: [], dispatched: [], notStarted: [] };
+      });
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: bound, run, log: f.log });
+      expect(run).toHaveBeenCalledOnce();
+      expect(numbers(f.queue.entries())).toEqual([1, 2]);
+      expect(f.logs.some(line => line.startsWith(prefix) && /capacity|hold/.test(line))).toBe(true);
+    },
+  );
+
+  it('clear, carry and absent (not owed) rows remove only settled PRs', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1, 2, 3, 4]));
+    await f.queue.sync(otherRepo, candidates([1]));
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4]), capacity: capacity(3),
+      run: () => ({ rows: [{ prNumber: 1, action: 'clear' }, { prNumber: 2, action: 'carry' }],
+        dispatched: [], notStarted: [] }), log: f.log });
+    expect(f.queue.entries().map(entry => entry.key)).toEqual([`${repo}#4`, `${otherRepo}#1`]);
+    expect(f.logs.filter(line => line.includes('remove'))).toHaveLength(3);
+    expect(f.logs.filter(line => line.includes('remove')).every(line => /clear|carry|owed|absent/.test(line))).toBe(true);
+  });
+
+  it('passes unrelated rows, headless rows and extra options through without mutating inputs', async () => {
+    const f = fixture();
+    const options = inputs([1, 2]);
+    delete options.plan.refusals[0].headSha; // resolve from rawPr.headRefOid
+    const headless = { prNumber: 3, kind: 'already-reviewed-head' };
+    const invalidHead = { prNumber: 4, kind: 'already-reviewed-head', headSha: 'unknown' };
+    const unrelated = { prNumber: 9, kind: 'other-refusal' };
+    options.plan.refusals.push(headless, invalidHead, unrelated);
+    options.plan.marker = 'preserve plan metadata';
+    options.rawPrs.push({ number: 3 }, { number: 4, headRefOid: 'unknown' }, { number: 9 });
+    const snapshot = structuredClone(options);
+    const dispatch = vi.fn();
+    const run = vi.fn(received => {
+      expect(received.plan.refusals).toEqual([options.plan.refusals[0], headless, invalidHead, unrelated]);
+      expect(received.rawPrs.map(pr => pr.number)).toEqual([1, 3, 4, 9]);
+      expect(received.plan.marker).toBe(options.plan.marker);
+      expect(received.capacity).toBe(bound);
+      expect(received.dispatch).toBe(dispatch);
+      expect(received.paused).toBe(true);
+      return { rows: [], dispatched: [], notStarted: [] };
+    });
+    const bound = capacity(1);
+    await runWithRedTeamQueue({ queue: f.queue, ...options, capacity: bound, run, dispatch, paused: true });
+    expect(run).toHaveBeenCalledOnce();
+    expect(options).toEqual(snapshot);
+    expect(numbers(f.queue.entries())).toEqual([2]);
+  });
+
+  it('run throws: queue order, attempts and persisted state remain unchanged and error propagates', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1, 2]));
+    await f.queue.admit(repo, 1);
+    await f.queue.settle(repo, refused(1, 'lane busy'));
+    const before = structuredClone(f.queue.entries());
+    const persisted = f.files.get(f.file);
+    const error = new Error('runner failed');
+    let caught;
+    try {
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run: () => { throw error; } });
+    } catch (failure) { caught = failure; }
+    expect(caught).toBe(error);
+    expect(f.queue.entries()).toEqual(before);
+    expect(f.files.get(f.file)).toBe(persisted);
+    expect(f.open().entries()).toEqual(before);
+  });
+
+  it.each(['sync', 'async'])('runner %s failure rolls back sync mutations, admissions and persisted state', async mode => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([1, 2, 3]));
+    await f.queue.admit(repo, 1);
+    const before = structuredClone(f.queue.entries());
+    const persisted = new Map(f.files);
+    f.operations.length = 0;
+    const error = new Error('runner failed after sync mutations');
+    const options = inputs([2, 3, 4], { capacity: capacity(1) });
+    options.plan.refusals[0].headSha = 'f'.repeat(40);
+    const run = vi.fn(() => {
+      // Sync removed PR 1, replaced PR 2's head and appended PR 4 before admission.
+      expect(numbers(f.queue.entries())).toEqual([3, 2, 4]);
+      expect(f.queue.entries()[1]).toMatchObject({ head: 'f'.repeat(40), attempts: 0 });
+      if (mode === 'async') return Promise.reject(error);
+      throw error;
+    });
+    let caught;
+    try {
+      await runWithRedTeamQueue({ queue: f.queue, ...options, run });
+    } catch (failure) { caught = failure; }
+    expect(caught).toBe(error);
+    expect(run).toHaveBeenCalledOnce();
+    expect(f.queue.entries()).toEqual(before);
+    expect(f.files).toEqual(persisted);
+    expect(f.operations).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+    // Settlement without another admit must still act on the pre-transaction admission (PR 1),
+    // rather than the failed transaction's admission (PR 3).
+    await f.queue.settle(repo, {
+      rows: [{ prNumber: 1, action: 'clear' }, { prNumber: 3, action: 'clear' }],
+      dispatched: [], notStarted: [],
+    });
+    expect(numbers(f.queue.entries())).toEqual([2, 3]);
+    expect(numbers(f.open().entries())).toEqual([2, 3]);
+  });
+
+  it('admit is FIFO per repo, supports Infinity and does not dequeue before settlement', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([3, 1, 2]));
+    await f.queue.sync(otherRepo, candidates([7]));
+    const before = structuredClone(f.queue.entries());
+    expect(numbers(await f.queue.admit(repo, Infinity))).toEqual([3, 1, 2]);
+    expect(numbers(await f.queue.admit(otherRepo, 2))).toEqual([7]);
+    expect(await f.queue.admit(repo, 0)).toEqual([]);
+    expect(f.queue.entries()).toEqual(before);
+  });
+
+  it('omitted maxAttempts rotates on exactly the third failed attempt', async () => {
+    const f = fixture();
+    const run = options => options.plan.refusals[0].prNumber === 1 ? refused(1, 'lane busy') : started(options);
+    const tick = () => runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
+    await tick();
+    expect(numbers(f.queue.entries())).toEqual([1, 2]);
+    expect(f.queue.entries()[0].attempts).toBe(1);
+    await tick();
+    expect(numbers(f.queue.entries())).toEqual([1, 2]);
+    expect(f.queue.entries()[0].attempts).toBe(2);
+    await tick();
+    expect(numbers(f.queue.entries())).toEqual([2, 1]);
+    expect(f.queue.entries()[1].attempts).toBe(0);
+  });
+
+  it('throwing diagnostics do not interrupt queue recovery or settlement', async () => {
+    const f = fixture({ logger: () => { throw new Error('logger down'); } });
+    f.files.set(f.file, '{ truncated');
+    const recovered = f.open();
+    expect(recovered.entries()).toEqual([]);
+    const run = vi.fn(started);
+    const result = await runWithRedTeamQueue({ queue: recovered, ...inputs([1, 2]), capacity: capacity(1), run,
+      log: () => { throw new Error('logger down'); } });
+    expect(result.dispatched.map(row => row.prNumber)).toEqual([1]);
+    expect(numbers(recovered.entries())).toEqual([2]);
+    expect(numbers(f.open().entries())).toEqual([2]);
+  });
+
+  describe.each([['writeFile'], ['rename']])('persist failure (%s) after a successful run', failing => {
+    it.each(['sync', 'async'])('%s runner: result is still returned, failure is only logged', async mode => {
+      const f = fixture();
+      const outcome = { dispatched: [{ prNumber: 1, jobPid: 1001 }], rows: [{ prNumber: 1, action: 'dispatch' }], notStarted: [] };
+      const run = vi.fn(() => {
+        // Break persistence only after the runner has started its job (its side effect is done).
+        f[failing].mockImplementation(() => { throw Object.assign(new Error('ENOSPC fixture'), { code: 'ENOSPC' }); });
+        return mode === 'async' ? Promise.resolve(outcome) : outcome;
+      });
+      const result = await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
+      expect(result).toBe(outcome);
+      // Memory keeps the settled state so the started PR is not re-offered next tick.
+      expect(numbers(f.queue.entries())).toEqual([2]);
+      expect(f.logs.some(line => line.startsWith(prefix) && line.includes('persist failed') && line.includes('ENOSPC fixture'))).toBe(true);
+      // No orphaned temp file is left behind by the failed write.
+      expect([...f.files.keys()].filter(name => name.endsWith('.tmp'))).toEqual([]);
+    });
+
+    it('the next tick rewrites the stale file even with no new change, so a restart cannot re-offer a started PR', async () => {
+      const f = fixture();
+      let broken = true;
+      f[failing].mockImplementation((...args) => {
+        if (broken) throw new Error('ENOSPC fixture');
+        return failing === 'rename' ? undefined : f.files.set(args[0], String(args[1]));
+      });
+      const outcome = { dispatched: [{ prNumber: 1, jobPid: 1001 }], rows: [{ prNumber: 1, action: 'dispatch' }], notStarted: [] };
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run: () => outcome, log: f.log });
+      expect(f.files.has(f.file)).toBe(false);
+      broken = false;
+      if (failing === 'rename') f[failing].mockImplementation((from, to) => { f.files.set(to, f.files.get(from)); f.files.delete(from); });
+      // Same candidates minus the started PR: sync/admit/settle change nothing.
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([2]), capacity: capacity(0), run: () => refused(2, 'no review capacity left'), log: f.log });
+      expect(numbers(f.open().entries())).toEqual([2]);
+    });
+  });
+
+  it('defaultQueueFile uses the environment override or the supplied home, never the real home', () => {
+    const home = join('fixture-home', 'operator');
+    expect(defaultQueueFile({}, home)).toBe(join(home, 'workspace', '.operations', 'red-team-dispatch-queue.json'));
+    const override = join('fixture-state', 'custom-queue.json');
+    expect(defaultQueueFile({ WE_RED_TEAM_QUEUE_FILE: override }, home)).toBe(override);
+  });
+});
