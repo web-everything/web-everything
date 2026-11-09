@@ -1719,9 +1719,20 @@ export function isRetryableGhJsonFailure(args, text) {
 // token-bearing argument can reach it. Append-only, rotated to `<log>.1` past 5 MB, and a failure never fails a call.
 export const GH_WAITLOG_FILENAME = 'gh-waitlog.jsonl';
 export const GH_WAITLOG_MAX_BYTES = 5 * 1024 * 1024;
+/** Caller label for the wait log: keeps only a short identifier-shaped label, so a credential that ended up in
+ *  `GH_CALLER`/`throttle.caller` can never reach the log. */
+export function ghWaitLogCaller(caller) {
+  const s = String(caller ?? '').slice(0, 200);
+  if (/(?:gh[pousr]_|github_pat_)/i.test(s) || /[A-Za-z0-9+/_=-]{32,}/.test(s) || !/^[A-Za-z0-9._:@/-]{1,80}$/.test(s)) return 'redacted';
+  return s;
+}
 export function recordGhWaitLogEntry(logPath, entry) {
   try {
-    try { if (statSync(logPath).size > GH_WAITLOG_MAX_BYTES) renameSync(logPath, `${logPath}.1`); } catch { /* missing log */ }
+    let size = 0;
+    try { size = statSync(logPath).size; } catch { /* missing log */ }
+    if (size > GH_WAITLOG_MAX_BYTES) {
+      try { renameSync(logPath, `${logPath}.1`); } catch { return; } // cannot rotate: drop the line, never grow past the cap
+    }
     appendFileSync(logPath, JSON.stringify(entry) + '\n', 'utf8');
   } catch {
     /* best-effort — logging must never fail the call */
@@ -2024,7 +2035,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
-      recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(waitStartedMs).toISOString(), caller, op: ghOpLabel(args), waitMs: Date.now() - waitStartedMs, durMs: 0, ok: false });
+      recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(waitStartedMs).toISOString(), caller: ghWaitLogCaller(caller), op: ghOpLabel(args), waitMs: Date.now() - waitStartedMs, durMs: 0, ok: false });
       const error = new Error(throttledMessage);
       Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
       throw error;
@@ -2050,7 +2061,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
       if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
     }
     if (!failure && isGhDeferred(result)) return result; // nested CLI deferral is not a landed write
-    recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(execStartedMs).toISOString(), caller, op: ghOpLabel(args), waitMs, durMs: Date.now() - execStartedMs, ok: !failure });
+    recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(execStartedMs).toISOString(), caller: ghWaitLogCaller(caller), op: ghOpLabel(args), waitMs, durMs: Date.now() - execStartedMs, ok: !failure });
     const captured = lastCapture;
     if (captured) recordGhHeadroom(lockRoot, identity, rateLimitRecords(captured.responses));
     recordGhCallLogEntry(logPath, {

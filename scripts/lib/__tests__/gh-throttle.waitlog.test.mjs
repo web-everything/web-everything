@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhSync, recordGhWaitLogEntry, GH_WAITLOG_FILENAME, GH_WAITLOG_MAX_BYTES } from '../gh-throttle.mjs';
+import { runGhSync, recordGhWaitLogEntry, ghWaitLogCaller, GH_WAITLOG_FILENAME, GH_WAITLOG_MAX_BYTES } from '../gh-throttle.mjs';
 
 function fixture(fn) {
   const lockRoot = mkdtempSync(join(tmpdir(), 'gh-waitlog-'));
@@ -12,6 +12,22 @@ const base = (lockRoot, extra = {}) => ({ lockRoot, env: {}, warn: vi.fn(), exec
 const lines = (lockRoot) => readFileSync(join(lockRoot, GH_WAITLOG_FILENAME), 'utf8').trim().split('\n').map(l => JSON.parse(l));
 
 describe('gh-throttle wait log', () => {
+  it('redacts a token-shaped caller (GH_CALLER / throttle.caller) and keeps normal labels', () => fixture(lockRoot => {
+    runGhSync(['pr', 'list'], { encoding: 'utf8', throttle: base(lockRoot, { caller: 'ghp_SECRET1234567890abcdefghijklmnop' }) });
+    const raw = readFileSync(join(lockRoot, GH_WAITLOG_FILENAME), 'utf8');
+    expect(raw).not.toContain('SECRET');
+    expect(lines(lockRoot)[0].caller).toBe('redacted');
+    expect(ghWaitLogCaller('we:scripts/pr-land.mjs')).toBe('we:scripts/pr-land.mjs');
+    expect(ghWaitLogCaller('has space token')).toBe('redacted');
+  }));
+  it('when rotation fails, drops the line instead of growing past the cap', () => fixture(lockRoot => {
+    const p = join(lockRoot, GH_WAITLOG_FILENAME);
+    writeFileSync(p, 'x'.repeat(GH_WAITLOG_MAX_BYTES + 1));
+    mkdirSync(`${p}.1`); // rename onto a directory fails
+    writeFileSync(join(`${p}.1`, 'keep'), '');
+    recordGhWaitLogEntry(p, { at: 'now', caller: 'c', op: 'pr list', waitMs: 1, durMs: 2, ok: true });
+    expect(readFileSync(p, 'utf8')).toBe('x'.repeat(GH_WAITLOG_MAX_BYTES + 1));
+  }));
   it('writes one JSONL line with at/caller/op/waitMs/durMs/ok per throttled call', () => fixture(lockRoot => {
     runGhSync(['pr', 'list'], { encoding: 'utf8', throttle: base(lockRoot) });
     const [row, ...rest] = lines(lockRoot);
