@@ -1,9 +1,9 @@
 /** @file merge-ai-prs-mq-failure-route-hook.test.mjs — R772: the same-head hold routes real MQ failures to the fixer. */
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const src = readFileSync(fileURLToPath(new URL('../merge-ai-prs.mjs', import.meta.url)), 'utf8');
+const src = readFileSync(resolve(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
 
 describe('merge-ai-prs mq-failure route hook', () => {
   it('calls routeMqFailureOnHold inside the mq-same-head-failed hold, before returning the decline', () => {
