@@ -1607,6 +1607,8 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, exists: false };
   const lease = readLease(dir);
+  // A history-quarantined lane is never acquirable (acquire would refuse it), so it must not be advertised either.
+  if (existsSync(historyQuarantinePath(repo, n))) return { lane: n, exists: false, quarantined: true };
   if (leaseDisqualifiesAcquire(lease, nowMs, ttlMs)) return { lane: n, exists: true, lease, dirtyOrAhead: null };
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
@@ -4075,7 +4077,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
         if (limit !== null && out.length >= limit) break; // #xn432dz --limit: stop once N are found
       }
     }
-    return out.map((n) => laneDir(repo, n));
+    return out.filter((n) => !existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n));
   } catch (e) {
     if (e && e.partialScan) return out.map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
     throw e;

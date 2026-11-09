@@ -100,6 +100,13 @@ it('skips an existing quarantine before claiming and refuses explicit acquire wi
   expect(explicit.stderr).toContain('history unreadable: missing parent');
 });
 
+it('list --acquirable does not advertise a quarantined lane', () => {
+  quarantine();
+  const result = runPool(['list', '--acquirable', '--no-cache']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.stringify(result.data)).not.toContain(laneDir);
+});
+
 it('retries a single transient history failure without quarantining', () => {
   const fault = `if (args.includes('rev-list') && args.includes('--max-count=200')) {
     fs.appendFileSync(${JSON.stringify(join(base, 'probes'))}, 'probe\\n');
