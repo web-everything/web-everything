@@ -32,6 +32,7 @@ function claimLedger() {
 
 function effects(overrides = {}) {
   return {
+    readPr: vi.fn(() => ({ state: 'OPEN', baseRefName: 'main', headRefOid: HEAD, isCrossRepository: false, mergeable: 'MERGEABLE' })),
     readHead: vi.fn(() => HEAD), readLabels: vi.fn(() => []), addLabel: vi.fn(() => ({ ok: true })),
     removeLabel: vi.fn(() => ({ ok: true })), ...overrides,
   };

@@ -56,19 +56,23 @@ function api(args, exec) {
   return out;
 }
 
+/** A skipped preflight is not a workflow-run read; preserve ordinary missing-run recovery. */
+export function canReadHeadWorkflowRuns({ pr, head, exec = execFileSyncThrottled }) {
+  if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[a-f0-9]{40}$/i.test(head ?? '')) return false;
+  return exec !== execFileSyncThrottled || String(process.env.PATH ?? '').split(delimiter).some(dir => {
+    if (!dir) return false;
+    try {
+      const file = join(dir, 'gh');
+      accessSync(file, constants.X_OK);
+      return statSync(file).isFile();
+    } catch { return false; }
+  });
+}
+
 /** Two bounded pages: target runs use the base SHA, so head-only evidence is insufficient. */
 export function readHeadWorkflowRuns({ repo, pr, head, exec = execFileSyncThrottled }) {
   try {
-    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[a-f0-9]{40}$/i.test(head ?? '')) return null;
-    // Avoid entering the throttle/router when there is no local gh executable.
-    if (exec === execFileSyncThrottled && !String(process.env.PATH ?? '').split(delimiter).some(dir => {
-      if (!dir) return false;
-      try {
-        const file = join(dir, 'gh');
-        accessSync(file, constants.X_OK);
-        return statSync(file).isFile();
-      } catch { return false; }
-    })) return null;
+    if (!canReadHeadWorkflowRuns({ pr, head, exec })) return null;
     const readPage = endpoint => {
       const result = JSON.parse(api([endpoint], exec));
       if (!Array.isArray(result.workflow_runs) || !Number.isSafeInteger(result.total_count)
@@ -94,6 +98,16 @@ export function readHeadWorkflowRuns({ repo, pr, head, exec = execFileSyncThrott
 export function createRetriggerIo({ repo, pr, exec = execFileSyncThrottled }) {
   return {
     readHead: () => JSON.parse(api([`repos/${repo}/pulls/${pr}`], exec))?.head?.sha,
+    readPr: () => {
+      const live = JSON.parse(api([`repos/${repo}/pulls/${pr}`], exec));
+      return {
+        state: typeof live?.state === 'string' ? live.state.toUpperCase() : null,
+        baseRefName: live?.base?.ref, headRefOid: live?.head?.sha,
+        isCrossRepository: text(live?.head?.repo?.full_name) && text(live?.base?.repo?.full_name)
+          ? live.head.repo.full_name !== live.base.repo.full_name : null,
+        mergeable: live?.mergeable === true ? 'MERGEABLE' : live?.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
+      };
+    },
     readLabels: () => {
       const labels = JSON.parse(api([`repos/${repo}/issues/${pr}/labels?per_page=100`], exec));
       if (!Array.isArray(labels) || labels.length >= 100 || !labels.every(row => text(row?.name)))
@@ -110,7 +124,7 @@ export function createRetriggerIo({ repo, pr, exec = execFileSyncThrottled }) {
 }
 
 /** Synchronous so the synchronous sweep observes completion; also usable with await. */
-export function retriggerRequiredContext({ repo, pr, head, context, io, ledger = createMergeGateRetriggerStore() }) {
+export function retriggerRequiredContext({ repo, pr, head, context, defaultBranch = 'main', io, ledger = createMergeGateRetriggerStore() }) {
   const defer = error => ({ ok: false, deferred: true, action: 'label-retrigger', error });
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !Number.isSafeInteger(pr) || pr <= 0
     || !/^[a-f0-9]{40}$/i.test(head ?? '') || context !== 'merge-gate') return defer('invalid retrigger key');
@@ -121,10 +135,18 @@ export function retriggerRequiredContext({ repo, pr, head, context, io, ledger =
     const labels = io.readLabels();
     if (!Array.isArray(labels) || !labels.every(text))
       throw new Error('unreadable PR labels; operator inspection required');
+    // Revalidate all eligibility on live evidence before even removing a stale sentinel.
+    let live;
+    try { live = io.readPr(); }
+    catch { return defer('live PR unreadable; operator inspection required'); }
+    if (live?.state !== 'OPEN' || !text(defaultBranch) || live?.baseRefName !== defaultBranch
+      || live?.isCrossRepository !== false || live?.mergeable !== 'MERGEABLE'
+      || live?.headRefOid !== head)
+      return defer('live PR is ineligible or incomplete; operator inspection required');
     if (labels.includes(RETRIGGER_LABEL) && io.removeLabel(RETRIGGER_LABEL)?.ok !== true)
       throw new Error('stale sentinel label removal unconfirmed; operator inspection required');
     if (io.addLabel(RETRIGGER_LABEL)?.ok !== true) throw new Error('label addition unconfirmed');
-  } catch (error) { return { ok: false, action: 'label-retrigger', error: String(error.message ?? error) }; }
+  } catch (error) { return defer(String(error.message ?? error)); }
   const result = { ok: true, action: 'label-retrigger' };
   try {
     if (io.removeLabel(RETRIGGER_LABEL)?.ok !== true) throw new Error('label removal unconfirmed');

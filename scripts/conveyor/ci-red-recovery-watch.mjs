@@ -73,7 +73,7 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
-import { decideRequiredContextRetrigger, retriggerRequiredContext, readHeadWorkflowRuns,
+import { decideRequiredContextRetrigger, retriggerRequiredContext, readHeadWorkflowRuns, canReadHeadWorkflowRuns,
   createMergeGateRetriggerStore } from './merge-gate-retrigger.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -1345,7 +1345,9 @@ export function sweepMissingRunRecovery({
     ? defaultReadAttributedRequiredChecks : readRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
-  readWorkflowRuns = readHeadWorkflowRuns, labelRetrigger = retriggerRequiredContext,
+  // Injected evidence readers must also supply run-list IO; never mix fixture evidence with live GitHub reads.
+  readWorkflowRuns = readRequiredContexts === defaultReadRequiredContexts ? readHeadWorkflowRuns : null,
+  labelRetrigger = retriggerRequiredContext,
   retriggerLedger = createMergeGateRetriggerStore(),
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
@@ -1414,13 +1416,15 @@ export function sweepMissingRunRecovery({
   });
 
   const applied = [];
-  // Each label candidate costs at most two run reads, a head read, a label read and three label writes.
-  // Bound evidence reads to eight candidates (56 new GitHub calls); others use existing recovery.
+  // Each label candidate costs at most two run reads, a head read, a PR read, a label read and three label writes.
+  // Bound evidence reads to eight candidates (64 new GitHub calls); excess candidates require operator inspection.
   let retriggerCandidates = 0;
   if (apply) {
     for (const d of plan.dispatch) {
       const pr = prByNumber.get(d.prNumber);
-      if (d.baseRefName === defaultBranch && defaultBasePartialContexts?.includes('merge-gate')
+      if (typeof readWorkflowRuns === 'function'
+        && (readWorkflowRuns !== readHeadWorkflowRuns || canReadHeadWorkflowRuns({ pr: d.prNumber, head: d.headSha }))
+        && d.baseRefName === defaultBranch && defaultBasePartialContexts?.includes('merge-gate')
         && !pr?.statusCheckRollup?.some(row => (row?.name ?? row?.context) === 'merge-gate')) {
         let decision;
         let workflowRuns;
@@ -1430,7 +1434,17 @@ export function sweepMissingRunRecovery({
             decision = decideRequiredContextRetrigger({ requiredContexts: defaultBasePartialContexts,
               rollup: pr?.statusCheckRollup, workflowRuns, alreadyRetriggered: false });
           }
-        } catch { /* Unavailable evidence leaves the existing recovery path in charge. */ }
+        } catch { /* Missing decision below refuses unreadable workflow evidence. */ }
+        if (!decision || decision.reason === 'merge-gate workflow is live'
+          || decision.reason === 'unreadable retrigger evidence; operator inspection required') {
+          const error = retriggerCandidates > 8
+            ? 'merge-gate evidence candidate bound exceeded; operator inspection required'
+            : decision?.reason?.includes('operator inspection required') ? decision.reason
+              : `${decision?.reason ?? 'merge-gate workflow evidence unreadable'}; operator inspection required`;
+          applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
+            ok: false, deferred: true, action: 'label-retrigger', labelCleared: false, error });
+          continue;
+        }
         if (decision?.action === 'retrigger' && workflowRuns.some(run => run.name === 'Merge gate'
           && run.event === 'pull_request_target' && run.conclusion === 'startup_failure')) {
           // Label recovery owns this head for the sweep, including capped or spent claims.
@@ -1451,7 +1465,7 @@ export function sweepMissingRunRecovery({
           let result;
           try {
             result = labelRetrigger({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha,
-              context: decision.context, ledger: retriggerLedger });
+              context: decision.context, defaultBranch, ledger: retriggerLedger });
           } catch (error) { result = { ok: false, deferred: true, error: String(error.message ?? error) }; }
           // Record every label attempt through the same durable marker path as push recovery,
           // so both per-head and PR-wide caps include successes and failures.
