@@ -144,6 +144,17 @@ const MAX_GLOBS = GUARD_FLOOR.length + 512;
 /** Most candidate forms one reported path may yield; more cannot be matched at bounded cost and fail closed. */
 const MAX_CANDIDATES = 32;
 /**
+ * The one fold a reported path and a protected pattern both go through (PR #6381 referral: the two sides dropped
+ * different characters): compatibility form (NFKC); invisible, control, format, line and paragraph separator
+ * characters and the blank Braille pattern dropped; the dash, slash and dot lookalikes NFKC keeps (U+2011, U+2212,
+ * U+2215, U+3002, ...) read as `-`, `/` and `.`. Written as escapes: a raw invisible in source is refused by check:standards.
+ */
+const foldPathText = s => s.normalize('NFKC')
+  .replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{2800}]/gu, '')
+  .replace(/[\p{Pd}\u{2212}\u{2043}]/gu, '-')
+  .replace(/[\u{2215}\u{2044}\u{2216}\u{29f5}\u{29f8}\u{29f9}]/gu, '/')
+  .replace(/[\u{b7}\u{589}\u{6d4}\u{2027}\u{2219}\u{22c5}\u{2e31}\u{2e33}\u{3002}\u{30fb}]/gu, '.');
+/**
  * Every repo-relative POSIX form a reported path may name, or null when it cannot be established (callers fail closed).
  * A model reading a diff or a trace wraps the file in text the floor globs never match: quotes or backticks, a diff
  * header or side prefix (`+++ b/`, `a/`, `i/`), a folder above the repo, a line suffix (`:42`, `:42-50`, `#L42`,
@@ -159,11 +170,16 @@ function pathCandidates(file, anchors = new Set()) {
   const raw = pathCandidate(file);
   if (raw === null) return null;
   const out = new Set([raw]);
-  // Folded with the same set cleanPattern drops (PR #6381 referral: a format or control character that is not
-  // default-ignorable, U+FFF9 or U+0600, split the token, so an explicitly named module matched no glob), plus the
-  // line and paragraph separators and the blank Braille pattern. A second form also drops whitespace, which renders as
-  // a gap inside a name. Each form only adds candidates; the raw report stays one too.
-  const folded = file.normalize('NFKC').replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}⠀]/gu, '');
+  // PR #6381 referral (block): a character that NFKC keeps split the folded token, so an explicitly named module
+  // matched no glob. Listing such characters always misses the next one (a format character, then a lookalike dash,
+  // then a combining mark), so the fold maps the separators a path uses and then REFUSES what is left: a token that
+  // still holds a non-ASCII letter, number, mark or symbol next to a path character cannot be established, and the
+  // path fails closed (protected). Every tracked file name is ASCII, so no real path is refused. A second form also
+  // drops whitespace, which renders as a gap inside a name. Each form only adds candidates; the raw report stays one.
+  // A run is what sits between whitespace, quotes and brackets (a curly-quoted or bracketed `(x.mjs)` stays prose); one holding a
+  // `.`, `/` or `\` names a path, so a non-ASCII character left in it refuses the report.
+  const folded = foldPathText(file);
+  if ((folded.match(/[^\s\p{Pi}\p{Pf}\p{Ps}\p{Pe}]+/gu) ?? []).some(run => /[^\x00-\x7f]/.test(run) && /[./\\]/.test(run))) return null;
   for (const form of new Set([file, folded, folded.replace(/\s/gu, '')])) {
     for (const token of form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []) {
       const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
@@ -203,7 +219,7 @@ function pathCandidate(file) {
 // climbs above it (`../x`) cannot be placed: both protect every path. A trailing `/` (a directory) is kept.
 const cleanPattern = p => {
   // Trimmed AFTER the invisible characters go, so a space beside one (`custom/** <U+200B>`) is trimmed too.
-  const s = p.normalize('NFKC').replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}]/gu, '').trim().replace(/\\/g, '/');
+  const s = foldPathText(p).trim().replace(/\\/g, '/');
   const segs = [];
   for (const seg of s.split('/')) {
     if (seg === '' || seg === '.') continue;

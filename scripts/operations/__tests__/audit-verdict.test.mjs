@@ -939,9 +939,23 @@ describe('R473 structured concurrency evidence', () => {
       // gap, not a character, and split the token too.
       ...[0xfff9, 0xfffb, 0x600, 0x6dd, 0x70f, 0x110bd, 0x85, 0x7f, 0x9f, 0x2028, 0x2029, 0x2800, 0x20, 0xa0, 0x3000].flatMap(cp => [`scripts/lib/review-${String.fromCodePoint(cp)}independence.mjs`,
         `scr${String.fromCodePoint(cp)}ipts/lib/review-independence.mjs`, `scripts/lib${String.fromCodePoint(cp)}/review-independence.mjs`,
-        `scripts/lib/git-hook${String.fromCodePoint(cp)}-surface.mjs`])])(
+        `scripts/lib/git-hook${String.fromCodePoint(cp)}-surface.mjs`]),
+      // Self-review of that fix: NFKC keeps dash, slash and dot lookalikes (U+2011, U+2212, U+2215, U+3002, ...), and a
+      // combining mark, a replacement character or a Cyrillic homoglyph splits or changes the name too.
+      ...[0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2212, 0x2043].map(cp => `scripts/lib/review${String.fromCodePoint(cp)}independence.mjs`),
+      ...[0x2215, 0x2044, 0x29f8, 0x2216].map(cp => `scripts${String.fromCodePoint(cp)}lib${String.fromCodePoint(cp)}review-independence.mjs`),
+      ...[0x3002, 0xff61, 0x2027, 0xb7, 0x589].map(cp => `scripts/lib/review-independence${String.fromCodePoint(cp)}mjs`),
+      ...[0x301, 0x20dd, 0x488, 0xfffd, 0xfffc, 0x2423, 0x203f].map(cp => `scripts/lib/review-indep${String.fromCodePoint(cp)}endence.mjs`),
+      `${String.fromCodePoint(0x455)}cripts/lib/review-independence.mjs`, `scripts/lib/r${String.fromCodePoint(0x435)}view-independence.mjs`,
+      `scripts/lib/review-independence${String.fromCodePoint(0x2e)}m${String.fromCodePoint(0x458)}s`])(
       'a protected file reported as %j still never ships', async file => {
         for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
+      });
+    // Every tracked file name is ASCII, so a non-ASCII character left in a path after the fold cannot name a real file
+    // and could hide a protected one: it fails closed, even where no protected name is in sight (PR #6381 self-review).
+    it.each([`src/comp${String.fromCodePoint(0x43e)}nents/merge-button.ts`, `x/out${String.fromCodePoint(0x301)}put.mjs`, `docs/notes${String.fromCodePoint(0x3001)}md`])(
+      'a reported path still holding a non-ASCII character after the fold, %j, fails closed', async file => {
+        neverShips(await compute([finding({ class: 'E2', file })], options()));
       });
     it('a path with more candidate forms than can be matched at bounded cost fails closed', async () => {
       neverShips(await compute([finding({ class: 'E2', file: `${'scripts/'.repeat(40)}output.mjs` })], options()));
@@ -949,7 +963,10 @@ describe('R473 structured concurrency evidence', () => {
       expect((await compute([finding({ class: 'E2', file: `${'x/'.repeat(200)}output.mjs` })], options())).verdict).toBe('NOT WEAKENED');
     });
     it.each(['a/scripts/output.mjs', 'scripts/output.mjs:12', 'scripts/output.mjs#L12', 'scripts/output.mjs ', '`scripts/output.mjs`',
-      '+++ b/scripts/output.mjs', 'src/components/merge-button.ts'])(
+      '+++ b/scripts/output.mjs', 'src/components/merge-button.ts',
+      // Quotes, brackets and a dash between words stay prose: they never refuse an unprotected report.
+      `${String.fromCodePoint(0x2018)}scripts/output.mjs${String.fromCodePoint(0x2019)}`, `${String.fromCodePoint(0x201c)}scripts/output.mjs${String.fromCodePoint(0x201d)}`,
+      `scripts/output.mjs ${String.fromCodePoint(0x2014)} line 12`, `scripts/output.mjs${String.fromCodePoint(0x2013)}12`, `${String.fromCodePoint(0x300c)}scripts/output.mjs${String.fromCodePoint(0x300d)}`])(
       'an unprotected file reported as %j still ships as debt (the stripped forms add protection, never remove a path)', async file => {
         expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('NOT WEAKENED');
       });
