@@ -48,15 +48,19 @@ describe('red-team check run contract', () => {
     // Reader contract: live PR object, complete comment array, verified standing-ruling scope.
     // Check history stays behind the injected gh boundary; no test can reach GitHub.
     function fixture() {
+      const checkRuns = [run({ conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' })];
       return { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, env: {},
         readLive: vi.fn(() => ({ headRefOid: HEAD, labels: [] })),
         readComments: vi.fn(() => [resultComment()]),
         readStandingRuling: vi.fn(() => null),
         holdFn: vi.fn(() => null),
-        gh: vi.fn(args => {
-          if (args.includes('POST')) return JSON.stringify({ id: 20 });
+        gh: vi.fn((args, options) => {
+          if (args.includes('POST')) {
+            checkRuns.push(run({ ...JSON.parse(options.input), id: 20 }));
+            return JSON.stringify({ id: 20 });
+          }
           if (args.includes(`repos/o/r/commits/${HEAD}/check-runs?check_name=red-team&filter=all&per_page=100`))
-            return JSON.stringify({ total_count: 1, check_runs: [run({ conclusion: 'failure' })] });
+            return JSON.stringify({ total_count: checkRuns.length, check_runs: checkRuns });
           throw Error(`unexpected GitHub read: ${JSON.stringify(args)}`);
         }),
       };
@@ -64,6 +68,34 @@ describe('red-team check run contract', () => {
     const posts = io => io.gh.mock.calls.filter(([args]) => args.includes('POST'));
     const payloads = io => posts(io).map(([, options]) => JSON.parse(options.input));
     const publish = io => api.publishRedTeamCheckFromLive(io);
+
+    it.each([[null, 'in_progress'], [null, 'completed'], [10, 'in_progress'], [10, 'completed']])
+    ('detects a run hidden between the pre-read (%s) and our success (status=%s)', async (beforeId, status) => {
+        const intervening = run({ id: 15, status, conclusion: status === 'completed' ? 'success' : null });
+        const io = fixture();
+        let posted = false;
+        const prior = beforeId === null ? [] : [run({ id: beforeId })];
+        io.gh.mockImplementation(args => {
+          if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+          const check_runs = posted ? [...prior, intervening, run({ id: 20 })] : prior;
+          return JSON.stringify({ total_count: check_runs.length, check_runs });
+        });
+        expect(await publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/raced publication/) });
+        expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+    });
+
+    it.each([null, 10])('accepts exactly the pre-read runs (%s) followed by our success', async beforeId => {
+      const io = fixture();
+      let posted = false;
+      const prior = beforeId === null ? [] : [run({ id: beforeId })];
+      io.gh.mockImplementation(args => {
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+        const check_runs = posted ? [...prior, run({ id: 20 })] : prior;
+        return JSON.stringify({ total_count: check_runs.length, check_runs });
+      });
+      expect(await publish(io)).toMatchObject({ ok: true });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success']);
+    });
 
     it.each([
       '1. [**confirmed**] edge-case broken — missing parenthesised class.',
@@ -118,12 +150,18 @@ describe('red-team check run contract', () => {
       ['invalid result timestamp', 'unreadable', '2026-11-07T11:00:00Z', undefined, false],
       ['missing run timestamps', '2026-11-07T12:00:00Z', undefined, undefined, false],
       ['invalid completion timestamp', '2026-11-07T12:00:00Z', 'unreadable', '2026-11-07T08:00:00Z', false],
-      ['started_at fallback', '2026-11-07T12:00:00Z', undefined, '2026-11-07T11:00:00Z', true],
+      ['missing completed_at despite an earlier started_at', '2026-11-07T12:00:00Z', undefined, '2026-11-07T11:00:00Z', false],
     ])('requires a demonstrably newer trusted result before replacing failure: %s', async (_name, created_at, completed_at, started_at, ok) => {
       const io = fixture();
       io.readComments.mockReturnValue([{ ...resultComment(), created_at }]);
-      io.gh.mockImplementation(args => args.includes('POST') ? JSON.stringify({ id: 20 })
-        : JSON.stringify({ total_count: 1, check_runs: [run({ conclusion: 'failure', completed_at, started_at })] }));
+      const check_runs = [run({ conclusion: 'failure', completed_at, started_at })];
+      io.gh.mockImplementation((args, options) => {
+        if (args.includes('POST')) {
+          check_runs.push(run({ ...JSON.parse(options.input), id: 20 }));
+          return JSON.stringify({ id: 20 });
+        }
+        return JSON.stringify({ total_count: check_runs.length, check_runs });
+      });
       expect(await publish(io)).toMatchObject({ ok });
       expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
     });

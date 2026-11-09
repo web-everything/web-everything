@@ -145,12 +145,13 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
           return parsed?.pr === Number(pr) && parsed.rev === headSha.toLowerCase()
             && redTeamResultId(parsed) === resultId;
         }).map(comment => Date.parse(commentCreatedAt(comment)));
-        const failedAt = Date.parse(latest.completed_at ?? latest.started_at);
+        // A result produced during a round cannot resolve that round's later failure.
+        const failedAt = Date.parse(latest.completed_at);
         if (!dates.length || dates.some(date => !Number.isFinite(date)) || !Number.isFinite(failedAt)
           || Math.max(...dates) <= failedAt)
           throw Error('trusted live result not demonstrably newer than failed check; operator must inspect result and run timestamps');
       }
-      return latest?.id ?? null;
+      return runs.map(run => run.id);
     };
     const before = inspect();
     let postedId;
@@ -167,7 +168,11 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
       }, payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null }) });
     if (!posted.ok) throw Error(posted.reason);
     const after = inspect();
-    if (after !== before && after !== postedId) throw Error('another red-team check raced publication');
+    // Our newer id can hide an intervening round even when ours is the latest visible success.
+    // Require the entire previous order, with only our run prepended (runs are newest first).
+    if (after[0] !== postedId || after.length !== before.length + 1
+      || before.some((id, index) => after[index + 1] !== id))
+      throw Error('another red-team check raced publication');
     return { ok: true };
   } catch (error) {
     const reason = `live red-team check not clear: ${message(error)}`;
