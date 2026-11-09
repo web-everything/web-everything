@@ -49,8 +49,9 @@ it('composes a bounded title, full digest and only explicit WE scope', () => {
   expect(composeFileItemInput({ text: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.' })).toMatchObject({
     title: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.', digest: 'Repair behavior; details in `we:scripts/a.mjs` and we:scripts/b.mjs.', scope: 'we:scripts/a.mjs,we:scripts/b.mjs',
   });
-  expect(composeFileItemInput({ text: 'x' })).toHaveProperty('size', '');
-  expect(sizeRefusal(composeFileItemInput({ text: 'x' }).kind, composeFileItemInput({ text: 'x' }).size)).toBeNull();
+  // file-item defaults size to '' — handing one in trips the unsized-kind guard (#x0h3pe4).
+  expect(composeFileItemInput({ text: 'x' })).not.toHaveProperty('size');
+  expect(sizeRefusal(composeFileItemInput({ text: 'x' }).kind, '')).toBeNull();
   expect(composeFileItemInput({ text: 'a'.repeat(150) }).title).toHaveLength(111);
   expect(composeFileItemInput({ text: 'No scope' })).not.toHaveProperty('scope');
 });
