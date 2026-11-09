@@ -11,8 +11,9 @@ const globOk = (p, pat) => {
   return re.test(p);
 };
 /** The new matcher as a caller uses it: null is protected, otherwise any candidate matches any pattern. */
+const ANCHORS = oracleAnchorsOf(PATTERNS.map(oracleCleanPattern));
 const protects = (file, patterns = PATTERNS) => {
-  const c = canonicalPaths(file);
+  const c = canonicalPaths(file, ANCHORS);
   return c === null || lower(c).some(x => patterns.some(p => globOk(x, p.toLowerCase())));
 };
 
@@ -43,6 +44,7 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
     'leading slash': '/scripts/guard-bash.mjs',
     'backslash separator': 'scripts\\guard-bash.mjs',
     'uppercase (case-insensitive fs)': 'Scripts/Guard-Bash.mjs',
+    'top-level name with line suffix reads as a scheme': 'review-x.mjs:42',
     'plus in name': 'custom/a+b.mjs',
     'plus in name, quoted + line': '"custom/a+b.mjs":12',
     'plus in name, markdown link': '[x](custom/a+b.mjs)',
@@ -86,7 +88,7 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
   });
   it('reads the accepted shapes', () => {
     expect(canonicalPaths('scripts/x.mjs')).toEqual(['scripts/x.mjs']);
-    expect(canonicalPaths('  "./scripts//x.mjs":4-9\n')).toEqual(['scripts/x.mjs']);
+    expect(canonicalPaths('  "./scripts//x.mjs":4-9 ')).toEqual(['scripts/x.mjs']);
     expect(canonicalPaths('+++ b/scripts/x.mjs')).toEqual(['b/scripts/x.mjs', 'scripts/x.mjs']);
     expect(canonicalPaths('a/x.mjs#L3-L9')).toEqual(['a/x.mjs', 'x.mjs']);
     expect(canonicalPaths('scripts/x.mjs:1:2')).toEqual(['scripts/x.mjs']);
@@ -103,7 +105,7 @@ const rng = seed => () => {
   t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 };
-const FRAGS = ['scripts', 'lib', 'guard-bash.mjs', 'custom', 'a+b.mjs', '.claude', 'x', '..', '.', '/', '/', '/', '"', "'", '`', '+++ ', '--- ', 'a/', 'b/', ':42', ':4-9', ':1:2', '#L3', '#L3-L9', ' ', '\t', '\n', '(', ')', '[', ']', ',', '.', '@', '%2B', '&#43;', '\\', '-', '_', '​', '؀', '‑', '∕', 'ｓ', '。', '⠀', '́', 'é', '*', '**', 'review-x.mjs'];
+const FRAGS = ['scripts', 'lib', 'guard-bash.mjs', 'custom', 'a+b.mjs', '.claude', 'x', '..', '.', '/', '/', '/', '"', "'", '`', '+++ ', '--- ', 'a/', 'b/', ':42', ':4-9', ':1:2', '#L3', '#L3-L9', ' ', '\t', '\n', '(', ')', '[', ']', ',', '.', '@', '%2B', '&#43;', '\\', '-', '_', '\u200b', '\u0600', '\u2011', '\u2215', '\uff53', '\u3002', '\u2800', '\u0301', '\u00e9', '*', '**', 'review-x.mjs'];
 const fuzz = r => {
   let s = ''; const n = 1 + Math.floor(r() * 9);
   for (let i = 0; i < n; i++) s += FRAGS[Math.floor(r() * FRAGS.length)];
@@ -113,14 +115,14 @@ const fuzz = r => {
 describe('P2 monotonic against the old matcher (test-only oracle)', () => {
   // The oracle also matched on forms that are not names: every trailing sub-path of a longer path ("folder above the
   // repo"), the digits of a line suffix, and the raw report with its wrapper text. The strict grammar drops exactly
-  // those; any other candidate the oracle matched on must still make the new matcher protect the path.
+  // those (the sub-paths come back through the optional anchors argument); any other candidate the oracle matched on must still make the new matcher protect the path.
   const clean = PATTERNS.map(oracleCleanPattern);
-  const allowedDrop = (c, news, file) => /^\d+$/.test(c) || c === file.toLowerCase() || news.some(n => n.endsWith('/' + c));
+  const allowedDrop = (c, news, file) => /^\d+$/.test(c) || c === file.toLowerCase();
   const check = file => {
     if (!oracleMatchesSome(file, PATTERNS) || protects(file)) return;
-    const news = lower(canonicalPaths(file));
+    const news = lower(canonicalPaths(file, ANCHORS));
     const old = oraclePathCandidates(file, oracleAnchorsOf(clean));
-    if (old === null) return; // the oracle refused (protected) a shape the grammar defines; P3 guards over-blocking
+    expect(old, 'oracle refused but grammar accepted ' + JSON.stringify(file)).not.toBeNull();
     for (const c of lower(old)) {
       if (clean.some(p => oracleMatchesPath(c, p)) && !allowedDrop(c, news, file)) throw new Error('lost match on ' + JSON.stringify(c) + ' for ' + JSON.stringify(file));
     }
@@ -140,9 +142,10 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     const names = ['scripts/guard-bash.mjs', 'scripts/lib/a.mjs', '.claude/s.json', 'custom/q/r.mjs', 'review-x.mjs', 'docs/a.md'];
     for (let i = 0; i < 5000; i++) check(fuzz(r) + names[Math.floor(r() * names.length)] + fuzz(r));
   });
-  it('named narrowing: a folder above the repo is a nested path, not a repo file', () => {
+  it('folder above the repo: without anchors a nested path, with anchors the anchored sub-path too', () => {
     expect(oracleMatchesSome('repo/scripts/guard-bash.mjs', ['scripts/guard-bash.mjs'])).toBe(true);
     expect(canonicalPaths('repo/scripts/guard-bash.mjs')).toEqual(['repo/scripts/guard-bash.mjs']);
+    expect(canonicalPaths('repo/scripts/guard-bash.mjs', ANCHORS)).toEqual(['repo/scripts/guard-bash.mjs', 'scripts/guard-bash.mjs']);
   });
 });
 
