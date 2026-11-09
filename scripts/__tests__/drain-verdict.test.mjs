@@ -260,7 +260,7 @@ const RUNNER_STEP_ENV = Object.freeze({
   GITHUB_WORKSPACE: '/home/runner/work/r/r', GITHUB_ACTION_PATH: '', GITHUB_API_URL: 'https://api.github.com',
   RUNNER_TEMP: '/home/runner/work/_temp', RUNNER_OS: 'Linux', RUNNER_ARCH: 'X64', RUNNER_NAME: 'GitHub Actions 1',
   RUNNER_TOOL_CACHE: '/opt/hostedtoolcache', RUNNER_WORKSPACE: '/home/runner/work/r', RUNNER_ENVIRONMENT: 'github-hosted',
-  SELENIUM_JAR_PATH: '/usr/share/java/selenium-server.jar', SWIFT_PATH: '/usr/share/swift/usr/bin', GIT_PATCH_LEVEL: '1',
+  SELENIUM_JAR_PATH: '/usr/share/java/selenium-server.jar', SWIFT_PATH: '/usr/share/swift/usr/bin',
 });
 function ioFor() {
   return {
@@ -287,7 +287,7 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     ['missing run ID', env => { delete env.GITHUB_RUN_ID; }],
     ['empty run ID', env => { env.GITHUB_RUN_ID = ''; }],
     ...['APP_PRIVATE_KEY', 'MY_APP_ID', 'SOME_SECRET', 'BOT_PAT', 'GH_TOKEN', 'EXTRA_TOKEN', 'private_key', 'app_id', 'secret', 'bot_pat',
-      'PAT', 'GH_PAT2', 'ORG_PAT_RW', 'pat_bot']
+      'PAT', 'GH_PAT2', 'ORG_PAT_RW', 'pat_bot', 'GH_PATTOKEN', 'BOT_PATS', 'BOT_PAT-RW']
       .map(name => [`credential ${name}`, env => { env[name] = 'foreign-credential'; }]),
     ['empty forbidden credential still present', env => { env.APP_PRIVATE_KEY = ''; }],
   ])('refuses %s before any process or write', async (_name, mutate) => {

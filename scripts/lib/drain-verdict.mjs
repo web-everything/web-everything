@@ -49,8 +49,8 @@ export function build(inputs) {
   return verdict;
 }
 
-// PAT is matched as a whole `_`-separated word: a substring match also refuses GITHUB_PATH / *_PATH, which every runner step sets.
-export const forbiddenCredential = name => /PRIVATE_KEY|APP_ID|SECRET|(?:^|_)PAT\d*(?:_|$)/i.test(name) ||
+// PAT excludes only PATH: a bare `_PAT` substring also refuses GITHUB_PATH / *_PATH, which every runner step sets.
+export const forbiddenCredential = name => /PRIVATE_KEY|APP_ID|SECRET|(?:^|_)PAT(?!H)/i.test(name) ||
   (/_TOKEN$/i.test(name) && !['GITHUB_TOKEN', 'GH_TOKEN'].includes(name));
 
 /** Audit parsed structure and raw text: comments and expressions also carry credential references. */
