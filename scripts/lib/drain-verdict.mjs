@@ -49,7 +49,9 @@ export function build(inputs) {
   return verdict;
 }
 
-export const forbiddenCredential = name => /PRIVATE_KEY|APP_ID|SECRET|_PAT/i.test(name) ||
+// PAT is matched as a whole `_`-delimited word: a bare `_PAT` substring also hits GITHUB_PATH and
+// SELENIUM_JAR_PATH, which every hosted runner sets, and refused every real run.
+export const forbiddenCredential = name => /PRIVATE_KEY|APP_ID|SECRET|(?:^|_)PATS?(?:_|$)/i.test(name) ||
   (/_TOKEN$/i.test(name) && !['GITHUB_TOKEN', 'GH_TOKEN'].includes(name));
 
 /** Audit parsed structure and raw text: comments and expressions also carry credential references. */

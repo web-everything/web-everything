@@ -251,6 +251,20 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
 });
 
 const argv = ['--only=7', '--verdict-out=verdict.json', '--repo=o/r'];
+// Names a GitHub-hosted ubuntu runner sets for every `run:` step (values elided). Credential matching must
+// accept all of them: `_PAT` once matched GITHUB_PATH, so every real run failed before writing a verdict.
+const RUNNER_ENV = Object.freeze(Object.fromEntries([
+  'GITHUB_PATH', 'GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY', 'GITHUB_STATE', 'GITHUB_EVENT_PATH',
+  'GITHUB_WORKSPACE', 'GITHUB_ACTION_PATH', 'GITHUB_ACTION_REPOSITORY', 'GITHUB_ACTION_REF', 'GITHUB_ACTOR',
+  'GITHUB_ACTOR_ID', 'GITHUB_API_URL', 'GITHUB_GRAPHQL_URL', 'GITHUB_SERVER_URL', 'GITHUB_SHA', 'GITHUB_REF_NAME',
+  'GITHUB_REF_TYPE', 'GITHUB_REF_PROTECTED', 'GITHUB_RUN_ATTEMPT', 'GITHUB_RUN_NUMBER', 'GITHUB_JOB',
+  'GITHUB_WORKFLOW', 'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_RETENTION_DAYS',
+  'GITHUB_REPOSITORY_ID', 'GITHUB_REPOSITORY_OWNER', 'GITHUB_REPOSITORY_OWNER_ID', 'GITHUB_TRIGGERING_ACTOR',
+  'RUNNER_OS', 'RUNNER_ARCH', 'RUNNER_NAME', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'RUNNER_WORKSPACE',
+  'RUNNER_ENVIRONMENT', 'RUNNER_PERFLOG', 'RUNNER_TRACKING_ID', 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE', 'CI',
+  'PATH', 'HOME', 'SELENIUM_JAR_PATH', 'ANDROID_SDK_ROOT', 'JAVA_HOME', 'PIPX_HOME', 'PIPX_BIN_DIR',
+  'POWERSHELL_DISTRIBUTION_CHANNEL', 'ImageOS', 'ImageVersion', 'XDG_CONFIG_HOME', 'INVOCATION_ID', 'JOURNAL_STREAM',
+].map(name => [name, 'runner-value'])));
 function ioFor() {
   return {
     env: { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'schedule',
@@ -275,7 +289,8 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     ...['pull_request', 'pull_request_target', 'push', ''].map(event => [`event ${event}`, env => { env.GITHUB_EVENT_NAME = event; }]),
     ['missing run ID', env => { delete env.GITHUB_RUN_ID; }],
     ['empty run ID', env => { env.GITHUB_RUN_ID = ''; }],
-    ...['APP_PRIVATE_KEY', 'MY_APP_ID', 'SOME_SECRET', 'BOT_PAT', 'GH_TOKEN', 'EXTRA_TOKEN', 'private_key', 'app_id', 'secret', 'bot_pat']
+    ...['APP_PRIVATE_KEY', 'MY_APP_ID', 'SOME_SECRET', 'BOT_PAT', 'GH_TOKEN', 'EXTRA_TOKEN', 'private_key', 'app_id', 'secret', 'bot_pat',
+      'PAT', 'GITHUB_PAT', 'PAT_VALUE', 'MY_PAT_VALUE', 'BOT_PATS', 'gh_pat', 'GITHUB_PATH_PAT']
       .map(name => [`credential ${name}`, env => { env[name] = 'foreign-credential'; }]),
     ['empty forbidden credential still present', env => { env.APP_PRIVATE_KEY = ''; }],
   ])('refuses %s before any process or write', async (_name, mutate) => {
@@ -314,6 +329,11 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     expect(args.some(arg => arg === '--import' || arg.startsWith('--import='))).toBe(false);
     expect(options.env).not.toHaveProperty('DRAIN_CLASSIFY_ONLY');
     expect(options.env.NODE_OPTIONS || '').not.toMatch(/--import|drain-classify-guard/);
+  });
+  it('accepts a real GitHub-hosted runner environment (GITHUB_PATH, RUNNER_*, image tool paths)', async () => {
+    const io = ioFor(); Object.assign(io.env, RUNNER_ENV);
+    await runCli(argv, io);
+    expect(io.writeFileSync).toHaveBeenCalledTimes(1);
   });
   it('resolves the optional repo from the injected environment', async () => {
     const io = ioFor();
@@ -388,6 +408,10 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
   });
   it.each(['9; echo', '-1', 'x', '0'])('schedule ignores non-numeric PR list entry %j as a failure', bad => {
     expect(runBatch(batchArgv, batchIo({ prs: `${bad}\n` }))).toMatchObject({ written: 0, failed: 1 });
+  });
+  it('a real runner environment still writes verdicts', () => {
+    const io = batchIo(); Object.assign(io.env, RUNNER_ENV);
+    expect(runBatch(batchArgv, io)).toMatchObject({ written: 2, failed: 0 });
   });
   it('refuses unsafe env before any process', () => {
     const io = batchIo(); io.env.GITHUB_REF = 'refs/heads/feature';
