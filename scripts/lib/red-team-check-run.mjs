@@ -3,6 +3,11 @@ import { runGhSync } from './gh-throttle.mjs';
 import { readFileSync } from 'node:fs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { readRedTeamDisposition } from './red-team-gate.mjs';
+import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
+import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
+import { createGhProvider } from './review-label-provider.mjs';
 
 /** Cutover defaults to both authorities; invalid overrides retain the lower layer. */
 export function readRedTeamGateSource({ env = process.env,
@@ -91,6 +96,70 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false }) });
 }
 
+/** Re-derive a carried/ruling settlement from live gate evidence; never override a live round.
+ * Recheck after publication and supersede our success if evidence changed or became unreadable. */
+export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = runGhSync,
+  env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
+  holdFn = redTeamEnqueueHold } = {}) {
+  let published = false;
+  try {
+    if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
+      return failure('invalid red-team check identity or WE_APP_ID; operator must inspect configuration');
+    const provider = createGhProvider({ exec: (args, options) => gh(args, { ...ioOptions, ...options }) });
+    const inspect = () => {
+      const live = readLive ? readLive({ repo, pr }) : provider.readPrState(repo, pr);
+      if (live?.headRefOid !== headSha) throw Error('red-team live head moved or unreadable');
+      if (!Array.isArray(live.labels) || live.labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string'))
+        throw Error('red-team live labels unreadable');
+      const labels = live.labels.map(label => typeof label === 'string' ? label : label.name);
+      const blocked = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(label => labels.includes(label));
+      if (blocked) throw Error(`red-team publication held by ${blocked}`);
+      const comments = readComments ? readComments({ repo, pr }) : provider.readComments(repo, pr);
+      if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
+      const standingRuling = readStandingRuling({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } });
+      const disposition = readRedTeamDisposition({ repo, pr, head: headSha, comments, standingRuling, env });
+      if (!disposition.result) throw Error('no trusted red-team result on live head');
+      const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
+      if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);
+      const history = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
+      if (!history.ok) throw Error(history.reason);
+      const fact = evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: history.checkRuns });
+      if (!fact.ok && fact.reason !== 'no red-team check run on head'
+        && !fact.reason.startsWith('red-team check run failed (')) throw Error(fact.reason);
+      const runs = history.checkRuns.filter(run => run?.name === 'red-team' && run.head_sha?.toLowerCase() === headSha.toLowerCase()
+        && Number(run.app?.id) === Number(appId) && run.external_id === prIdentity(repo, pr));
+      if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0))
+        throw Error('red-team check ordering unreadable; operator must inspect full check history');
+      const latest = runs.sort((a, b) => b.id - a.id)[0];
+      if (latest && latest.status !== 'completed') throw Error('red-team check run in progress or incomplete');
+      return latest?.id ?? null;
+    };
+    const before = inspect();
+    let postedId;
+    const posted = postRedTeamCheckRun({ repo, pr, headSha,
+      gh: (args, options) => {
+        const response = gh(args, options);
+        // The response id distinguishes our check from a racing writer's check.
+        published = true;
+        postedId = JSON.parse(response)?.id;
+        if (!Number.isSafeInteger(postedId) || postedId <= 0) throw Error('published check id unreadable');
+        return response;
+      }, payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null }) });
+    if (!posted.ok) throw Error(posted.reason);
+    const after = inspect();
+    if (after !== before && after !== postedId) throw Error('another red-team check raced publication');
+    return { ok: true };
+  } catch (error) {
+    const reason = `live red-team check not clear: ${message(error)}`;
+    if (published) {
+      const supersede = postRedTeamCheckRun({ repo, pr, headSha, gh,
+        payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason }) });
+      if (!supersede.ok) return failure(`${reason}; ${supersede.reason}`);
+    }
+    return failure(reason);
+  }
+}
+
 /** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a
  * second channel beside the check-runs API. The drain posts it when a red-team transition AND its failure supersede
  * both fail to publish, and posts `success` on the same context once publication is confirmed. Any CI host reads it,
@@ -161,13 +230,20 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
 }
 
 /** One bounded read; incomplete evidence needs operator inspection rather than a guessed pass. */
-export function readRedTeamCheckFact({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
+function readRedTeamCheckRuns({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
   if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   try {
     const data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions));
     if (!Array.isArray(data?.check_runs) || data.check_runs.length > 100 || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
       return failure('red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history');
-    return evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: data.check_runs });
+    return { ok: true, checkRuns: data.check_runs };
+  } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
+}
+
+export function readRedTeamCheckFact(options = {}) {
+  try {
+    const history = readRedTeamCheckRuns(options);
+    return history.ok ? evaluateRedTeamCheckFact({ ...options, checkRuns: history.checkRuns }) : history;
   } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
 }

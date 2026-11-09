@@ -147,6 +147,39 @@ describe('red-team check run contract', () => {
         head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
     });
 
+    it.each(['head-moved', 'labels-unreadable', 'result-missing', 'live-unreadable', 'comments-unreadable',
+      'standing-ruling-error', 'hold-error', 'held-break', 'history-unreadable', 'completed-run'])
+    ('supersedes success with failure when post-publication evidence is %s', async mode => {
+      const io = fixture();
+      let posted = false;
+      const readGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+        if (posted && mode === 'history-unreadable') throw Error('check history unavailable');
+        if (posted && mode === 'completed-run') return JSON.stringify({ total_count: 1,
+          check_runs: [run({ id: 99 })] });
+        return readGh(args, options);
+      });
+      io.readLive.mockImplementation(() => !posted ? { headRefOid: HEAD, labels: [] }
+        : mode === 'live-unreadable' ? null
+          : { headRefOid: mode === 'head-moved' ? OLD_HEAD : HEAD,
+            labels: mode === 'labels-unreadable' ? null : [] });
+      io.readComments.mockImplementation(() => posted && mode === 'comments-unreadable' ? null
+        : posted && mode === 'result-missing' ? [] : [resultComment()]);
+      io.readStandingRuling.mockImplementation(() => {
+        if (posted && mode === 'standing-ruling-error') throw Error('standing ruling unavailable');
+        return null;
+      });
+      io.holdFn.mockImplementation(() => {
+        if (posted && mode === 'hold-error') throw Error('hold evidence unavailable');
+        return posted && mode === 'held-break' ? 'confirmed break requires send-back' : null;
+      });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
+        head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
+    });
+
     it.each(['readLive', 'readComments', 'readStandingRuling', 'holdFn', 'gh'])('%s errors return ok:false without throwing or posting', async reader => {
       const io = fixture();
       io[reader].mockImplementation(() => { throw Error('reader unavailable'); });

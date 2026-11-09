@@ -97,6 +97,7 @@ import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDea
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
+import { publishRedTeamCheckFromLive } from '../lib/red-team-check-run.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
@@ -495,6 +496,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { ok: r.status === 0, reason: String(r.stderr || r.stdout || r.error || `exit ${r.status}`) };
     },
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
+    publishCarriedCheck: ({ pr, repo, headSha }) => publishRedTeamCheckFromLive({ pr, repo, headSha,
+      appId: env.WE_APP_ID, env, gh: (args, options) => exec('gh', args, { ...options, cwd: root, env }) }),
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
@@ -1130,7 +1133,15 @@ function runReviewArc({
                 'Review verdict carried across an identical contribution.',
                 ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');
               io.postCarryComment({ pr: planned.pr, repo: planned.repo, body });
-              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId };
+              let checkPublished = false;
+              try {
+                const published = io.publishCarriedCheck({ pr: planned.pr, repo: planned.repo, headSha: evidence.headSha });
+                checkPublished = published?.ok === true;
+                if (!checkPublished) io.log(`review-job ${slug}: carried check not published (${tail(safeErrorText(published?.reason ?? 'unknown error').replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`);
+              } catch (error) {
+                io.log(`review-job ${slug}: carried check not published (${tail(safeErrorText(error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`);
+              }
+              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId, checkPublished };
               return result(classified);
             }
           }

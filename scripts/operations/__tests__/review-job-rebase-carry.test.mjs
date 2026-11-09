@@ -26,7 +26,8 @@ describe('review job rebase carry', () => {
     expect([...gateOutcomesForHead([trusted(body)], 1, b)]).toEqual(['card-queued']);
     for (const key of ['runLoop', 'runExtraSeats', 'runRedTeam', 'startSpeculativeRedTeam']) expect(io[key]).not.toHaveBeenCalled();
     expect(io.restampVerdict.mock.invocationCallOrder[0]).toBeLessThan(io.postCarryComment.mock.invocationCallOrder[0]);
-    expect(io.publishCarriedCheck).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    expect(io.publishCarriedCheck).toHaveBeenCalledTimes(1);
+    expect(io.publishCarriedCheck).toHaveBeenCalledWith(expect.objectContaining({
       pr: 1, repo: 'web-everything/web-everything', headSha: b,
     }));
     expect(io.postCarryComment.mock.invocationCallOrder[0]).toBeLessThan(io.publishCarriedCheck.mock.invocationCallOrder[0]);
