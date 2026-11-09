@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { diffPlists, renderAll, validateTable } from './daemons-render.mjs';
 
-const TABLE = new URL('../settings/daemon-tasks.json', import.meta.url);
+const TABLE = join(dirname(fileURLToPath(import.meta.url)), '../settings/daemon-tasks.json');
 
 export function readTable(path = TABLE) {
   return validateTable(JSON.parse(readFileSync(path, 'utf8')));
