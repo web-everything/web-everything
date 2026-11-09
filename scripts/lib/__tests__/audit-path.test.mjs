@@ -151,6 +151,15 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     const many = 'scripts/'.repeat(34) + 'x.mjs';
     expect(oracleMatchesSome(many, pats)).toBe(true);
     expect(canonicalPaths(many, anchors)).toBeNull();
+    for (const n of [4, 6, 8, 10, 12, 16, 34]) {
+      for (const wrap of [x => x, x => '"' + x + '":42', x => '+++ b/' + x + '#L3']) {
+        const f = wrap('scripts/'.repeat(n) + 'x.mjs');
+        if (oracleMatchesSome(f, pats)) {
+          const c = canonicalPaths(f, anchors);
+          expect(c === null || c.some(x => globOk(x, 'scripts/secret.mjs')), f).toBe(true);
+        }
+      }
+    }
     expect(canonicalPaths('custom/x.mjs:42')).toContain('42');
     expect(canonicalPaths('custom/x.mjs:42')).toContain('custom/x.mjs42');
     expect(canonicalPaths('public/readme.md#L42')).toContain('L42');
@@ -191,7 +200,7 @@ describe('P4 total and bounded', () => {
     const t0 = performance.now();
     for (const h of hostile) {
       const c = canonicalPaths(h);
-      expect(c === null || (Array.isArray(c) && c.length >= 1 && c.length <= 32)).toBe(true);
+      expect(c === null || (Array.isArray(c) && c.length >= 1 && c.length <= 16)).toBe(true);
     }
     expect(performance.now() - t0).toBeLessThan(2000);
   });
