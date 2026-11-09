@@ -535,6 +535,18 @@ describe('redecideWithCandidate (R787/R796)', () => {
     expect(o.alert).not.toHaveBeenCalledWith('ready-candidate-redecided', expect.anything());
   });
 
+  it('proves containment against the original live tips even if candidate code rewrites its liveApplied', async () => {
+    const o = setup();
+    const base = o.git;
+    o.git = (args) => (args[0] === 'merge-tree' && args[4] === 'b'.repeat(40) ? { status: 0, stdout: `${'e'.repeat(40)}\n` } : base(args));
+    o.candidate.matchReadyCandidate.mockImplementation((a) => {
+      for (const entry of a.liveApplied) entry.sha = a.ready.adopt.finalSha;
+      return { adopt: a.ready.adopt, dropRefs: [] };
+    });
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.alert).toHaveBeenCalledWith('redecide-containment-failed', expect.any(Object));
+  });
+
   it('retains the original refusal and cleans scratch when the loader throws', async () => {
     const o = setup();
     let scratch;

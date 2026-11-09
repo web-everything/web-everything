@@ -168,6 +168,7 @@ export async function redecideWithCandidate({ m, ready, git, args, alert, loadCa
     dir = mkdtempSync(join(tmpdir(), 'we-ready-redecide-'));
     const finalSha = ready.adopt.finalSha;
     const expected = JSON.stringify(ready.adopt); // snapshot before candidate code runs
+    const liveSnapshot = structuredClone(args.liveApplied); // the proof reads the running code's own copy, never one candidate code can mutate
     const candidate = await loadCandidate({ git, finalSha, dir });
     if (typeof candidate?.matchReadyCandidate !== 'function' || typeof candidate?.overlayGraduated !== 'function') {
       throw new Error('candidate adoption exports unavailable');
@@ -175,6 +176,7 @@ export async function redecideWithCandidate({ m, ready, git, args, alert, loadCa
     const result = await candidate.matchReadyCandidate({
       ...args,
       ready: structuredClone(ready),
+      liveApplied: structuredClone(liveSnapshot),
       leftForMain: (applied, build) => args.leftForMain(applied, build, candidate.overlayGraduated),
     });
     if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('candidate returned a non-object decision');
@@ -182,7 +184,7 @@ export async function redecideWithCandidate({ m, ready, git, args, alert, loadCa
     const sameAdopt = JSON.stringify(result.adopt) === expected && JSON.stringify(ready.adopt) === expected;
     if (!sameAdopt || result.adopt?.finalSha !== finalSha || !Array.isArray(result.dropRefs) || result.dropRefs.length !== 0) return m;
     // The candidate's word is never enough: the RUNNING code proves, by git alone, that each omitted overlay tip is already in the tree.
-    if (!omittedContentContained({ git, finalSha, omitted: m.omitted, liveApplied: args.liveApplied })) {
+    if (!omittedContentContained({ git, finalSha, omitted: m.omitted, liveApplied: liveSnapshot })) {
       alert('redecide-containment-failed', { target: finalSha, omitted: m.omitted ?? [] });
       return m;
     }
