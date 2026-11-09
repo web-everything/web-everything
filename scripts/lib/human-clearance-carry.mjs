@@ -41,17 +41,18 @@
  *   Setting: `review.carryEquivalence` (contribution|strict), env `WE_REVIEW_CARRY_EQUIVALENCE`.
  */
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
+import { resolveMechanicalCarrySetting } from './human-clearance-mechanical-carry-setting.mjs';
+import { AUTOMATION_LOGINS } from './marker-authorship.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   parseLatestHumanClearedSha, parseReviewedSha, parseReviewedDiff, parseOperatorClearance, parseReviewedContribution,
-  buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker,
+  buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId, latestHumanClearanceComment,
 } from './review-escalation.mjs';
 import { compareCarryFingerprints, ensureCommitReadable, liveCarryFingerprints, proveReplayEquivalent, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isNumberingTolerableLaterBody, proveNumberingOnlyMove, resolveNumberingHumanClearanceSetting } from './numbering-carry.mjs';
 import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const HUMAN_CLEARANCE_CARRY_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'human-clearance-carry.json');
 export const HUMAN_CLEARANCE_CARRY_ENV = 'WE_REVIEW_HUMAN_CLEARANCE_CARRY';
@@ -91,15 +92,15 @@ export function latestHumanClearance(comments) {
   const list = Array.isArray(comments) ? comments : [];
   const sha = parseLatestHumanClearedSha(list);
   if (!sha) return null;
-  const trusted = list.filter(isTrustedMarkerAuthor);
-  const latest = trusted.findLast((c) => parseReviewedSha([c]));
+  // The comment the shared scan ACCEPTED (a human original or a proven carrier), never a rejected carrier's metadata.
+  const latest = latestHumanClearanceComment(list);
   if (!latest || parseReviewedSha([latest]) !== sha) return null;
   // Only a full 40-hex sha can be compared to the live head and fed to git; an attributed clearance needs a named actor
   // (`parseOperatorClearance` refuses an empty `cleared-human:` where `parseLatestHumanClearedSha` does not).
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
   const clearance = parseOperatorClearance([latest]);
   if (!clearance) return null;
-  return { sha, diff: parseReviewedDiff([latest]), contribution: parseReviewedContribution([latest]), actor: sanitizeActor(clearance.actor) };
+  return { sha, diff: parseReviewedDiff([latest]), contribution: parseReviewedContribution([latest]), actor: sanitizeActor(clearance.actor), sourceId: latestHumanClearanceSourceId(list) };
 }
 
 /**
@@ -286,7 +287,7 @@ export function buildCarryMarker({ fromSha, toSha, fingerprint }) {
  * (what `parseLatestHumanClearedSha` requires), with the reviewed diff/contribution of the live net diff text.
  * @param {{fromSha:string, toSha:string, fingerprint:string, actor:string, headDiffText:string, mechanicalReason?:string, tier?:'strict'|'contribution'|'numbering'|'tree'}} o
  */
-export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawActor, headDiffText, mechanicalReason = '', tier = 'strict' }) {
+export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawActor, headDiffText, mechanicalReason = '', tier = 'strict', sourceId = '' }) {
   const actor = sanitizeActor(rawActor);
   return [
     '📌 review — human clearance carried forward (equivalent change after a mechanical refresh, no new review)',
@@ -308,6 +309,8 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     buildReviewedDiffMarker(headDiffText),
     buildReviewedContributionMarker(headDiffText),
     buildClearedHumanMarker(actor),
+    // R706 — the original human clearance comment this record carries; without it the parser refuses the record.
+    buildClearedFromMarker(sourceId),
     buildCarryMarker({ fromSha, toSha, fingerprint }),
   ].filter((l) => l !== undefined).join('\n');
 }
@@ -371,6 +374,7 @@ export function applyHumanClearanceCarry({
   equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove,
   numberingSetting = resolveNumberingHumanClearanceSetting(), numberingOnly = false,
   netPatchSetting = resolveIdenticalNetPatchSetting(),
+  mechanicalCarry,
   setting = resolveHumanClearanceCarrySetting(), log = (s) => process.stderr.write(s),
 } = {}) {
   const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence, proveNumbering, numberingSetting, numberingOnly, netPatchSetting });
@@ -382,6 +386,18 @@ export function applyHumanClearanceCarry({
   const tag = `${repo ? `${repo}` : ''}#${pr}`;
   if (!d.carry) {
     log(`  human-clearance-carry ${tag}: NOT carried ${String(evidence?.humanClearance?.sha || '').slice(0, 9)}→${String(evidence?.headSha || '').slice(0, 9)} — ${d.reason}\n`);
+    return null;
+  }
+  const mechanical = mechanicalCarry ?? resolveMechanicalCarrySetting({ log });
+  const sourceId = evidence?.humanClearance?.sourceId;
+  if (!buildClearedFromMarker(sourceId)) {
+    log(`  human-clearance-carry ${tag}: NOT carried — missing or unsafe human clearance source id\n`);
+    return null;
+  }
+  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason, sourceId });
+  const recordedDiff = parseReviewedDiff([{ author: { login: AUTOMATION_LOGINS[0] }, body }]);
+  if (!recordedDiff || (mechanical.value !== 'trust-drain-record' && recordedDiff !== evidence.humanClearance.diff)) {
+    log(`  human-clearance-carry ${tag}: NOT carried (humanClearance.mechanicalCarry=refuse) — reviewed diff changed; a human must re-approve\n`);
     return null;
   }
   const carried = { fromSha: d.fromSha, toSha: d.toSha, fingerprint: d.fingerprint, actor: d.actor, tier: d.tier, mechanicalReason: d.mechanicalReason, recorded: false };
@@ -406,7 +422,6 @@ export function applyHumanClearanceCarry({
         reason: `human clearance carry (${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)}) not recorded: ${changed} — merge deferred this pass` };
     }
   }
-  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason });
   try {
     exec('gh', ['pr', 'comment', String(pr), ...(repo ? ['--repo', repo] : []), '--body', body],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });

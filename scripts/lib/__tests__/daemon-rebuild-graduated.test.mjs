@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as adoption from '../daemon-rebuild/adopt.mjs';
-import { readOverlayEventLog } from '../daemon-rebuild/prepare.mjs';
+import { readOverlayEventLog, prMergedDropEvidence } from '../daemon-rebuild/prepare.mjs';
 import { overlayFilePath } from '../daemon-overlays.mjs';
 
 const liveApplied = [
@@ -73,6 +73,143 @@ function matchWith(evidence, overrides = {}) {
   }));
   return { args, leftForMain, match: adoption.matchReadyCandidate({ ...args, leftForMain }) };
 }
+
+const ruledDrop = {
+  ref: 'lane/redteam-pending-on-accept-m1', pr: 6554,
+  at: '2026-11-09T11:58:41.018Z', ruling: 'R790',
+};
+
+function prMergedDrop({ legacy = false, event = {}, ...overrides } = {}) {
+  return autoDropped({
+    ref: ruledDrop.ref, readyAt: '2026-11-09T12:00:00.000Z',
+    events: [{
+      kind: 'auto-dropped', reason: 'pr-merged',
+      ref: ruledDrop.ref, pr: ruledDrop.pr, at: ruledDrop.at,
+      ...(!legacy ? { tip: liveApplied[0].sha, evidence: { contentInMain: true, cleanMerges: true } } : {}),
+      ...event,
+    }],
+    ...overrides,
+  });
+}
+
+describe('prMergedDropEvidence writer', () => {
+  const tip = liveApplied[0].sha;
+  const mainSha = 'e'.repeat(40);
+  const merge = 'f'.repeat(40);
+  const parent = 'd'.repeat(40);
+  function writerGit({ unresolved = false, stacked = false, clean = true } = {}) {
+    const responses = new Map([
+      [JSON.stringify(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ruledDrop.ref}^{commit}`]),
+        { status: unresolved ? 1 : 0, stdout: unresolved ? '' : tip }],
+      [JSON.stringify(['rev-parse', '--verify', `${mainSha}^{tree}`]), { status: 0, stdout: buildTree }],
+      [JSON.stringify(['rev-list', '--no-merges', `${mainSha}..${tip}`]), { status: 0, stdout: stacked ? parent : '' }],
+      [JSON.stringify(['rev-list', '--merges', `${mainSha}..${tip}`]), { status: 0, stdout: stacked ? merge : '' }],
+      [JSON.stringify(['rev-list', '--parents', '-n', '1', merge]), { status: 0, stdout: `${merge} ${mainSha} ${parent}` }],
+      [JSON.stringify(['merge-tree', '--write-tree', '--no-messages', mainSha, parent]), { status: 0, stdout: tip }],
+      [JSON.stringify(['rev-parse', '--verify', `${merge}^{tree}`]), { status: 0, stdout: clean ? tip : buildTree }],
+      [JSON.stringify(['merge-tree', '--write-tree', '--no-messages', mainSha, tip]),
+        { status: 0, stdout: stacked ? tip : buildTree }],
+    ]);
+    return vi.fn((args) => responses.get(JSON.stringify(args)) ?? { status: 1, stdout: '' });
+  }
+
+  it('records content in the plan main and adapts git status to code', () => {
+    const git = writerGit();
+    expect(prMergedDropEvidence({ git, ref: ruledDrop.ref, mainSha })).toEqual({
+      tip, evidence: { contentInMain: true, cleanMerges: true },
+    });
+    expect(git).toHaveBeenCalledWith(['merge-tree', '--write-tree', '--no-messages', mainSha, tip]);
+  });
+
+  it('fails closed with null tip and false evidence for an unresolvable tip', () => {
+    expect(prMergedDropEvidence({ git: writerGit({ unresolved: true }), ref: ruledDrop.ref, mainSha })).toEqual({
+      tip: null, evidence: { contentInMain: false, cleanMerges: false },
+    });
+  });
+
+  it('does not claim stacked-branch merge content is in main', () => {
+    expect(prMergedDropEvidence({ git: writerGit({ stacked: true }), ref: ruledDrop.ref, mainSha })).toEqual({
+      tip, evidence: { contentInMain: false, cleanMerges: true },
+    });
+  });
+
+  it('records unclean stacked merges as false', () => {
+    expect(prMergedDropEvidence({ git: writerGit({ stacked: true, clean: false }), ref: ruledDrop.ref, mainSha })).toEqual({
+      tip, evidence: { contentInMain: false, cleanMerges: false },
+    });
+  });
+
+  it('fails closed when git throws', () => {
+    expect(prMergedDropEvidence({ git: () => { throw new Error('unreadable'); }, ref: ruledDrop.ref, mainSha })).toEqual({
+      tip: null, evidence: { contentInMain: false, cleanMerges: false },
+    });
+  });
+});
+
+describe('overlayGraduated pr-merged auto-drops', () => {
+  it('accepts evidence bound to the applied tip with independent content proof', () => {
+    expect(adoption.overlayGraduated(prMergedDrop())).toBe(true);
+  });
+
+  it.each([
+    ['missing tip', { tip: undefined }],
+    ['wrong tip', { tip: liveApplied[1].sha }],
+    ['contentInMain false', { evidence: { contentInMain: false, cleanMerges: true } }],
+    ['cleanMerges false', { evidence: { contentInMain: true, cleanMerges: false } }],
+    ['incomplete evidence', { evidence: {} }],
+    ['at readyAt', { at: '2026-11-09T12:00:00.000Z' }],
+    ['after readyAt', { at: '2026-11-09T12:00:00.001Z' }],
+    ['pr-closed', { reason: 'pr-closed' }],
+    ['ref-gone', { reason: 'ref-gone' }],
+  ])('refuses %s even for the ruled identity', (_name, event) => {
+    expect(adoption.overlayGraduated(prMergedDrop({ event }))).toBe(false);
+  });
+
+  it('exports the frozen exact R790 allowlist', () => {
+    expect(adoption.RULED_LEGACY_PR_MERGED_DROPS).toEqual([ruledDrop]);
+    expect(Object.isFrozen(adoption.RULED_LEGACY_PR_MERGED_DROPS)).toBe(true);
+    expect(Object.isFrozen(adoption.RULED_LEGACY_PR_MERGED_DROPS[0])).toBe(true);
+  });
+
+  it('accepts the exact legacy R790 entry with independent content proof', () => {
+    expect(adoption.overlayGraduated(prMergedDrop({ legacy: true }))).toBe(true);
+  });
+
+  it.each([
+    ['ref', { ref: 'lane/other' }],
+    ['pr', { pr: 6555 }],
+    ['pr type', { pr: '6554' }],
+    ['at', { at: '2026-11-09T11:58:41.019Z' }],
+    ['equivalent at spelling', { at: '2026-11-09T11:58:41.018+00:00' }],
+    ['kind', { kind: 'removed' }],
+    ['reason', { reason: 'pr-closed' }],
+  ])('refuses a legacy event with a different %s', (_name, event) => {
+    expect(adoption.overlayGraduated(prMergedDrop({ legacy: true, event, ...(event.ref ? { ref: event.ref } : {}) }))).toBe(false);
+  });
+
+  it.each([false, true])('refuses content missing from the candidate (legacy=%s)', (legacy) => {
+    const evidence = prMergedDrop({ legacy });
+    const success = evidence.git;
+    evidence.git = (args) => args[0] === 'merge-tree' ? { status: 0, stdout: 'd'.repeat(40) } : success(args);
+    expect(adoption.overlayGraduated(evidence)).toBe(false);
+  });
+
+  it.each(['2026-11-09T11:58:41.018Z', '2026-11-09T11:58:41.017Z'])('refuses the legacy drop at or after readyAt %s', (readyAt) => {
+    expect(adoption.overlayGraduated(prMergedDrop({ legacy: true, readyAt }))).toBe(false);
+  });
+
+  it('adopts a superseded ready candidate omitting both live occurrences of the ruled ref', () => {
+    const evidence = prMergedDrop({ legacy: true });
+    const base = fixture();
+    const ready = { ...base.ready, at: evidence.readyAt };
+    const applied = { ref: evidence.ref, sha: evidence.sha };
+    const { args, leftForMain, match } = matchWith(evidence, { ready, liveApplied: [applied, { ...applied }] });
+    expect(args.plan.finalSha).not.toBe(ready.adopt.finalSha);
+    expect(args.treeOf(args.plan.finalSha)).not.toBe(ready.tree);
+    expect(match).toEqual({ adopt: ready.adopt, dropRefs: [], match: 'superseded' });
+    expect(leftForMain.mock.results.map(({ value }) => value)).toEqual([true, true]);
+  });
+});
 
 describe('readOverlayEventLog', () => {
   it('reads auto-dropped in-main events from the overlay directory and skips blank lines', () => {
@@ -277,6 +414,8 @@ describe('overlayGraduated evidence', () => {
 describe.each([
   ['graduated-merged', graduation],
   ['auto-dropped in-main', autoDropped],
+  ['auto-dropped pr-merged', prMergedDrop],
+  ['R790 legacy pr-merged', () => prMergedDrop({ legacy: true })],
 ])('overlayGraduated %s merge driver evidence', (_name, makeEvidence) => {
   const configArgs = ['config', '--get-regexp', '^merge\\..*\\.driver$'];
 

@@ -397,8 +397,8 @@ export function planOperatorRuling(read, input) {
   if (actor === JUDGE_ACTOR) {
     // The selection may DERIVE supersession (a disputed finding with no --supersedes): refuse it like an explicit one.
     for (const o of selected) assertJudgeAuthority(read, { actor, ruling, supersedes: supersedesFor(o) });
-    assertRulingIdentity(read.identity, actor);
   }
+  const checkedPoster = byPolicy ? null : assertRulingIdentity(read.identity, actor);
   const record = {
     version: 1, repo, pr: Number(pr), head: read.head,
     rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'not-real' ? { lens: o.seat ?? JSON.parse(o.key)[0] } : {}),
@@ -406,6 +406,9 @@ export function planOperatorRuling(read, input) {
       ...(supersedesFor(o).length ? { supersedes: supersedesFor(o) } : {}) })),
     actor: String(actor).toLowerCase(), channel: String(channel).trim(), reason: actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}\n${reason}` : String(reason), at: read.now,
     clearerId: read.clearerId,
+    // PR #6529: bind the comment to the login the identity check passed, so the gate reader refuses any other author
+    // (an App copy left by a credential split). A judge row is automation-authored and is checked by its own branch.
+    ...(checkedPoster && actor !== JUDGE_ACTOR ? { poster: checkedPoster } : {}),
   };
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
   const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head, actor: String(actor).toLowerCase(),

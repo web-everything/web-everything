@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
@@ -45,7 +46,7 @@ const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWrite
   && typeof w.markers.redispatch?.abandonedAt === 'string';
 
 /** Pure decision on a raw witness. Probes and time are supplied by the caller. */
-export function planRedTeamRecovery(w, { now, probe, deadlineMs, setting = resolveReviewRedTeamOnSkip().value } = {}) {
+export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.env, setting = resolveReviewRedTeamOnSkip({ env }).value } = {}) {
   if (w?.ok === false) return { mode: 'skip', why: w.reason };
   const raw = w.rawWriter.parsed;
   let executionPrior = raw;
@@ -70,6 +71,20 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, setting = resol
           dead = true;
         }
       } catch { /* Unprobeable owners use the explicit age deadline. */ }
+    }
+    if (!dead) {
+      // A host rename after a crash leaves a record no local pid probe can settle: apply the same stale-record rule the
+      // evidence reader uses, so recovery and the reader never disagree. An unprobeable owner stays held.
+      try {
+        // Our own abandonment rewrites the file and resets the mtime this rule reads, so a foreign-host abandonment whose
+        // marker still binds this exact writer AND evidence stays proven dead (it was proven under the claim). It is still
+        // probed: a pid that is alive here with its recorded birth time keeps the record held, and a throwing probe holds it.
+        const m = w.markers.redispatch;
+        const boundAbandonment = Boolean(raw.staleAbandoned && raw.host && raw.host !== probe.host
+          && (raw.pidNamespace == null || raw.pidNamespace === probe.namespace) && m?.writer === w.rawWriter.sha256 && m?.evidence === w.evidenceSha256);
+        dead = (boundAbandonment && !localPidLive(raw, { isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) }))
+          || foreignStaleOwnerDead(raw, { host: probe.host, namespace: probe.namespace, statusAt: w.statusAt, now, env, isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) });
+      } catch { dead = false; }
     }
     if (!dead) {
       const stamp = raw.pidStart;
@@ -145,7 +160,7 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
   try {
     return withRedTeamStatusClaim(path, () => {
       const at = now();
-      const w = readWitness(), p = planRedTeamRecovery(w, { now: at, probe, deadlineMs, setting });
+      const w = readWitness(), p = planRedTeamRecovery(w, { now: at, probe, deadlineMs, env: key.env, setting });
       if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
       if (!p.abandon || p.mode === 'skip' || (w.markers.redispatch && !pendingAbandonment(w) && !p.refill)) return { ok: false };
       const marker = `${path}.stale-redispatch-1`;
@@ -742,7 +757,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
       readEvidence, readStatus, readReviewRuns,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed,
-      recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } };
+      recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
     const escalateRow = row => {
       try {

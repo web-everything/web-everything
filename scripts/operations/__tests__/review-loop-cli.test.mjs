@@ -1552,14 +1552,17 @@ describe('unattended accept reads the live head', () => {
   const record = { version: 1, repo, pr: 1234, head: HEAD_A, runId: 'referred-run',
     reviewer: mandatoryReferralReviewer('referred-run'), authorBody: '<!-- authored-by-actor: author -->',
     attempted: true, referrals: [{ key, seat, original, finding: normalizeFinding(original) }], rulings: [] };
-  const comment = body => ({ body, author: { login: 'web-everything' } });
+  const comment = (body, login = 'web-everything') => ({ body, author: { login } });
   it.each(['accept', 'prevention-outstanding'].flatMap(verdict =>
     [null, 'auto-policy', 'card', 'not-real'].map(result => [verdict, result])))
   ('%s with live referral ruling %s gates the actual accept effects', async (verdict, result) => {
     const comments = [comment(renderReferralRecord(record))];
+    // The policy ruling is posted by automation; an operator's clearing ruling by that operator (PR #6529: an
+    // unstamped automation copy posted after poster stamping shipped keeps only its block rows).
     if (result) comments.push(comment(buildOperatorRulingComment({ version: 1, repo, pr: 1234, head: HEAD_A,
       actor: result === 'auto-policy' ? 'auto-policy' : 'chalbert', channel: 'operator-chat', reason: 'checked the finding', at: '2026-10-15T15:45:00Z', clearerId: 'operator-session',
-      rulings: [{ runId: record.runId, key, result: result === 'auto-policy' ? 'block' : result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] })));
+      rulings: [{ runId: record.runId, key, result: result === 'auto-policy' ? 'block' : result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] }),
+      result === 'auto-policy' ? 'web-everything' : 'chalbert'));
     const { declaration, registry } = registryFor({ rev: HEAD_A });
     const seen = [];
     const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A, body: record.authorBody, comments }));

@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
+import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
@@ -323,6 +324,9 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
+  // The writer file's mtime is the age of a record whose pid cannot be probed here (foreign host name). Unreadable stays unknown.
+  let statusAt;
+  if (bytes !== null) { try { statusAt = statSync(path).mtimeMs; } catch { statusAt = undefined; } }
   if (bytes !== null && (!parsed || parsed.repo !== repo || Number(parsed.pr) !== Number(pr) || parsed.head !== head)) throw Error('recovery writer identity mismatch');
   const records = readScorecards();
   const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
@@ -346,7 +350,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   }
   const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
-  return { ...key, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
+  return { ...key, statusAt, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
     ...(newest ? {} : { carryEvidence: carryEvidence ?? readCarryEvidence() }),
     evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
@@ -684,7 +688,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
     let live = false;
     if (['queued', 'running'].includes(status.status)) {
-      if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
+      // The host name can change under a still-running job (rename mid-run), so a foreign record is dead only when it is
+      // stale AND its pid is not alive here with the recorded birth time. A cross-namespace record is never probed.
+      if (foreignStaleOwnerDead(status, { host, namespace, statusAt, now, env, isAlive, readPidStart })) live = false;
+      else if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
       else if (isAlive(status.pid)) {
         const start = status.pidStart ? readPidStart(status.pid) : null;
         live = !start || !status.pidStart || start === status.pidStart;
