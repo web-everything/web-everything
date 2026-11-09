@@ -12,7 +12,7 @@ function checkState(state) {
     || Object.values(state).some(value => value !== true)) throw new Error('MQ ledger corrupt; operator inspection required');
 }
 /** Transactions never reclaim a held lock. A crashed transaction requires operator inspection. */
-export function mqFailureLedgerStorage(root = resolveCoordinationRoot()) {
+export function mqFailureLedgerStorage(root = resolveCoordinationRoot(), { readFile = readFileSync } = {}) {
   const dir = join(root, 'mq-failure-recovery'), file = join(dir, 'ledger.json');
   return { atomicUpdate(update) {
     mkdirSync(dir, { recursive: true });
@@ -23,7 +23,7 @@ export function mqFailureLedgerStorage(root = resolveCoordinationRoot()) {
       let state = {};
       try {
         if (statSync(file).size > 8 * 1024 * 1024) throw new Error('MQ ledger oversized; operator inspection required');
-        state = JSON.parse(readFileSync(file, 'utf8'));
+        state = JSON.parse(readFile(file, 'utf8'));
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       checkState(state);
       const next = update(state);
@@ -68,7 +68,13 @@ export function createMqFailureLedger({ io = mqFailureLedgerStorage() } = {}) {
       if (!identityValid({ ...identity, head: identity.newHead })) return Promise.reject(new TypeError('Unknown refreshed successor'));
       return transaction(identity, state => ({ state: { ...state,
         [keyFor({ ...identity, kind: 'refresh' })]: true,
-        [keyFor({ ...identity, head: identity.newHead, kind: 'refresh' })]: true }, result: { recorded: true } }));
+        [keyFor({ ...identity, head: identity.newHead, kind: 'refresh' })]: true,
+        // Marks the successor as a head this ledger itself produced, so a later failure of it can reach the fixer.
+        [keyFor({ ...identity, head: identity.newHead, kind: 'refresh-successor' })]: true }, result: { recorded: true } }));
+    },
+    readRefreshSuccessor(identity) {
+      return transaction(identity, state => ({ state,
+        result: state[keyFor({ ...identity, kind: 'refresh-successor' })] === true }));
     },
   };
 }

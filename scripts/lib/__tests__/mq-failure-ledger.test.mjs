@@ -139,9 +139,20 @@ describe('mq failure ledger production storage (real filesystem)', () => {
   it('a ledger file over 8 MB is rejected before it is read', async () => {
     const root = freshRoot();
     seed(root, Buffer.alloc(8 * 1024 * 1024 + 1, 0x20));
-    const ledger = createMqFailureLedger({ io: mqFailureLedgerStorage(root) });
+    const readFile = vi.fn(() => { throw new Error('the oversized ledger must not be read'); });
+    const ledger = createMqFailureLedger({ io: mqFailureLedgerStorage(root, { readFile }) });
     await expect(claim(ledger)).rejects.toThrow(/oversized/);
+    expect(readFile).not.toHaveBeenCalled(); // observable: rejection happens on the size, before any content read
     expect(readdirSync(files(root).locks)).toEqual([]);
+  });
+
+  it('a ledger file at the 8 MB limit is still read (the spy sees the read, so the previous test discriminates)', async () => {
+    const root = freshRoot();
+    seed(root, Buffer.from('{}'));
+    const readFile = vi.fn(path => readFileSync(path, 'utf8'));
+    const ledger = createMqFailureLedger({ io: mqFailureLedgerStorage(root, { readFile }) });
+    expect(await claim(ledger)).toMatchObject({ claimed: true });
+    expect(readFile).toHaveBeenCalledTimes(1);
   });
 
   it('a transaction that would grow the ledger past 8 MB is rejected and nothing is written', async () => {

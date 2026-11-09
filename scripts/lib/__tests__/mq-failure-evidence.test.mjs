@@ -539,4 +539,43 @@ describe('mq failure evidence: real vitest output shapes', () => {
       changedFiles: { ...removal, complete: true, files: ['tests/my widget.test.mjs'] } });
     expect(decision).toBe('fix');
   });
+
+  // Every accepted failure-marker form crossed with a whitespace-containing path: none may authorize a refresh.
+  const spaced = 'tests/my widget.test.mjs';
+  it.each([
+    ['FAIL', ` FAIL  ${spaced} > breaks`], ['FAILED', ` FAILED  ${spaced} > breaks`],
+    ['labelled lowercase failure', `runner: failure ${spaced} > breaks`], ['bare lowercase failure', `failure ${spaced} > breaks`],
+    ['labelled failure, no suite cut', `runner: failure ${spaced}`], ['progress row', ` ❯ ${spaced}  (1 test | 1 failed) 5ms`],
+    ['AssertionError text', `AssertionError: expected failure in ${spaced}`], ['Error: expect text', `Error: expect(x) failed in ${spaced}`],
+    ['Expected detail', `Expected: ${spaced}`], ['Received detail', `Received: ${spaced}`],
+  ])('space-containing path after a %s marker, following a valid outside-diff failure, selects fix', async (_name, line) => {
+    const evidence = await one(` FAIL  tests/other.test.mjs > a\nAssertionError: expected 1 to be 2\n${line}\n`);
+    expect(evidence.complete).toBe(false);
+    const decision = classifyMqFailureIntake({ ...removal, route: { ...removal, ...evidence, stale: false },
+      changedFiles: { ...removal, complete: true, files: [spaced] } });
+    expect(decision).toBe('fix');
+  });
+  it('a list of complete test paths after a marker is not mistaken for a spaced path', async () => {
+    const evidence = await one(' FAIL  tests/a.test.mjs > t\nAssertionError: see tests/a.test.mjs tests/b.test.mjs\n');
+    expect(evidence).toMatchObject({ complete: true });
+  });
+});
+
+describe('mq failure evidence: pathological log lines are bounded', () => {
+  const one = text => { const f = fixture(); f.readJobLog.mockResolvedValue({ text, complete: true }); return collect(f); };
+  // The old trailing-bracket regex took ~2s on 80KB of " [" and quadrupled per doubling.
+  it.each([
+    ['FAIL with repeated " ["', ` FAIL  ${' ['.repeat(120 * 1024)}`],
+    ['progress row with repeated " ["', ` ❯ ${' ['.repeat(120 * 1024)}`],
+    ['FAIL with a long whitespace run', ` FAIL  tests/a.test.mjs${' '.repeat(250 * 1024)}x`],
+    ['labelled failure with repeated " ["', `runner: failure ${' ['.repeat(120 * 1024)}`],
+  ])('%s is parsed in bounded time and keeps path evidence incomplete', async (_name, line) => {
+    const started = performance.now();
+    const evidence = await one(`${line}\nAssertionError: x\n`);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(evidence.complete).toBe(false);
+  });
+  it('a normal trailing "[ file ]" suffix is still cut (the linear strip keeps the old behaviour)', async () => {
+    expect(await one(' FAIL  tests/a.test.mjs [ tests/a.test.mjs ]\nAssertionError: x\n')).toMatchObject({ complete: true });
+  });
 });

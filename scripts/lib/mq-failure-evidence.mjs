@@ -40,6 +40,23 @@ function hasOnlyUpstreamFailure(lines) {
     && lines.every(line => upstreamFailureOutcomes.has(line) || upstreamGateTranscript.has(line));
 }
 
+// Longest log line the parser reads. Real runner headings are far shorter; a longer line is not parsed past this
+// bound (every regex below is then bounded) and keeps path evidence incomplete, so it goes to the fixer.
+const MAX_LINE = 2048;
+// Linear equivalent of replace(/\s+\[[^\]]*\]\s*$/, ''): drop a trailing " [ ... ]" group with no inner "]".
+function stripBracketSuffix(text) {
+  const trimmed = text.trimEnd();
+  if (!trimmed.endsWith(']')) return text;
+  for (let i = trimmed.lastIndexOf(']', trimmed.length - 2) + 1; i < trimmed.length - 1; i++) {
+    if (trimmed[i] === '[' && i > 0 && /\s/.test(trimmed[i - 1])) {
+      let start = i - 1;
+      while (start > 0 && /\s/.test(trimmed[start - 1])) start--;
+      return trimmed.slice(0, start);
+    }
+  }
+  return text;
+}
+
 function failurePaths(text, repo) {
   const name = repo.split('/').at(-1);
   // The hosted-runner root is assembled from parts so no literal host home path is committed (host-path ratchet).
@@ -53,9 +70,11 @@ function failurePaths(text, repo) {
   // remains, parentheses and brackets included, must be ONE token, the shape the FAIL-heading counter also requires.
   // The words found in an ambiguous heading stay only as a hint for the fixer; the incomplete flag keeps them from
   // ever authorizing a refresh.
-  const lead = /^(?:FAIL(?:ED)?|(❯))\s+([\s\S]*)$/.exec(text);
+  // The same one-token rule covers every failure-marker form that is followed by a path: a labelled or bare lowercase
+  // "failure" marker ("runner: failure <path> > t") is a heading just like FAIL.
+  const lead = /^(?:[\w-]+:\s+)?(?:FAIL(?:ED)?|failure|(❯))\s+([\s\S]*)$/.exec(text);
   if (lead) {
-    let candidate = lead[2].split(/\s+>\s/, 1)[0].replace(/\s+\[[^\]]*\]\s*$/, '');
+    let candidate = stripBracketSuffix(lead[2].split(/\s+>\s/, 1)[0]);
     if (lead[1]) {
       // "❯" rows: strip a progress suffix "(4 tests | 1 failed) 31ms" and an optional leading stack-frame function
       // token ("Proxy.<anonymous> test/a.test.mjs:5:3"); a bare word is NOT a function token.
@@ -66,6 +85,11 @@ function failurePaths(text, repo) {
     if (!/^[^\s"'`()[\]]+$/.test(candidate)) complete = false;
   }
   for (const match of text.matchAll(/(?:^|[\s(])((?:[A-Za-z]:)?[\w@./\\-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=[:\s)]|$)/g)) {
+    // A path that follows a directory-looking word after whitespace ("tests/my widget.test.mjs") is the tail of a
+    // spaced path, whatever marker introduced it. A preceding complete test path (a list of files) is not.
+    const before = text.slice(0, match.index + match[0].length - match[1].length);
+    const word = /(\S+)\s+$/.exec(before.length > 512 ? before.slice(-512) : before)?.[1] ?? '';
+    if (/[/\\]/.test(word) && !/\.(?:test|spec)\.[cm]?[jt]sx?(?::\d+){0,2}[,;]?$/.test(word)) complete = false;
     let path = match[1].replace(/\\/g, '/');
     if (path.startsWith('/') || /^[A-Za-z]:/.test(path)) {
       const root = roots.find(prefix => path.startsWith(prefix));
@@ -140,7 +164,9 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         const jobAssertions = [], jobPaths = new Set(), causalityLines = [], markerLines = [];
         let activePaths = [], capturedOutput = false, unterminatedBlock = false;
         let pathIncomplete = false, blankSince = false, headlineUsed = false, unhandledErrors = false; const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
-        for (const raw of clean(log.text).split(/\r?\n/)) {
+        for (const rawFull of clean(log.text).split(/\r?\n/)) {
+          let raw = rawFull;
+          if (raw.length > MAX_LINE) { raw = raw.slice(0, MAX_LINE); pathIncomplete = true; }
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
           // Vitest echoes passing tests' stdout/stderr verbatim. These blocks can contain fake
           // FAILs/assertions/paths; only the next blank line returns us to the runner's own output.

@@ -114,6 +114,17 @@ describe('drain MQ failure production adapter', () => {
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
   });
 
+  it.each(['1', 'true'])('an omitted dryRun inherits DRY_RUN=%s: no reads, claims or writes', async value => {
+    const previous = process.env.DRY_RUN;
+    process.env.DRY_RUN = value;
+    try {
+      const f = fixture();
+      const { dryRun: _explicit, ...omitted } = f.options; // the fixture passes dryRun:false; here the argument is absent
+      expect(await routeMqFailureOnHold(omitted)).toMatchObject({ routed: false, reason: expect.stringMatching(/dry.run/i) });
+      expect(f.exec).not.toHaveBeenCalled();
+    } finally { if (previous === undefined) delete process.env.DRY_RUN; else process.env.DRY_RUN = previous; }
+  });
+
   it.each([null, { hold: false, line: guard.line }, { hold: true, line: `quoted\n${guard.line}` },
     { hold: true, line: 'mq-same-head-retry: failed_checks' }])('does not read evidence without the precise held guard: %j', async badGuard => {
     const f = fixture();

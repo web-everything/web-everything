@@ -90,7 +90,9 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
 export const productionIo = createDrainMqFailureRecoveryIo();
 
 /** Called by a drain when mqSameHeadGuard holds. Always retain the guard; routing is best-effort. */
-export async function routeMqFailureOnHold({ repo, pr, head, guard, dryRun = false,
+export async function routeMqFailureOnHold({ repo, pr, head, guard,
+  // Same default as the reconcile dispatcher: an omitted argument inherits DRY_RUN, so no caller can write by omission.
+  dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   log = () => {}, io = productionIo } = {}) {
   const finish = (routed, reason) => {
     try { log(safe(`mq-failure-recovery: #${pr} ${reason}`)); } catch { /* Logging cannot interrupt the drain. */ }

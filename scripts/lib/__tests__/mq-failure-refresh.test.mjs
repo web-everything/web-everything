@@ -45,11 +45,11 @@ describe('mq failure head refresh executor', () => {
     expect(options.io.createCheckout).toHaveBeenCalledTimes(1);
   });
 
-  it('repeated failure on an already refreshed head => no loop (stop with note), including the successor SHA', async () => {
+  it('repeated failure on an already refreshed head => no second refresh, including the successor SHA (the fixer takes it)', async () => {
     const options = fixture();
     await refreshMqFailureHead(options);
     options.io.readHead.mockResolvedValue(newHead);
-    expect(await refreshMqFailureHead({ ...options, head: newHead })).toMatchObject({ action: 'stop', note: expect.stringMatching(/already refreshed/i) });
+    expect(await refreshMqFailureHead({ ...options, head: newHead })).toMatchObject({ action: 'fix', note: expect.stringMatching(/no second refresh/i) });
     expect(pushes(options)).toHaveLength(1);
     expect(options.io.createCheckout).toHaveBeenCalledTimes(1);
   });
@@ -149,11 +149,66 @@ describe('mq failure refresh ordering', () => {
     expect(reservedAtPush).toBe(true); // the successor was already claimed (reserved) when the push ran
   });
 
-  it('a failed successor reservation prevents the push', async () => {
+  it('a failed successor reservation prevents the push and hands the PR to the fixer', async () => {
     const options = fixture();
     options.ledger = { ...options.ledger, recordRefresh: vi.fn(async () => { throw new Error('disk full'); }) };
-    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop' });
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'fix' });
     expect(pushes(options)).toHaveLength(0);
+    expect(options.io.removeCheckout).toHaveBeenCalledTimes(1);
+    expect(await options.ledger.readFixFallback(identity)).toBe(true);
+  });
+});
+
+// Policy per yield point after the attempt is claimed: every failure records the fixer fallback (`fix`), except the
+// single deliberate stop "head changed after merge". A claimed attempt must never leave the PR with no owner.
+describe('mq failure refresh post-claim failure policy', () => {
+  const boom = () => { throw new Error('transient'); };
+  it.each([
+    ['createCheckout throws', o => { o.io.createCheckout = vi.fn(boom); }, false, 0],
+    ['merge throws', o => { o.io.git = vi.fn(async ({ args }) => { if (args[0] === 'merge') boom(); return { ok: true }; }); }, true, 0],
+    ['merged head is unreadable', o => { o.io.git = vi.fn(async ({ args }) => args[0] === 'merge' ? { ok: true, head: 'nope' } : { ok: true }); }, true, 0],
+    ['recordRefresh throws', o => { o.ledger = { ...o.ledger, recordRefresh: vi.fn(boom) }; }, true, 0],
+    ['post-merge head read throws', o => { let n = 0; o.io.readHead = vi.fn(async () => { if (++n === 2) boom(); return identity.head; }); }, true, 0],
+    ['push throws', o => { o.io.git = vi.fn(async ({ args }) => { if (args[0] === 'push') boom(); return args[0] === 'merge' ? { ok: true, head: newHead } : { ok: true }; }); }, true, 1],
+  ])('%s => fixer fallback recorded, checkout cleaned up', async (_name, inject, hasCheckout, pushAttempts) => {
+    const options = fixture();
+    inject(options);
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'fix' });
+    expect(await options.ledger.readFixFallback(identity)).toBe(true);
+    expect(options.io.removeCheckout).toHaveBeenCalledTimes(hasCheckout ? 1 : 0);
+    expect(pushes(options).length).toBeLessThanOrEqual(pushAttempts);
+  });
+  it('the head moving after the merge is the one deliberate stop: no push, no fallback', async () => {
+    const options = fixture();
+    let n = 0;
+    options.io.readHead = vi.fn(async () => (++n === 2 ? newHead : identity.head));
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/head changed/i) });
+    expect(pushes(options)).toHaveLength(0);
+    expect(await options.ledger.readFixFallback(identity)).toBe(false);
+  });
+  it('when even the fallback cannot be recorded, the executor stops visibly', async () => {
+    const options = fixture();
+    options.io.createCheckout = vi.fn(boom);
+    options.ledger = { ...options.ledger, recordFixFallback: vi.fn(async () => { throw new Error('disk full'); }) };
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/operator inspection/i) });
+  });
+  it('a refreshed head that fails again goes to the fixer, not a dead-end stop; a plain denied claim still stops', async () => {
+    const options = fixture();
+    await refreshMqFailureHead(options); // refreshes identity.head -> newHead and reserves the successor
+    options.io.readHead.mockResolvedValue(newHead);
+    expect(await refreshMqFailureHead({ ...options, head: newHead })).toMatchObject({ action: 'fix', note: expect.stringMatching(/failed again/i) });
+    expect(await options.ledger.readFixFallback({ ...identity, head: newHead })).toBe(true);
+    expect(pushes(options)).toHaveLength(1); // no second refresh
+    // A concurrent loser on the original head (claimed, not a successor) must not dispatch a second owner.
+    options.io.readHead.mockResolvedValue(identity.head);
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/already refreshed/i) });
+  });
+  it.each([['-x'], ['a..b'], ['has space'], ['semi;colon'], ['']])('invalid checkout branch %j never reaches the push refspec', async branch => {
+    const options = fixture();
+    options.io.createCheckout = vi.fn(async () => ({ cwd: checkout.cwd, branch }));
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'fix', note: expect.stringMatching(/invalid checkout branch/i) });
+    expect(pushes(options)).toHaveLength(0);
+    expect(options.io.git).not.toHaveBeenCalled();
     expect(options.io.removeCheckout).toHaveBeenCalledTimes(1);
   });
 });

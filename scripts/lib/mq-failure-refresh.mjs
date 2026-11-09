@@ -43,34 +43,40 @@ function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
   if (dryRun) return stop('Dry-run: no refresh claim or writes');
   if (!/^[a-f0-9]{40}$/.test(head ?? '')) return stop('Unknown head; operator inspection required');
   const identity = { repo, pr, head };
-  let checkout;
+  let checkout, claimed = false;
+  // Policy after the attempt is claimed (the claim is never released): every failure either hands the PR to the
+  // ordinary fixer (record the fallback, return `fix`) or is a deliberate stop. The only deliberate post-claim stop is
+  // "head changed after merge" (a newer head owns the next route). Nothing else may leave the PR with no owner.
+  const fallback = function* (note) { yield () => ledger.recordFixFallback(identity); return { action: 'fix', note }; };
   try {
     if ((yield () => io.readHead({ repo, pr })) !== head) return stop('Head changed; stale route retained for operator inspection');
     const claim = yield () => ledger.claim({ ...identity, kind: 'refresh' });
-    if (!claim.claimed) return stop(claim.note ?? 'Already refreshed once; operator inspection required');
+    if (!claim.claimed) {
+      // A head this ledger produced by a refresh that failed again is main-caused or real: the fixer gets it. Any other
+      // denied claim (a concurrent executor, an earlier attempt) stays a loop-guard stop.
+      if ((yield () => ledger.readRefreshSuccessor?.(identity)) === true)
+        return yield* fallback('Refreshed head failed again; normal fix required (no second refresh)');
+      return stop(claim.note ?? 'Already refreshed once; operator inspection required');
+    }
+    claimed = true;
     checkout = yield () => io.createCheckout(identity);
     if (!checkout?.cwd || typeof checkout.branch !== 'string' || !/^[\w./-]+$/.test(checkout.branch)
-      || checkout.branch.startsWith('-') || checkout.branch.includes('..')) return stop('Invalid checkout branch; operator inspection required');
+      || checkout.branch.startsWith('-') || checkout.branch.includes('..')) return yield* fallback('Invalid checkout branch; normal fix required');
     const merged = yield () => io.git({ cwd: checkout.cwd, args: ['merge', 'origin/main'] });
-    if (!merged?.ok) {
-      yield () => ledger.recordFixFallback(identity);
-      return { action: 'fix', note: 'Merge conflict or failure; normal fix required' };
-    }
-    if (!/^[a-f0-9]{40}$/.test(merged.head ?? '')) return stop('Unknown merged head; operator inspection required');
-    if (merged.head === head) {
-      yield () => ledger.recordFixFallback(identity);
-      return { action: 'fix', note: 'Merge left head unchanged (main already included); normal fix required' };
-    }
+    if (!merged?.ok) return yield* fallback('Merge conflict or failure; normal fix required');
+    if (!/^[a-f0-9]{40}$/.test(merged.head ?? '')) return yield* fallback('Unknown merged head; normal fix required');
+    if (merged.head === head) return yield* fallback('Merge left head unchanged (main already included); normal fix required');
     // Reserve the successor BEFORE publication: a crash after push cannot grant it another refresh.
     yield () => ledger.recordRefresh({ ...identity, newHead: merged.head });
     if ((yield () => io.readHead({ repo, pr })) !== head) return stop('Head changed after merge; refusing stale push');
     const pushed = yield () => io.git({ cwd: checkout.cwd, args: ['push', 'origin', `HEAD:refs/heads/${checkout.branch}`] });
-    if (!pushed?.ok) {
-      yield () => ledger.recordFixFallback(identity);
-      return { action: 'fix', note: 'Ordinary push rejected; normal fix required (no retry)' };
-    }
+    if (!pushed?.ok) return yield* fallback('Ordinary push rejected; normal fix required (no retry)');
     return { action: 'refreshed', head: merged.head };
-  } catch { return stop('Refresh head, checkout or ledger unreadable; operator inspection required'); }
+  } catch {
+    if (!claimed) return stop('Refresh head, checkout or ledger unreadable; operator inspection required');
+    try { return yield* fallback('Refresh failed after the attempt was claimed; normal fix required'); }
+    catch { return stop('Refresh failed and the fixer fallback could not be recorded; operator inspection required'); }
+  }
   finally { if (checkout) { try { yield () => io.removeCheckout(checkout); } catch { /* Isolated checkout may need operator cleanup. */ } } }
 }
 export async function refreshMqFailureHead(options) {

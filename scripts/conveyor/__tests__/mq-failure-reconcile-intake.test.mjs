@@ -309,12 +309,12 @@ describe('mq recovery dispatcher guards', () => {
   const entry = (overrides = {}) => ({ kind: 'fix', prNumber: identity.pr, headRefName: 'topic', headRefOid: identity.head,
     files: ['src/unrelated.mjs'], mqFailureRecovery: admitMqFailureRoute({ ...identity, repo: wePrRepo,
       route: { ...route, repo: wePrRepo }, changedFiles: { ...changedFiles, repo: wePrRepo } }), ...overrides });
-  function run({ entries = [entry()], ledger = { readFixFallback: () => false }, dryRun = false, readHead, refresh, lanes = [5] } = {}) {
+  function run({ entries = [entry()], ledger = { readFixFallback: () => false }, dryRun = false, omitDryRun = false, readHead, refresh, lanes = [5] } = {}) {
     const dispatch = vi.fn(planned => ({ pr: planned.pr, sessionId: 'fixture-fixer' }));
     const fetchFiles = vi.fn(() => ['src/unrelated.mjs']);
     const head = readHead ?? vi.fn(() => identity.head);
     const refreshMqFailure = refresh ?? vi.fn(() => ({ action: 'refreshed', head: 'b'.repeat(40) }));
-    const result = runReconcileFixDispatch({ root: 'fixture/dispatch', repo: 'we', dryRun,
+    const result = runReconcileFixDispatch({ root: 'fixture/dispatch', repo: 'we', ...(omitDryRun ? {} : { dryRun }),
       reconcile: () => ({ dispatch: entries, refusals: [] }),
       checkStaleness: () => ({ fresh: true, behind: 0 }),
       mqFailureIo: { readHead: head }, mqFailureLedger: ledger, refreshMqFailure,
@@ -351,6 +351,29 @@ describe('mq recovery dispatcher guards', () => {
     expect(f.fetchFiles).not.toHaveBeenCalled();
     expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
     expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  // The default is the guarantee: a caller that omits dryRun inherits DRY_RUN, so a dry pass claims and pushes nothing.
+  it.each(['1', 'true'])('an omitted dryRun inherits DRY_RUN=%s: no diff read, no claim, no push', value => {
+    const previous = process.env.DRY_RUN;
+    process.env.DRY_RUN = value;
+    try {
+      const refresh = vi.fn(() => ({ action: 'stop', note: 'Dry-run: no refresh' }));
+      const f = run({ omitDryRun: true, refresh });
+      expect(f.fetchFiles).not.toHaveBeenCalled();
+      expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
+      expect(f.dispatch).not.toHaveBeenCalled();
+    } finally { if (previous === undefined) delete process.env.DRY_RUN; else process.env.DRY_RUN = previous; }
+  });
+
+  it.each([undefined, '0', ''])('an omitted dryRun with DRY_RUN=%j runs live (the env, not a constant, decides)', value => {
+    const previous = process.env.DRY_RUN;
+    if (value === undefined) delete process.env.DRY_RUN; else process.env.DRY_RUN = value;
+    try {
+      const refresh = vi.fn(() => ({ action: 'refreshed', head: 'b'.repeat(40) }));
+      run({ omitDryRun: true, refresh });
+      expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ dryRun: false }));
+    } finally { if (previous === undefined) delete process.env.DRY_RUN; else process.env.DRY_RUN = previous; }
   });
 
   it('one pass reads at most eight MQ diffs; entries past the bound keep fixer admission', () => {
