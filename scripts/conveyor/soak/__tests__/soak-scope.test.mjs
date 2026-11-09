@@ -16,6 +16,15 @@ const CI_YML = join(ROOT, '.github/workflows/ci.yml');
 // Built by join, never one quoted literal: this file sits inside the soak seed, so a quoted
 // repo path here would put RED_TEAM in the closure by the literal scan alone (#6573 review).
 const RED_TEAM = ['scripts', 'lib', 'review-red-team-on-skip.mjs'].join('/');
+// Same rule: each runtime file is joined from parts so this file never names it whole.
+const RUNTIME_FILES = [
+  ['schemas', 'worker-result.v1.json'].join('/'),
+  ['package', 'json'].join('.'),
+  ['package-lock', 'json'].join('.'),
+  ['', 'gitignore'].join('.'),
+  ['docs', 'agent', 'reviewer-expectations.md'].join('/'),
+  ['src', '_data', 'backlog.js'].join('/'),
+];
 const temporaryRoots = [];
 
 function fixtureRoot() {
@@ -28,6 +37,13 @@ function writeFixture(root, path, source) {
   const target = join(root, path);
   mkdirSync(dirname(target), { recursive: true });
   writeFileSync(target, source);
+}
+
+// The minimal soak tree: its config plus the runtime copy list (red-green.mjs#RUNTIME_PATHS).
+function soakFixture(root, runtimePaths = []) {
+  writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
+  writeFixture(root, 'scripts/conveyor/soak/red-green.mjs',
+    `export const RUNTIME_PATHS = Object.freeze(${JSON.stringify(runtimePaths)});\n`);
 }
 
 function runCli(input, root = ROOT) {
@@ -57,7 +73,9 @@ afterEach(() => {
 describe('soak scope', () => {
   it('does not name the red-team helper as one literal, so the real-repo cases test import following', () => {
     const source = readFileSync(THIS_FILE, 'utf8');
-    expect(source.includes(RED_TEAM)).toBe(false);
+    for (const path of [RED_TEAM, ...RUNTIME_FILES]) {
+      expect(source.includes(`'${path}'`) || source.includes(`"${path}"`) || source.includes(`\`${path}\``), path).toBe(false);
+    }
   });
 
   it('includes the real red-team helper reached by the red-team-skip soak case', () => {
@@ -71,7 +89,14 @@ describe('soak scope', () => {
       ['scripts', 'lib', 'test-tmp-root.mjs'].join('/')]) {
       expect(closure.has(path), path).toBe(true);
     }
+    // Files the soak world copies by name outside scripts/ (sim/world.mjs#buildWeTemplate) — the
+    // schema is read at import time by scripts/operations/worker-result.mjs (#6573 red team).
+    for (const path of RUNTIME_FILES) expect(closure.has(path), path).toBe(true);
   }, 25_000);
+
+  it.each(RUNTIME_FILES.map((path) => [path]))('CLI selects the soak for the runtime file %s', (path) => {
+    expectCliOutput(runCli(`${path}\n`), 'run=true');
+  }, 30_000);
 
   it.each([
     ['backlog/123-x.md', false],
@@ -104,6 +129,7 @@ describe('soak scope', () => {
 
   it('follows a fixture a → b → c import chain without including unrelated d', () => {
     const root = fixtureRoot();
+    soakFixture(root);
     writeFixture(root, 'vitest.soak.config.ts',
       "export default { test: { include: ['scripts/conveyor/soak/**/*.soak.test.mjs'] } };\n");
     writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "import '../../../fixture/b.mjs';\n");
@@ -124,7 +150,7 @@ describe('soak scope', () => {
   });
   it('follows literal repo-path spawn/read targets and their imports', () => {
     const root = fixtureRoot();
-    writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
+    soakFixture(root);
     writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs',
       "spawnSync('node', ['scripts/tools-lit/runner.mjs']);\n");
     writeFixture(root, 'scripts/tools-lit/runner.mjs', "import './helper.mjs';\n");
@@ -158,9 +184,14 @@ describe('soak scope', () => {
     ['file-relative non-import literal', "new URL('../../../fixture/dep.mjs', import.meta.url);"],
     ['config-style relative literal', "export default { setupFiles: ['../../../fixture/dep.mjs'] };"],
     ['dotted extensionless basename', "import '../../../fixture/dep.v2';"],
+    ['import URL with a query string', "import '../../../fixture/dep.mjs?fresh=1';"],
+    ['dynamic import URL with a hash', "await import('../../../fixture/dep.mjs#v');"],
+    ['import URL with a query and a hash', "export * from '../../../fixture/dep.mjs?a=1#b';"],
+    ['repo-root literal under any top-level folder', "readFileSync(join(ROOT, 'fixture/dep.mjs'));"],
+    ['repo-root literal with a query string', "copy('fixture/dep.mjs?raw');"],
   ])('follows %s', (_name, source) => {
     const root = fixtureRoot();
-    writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
+    soakFixture(root);
     writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', `${source}\n`);
     writeFixture(root, 'fixture/dep.mjs', 'export const x = 1;\n');
     writeFixture(root, 'scripts/x/dep.mjs', 'export const x = 1;\n');
@@ -173,11 +204,87 @@ describe('soak scope', () => {
     expect(soakScopeRun({ root, changed: [target] })).toBe(true);
   });
 
+  it('follows existing files named by literal under any top-level folder, and top-level files', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', [
+      "copy(['schemas/s.v1.json', 'app.json', '.ignorefile', 'docs/agent/list.md', 'docs']);",
+      // A fixture name that does not exist outside the code folders is not a dependency.
+      "writeCard('backlog/1-fake.md');",
+      '',
+    ].join('\n'));
+    writeFixture(root, 'schemas/s.v1.json', '{}\n');
+    writeFixture(root, 'schemas/other.json', '{}\n');
+    writeFixture(root, 'app.json', '{}\n');
+    writeFixture(root, '.ignorefile', 'node_modules\n');
+    writeFixture(root, 'docs/agent/list.md', '- x\n');
+    writeFixture(root, 'docs/index.mjs', 'export {};\n');
+    writeFixture(root, 'backlog/2-real.md', '---\n---\n');
+
+    const closure = computeSoakClosure({ root });
+    for (const path of ['schemas/s.v1.json', 'app.json', '.ignorefile', 'docs/agent/list.md']) {
+      expect(closure.has(path), path).toBe(true);
+    }
+    expect(closure.has('schemas/other.json')).toBe(false);
+    expect(closure.has('backlog/1-fake.md')).toBe(false);
+    // A bare folder word is not a file: `'docs'` must not pull in docs/index.mjs.
+    expect(closure.has('docs/index.mjs')).toBe(false);
+    expect(soakScopeRun({ root, changed: ['backlog/2-real.md'] })).toBe(false);
+  });
+
+  it('keeps every file of the soak world runtime copy list in scope, even when a PR deletes it', () => {
+    const root = fixtureRoot();
+    soakFixture(root, ['scripts', 'schemas/rt.v1.json', 'app.json', 'data']);
+    writeFixture(root, 'scripts/x.mjs', 'export {};\n');
+    writeFixture(root, 'app.json', '{}\n');
+    writeFixture(root, 'data/a.json', '{}\n');
+
+    const closure = computeSoakClosure({ root });
+    expect(closure.has('app.json')).toBe(true);
+    expect(closure.has('schemas/rt.v1.json')).toBe(true); // deleted by the PR
+    expect(closure.has('scripts')).toBe(false); // folders are left to the import graph
+    expect(closure.has('data/a.json')).toBe(false);
+    expect(soakScopeRun({ root, changed: ['schemas/rt.v1.json'] })).toBe(true);
+  });
+
+  it('fails open (run=true) when the runtime copy list cannot be read', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/red-green.mjs', 'export const RUNTIME_PATHS = computed();\n');
+    expect(soakScopeRun({ root, changed: ['backlog/1-x.md'] })).toBe(true);
+    expectCliOutput(runCli('backlog/1-x.md\n', root), 'run=true');
+  }, 30_000);
+
+  it('follows a percent-encoded import URL to the decoded file', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "import '../../../fixture/dep%20x.mjs?v=1';\n");
+    writeFixture(root, 'fixture/dep x.mjs', 'export const x = 1;\n');
+    expect(computeSoakClosure({ root }).has('fixture/dep x.mjs')).toBe(true);
+  });
+
+  it('does not scan the soak tooling unit tests, which the soak never runs, unless a soak file imports them', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "import './__tests__/helper.mjs';\n");
+    writeFixture(root, 'scripts/conveyor/soak/__tests__/unit.test.mjs', "import '../../../../fixture/unit-only.mjs';\n");
+    writeFixture(root, 'scripts/conveyor/soak/__tests__/helper.mjs', "import '../../../../fixture/helper-dep.mjs';\n");
+    writeFixture(root, 'fixture/unit-only.mjs', 'export const u = 1;\n');
+    writeFixture(root, 'fixture/helper-dep.mjs', 'export const h = 1;\n');
+
+    const closure = computeSoakClosure({ root });
+    expect(closure.has('scripts/conveyor/soak/__tests__/unit.test.mjs')).toBe(true);
+    expect(closure.has('fixture/unit-only.mjs')).toBe(false);
+    expect(closure.has('fixture/helper-dep.mjs')).toBe(true);
+  });
+
   it('never resolves a literal naming the root itself to a sibling outside the repository', () => {
     const parent = fixtureRoot();
     const root = join(parent, 'repo');
-    writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
-    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "new URL('../../../', import.meta.url);\n");
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs',
+      "new URL('../../../', import.meta.url); read('docs/../../repo.mjs'); read('./scripts/../../repo.mjs');\n");
+    writeFixture(root, 'docs/x.md', '- x\n');
     // `<root>.mjs` beside the repository must stay out of the closure.
     writeFixture(parent, 'repo.mjs', "import './repo/outside-dep.mjs';\n");
 
@@ -189,7 +296,7 @@ describe('soak scope', () => {
   it('discovers dependencies without executing their source', () => {
     const root = fixtureRoot();
     const marker = join(root, 'executed');
-    writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
+    soakFixture(root);
     writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "import '../../../fixture/hostile.mjs';\n");
     writeFixture(root, 'fixture/hostile.mjs', [
       "import { writeFileSync } from 'node:fs';",

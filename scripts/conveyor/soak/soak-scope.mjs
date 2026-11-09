@@ -10,10 +10,13 @@ import { fileURLToPath } from 'node:url';
 
 const DEFAULT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const SOURCE = /\.(?:[cm]?[jt]sx?)$/;
+// Code folders: a named path here is followed even when missing (a deleted dependency).
+const CODE_ROOT = /^(?:scripts|src|tools|skills-src)\//;
 
 export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   root = resolve(root);
   const closure = new Set();
+  const scanned = new Set();
   const pending = [];
   const inside = (path) => {
     const rel = relative(root, path);
@@ -22,17 +25,31 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   const add = (path, scan = true) => {
     if (!inside(path)) return;
     const key = relative(root, path).split(sep).join('/');
-    if (closure.has(key)) return;
     closure.add(key);
-    if (scan) pending.push(path);
+    // A file first seen unscanned (a soak unit test) is still scanned once a soak file imports it.
+    if (scan && !scanned.has(key)) { scanned.add(key); pending.push(path); }
   };
+  // The soak tooling's own unit tests are in scope as files, but the soak never runs them, so
+  // their fixture literals are not soak dependencies (and would make their own assertions vacuous).
+  const UNIT_TESTS = 'scripts/conveyor/soak/__tests__/';
   const seed = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = resolve(dir, entry.name);
       if (entry.isDirectory()) seed(path);
-      else if (entry.isFile()) add(path);
+      else if (entry.isFile()) add(path, !relative(root, path).split(sep).join('/').startsWith(UNIT_TESTS));
       else throw new Error('Unsupported soak seed entry');
     }
+  };
+  // Any top-level folder or file can be a runtime dependency (the soak world copies
+  // `schemas/…`, `package.json`, `.gitignore` by name), not only the code folders.
+  const topLevel = new Set(readdirSync(root).filter((name) => name !== '.git' && name !== 'node_modules'));
+  // An import specifier is a URL: `./x.mjs?fresh=1#v` and `./a%20b.mjs` load `x.mjs` and `a b.mjs`.
+  // Keep the raw form too (a plain path may legitimately contain `?`, `#` or `%`).
+  const forms = (specifier) => {
+    const bare = specifier.replace(/[?#].*$/, '');
+    let decoded = bare;
+    try { decoded = decodeURIComponent(bare); } catch { /* malformed escape: keep the raw form */ }
+    return [...new Set([specifier, bare, decoded])].filter(Boolean);
   };
   const isFile = (path) => {
     try { return statSync(path).isFile(); }
@@ -62,6 +79,21 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   const config = resolve(root, 'vitest.soak.config.ts');
   if (!isFile(config)) throw new Error('Missing soak configuration');
   add(config);
+  // The files the soak world copies by name (red-green.mjs#RUNTIME_PATHS, which mirrors
+  // sim/world.mjs#buildWeTemplate) are in scope even when a PR deletes one. Folders in that
+  // list are covered by the import graph. A list that cannot be read fails open (run=true).
+  const runtime = /RUNTIME_PATHS\s*=\s*Object\.freeze\(\[([^\]]*)\]\)/.exec(
+    readFileSync(resolve(root, 'scripts/conveyor/soak/red-green.mjs'), 'utf8'));
+  if (!runtime) throw new Error('Unreadable soak runtime path list');
+  for (const [, , path] of runtime[1].matchAll(/(['"])([^'"]+)\1/g)) {
+    const target = resolve(root, path);
+    if (!inside(target)) continue;
+    let directory = false;
+    try { directory = statSync(target).isDirectory(); } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+    }
+    if (!directory) add(target);
+  }
   while (pending.length) {
     const file = pending.pop();
     if (!SOURCE.test(file)) continue;
@@ -72,14 +104,23 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     // dynamic import/require may take a template literal. The specifier is matched in a
     // lookahead so a quoted keyword (`'import'`) cannot consume a real import after it.
     for (const match of source.matchAll(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])([^'"`\r\n]+)\1)/g)) {
-      if (isRelative(match[2])) follow(resolve(dirname(file), match[2]));
+      for (const form of forms(match[2])) {
+        if (isRelative(form)) follow(resolve(dirname(file), form));
+      }
     }
     for (const match of source.matchAll(/(['"`])([^'"`\r\n]+)\1/g)) {
       // Non-import literals: file-relative (`setupFiles: ['./x']`, `new URL('../x', import.meta.url)`)
-      // and repo-root (spawn/readFile targets, `new URL('./scripts/x', ROOT_URL)`).
-      if (isRelative(match[2])) follow(resolve(dirname(file), match[2]));
-      const path = match[2].replace(/^\.\//, '');
-      if (/^(?:scripts|src|tools|skills-src)\//.test(path)) follow(resolve(root, path));
+      // and repo-root (spawn/readFile/copy targets, `new URL('./scripts/x', ROOT_URL)`).
+      for (const form of forms(match[2])) {
+        if (isRelative(form)) follow(resolve(dirname(file), form));
+        const path = form.replace(/^\.\//, '');
+        if (CODE_ROOT.test(path)) { follow(resolve(root, path)); continue; }
+        // Elsewhere only an existing file counts: test fixtures name many fake paths
+        // (`backlog/1-x.md`), and a bare folder word (`'docs'`) is not a file dependency.
+        // `inside` first: `docs/../../x` names a top-level folder but resolves outside the repo.
+        const target = resolve(root, path);
+        if (topLevel.has(path.split('/')[0]) && inside(target) && isFile(target)) add(target);
+      }
     }
   }
   return closure;
@@ -112,6 +153,7 @@ async function selfTest() {
       mkdirSync(seed, { recursive: true });
       mkdirSync(join(root, 'fixture'));
       writeFileSync(join(root, 'vitest.soak.config.ts'), 'export default {};');
+      writeFileSync(join(seed, 'red-green.mjs'), "export const RUNTIME_PATHS = Object.freeze(['schemas/rt.json']);");
       writeFileSync(join(root, dependency), 'export const value = true;');
       writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/dependency.mjs';");
       prepare({ root, seed });
@@ -159,6 +201,13 @@ async function selfTest() {
     assert.ok(computeSoakClosure({ root }).has('fixture/transitive.mjs'));
     assert.equal(existsSync(join(root, 'executed')), false);
   });
+  await scopeCase('a deleted runtime copy-list file requests the soak', () => {}, 'schemas/rt.json', true);
+  await scopeCase('import URL query strings still reach the dependency', ({ seed }) => {
+    writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/dependency.mjs?fresh=1#v';");
+  }, dependency, true);
+  await scopeCase('an unreadable runtime copy list requests the soak', ({ seed }) => {
+    writeFileSync(join(seed, 'red-green.mjs'), 'export const RUNTIME_PATHS = computed();');
+  }, 'backlog/unrelated.md', true);
   await scopeCase('unrelated changes skip the soak with readable evidence', () => {}, 'backlog/unrelated.md', false);
 }
 
