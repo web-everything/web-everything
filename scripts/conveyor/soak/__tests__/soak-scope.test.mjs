@@ -211,6 +211,10 @@ describe('soak scope', () => {
     ['backslash separators in an import specifier', "import '../..\\\\..\\\\fixture\\\\dep.mjs';"],
     ['a raw newline inside a template dynamic import', 'await import(`../../../fixture/\ndep.mjs`);'],
     ['an escaped tab in a new URL literal', "new URL('../../../fixture/de\\tp.mjs', import.meta.url);"],
+    ['a same-scheme file: reference in new URL', "new URL('file:../../../fixture/dep.mjs', import.meta.url);"],
+    // An escaped backslash before a quote does not escape the quote (self-review round 2).
+    ['a literal after an escaped backslash inside another string',
+      "const code = `cd C:\\\\'./scripts/x/dep\\'s.mjs'`;", "scripts/x/dep's.mjs"],
   ])('follows %s', (_name, source, expectedTarget) => {
     const root = fixtureRoot();
     soakFixture(root);
@@ -219,6 +223,7 @@ describe('soak scope', () => {
     writeFixture(root, 'scripts/x/dep.mjs', 'export const x = 1;\n');
     writeFixture(root, 'fixture/dep.v2.mjs', 'export const x = 2;\n');
     writeFixture(root, "fixture/dep's.mjs", 'export const x = 3;\n');
+    writeFixture(root, "scripts/x/dep's.mjs", 'export const x = 4;\n');
 
     const closure = computeSoakClosure({ root });
     const target = expectedTarget ?? (source.includes('./scripts/x/') ? 'scripts/x/dep.mjs'
@@ -226,6 +231,19 @@ describe('soak scope', () => {
     expect(closure.has(target)).toBe(true);
     expect(soakScopeRun({ root, changed: [target] })).toBe(true);
   });
+
+  // `require('..')` loads the parent folder's index file; a chain keeps it outside the seed.
+  it.each([['..', 'fixture/index.js'], ['.', 'fixture/sub/index.js']])(
+    "follows require('%s') to %s", (specifier, target) => {
+      const root = fixtureRoot();
+      soakFixture(root);
+      writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "import '../../../fixture/sub/a.mjs';\n");
+      writeFixture(root, 'fixture/sub/a.mjs', `require('${specifier}');\n`);
+      writeFixture(root, target, 'module.exports = 1;\n');
+
+      expect(computeSoakClosure({ root }).has(target)).toBe(true);
+      expect(soakScopeRun({ root, changed: [target] })).toBe(true);
+    });
 
   // A chain: a bare name in the seed directory would resolve inside the seed and pass trivially.
   it('follows an escaped file-relative new URL literal without a ./ prefix', () => {
@@ -257,7 +275,7 @@ describe('soak scope', () => {
   // previous shape took about 23 s on this 20 KB line, against a 5-minute CI job (#6573 review).
   it.each([
     ['escaped single quotes', `const s = '${"\\'".repeat(10_000)}';`],
-    ['embedded JSON', `const s = "${'{\\"k\\":1},'.repeat(2_000)}";`],
+    ['embedded JSON', `const s = "${'{\\"k\\":1},'.repeat(6_000)}";`],
     ['escaped backticks', `const s = \`${'\\`'.repeat(10_000)}\`;`],
   ])('scans a long line of %s in linear time', (_name, line) => {
     const root = fixtureRoot();

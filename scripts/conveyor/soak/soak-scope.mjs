@@ -37,9 +37,10 @@ function unescapeJs(text) {
 // PLAIN is the original shape (no quote of any kind inside). STRING and TEMPLATE add the other
 // quote, `\'`, escapes, line continuations and (templates only) raw newlines; `forms` decodes
 // their bodies. All shapes are scanned and unioned, so scope only widens.
-// Linear cost: an escape-aware start is a quote with no backslash right before it, so it is
-// never an escaped quote, and it ends at the next unescaped quote of its kind; two starts of
-// one kind never scan the same text.
+// Linear cost: an escape-aware start is a quote after an even run of backslashes (none, or an
+// escaped backslash as in `C:\\'./x'`), so it is never an escaped quote, and it ends at the
+// next unescaped quote of its kind; two starts of one kind never scan the same text. The quote
+// is tested before the backslash-run lookbehind, so that lookbehind runs only at quotes.
 const PLAIN = /(?=(['"`])([^'"`\r\n]+)\1)/.source;
 const STRING = /(?=(['"])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/.source;
 const TEMPLATE = /(?=(`)((?:[^`\\]|\\[^])+)\1)/.source;
@@ -52,7 +53,7 @@ const shapes = (prefix, escapedPrefix = prefix) => [
 // dynamic import/require may take a template literal. A keyword start is never escaped.
 const IMPORT_SHAPES = shapes(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*/.source);
 const URL_SHAPES = shapes(/\bnew\s+URL\s*\(\s*/.source);
-const LITERAL_SHAPES = [/(['"`])([^'"`\r\n]+)\1/g, ...shapes('', /(?<!\\)/.source).slice(1)];
+const LITERAL_SHAPES = [/(['"`])([^'"`\r\n]+)\1/g, ...shapes('', /(?=['"`])(?<=(?:^|[^\\])(?:\\\\)*)/.source).slice(1)];
 
 // The URL parser trims leading and trailing C0 controls and spaces (code points 0-32) only.
 function urlTrim(text) {
@@ -177,17 +178,21 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     if (!SOURCE.test(file)) continue;
     const source = readFileSync(file, 'utf8');
     // Over-approximate: literals in comments/fixtures may widen scope too.
-    const isRelative = (specifier) => specifier.startsWith('./') || specifier.startsWith('../');
+    // `require('.')` and `require('..')` load that folder's index file.
+    const isRelative = (specifier) => specifier.startsWith('./') || specifier.startsWith('../')
+      || specifier === '.' || specifier === '..';
     const matches = (patterns) => patterns.flatMap((pattern) => [...source.matchAll(pattern)]);
     for (const match of matches(IMPORT_SHAPES)) {
       for (const form of forms(match[2])) {
         if (isRelative(form)) follow(resolve(dirname(file), form));
       }
     }
-    // `new URL('data.json', import.meta.url)` is file-relative without a `./` prefix.
+    // `new URL('data.json', import.meta.url)` is file-relative without a `./` prefix, and so is
+    // a same-scheme reference against the `file:` base (`new URL('file:dep.json', base)`).
     for (const match of matches(URL_SHAPES)) {
       for (const form of forms(match[2])) {
-        if (!/^[a-z][a-z0-9+.-]*:|^\/|\$\{/i.test(form)) follow(resolve(dirname(file), form));
+        const reference = form.replace(/^file:(?!\/)/i, '');
+        if (!/^[a-z][a-z0-9+.-]*:|^\/|\$\{/i.test(reference)) follow(resolve(dirname(file), reference));
       }
     }
     for (const match of matches(LITERAL_SHAPES)) {
