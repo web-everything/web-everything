@@ -371,7 +371,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         if (queued) {
           if (input.redTeamMode) {
             witness = readWitness(key);
-            recovery = planRedTeamRecovery(witness, { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env) });
+            recovery = planRedTeamRecovery(witness, { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env });
             if (recovery.mode === 'skip' || recovery.abandon || recovery.mode !== input.redTeamMode
               || JSON.stringify(recovery.payload?.findings?.read) !== JSON.stringify(input.loopPayload?.findings?.read)) throw Error(recovery.why ?? 'recovery evidence changed; retry next tick');
           }
