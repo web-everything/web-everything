@@ -263,6 +263,26 @@ describe('R473 pure classified verdict', () => {
     expect((await compute([finding({ class: 'E2', file: 'other/x.mjs' })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/**/'] }))).verdict)
       .toBe('NOT WEAKENED');
   });
+  // PR #6381 judge (red-team 1b07722449ffc6d7): the path-character token regex has no `+` (nor `@ ~ % = ,`), so a legal
+  // ASCII name like custom/a+b.mjs was split at the `+` once quoted, line-suffixed or diff-prefixed, and no candidate
+  // equalled the protected glob. The whitespace-run cores (edges trimmed, interior kept) are now candidates too.
+  describe('a protected name holding ASCII punctuation the token regex splits on (PR #6381 judge)', () => {
+    const PLUS = 'custom/a+b.mjs'; const MIXED = 'custom/x@y~z%w=v,u.mjs';
+    const wrapped = name => [name, `"${name}"`, `${name}:12`, `+++ b/${name}`, `\`${name}\``, `${name}:42:7`, `${name}#L42`,
+      `${name} (line 42)`, `${name}@ec32b86`, `a/${name}`, `see (${name})`];
+    it.each([...wrapped(PLUS), ...wrapped(MIXED)])('%j is WEAKENED under guardFloorPaths naming it', async file => {
+      const f = finding({ class: 'E2', file });
+      const layered = await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: [PLUS, MIXED] }));
+      expect(layered.verdict).toBe('WEAKENED');
+      expect(ids(layered.blocks)).toContain('f1');
+      expect((await compute([f], options('prerelease', { guardFloorPaths: [PLUS, MIXED] }))).verdict).toBe('WEAKENED');
+    });
+    it.each(['custom/ab.mjs', '"custom/ab.mjs"', 'custom/ab.mjs:12', '+++ b/custom/ab.mjs', 'custom/a.mjs', 'custom/b.mjs', 'custom/x@y.mjs'])(
+      'an unrelated path %j still ships (the cores never over-block)', async file => {
+        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: [PLUS, MIXED] }))).verdict)
+          .toBe('NOT WEAKENED');
+      });
+  });
   // PR #6381 judge: WE_PLATFORM_PREFERENCES_FILE replaced the whole platform chain, so a race path the default chain
   // protects was dropped and a D3 race there cleared once the override pointed anywhere else.
   it('a D3 race in a default-chain protected path stays WEAKENED under a platform-file override (PR #6381 judge)', async () => {

@@ -186,15 +186,28 @@ function pathCandidates(file, anchors = new Set()) {
   // Forms: the raw report, the fold, the fold without whitespace, and the fold keeping only path characters, so any
   // splitter inside a name (a gap, a bracket, `,`, `!`, `:`, a symbol stripped above as an edge) joins it up again.
   const joined = folded.replace(/\s/gu, '');
+  const tokens = [];
   for (const form of new Set([file, folded, joined, folded.replace(/[^\p{L}\p{N}\p{M}_.\-/\\]/gu, '')])) {
-    for (const token of form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []) {
-      const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
-      for (let i = 0; i < segs.length; i++) {
-        if (i > 0 && !anchors.has(segs[i].toLowerCase())) continue;
-        const c = pathCandidate(segs.slice(i).join('/'));
-        if (c !== null) out.add(c);
-        if (out.size > MAX_CANDIDATES) return null;
-      }
+    tokens.push(...(form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []));
+  }
+  // PR #6381 judge: the token regex splits on any ASCII character it does not list (`+`, `@`, `~`, `%`, `=`, `,`), so a
+  // legal name such as custom/a+b.mjs never matched once quoted, line-suffixed or diff-prefixed. Adding characters to
+  // the regex always misses the next one, so the cores are tokens too: only their edges were trimmed, so every
+  // interior character stays. A core may also carry a trailing line or annotation suffix (`:12`, `:42:7`, `#L42`,
+  // `@sha`); each cut at such a character in its last folder is a token as well, so a name holding `@` keeps both.
+  for (const core of [...cores, joined.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '')]) {
+    if (core === '') continue;
+    tokens.push(core);
+    const last = core.replace(/\\/g, '/').lastIndexOf('/') + 1;
+    for (let i = core.length - 1; i >= last; i--) if (/[:#@(]/.test(core[i])) tokens.push(core.slice(0, i));
+  }
+  for (const token of tokens) {
+    const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
+    for (let i = 0; i < segs.length; i++) {
+      if (i > 0 && !anchors.has(segs[i].toLowerCase())) continue;
+      const c = pathCandidate(segs.slice(i).join('/'));
+      if (c !== null) out.add(c);
+      if (out.size > MAX_CANDIDATES) return null;
     }
   }
   return [...out];
