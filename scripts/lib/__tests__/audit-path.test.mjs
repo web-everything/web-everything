@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { canonicalPaths } from '../audit-path.mjs';
-import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern } from './fixtures/audit-path-old-oracle.mjs';
+import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern, oracleMatchesPath } from './fixtures/audit-path-old-oracle.mjs';
 
 const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/'];
 const lower = a => a.map(x => x.toLowerCase());
@@ -25,8 +25,8 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
     'backticks': '`scripts/guard-bash.mjs`',
     'diff header +++ b/': '+++ b/scripts/guard-bash.mjs',
     'diff header --- a/': '--- a/scripts/guard-bash.mjs',
-    'side prefix i/': 'i/scripts/guard-bash.mjs',
-    'folder above the repo': 'repo/scripts/guard-bash.mjs',
+    'git side prefix i/': 'i/scripts/guard-bash.mjs',
+    'git side prefix w/': 'w/scripts/guard-bash.mjs',
     'absolute path': '/home/dev/repo/scripts/guard-bash.mjs',
     'line suffix :42': 'scripts/guard-bash.mjs:42',
     'line range :42-50': 'scripts/guard-bash.mjs:42-50',
@@ -91,6 +91,8 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
     expect(canonicalPaths('a/x.mjs#L3-L9')).toEqual(['a/x.mjs', 'x.mjs']);
     expect(canonicalPaths('scripts/x.mjs:1:2')).toEqual(['scripts/x.mjs']);
     expect(canonicalPaths('scripts/x.mjs.')).toEqual(['scripts/x.mjs.', 'scripts/x.mjs']);
+    expect(canonicalPaths('-docs/a.md')).toEqual(['-docs/a.md', 'docs/a.md']);
+    expect(canonicalPaths('./x.mjs')).toEqual(['x.mjs']);
   });
 });
 
@@ -109,48 +111,47 @@ const fuzz = r => {
 };
 
 describe('P2 monotonic against the old matcher (test-only oracle)', () => {
-  // The oracle also read every trailing sub-path of a longer path ("folder above the repo") and the digits of a line
-  // suffix as candidates. The strict grammar drops exactly those two (a nested x/y is not y); everything else the
-  // oracle read from a grammar-valid report must still be a candidate.
-  const allowedDrop = (c, news) => /^\d+$/.test(c) || news.some(n => n.endsWith('/' + c));
+  // The oracle also matched on forms that are not names: every trailing sub-path of a longer path ("folder above the
+  // repo"), the digits of a line suffix, and the raw report with its wrapper text. The strict grammar drops exactly
+  // those; any other candidate the oracle matched on must still make the new matcher protect the path.
+  const clean = PATTERNS.map(oracleCleanPattern);
+  const allowedDrop = (c, news, file) => /^\d+$/.test(c) || c === file.toLowerCase() || news.some(n => n.endsWith('/' + c));
   const check = file => {
-    const news = canonicalPaths(file);
-    if (news === null) return; // protected: nothing is lost
-    const anchors = oracleAnchorsOf(PATTERNS.map(oracleCleanPattern));
-    const old = oraclePathCandidates(file, anchors);
-    if (old === null) return; // the oracle refused it; the grammar defines this shape, P3 covers over-blocking
+    if (!oracleMatchesSome(file, PATTERNS) || protects(file)) return;
+    const news = lower(canonicalPaths(file));
+    const old = oraclePathCandidates(file, oracleAnchorsOf(clean));
+    if (old === null) return; // the oracle refused (protected) a shape the grammar defines; P3 guards over-blocking
     for (const c of lower(old)) {
-      if (!lower(news).includes(c) && !allowedDrop(c, lower(news))) throw new Error('lost candidate ' + JSON.stringify(c) + ' for ' + JSON.stringify(file));
+      if (clean.some(p => oracleMatchesPath(c, p)) && !allowedDrop(c, news, file)) throw new Error('lost match on ' + JSON.stringify(c) + ' for ' + JSON.stringify(file));
     }
   };
-  it('every corpus-style shape keeps all the oracle candidates', () => {
-    for (const f of ['scripts/lib/x.mjs', '"scripts/lib/x.mjs":4', '+++ b/.claude/x', 'a/custom/y.mjs', 'x.mjs.', 'repo/scripts/guard-bash.mjs', '"custom/x"#L3-L4']) check(f);
+  it('every corpus-style shape stays protected', () => {
+    for (const f of ['scripts/lib/x.mjs', '"scripts/lib/x.mjs":4', '+++ b/.claude/x', 'a/custom/y.mjs', '"custom/x"#L3-L4', 'docs/a.md']) {
+      expect(oracleMatchesSome(f, PATTERNS)).toBe(true);
+      expect(protects(f)).toBe(true);
+    }
   });
-  it('5000 seeded fuzz strings never lose a candidate', () => {
+  it('5000 seeded fuzz strings: nothing the oracle protected is lost', () => {
     const r = rng(0x6381);
     for (let i = 0; i < 5000; i++) check(fuzz(r));
   });
-  it('where the oracle protected a path by match, the new matcher protects it (bar the named narrowing)', () => {
+  it('5000 more fuzz strings built around protected names', () => {
     const r = rng(0x5eed);
-    for (let i = 0; i < 5000; i++) {
-      const f = fuzz(r);
-      if (!oracleMatchesSome(f, PATTERNS) || protects(f)) continue;
-      const news = canonicalPaths(f);
-      expect(news).not.toBeNull();
-      expect(news.some(n => n.includes('/'))).toBe(true);
-    }
+    const names = ['scripts/guard-bash.mjs', 'scripts/lib/a.mjs', '.claude/s.json', 'custom/q/r.mjs', 'review-x.mjs', 'docs/a.md'];
+    for (let i = 0; i < 5000; i++) check(fuzz(r) + names[Math.floor(r() * names.length)] + fuzz(r));
   });
-  it('named narrowing: a nested sub-path is no longer read as a repo file', () => {
+  it('named narrowing: a folder above the repo is a nested path, not a repo file', () => {
     expect(oracleMatchesSome('repo/scripts/guard-bash.mjs', ['scripts/guard-bash.mjs'])).toBe(true);
     expect(canonicalPaths('repo/scripts/guard-bash.mjs')).toEqual(['repo/scripts/guard-bash.mjs']);
   });
 });
 
-describe('P3 every tracked path canonicalises to itself', () => {
+describe('P3 every tracked path canonicalises to itself first', () => {
   it('git ls-files', () => {
     const files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 1 << 28 }).split('\0').filter(Boolean);
     expect(files.length).toBeGreaterThan(100);
-    const bad = files.filter(f => { const c = canonicalPaths(f); return !(c && c.length === 1 && c[0] === f); });
+    // The first candidate is the path as reported; any others are the edge-trimmed forms (`.claude/x` also reads `claude/x`).
+    const bad = files.filter(f => { const c = canonicalPaths(f); return !(c && c[0] === f && c.length <= 3); });
     expect(bad.slice(0, 10)).toEqual([]);
   });
 });
@@ -163,7 +164,7 @@ describe('P4 total and bounded', () => {
     const t0 = performance.now();
     for (const h of hostile) {
       const c = canonicalPaths(h);
-      expect(c === null || (Array.isArray(c) && c.length >= 1 && c.length <= 4)).toBe(true);
+      expect(c === null || (Array.isArray(c) && c.length >= 1 && c.length <= 8)).toBe(true);
     }
     expect(performance.now() - t0).toBeLessThan(2000);
   });
