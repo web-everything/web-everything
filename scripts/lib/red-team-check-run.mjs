@@ -157,6 +157,10 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
       return runs.map(run => run.id);
     };
     const before = inspect();
+    // A hold left by another publication belongs to its recovery path. Do not overwrite it
+    // with our temporary hold and later clear that writer's protection.
+    const existingHold = readRedTeamPublicationHoldFact({ repo, pr, headSha, gh });
+    if (existingHold.ok !== true) throw Error(existingHold.reason);
     const held = postRedTeamPublicationHold({ repo, pr, headSha, held: true,
       reason: 'validating live red-team check publication', gh });
     if (!held.ok) throw Error(held.reason);
