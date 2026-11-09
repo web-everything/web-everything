@@ -149,8 +149,8 @@ const MAX_CANDIDATES = 32;
  * characters and the blank Braille pattern dropped; the dash, slash and dot lookalikes NFKC keeps (U+2011, U+2212,
  * U+2215, U+3002, ...) read as `-`, `/` and `.`. Written as escapes: a raw invisible in source is refused by check:standards.
  */
-const foldPathText = s => s.normalize('NFKC')
-  .replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{2800}]/gu, '')
+const foldPathText = (s, gap = '') => s.normalize('NFKC')
+  .replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{2800}]/gu, gap)
   .replace(/[\p{Pd}\u{2212}\u{2043}]/gu, '-')
   .replace(/[\u{2215}\u{2044}\u{2216}\u{29f5}\u{29f8}\u{29f9}]/gu, '/')
   .replace(/[\u{b7}\u{589}\u{6d4}\u{2027}\u{2219}\u{22c5}\u{2e31}\u{2e33}\u{3002}\u{30fb}]/gu, '.');
@@ -193,13 +193,26 @@ function pathCandidates(file, anchors = new Set()) {
   // PR #6381 judge: the token regex splits on any ASCII character it does not list (`+`, `@`, `~`, `%`, `=`, `,`), so a
   // legal name such as custom/a+b.mjs never matched once quoted, line-suffixed or diff-prefixed. Adding characters to
   // the regex always misses the next one, so the cores are tokens too: only their edges were trimmed, so every
-  // interior character stays. A core may also carry a trailing line or annotation suffix (`:12`, `:42:7`, `#L42`,
-  // `@sha`); each cut at such a character in its last folder is a token as well, so a name holding `@` keeps both.
-  for (const core of [...cores, joined.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '')]) {
+  // interior character stays. Wrapping prose may still sit inside a core (`"a+b.mjs":12`, `[x](a+b.mjs)`, `a+b.mjs?x=1`,
+  // two names joined by `,`), and no list of those characters is complete either, so the core is cut at EVERY
+  // punctuation or symbol that is not a path character, and every run between two cuts, edges trimmed again, is a
+  // token. The cores are taken from a second fold too, where a dropped invisible or line separator is a gap rather than
+  // nothing, so prose it glued onto a name is cut off. More candidates than the bound still fail closed.
+  const edges = s => s.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
+  const spacedCores = foldPathText(file, ' ').split(/\s+/u).map(edges);
+  for (const core of new Set([...cores, ...spacedCores, edges(joined)])) {
     if (core === '') continue;
-    tokens.push(core);
-    const last = core.replace(/\\/g, '/').lastIndexOf('/') + 1;
-    for (let i = core.length - 1; i >= last; i--) if (/[:#@(]/.test(core[i])) tokens.push(core.slice(0, i));
+    const cuts = [-1];
+    for (let i = 0; i < core.length; i++) if (/[^\p{L}\p{N}\p{M}_.\-/\\]/u.test(core[i])) cuts.push(i);
+    // Runs grow with the square of the cuts: a core with more cuts than the candidate bound fails closed (protected).
+    if (cuts.length > MAX_CANDIDATES + 1) return null;
+    cuts.push(core.length);
+    for (let a = 0; a < cuts.length - 1; a++) {
+      for (let b = a + 1; b < cuts.length; b++) {
+        const span = edges(core.slice(cuts[a] + 1, cuts[b]));
+        if (span !== '') tokens.push(span);
+      }
+    }
   }
   for (const token of tokens) {
     const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');

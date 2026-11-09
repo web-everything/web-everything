@@ -267,19 +267,44 @@ describe('R473 pure classified verdict', () => {
   // ASCII name like custom/a+b.mjs was split at the `+` once quoted, line-suffixed or diff-prefixed, and no candidate
   // equalled the protected glob. The whitespace-run cores (edges trimmed, interior kept) are now candidates too.
   describe('a protected name holding ASCII punctuation the token regex splits on (PR #6381 judge)', () => {
-    const PLUS = 'custom/a+b.mjs'; const MIXED = 'custom/x@y~z%w=v,u.mjs';
-    const wrapped = name => [name, `"${name}"`, `${name}:12`, `+++ b/${name}`, `\`${name}\``, `${name}:42:7`, `${name}#L42`,
-      `${name} (line 42)`, `${name}@ec32b86`, `a/${name}`, `see (${name})`];
-    it.each([...wrapped(PLUS), ...wrapped(MIXED)])('%j is WEAKENED under guardFloorPaths naming it', async file => {
+    const PLUS = 'custom/a+b.mjs'; const MIXED = 'custom/x@y~z%w=v,u.mjs'; const QUOTED = "custom/it's!&$.mjs";
+    const GUARDED = [PLUS, MIXED, QUOTED];
+    const wrapped = name => [name, `"${name}"`, `${name}:12`, `+++ b/${name}`, `--- a/${name}`, `\`${name}\``, `${name}:42:7`, `${name}#L42`,
+      `${name} (line 42)`, `${name}@ec32b86`, `a/${name}`, `see (${name})`, `${name}, line 4`, `${name}:12:`, `custom\\${name.slice(7)}`,
+      // Self-review of the cores fix: a wrapper closed before a line suffix, a markdown link, a query or other annotation
+      // after the name, two names joined by a comma, and an invisible or line separator gluing prose onto the name.
+      `\`${name}\`:12`, `"${name}":12`, `'${name}':12`, `<${name}>:12`, `(${name}):12`, `{${name}}:12`, `*${name}*:12`,
+      `[${name}](link)`, `[x](${name})`, `[${name}](https://example.test/a/b)`, `${name}?plain=1`, `${name}?plain=1#L4`,
+      `${name}~1`, `${name}|12`, `${name}!12`, `${name}%3A12`, `${name},custom/c.mjs`, `custom/c.mjs,${name}`,
+      ...[0x2028, 0x2029, 0x85, 0x200b, 0xad, 0x2060].map(cp => `${name}${String.fromCodePoint(cp)}more`)];
+    it.each([...wrapped(PLUS), ...wrapped(MIXED), ...wrapped(QUOTED)])('%j is WEAKENED under guardFloorPaths naming it', async file => {
       const f = finding({ class: 'E2', file });
-      const layered = await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: [PLUS, MIXED] }));
+      const layered = await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }));
       expect(layered.verdict).toBe('WEAKENED');
-      expect(ids(layered.blocks)).toContain('f1');
-      expect((await compute([f], options('prerelease', { guardFloorPaths: [PLUS, MIXED] }))).verdict).toBe('WEAKENED');
+      expect(layered.ships).toEqual([]);
+      // A report cut so often that its runs pass the candidate bound fails closed into recheck (X2, human adjudication)
+      // instead of a block: still protected, never shipped. Every PLUS and QUOTED form stays within the bound.
+      expect([...ids(layered.blocks), ...(file.includes(MIXED) ? ids(layered.recheck) : [])]).toContain('f1');
+      expect((await compute([f], options('prerelease', { guardFloorPaths: GUARDED }))).verdict).toBe('WEAKENED');
     });
-    it.each(['custom/ab.mjs', '"custom/ab.mjs"', 'custom/ab.mjs:12', '+++ b/custom/ab.mjs', 'custom/a.mjs', 'custom/b.mjs', 'custom/x@y.mjs'])(
+    it.each(['custom/a.mjs', 'custom/b.mjs', 'custom/x@y.mjs', 'custom/it.mjs', ...wrapped('custom/ab.mjs')])(
       'an unrelated path %j still ships (the cores never over-block)', async file => {
-        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: [PLUS, MIXED] }))).verdict)
+        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
+          .toBe('NOT WEAKENED');
+      });
+    // The runs between cuts grow with the square of the cuts, so a core cut more often than the candidate bound allows
+    // fails closed (protected, an operator-visible block), at bounded cost; one just under it is still judged.
+    it('a core with more cuts than the candidate bound fails closed at bounded cost', async () => {
+      const started = Date.now();
+      for (const file of [`other/${'a+'.repeat(40)}.mjs`, `other/${'+'.repeat(500)}x`, `other/x${'?'.repeat(400)}.mjs`]) {
+        const r = await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }));
+        expect(r.verdict, file.slice(0, 20)).toBe('WEAKENED');
+        expect(r.ships).toEqual([]);
+      }
+      expect(Date.now() - started).toBeLessThan(5000);
+    });
+    it.each(['other/a+b+c.mjs', 'other/x.mjs?plain=1#L4-L9'])('a report %j with a few cuts is still judged and ships', async file => {
+        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
           .toBe('NOT WEAKENED');
       });
   });
