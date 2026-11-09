@@ -47,8 +47,8 @@ async function adoptFromMain({ root, env, log, entries = [], mainOnly, admission
     const cwd = ensureCodeSnapshot({ jobsDir, codeSha, repoDir: root });
     // Dependencies also come from the pinned lockfile, never the daemon's moving checkout.
     if (existsSync(join(cwd, 'package-lock.json'))) {
-      const store = ensureNodeModulesStore({ jobsDir, sourceDir: cwd });
-      linkNodeModules(cwd, store.dir);
+      const store = ensureNodeModulesStore({ jobsDir, sourceDir: cwd, adopter: true });
+      linkNodeModules(cwd, store.dir, { replace: true });
     }
     const childEnv = { ...env };
     delete childEnv.NODE_PATH;

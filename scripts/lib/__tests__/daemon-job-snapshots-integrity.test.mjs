@@ -147,6 +147,52 @@ function fixture() {
 }
 
 describe('adopter dependency provenance and integrity', () => {
+  it('normalizes a successful dependency-free npm ci, verifies its empty digest and repairs added files', () => {
+    const f = fixture();
+    // Model npm's real empty-install result: successful exit, no node_modules.
+    io.exec.mockImplementation(() => '');
+    const options = { jobsDir: jobs.rebuildJobsDir(f.root, f.env), sourceDir: f.snapshot, adopter: true,
+      install: snapshots.npmCiInstaller({ exec: io.exec }) };
+    const store = realEnsureNodeModulesStore(options);
+    expect(io.exec).toHaveBeenCalledTimes(1);
+    expect(io.exec.mock.calls[0].slice(0, 2)).toEqual(['npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund']]);
+    expect(readdirSync(join(store.dir, 'node_modules'))).toEqual([]);
+    expect(JSON.parse(readFileSync(join(store.dir, INTEGRITY), 'utf8'))).toEqual({
+      lockHash: sha(LOCK), treeDigest: sha('[]'),
+    });
+    expect(realEnsureNodeModulesStore(options)).toEqual(store);
+    expect(io.exec).toHaveBeenCalledTimes(1);
+    put(store.dir, 'node_modules/injected.js', 'untrusted');
+    expect(realEnsureNodeModulesStore(options)).toEqual(store);
+    expect(io.exec).toHaveBeenCalledTimes(2);
+    expect(readdirSync(join(store.dir, 'node_modules'))).toEqual([]);
+  });
+
+  it.each([
+    ['nonempty lock', '{"name":"fixture"}', '{"lockfileVersion":3,"packages":{"node_modules/pkg":{"version":"1"}}}'],
+    ['manifest dependencies', '{"dependencies":{"pkg":"1"}}', LOCK],
+    ['unknown lock shape', '{"name":"fixture"}', '{}'],
+  ])('refuses a missing npm-installed tree with %s before child execution', async (_name, manifest, lock) => {
+    const f = fixture();
+    put(f.snapshot, 'package.json', manifest);
+    put(f.snapshot, 'package-lock.json', lock);
+    io.exec.mockImplementation(() => '');
+    f.install.mockImplementation(snapshots.npmCiInstaller({ exec: io.exec }));
+    await expect(f.adopt()).resolves.toMatchObject({ moved: false, reason: 'adopt-child-failed' });
+    expect(io.exec).toHaveBeenCalledTimes(1);
+    expect(f.child).not.toHaveBeenCalled();
+    f.unchanged();
+  });
+
+  it('refuses an injected installer that leaves no tree even with dependency-free inputs', async () => {
+    const f = fixture();
+    f.install.mockImplementation(() => {});
+    await expect(f.adopt()).resolves.toMatchObject({ moved: false, reason: 'adopt-child-failed' });
+    expect(f.install).toHaveBeenCalledTimes(1);
+    expect(f.child).not.toHaveBeenCalled();
+    f.unchanged();
+  });
+
   it('A/D: bypasses a complete checkout-copied shared job store without modifying it', async () => {
     const f = fixture();
     const jobsDir = jobs.rebuildJobsDir(f.root, f.env);

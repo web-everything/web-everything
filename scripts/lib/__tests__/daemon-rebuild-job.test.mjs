@@ -13,6 +13,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 import {
@@ -343,7 +344,9 @@ describe('R787 — adoption is a fail-closed main-snapshot child', () => {
       writeFile(dir, 'reviewed.txt', 'main\n');
       // A tiny reviewed CLI fixture calls the real adopter in a separate process.
       // Loaded-process Vitest mocks cannot affect its decision or lock handling.
-      const source = new URL('../daemon-rebuild.mjs', import.meta.url).href;
+      // Vite rewrites new URL(relative, import.meta.url) into an HTTP asset URL.
+      // The real Node child needs a filesystem module, independent of DOM transforms.
+      const source = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../daemon-rebuild.mjs')).href;
       writeFile(dir, 'scripts/lib/daemon-rebuild.mjs', `
         import { rebuildClone } from ${JSON.stringify(source)};
         if (!process.argv.includes('--adopt-only') || !process.argv.includes('--json')) process.exit(2);
