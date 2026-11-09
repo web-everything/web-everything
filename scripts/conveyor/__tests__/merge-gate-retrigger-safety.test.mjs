@@ -148,17 +148,17 @@ describe('merge-gate retrigger safety', () => {
   it('production IO uses bounded argv-based live-head and label endpoints', () => {
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ head: { sha: head } }))
       .mockReturnValueOnce(JSON.stringify([{ name: 'other' }]))
-      .mockReturnValueOnce(JSON.stringify([{ name: 'merge-gate-retrigger' }])).mockReturnValueOnce('');
+      .mockReturnValueOnce(JSON.stringify([{ name: 'review:merge-gate-retrigger' }])).mockReturnValueOnce('');
     const io = createRetriggerIo({ repo, pr: 1, exec });
     expect(io.readHead()).toBe(head);
     expect(io.readLabels()).toEqual(['other']);
-    expect(io.addLabel('merge-gate-retrigger')).toEqual({ ok: true });
-    io.removeLabel('merge-gate-retrigger');
+    expect(io.addLabel('review:merge-gate-retrigger')).toEqual({ ok: true });
+    io.removeLabel('review:merge-gate-retrigger');
     expect(exec.mock.calls.map(call => call[1])).toEqual([
       ['api', `repos/${repo}/pulls/1`],
       ['api', `repos/${repo}/issues/1/labels?per_page=100`],
-      ['api', '-X', 'POST', `repos/${repo}/issues/1/labels`, '-f', 'labels[]=merge-gate-retrigger'],
-      ['api', '-X', 'DELETE', `repos/${repo}/issues/1/labels/merge-gate-retrigger`],
+      ['api', '-X', 'POST', `repos/${repo}/issues/1/labels`, '-f', 'labels[]=review:merge-gate-retrigger'],
+      ['api', '-X', 'DELETE', `repos/${repo}/issues/1/labels/review%3Amerge-gate-retrigger`],
     ]);
     for (const call of exec.mock.calls) expect(call[2]).toEqual(expect.objectContaining({ timeout: 60_000, maxBuffer: 4 * 1024 * 1024 }));
   });
@@ -185,7 +185,7 @@ describe('merge-gate retrigger safety', () => {
     const { result, labelRetrigger, trigger, postComment } = sweepWithRuns(() => [startupFailure]);
     expect(labelRetrigger).toHaveBeenCalledWith(expect.objectContaining({ repo, pr: 1, head, context: 'merge-gate' }));
     expect(trigger).not.toHaveBeenCalled();
-    expect(postComment).not.toHaveBeenCalled();
+    expect(postComment).toHaveBeenCalledWith(1, expect.objectContaining({ headSha: head, action: 'label-event', ok: true }));
     expect(result.applied).toEqual([expect.objectContaining({ ok: true, action: 'label-retrigger' })]);
   });
 
@@ -213,7 +213,8 @@ describe('merge-gate retrigger safety', () => {
       expect(io.removeLabel).not.toHaveBeenCalled();
       for (const sweep of [first, second]) {
         expect(sweep.trigger).toHaveBeenCalledTimes(1);
-        expect(sweep.postComment).toHaveBeenCalledTimes(1);
+        expect(sweep.postComment).toHaveBeenCalledTimes(2);
+        expect(sweep.postComment).toHaveBeenNthCalledWith(1, 1, expect.objectContaining({ headSha: head, action: 'label-event', ok: false }));
         expect(sweep.clearLabel).toHaveBeenCalledTimes(1);
         expect(sweep.result.applied).toEqual([
           expect.objectContaining({ prNumber: 1, ok: true, action: 'pull-request-push' }),
@@ -231,7 +232,9 @@ describe('merge-gate retrigger safety', () => {
     const { result, trigger, postComment } = sweepWithRuns(() => [startupFailure], 1, { labelRetrigger });
     expect(labelRetrigger).toHaveBeenCalledTimes(1);
     expect(trigger).toHaveBeenCalledTimes(1);
-    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenNthCalledWith(1, 1, expect.objectContaining({ headSha: head, action: 'label-event', ok: false }));
+    expect(postComment).toHaveBeenNthCalledWith(2, 1, expect.objectContaining({ action: 'pull-request-push', ok: true }));
     expect(result.applied).toEqual([expect.objectContaining({ ok: true, action: 'pull-request-push' })]);
   });
 
@@ -244,7 +247,7 @@ describe('merge-gate retrigger safety', () => {
     });
     expect(io.addLabel).toHaveBeenCalledTimes(1);
     expect(trigger).not.toHaveBeenCalled();
-    expect(postComment).not.toHaveBeenCalled();
+    expect(postComment).toHaveBeenCalledWith(1, expect.objectContaining({ headSha: head, action: 'label-event', ok: true }));
     expect(result.applied).toEqual([expect.objectContaining({
       ok: true, action: 'label-retrigger', warning: expect.stringContaining('operator must remove'),
     })]);
@@ -291,7 +294,7 @@ describe('merge-gate retrigger safety', () => {
     expect(readWorkflowRuns).toHaveBeenCalledTimes(8);
     expect(labelRetrigger).toHaveBeenCalledTimes(8);
     expect(trigger).toHaveBeenCalledTimes(1);
-    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(9);
     expect(result.applied.at(-1)).toEqual(expect.objectContaining({ prNumber: 9, action: 'pull-request-push' }));
   });
 
@@ -304,9 +307,9 @@ describe('merge-gate retrigger safety', () => {
   }
 
   it('stale sentinel label is removed before the fresh label transition', () => {
-    const io = labelIo(['other', 'merge-gate-retrigger']);
+    const io = labelIo(['other', 'review:merge-gate-retrigger']);
     expect(retrigger(io)).toEqual({ ok: true, action: 'label-retrigger' });
-    expect(io.removeLabel.mock.calls).toEqual([['merge-gate-retrigger'], ['merge-gate-retrigger']]);
+    expect(io.removeLabel.mock.calls).toEqual([['review:merge-gate-retrigger'], ['review:merge-gate-retrigger']]);
     const order = [io.readHead.mock.invocationCallOrder[0], io.readLabels.mock.invocationCallOrder[0],
       io.removeLabel.mock.invocationCallOrder[0], io.addLabel.mock.invocationCallOrder[0],
       io.removeLabel.mock.invocationCallOrder[1]];
@@ -314,7 +317,7 @@ describe('merge-gate retrigger safety', () => {
   });
 
   it.each(['throw', 'unconfirmed'])('failed stale sentinel pre-removal (%s) refuses label addition', kind => {
-    const io = labelIo(['merge-gate-retrigger']);
+    const io = labelIo(['review:merge-gate-retrigger']);
     io.removeLabel.mockImplementation(() => {
       if (kind === 'throw') throw new Error('removal rejected');
       return { ok: false };

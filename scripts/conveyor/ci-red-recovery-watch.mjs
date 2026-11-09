@@ -1436,6 +1436,12 @@ export function sweepMissingRunRecovery({
             result = labelRetrigger({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha,
               context: decision.context, ledger: retriggerLedger });
           } catch (error) { result = { ok: false, deferred: true, error: String(error.message ?? error) }; }
+          // Record every label attempt through the same durable marker path as push recovery,
+          // so both per-head and PR-wide caps include successes and failures.
+          postComment(d.prNumber, {
+            repo, headRefName: d.headRefName, headSha: d.headSha, mainGreen,
+            ok: result?.ok === true, action: 'label-event', error: result?.error ?? null,
+          });
           // Only a submitted label event completes recovery. Failed attempts retain their
           // ledger claim, so both failures and spent claims must allow existing recovery.
           if (result?.ok === true) {

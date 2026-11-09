@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 let decideRequiredContextRetrigger;
@@ -44,10 +45,20 @@ function assertSkip(input) {
 }
 
 describe('required merge-gate context retrigger', () => {
+  it('sentinel satisfies the merge-gate workflow label watch rule', () => {
+    const skipped = RETRIGGER_LABEL !== 'ready-to-merge' && !RETRIGGER_LABEL.startsWith('review:');
+    expect(skipped).toBe(false);
+  });
+
+  it('workflow text retains the review prefix label watch clause', () => {
+    const workflow = readFileSync('.github/workflows/merge-gate.yml', 'utf8');
+    expect(workflow).toContain("!startsWith(github.event.label.name, 'review:')");
+  });
+
   it('missing required context plus startup_failure run gives one retrigger', async () => {
     const decision = decideRequiredContextRetrigger(facts());
     expect(decision).toEqual(expect.objectContaining({ action: 'retrigger', context: 'merge-gate', reason: expect.any(String) }));
-    expect(RETRIGGER_LABEL).toBe('merge-gate-retrigger');
+    expect(RETRIGGER_LABEL).toBe('review:merge-gate-retrigger');
     const ledger = claimLedger();
     const io = effects();
     const result = await retriggerRequiredContext({ repo: REPO, pr: 5060, head: HEAD, context: decision.context, io, ledger });

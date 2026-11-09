@@ -5,7 +5,8 @@ import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 
-export const RETRIGGER_LABEL = 'merge-gate-retrigger';
+// Watched by merge-gate's review: prefix; exact-name review holds ignore this sentinel.
+export const RETRIGGER_LABEL = 'review:merge-gate-retrigger';
 const skip = reason => ({ action: 'skip', reason });
 const text = value => typeof value === 'string' && value.trim().length > 0;
 
@@ -127,6 +128,6 @@ export function retriggerRequiredContext({ repo, pr, head, context, io, ledger =
   const result = { ok: true, action: 'label-retrigger' };
   try {
     if (io.removeLabel(RETRIGGER_LABEL)?.ok !== true) throw new Error('label removal unconfirmed');
-  } catch { result.warning = 'label event submitted, but cleanup failed; operator must remove merge-gate-retrigger'; }
+  } catch { result.warning = 'label event submitted, but cleanup failed; operator must remove review:merge-gate-retrigger'; }
   return result;
 }

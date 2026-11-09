@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { sweepMissingRunRecovery } from '../ci-red-recovery-watch.mjs';
+import { buildMissingRunComment, countMissingRunComments, MISSING_RUN_COMMENT_MARKER } from '../main-red-recovery.mjs';
+import { defaultPostMissingRunComment, sweepMissingRunRecovery } from '../ci-red-recovery-watch.mjs';
 
 // Any missed reader injection fails locally instead of contacting GitHub.
 vi.mock('../../lib/gh-throttle.mjs', async (original) => ({
@@ -51,6 +52,55 @@ function fixture() {
 }
 
 describe('missing-run sweep merge-gate label recovery', () => {
+  it.each(['success', 'failure', 'throw'])('label attempt posts the durable missing-run attempt marker for its head: %s', outcome => {
+    const f = fixture();
+    const exec = vi.fn();
+    f.postComment.mockImplementation((pr, options) => defaultPostMissingRunComment(pr, { ...options, exec }));
+    if (outcome !== 'success') f.labelRetrigger.mockImplementation(() => {
+      if (outcome === 'throw') throw new Error('label rejected');
+      return { ok: false, error: 'label rejected' };
+    });
+    sweepMissingRunRecovery({ ...f.options, apply: true });
+    expect(f.postComment).toHaveBeenNthCalledWith(1, 5060, expect.objectContaining({
+      repo: REPO, headSha: HEAD, headRefName: 'lane/5060', action: 'label-event', ok: outcome === 'success',
+    }));
+    const body = exec.mock.calls[0][1][4];
+    expect(body).toBe(buildMissingRunComment({
+      headSha: HEAD, headRefName: 'lane/5060', action: 'label-event', ok: outcome === 'success',
+      error: outcome === 'success' ? null : 'label rejected',
+    }));
+    expect(body).toContain(MISSING_RUN_COMMENT_MARKER);
+    expect(body).toContain(`sha: ${HEAD}`);
+    const comments = [{ body, author: { login: 'web-everything' } }];
+    expect(countMissingRunComments(comments, HEAD)).toBe(1);
+    expect(countMissingRunComments(comments)).toBe(1);
+    expect(countMissingRunComments(comments, 'b'.repeat(40))).toBe(0);
+  });
+
+  it.each(['per-SHA', 'PR-wide'])('persisted label attempt enforces the %s retry cap on the next sweep', cap => {
+    const f = fixture();
+    const comments = [];
+    f.postComment.mockImplementation((_pr, options) => comments.push({
+      body: buildMissingRunComment(options), author: { login: 'web-everything' },
+    }));
+    const options = { ...f.options, apply: true, readComments: () => comments,
+      maxRetriesPerSha: cap === 'per-SHA' ? 1 : 10, maxRetriesPerPr: 1 };
+    sweepMissingRunRecovery(options);
+    expect(comments).toHaveLength(1);
+    if (cap === 'PR-wide') {
+      const oldRead = options.readOpenPrs;
+      options.readOpenPrs = () => oldRead().map(pr => ({ ...pr, headRefOid: 'b'.repeat(40) }));
+    }
+    const next = sweepMissingRunRecovery(options);
+    expect(next.dispatch).toEqual([]);
+    expect(next.refusals).toContainEqual(expect.objectContaining({
+      kind: cap === 'per-SHA' ? 'missing-run-cap-exhausted' : 'missing-run-pr-cap-exhausted', attempts: 1,
+    }));
+    expect(f.labelRetrigger).toHaveBeenCalledTimes(1);
+    expect(f.postComment).toHaveBeenCalledTimes(1);
+    expect(f.trigger).not.toHaveBeenCalled();
+  });
+
   it('sweep with apply=false fires nothing', () => {
     const f = fixture();
     const result = sweepMissingRunRecovery({ ...f.options, apply: false });
