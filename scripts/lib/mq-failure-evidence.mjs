@@ -16,12 +16,16 @@ const localJobName = name => clean(name).split(' / ').at(-1).trim().replace(/\s+
 const upstreamFailureOutcomes = new Set(['Some required jobs were not successful.', 'failure: upstream shard failed',
   // Real gate wording from the CI aggregate jobs (coverage-merge, test) when a unit shard failed.
   '##[error]Unit shards did not succeed; refusing incomplete coverage.', '##[error]Unit shards did not succeed.',
-  '##[error]Coverage merge did not succeed.']);
+  '##[error]Coverage merge did not succeed.',
+  // The required `test` job also gates on the integration, standards and host-paths jobs (ci.yml "Gate on shard
+  // results"). Each of those has its own failed job and log, so the sibling's assertions still have to carry the proof.
+  '##[error]Integration did not succeed.', '##[error]Standards did not succeed.', '##[error]Host paths did not succeed.']);
 const upstreamGateTranscript = new Set([
   '##[group]Run if [ "failure" != "success" ]; then',
   'if [ "failure" != "success" ]; then',
   'echo "Some required jobs were not successful."',
   'echo "::error::Unit shards did not succeed; refusing incomplete coverage."', 'echo "::error::Unit shards did not succeed."',
+  'echo "::error::Integration did not succeed."', 'echo "::error::Standards did not succeed."', 'echo "::error::Host paths did not succeed."',
   'echo "::error::Coverage merge did not succeed."', 'shell: /usr/bin/bash -e {0}', 'exit 0',
   'exit 1', 'fi', '##[endgroup]', '##[error]Process completed with exit code 1.',
 ]);

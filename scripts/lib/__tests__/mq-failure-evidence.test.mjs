@@ -396,6 +396,26 @@ describe('mq failure evidence: real #6499 log shapes', () => {
     expect(evidence).toMatchObject({ complete: true, failedJobs: ['test-shard (5)', 'coverage-merge', 'test'],
       testFiles: ['scripts/lib/__tests__/delivery-policy.test.mjs'] });
   });
+  // Break found by the red-team gate: the `test` aggregate also fails on the integration job, and ci.yml words that
+  // "Integration did not succeed." The integration job's own assertion must survive and admit recovery.
+  const integrationLog = ['FAIL scripts/lib/__tests__/git-merge.integration.test.mjs > merge', 'AssertionError: expected 1 to be 2'].join('\n');
+  it.each(['Integration did not succeed.', 'Standards did not succeed.', 'Host paths did not succeed.'])(
+    'a test aggregate failing with the CI gate wording %j is a recognized upstream outcome', async annotation => {
+      const evidence = await collect({ ...fixture(),
+        listJobs: vi.fn(async () => ({ complete: true, nextPage: null, jobs: [
+          { id: 911, name: 'integration', conclusion: 'failure' }, { id: 903, name: 'test', conclusion: 'failure' }] })),
+        readJobLog: vi.fn(async ({ jobId }) => ({ complete: true, text: jobId === 911 ? integrationLog : ghAggregate(annotation) })) });
+      expect(evidence).toMatchObject({ complete: true, failedJobs: ['integration', 'test'],
+        testFiles: ['scripts/lib/__tests__/git-merge.integration.test.mjs'] });
+      expect(classifyMqFailureEvidence(evidence)).toBe('real');
+    });
+  it('an integration-gate aggregate with no sibling assertion stays unknown', async () => {
+    const evidence = await collect({ ...fixture(),
+      listJobs: vi.fn(async () => ({ complete: true, nextPage: null, jobs: [{ id: 903, name: 'test', conclusion: 'failure' }] })),
+      readJobLog: vi.fn(async () => ({ complete: true, text: ghAggregate('Integration did not succeed.') })) });
+    expect(evidence.complete).toBe(false);
+    expect(classifyMqFailureEvidence(evidence)).toBe('unknown');
+  });
   it('a hosted aggregate log with an extra unrelated ##[error] stays incomplete', async () => {
     const evidence = await collect(io({ 901: shardLog,
       902: `${ghAggregate('Unit shards did not succeed; refusing incomplete coverage.')}\n##[error]ENOENT: coverage artifact missing`,
