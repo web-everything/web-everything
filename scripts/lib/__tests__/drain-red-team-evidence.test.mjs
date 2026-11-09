@@ -356,6 +356,50 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'original-start' }).inFlight).toBe(true);
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'reused-start' }).inFlight).toBe(false);
   });
+  describe('foreign host name with a stale record (host renamed after a crash)', () => {
+    const run = (f, ageMs, extra = {}, writer = {}) => {
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, host: 'old-name', readPidStart: () => 'start', ...writer });
+      const at = new Date(Date.now() - ageMs);
+      utimesSync(join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`), at, at);
+      return readDrainRedTeamEvidence({ ...f, host: 'new-name', isAlive: () => true, ...extra });
+    };
+    it('counts a foreign-host run with a stale record and no live pid as dead', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false })).toMatchObject({ inFlight: false, scheduled: true });
+    });
+    it('keeps a stale foreign-host run live while its pid is alive here with the same birth time', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => true, readPidStart: () => 'start' }).inFlight).toBe(true);
+    });
+    it('counts a stale foreign-host run as dead when its pid is alive here with a different birth time (reused pid)', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => true, readPidStart: () => 'reused-start' })).toMatchObject({ inFlight: false, scheduled: true });
+    });
+    it('stale foreign-host record in a different pid namespace stays live even with isAlive:false', () => {
+      // Both namespaces are pinned so the guard is exercised on every platform (pidNamespace() is null on macOS).
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false, namespace: 'pid:[new-namespace]' }, { namespace: 'pid:[old-namespace]' }).inFlight).toBe(true);
+    });
+    it('probes a stale foreign-host record that carries no pid namespace (legacy) and counts it dead when the pid is gone', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false, namespace: 'pid:[new-namespace]' }, { namespace: null }).inFlight).toBe(false);
+    });
+    it('probes a stale foreign-host record in the same pid namespace and counts it dead when the pid is gone', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => false, namespace: 'pid:[same]' }, { namespace: 'pid:[same]' }).inFlight).toBe(false);
+    });
+    it('keeps a stale foreign-host run live while its birth time cannot be read here (unknown is never a kill)', () => {
+      expect(run(fixture(), 31 * 60_000, { isAlive: () => true, readPidStart: () => null }).inFlight).toBe(true);
+    });
+    it('keeps a foreign-host run with a fresh record live', () => {
+      expect(run(fixture(), 5 * 60_000).inFlight).toBe(true);
+    });
+    it('honors the stale-window setting', () => {
+      const f = fixture();
+      expect(run(f, 12 * 60_000, { isAlive: () => false, env: { ...f.env, WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '600000' } }).inFlight).toBe(false);
+    });
+    it('keeps same-host behaviour: a stale record with a live pid stays live', () => {
+      const f = fixture();
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, host: 'same', readPidStart: () => 'start' });
+      const at = new Date(Date.now() - 3_600_000);
+      utimesSync(join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`), at, at);
+      expect(readDrainRedTeamEvidence({ ...f, host: 'same', isAlive: () => true, readPidStart: () => 'start' }).inFlight).toBe(true);
+    });
+  });
   it.each([
     [{ host: 'review-host' }, { host: 'drain-host' }],
     [{ host: 'same-host', namespace: 'pid:[review]' }, { host: 'same-host', namespace: 'pid:[drain]' }],

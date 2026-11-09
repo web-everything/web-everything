@@ -27,6 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
@@ -40,6 +41,33 @@ export function readOverlayEventLog(root, env) {
     const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
     return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
   } catch { return []; }
+}
+
+/** Record pr-merged drop evidence without changing drop policy. Unknown proof fails closed. */
+export function prMergedDropEvidence({ git, ref, mainSha }) {
+  let tip = null;
+  const evidence = { contentInMain: false, cleanMerges: false };
+  try {
+    const tipRev = `refs/remotes/origin/${ref}^{commit}`;
+    const resolved = git(['rev-parse', '--verify', '--quiet', tipRev]);
+    const value = typeof resolved?.stdout === 'string' ? resolved.stdout.trim() : '';
+    if (resolved?.status !== 0 || !/^[a-f0-9]{40}$/.test(value)) return { tip, evidence };
+    tip = value;
+    if (!/^[a-f0-9]{40}$/.test(mainSha)) return { tip, evidence };
+    const proof = carriedBeyondMain({
+      ref, mainRef: mainSha,
+      git: (args) => {
+        // Reuse the resolved tip so the evidence and event describe the same observation.
+        const result = args[0] === 'rev-parse' && args[3] === tipRev ? resolved : git(args);
+        return { code: result?.status, stdout: result?.stdout };
+      },
+    });
+    if (proof.ok === true) {
+      evidence.contentInMain = proof.contentInMain === true;
+      evidence.cleanMerges = proof.cleanMerges === true;
+    }
+  } catch { /* Keep the drop, but never claim unreadable evidence proves graduation. */ }
+  return { tip, evidence };
 }
 
 /** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
@@ -451,8 +479,9 @@ export async function prepareRebuild({
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
+      const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
       removeOverlay(root, d.ref, { env, why: d.reason });
-      appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
+      appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
       alert('overlay-conflict-dropped', {
