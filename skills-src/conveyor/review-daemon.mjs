@@ -1274,7 +1274,12 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
       const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
-      const queueOff = String(queueSetting ?? '').trim().toLowerCase() === 'off';
+      const queueWord = String(queueSetting ?? '').trim().toLowerCase();
+      // Same words the other boolean env settings accept; an unrecognised value fails open to the default (on), logged.
+      const queueOff = ['off', '0', 'false', 'no'].includes(queueWord);
+      if (queueWord && !queueOff && !['on', '1', 'true', 'yes'].includes(queueWord)) {
+        options.log(`review-daemon: red-team queue ignoring unrecognised WE_RED_TEAM_DISPATCH_QUEUE value (expected on/off/1/0/true/false); queue stays on`);
+      }
       if (queueOff) {
         options.log('review-daemon: red-team queue off (source: env WE_RED_TEAM_DISPATCH_QUEUE); recovery runs directly');
         return runRedTeamOnSkip(options);

@@ -39,12 +39,13 @@ function fixture({ maxAttempts, logger } = {}) {
     files.set(to, files.get(from));
     files.delete(from);
   });
+  const unlink = vi.fn(path => { files.delete(path); });
   const log = logger ?? ((...parts) => logs.push(parts.join(' ')));
   const open = () => createRedTeamDispatchQueue({
-    file, readFile, writeFile, rename, now: () => clock, log, maxAttempts,
+    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts,
   });
   return {
-    file, files, operations, logs, log, readFile, writeFile, rename, open,
+    file, files, operations, logs, log, readFile, writeFile, rename, unlink, open,
     queue: open(), advance: () => { clock += 1000; },
   };
 }
@@ -447,6 +448,25 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       // Memory keeps the settled state so the started PR is not re-offered next tick.
       expect(numbers(f.queue.entries())).toEqual([2]);
       expect(f.logs.some(line => line.startsWith(prefix) && line.includes('persist failed') && line.includes('ENOSPC fixture'))).toBe(true);
+      // No orphaned temp file is left behind by the failed write.
+      expect([...f.files.keys()].filter(name => name.endsWith('.tmp'))).toEqual([]);
+    });
+
+    it('the next tick rewrites the stale file even with no new change, so a restart cannot re-offer a started PR', async () => {
+      const f = fixture();
+      let broken = true;
+      f[failing].mockImplementation((...args) => {
+        if (broken) throw new Error('ENOSPC fixture');
+        return failing === 'rename' ? undefined : f.files.set(args[0], String(args[1]));
+      });
+      const outcome = { dispatched: [{ prNumber: 1, jobPid: 1001 }], rows: [{ prNumber: 1, action: 'dispatch' }], notStarted: [] };
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run: () => outcome, log: f.log });
+      expect(f.files.has(f.file)).toBe(false);
+      broken = false;
+      if (failing === 'rename') f[failing].mockImplementation((from, to) => { f.files.set(to, f.files.get(from)); f.files.delete(from); });
+      // Same candidates minus the started PR: sync/admit/settle change nothing.
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([2]), capacity: capacity(0), run: () => refused(2, 'no review capacity left'), log: f.log });
+      expect(numbers(f.open().entries())).toEqual([2]);
     });
   });
 

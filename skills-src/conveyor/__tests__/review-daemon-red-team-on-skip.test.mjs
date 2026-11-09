@@ -1,4 +1,4 @@
-import { it, expect, vi, afterAll } from 'vitest';
+import { it, expect, vi, afterAll, beforeEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +16,8 @@ import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.m
 const QUEUE_DIR = mkdtempSync(join(tmpdir(), 'we-rtq-test-'));
 const QUEUE_FILE = join(QUEUE_DIR, 'queue.json');
 afterAll(() => rmSync(QUEUE_DIR, { recursive: true, force: true }));
+// A developer's exported WE_RED_TEAM_DISPATCH_QUEUE=off must not flip the tests that expect the queue.
+beforeEach(() => { vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on'); });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
 /** Mocks evidence for N owed PRs (heads derived per PR) and returns the owed plan/rawPrs. */
@@ -55,13 +57,13 @@ it('CLI routes red-team recovery through the FIFO queue: capacity 1 dispatches o
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
 
-it('CLI bypasses the dispatch queue when WE_RED_TEAM_DISPATCH_QUEUE=off', () => {
+it.each(['off', 'OFF', ' off ', '0', 'false', 'no'])('CLI bypasses the dispatch queue when WE_RED_TEAM_DISPATCH_QUEUE=%j', value => {
   const repo = 'web-everything/web-everything';
   const { plan, rawPrs } = owedPrs(repo, [6011, 6012, 6013]);
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
-  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'off');
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', value);
   const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
   const lines = [];
   const queueBefore = readQueueFile();
@@ -76,6 +78,23 @@ it('CLI bypasses the dispatch queue when WE_RED_TEAM_DISPATCH_QUEUE=off', () => 
     expect(dispatch.mock.calls.map(call => call[0].pr)).toEqual([6011, 6012, 6013]);
     expect(readQueueFile()).toBe(queueBefore);
     expect(lines.some(line => line.includes('red-team queue') && line.includes('off') && line.includes('WE_RED_TEAM_DISPATCH_QUEUE'))).toBe(true);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it('CLI keeps the queue on and logs when WE_RED_TEAM_DISPATCH_QUEUE is unrecognised', () => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [6031, 6032]);
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'maybe');
+  const lines = [];
+  try {
+    const production = cliReviewTickOpts({ log: { error: line => lines.push(line) } });
+    production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
+      capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
+    expect(dispatch.mock.calls.map(call => call[0].pr)).toEqual([6031]);
+    expect(lines.some(line => line.includes('unrecognised WE_RED_TEAM_DISPATCH_QUEUE'))).toBe(true);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
 

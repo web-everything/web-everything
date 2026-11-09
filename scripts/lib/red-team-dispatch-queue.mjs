@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -17,9 +17,10 @@ export function defaultQueueFile(env = process.env, home = homedir()) {
 
 /** Synchronous IO matches the daemon's tick; admission never dequeues a PR. */
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
-  writeFile = writeFileSync, rename = renameSync, now = Date.now, log = () => {}, maxAttempts = 3 } = {}) {
+  writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3 } = {}) {
   let entries = [];
   let pending = null;
+  let stale = false; // true after a failed persist, until a later write succeeds
   const limit = Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : 3;
   try {
     const restored = JSON.parse(readFile(file, 'utf8'));
@@ -44,8 +45,16 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   const persist = data => {
     if (writeFile === writeFileSync) mkdirSync(dirname(file), { recursive: true });
     const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-    writeFile(temp, data, 'utf8');
-    rename(temp, file);
+    try {
+      writeFile(temp, data, 'utf8');
+      rename(temp, file);
+      stale = false;
+    } catch (error) {
+      // The file no longer matches memory: remember it so the next commit rewrites it even with no new change.
+      stale = true;
+      try { unlink(temp); } catch { /* the temp file may never have been created */ }
+      throw error;
+    }
   };
   const changed = message => {
     const data = JSON.stringify(entries);
@@ -119,7 +128,10 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     pending = [];
     return {
       commit() {
-        const mutations = pending;
+        // A previous failed write leaves the file behind memory; repair it even when this tick changed nothing,
+        // so a restart cannot re-offer a PR whose job already started.
+        const mutations = pending.length || !stale ? pending
+          : [{ data: JSON.stringify(entries), message: 'rewrite stale queue file' }];
         pending = null;
         // The runner has already started its jobs: a failed write must never discard its result or roll
         // memory back (the settled entries stay in memory, so the next tick does not re-offer a started PR).
