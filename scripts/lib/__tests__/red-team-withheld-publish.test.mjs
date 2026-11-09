@@ -200,3 +200,13 @@ describe('publication with fresh disk state under the shared lock', () => {
     expect(postComment).not.toHaveBeenCalled();
   }));
 });
+
+describe('legacy recovery never publishes an unparseable break', () => {
+  it('retries then escalates instead of posting a body that drops a confirmed finding', () => {
+    const row = { rev: head, foldedVerdict: 'changes', confirmedMissCount: 1, provider: 'p', model: 'm', callId: 'c',
+      findings: [{ summary: 's', file: ' ', category: 'correctness', confirmedByRecheck: true }] };
+    const io = harness({ repo: 'o/n', pr: 42, head, status: 'finished', result: 'ran' }, { readSeatRow: () => row });
+    expect(publishStoredRedTeamResult(io).status).not.toBe('posted');
+    expect(io.postComment).not.toHaveBeenCalled();
+  });
+});

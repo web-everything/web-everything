@@ -5,7 +5,7 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { renderRedTeamComment, redTeamCommentPosted as markerPosted, priorRedTeamRow } from '../operations/review-extra-seats.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { redTeamMarker } from './red-team-gate.mjs';
+import { redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
@@ -113,6 +113,10 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       if (scrub(body).length) body = renderMinimal(input);
       if (scrub(body).length) body = renderMinimal({ ...input, omitLocation: true });
       if (scrub(body).length) throw Error('red-team minimal comment failed secret scrub');
+      // A rendered body must still show every confirmed break to the gate, or clear would be guessed.
+      if (legacy && parseRedTeamComment(body).findings.filter(f => f.confirmed).length !== result.confirmedMissCount) {
+        throw Error('red-team legacy comment drops confirmed findings');
+      }
       if (postComment) postComment({ repo, pr, body });
       else provider.postComment(repo, pr, body);
     } catch { return failedAttempt(); }
