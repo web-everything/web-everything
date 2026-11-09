@@ -264,4 +264,30 @@ describe('reserved priority slot (drain freeze read)', () => {
     // the ordinary caller keeps the old fail-open behaviour
     expect(runGhSync(READ, { encoding: 'utf8', throttle: { ...f.throttle, lockRoot: t.lockRoot } })).toBe('[]');
   });
+  it('passthrough: an eligible reserved read really spawns (the injected spawn is called) and releases its slot', () => {
+    const f = fullPool('red-main-freeze-read');
+    const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.from('[]'), stderr: Buffer.alloc(0) }));
+    const t = { ...f.throttle, reservedSlot: true };
+    const r = runGhCliPassthrough(FREEZE_ARGS, { throttle: t, spawn });
+    expect(r).toMatchObject({ status: 0, stdout: Buffer.from('[]') });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn.mock.calls[0][2].timeout).toBeLessThanOrEqual(20000);
+    runGhCliPassthrough(FREEZE_ARGS, { throttle: t, spawn });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(f.elapsed()).toBe(0);
+  });
+  it('passthrough: an ordinary read in the same full pool is still throttled without spawning', () => {
+    const f = fullPool('red-main-freeze-read');
+    const spawn = vi.fn();
+    expect(runGhCliPassthrough(FREEZE_ARGS, { throttle: f.throttle, spawn })).toMatchObject({ throttled: true });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it('end to end: the real exported passthrough runs a real child process through the reserved slot', () => {
+    const f = fullPool('red-main-freeze-read');
+    const bin = join(f.throttle.lockRoot, 'fake-gh.sh');
+    writeFileSync(bin, '#!/bin/sh\nprintf "[]"\n', { mode: 0o755 });
+    const r = runGhCliPassthrough(FREEZE_ARGS, { throttle: { ...f.throttle, reservedSlot: true }, bin });
+    expect(r.status).toBe(0);
+    expect(String(r.stdout)).toBe('[]');
+  });
 });

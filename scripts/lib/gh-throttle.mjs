@@ -2284,7 +2284,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   const reserved = ghReservedSlotEligible({ throttle, caller, args: argv, isWrite });
   const slotCap = cap + (reserved ? 1 : 0);
   // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
-  const reservedCapMs = reserved ? ghReservedWaitCapMs(spawnOpts) : 0, reservedStartMs = reserved ? now() : 0;
+  const reservedCapMs = reserved ? ghReservedWaitCapMs({ timeout: throttle.reservedTimeoutMs }) : 0, reservedStartMs = reserved ? now() : 0;
   const reservedLeftMs = () => Math.max(1, reservedCapMs - (now() - reservedStartMs));
   // #gh-graphql-budget — the shared primary-budget backoff (see runGhSync's identical wiring).
   const resource = classifyGhResource(argv);
