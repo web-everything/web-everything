@@ -50,9 +50,9 @@ export function canonicalPaths(file, anchors = null) {
   const out = new Set([first]);
   // A git diff side prefix (`a/ b/ c/ i/ w/ o/`) may be a real folder, so the path is read both with and without it.
   if (/^[abciwo]\//.test(path)) { const c = normalise(path.slice(2)); if (c !== null) out.add(c); }
-  // A leading run of `-`, `_` or `.` is a bullet or a hidden-folder dot in prose (`-docs/a.md`): the trimmed name too.
+  // A leading run of `-`, `_`, `.` or `/` is a bullet or a hidden-folder dot in prose (`-docs/a.md`): the trimmed name too.
   for (const f of [...out]) {
-    const t = f.replace(/^[-_.]+/, '');
+    const t = f.replace(/^[-_./]+/, '');
     const c = t !== f ? normalise(t) : null;
     if (c !== null) out.add(c);
   }
