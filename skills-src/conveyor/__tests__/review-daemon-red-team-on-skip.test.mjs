@@ -3,8 +3,45 @@ import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.m
 import { cliReviewTickOpts, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
 import * as reviewJob from '../../../scripts/operations/review-job.mjs';
 import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.mjs';
+import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
+import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
+
+it('CLI label repair exception preserves original PRs and still dispatches red-team recovery', () => {
+  const repo = 'web-everything/web-everything', head = 'e'.repeat(40), pr = 5762;
+  const rawPrs = [{ number: pr, headRefOid: head, labels: [], comments: [] }];
+  const plan = { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] };
+  const before = structuredClone(rawPrs);
+  const sync = vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(() => {
+    throw new Error('injected label repair exception');
+  });
+  const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
+  vi.spyOn(redTeamEvidence, 'readDrainRedTeamEvidence').mockReturnValue({
+    recorded: false, loopPayload: {
+      verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
+    },
+  });
+  vi.spyOn(redTeamEvidence, 'readRedTeamStatus').mockReturnValue(null);
+  vi.spyOn(redTeamEvidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
+      capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(sync).toHaveBeenCalledWith({ repo, refusals: plan.refusals, rawPrs, log: expect.any(Function) });
+    expect(recovery).toHaveBeenCalledTimes(1);
+    expect(recovery.mock.calls[0][0].rawPrs).toBe(rawPrs);
+    expect(sync.mock.invocationCallOrder[0]).toBeLessThan(recovery.mock.invocationCallOrder[0]);
+    expect(rawPrs).toEqual(before);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(result.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
 
 it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head in %s mode', mode => {
   const repo = 'web-everything/web-everything', head = (mode === 'fresh' ? 'c' : 'd').repeat(40), pr = 5762;
