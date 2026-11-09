@@ -25,9 +25,17 @@ function normalise(path) {
   return parts.length ? parts.join('/') : null;
 }
 
-export function canonicalPaths(file) {
+/**
+ * `anchors` (optional, lower-case): the first folder of each protected glob (`scripts` of `scripts/**`). A report that
+ * sits under a folder above the repo (`repo/scripts/x.mjs`) also yields each trailing sub-path that starts at an anchor,
+ * as the old matcher did, so the nested form is never less protected. Without anchors only the path itself is read.
+ */
+export function canonicalPaths(file, anchors = null) {
   if (typeof file !== 'string' || file.length > MAX_AUDIT_PATH) return null;
-  const m = GRAMMAR.exec(file.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, ''));
+  const text = file.replace(/^ +| +$/g, '');
+  // A leading `word:` reads as a URL scheme (`file:x`, or a top-level `x.mjs:42`): refused, as the old matcher did.
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return null;
+  const m = GRAMMAR.exec(text);
   if (!m) return null;
   const path = m[2] ?? m[3];
   const out = new Set();
@@ -47,6 +55,12 @@ export function canonicalPaths(file) {
   for (const f of forms.slice(1)) {
     const c = normalise(f);
     if (c !== null) out.add(c);
+  }
+  if (anchors && anchors.size) {
+    for (const c of [...out]) {
+      const segs = c.split('/');
+      for (let i = 1; i < segs.length; i++) if (anchors.has(segs[i].toLowerCase())) out.add(segs.slice(i).join('/'));
+    }
   }
   return [...out];
 }
