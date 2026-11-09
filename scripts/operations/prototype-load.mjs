@@ -5,7 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH, SINGLE_RUN_PASS_CUTOFF, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
+import { QUESTION_HASH, SINGLE_RUN_PASS_CUTOFF, isFailedOrWeakRuns, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
@@ -121,7 +121,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // never blocks forever. A CARRIED head is deliberately not widened: "carry veto follows findAudit" (round 4) pins that
   // an unusable record on a carried head never blocks the carry.
   // D2: a record whose runs hold a WEAKENED is WEAKENED too, whatever its verdict field says.
-  const isWeak = (r) => r?.verdict === 'WEAKENED' || (Array.isArray(r?.runs) && r.runs.includes('WEAKENED'));
+  const isWeak = (r) => r?.verdict === 'WEAKENED' || isFailedOrWeakRuns(r);
   if (list.some((r) => r?.head === sha && r.base !== sha && isWeak(r)
     // An unparsable time cannot place the record outside its window, so it is judged by the hash's own expiry alone
     // (fail closed, matching a current-question record, which blocks whatever its time).

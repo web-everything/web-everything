@@ -352,6 +352,15 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     expect(findAudit([pass, olderWeak], o)).toBe(pass);
   });
 
+  it.each([['unparseable flag', { unparseable: true }], ['an UNPARSEABLE run', { runs: ['NOT WEAKENED', 'UNPARSEABLE'] }]])(
+    'a NOT WEAKENED record with %s counts as WEAKENED whatever its date', (_, extra) => {
+      for (const at of ['2026-01-01T00:00:00.000Z', BEFORE, AFTER]) {
+        const bad = rec({ at, ...extra });
+        expect(findAudit([bad], Q)).toMatchObject({ verdict: 'WEAKENED' });
+        expect(findAudit([rec({ at: '2026-01-01T00:00:00.000Z' }), bad], Q)).toMatchObject({ verdict: 'WEAKENED' });
+      }
+    });
+
   it('a WEAKENED with an unknown timestamp is not masked by an older dated WEAKENED, in either order', () => {
     const dated = rec({ verdict: 'WEAKENED', at: BEFORE });
     const undated = rec({ verdict: 'WEAKENED', at: 'garbage' });

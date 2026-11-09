@@ -365,6 +365,12 @@ describe('canonicalAuditEvidence: new-format passes need a fingerprint (D2)', ()
     expect(prototypeLoad.canonicalAuditEvidence([carriedPass, invalid], SHA, () => true, FPX)).toEqual({ ok: false, reason: 'no-record' });
     expect(prototypeLoad.canonicalAuditEvidence([carriedPass], SHA, () => true, FPX)).toMatchObject({ ok: true });
   });
+  it.each([['unparseable flag', { unparseable: true }], ['an UNPARSEABLE run', { runs: ['NOT WEAKENED', 'UNPARSEABLE'] }]])(
+    'a pre-cutoff NOT WEAKENED record with %s blocks the live head and the carry', (_, extra) => {
+      expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ at: BEFORE, ...extra })], SHA, () => true, FPX)).toEqual({ ok: false, reason: 'weakened' });
+      const carriedBad = auditRecord({ head: 'd'.repeat(40), base: '8'.repeat(40), at: BEFORE, fingerprint: FPX, ...extra });
+      expect(prototypeLoad.canonicalAuditEvidence([carriedBad], SHA, () => true, FPX)).toEqual({ ok: false, reason: 'weakened' });
+    });
   it('still accepts a legacy pass before the cutoff without a fingerprint', () => {
     const legacy = auditRecord({ at: BEFORE, fingerprint: undefined });
     expect(prototypeLoad.canonicalAuditEvidence([legacy], SHA, () => true, FPX)).toEqual({ ok: true, record: legacy });

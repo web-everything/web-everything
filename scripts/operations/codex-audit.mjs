@@ -74,7 +74,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   const weakTs = r => { const t = Date.parse(r.at); return Number.isFinite(t) ? t : Infinity; };
   for (let record of records) {
     if (record?.head !== head || record.base !== base) continue;
-    const runsWeak = Array.isArray(record.runs) && record.runs.includes('WEAKENED');
+    const runsWeak = isFailedOrWeakRuns(record);
     const isCurrent = record.questionHash === QUESTION_HASH;
     // Any matching current-question record, usable or not (bad timestamp, unknown verdict), blocks the prior fallback.
     if (isCurrent) sawCurrent = true;
@@ -99,6 +99,9 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   if (sawCurrent && !weakCurrent && weakPrior && (!latest || ts(weakPrior) > ts(latest))) return weakPrior;
   return sawCurrent ? (weakCurrent ?? latest) : (weakPrior ?? prior);
 }
+
+/** True for a record that says WEAKENED or UNPARSEABLE in its runs, or carries the unparseable flag, whatever its date. */
+export const isFailedOrWeakRuns = r => r?.unparseable === true || (Array.isArray(r?.runs) && (r.runs.includes('WEAKENED') || r.runs.includes('UNPARSEABLE')));
 
 export const DEFAULT_AUDIT_RUNS = 2;
 const MAX_AUDIT_RUNS = 5;
