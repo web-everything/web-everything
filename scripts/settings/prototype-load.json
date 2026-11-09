@@ -1,35 +1,50 @@
 {
   "daemons": {
     "review": {
-      "label": "com.we.review-daemon"
+      "label": "com.we.review-daemon",
+      "runs": "review daemon (PR reviews, lease-reaper, lane-pool health, parked-PR conflict watch)"
     },
     "fix": {
-      "label": "com.we.fix-dispatch-daemon"
+      "label": "com.we.fix-dispatch-daemon",
+      "runs": "fix-dispatch daemon (fixers for red or blocked PRs)"
     },
     "build": {
-      "label": "com.we.build-dispatch-daemon"
+      "label": "com.we.build-dispatch-daemon",
+      "runs": "build-dispatch daemon (builders for ready backlog items)"
     },
     "verify": {
-      "label": "com.we.verify-daemon"
+      "label": "com.we.verify-daemon",
+      "runs": "verify daemon (PR verification runs)"
     },
     "health-watch": {
-      "label": "com.we.health-watch"
+      "label": "com.we.health-watch",
+      "runs": "health-watch (daemon and queue smell detection)"
     },
     "lease-reaper": {
-      "label": "com.we.lease-reaper"
+      "label": "com.we.lease-reaper",
+      "runs": "lease-reaper (expires stale lane and scope leases)"
     },
     "pass-readers": {
       "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
-      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code."
+      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code.",
+      "runs": "reader pass daemons (ci-red-recovery-watch and the other read-only passes)"
     },
     "control": {
       "label": "com.we.control",
-      "clone": "wev-control"
+      "clone": "wev-control",
+      "runs": "control daemon (operator control surface)"
     },
     "drain": {
       "label": "com.plateau.drain-daemon",
       "clone": ".lanes/we-drain-daemon/code",
-      "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs."
+      "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs.",
+      "runs": "merge-queue drain (drain-queue-safety, enqueue)"
+    },
+    "merge-watch": {
+      "label": "com.we.conveyor-pass-daemon.merge-orphan-sweep",
+      "clone": "wev-merge-daemon",
+      "unsupported": "its merge-orphan-sweep pass runs self-sync main-only (mainOnly=true), which excludes registered overlays, so a prototype loaded here would stay pending forever. Land the change through a normal PR instead.",
+      "runs": "merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that. Does not accept prototype loads (unsupported)"
     }
   },
   "daemonAliases": {
@@ -207,6 +222,14 @@
         "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:343 — Cached main-red evidence bypasses retesting for six hours by default, delaying detection of changed environmental failures even when commit SHAs remain unchanged.",
         "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:276 — Missing, unreadable, or invalid rerun configuration falls back to allowing one rerun, enabling the weaker publication policy instead of retaining the original fail-closed behavior.",
         "scripts/conveyor/__tests__/prep-review.test.mjs:301 — Raises this test’s timeout to 30 seconds; the same relaxation at line 659 allows slower or stalled behavior to escape the previous timeout guard."
+      ]
+    },
+    {
+      "ref": "lane/redteam-foreign-host",
+      "sha": "df6f584666eecef95c6a0b2c72d393cd8e54dd6d",
+      "ruling": "R757",
+      "findings": [
+        "scripts/lib/drain-red-team-evidence.mjs:541 — Replaces the foreign-host fail-closed hold with an age-based local PID check. Different machines can both have null PID namespaces; an absent or mismatched local PID cannot prove the remote writer stopped. After 30 minutes (configurable down to 10), a live remote review can lose its in-flight/queued protection, allowing review-job.mjs:387 to admit a replacement writer and overwrite its status."
       ]
     }
   ]

@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
@@ -181,8 +182,29 @@ function isNonBlockingRedTeamGate(text) {
     && (gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || actions.some(line => card.test(line)));
 }
 
+/**
+ * The carry writer's envelope (review-job.mjs): the carried marker, its fixed sentence, then optionally a non-blocking
+ * advisory re-bound to the carried-to head (its "Head" label keeps the carried-from head). Anything else is a possible hold.
+ */
+function isNonBlockingCarriedVerdict(text, comment) {
+  if (comment === undefined || !isTrustedMarkerAuthor(comment)) return false;
+  const carried = parseVerdictCarriedMarker(text);
+  if (!carried) return false;
+  const marker = buildVerdictCarriedMarker(carried);
+  if (!text.startsWith(marker)) return false;
+  const sentence = 'Review verdict carried across an identical contribution.';
+  let rest = text.slice(marker.length);
+  if (!rest.startsWith(`\n${sentence}`)) return false;
+  rest = rest.slice(sentence.length + 1);
+  if (!rest.trim()) return true;
+  if (!rest.startsWith('\n') || !rest.trimStart().startsWith(RED_TEAM_COMMENT_MARKER)) return false;
+  rest = rest.trim();
+  const parsed = parseRedTeamComment(rest);
+  return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, carried.fromSha.slice(0, 12));
+}
+
 /** Validate the rendered envelope and every finding line: the shared evidence parser skips malformed lines. */
-function isNonBlockingRedTeamAdvisory(text) {
+function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
   const parsed = parseRedTeamComment(text);
   if (!parsed) return false;
   const lines = text.split('\n');
@@ -191,7 +213,7 @@ function isNonBlockingRedTeamAdvisory(text) {
     ? `${findings.length} possible break(s), ${findings.filter(f => f.confirmed).length} confirmed by Claude's re-check`
     : 'no break found';
   const prefix = 'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
-    + `Head \`${parsed.rev.slice(0, 12)}\` · red team `;
+    + `Head \`${shownHead ?? parsed.rev.slice(0, 12)}\` · red team `;
   if (lines[0] !== redTeamMarker(parsed.pr, parsed.rev) || lines[1] !== `### Post-accept red team — ${heading}`
     || lines[2] !== '' || !lines[3]?.startsWith(prefix)
     || !/^[^\s`]+\/[^\s`]+(?: · re-check (?:ok|pending|not-needed|error))? · recorded verdict `(accept|changes|null)`\.$/.test(lines[3].slice(prefix.length))
@@ -210,7 +232,10 @@ function isNonBlockingRedTeamAdvisory(text) {
     const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
     if (finding) {
       if (finding.index !== ++count || !finding.category || !finding.summary) return false;
-    } else if (!count || !/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)) return false;
+    } else if (!count || !(/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)
+      // The writer's classification sublines (review-extra-seats.mjs); same shapes the gate parser reads.
+      || /^ {3}- Class: [^\r\n]+? → (?:fix-now|defer-card)(?: \(basis: [^\r\n]*\))?$/.test(line)
+      || /^ {3}- Also class: [a-z-]+(?:, [a-z-]+)*$/.test(line))) return false;
   }
   return count === findings.length;
 }
@@ -225,6 +250,7 @@ export function isKnownMachineBody(body, comment = undefined) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
+  if (text.startsWith('<!-- review-verdict-carried ')) return isNonBlockingCarriedVerdict(text, comment);
   // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
   if (isTrustedMarkerAuthor(comment)) {
     if (text.startsWith(RED_TEAM_GATE_MARKER)) {

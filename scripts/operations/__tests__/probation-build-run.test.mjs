@@ -22,6 +22,12 @@ import { withInfraLock } from '../../conveyor/infra-blocked.mjs';
 import { buildCodexDirectTaskArgv } from '../../codex-direct-task.mjs';
 import { gateFailureDetail, captureWorkerMessage, lightWorkerArgv, openPrArgv, parseArgs, realIo, runProbationBuild, probationHoldIdentityEnv } from '../probation-build-run.mjs';
 
+function cloneFixture(src, dest) {
+  // CI partial clones disable lazy fetch: depth 1 needs only HEAD's checked-out tree,
+  // avoiding missing historical blobs that a shared clone would try to fetch.
+  execFileSync('git', ['clone', '--quiet', '--no-local', '--depth=1', `file://${src}`, dest], { stdio: 'pipe' });
+}
+
 describe('realIo().blockedByGraph', () => {
   it('includes hash-named cards and validates their parsed proposals against the loaded graph', async () => {
     const { parseProposedBlockedBy, validateProposedBlockedBy } = await import('../../lib/probation-launcher.mjs');
@@ -1495,7 +1501,7 @@ describe('Findings publication regressions', () => {
   it('sanitises absolute paths and bare file:line with the real lane standards gate', () => {
     const dir = mkdtempSync(join(tmpdir(), 'findings-standards-'));
     try {
-      execFileSync('git', ['clone', '--shared', '--quiet', resolve('.'), dir]);
+      cloneFixture(resolve('.'), dir);
       // A CI checkout has no local `main` for the shared clone to track, so `origin/main` is missing and the
       // backlog scope guards refuse to run; pin it to HEAD so the changed set is just this test's edit.
       try { execFileSync('git', ['-C', dir, 'rev-parse', '--verify', '-q', 'origin/main'], { stdio: 'ignore' }); }
@@ -1616,7 +1622,7 @@ describe('owned new test scope (#4650)', () => {
 it('observes NEW tests through real Git numstat including staged and untracked additions', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owned-test-git-'));
   try {
-    execFileSync('git', ['clone', '--shared', '--quiet', resolve('.'), dir]);
+    cloneFixture(resolve('.'), dir);
     const io = realIo();
     const existing = 'scripts/operations/probation-build-run.mjs';
     const fresh = 'scripts/operations/__tests__/probation-build-run-new-regression.test.mjs';
@@ -1632,7 +1638,7 @@ it('observes NEW tests through real Git numstat including staged and untracked a
 it.each(['4397', '4389'])('replays incident #%s using its checkout card and real Git/file IO', async num => {
   const dir = mkdtempSync(join(tmpdir(), `probation-${num}-replay-`));
   try {
-    execFileSync('git', ['clone', '--shared', '--quiet', resolve('.'), dir]);
+    cloneFixture(resolve('.'), dir);
     const real = realIo();
     const item = real.findItem(num, dir);
     const { io, calls } = fakeIo({ lane: dir, item });
