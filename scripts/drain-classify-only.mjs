@@ -12,18 +12,20 @@ export function resultToVerdictInputs(result, ctx) {
   for (const key of ['toMerge', 'skipped', 'parked']) {
     if (!Array.isArray(result[key])) throw new Error(`missing ${key}; run the local drain`);
   }
-  const matches = row => Number(row.num) === ctx.pr && (!ctx.repo || row.repo === ctx.repo);
+  // Local-repo dry-run rows carry repo:null; they belong to ctx.repo (the resolved local slug).
+  const rowRepo = row => row.repo ?? ctx.repo;
+  const matches = row => Number(row.num) === ctx.pr && (!ctx.repo || rowRepo(row) === ctx.repo);
   const merge = result.toMerge.filter(matches);
   const skipped = result.skipped.filter(matches);
   const parked = result.parked.filter(matches);
   const rows = [...merge, ...skipped, ...parked];
   if (!rows.length) throw new Error('target absent; run the local drain');
-  const repo = ctx.repo || rows[0].repo;
+  const repo = ctx.repo || rowRepo(rows[0]);
   const heads = new Set(rows.map(r => r.headSha));
-  if (heads.size !== 1 || !rows[0].headSha || rows.some(r => r.repo !== repo)) throw new Error('ambiguous headSha/repo; run the local drain');
+  if (heads.size !== 1 || !rows[0].headSha || rows.some(r => rowRepo(r) !== repo)) throw new Error('ambiguous headSha/repo; run the local drain');
   if (merge.length && (skipped.length || parked.length)) throw new Error('contradictory classification; run the local drain');
   const reasons = rows.flatMap(r => [r.reason, ...(r.reasons || [])]).filter(Boolean);
-  const skipRows = (result.skipReasons || []).filter(r => Number(r.num) === ctx.pr && r.repo === repo);
+  const skipRows = (result.skipReasons || []).filter(r => Number(r.num) === ctx.pr && rowRepo(r) === repo);
   const hold = rows.some(r => r.humanRequired || r.hold) ||
     skipRows.some(r => /(?:^|-)hold$/.test(r.kind)) ||
     [...reasons, ...skipRows.map(r => r.reason)].some(r => /\bhold\b|review:(?:human|changes|pending)|human.required|awaiting review/i.test(r));
@@ -70,6 +72,7 @@ export function runCli(argv = process.argv.slice(2), io = {}) {
   const env = { ...(io.env || process.env), DRAIN_CLASSIFY_ONLY: '1' };
   const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 10 * 60_000, env };
   const started = (io.now || Date.now)();
+  const repoSlug = flags.repo || String(exec('gh', ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], options)).trim();
   const git = ref => String(exec('git', ['rev-parse', ref], options)).trim();
   const before = { mainSha: git('origin/main'), codeSha: git('HEAD'), gateTree: git('HEAD:scripts') };
   const readSettings = io.readSettings || readDeclaredSettings;
@@ -87,7 +90,7 @@ export function runCli(argv = process.argv.slice(2), io = {}) {
   if (before.mainSha !== git('origin/main') || before.codeSha !== git('HEAD') || before.gateTree !== git('HEAD:scripts') ||
       settingsDigest !== digest({ settings: readSettings(), env })) throw new Error('classification inputs changed; run the local drain');
   const now = (io.now || Date.now)();
-  const inputs = resultToVerdictInputs(result, { ...before, pr: Number(flags.only), repo: flags.repo,
+  const inputs = resultToVerdictInputs(result, { ...before, pr: Number(flags.only), repo: repoSlug,
     settingsDigest, computedAt: new Date(started).toISOString() });
   const verdict = build(inputs);
   if (!verify(verdict, inputs, { maxAgeMinutes, now }).ok) throw new Error('verdict verification failed; run the local drain');

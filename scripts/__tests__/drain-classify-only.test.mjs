@@ -27,6 +27,7 @@ function ioFor(result) {
     execFileSync: (cmd, args, options) => {
       calls.push({ cmd, args, options });
       if (cmd === 'git' && args[0] === 'rev-parse') return { 'origin/main': 'main', HEAD: 'code', 'HEAD:scripts': 'tree' }[args[1]];
+      if (cmd === 'gh' && args[0] === 'repo') return ctx.repo + '\n';
       if (cmd === process.execPath) return JSON.stringify(result);
       throw new Error('unexpected command');
     }, writeFileSync: vi.fn() };
@@ -103,5 +104,12 @@ describe('real settings reader digest', () => {
   it('digests the default readDeclaredSettings() result (null-prototype owners map)', async () => {
     const { readDeclaredSettings } = await import('../lib/settings-files.mjs');
     expect(() => digest({ settings: readDeclaredSettings(), env: {} })).not.toThrow();
+  });
+});
+
+describe('local-repo rows (repo:null)', () => {
+  it('attributes repo:null dry-run rows to the resolved local slug', () => {
+    const r = { ...base(), toMerge: [{ ...row, repo: null }] };
+    expect(resultToVerdictInputs(r, ctx)).toMatchObject({ decision: 'enqueue', repo: ctx.repo });
   });
 });

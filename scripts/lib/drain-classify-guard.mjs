@@ -19,6 +19,13 @@ export function isMutatingGhCall(cmd, args = []) {
   }
   if (name === 'git') {
     // Global options can install aliases/helpers: only the direct read forms are admitted.
+    // Fetch only updates local object/ref storage (never the remote): admit it for plain remote + refspec args,
+    // refusing helper-executing options and any destination outside refs/remotes/.
+    if (a[0] === 'fetch') {
+      const okOpts = new Set(['--quiet', '-q', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules']);
+      return a.slice(1).some(arg => arg.startsWith('-') ? !(okOpts.has(arg) || /^--depth=\d+$/.test(arg)) :
+        (arg.includes(':') && !/^\+?[\w./-]*:refs\/remotes\/[\w./-]+$/.test(arg)) || arg.includes('..') || arg.startsWith('ext::'));
+    }
     if (!['rev-parse', 'status', 'diff', 'show', 'log', 'ls-tree', 'merge-base', 'ls-files', 'cat-file'].includes(a[0])) return true;
     // Diff-producing commands can execute configured helpers even without an
     // explicit enabling flag. Require the protections first, before options that
@@ -70,7 +77,7 @@ function assertRead(cmd, args, shell = false) {
     cmd = words.shift(); args = words;
   }
   if (isMutatingGhCall(cmd, Array.isArray(args) ? args : [])) {
-    throw new Error('DRAIN_CLASSIFY_ONLY: mutating or unknown command refused; use the local drain');
+    throw new Error(`DRAIN_CLASSIFY_ONLY: mutating or unknown command refused (${String([cmd, ...(Array.isArray(args) ? args : [])].join(' ')).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 120)}); use the local drain`);
   }
 }
 

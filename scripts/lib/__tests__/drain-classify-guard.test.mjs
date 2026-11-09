@@ -152,3 +152,14 @@ describe('classify write guard', () => {
       '--input-type=module', '-e', source], { encoding: 'utf8', env: { ...process.env, DRAIN_CLASSIFY_ONLY: '1' } })).toBe('blocked');
   });
 });
+
+describe('git fetch admission', () => {
+  it('admits plain fetches into local storage and refuses helpers or non-remote destinations', () => {
+    expect(isMutatingGhCall('git', ['fetch', 'origin', 'lane/x'])).toBe(false);
+    expect(isMutatingGhCall('git', ['fetch', '--quiet', 'origin', '+refs/heads/x:refs/remotes/origin/x'])).toBe(false);
+    expect(isMutatingGhCall('git', ['fetch', 'origin', 'x:refs/heads/main'])).toBe(true);
+    expect(isMutatingGhCall('git', ['fetch', '--upload-pack=sh', 'origin'])).toBe(true);
+    expect(isMutatingGhCall('git', ['fetch', 'ext::sh -c x'])).toBe(true);
+    expect(isMutatingGhCall('git', ['push', 'origin', 'x'])).toBe(true);
+  });
+});
