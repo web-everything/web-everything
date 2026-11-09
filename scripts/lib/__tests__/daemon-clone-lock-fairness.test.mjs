@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock, resolveReaderPriorityAfter,
-  DEFAULT_READER_PRIORITY_AFTER,
+  DEFAULT_READER_PRIORITY_AFTER, DEFAULT_WRITER_PRIORITY_AFTER, DEFAULT_WRITER_PRIORITY_MAX_SKIPS,
 } from '../daemon-clone-lock.mjs';
 import { withSelfSync, resolvePriorityWaitMs, DEFAULT_READER_PRIORITY_WAIT_MS } from '../daemon-self-sync.mjs';
 
@@ -38,7 +38,7 @@ const LEASE = 1e9; // minutes — fake clocks start at epoch 0 while some calls 
  *     keeps moving, so there is always a rebuild to try);
  *   - R, the review daemon, tries its read once per round, landing while W is draining.
  */
-async function simulate({ rounds, readerPriorityAfter }) {
+async function simulate({ rounds, readerPriorityAfter, writerPriorityAfter }) {
   const lockRoot = mkTmp('dclf-root-');
   const clone = mkTmp('dclf-clone-');
   let t = 0;
@@ -61,6 +61,7 @@ async function simulate({ rounds, readerPriorityAfter }) {
       waitMs: 60_000,
       pollMs: 10_000,
       readerPriorityAfter,
+      writerPriorityAfter,
       sleep: async (ms) => { t += ms; if (!rTried && t >= round * 120_000 - 90_000) rTry(); },
     });
     expect(w.ok).toBe(false); // L never drains, so W never moves anything in this scenario
@@ -80,15 +81,33 @@ describe('reader fairness — the livelock', () => {
   });
 
   it('RESOLVES with reader priority on: the reader gets in right after its K-th refusal', async () => {
-    const { log, readerIn, clone, common } = await simulate({ rounds: 12, readerPriorityAfter: 3 });
+    const { log, readerIn, clone, common } = await simulate({ rounds: 12, readerPriorityAfter: 3, writerPriorityAfter: 0 });
     expect(log.map((r) => r.ok)).toEqual([false, false, false, true]);
     expect(readerIn).toBe(4);
     expect(inspectCloneLock(clone, common).starved).toEqual([]); // claim cleared once in
   });
+
+  it('admits the reader on round 7 with default thresholds despite a reader that never drains', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER', undefined);
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS', undefined);
+    try {
+      const admissionRound = DEFAULT_WRITER_PRIORITY_AFTER + Math.max(1, DEFAULT_WRITER_PRIORITY_MAX_SKIPS + 1) + 1;
+      expect(admissionRound).toBe(7);
+      const { log, readerIn, clone, common } = await simulate({ rounds: admissionRound, readerPriorityAfter: 3 });
+      expect(readerIn).toBe(admissionRound);
+      expect(log.map((r) => r.ok)).toEqual([false, false, false, false, false, false, true]);
+      const state = inspectCloneLock(clone, common);
+      expect(state.writer).toBeNull();
+      expect(state.writerClaim).toBeNull();
+      expect(state.starved).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe('reader fairness — the lock protocol', () => {
-  const base = () => ({ lockRoot: mkTmp('dclf-root-'), probe: alive, leaseMinutes: LEASE });
+  const base = () => ({ lockRoot: mkTmp('dclf-root-'), probe: alive, leaseMinutes: LEASE, writerPriorityAfter: 0 });
 
   it('a draining writer backs off (reader-priority, writer key released) once a reader is starved', async () => {
     const o = base();

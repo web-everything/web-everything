@@ -210,7 +210,10 @@ function isNonBlockingRedTeamAdvisory(text) {
     const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
     if (finding) {
       if (finding.index !== ++count || !finding.category || !finding.summary) return false;
-    } else if (!count || !/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)) return false;
+    } else if (!count || !(/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)
+      // The writer's classification sublines (review-extra-seats.mjs); same shapes the gate parser reads.
+      || /^ {3}- Class: [^\r\n]+? → (?:fix-now|defer-card)(?: \(basis: [^\r\n]*\))?$/.test(line)
+      || /^ {3}- Also class: [a-z-]+(?:, [a-z-]+)*$/.test(line))) return false;
   }
   return count === findings.length;
 }

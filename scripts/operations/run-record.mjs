@@ -70,9 +70,12 @@ function isPlainObject(v) {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
-/** Is `id` usable as a run id (and therefore as a filename)? */
+/**
+ * Is `id` usable as a run id (and therefore as a filename)? R755: an id ending `.abandoned` is reserved for the
+ * `<id>.abandoned.json` tombstone sidecar, so listRunIds never mistakes a tombstone for a run record.
+ */
 export function isValidRunId(id) {
-  return typeof id === 'string' && RUN_ID_RE.test(id) && id !== '.' && id !== '..';
+  return typeof id === 'string' && RUN_ID_RE.test(id) && id !== '.' && id !== '..' && !id.endsWith('.abandoned');
 }
 
 /**
