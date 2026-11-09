@@ -371,6 +371,29 @@ describe('canonicalAuditEvidence: new-format passes need a fingerprint (D2)', ()
       const carriedBad = auditRecord({ head: 'd'.repeat(40), base: '8'.repeat(40), at: BEFORE, fingerprint: FPX, ...extra });
       expect(prototypeLoad.canonicalAuditEvidence([carriedBad], SHA, () => true, FPX)).toEqual({ ok: false, reason: 'weakened' });
     });
+  describe('any live-head current-question record is the live-head decision; a carried pass never stands in', () => {
+    const carriedPass = () => auditRecord({ head: 'd'.repeat(40), base: '8'.repeat(40), at: BEFORE, fingerprint: FPX });
+    const decide = (live) => prototypeLoad.canonicalAuditEvidence([carriedPass(), live], SHA, () => true, FPX);
+    it.each([
+      ['an invalid fingerprint-less post-cutoff pass', { at: AFTER, runs }],
+      ['a single-run post-cutoff pass', { at: AFTER, runs: ['NOT WEAKENED'], fingerprint: FPX }],
+      ['a pass with no runs after the cutoff', { at: AFTER, fingerprint: FPX }],
+      ['an unparseable record', { at: AFTER, verdict: 'WEAKENED', unparseable: true, runs: ['UNPARSEABLE'] }],
+      ['a WEAKENED record', { at: AFTER, verdict: 'WEAKENED', runs: ['WEAKENED'] }],
+      ['a record with an unusable timestamp', { at: 'not-a-date', runs, fingerprint: FPX }],
+      ['a pass with contradictory findings', { at: AFTER, runs, fingerprint: FPX, findings: ['WEAKENED'] }],
+      ['a record with an unknown verdict', { at: AFTER, verdict: 'MAYBE', runs, fingerprint: FPX }],
+    ])('%s blocks the carried pass', (_, over) => {
+      expect(decide(auditRecord({ fingerprint: undefined, ...over })).ok).toBe(false);
+    });
+    it('a valid live-head pass is the decision and admits', () => {
+      const valid = auditRecord({ at: AFTER, runs, fingerprint: FPX });
+      expect(decide(valid)).toEqual({ ok: true, record: valid });
+    });
+    it('with no live-head record at all, the carried pass decides', () => {
+      expect(prototypeLoad.canonicalAuditEvidence([carriedPass()], SHA, () => true, FPX)).toMatchObject({ ok: true });
+    });
+  });
   it('still accepts a legacy pass before the cutoff without a fingerprint', () => {
     const legacy = auditRecord({ at: BEFORE, fingerprint: undefined });
     expect(prototypeLoad.canonicalAuditEvidence([legacy], SHA, () => true, FPX)).toEqual({ ok: true, record: legacy });

@@ -147,7 +147,10 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // WEAKENED is judged by findAudit's newer-than-the-pass rule above.
   if (list.some((r) => typeof r?.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head && r.questionHash === QUESTION_HASH && isWeak(r) && carriesAcross(r.fingerprint, liveFp))) return { ok: false, reason: 'weakened' };
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
-  const passes = ownAny.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
+  // D2: ANY live-head current-question record (valid, invalid, single-run, unparseable, WEAKENED, malformed) is the live-head
+  // decision; a carried pass stands in only when the live head has no such record at all.
+  const liveHasRecord = ownAny.length > 0 || list.some((r) => r?.head === sha && r.base !== sha && r.questionHash === QUESTION_HASH);
+  const passes = liveHasRecord ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
     // D2: a new-format pass (made after the cutoff) must carry a readable net-diff fingerprint; a legacy one need not.
