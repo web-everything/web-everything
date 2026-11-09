@@ -20,6 +20,7 @@ function fullPool(caller = 'lane-pool-health-watch-we', env = {}) {
   return { throttle, elapsed: () => clock - start, rows: () => readFileSync(throttle.logPath, 'utf8').trim().split('\n').map(JSON.parse) };
 }
 
+const FREEZE_ARGS = ['api', '-i', 'repos/o/r/git/ref/heads/main'];
 describe('ghSlotWaitClass', () => {
   it.each([
     ['unknown', ['pr', 'edit', '1', '--add-label', 'x'], 'priority'],
@@ -176,11 +177,12 @@ it('recognizes shared throttled markers without confusing deferrals or ordinary 
 });
 
 describe('reserved priority slot (drain freeze read)', () => {
+  const FREEZE = ['api', '-i', 'repos/o/r/git/ref/heads/main'];
   it('a full pool throttles an ordinary read but a reservedSlot read runs at once, with no wait', () => {
     const plain = fullPool('red-main-freeze-read');
-    expect(() => runGhSync(READ, { encoding: 'utf8', throttle: plain.throttle })).toThrow(/throttled/);
+    expect(() => runGhSync(FREEZE, { encoding: 'utf8', throttle: plain.throttle })).toThrow(/throttled/);
     const f = fullPool('red-main-freeze-read');
-    expect(runGhSync(READ, { encoding: 'utf8', throttle: { ...f.throttle, reservedSlot: true } })).toBe('[]');
+    expect(runGhSync(FREEZE, { encoding: 'utf8', throttle: { ...f.throttle, reservedSlot: true } })).toBe('[]');
     expect(f.elapsed()).toBe(0);
     expect(f.throttle.exec).toHaveBeenCalledTimes(1);
   });
@@ -188,7 +190,7 @@ describe('reserved priority slot (drain freeze read)', () => {
     const f = fullPool('red-main-freeze-read');
     const t = { ...f.throttle, reservedSlot: true, acquireTimeoutMs: 3000 };
     expect(acquireGhSlotSync({ lockRoot: t.lockRoot, cap: 2, owner: `${process.pid}:reserved`, pid: process.pid, now: t.now, timeoutMs: 0 }).ok).toBe(true);
-    expect(() => runGhSync(READ, { encoding: 'utf8', throttle: t })).toThrow(/throttled/);
+    expect(() => runGhSync(FREEZE, { encoding: 'utf8', throttle: t })).toThrow(/throttled/);
     expect(f.throttle.exec).not.toHaveBeenCalled();
   });
   it('a write never takes the reserved slot', () => {
@@ -200,5 +202,22 @@ describe('reserved priority slot (drain freeze read)', () => {
     const lockRoot = temp();
     expect(acquireGhSlotSync({ lockRoot, cap: 1, owner: `${process.pid}:a`, pid: process.pid, timeoutMs: 0 }).ok).toBe(true);
     expect(acquireGhSlotSync({ lockRoot, cap: 1, owner: `${process.pid}:b`, pid: process.pid, timeoutMs: 0 }).ok).toBe(false);
+  });
+  it.each([
+    ['another caller', 'review-daemon', FREEZE_ARGS],
+    ['a method override', 'red-main-freeze-read', ['api', '-i', '-X', 'DELETE', 'repos/o/r/git/refs/heads/x']],
+    ['a body field', 'red-main-freeze-read', ['api', '-i', '-f', 'a=b', 'repos/o/r/issues']],
+    ['a non-repos endpoint', 'red-main-freeze-read', ['api', '-i', 'user']],
+    ['a classifier-missed write (repo delete)', 'red-main-freeze-read', ['repo', 'delete', 'o/r']],
+  ])('%s never takes the reserved slot', (_n, caller, args) => {
+    const f = fullPool(caller);
+    expect(() => runGhSync(args, { encoding: 'utf8', throttle: { ...f.throttle, reservedSlot: true, acquireTimeoutMs: 3000 } })).toThrow(/throttled/);
+    expect(f.throttle.exec).not.toHaveBeenCalled();
+  });
+  it('a reserved read waits for its slot no longer than its own call timeout', () => {
+    const f = fullPool('red-main-freeze-read');
+    expect(acquireGhSlotSync({ lockRoot: f.throttle.lockRoot, cap: 2, owner: `${process.pid}:r2`, pid: process.pid, now: f.throttle.now, timeoutMs: 0 }).ok).toBe(true);
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 4000, throttle: { ...f.throttle, reservedSlot: true } })).toThrow(/throttled/);
+    expect(f.elapsed()).toBe(4000);
   });
 });
