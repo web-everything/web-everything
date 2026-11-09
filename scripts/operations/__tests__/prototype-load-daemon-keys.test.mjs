@@ -24,6 +24,12 @@ describe('prototype-load daemon registry', () => {
     expect(config.daemons).not.toHaveProperty('merge');
   });
 
+  it('marks merge-watch unsupported with a reason naming main-only self-sync, so the loader refuses it', () => {
+    expect(typeof config.daemons['merge-watch'].unsupported).toBe('string');
+    expect(config.daemons['merge-watch'].unsupported).toMatch(/main-only|mainOnly/);
+    for (const [key, d] of Object.entries(config.daemons)) if (key !== 'merge-watch') expect(d.unsupported, key).toBeUndefined();
+  });
+
   it('gives every daemon a runs description', () => {
     for (const [key, d] of Object.entries(config.daemons)) expect(typeof d.runs, key).toBe('string');
   });

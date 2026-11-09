@@ -233,8 +233,11 @@ export function renderDaemonList({ edgeClone, settings } = {}) {
   const ends = (clone, name) => Boolean(name) && (tail(clone) === tail(name) || tail(clone).endsWith(`/${tail(name)}`));
   const keys = Object.keys(daemons).filter(key => ends(edgeClone, daemons[key].clone)
     || Object.entries(cfg.daemonAliases || {}).some(([alias, target]) => target === key && ends(edgeClone, alias)));
-  const lines = Object.entries(daemons).map(([key, d]) => `   - ${key}: ${d.runs || '(no description)'}`);
-  const verdict = keys.length
+  const lines = Object.entries(daemons).map(([key, d]) => `   - ${key}: ${d.runs || '(no description)'}${d.unsupported ? ' [prototype load UNSUPPORTED]' : ''}`);
+  const refused = keys.filter(key => daemons[key].unsupported);
+  const verdict = refused.length
+    ? `WARNING: --edge-clone ${edgeClone} matches daemon key ${refused.join(', ')}, which cannot adopt prototype loads (${daemons[refused[0]].unsupported}). Do not load a prototype there; land the change through a normal PR.`
+    : keys.length
     ? `--edge-clone ${edgeClone} matches daemon key ${keys.join(', ')}.`
     : `WARNING: --edge-clone ${edgeClone} matches no daemon clone. Check which daemon runs your code before loading.`;
   return `   Daemons (key: what it runs):\n${lines.join('\n')}\n   ${verdict}\n`;

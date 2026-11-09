@@ -43,7 +43,8 @@
     "merge-watch": {
       "label": "com.we.conveyor-pass-daemon.merge-orphan-sweep",
       "clone": "wev-merge-daemon",
-      "runs": "merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that"
+      "unsupported": "its merge-orphan-sweep pass runs self-sync main-only (mainOnly=true), which excludes registered overlays, so a prototype loaded here would stay pending forever. Land the change through a normal PR instead.",
+      "runs": "merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that. Does not accept prototype loads (unsupported)"
     }
   },
   "daemonAliases": {
