@@ -121,7 +121,13 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       commit() {
         const mutations = pending;
         pending = null;
-        for (const { data, message } of mutations) { persist(data); note(log, message); }
+        // The runner has already started its jobs: a failed write must never discard its result or roll
+        // memory back (the settled entries stay in memory, so the next tick does not re-offer a started PR).
+        // Each staged item is a full snapshot, so a later successful write repairs an earlier failed one.
+        for (const { data, message } of mutations) {
+          try { persist(data); note(log, message); }
+          catch (error) { note(log, `persist failed (queue file left stale, in-memory state kept): ${error?.message ?? error}`); }
+        }
       },
       abort() {
         entries = before;

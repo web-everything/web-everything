@@ -1272,7 +1272,17 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
       } catch { /* Label repair must never block red-team recovery. */ }
       const options = { ...o, rawPrs,
         dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
-      redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: options.log });
+      // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
+      const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
+      const queueOff = String(queueSetting ?? '').trim().toLowerCase() === 'off';
+      if (queueOff) {
+        options.log('review-daemon: red-team queue off (source: env WE_RED_TEAM_DISPATCH_QUEUE); recovery runs directly');
+        return runRedTeamOnSkip(options);
+      }
+      if (!redTeamDispatchQueue) {
+        options.log(`review-daemon: red-team queue on (source: ${queueSetting === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`);
+        redTeamDispatchQueue = createRedTeamDispatchQueue({ log: options.log });
+      }
       return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,

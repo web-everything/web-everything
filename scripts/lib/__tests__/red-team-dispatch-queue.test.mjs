@@ -17,7 +17,8 @@ const prefix = 'review-daemon: red-team queue ';
 
 // Sync IO doubles match node:fs semantics without touching the operator's queue.
 // No persisted envelope is assumed: restart assertions exercise the public reader.
-function fixture({ maxAttempts = 3 } = {}) {
+// maxAttempts is deliberately NOT defaulted here: omitting it exercises the production default (3).
+function fixture({ maxAttempts, logger } = {}) {
   const file = join('queue-fixture', 'queue.json');
   const files = new Map();
   const operations = [];
@@ -38,7 +39,7 @@ function fixture({ maxAttempts = 3 } = {}) {
     files.set(to, files.get(from));
     files.delete(from);
   });
-  const log = (...parts) => logs.push(parts.join(' '));
+  const log = logger ?? ((...parts) => logs.push(parts.join(' ')));
   const open = () => createRedTeamDispatchQueue({
     file, readFile, writeFile, rename, now: () => clock, log, maxAttempts,
   });
@@ -402,6 +403,51 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(await f.queue.admit(otherRepo, 2))).toEqual([7]);
     expect(await f.queue.admit(repo, 0)).toEqual([]);
     expect(f.queue.entries()).toEqual(before);
+  });
+
+  it('omitted maxAttempts rotates on exactly the third failed attempt', async () => {
+    const f = fixture();
+    const run = options => options.plan.refusals[0].prNumber === 1 ? refused(1, 'lane busy') : started(options);
+    const tick = () => runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
+    await tick();
+    expect(numbers(f.queue.entries())).toEqual([1, 2]);
+    expect(f.queue.entries()[0].attempts).toBe(1);
+    await tick();
+    expect(numbers(f.queue.entries())).toEqual([1, 2]);
+    expect(f.queue.entries()[0].attempts).toBe(2);
+    await tick();
+    expect(numbers(f.queue.entries())).toEqual([2, 1]);
+    expect(f.queue.entries()[1].attempts).toBe(0);
+  });
+
+  it('throwing diagnostics do not interrupt queue recovery or settlement', async () => {
+    const f = fixture({ logger: () => { throw new Error('logger down'); } });
+    f.files.set(f.file, '{ truncated');
+    const recovered = f.open();
+    expect(recovered.entries()).toEqual([]);
+    const run = vi.fn(started);
+    const result = await runWithRedTeamQueue({ queue: recovered, ...inputs([1, 2]), capacity: capacity(1), run,
+      log: () => { throw new Error('logger down'); } });
+    expect(result.dispatched.map(row => row.prNumber)).toEqual([1]);
+    expect(numbers(recovered.entries())).toEqual([2]);
+    expect(numbers(f.open().entries())).toEqual([2]);
+  });
+
+  describe.each([['writeFile'], ['rename']])('persist failure (%s) after a successful run', failing => {
+    it.each(['sync', 'async'])('%s runner: result is still returned, failure is only logged', async mode => {
+      const f = fixture();
+      const outcome = { dispatched: [{ prNumber: 1, jobPid: 1001 }], rows: [{ prNumber: 1, action: 'dispatch' }], notStarted: [] };
+      const run = vi.fn(() => {
+        // Break persistence only after the runner has started its job (its side effect is done).
+        f[failing].mockImplementation(() => { throw Object.assign(new Error('ENOSPC fixture'), { code: 'ENOSPC' }); });
+        return mode === 'async' ? Promise.resolve(outcome) : outcome;
+      });
+      const result = await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
+      expect(result).toBe(outcome);
+      // Memory keeps the settled state so the started PR is not re-offered next tick.
+      expect(numbers(f.queue.entries())).toEqual([2]);
+      expect(f.logs.some(line => line.startsWith(prefix) && line.includes('persist failed') && line.includes('ENOSPC fixture'))).toBe(true);
+    });
   });
 
   it('defaultQueueFile uses the environment override or the supplied home, never the real home', () => {
