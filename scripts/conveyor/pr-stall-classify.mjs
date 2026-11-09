@@ -227,8 +227,20 @@ function classifyUnsafe(o = {}) {
     return out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
       { onceKey: `${row.repo}#${row.number}@${head.toLowerCase()}:ask-review-daemon` });
   }
-  if (state === 'drain-skip:mq-same-head-failed') return out('system', 'await-mq-failure-recovery', 'waiting on mq-failure recovery: the same-head merge-queue attempt failed; recovery (R772) retries it, held until the head changes');
-  if (state === 'drain-skip:card-grouped') return out('system', 'await-card-group', 'waiting on the card group: the PR is grouped into an open card group and waits for the group to land');
+  if (state === 'drain-skip:mq-same-head-failed') {
+    const reason = /^the drain skipped it: mq-same-head-failed: #[0-9]+ head \S+ — ([\s\S]*)/.exec(row.why)?.[1];
+    // Only the first failed-check removal has an R772 recovery path. Every other hold needs inspection.
+    if (reason === 'failed_checks' || reason?.startsWith('failed_checks infra retry') || reason?.startsWith('failed_checks quarantine retry')) {
+      return out('system', 'await-mq-failure-recovery', 'waiting on mq-failure recovery: the same-head merge-queue attempt failed; recovery (R772) retries it, held until the head changes');
+    }
+    return operator(state, `merge-queue hold requires inspection: ${row.why}`, 'operator must inspect');
+  }
+  if (state === 'drain-skip:card-grouped') {
+    if (/grouped into | is reserved by open card group /.test(row.why)) {
+      return out('system', 'await-card-group', 'waiting on the card group: the PR is grouped into an open card group and waits for the group to land');
+    }
+    return operator(state, `card-group hold requires inspection: ${row.why}`, 'operator must inspect');
+  }
   if (OPERATOR_STATES[state]) return operator(state, OPERATOR_STATES[state]);
   const smell = TOOLING_SMELL[state] ?? null;
   if (smell) {
