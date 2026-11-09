@@ -105,12 +105,12 @@ describe('#4979 gate: operator rulings alongside reviewer rulings', () => {
     expect(parseOperatorRulingComment(gh(body, r.actor)).record.reason).toBe(r.reason);
   });
   it('a ruling binds to its exact run, finding and head; a new head invalidates it', () => {
-    const wrongRun = gh(buildOperatorRulingComment(ruling(blocked, { runId: 'review-pr-other' })));
-    const wrongKey = gh(buildOperatorRulingComment(ruling(blocked, { key: '["x","y","","z"]' })));
+    const wrongRun = op(ruling(blocked, { runId: 'review-pr-other' }));
+    const wrongKey = op(ruling(blocked, { key: '["x","y","","z"]' }));
     for (const c of [wrongRun, wrongKey]) expect(mandatoryReferralState(thread(c), ctx()).blocked).toEqual([blocked.referrals[0].key]);
     // The PR moved: the new head's own record is pending, and the old-head ruling does not reach it.
     const fresh = referral({ runId: 'review-pr-2', h: newHead });
-    const old = gh(buildOperatorRulingComment(ruling(blocked)));
+    const old = op(ruling(blocked));
     const onNew = mandatoryReferralState([...thread(old), gh(renderReferralRecord(fresh))], ctx({ head: newHead }));
     expect(onNew.pending).toEqual([fresh.referrals[0].key]);
     // A broken ruling that provably belongs to the OLD head does not hold the new one.
@@ -287,9 +287,9 @@ describe('#4979 acceptance and wake-up read the operator ruling', () => {
     const pr = (comments) => ({ number: 7, headRefOid: head, comments });
     const later = new Date(at + 1000).toISOString();
     expect(decideReferralHold(pr([]), runs, { repo, now: at + 2000 })).not.toBeNull();
-    const ok = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real' })), 'web-everything', { createdAt: later });
+    const ok = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real' })), 'chalbert', { createdAt: later });
     expect(decideReferralHold(pr([ok]), runs, { repo, now: at + 2000 })).toBeNull();
-    const other = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real', h: newHead })), 'web-everything', { createdAt: later });
+    const other = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real', h: newHead })), 'chalbert', { createdAt: later });
     expect(decideReferralHold(pr([other]), runs, { repo, now: at + 2000 })).not.toBeNull();
   });
 });

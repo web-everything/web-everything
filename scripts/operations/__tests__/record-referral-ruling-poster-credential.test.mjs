@@ -189,7 +189,7 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
     // shipped (PR #5925: automation-posted operator rulings recorded before the stamp).
     const { poster, ...legacy } = p.record;
     expect(poster).toBe('chalbert');
-    expect(readOperatorRulings([{ ...gh(buildOperatorRulingComment(legacy), 'web-everything'), createdAt: '2026-10-01T00:00:00Z' }]).rulings).toHaveLength(1);
+    expect(readOperatorRulings([{ ...gh(buildOperatorRulingComment(legacy), 'web-everything'), createdAt: '2026-10-01T00:00:00Z', includesCreatedEdit: false }]).rulings).toHaveLength(1);
   });
 
   describe('PR #6529 red team (result 5acf690a8e9b87a6): omitting poster cannot bypass the author binding', () => {
@@ -219,15 +219,29 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
       expect(readOperatorRulings([at(buildOperatorRulingComment(record(['card'])), 'web-everything', when)])).toEqual({ rulings: [], malformed: false });
     });
 
-    it('the REST spelling created_at is read the same way', () => {
+    it('the REST spellings created_at / updated_at are read the same way', () => {
       const body = buildOperatorRulingComment(record(['not-real', 'block']));
-      expect(results([{ ...gh(body, 'web-everything'), created_at: '2026-11-09T11:00:00Z' }])).toEqual(['block']);
-      expect(results([{ ...gh(body, 'web-everything'), created_at: '2026-10-01T00:00:00Z' }])).toEqual(['not-real', 'block']);
+      expect(results([{ ...gh(body, 'web-everything'), created_at: '2026-11-09T11:00:00Z', updated_at: '2026-11-09T11:00:00Z' }])).toEqual(['block']);
+      expect(results([{ ...gh(body, 'web-everything'), created_at: '2026-10-01T00:00:00Z', updated_at: '2026-10-01T00:00:00Z' }])).toEqual(['not-real', 'block']);
     });
 
-    it('an unstamped automation copy dated before the cutoff keeps every row (legacy PR #5925)', () => {
+    it('an unstamped, unedited automation copy dated before the cutoff keeps every row (legacy PR #5925)', () => {
       const body = buildOperatorRulingComment(record(['not-real', 'block', 'card']));
-      expect(results([at(body, 'web-everything', '2026-11-08T12:22:32Z')])).toEqual(['not-real', 'block', 'card']);
+      expect(results([{ ...at(body, 'web-everything', '2026-11-08T12:22:32Z'), includesCreatedEdit: false }])).toEqual(['not-real', 'block', 'card']);
+      expect(results([{ ...at(body, 'web-everything', '2026-11-08T12:22:32Z'), updatedAt: '2026-11-08T12:22:32Z' }])).toEqual(['not-real', 'block', 'card']);
+    });
+
+    // GitHub keeps created_at when a comment is edited: an old automation comment rewritten into a fresh unstamped
+    // clearing ruling must not borrow its creation date.
+    it.each([
+      ['edited (GraphQL includesCreatedEdit)', { includesCreatedEdit: true }],
+      ['edited after the cutoff (REST updated_at)', { updated_at: '2026-11-09T11:00:00Z' }],
+      ['edited exactly at the cutoff', { updatedAt: CUTOFF }],
+      ['with no edit metadata', {}],
+      ['with an unparseable updated_at', { updated_at: 'never' }],
+    ])('a pre-cutoff automation copy %s keeps only its block rows', (_label, meta) => {
+      const body = buildOperatorRulingComment(record(['not-real', 'block', 'card']));
+      expect(results([{ ...at(body, 'web-everything', '2026-10-01T00:00:00Z'), ...meta }])).toEqual(['block']);
     });
 
     it('an unstamped ruling authored by an operator stays valid whatever its date', () => {
