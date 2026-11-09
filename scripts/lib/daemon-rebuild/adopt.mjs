@@ -210,6 +210,10 @@ export function readyBuildVerified({
   // The head's TRUE main base: an overlay the head carries may have merged into main since, which would make a plain
   // merge-base(head, mainTip) the (newer) overlay commit and read a good older plain-main fallback as a rollback.
   // So walk the head's first-parent chain across rebuild-committed overlay merges to the main commit they sit on.
+  // The floor is unchanged in meaning: the main commit the head was BUILT on, never an older one. Candidates below
+  // it are still refused. A candidate between that base and the overlay's later main merge omits the overlay's
+  // content only for the span until the next tick (the overlay is in main, so the live plan carries it); the build
+  // is a smoked plain-main record whose `applied` chain is verified below, and it never reaches below the head's base.
   const headBase = prevHead ? trueMainBase(git, prevHead, mainTip) : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
   const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
