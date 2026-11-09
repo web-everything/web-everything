@@ -443,11 +443,11 @@ describe('classifyIdleFinished — PURE core', () => {
   });
 
   it('rowIdle + pending call but still INSIDE the window → not finished', () => {
-    expect(classifyIdleFinished({ lastActivityMs: NOW - 1000, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true }).finished).toBe(false);
+    expect(classifyIdleFinished({ lastActivityMs: NOW - 1000, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: true, pendingGraceMs: 90 * 60_000 }).finished).toBe(false);
   });
 
   it('a busy/waiting row (rowIdle false) with a pending call stays unfinished at any age', () => {
-    expect(classifyIdleFinished({ lastActivityMs: NOW - THRESHOLD * 100, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: false }).reason).toBe('pending-tool-call');
+    expect(classifyIdleFinished({ lastActivityMs: NOW - THRESHOLD * 100, nowMs: NOW, thresholdMs: THRESHOLD, pendingToolUse: true, rowIdle: false, pendingGraceMs: 90 * 60_000 }).reason).toBe('pending-tool-call');
   });
 
   it('any non-finite/invalid input answers no-signal, never a guess', () => {
