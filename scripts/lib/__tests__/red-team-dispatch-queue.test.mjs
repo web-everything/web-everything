@@ -478,7 +478,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
   });
   describe('non-runnable head does not consume an admission', () => {
     const block = async (f, pr) => {
-      await f.queue.admit(repo, 1);
+      f.queue.admit(repo, pr);
       await f.queue.settle(repo, refused(pr, 'review-unfinished'));
     };
     it('a review-unfinished head is probed each tick but the next runnable PR is admitted in the same tick', async () => {
@@ -493,9 +493,9 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     it('keeps FIFO order and the capacity bound among runnable PRs', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
-      await block(f, 2);
+      await block(f, 1);
       expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
-      expect(numbers(f.queue.admit(repo, 0))).toEqual([2]);
+      expect(numbers(f.queue.admit(repo, 0))).toEqual([1]);
     });
     it('does not spend a retry while probing, and stops being blocked once dispatched', async () => {
       const f = fixture();
