@@ -149,6 +149,8 @@ function validate(capsule) {
 }
 
 const poisoned = new WeakSet();
+const pending = new Map(); // recorder -> in-flight gh reads; finalize refuses while any are pending
+const sealed = new WeakSet();
 
 export function createCapsuleRecorder() {
   const recorder = Object.freeze({});
@@ -165,6 +167,8 @@ export function recordingRunChild(inner, recorder) {
     requireRepositoryContext(args, executionOptions);
     // Any failure after validation (inner error, unsafe body, conflicting response) poisons the recorder:
     // rejected evidence must never end up in a finalized capsule.
+    if (sealed.has(recorder)) fail();
+    pending.set(recorder, (pending.get(recorder) ?? 0) + 1);
     try {
       const result = await inner(command, args, ...executionOptions);
       const body = safeText(typeof result === 'string' ? result : result?.stdout);
@@ -175,13 +179,16 @@ export function recordingRunChild(inner, recorder) {
     } catch (error) {
       poisoned.add(recorder);
       throw error;
+    } finally {
+      pending.set(recorder, pending.get(recorder) - 1);
     }
   };
 }
 
 export function finalizeCapsule(recorder, { stateRoots } = {}) {
   const entries = recorders.get(recorder);
-  if (!entries || poisoned.has(recorder) || !Array.isArray(stateRoots)) fail();
+  if (!entries || poisoned.has(recorder) || pending.get(recorder) || !Array.isArray(stateRoots)) fail();
+  sealed.add(recorder);
   const gh = [...entries.values()].map(entry => ({ ...entry }));
   const state = [];
   for (const descriptor of stateRoots) {

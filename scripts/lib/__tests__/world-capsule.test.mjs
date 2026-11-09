@@ -210,6 +210,22 @@ describe('world capsule (R649 S1)', () => {
     }
   });
 
+  it('refuses to finalize while a read is pending and seals the recorder after finalizing', async () => {
+    const recorder = createCapsuleRecorder();
+    const argv = ['api', '--method', 'GET', 'repos/o/r'];
+    await recordingRunChild(async () => '{"v":1}', recorder)('gh', argv);
+    let release;
+    const slow = recordingRunChild(() => new Promise((_, reject) => { release = reject; }), recorder)('gh', ['api', '--method', 'GET', 'repos/o/s']);
+    expect(() => finalizeCapsule(recorder, { stateRoots: [] })).toThrow();
+    release(new Error('late failure'));
+    await expect(slow).rejects.toThrow('late failure');
+    expect(() => finalizeCapsule(recorder, { stateRoots: [] })).toThrow();
+    const clean = createCapsuleRecorder();
+    await recordingRunChild(async () => '{"v":1}', clean)('gh', argv);
+    finalizeCapsule(clean, { stateRoots: [] });
+    await expect(recordingRunChild(async () => '{"v":2}', clean)('gh', argv)).rejects.toThrow();
+  });
+
   it('does not import readPrsFromFile', () => {
     const source = readFileSync(join(process.cwd(), 'scripts/lib/daemon-rebuild/world-capsule.mjs'), 'utf8');
     expect(source).not.toContain('readPrsFromFile');
