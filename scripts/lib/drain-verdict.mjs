@@ -94,8 +94,17 @@ export function auditWorkflow(yamlText) {
     Object.values(value).forEach(walk);
   };
   walk(doc);
-  const loop = JSON.stringify(doc.jobs ?? {});
-  if (!/failed=1/.test(loop) || !/exit \\\"\$\{failed:-0\}\\\"/.test(loop)) problems.push('scheduled classification failures must fail the job');
+  const steps = Object.values(record(doc.jobs) ? doc.jobs : {}).flatMap(job => (record(job) && Array.isArray(job.steps) ? job.steps : []));
+  const guards = { classify: "github.event_name == 'schedule'", dispatch: "github.event_name == 'workflow_dispatch'", upload: 'always()' };
+  const sched = steps.filter(st => typeof st?.run === 'string' && st.run.includes('failed=1'));
+  const disp = steps.filter(st => typeof st?.run === 'string' && st.run.includes('drain-classify-only') && !st.run.includes('failed=1'));
+  const up = steps.filter(st => /^actions\/upload-artifact@/.test(st?.uses ?? ''));
+  if (sched.length !== 1 || !/exit "\$\{failed:-0\}"/.test(sched[0].run) || sched[0].if !== guards.classify ||
+      disp.length !== 1 || disp[0].if !== guards.dispatch || up.length !== 1 || up[0].if !== guards.upload ||
+      steps.some(st => Object.hasOwn(st, 'if') && ![sched[0], disp[0], up[0]].includes(st)) ||
+      Object.values(doc.jobs).some(job => Object.hasOwn(job, 'if'))) {
+    problems.push('scheduled classification failures must fail the job');
+  }
   const jobs = record(doc.jobs) ? Object.values(doc.jobs) : [];
   if (jobs.length !== 1 || !jobs.every(job => record(job) && Number.isFinite(job['timeout-minutes']) &&
       job['timeout-minutes'] > 0 && Array.isArray(job.steps) && job.steps.some(step => /^actions\/checkout@/.test(step.uses)))) {
