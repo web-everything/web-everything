@@ -3373,6 +3373,24 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
     }
   });
 
+  it('finish() after a signal still keeps a clean clone (the KEPT line stays true)', () => {
+    const { dir, sha } = makeClone();
+    const rm = vi.fn();
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      // A host that embeds the run with its own non-exiting signal listener keeps the run alive past the signal.
+      const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+      proc.on('SIGINT', () => {});
+      const guard = createScratchGuard({ proc, rmFn: rm });
+      guard.arm(dir, sha);
+      proc.emit('SIGINT');
+      const r = guard.finish();
+      expect(r).toMatchObject({ removed: false, path: dir, reason: 'interrupted by signal' });
+      expect(rm).not.toHaveBeenCalled();
+      expect(statSync(dir).isDirectory()).toBe(true);
+    } finally { spy.mockRestore(); }
+  });
+
   it('a signal during the run keeps a dirty clone', () => {
     const { dir, sha } = makeClone();
     const proc = new EventEmitter();

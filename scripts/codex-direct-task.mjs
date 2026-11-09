@@ -668,9 +668,12 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
 export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmFn = rmSync } = {}) {
   let target = null;
   let result = null;
+  let signaled = false;
   const run = () => {
     if (result) return result;
     if (!target) return null;
+    // A signal already told the operator the clone is KEPT; a later finish() must not contradict that.
+    if (signaled) { result = { removed: false, path: target.dir, reason: 'interrupted by signal' }; return result; }
     result = cleanupScratchClone({ ...target, execFn, rmFn });
     return result;
   };
@@ -683,6 +686,7 @@ export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmF
     handlers[sig] = () => {
       // A signal NEVER deletes: the worker may still be writing (its kill is a separate listener), so the
       // clone is kept and its path reported. Only a normal run end (`finish()`) applies the delete rule.
+      signaled = true;
       try { if (target) report({ removed: false, path: target.dir, reason: 'interrupted by signal' }); } catch { /* never throw from a signal handler */ }
       off();
       // We swallowed the default action by listening; restore it when nobody else is listening.
