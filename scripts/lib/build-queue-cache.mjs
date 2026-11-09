@@ -64,19 +64,25 @@ export function acquireBuildQueueLock({ file, now = Date.now(), staleMs = 600_00
     created = true;
     write(ownerFile, owner, 'utf8');
     let released = false;
-    return () => {
+    const release = () => {
       if (released) return;
+      released = true;
       let releaseGuarded = false;
       try {
         mkdir(guard);
         releaseGuarded = true;
-        released = true;
         if (read(ownerFile, 'utf8') === owner) remove(lock, { recursive: true });
       } catch { /* best-effort release */ }
       finally {
         if (releaseGuarded) { try { rmdir(guard); } catch { /* best-effort cleanup */ } }
       }
     };
+    release.holds = () => {
+      if (released) return false;
+      try { return read(ownerFile, 'utf8') === owner; }
+      catch { return false; }
+    };
+    return release;
   } catch {
     if (created) { try { remove(lock, { recursive: true }); } catch { /* best-effort cleanup */ } }
     return null;
@@ -97,13 +103,14 @@ export function waitForBuildQueueCache({ file, key, timeoutMs = 30_000, pollMs =
   }
 }
 
-export function writeBuildQueueCache({ file, key, at = Date.now(), stdout }) {
+export function writeBuildQueueCache({ file, key, at = Date.now(), stdout, fence }) {
   if (key === null) return;
   let temp;
   try {
     mkdirSync(dirname(file), { recursive: true });
     temp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     writeFileSync(temp, JSON.stringify({ key, at, stdout }), 'utf8');
+    if (fence !== undefined && !fence()) return;
     renameSync(temp, file);
   } catch { /* best-effort cache */ }
   finally { if (temp) { try { unlinkSync(temp); } catch { /* renamed or unavailable */ } } }

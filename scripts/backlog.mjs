@@ -1183,7 +1183,7 @@ function buildQueue() {
   const emit = (payload, human) => {
     if (key === null) return ok(payload, human);
     const stdout = `${JSON.stringify({ ok: true, ...payload })}\n`;
-    writeBuildQueueCache({ file, key, at, stdout });
+    writeBuildQueueCache({ file, key, at, stdout, fence: releaseLock ? releaseLock.holds : () => false });
     releaseLock?.();
     writeAllSync(1, stdout);
     process.exit(0);

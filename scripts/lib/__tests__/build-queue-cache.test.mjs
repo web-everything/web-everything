@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { acquireBuildQueueLock, buildQueueCacheKey, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache } from '../build-queue-cache.mjs';
 const dirs = [];
@@ -43,13 +43,100 @@ it('denies a second caller the held lock and serves the first caller stdout afte
   expect(readBuildQueueCache({ file, key })).toBeNull();
   const release = acquireBuildQueueLock({ file });
   expect(release).toBeTypeOf('function');
+  expect(release.holds()).toBe(true);
   expect(statSync(`${file}.lock`).isDirectory()).toBe(true);
   try {
     expect(readBuildQueueCache({ file, key })).toBeNull();
     expect(acquireBuildQueueLock({ file })).toBeNull();
-    writeBuildQueueCache({ file, key, stdout });
+    writeBuildQueueCache({ file, key, stdout, fence: release.holds });
   } finally { release(); }
+  expect(release.holds()).toBe(false);
   expect(waitForBuildQueueCache({ file, key, timeoutMs: 25, pollMs: 5 })).toBe(stdout);
+});
+
+it('a late caller without the lock prints its result without publishing a cache file', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const release = acquireBuildQueueLock({ file });
+  const stdout = '{"builds":[1]}\n';
+  try {
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { acquireBuildQueueLock, writeBuildQueueCache }
+        from ${JSON.stringify(pathToFileURL(resolve('scripts/lib/build-queue-cache.mjs')).href)};
+      const file = ${JSON.stringify(file)};
+      const releaseLock = acquireBuildQueueLock({ file });
+      if (releaseLock !== null) throw new Error('expected lock contention');
+      const stdout = ${JSON.stringify(stdout)};
+      writeBuildQueueCache({ file, key: 'key', stdout, fence: releaseLock ? releaseLock.holds : () => false });
+      process.stdout.write(stdout);
+    `], { encoding: 'utf8', timeout: 5_000, maxBuffer: 64 * 1024 });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(child.stderr).toBe('');
+    expect(child.stdout).toBe(stdout);
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(dir).some(name => name.endsWith('.tmp'))).toBe(false);
+  } finally { release(); }
+});
+
+it.each(['false', 'throws'])('checks the fence after staging and preserves existing cache when it %s', outcome => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  writeBuildQueueCache({ file, key: 'key', stdout: 'existing\n' });
+  let calls = 0;
+  let staged;
+  writeBuildQueueCache({ file, key: 'key', stdout: 'late\n', fence: () => {
+    calls++;
+    const temp = readdirSync(dir).find(name => name.endsWith('.tmp'));
+    staged = temp && JSON.parse(fs.readFileSync(join(dir, temp), 'utf8')).stdout;
+    if (outcome === 'throws') throw new Error('unreadable ownership');
+    return false;
+  } });
+  expect(calls).toBe(1);
+  expect(staged).toBe('late\n');
+  expect(readBuildQueueCache({ file, key: 'key' })).toBe('existing\n');
+  expect(readdirSync(dir).some(name => name.endsWith('.tmp'))).toBe(false);
+});
+
+it('drops a reclaimed owner late publish while the replacement owner publishes', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const releaseA = acquireBuildQueueLock({ file, now: 1_000, staleMs: 100 });
+  expect(releaseA.holds()).toBe(true);
+  const releaseB = acquireBuildQueueLock({ file, now: 1_101, staleMs: 100 });
+  try {
+    expect(releaseA.holds()).toBe(false);
+    expect(releaseB.holds()).toBe(true);
+    writeBuildQueueCache({ file, key: 'key', stdout: 'A\n', fence: releaseA.holds });
+    expect(existsSync(file)).toBe(false);
+    writeBuildQueueCache({ file, key: 'key', stdout: 'B\n', fence: releaseB.holds });
+    expect(readBuildQueueCache({ file, key: 'key' })).toBe('B\n');
+    writeBuildQueueCache({ file, key: 'key', stdout: 'A late\n', fence: releaseA.holds });
+    expect(readBuildQueueCache({ file, key: 'key' })).toBe('B\n');
+    expect(readdirSync(dir).some(name => name.endsWith('.tmp'))).toBe(false);
+  } finally { releaseA(); releaseB(); }
+});
+
+it('holds fails closed on owner read errors and missing owner files', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  let unreadable = false;
+  const release = acquireBuildQueueLock({ file, io: { ...fs, readFileSync(...args) {
+    if (unreadable) throw new Error('denied');
+    return fs.readFileSync(...args);
+  } } });
+  expect(release.holds()).toBe(true);
+  unreadable = true;
+  expect(release.holds()).toBe(false);
+  unreadable = false;
+  rmSync(`${file}.lock/owner.json`);
+  expect(release.holds()).toBe(false);
+  release();
+});
+
+it('holds stays false after release even if release cannot acquire its guard', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const release = acquireBuildQueueLock({ file });
+  mkdirSync(`${file}.lock.guard`);
+  release();
+  expect(existsSync(`${file}.lock/owner.json`)).toBe(true);
+  expect(release.holds()).toBe(false);
 });
 
 it('waits until timeout and returns null for a different content key', () => {
@@ -253,7 +340,7 @@ it('single-flights real concurrent child processes so both print cached stdout a
             appendFileSync(${JSON.stringify(counter)}, 'compute\\n');
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
             fresh = ${JSON.stringify(stdout)};
-            writeBuildQueueCache({ file, key, stdout: fresh });
+            writeBuildQueueCache({ file, key, stdout: fresh, fence: release.holds });
           }
           process.stdout.write(fresh);
         } finally { release(); }
