@@ -129,7 +129,9 @@ export async function wakeRun(run, { observers, store, registry, sinks = {}, now
         // `auto`, because this is the timer. The distinction is the whole point of recording it.
         const outcome = await applyPendingEffects(current, { sinks, store, attemptedBy: 'auto' });
         current = outcome.run;
-        if (outcome.error) { report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) }); break; }
+        // A permanent guard refusal is a settled fact, not a halt: it must reach `advance` so the engine ends the
+        // run `refused`, exactly as `driveRun` does. Breaking here left it awaiting-effect forever.
+        if (outcome.error && outcome.halted?.status !== 'refused') { report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) }); break; }
         // Parked again on a NEW dispatch — a legitimate outcome, and the next pass picks it up.
         if (outcome.inFlight && outcome.inFlight.length) break;
         // ADVANCE, do not loop back. `applyPendingEffects` does not clear `pending` — only `advance` does — so
