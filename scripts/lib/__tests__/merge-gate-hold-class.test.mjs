@@ -306,10 +306,40 @@ merge-gate: HOLD — held`;
   it('lets the review that produces the red-team check start on a fresh head', () => {
     expect(probe()).toMatchObject({ allowed: true });
   });
-  // Every reason readRedTeamCheckFact / the publication-hold reads can emit besides plain absence (all `ok:false`, so
+  const pendingReason = 'red-team check run in progress or incomplete';
+  const pending = freshHead.replace('no red-team check run on head', pendingReason);
+  it('excuses the pending red-team hold for a non-candidate so review acceptance can proceed', () => {
+    expect(probe({ readMergeGateVerdict: () => verdict(pending) })).toMatchObject({ allowed: true });
+    expect(classify([{ id: 'red-team', status: 'hold', reason: pendingReason }]))
+      .toMatchObject({ excused: true, kind: 'candidacy' });
+  });
+  it('keeps the pending red-team hold for a ready-to-merge candidate', () => {
+    expect(probe({ readLabels: () => [{ name: 'ready-to-merge' }], readMergeGateVerdict: () => verdict(pending) }))
+      .toMatchObject({ allowed: false });
+    expect(classify([{ id: 'red-team', status: 'hold', reason: pendingReason }], { prLabels: ['ready-to-merge'] }))
+      .toMatchObject({ excused: false, kind: 'real' });
+  });
+  it('does not defer the pending red-team hold on the PR event leg', () => {
+    const results = [{ id: 'red-team', status: 'hold', reason: pendingReason }];
+    const input = { num: 4965, ok: false, results, blocking: results };
+    expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting: 'on' })).toEqual(input);
+  });
+  it.each(['clear', 'absent'])('allows review acceptance with a %s red-team check', state => {
+    const log = state === 'clear'
+      ? freshHead.replace('hold              red-team               no red-team check run on head',
+        'pass              red-team               red-team check run succeeded on head')
+      : freshHead.split('\n').filter(line => !line.includes('red-team')).join('\n');
+    expect(probe({ readMergeGateVerdict: () => verdict(log) })).toMatchObject({ allowed: true });
+  });
+  it('requires the exact pending reason, red-team id and hold status for candidacy', () => {
+    expect(isCandidacyHold({ id: 'red-team', status: 'fail-closed', reason: pendingReason })).toBe(false);
+    expect(isCandidacyHold({ id: 'codeql', status: 'hold', reason: pendingReason })).toBe(false);
+    expect(isCandidacyHold({ id: 'red-team', status: 'hold', reason: `${pendingReason}: unknown` })).toBe(false);
+  });
+  // Every reason readRedTeamCheckFact / the publication-hold reads can emit besides plain absence or pending (all `ok:false`, so
   // merge-gate-ci renders them `hold`): each is a real hold the review gate must not excuse.
   const realReasons = [
-    'red-team check run failed (failure)', 'red-team check run in progress or incomplete',
+    'red-team check run failed (failure)',
     'WE_APP_ID unset or invalid; configure the WE App repository variable',
     'red-team check runs unreadable: offline',
     'red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history',
