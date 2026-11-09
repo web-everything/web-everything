@@ -110,7 +110,7 @@ export function matchReadyCandidate({
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
-/** Prove a removed overlay graduated into this build, including squash-merged content. Unknown evidence refuses. */
+/** Prove a removed overlay graduated into this build, including auto-dropped in-main/pr-merged and squash-merged content. Unknown evidence refuses. */
 export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
   try {
     if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
@@ -122,7 +122,8 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
     // still has to agree independently; anything else refuses (live 2026-11-04 author-lookup-defer-m2).
     const retiredWithProof = last?.kind === 'auto-retired' && ['pr-merged', 'in-main'].includes(last.reason)
       && last.tip === sha && last.evidence?.contentInMain === true && last.evidence?.cleanMerges === true;
-    if ((last?.kind === 'auto-dropped' && last.reason === 'in-main') || retiredWithProof) {
+    // Both auto-drop reasons require a pre-ready event and the independent content/driver checks below.
+    if ((last?.kind === 'auto-dropped' && ['in-main', 'pr-merged'].includes(last.reason)) || retiredWithProof) {
       const droppedMs = timeMs(last.at);
       const readyMs = timeMs(readyAt);
       if (!Number.isFinite(droppedMs) || !Number.isFinite(readyMs) || droppedMs >= readyMs) return false;

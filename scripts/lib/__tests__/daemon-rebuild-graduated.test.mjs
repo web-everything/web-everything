@@ -189,9 +189,10 @@ describe('overlayGraduated auto-dropped in-main evidence', () => {
     ['event at unparsable', () => ({ event: { at: 'not-a-date' } })],
     ['event at equals readyAt', () => ({ event: { at: fixture().ready.at } })],
     ['event at after readyAt', () => ({ event: { at: new Date(1_000_001).toISOString() } })],
-    ...['pr-closed', 'ref-gone', 'pr-merged'].map((reason) => [
+    ...['pr-closed', 'ref-gone'].map((reason) => [
       `reason is ${reason} without a merge sha`, () => ({ event: { reason } }),
     ]),
+    ['reason is pr-merged without content proof', () => ({ event: { reason: 'pr-merged' }, git: () => undefined })],
     ['a later added event exists for the ref', () => ({ events: [
       ...autoDropped().events, { kind: 'added', ref: 'lane/daemon-heap-log-m2' },
     ] })],
@@ -221,6 +222,68 @@ describe('overlayGraduated auto-dropped in-main evidence', () => {
   it('fails closed when git throws during the content proof', () => {
     const evidence = autoDropped({ git: () => { throw new Error('unreadable git evidence'); } });
     expect(adoption.overlayGraduated(evidence)).toBe(false);
+  });
+});
+
+describe('overlayGraduated auto-dropped pr-merged evidence', () => {
+  const prMerged = (overrides = {}) => autoDropped({ event: { reason: 'pr-merged' }, ...overrides });
+
+  it('accepts pr-merged before readyAt with independent content proof', () => {
+    const evidence = prMerged();
+    expect(adoption.overlayGraduated(evidence)).toBe(true);
+    expect(evidence.git).toHaveBeenCalledWith([
+      'merge-tree', '--write-tree', '--no-messages', evidence.build, evidence.sha,
+    ]);
+  });
+
+  it('refuses pr-merged when overlay content is not in the candidate build', () => {
+    const evidence = prMerged();
+    const success = evidence.git;
+    evidence.git = vi.fn((args) => args[0] === 'merge-tree'
+      ? { status: 0, stdout: `${'d'.repeat(40)}\n` } : success(args));
+    expect(adoption.overlayGraduated(evidence)).toBe(false);
+  });
+
+  it.each(['pr-closed', 'ref-gone'])('refuses %s even with content in the build', (reason) => {
+    expect(adoption.overlayGraduated(prMerged({ event: { reason } }))).toBe(false);
+  });
+
+  it.each([
+    ['at readyAt', fixture().ready.at],
+    ['after readyAt', new Date(1_000_001).toISOString()],
+    ['missing time', undefined],
+    ['unreadable time', 'not-a-date'],
+  ])('refuses pr-merged dropped %s', (_name, at) => {
+    const evidence = prMerged({ event: { reason: 'pr-merged', at } });
+    expect(adoption.overlayGraduated(evidence)).toBe(false);
+    expect(evidence.git).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing events', () => ({ events: undefined })],
+    ['missing readyAt', () => ({ readyAt: undefined })],
+    ['another ref', () => ({ events: [{ ...prMerged().events[1], ref: 'lane/other' }] })],
+    ['a later event for the same ref', () => ({ events: [
+      ...prMerged().events, { kind: 'added', ref: prMerged().ref },
+    ] })],
+    ['unreadable git evidence', () => ({ git: () => { throw new Error('unreadable'); } })],
+  ])('refuses pr-merged with %s', (_name, overrides) => {
+    expect(adoption.overlayGraduated(prMerged(overrides()))).toBe(false);
+  });
+
+  it('stops the chase by adopting a superseded build with a duplicated live pr-merged overlay', () => {
+    const ref = 'lane/redteam-pending-on-accept-m1';
+    const evidence = prMerged({ ref, events: [{ ...prMerged().events[1], ref }] });
+    const applied = { ref, sha: evidence.sha };
+    const { args, leftForMain, match } = matchWith(evidence, { liveApplied: [applied, applied] });
+    expect(args.ready.adopt.finalSha).not.toBe(args.plan.finalSha);
+    expect(args.ready.adopt.mainSha).not.toBe(args.plan.mainSha);
+    expect(args.ready.tree).not.toBe(args.treeOf(args.plan.finalSha));
+    expect(match).toEqual({ adopt: args.ready.adopt, dropRefs: [], match: 'superseded' });
+    expect(leftForMain.mock.results.map(({ value }) => value)).toEqual([true, true]);
+    expect(leftForMain.mock.calls).toEqual([
+      [applied, args.ready.adopt.finalSha], [applied, args.ready.adopt.finalSha],
+    ]);
   });
 });
 
@@ -277,6 +340,7 @@ describe('overlayGraduated evidence', () => {
 describe.each([
   ['graduated-merged', graduation],
   ['auto-dropped in-main', autoDropped],
+  ['auto-dropped pr-merged', () => autoDropped({ event: { reason: 'pr-merged' } })],
 ])('overlayGraduated %s merge driver evidence', (_name, makeEvidence) => {
   const configArgs = ['config', '--get-regexp', '^merge\\..*\\.driver$'];
 
