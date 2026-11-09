@@ -138,7 +138,7 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     const pats = ['scripts/**', 'guard-*.mjs', 'scripts/x.mjs42', 'scripts/x.mjs-'];
     const anchors = oracleAnchorsOf(pats.map(oracleCleanPattern));
     const protectedByNew = f => { const c = canonicalPaths(f, anchors); return c === null || c.some(x => pats.some(p => globOk(x, p))); };
-    for (const f of ['repo/scripts/x.mjs:42', 'repo/scripts/../guard-x.mjs', 'scripts/x.mjs-.', 'scripts/x.mjs-', 'repo/scripts/x.mjs#L42']) {
+    for (const f of ['repo/scripts/x.mjs:42', 'repo/scripts/../guard-x.mjs', 'scripts/x.mjs-.', 'scripts/x.mjs-', 'repo/scripts/x.mjs#L42', '-/guard-x.mjs', '_/guard-x.mjs', '././guard-x.mjs']) {
       expect(oracleMatchesSome(f, pats), f).toBe(true);
       expect(protectedByNew(f), f).toBe(true);
     }
