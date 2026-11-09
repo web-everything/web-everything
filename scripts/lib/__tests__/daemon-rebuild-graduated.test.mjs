@@ -39,6 +39,7 @@ function graduation(overrides = {}) {
     [JSON.stringify(['rev-parse', '--verify', `${merged}^{commit}`]), { status: 0, stdout: `${mergeSha}\n` }],
     [JSON.stringify(['merge-base', '--is-ancestor', mergeSha, build]), { status: 0, stdout: '' }],
     [JSON.stringify(['rev-parse', `${build}^{tree}`]), { status: 0, stdout: `${buildTree}\n` }],
+    [JSON.stringify(['rev-parse', '--verify', '--end-of-options', `${build}^{tree}`]), { status: 0, stdout: `${buildTree}\n` }],
     ...liveApplied.map(({ sha }) => [
       JSON.stringify(['merge-tree', '--write-tree', '--no-messages', build, sha]),
       { status: 0, stdout: `${buildTree}\nadditional output\n` },
@@ -519,6 +520,21 @@ describe('redecideWithCandidate (R787/R796)', () => {
     });
   });
 
+  it.each([
+    ['one overlay content missing', (git) => (args) => (args[0] === 'merge-tree' && args[4] === 'b'.repeat(40)
+      ? { status: 0, stdout: `${'e'.repeat(40)}\n` } : git(args))],
+    ['a merge-tree conflict', (git) => (args) => (args[0] === 'merge-tree' ? { status: 1, stdout: '' } : git(args))],
+    ['a git error', (git) => (args) => { if (args[0] === 'merge-tree') throw new Error('git failed'); return git(args); }],
+  ])('refuses a candidate adopt when running-code containment fails: %s', async (_name, wrap) => {
+    const o = setup();
+    o.git = wrap(o.git);
+    expect(o.candidate.matchReadyCandidate).not.toHaveBeenCalled();
+    expect(await adoption.redecideWithCandidate(o)).toBe(o.m);
+    expect(o.candidate.matchReadyCandidate).toHaveBeenCalledTimes(1); // the candidate claimed adopt; containment overruled it
+    expect(o.alert).toHaveBeenCalledWith('redecide-containment-failed', expect.any(Object));
+    expect(o.alert).not.toHaveBeenCalledWith('ready-candidate-redecided', expect.anything());
+  });
+
   it('retains the original refusal and cleans scratch when the loader throws', async () => {
     const o = setup();
     let scratch;
@@ -595,11 +611,15 @@ describe('redecideWithCandidate (R787/R796)', () => {
         treeOf: () => 'T2', stillWanted: () => true, verifyBuilt: () => true,
         carries: () => false, leftForMain: (applied, build, graduate = () => false) => graduate({ ...applied, build }),
       });
-      const m = { adopt: null, reason: 'superseded-omits-live-overlay: lane/base' };
+      const m = { adopt: null, reason: 'superseded-omits-live-overlay: lane/base', omitted: args.liveApplied.map((a) => a.ref) };
       const alerts = [], calls = [];
       const git = (argv) => {
         calls.push(argv);
         const name = argv[1]?.slice('S1:'.length);
+        // running-code containment proof (git only): nothing to merge, tree unchanged
+        if (argv[0] === 'config') return { status: 1, stdout: '' };
+        if (argv[0] === 'rev-parse') return { status: 0, stdout: 'TREE' };
+        if (argv[0] === 'merge-tree') return { status: 0, stdout: 'TREE' };
         return argv[0] === 'show' && argv[1].startsWith('S1:') && blobs.has(name) && blobs.get(name) !== null
           ? { status: 0, stdout: blobs.get(name) } : { status: 1, stdout: '' };
       };
@@ -607,7 +627,7 @@ describe('redecideWithCandidate (R787/R796)', () => {
         alert: (...args) => alerts.push(args) });
       process.stdout.write(JSON.stringify({ result, alerts, sameOriginal: result === m,
         scratchRemoved: result.sourceUrl ? !existsSync(new URL(result.sourceUrl)) : null,
-        allFromReadySha: calls.length > 0 && calls.every(([cmd, spec]) => cmd === 'show' && spec.startsWith('S1:')) }));
+        allFromReadySha: calls.some(([cmd]) => cmd === 'show') && calls.filter(([cmd]) => cmd === 'show').every(([cmd, spec]) => cmd === 'show' && spec.startsWith('S1:')) }));
     `;
     try {
       const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', driver, JSON.stringify(input)], {

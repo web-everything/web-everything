@@ -143,6 +143,23 @@ async function loadReadyAdoption({ git, finalSha, dir }) {
   return importModule(pathToFileURL(join(dir, entry)).href);
 }
 
+/** Running-code proof (never candidate output): every omitted live overlay's applied tip adds nothing to the build tree. */
+function omittedContentContained({ git, finalSha, omitted, liveApplied }) {
+  try {
+    if (!Array.isArray(omitted) || omitted.length === 0 || !Array.isArray(liveApplied)) return false;
+    if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false; // custom drivers can hide changes
+    const buildTree = verifyRev(git, `${finalSha}^{tree}`);
+    if (!buildTree) return false;
+    const entries = liveApplied.filter((a) => omitted.includes(a?.ref));
+    if (entries.length === 0 || omitted.some((r) => !entries.some((a) => a.ref === r))) return false;
+    return entries.every((a) => {
+      if (!a.sha) return false;
+      const mt = git(['merge-tree', '--write-tree', '--no-messages', finalSha, a.sha]);
+      return mt?.status === 0 && String(mt.stdout ?? '').split('\n')[0].trim() === buildTree;
+    });
+  } catch { return false; }
+}
+
 /** R787/R796: only a verified omission may ask the smoke-passed candidate for one fresh decision. */
 export async function redecideWithCandidate({ m, ready, git, args, alert, loadCandidate = loadReadyAdoption }) {
   if (m?.adopt !== null || !m.reason?.startsWith('superseded-omits-live-overlay')) return m;
@@ -164,6 +181,11 @@ export async function redecideWithCandidate({ m, ready, git, args, alert, loadCa
     // Bound the candidate's answer: exactly the ready record's own adopt metadata, never a rewritten plan.
     const sameAdopt = JSON.stringify(result.adopt) === expected && JSON.stringify(ready.adopt) === expected;
     if (!sameAdopt || result.adopt?.finalSha !== finalSha || !Array.isArray(result.dropRefs) || result.dropRefs.length !== 0) return m;
+    // The candidate's word is never enough: the RUNNING code proves, by git alone, that each omitted overlay tip is already in the tree.
+    if (!omittedContentContained({ git, finalSha, omitted: m.omitted, liveApplied: args.liveApplied })) {
+      alert('redecide-containment-failed', { target: finalSha, omitted: m.omitted ?? [] });
+      return m;
+    }
     alert('ready-candidate-redecided', { match: 'redecided-by-candidate', target: finalSha });
     return { ...result, match: 'redecided-by-candidate' };
   } catch (error) {
