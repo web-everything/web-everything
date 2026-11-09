@@ -94,7 +94,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
       const mine = entries.filter(entry => entry.repo === repo);
       // Zero admission (unreadable capacity, fail closed) admits no probe either.
-      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0 && allowProbes).slice(0, MAX_PROBES).map(entry => entry.key));
+      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes).slice(0, MAX_PROBES).map(entry => entry.key));
       const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
@@ -185,18 +185,31 @@ export function redTeamQueueAdmitCount(capacity) {
   return Math.max(0, Math.floor(Math.min(...bounds)));
 }
 
-// Probes ride along outside the admission bound, so they are only allowed when every capacity figure is a whole
-// number: the runner then cannot start more reviews than the bound (fractional lanes, e.g. 1.5, would allow two).
-const wholeCapacity = capacity => !!capacity && [capacity.lanes, capacity.remainingStarts, capacity.budget?.left]
-  .every(value => value == null || Number.isInteger(value) || value === Infinity || value === -Infinity);
+// Capacity is normalized once at intake to max(0, floor(raw)) for every finite figure, so the admission bound and the
+// runner (whose own check is only "> 0") agree: 0.5 is 0, 1.7 is 1, counters never go negative. The shared budget
+// object is floored in place (copying it would disconnect the runner's reservations from the live balance).
+const whole = value => (typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : value);
+function normalizeCapacity(capacity) {
+  if (!capacity || typeof capacity !== 'object') return capacity;
+  if (capacity.budget && typeof capacity.budget === 'object' && whole(capacity.budget.left) !== capacity.budget.left) {
+    capacity.budget.left = whole(capacity.budget.left);
+  }
+  const lanes = whole(capacity.lanes), remainingStarts = whole(capacity.remainingStarts);
+  return lanes === capacity.lanes && remainingStarts === capacity.remainingStarts ? capacity
+    : { ...capacity, lanes, remainingStarts };
+}
+const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'number' && !Number.isNaN(capacity.lanes)
+  && (capacity.remainingStarts == null || (typeof capacity.remainingStarts === 'number' && !Number.isNaN(capacity.remainingStarts)))
+  && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
-export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, log = () => {}, ...rest }) {
+export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {}, ...rest }) {
   const candidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
     if (isRealHead(head)) candidates.push({ pr: Number(row.prNumber), head });
   }
+  const capacity = normalizeCapacity(rawCapacity);
   const transaction = transactions.get(queue)?.();
   try {
     queue.sync(repo, candidates);
@@ -208,7 +221,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
     const exhausted = bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: wholeCapacity(capacity) });
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity) });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);

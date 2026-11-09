@@ -495,7 +495,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       await f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
       await block(f, 1);
       expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
-      expect(numbers(f.queue.admit(repo, 0))).toEqual([]); // fail closed: no probe at zero admission
+      expect(numbers(f.queue.admit(repo, 0))).toEqual([1]); // a probe uses no slot, so it still runs at zero admission
     });
     it('bounds probes per tick and rotates a head that stays blocked to the tail after maxAttempts', async () => {
       const f = fixture();
@@ -539,14 +539,42 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
         enqueuedAt: 1, attempts: 0, blocked: 'unrecognized-reason' }))));
       expect(f.open().entries()).toEqual([]);
     });
-    it('admits no probe when capacity is fractional, so the runner cannot exceed the bound', async () => {
+    const planned = async (f, capacityValue) => {
+      let seen, cap;
+      runWithRedTeamQueue({ ...inputs([1, 2, 3], { capacity: capacityValue }), queue: f.queue,
+        run: options => { seen = options.plan.refusals.map(row => row.prNumber); cap = options.capacity; return { rows: [], dispatched: [], notStarted: [] }; } });
+      return { seen, cap };
+    };
+    it('normalizes capacity at intake: 0.5 gives 0 (runner sees 0), 1.7 gives 1', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      expect((await planned(f, { lanes: 0.5, remainingStarts: 0.5, budget: { left: 0.5 } })).cap).toEqual({ lanes: 0, remainingStarts: 0, budget: { left: 0 } });
+      const g = fixture();
+      await g.queue.sync(repo, candidates([1, 2, 3]));
+      const { seen, cap } = await planned(g, { lanes: 1.7, remainingStarts: 1.7, budget: { left: 1.7 } });
+      expect(seen).toEqual([1]);
+      expect(cap).toEqual({ lanes: 1, remainingStarts: 1, budget: { left: 1 } });
+    });
+    it('floors the shared budget in place and never lets a negative figure through', async () => {
+      const f = fixture();
+      const budget = { left: 0.5 };
+      await planned(f, { lanes: 1, remainingStarts: 1, budget });
+      expect(budget.left).toBe(0);
+      expect((await planned(f, { lanes: -0.5, remainingStarts: 1 })).cap.lanes).toBe(0);
+    });
+    it('at capacity 0 blocked heads are still probed and rotated, counters stay >= 0', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2]));
       await block(f, 1);
-      let seen;
-      runWithRedTeamQueue({ ...inputs([1, 2], { capacity: { lanes: 1.5, remainingStarts: 1.5, budget: { left: 1.5 } } }),
-        queue: f.queue, run: options => { seen = options.plan.refusals.map(row => row.prNumber); return { rows: [], dispatched: [], notStarted: [] }; } });
-      expect(seen).toEqual([2]);
+      for (let tick = 0; tick < 3; tick++) {
+        let cap;
+        runWithRedTeamQueue({ ...inputs([1, 2], { capacity: { lanes: 0.5, remainingStarts: 0.5 } }), queue: f.queue,
+          run: options => { cap = options.capacity; const r = refused(1, 'review-unfinished');
+            return { rows: [...r.rows, { prNumber: 2, action: 'skip', why: 'no review capacity left' }], dispatched: [],
+              notStarted: [...r.notStarted, { prNumber: 2, reason: 'no review capacity left' }] }; } });
+        expect(cap.lanes).toBeGreaterThanOrEqual(0);
+      }
+      expect(numbers(f.queue.entries())).toEqual([2, 1]); // rotated to the tail after maxAttempts
     });
     it('survives a restart', async () => {
       const f = fixture();
