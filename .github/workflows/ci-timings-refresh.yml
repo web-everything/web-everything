@@ -83,6 +83,8 @@ jobs:
         run: |
           # Recheck before publishing; never overwrite an existing operator/automation branch.
           refs=$(git ls-remote --heads origin refs/heads/ci/refresh-test-timings)
+          # Stamp the automation as author only for a branch THIS run created; a pre-existing branch has unknown provenance.
+          created=0
           if [ -z "$refs" ]; then
             if git diff --quiet -- scripts/ci/test-timings.json; then
               echo "Timings unchanged."
@@ -97,10 +99,15 @@ jobs:
             gh auth setup-git --hostname github.com
             # Create-only: the empty lease refuses if the branch appeared after the recheck.
             git push --force-with-lease=refs/heads/ci/refresh-test-timings: origin HEAD:refs/heads/ci/refresh-test-timings
+            created=1
           fi
           # Resume publication after an earlier push whose PR creation failed. A failed
           # lookup must stop this step rather than treating an unknown PR state as absent.
           open_prs=$(gh pr list --head ci/refresh-test-timings --state open --json number --jq 'length')
           if [ "$open_prs" = 0 ]; then
-            gh pr create --base main --head ci/refresh-test-timings --label review:pending --title 'ci: refresh measured unit test timings' --body $'Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.\n\n<!-- authored-by-actor: github-actions:ci-refresh-test-timings -->'
+            body='Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.'
+            if [ "$created" = 1 ]; then
+              body="$body"$'\n\n<!-- authored-by-actor: github-actions:ci-refresh-test-timings -->'
+            fi
+            gh pr create --base main --head ci/refresh-test-timings --label review:pending --title 'ci: refresh measured unit test timings' --body "$body"
           fi
