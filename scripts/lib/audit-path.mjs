@@ -11,7 +11,9 @@
  * is refused rather than decoded, so no decoding can ever reduce what is protected.
  */
 export const MAX_AUDIT_PATH = 512;
-const GRAMMAR = /^(?:(?:\+\+\+|---) )?(?:(["'`])([A-Za-z0-9._/-]+)\1|([A-Za-z0-9._/-]+))(?::\d+(?:-\d+|:\d+)?|#L\d+(?:-L\d+)?)?$/;
+/** Most candidates one report may yield; more cannot be matched at bounded cost and fail closed (protected). */
+export const MAX_AUDIT_CANDIDATES = 32;
+const GRAMMAR = /^(?:(?:\+\+\+|---) )?(?:(["'`])([A-Za-z0-9._/-]+)\1|([A-Za-z0-9._/-]+))(:\d+(?:-\d+|:\d+)?|#L\d+(?:-L\d+)?)?$/;
 
 /** Collapses `.`, empty and `..` segments; null for an empty path or one that climbs above the root. */
 function normalise(path) {
@@ -68,5 +70,10 @@ export function canonicalPaths(file, anchors = null) {
       }
     }
   }
-  return [...out];
+  // The old matcher also matched the report as written and the digits of its line suffix; kept, so nothing it
+  // protected is lost. Both are extra candidates only: they can protect more, never less.
+  const raw = normalise(text);
+  if (raw !== null) out.add(raw);
+  for (const d of (m[4] ?? '').match(/\d+/g) ?? []) out.add(d);
+  return out.size > MAX_AUDIT_CANDIDATES ? null : [...out];
 }

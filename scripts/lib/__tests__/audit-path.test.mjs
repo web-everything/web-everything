@@ -88,10 +88,10 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
   });
   it('reads the accepted shapes', () => {
     expect(canonicalPaths('scripts/x.mjs')).toEqual(['scripts/x.mjs']);
-    expect(canonicalPaths('  "./scripts//x.mjs":4-9 ')).toEqual(['scripts/x.mjs']);
-    expect(canonicalPaths('+++ b/scripts/x.mjs')).toEqual(['b/scripts/x.mjs', 'scripts/x.mjs']);
-    expect(canonicalPaths('a/x.mjs#L3-L9')).toEqual(['a/x.mjs', 'x.mjs']);
-    expect(canonicalPaths('scripts/x.mjs:1:2')).toEqual(['scripts/x.mjs']);
+    expect(canonicalPaths('  "./scripts//x.mjs":4-9 ')).toEqual(['scripts/x.mjs', '"./scripts/x.mjs":4-9', '4', '9']);
+    expect(canonicalPaths('+++ b/scripts/x.mjs')).toEqual(['b/scripts/x.mjs', 'scripts/x.mjs', '+++ b/scripts/x.mjs']);
+    expect(canonicalPaths('a/x.mjs#L3-L9')).toEqual(['a/x.mjs', 'x.mjs', 'a/x.mjs#L3-L9', '3', '9']);
+    expect(canonicalPaths('scripts/x.mjs:1:2')).toEqual(['scripts/x.mjs', 'scripts/x.mjs:1:2', '1', '2']);
     expect(canonicalPaths('scripts/x.mjs.')).toEqual(['scripts/x.mjs.', 'scripts/x.mjs']);
     expect(canonicalPaths('-docs/a.md')).toEqual(['-docs/a.md', 'docs/a.md']);
     expect(canonicalPaths('./x.mjs')).toEqual(['x.mjs']);
@@ -113,18 +113,16 @@ const fuzz = r => {
 };
 
 describe('P2 monotonic against the old matcher (test-only oracle)', () => {
-  // The oracle also matched on forms that are not names: every trailing sub-path of a longer path ("folder above the
-  // repo"), the digits of a line suffix, and the raw report with its wrapper text. The strict grammar drops exactly
-  // those (the sub-paths come back through the optional anchors argument); any other candidate the oracle matched on must still make the new matcher protect the path.
+  // No exemptions: every candidate the oracle matched on (the nested sub-paths via the anchors argument, the raw
+  // report, the digits of a line suffix) is still a candidate, so anything it protected stays protected.
   const clean = PATTERNS.map(oracleCleanPattern);
-  const allowedDrop = (c, news, file) => /^\d+$/.test(c) || c === file.toLowerCase();
   const check = file => {
     if (!oracleMatchesSome(file, PATTERNS) || protects(file)) return;
     const news = lower(canonicalPaths(file, ANCHORS));
     const old = oraclePathCandidates(file, oracleAnchorsOf(clean));
     expect(old, 'oracle refused but grammar accepted ' + JSON.stringify(file)).not.toBeNull();
     for (const c of lower(old)) {
-      if (clean.some(p => oracleMatchesPath(c, p)) && !allowedDrop(c, news, file)) throw new Error('lost match on ' + JSON.stringify(c) + ' for ' + JSON.stringify(file));
+      if (clean.some(p => oracleMatchesPath(c, p))&& !news.includes(c)) throw new Error('lost match on ' + JSON.stringify(c) + ' for ' + JSON.stringify(file));
     }
   };
   it('every corpus-style shape stays protected', () => {
@@ -139,6 +137,15 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     expect(oracleMatchesSome('repo/scripts/../guard-x.mjs', pats)).toBe(true);
     expect(canonicalPaths('repo/scripts/../guard-x.mjs', anchors)).toContain('guard-x.mjs');
     expect(canonicalPaths('repo/scripts/../guard-x.mjs', anchors).some(c => globOk(c, 'guard-*.mjs'))).toBe(true);
+  });
+  it('audit findings: candidate bound fails closed; line digits and the raw report stay candidates', () => {
+    const pats = ['scripts/secret.mjs'];
+    const anchors = oracleAnchorsOf(pats.map(oracleCleanPattern));
+    const many = 'scripts/'.repeat(34) + 'x.mjs';
+    expect(oracleMatchesSome(many, pats)).toBe(true);
+    expect(canonicalPaths(many, anchors)).toBeNull();
+    expect(canonicalPaths('custom/x.mjs:42')).toContain('42');
+    expect(canonicalPaths('"custom/x.mjs":42')).toContain('"custom/x.mjs":42');
   });
   it('5000 seeded fuzz strings: nothing the oracle protected is lost', () => {
     const r = rng(0x6381);
