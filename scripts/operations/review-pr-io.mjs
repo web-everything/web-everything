@@ -45,7 +45,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -165,7 +165,9 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   try { current = readFileSync(path, 'utf8'); } catch { current = null; }
   if (current !== entry.payload.body) {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, entry.payload.body, 'utf8');
+    // Never write THROUGH a link: a symlinked staged file is replaced by a regular file, not followed.
+    try { if (lstatSync(path).isSymbolicLink()) unlinkSync(path); } catch { /* absent */ }
+    writeFileSync(path, entry.payload.body, { encoding: 'utf8', flag: 'wx' });
   }
   return path;
 }

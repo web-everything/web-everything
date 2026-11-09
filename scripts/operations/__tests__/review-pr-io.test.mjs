@@ -17,7 +17,7 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, symlinkSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -486,6 +486,17 @@ describe('the label sink', () => {
     const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
       runNode: () => '{"ok":true,"pr":7,"to":"accepted"}' });
     await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(readFileSync(path, 'utf8')).toBe('# frozen verdict');
+  });
+
+  it('a symlinked staged file is replaced, never written through', async () => {
+    const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+    const outside = join(root, 'outside.txt'); writeFileSync(outside, 'keep me');
+    mkdirSync(dirname(path), { recursive: true }); symlinkSync(outside, path);
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: () => '{"ok":true,"pr":7,"to":"accepted"}' });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(readFileSync(outside, 'utf8')).toBe('keep me');
     expect(readFileSync(path, 'utf8')).toBe('# frozen verdict');
   });
 
