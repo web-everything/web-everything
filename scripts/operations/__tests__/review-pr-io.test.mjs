@@ -378,6 +378,8 @@ describe('pending red-team check before acceptance', () => {
 
     it(`${type}: binding mode turns a throwing writer into notApplied before any acceptance write`, async () => {
       const writes = [];
+      const staged = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+      mkdirSync(dirname(staged), { recursive: true }); writeFileSync(staged, 'Accept');
       const sinks = createReviewPrSinks({ root, env: {}, out: () => {}, postRedTeamCheckRun: () => { throw new Error('socket hang up'); },
         publishGate: () => ({ allowed: true, headSha: head }), readPublishHead: () => head,
         postComment: () => writes.push('comment'), runNode: () => { writes.push('script'); return '{"ok":true}'; },
@@ -513,6 +515,15 @@ describe('the label sink', () => {
     await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
     expect(existsSync(join(outsideDir, 'o-n-7-verdict.md'))).toBe(false);
     expect(seen).toEqual([]);
+  });
+
+  it('a run record without the frozen write-up refuses before any write, pending check included', async () => {
+    const seen = []; const post = vi.fn(async () => ({ ok: true }));
+    const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, runStore: { read: () => ({ id: 'run-1', effects: [] }) }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL]({ ...payload, redTeamOwed: true }, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(post).not.toHaveBeenCalled();
   });
 
   it('an unreadable run record refuses before any write instead of shelling', async () => {

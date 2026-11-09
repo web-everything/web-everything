@@ -165,7 +165,11 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
     throw notApplied(`the run record for ${runId} could not be read to verify the staged write-up: ${String((e && e.message) || e)}`, {});
   }
   const entry = (record?.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string');
-  if (!entry) return path;
+  // A record that exists but holds no matching write-up gives no evidence the staged bytes are the verdict.
+  if (!entry) {
+    if (record) throw notApplied(`the run record for ${runId} holds no frozen write-up for ${bodyFile}; refusing to publish an unverified staged file`, {});
+    return path;
+  }
   // The frozen payload is the durable truth: a missing, truncated or altered staged file is rewritten from it.
   let current = null;
   try { current = readFileSync(path, 'utf8'); } catch { current = null; }
@@ -1673,10 +1677,9 @@ export function createReviewPrSinks({
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
       await assertPublishable(payload);
-      if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
-      // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
-      // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
+      // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
+      if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
         String(payload.pr),
@@ -1865,12 +1868,12 @@ export function createReviewPrSinks({
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
       await assertPublishable(payload);
-      if (payload.redTeamOwed) await postPendingRedTeam(payload);
       const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
       // Fail closed: no staged body and no recoverable write-up means no note and no marker.
       if (!staged.trim()) throw notApplied(`stack-hold has no staged or recoverable write-up at ${bodyPath}`, {});
+      if (payload.redTeamOwed) await postPendingRedTeam(payload);
       // The staged write-up quotes juror text, which an attacker's diff can steer. Defuse every HTML-comment opener in it
       // so it cannot carry a forged marker (or hide the real one); the note opens and the marker closes the comment, and
       // `parseStackMarkers` reads only those two ends.
