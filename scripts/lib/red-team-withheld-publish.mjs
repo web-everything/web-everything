@@ -5,7 +5,7 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { renderRedTeamComment, redTeamCommentPosted as markerPosted, priorRedTeamRow } from '../operations/review-extra-seats.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
+import { redTeamMarker, parseRedTeamComment, redTeamForHead } from './red-team-gate.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
@@ -53,6 +53,15 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       throw Error('red-team publication status identity mismatch');
     }
     if (!needsPublish(status)) return { status: 'skipped' };
+    const holdLegacy = () => {
+      if (!status.needsYouPublished) {
+        publishNeedsYou({ kind: 'red-team-legacy-ran-unreadable', pr, repo, head,
+          reason: 'Legacy red-team evidence is unreadable or conflicts with the posted comment; operator review required.' });
+        status = { ...status, needsYouPublished: true };
+        writeStatus(status);
+      }
+      return { status: 'held' };
+    };
     const legacy = status.result === 'ran';
     let result = status.result;
     if (legacy) {
@@ -68,14 +77,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
         result = { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
           callId: row.callId, foldedVerdict: row.foldedVerdict, confirmedMissCount: row.confirmedMissCount,
           findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true })) };
-      } catch {
-        if (!status.needsYouPublished) {
-          publishNeedsYou({ kind: 'red-team-legacy-ran-unreadable', pr, repo, head,
-            reason: 'Legacy red-team evidence is unreadable; operator review required.' });
-          writeStatus({ ...status, needsYouPublished: true });
-        }
-        return { status: 'held' };
-      }
+      } catch { return holdLegacy(); }
     }
     const escalate = () => {
       if (!status.needsYouPublished) {
@@ -99,7 +101,12 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       const comments = listComments ? listComments() : provider.readComments(repo, pr);
       if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
       if (redTeamCommentPosted(comments, pr, head)) {
-        if (legacy) writeStatus({ ...status, result: { ...result, comment: 'posted' } });
+        if (legacy) {
+          // A marker alone is not the stored verdict: the existing comment must show every confirmed break.
+          const live = redTeamForHead(comments, pr, head);
+          if (!live || live.findings.filter(f => f.confirmed).length !== result.confirmedMissCount) return holdLegacy();
+          writeStatus({ ...status, result: { ...result, comment: 'posted' } });
+        }
         return { status: 'skipped' };
       }
     } catch { return failedAttempt(); }

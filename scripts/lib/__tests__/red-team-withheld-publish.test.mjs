@@ -210,3 +210,15 @@ describe('legacy recovery never publishes an unparseable break', () => {
     expect(io.postComment).not.toHaveBeenCalled();
   });
 });
+
+describe('legacy recovery against an existing comment', () => {
+  it('holds and alerts when the posted comment shows no break but the stored verdict has one', () => {
+    const row = { rev: head, foldedVerdict: 'changes', confirmedMissCount: 1, provider: 'p', model: 'm', callId: 'c',
+      findings: [{ summary: 's', file: 'a.mjs', line: 1, category: 'correctness', confirmedByRecheck: true }] };
+    const clean = { body: `${redTeamMarker(42, head)}\n### Post-accept red team\n\nno break found`, user: { login: 'github-actions[bot]' } };
+    const io = harness({ repo: 'o/n', pr: 42, head, status: 'finished', result: 'ran' }, { readSeatRow: () => row, listComments: () => [clean], redTeamCommentPosted: () => true });
+    expect(publishStoredRedTeamResult(io).status).toBe('held');
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+  });
+});
