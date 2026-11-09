@@ -223,7 +223,7 @@ export function readHungInfo(agent, nowMs, thresholdMs) {
   if (!tail || tail.hadUnparseableLine) return { hung: false, reason: 'no-signal', ageMs: null };
 
   const pendingToolUse = detectBlockedOnChild(tail.entries).pending === true;
-  const verdict = classifyHungSession({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse });
+  const verdict = classifyHungSession({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse, rowIdle: agent?.status === 'idle' });
   return { ...verdict, transcriptPath: tail.file };
 }
 
@@ -425,16 +425,21 @@ export const DEFAULT_IDLE_FINISHED_THRESHOLD_MS = 10 * 60 * 1000;
  * period: this axis exists specifically for "the turn ended and nothing followed", so a session still mid a
  * tool call never counts as finished by this axis, at any age (the hung axis, with its own longer threshold and
  * grace multiplier, is still what eventually catches a session genuinely stuck mid a long call).
- * @param {{lastActivityMs:number, nowMs:number, thresholdMs:number, pendingToolUse?:boolean}} o
+ * @param {{lastActivityMs:number, nowMs:number, thresholdMs:number, pendingToolUse?:boolean, rowIdle?:boolean}} o
  * @returns {{finished:boolean, reason:string, ageMs:number|null}}
  */
-export function classifyIdleFinished({ lastActivityMs, nowMs, thresholdMs, pendingToolUse = false } = {}) {
+export function classifyIdleFinished({ lastActivityMs, nowMs, thresholdMs, pendingToolUse = false, rowIdle = false } = {}) {
   if (!Number.isFinite(lastActivityMs) || !Number.isFinite(nowMs) || !Number.isFinite(thresholdMs) || thresholdMs <= 0) {
     return { finished: false, reason: 'no-signal', ageMs: null };
   }
   const ageMs = nowMs - lastActivityMs;
-  if (pendingToolUse) return { finished: false, reason: 'pending-tool-call', ageMs };
-  if (ageMs < thresholdMs) return { finished: false, reason: 'fresh', ageMs };
+  if (ageMs < thresholdMs) return { finished: false, reason: pendingToolUse ? 'pending-tool-call' : 'fresh', ageMs };
+  // A dangling (never-settling) tool call is overridden ONLY when the listing row itself says status:'idle' (the
+  // harness reports nothing running; a genuinely mid-call session is busy, a permission wait is 'waiting') AND the
+  // transcript has been silent past the window.
+  if (pendingToolUse) return rowIdle === true
+    ? { finished: true, reason: 'idle-row-dangling-tool-call', ageMs }
+    : { finished: false, reason: 'pending-tool-call', ageMs };
   return { finished: true, reason: 'turn-ended-idle', ageMs };
 }
 
@@ -467,7 +472,7 @@ export function readIdleFinishedInfo(agent, nowMs, thresholdMs) {
   if (!tail || tail.hadUnparseableLine) return { finished: false, reason: 'no-signal', ageMs: null };
 
   const pendingToolUse = detectBlockedOnChild(tail.entries).pending === true;
-  const verdict = classifyIdleFinished({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse });
+  const verdict = classifyIdleFinished({ lastActivityMs: tail.lastActivityMs, nowMs, thresholdMs, pendingToolUse, rowIdle: agent?.status === 'idle' });
   return { ...verdict, transcriptPath: tail.file };
 }
 
