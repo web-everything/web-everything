@@ -83,7 +83,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const entry = entries.find(entry => entry.key === admitted.key && entry.head === admitted.head);
         if (!entry) continue;
         const matches = row => Number(row.prNumber) === entry.pr;
-        const row = rows.find(matches), failure = notStarted.find(matches);
+        const row = rows.find(matches);
+        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip' } : undefined);
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {

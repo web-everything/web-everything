@@ -173,6 +173,22 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
+  it('planner skip rows (not in notStarted) count as attempts so a non-dispatchable head rotates', async () => {
+    const f = fixture({ maxAttempts: 2 });
+    const reason = 'stale re-dispatch already spent';
+    const run = options => {
+      const pr = options.plan.refusals[0].prNumber;
+      return pr === 1
+        ? { rows: [{ prNumber: 1, action: 'skip', why: reason }], dispatched: [], notStarted: [] }
+        : started(options);
+    };
+    for (let tick = 0; tick < 2; tick++) {
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
+    }
+    expect(numbers(f.queue.entries())).toEqual([2, 1]);
+    expect(f.logs.some(line => line.includes('requeue') && line.includes(reason))).toBe(true);
+  });
+
   it('stuck head skip-and-requeue after K attempts logs reason and lets the rest dispatch', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'dispatch refused before start: lane busy';
