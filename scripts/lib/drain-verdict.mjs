@@ -81,7 +81,8 @@ export function auditWorkflow(yamlText) {
       if (typeof value.uses !== 'string' || !/^[\w./-]+@[a-f0-9]{40}$/i.test(value.uses)) problems.push('action must be SHA pinned');
       if (/app-token/i.test(value.uses)) problems.push('App token action forbidden');
       if (/^actions\/checkout@/.test(value.uses) &&
-          (value.with?.ref !== 'main' || value.with?.['persist-credentials'] !== false)) problems.push('unsafe checkout');
+          (!exact(value.with, ['ref', 'persist-credentials']) || value.with.ref !== 'main' ||
+           value.with['persist-credentials'] !== false)) problems.push('unsafe checkout');
     }
     Object.values(value).forEach(walk);
   };
