@@ -9,7 +9,7 @@
  *   `~/workspace/.operations/pr-stall-sweep/YYYY-MM.jsonl` (`WE_PR_STALL_SWEEP_DIR` only for a dir named `pr-stall-sweep`):
  *   `pass`, `would-do`, `would-skip`, `operator`, each logged once per PR head and state.
  */
-import { appendFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -17,8 +17,9 @@ import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
 import { cascadePolicy, readPlatformPreferences, logCascadeSources } from '../lib/policy-cascade.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
-import { readRedTeamStatus as defaultReadRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { readRedTeamStatus as defaultReadRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace, pidStartTime } from '../lib/pid-alive.mjs';
+import { foreignStaleOwnerDead } from '../lib/red-team-foreign-host-stale.mjs';
 import { readConfirmedBreaks } from '../lib/red-team-gate.mjs';
 import { detectRoundCap, judgeRound } from '../lib/round-judge.mjs';
 import { assessPrSweep } from '../operations/pr-sweep-core.mjs';
@@ -214,7 +215,9 @@ const ghFiles = (gh) => (repo, n) => {
  * `gh` is the ONLY GitHub seam (read verbs only: `pr list`, `pr view`, `api` GET); tests pin that.
  */
 export async function runStallSweep({ now = Date.now(), env = process.env, state = {}, settings, gh = (f, a, o) => execFileSync(f, a, o),
-  read, readFiles, readRedTeamStatus = defaultReadRedTeamStatus, probe, judge = judgeRound, dir, log = console.error, force = false } = {}) {
+  read, readFiles, readRedTeamStatus = defaultReadRedTeamStatus,
+  readStatusAt = ({ repo, pr, head, env }) => statSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`)).mtimeMs,
+  probe, judge = judgeRound, dir, log = console.error, force = false } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
   const cfg = s.value;
   // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
@@ -295,6 +298,10 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
               // A missing birth time cannot prove PID reuse; retain the live-owner hold.
               ownerAlive = !start || !status.pidStart || start === status.pidStart;
             }
+          } else if (Number.isSafeInteger(status.pid) && status.pid > 0) {
+            const statusAt = await readStatusAt({ repo: row.repo, pr: row.number, head, env });
+            if (foreignStaleOwnerDead(status, { host: local.host, namespace: local.namespace, statusAt, now, env,
+              isAlive: local.isAlive, readPidStart: local.readPidStart })) ownerAlive = false;
           }
         }
       } catch (e) { ownerAlive = null; base.errors.push(`red-team owner ${row.repo}#${row.number}: ${msg(e)}`); }
