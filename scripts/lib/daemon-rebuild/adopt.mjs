@@ -174,18 +174,22 @@ export function reportDiscardedCandidate({ ready, match, alert, needsYou }) {
  *  chain (committer is the rebuild identity, subject `daemon-rebuild: merge overlay …`, 2-3 parents), then take the
  *  merge-base of the first other commit with `mainTip`. A head with no rebuild merges uses the plain merge-base.
  *  Unreadable history returns '' (the caller refuses: fail closed). */
-function trueMainBase(git, head, mainTip) {
+function trueMainBase(git, head, mainTip, isAncestor) {
   const log = git(['log', '--first-parent', '--format=%H%x09%P%x09%ce%x09%s', head]);
   if (log.status !== 0) return '';
   let base = head;
+  const stripped = [];
   for (const l of String(log.stdout ?? '').split('\n').filter(Boolean)) {
     const [sha, parents, committer, ...rest] = l.split('\t');
     const ps = String(parents ?? '').split(' ').filter(Boolean);
     const rebuildMerge = /^daemon-rebuild: merge overlay /.test(rest.join('\t'))
       && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length);
     if (!rebuildMerge) { base = sha; break; }
+    stripped.push(ps[1]);
     base = ps[0];
   }
+  // An overlay not (yet) in main keeps the strict floor: use the plain merge-base of the head.
+  if (stripped.some((o) => !isAncestor(o, mainTip))) base = head;
   if (!/^[0-9a-f]{40}$/.test(base ?? '')) return '';
   const mb = git(['merge-base', base, mainTip]);
   return mb.status === 0 ? String(mb.stdout ?? '').trim() : '';
@@ -210,11 +214,11 @@ export function readyBuildVerified({
   // The head's TRUE main base: an overlay the head carries may have merged into main since, which would make a plain
   // merge-base(head, mainTip) the (newer) overlay commit and read a good older plain-main fallback as a rollback.
   // So walk the head's first-parent chain across rebuild-committed overlay merges to the main commit they sit on.
-  // The floor is unchanged in meaning: the main commit the head was BUILT on, never an older one. Candidates below
-  // it are still refused. A candidate between that base and the overlay's later main merge omits the overlay's
-  // content only for the span until the next tick (the overlay is in main, so the live plan carries it); the build
-  // is a smoked plain-main record whose `applied` chain is verified below, and it never reaches below the head's base.
-  const headBase = prevHead ? trueMainBase(git, prevHead, mainTip) : '';
+  // The floor is lowered below the plain merge-base ONLY when every overlay stripped from the head is itself
+  // already an ancestor of `mainTip` (its content is in main, so the next tick's live plan carries it): then the
+  // floor is the main commit the head was BUILT on. Any stripped overlay not in main keeps the strict plain
+  // merge-base. Candidates below the head's base are refused either way.
+  const headBase = prevHead ? trueMainBase(git, prevHead, mainTip, isAncestor) : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
   const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
   let cur = adopt.finalSha;
