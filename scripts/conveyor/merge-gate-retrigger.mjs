@@ -10,6 +10,7 @@ export const RETRIGGER_LABEL = 'review:merge-gate-retrigger';
 const text = value => typeof value === 'string' && value.trim().length > 0;
 export { decideRequiredContextRetrigger } from './recovery-preflight.mjs';
 import { recoveryPreflight } from './recovery-preflight.mjs';
+import { pushRefusal } from './fix-procedure.mjs';
 export const mergeGateRetriggerStatePath = () => join(homedir(), '.claude', 'conveyor', 'merge-gate-retrigger-state.json');
 
 /** Append-only, locked claims. Errors and failed attempts never release a spent key. */
@@ -105,7 +106,7 @@ export function createRetriggerIo({ repo, pr, exec = execFileSyncThrottled }) {
 
 /** Synchronous so the synchronous sweep observes completion; also usable with await. */
 export function retriggerRequiredContext({ repo, pr, head, context, defaultBranch = 'main', io, ledger = createMergeGateRetriggerStore(),
-  headRefName, runs, rollup, token, env = process.env, ...evidence }) {
+  headRefName, runs, rollup, token, env = process.env, checkClaim = pushRefusal, ...evidence }) {
   const defer = error => ({ ok: false, deferred: true, action: 'label-retrigger', error });
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !Number.isSafeInteger(pr) || pr <= 0
     || !/^[a-f0-9]{40}$/i.test(head ?? '') || context !== 'merge-gate') return defer('invalid retrigger key');
@@ -121,7 +122,8 @@ export function retriggerRequiredContext({ repo, pr, head, context, defaultBranc
     try { live = io.readPr(); }
     catch { return defer('live PR unreadable; operator inspection required'); }
     const decision = recoveryPreflight({ ...evidence, pr: live, head, headRefName, context,
-      runs, rollup, token: token ?? env.GH_TOKEN ?? env.GITHUB_TOKEN, env, claimed: evidence.claimed ?? false,
+      runs, rollup, token: token ?? env.GH_TOKEN ?? env.GITHUB_TOKEN, env,
+      claimed: evidence.claimed === true || checkClaim({ repo, branch: headRefName }) !== null,
       defaultBranch, kind: 'label', labels });
     if (!decision.allow) return defer(decision.reason);
     if (io.addLabel(RETRIGGER_LABEL)?.ok !== true) throw new Error('label addition unconfirmed');

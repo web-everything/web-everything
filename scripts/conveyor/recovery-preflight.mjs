@@ -25,16 +25,18 @@ export function decideRequiredContextRetrigger(input) {
 
 
 /** Pure admission shared by label events and synchronize pushes. Unknown evidence holds. */
-export function recoveryPreflight({ pr, head, headRefName, context, runs, rollup,
+export function recoveryPreflight({ pr, head, headRefName, context, missingContexts = [], runs, rollup,
   token, env = {}, claimed, defaultBranch = 'main', kind = 'push',
   candidate = 1, attemptsForSha = 0, attemptsForPr = 0,
   maxRetriesPerSha = 1, maxRetriesPerPr = 1, labels = [], labelAttempted = false,
 } = {}) {
   const refuse = reason => ({ allow: false, kind, reason });
   if (!['label', 'push'].includes(kind)) return refuse('unknown recovery kind; operator inspection required');
-  if (claimed !== false) return refuse('head already claimed or claim unreadable; operator inspection required');
+  if (kind === 'push' && (context === 'merge-gate' || missingContexts?.includes('merge-gate')))
+    return refuse('merge-gate recovery requires the label path; operator inspection required');
   if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > 8)
     return refuse('recovery evidence candidate bound exceeded; operator inspection required');
+  if (claimed !== false) return refuse('head already claimed or claim unreadable; operator inspection required');
   if (![attemptsForSha, attemptsForPr, maxRetriesPerSha, maxRetriesPerPr].every(n => Number.isSafeInteger(n) && n >= 0)
     || attemptsForSha >= maxRetriesPerSha || attemptsForPr >= maxRetriesPerPr)
     return refuse('missing-run retry cap exhausted; human/ci-heal inspection required');

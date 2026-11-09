@@ -8,7 +8,7 @@ import { sweepMissingRunRecovery } from '../ci-red-recovery-watch.mjs';
 
 const repo = 'web-everything/web-everything';
 const head = 'a'.repeat(40);
-const admission = { headRefName: 'lane/0', token: 'ghp_fixture', runs: [], rollup: [] };
+const admission = { checkClaim: () => null, headRefName: 'lane/0', token: 'ghp_fixture', runs: [], rollup: [] };
 const livePr = { headRefName: 'lane/0', state: 'OPEN', baseRefName: 'main', headRefOid: head, isCrossRepository: false, mergeable: 'MERGEABLE' };
 const restPr = { state: 'open', head: { sha: head, ref: 'lane/0', repo: { full_name: repo } },
   base: { ref: 'main', repo: { full_name: repo } }, mergeable: true };
@@ -116,7 +116,7 @@ describe('merge-gate retrigger safety', () => {
     const labelRetrigger = vi.fn();
     const claim = vi.fn();
     const trigger = vi.fn(() => ({ ok: false, deferred: true, error: 'existing recovery deferred' }));
-    const result = sweepMissingRunRecovery({ recoveryToken: 'ghp_fixture',
+    const result = sweepMissingRunRecovery({ checkClaim: () => null, recoveryToken: 'ghp_fixture',
       readRecoveryPr: ({ pr }) => ({ ...livePr, headRefName: `lane/${pr}` }), repo, apply: true, mainRuns: [],
       now: Date.parse('2026-10-13T12:00:00Z'),
       readOpenPrs: () => [{ number: 1, headRefName: 'lane/1', headRefOid: head, baseRefName: 'main',
@@ -179,7 +179,7 @@ describe('merge-gate retrigger safety', () => {
     const prs = Array.from({ length: count }, (_, i) => ({ number: i + 1, headRefName: `lane/${i}`,
       headRefOid: head, baseRefName: 'main', mergeable: 'MERGEABLE', labels: [],
       statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] }));
-    const result = sweepMissingRunRecovery({ recoveryToken: 'ghp_fixture',
+    const result = sweepMissingRunRecovery({ checkClaim: () => null, recoveryToken: 'ghp_fixture',
       readRecoveryPr: ({ pr }) => ({ ...livePr, headRefName: `lane/${pr - 1}` }), repo, apply: true, mainRuns: [],
       now: Date.parse('2026-10-13T12:00:00Z'), readOpenPrs: () => prs,
       readRequiredContexts: () => ['test'], readAttributedRequiredChecks: () => ['test', 'merge-gate'],
@@ -323,9 +323,9 @@ describe('merge-gate retrigger safety', () => {
     expect(result.applied).toEqual([expect.objectContaining({ ok: true, action: 'pull-request-push' })]);
   });
 
-  it('injected protection evidence without run-list IO preserves push recovery', () => {
+  it('injected protection evidence without run-list IO refuses merge-gate push recovery', () => {
     const { trigger, labelRetrigger } = sweepWithRuns();
-    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger).not.toHaveBeenCalled();
     expect(labelRetrigger).not.toHaveBeenCalled();
   });
 
@@ -335,13 +335,13 @@ describe('merge-gate retrigger safety', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('unavailable default workflow reader preserves ordinary push recovery without label IO', () => {
+  it('unavailable default workflow reader refuses merge-gate push recovery without label IO', () => {
     vi.stubEnv('PATH', '');
     try {
       expect(readHeadWorkflowRuns({ repo, pr: 1, head })).toBeNull();
       const { labelRetrigger, trigger } = sweepWithRuns(undefined, 1, { readWorkflowRuns: readHeadWorkflowRuns });
       expect(labelRetrigger).not.toHaveBeenCalled();
-      expect(trigger).toHaveBeenCalledTimes(1);
+      expect(trigger).not.toHaveBeenCalled();
     } finally { vi.unstubAllEnvs(); }
   });
 

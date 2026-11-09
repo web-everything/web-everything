@@ -76,7 +76,10 @@ export function pushMissingRunCommit(d, {
     // An ineligible credential is structural (config, not a race): count it so the per-sha cap hands the PR
     // off instead of re-planning it every tick forever.
     if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, action, error: MISSING_RUN_CREDENTIAL_REFUSAL };
-    const admission = recoveryPreflight({ ...recoveryEvidence, pr: {
+    const admission = recoveryPreflight({ ...recoveryEvidence,
+      context: d.context ?? recoveryEvidence.context,
+      missingContexts: [...(d.missingContexts ?? []), ...(recoveryEvidence.missingContexts ?? []),
+        recoveryEvidence.context, d.context].filter(Boolean), pr: {
       state: pr.state.toUpperCase(), baseRefName: pr.base.ref, headRefOid: pr.head.sha,
       headRefName: pr.head.ref, isCrossRepository: pr.head.repo.full_name !== repo,
       mergeable: pr.mergeable === true ? 'MERGEABLE' : 'UNKNOWN',

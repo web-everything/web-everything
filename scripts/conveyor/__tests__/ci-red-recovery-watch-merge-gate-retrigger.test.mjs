@@ -37,7 +37,7 @@ function fixture() {
     status: 'completed', created_at: '2026-10-13T11:00:00Z', id: 101,
   }]);
   const options = {
-    recoveryToken: 'ghp_fixture',
+    recoveryToken: 'ghp_fixture', checkClaim: () => null,
     readRecoveryPr: () => ({ state: 'OPEN', headRefName: 'lane/5060', baseRefName: 'main',
       headRefOid: HEAD, isCrossRepository: false, mergeable: 'MERGEABLE' }),
     repo: REPO, mainRuns: [], now: Date.parse('2026-10-13T12:00:00Z'),
@@ -57,6 +57,32 @@ function fixture() {
 }
 
 describe('missing-run sweep merge-gate label recovery', () => {
+  it.each([
+    ['a live fix claim blocks the label path', () => ({ message: 'fixer owns this branch' })],
+    ['unreadable claim state blocks the label path', () => { throw Error('claim unreadable'); }],
+    ['unknown claim result blocks the label path', () => undefined],
+  ])('%s', (_name, readClaim) => {
+    const f = fixture();
+    const checkClaim = vi.fn(readClaim);
+    const result = sweepMissingRunRecovery({ ...f.options, apply: true, checkClaim });
+    expect(checkClaim).toHaveBeenCalledWith({ repo: REPO, branch: 'lane/5060' });
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, deferred: true,
+      error: expect.stringMatching(/claim/) })]);
+    expect(f.labelRetrigger).not.toHaveBeenCalled();
+    expect(f.retriggerLedger.claim).not.toHaveBeenCalled();
+    expect(f.trigger).not.toHaveBeenCalled();
+    expect(f.postComment).not.toHaveBeenCalled();
+  });
+
+  it.each([null, undefined])('missing run IO (%s) refuses the push path for merge-gate', readWorkflowRuns => {
+    const f = fixture();
+    const result = sweepMissingRunRecovery({ ...f.options, apply: true, readWorkflowRuns });
+    expect(f.trigger).not.toHaveBeenCalled();
+    expect(f.labelRetrigger).not.toHaveBeenCalled();
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, deferred: true,
+      error: expect.stringMatching(/label/) })]);
+  });
+
   it.each(['success', 'failure', 'throw'])('label attempt posts the durable missing-run attempt marker for its head: %s', outcome => {
     const f = fixture();
     const exec = vi.fn();

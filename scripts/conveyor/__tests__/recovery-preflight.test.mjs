@@ -45,7 +45,7 @@ describe('shared recovery preflight bypasses', () => {
     for (const kind of ['label', 'push']) expect(recoveryPreflight({ ...evidence, kind })).toMatchObject({ allow: false, kind, reason: expect.any(String) });
     const io = { readHead: () => head, readPr: () => evidence.pr, readLabels: () => evidence.labels,
       addLabel: vi.fn(), removeLabel: vi.fn() };
-    const label = retriggerRequiredContext({ ...evidence, repo, pr: 1, io,
+    const label = retriggerRequiredContext({ ...evidence, repo, pr: 1, io, checkClaim: () => null,
       ledger: { claim: () => !evidence.claimed } });
     expect(label.ok).toBe(false);
     expect(io.addLabel).not.toHaveBeenCalled();
@@ -64,9 +64,24 @@ describe('shared recovery preflight bypasses', () => {
     expect(exec.mock.calls.every(([command]) => command === 'gh')).toBe(true);
   });
 
-  it.each(['label', 'push'])('allows complete eligible evidence for %s', kind => {
+  it.each(['label'])('allows complete eligible evidence for %s', kind => {
     expect(recoveryPreflight({ ...facts, kind }).allow).toBe(true);
     expect(recoveryPreflight({ ...facts, runs: [], kind }).allow).toBe(true);
+  });
+
+  it('push path refuses a merge-gate context', () => {
+    for (const runs of [[], [run], null]) {
+      expect(recoveryPreflight({ ...facts, runs, kind: 'push' })).toMatchObject({
+        allow: false, reason: expect.stringMatching(/label/),
+      });
+      const exec = vi.fn(() => JSON.stringify({ state: 'open', mergeable: true,
+        head: { sha: head, ref: live.headRefName, repo: { full_name: repo } }, base: { ref: 'main' } }));
+      expect(pushMissingRunCommit({ prNumber: 1, headSha: head, headRefName: live.headRefName }, {
+        repo, exec, env: { GH_TOKEN: facts.token }, readCache: () => null,
+        checkClaim: () => null, recoveryEvidence: { context: 'merge-gate', runs },
+      })).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/label/) });
+      expect(exec.mock.calls.every(([command]) => command === 'gh')).toBe(true);
+    }
   });
 
   function sweep(overrides = {}) {
@@ -77,7 +92,7 @@ describe('shared recovery preflight bypasses', () => {
       readOpenPrs: () => [{ ...live, number: 1, labels: [], statusCheckRollup: [] }],
       readRequiredContexts: () => ['test'], readAttributedRequiredChecks: () => ['test', 'merge-gate'],
       readComments: () => [], readPush: () => null, readHeadCommittedAt: () => '2026-10-12T00:00:00Z',
-      readWorkflowRuns: () => [run], readRecoveryPr: () => live, recoveryToken: facts.token,
+      readWorkflowRuns: () => [run], readRecoveryPr: () => live, recoveryToken: facts.token, checkClaim: () => null,
       labelRetrigger: options => retriggerRequiredContext({ ...options, io }), retriggerLedger: { claim: () => true },
       trigger, postComment: vi.fn(), clearLabel: vi.fn(), ...overrides });
     expect(trigger).not.toHaveBeenCalled();

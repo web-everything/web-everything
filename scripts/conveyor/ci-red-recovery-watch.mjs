@@ -1349,7 +1349,7 @@ export function sweepMissingRunRecovery({
   // Injected evidence readers must also supply run-list IO; never mix fixture evidence with live GitHub reads.
   readWorkflowRuns = readRequiredContexts === defaultReadRequiredContexts ? readHeadWorkflowRuns : null,
   labelRetrigger = retriggerRequiredContext,
-  recoveryEnv = process.env, recoveryToken,
+  recoveryEnv = process.env, recoveryToken, checkClaim = pushRefusal,
   readRecoveryPr = key => createRetriggerIo(key).readPr(),
   retriggerLedger = createMergeGateRetriggerStore(),
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
@@ -1425,26 +1425,28 @@ export function sweepMissingRunRecovery({
   if (apply) {
     for (const d of plan.dispatch) {
       const pr = prByNumber.get(d.prNumber);
-      // Injected legacy readers without run IO preserve their ordinary push contract.
-      // An unavailable default reader has not attempted live IO. Once entered, this branch
-      // owns every decision, including failed reads, and must never fall through to a push.
-      if (typeof readWorkflowRuns === 'function' && defaultBasePartialContexts?.includes('merge-gate')
-        && !pr?.statusCheckRollup?.some(row => (row?.name ?? row?.context) === 'merge-gate')
-        && (readWorkflowRuns !== readHeadWorkflowRuns
-          || canReadHeadWorkflowRuns({ pr: d.prNumber, head: d.headSha }))) {
+      // A missing label-owned context never falls through to synchronize recovery,
+      // including when run IO is unavailable or its evidence is incomplete.
+      const recoveryContexts = d.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts;
+      if (recoveryContexts?.includes('merge-gate')
+        && !pr?.statusCheckRollup?.some(row => (row?.name ?? row?.context) === 'merge-gate')) {
         const candidate = ++retriggerCandidates;
-        let runs, live;
+        let runs, live, claimed;
         try {
           if (candidate <= 8) {
-            runs = readWorkflowRuns({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha });
-            live = readRecoveryPr({ repo: repoSlug(repo), pr: d.prNumber });
+            claimed = checkClaim({ repo: repoSlug(repo), branch: d.headRefName }) !== null;
+            if (typeof readWorkflowRuns === 'function' && (readWorkflowRuns !== readHeadWorkflowRuns
+              || canReadHeadWorkflowRuns({ pr: d.prNumber, head: d.headSha }))) {
+              runs = readWorkflowRuns({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha });
+              live = readRecoveryPr({ repo: repoSlug(repo), pr: d.prNumber });
+            }
           }
         } catch { /* Unknown evidence is refused by the shared preflight. */ }
         const comments = commentsByPr.get(d.prNumber);
         const evidence = { head: d.headSha, headRefName: d.headRefName, context: 'merge-gate',
           runs, rollup: pr?.statusCheckRollup, defaultBranch, candidate,
           token: recoveryToken ?? recoveryEnv.GH_TOKEN ?? recoveryEnv.GITHUB_TOKEN, env: recoveryEnv,
-          claimed: false, attemptsForSha: countMissingRunComments(comments, d.headSha, { defaultBranch }),
+          claimed, attemptsForSha: countMissingRunComments(comments, d.headSha, { defaultBranch }),
           attemptsForPr: countMissingRunComments(comments, null, { defaultBranch }),
           maxRetriesPerSha, maxRetriesPerPr };
         const decision = recoveryPreflight({ ...evidence, pr: live, kind: 'label',
@@ -1463,7 +1465,7 @@ export function sweepMissingRunRecovery({
         let result;
         try {
           result = labelRetrigger({ ...evidence, repo: repoSlug(repo), pr: d.prNumber,
-            ledger: retriggerLedger });
+            ledger: retriggerLedger, checkClaim });
         } catch (error) { result = { ok: false, deferred: true, error: String(error.message ?? error) }; }
         postComment(d.prNumber, { repo, headRefName: d.headRefName, headSha: d.headSha, mainGreen,
           ok: result?.ok === true, action: 'label-event', error: result?.error ?? null });

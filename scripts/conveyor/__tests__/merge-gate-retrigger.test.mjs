@@ -11,7 +11,7 @@ beforeAll(async () => {
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
-const admission = { headRefName: 'lane/recovery', token: 'ghp_fixture', runs: [], rollup: [] };
+const admission = { checkClaim: () => null, headRefName: 'lane/recovery', token: 'ghp_fixture', runs: [], rollup: [] };
 const run = (overrides = {}) => ({
   name: 'Merge gate', event: 'pull_request_target', conclusion: 'startup_failure',
   status: 'completed', created_at: '2026-10-13T11:00:00Z', id: 101, ...overrides,
