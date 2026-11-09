@@ -5,7 +5,7 @@
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
 
 /** @typedef {{home: string, nodePath: string, path: string}} HostOverlay */
-const TOP_KEYS = new Set(['version', 'description', 'tasks']);
+const TOP_KEYS = new Set(['version', 'daemonTasksDescription', 'tasks']);
 const TASK_KEYS = new Set(['label', 'program', 'workingDir', 'runAtLoad', 'keepAlive', 'startInterval', 'throttleInterval', 'processType', 'stdout', 'stderr', 'env', 'hostEnvKeys', 'manifestPass']);
 const SECRET = /KEY|TOKEN|SECRET|PRIVATE|APP_ID|INSTALLATION|URL|PASSWORD|AUTH/i;
 const TOKENS = /\{([^{}\s]+)\}/g;
@@ -27,7 +27,7 @@ export function validateTable(table) {
   if (!object(table)) fail('table must be an object');
   for (const key of Object.keys(table)) if (!TOP_KEYS.has(key)) fail(`unknown table key ${key}`);
   if (table.version !== 1) fail('version must be 1');
-  if (table.description !== undefined) string(table.description, 'description');
+  if (table.daemonTasksDescription !== undefined) string(table.daemonTasksDescription, 'daemonTasksDescription');
   if (!Array.isArray(table.tasks)) fail('tasks must be an array');
   checkStrings(table);
   const labels = new Set();

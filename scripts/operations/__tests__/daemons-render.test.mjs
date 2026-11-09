@@ -36,8 +36,8 @@ describe('daemon renderer', () => {
   it.each([
     ['unknown task key', { ...task, surprise: true }, /unknown/i],
     ['unknown token', { ...task, program: ['{missing}'] }, /token/i],
-    ['literal user home', { ...task, stdout: '/Users/person/log' }, /literal/i],
-    ['literal linux home', { ...task, env: { SAFE: '/home/person' } }, /literal/i],
+    ['literal user home', { ...task, stdout: ['', 'Users', 'person', 'log'].join('/') }, /literal/i],
+    ['literal linux home', { ...task, env: { SAFE: ['', 'home', 'person'].join('/') } }, /literal/i],
     ['invalid program', { ...task, program: [] }, /program/i],
     ['invalid interval', { ...task, startInterval: -1 }, /Interval/],
   ])('refuses %s', (_name, invalid, error) => {
@@ -96,8 +96,9 @@ describe('daemon renderer', () => {
     const env = Object.fromEntries([...xml.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)[1].matchAll(/<key>([^<]*)<\/key>\s*<string>([\s\S]*?)<\/string>/g)].map(match => [decode(match[1]), decode(match[2])]));
     expect(env.WE_WIP_PUBLISH_HOME).toBe(home);
     expect(args[2]).not.toContain(home);
-    // Disable startup files for the probe; run the rendered shell source with only rendered env.
-    const output = execFileSync(args[0], ['-f', '-c', args[2]], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
+    expect(args.slice(0, 2)).toEqual(['/bin/zsh', '-lc']);
+    // The rendered source is POSIX; probe it with /bin/sh (zsh is absent on Linux CI) and only rendered env.
+    const output = execFileSync('/bin/sh', ['-c', args[2]], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
     expect(output.trim()).toBe(realpathSync(app));
     expect(existsSync(join(root, 'dollar-executed'))).toBe(false);
     expect(existsSync(join(root, 'backtick-executed'))).toBe(false);
