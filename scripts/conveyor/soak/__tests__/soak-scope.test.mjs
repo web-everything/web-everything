@@ -189,19 +189,73 @@ describe('soak scope', () => {
     ['import URL with a query and a hash', "export * from '../../../fixture/dep.mjs?a=1#b';"],
     ['repo-root literal under any top-level folder', "readFileSync(join(ROOT, 'fixture/dep.mjs'));"],
     ['repo-root literal with a query string', "copy('fixture/dep.mjs?raw');"],
-  ])('follows %s', (_name, source) => {
+    // String escapes are decoded by the language before the specifier is resolved (#6573 review).
+    // Plain strings with doubled backslashes: the fixture file must hold the escape itself.
+    ['a Unicode-escaped import specifier', "import '../../../fixture/\\u0064ep.mjs';"],
+    ['a braced Unicode-escaped import specifier', "import '../../../fixture/\\u{64}ep.mjs';"],
+    ['a hex-escaped import specifier', 'import "../../../fixture/\\x64ep.mjs";'],
+    ['an identity-escaped import specifier', "import '..\\/..\\/..\\/fixture/\\dep.mjs';"],
+    ['an escaped query mark in an import URL', "import '../../../fixture/dep.mjs\\u003Ffresh=1';"],
+    ['a line continuation inside an import specifier', "import '../../../fixture/de\\\np.mjs';"],
+    ['an escaped template-literal dynamic import', 'await import(`../../../fixture/\\u0064ep.mjs`);'],
+    ['a legacy octal escape in a CommonJS require', "require('../../../fixture/\\144ep.mjs');"],
+    ['an escaped repo-root literal', "readFileSync(join(ROOT, 'fixture/\\x64ep.mjs'));"],
+    ['an escaped quote inside an import specifier', "import '../../../fixture/dep\\'s.mjs';", "fixture/dep's.mjs"],
+    ['the other quote inside an import specifier', `import "../../../fixture/dep's.mjs";`, "fixture/dep's.mjs"],
+    ['the other quote inside a repo-root literal', `copy("fixture/dep's.mjs");`, "fixture/dep's.mjs"],
+  ])('follows %s', (_name, source, expectedTarget) => {
     const root = fixtureRoot();
     soakFixture(root);
     writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', `${source}\n`);
     writeFixture(root, 'fixture/dep.mjs', 'export const x = 1;\n');
     writeFixture(root, 'scripts/x/dep.mjs', 'export const x = 1;\n');
     writeFixture(root, 'fixture/dep.v2.mjs', 'export const x = 2;\n');
+    writeFixture(root, "fixture/dep's.mjs", 'export const x = 3;\n');
 
     const closure = computeSoakClosure({ root });
-    const target = source.includes('./scripts/x/') ? 'scripts/x/dep.mjs'
-      : source.includes('dep.v2') ? 'fixture/dep.v2.mjs' : 'fixture/dep.mjs';
+    const target = expectedTarget ?? (source.includes('./scripts/x/') ? 'scripts/x/dep.mjs'
+      : source.includes('dep.v2') ? 'fixture/dep.v2.mjs' : 'fixture/dep.mjs');
     expect(closure.has(target)).toBe(true);
     expect(soakScopeRun({ root, changed: [target] })).toBe(true);
+  });
+
+  // A chain: a bare name in the seed directory would resolve inside the seed and pass trivially.
+  it('follows an escaped file-relative new URL literal without a ./ prefix', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "import '../../../fixture/b.mjs';\n");
+    writeFixture(root, 'fixture/b.mjs', "export const u = new URL('\\u0064ep.json', import.meta.url);\n");
+    writeFixture(root, 'fixture/dep.json', '{}\n');
+
+    expect(computeSoakClosure({ root }).has('fixture/dep.json')).toBe(true);
+    expectCliOutput(runCli('fixture/dep.json\n', root), 'run=true');
+  }, 30_000);
+
+  it('decodes escapes in one pass and keeps an out-of-range code point raw', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    // `\\u0064` is a backslash then `u0064`, never `d`; `\u{110000}` is not a code point.
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs',
+      "import '../../../fixture/\\\\u0064ep.mjs'; import '../../../fixture/\\u{110000}.mjs';\n");
+    writeFixture(root, 'fixture/dep.mjs', 'export const x = 1;\n');
+
+    const closure = computeSoakClosure({ root });
+    expect(closure.has('fixture/dep.mjs')).toBe(false);
+    expect(closure.has('fixture/\\u0064ep.mjs')).toBe(true);
+    expect(closure.has('fixture/\\u{110000}.mjs')).toBe(true);
+  });
+
+  // `\0` and `%00` decode to NUL, which makes the fs calls throw: that must not turn every
+  // PR into run=true, and it must not hide a later real import (#6573 review).
+  it('ignores a decoded NUL instead of failing the whole scan', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs',
+      "read('scripts/x.mjs\\0'); read('scripts/y.mjs%00'); import '../../../fixture/dep.mjs';\n");
+    writeFixture(root, 'fixture/dep.mjs', 'export const x = 1;\n');
+
+    expect(computeSoakClosure({ root }).has('fixture/dep.mjs')).toBe(true);
+    expect(soakScopeRun({ root, changed: ['backlog/1-x.md'] })).toBe(false);
   });
 
   it('follows existing files named by literal under any top-level folder, and top-level files', () => {
@@ -402,6 +456,34 @@ describe('ci.yml daemon-soak scope step wiring', () => {
   it('runs the soak for a derived-only path outside the legacy grep', () => {
     expect(runStep({ files: RED_TEAM })).toBe('run=true');
   }, 30_000);
+
+  // The OR only widens: each side alone must select the soak. A legacy-grep path outside the
+  // import closure still runs it when the derived scope says run=false (#6573 review).
+  it.each([
+    ['scripts/lane-pool.mjs'],
+    ['scripts/operations/dispatch-lane.mjs'],
+    ['scripts/review-set-label.mjs'],
+  ])('runs the soak for the legacy-only path %s when the derived scope says run=false', (files) => {
+    expect(runStep({ files, node: 'node() { cat >/dev/null; echo run=false; }' })).toBe('run=true');
+  }, 30_000);
+
+  it('skips the soak when the derived scope says run=false and the legacy grep has no hit', () => {
+    expect(runStep({ files: 'backlog/1-x.md', node: 'node() { cat >/dev/null; echo run=false; }' })).toBe('run=false');
+  }, 30_000);
+
+  it('runs the scope safeguards self-test in the same job, before the scope step', () => {
+    const steps = yaml.load(readFileSync(CI_YML, 'utf8')).jobs['daemon-soak-scope'].steps;
+    const selfTest = steps.findIndex((step) => step.run?.trim() === 'node scripts/conveyor/soak/soak-scope.mjs --self-test');
+    expect(selfTest).toBeGreaterThanOrEqual(0);
+    expect(selfTest).toBeLessThan(steps.findIndex((step) => step.id === 'scope'));
+    expect(steps[selfTest].if).toBeUndefined();
+    expect(steps[selfTest]['continue-on-error']).toBeUndefined();
+    const result = spawnSync(process.execPath, [CLI, '--self-test'], {
+      cwd: ROOT, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  }, 70_000);
 
   it('skips the soak when neither the legacy grep nor the derived scope selects it', () => {
     expect(runStep({ files: 'backlog/1-x.md' })).toBe('run=false');

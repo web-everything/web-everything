@@ -13,6 +13,24 @@ const SOURCE = /\.(?:[cm]?[jt]sx?)$/;
 // Code folders: a named path here is followed even when missing (a deleted dependency).
 const CODE_ROOT = /^(?:scripts|src|tools|skills-src)\//;
 
+// Decode JavaScript string escapes in one left-to-right pass (so `\\u0064` stays `d`):
+// `\u{…}`, `\uXXXX`, `\xXX`, legacy octal (CommonJS sloppy mode), line continuations, the
+// single-letter controls and identity escapes (`\/`, `\'`). An out-of-range `\u{…}` stays raw.
+const JS_ESCAPE = /\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|([0-3][0-7]{0,2}|[4-7][0-7]?)|(\r\n|[\n\r\p{Zl}\p{Zp}])|([^]))/gu;
+const CONTROL = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' };
+function unescapeJs(text) {
+  return text.replace(JS_ESCAPE, (whole, braced, unicode, hex, octal, continuation, other) => {
+    if (braced !== undefined) {
+      const point = Number.parseInt(braced, 16);
+      return point <= 0x10ffff ? String.fromCodePoint(point) : whole;
+    }
+    if (unicode !== undefined || hex !== undefined) return String.fromCharCode(Number.parseInt(unicode ?? hex, 16));
+    if (octal !== undefined) return String.fromCharCode(Number.parseInt(octal, 8));
+    if (continuation !== undefined) return '';
+    return CONTROL[other] ?? other;
+  });
+}
+
 export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   root = resolve(root);
   const closure = new Set();
@@ -43,13 +61,21 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   // Any top-level folder or file can be a runtime dependency (the soak world copies
   // `schemas/…`, `package.json`, `.gitignore` by name), not only the code folders.
   const topLevel = new Set(readdirSync(root).filter((name) => name !== '.git' && name !== 'node_modules'));
-  // An import specifier is a URL: `./x.mjs?fresh=1#v` and `./a%20b.mjs` load `x.mjs` and `a b.mjs`.
-  // Keep the raw form too (a plain path may legitimately contain `?`, `#` or `%`).
+  // The language decodes string escapes first: `'./dep.mjs'` names `./dep.mjs`. Then an
+  // import specifier is a URL: `./x.mjs?fresh=1#v` and `./a%20b.mjs` load `x.mjs` and `a b.mjs`.
+  // Keep the raw forms too (a plain path may legitimately contain `\`, `?`, `#` or `%`).
   const forms = (specifier) => {
-    const bare = specifier.replace(/[?#].*$/, '');
-    let decoded = bare;
-    try { decoded = decodeURIComponent(bare); } catch { /* malformed escape: keep the raw form */ }
-    return [...new Set([specifier, bare, decoded])].filter(Boolean);
+    // Fast path: without these characters every form below equals the specifier itself.
+    if (!/[\\?#%\0]/.test(specifier)) return [specifier];
+    const all = new Set();
+    for (const text of [specifier, unescapeJs(specifier)]) {
+      const bare = text.replace(/[?#].*$/, '');
+      let decoded = bare;
+      try { decoded = decodeURIComponent(bare); } catch { /* malformed escape: keep the raw form */ }
+      all.add(text).add(bare).add(decoded);
+    }
+    // A NUL (`\0`, `%00`) cannot name a file, and the fs calls throw on it rather than ENOENT.
+    return [...all].filter((form) => form && !form.includes('\0'));
   };
   const isFile = (path) => {
     try { return statSync(path).isFile(); }
@@ -58,7 +84,11 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
       throw error;
     }
   };
+  // Both literal shapes name most literals twice; the outcome depends only on `base`.
+  const followed = new Set();
   const follow = (base) => {
+    if (followed.has(base)) return;
+    followed.add(base);
     // Always try the suffixes: a dotted basename (`./vitest.shared`) has an extname but is
     // still extensionless to the resolver. Each candidate is checked: `<root>.mjs` (from a
     // literal naming the root itself) lies outside the repository and is never touched.
@@ -109,18 +139,34 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     // `import'x'`, `export*from"x"` and `import(\`x\`)` are valid: whitespace is optional, and
     // dynamic import/require may take a template literal. The specifier is matched in a
     // lookahead so a quoted keyword (`'import'`) cannot consume a real import after it.
-    for (const match of source.matchAll(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])([^'"`\r\n]+)\1)/g)) {
+    // Each scan runs two literal shapes and unions them, so scope only widens: the plain one
+    // (no quote of any kind inside) and the escape-aware one (the other quote, `\'`, `d`,
+    // a line continuation), whose body `forms` decodes. Each pattern has exactly two groups.
+    const matches = (patterns) => patterns.flatMap((pattern) => [...source.matchAll(pattern)]);
+    for (const match of matches([
+      /(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])([^'"`\r\n]+)\1)/g,
+      /(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/g,
+    ])) {
       for (const form of forms(match[2])) {
         if (isRelative(form)) follow(resolve(dirname(file), form));
       }
     }
     // `new URL('data.json', import.meta.url)` is file-relative without a `./` prefix.
-    for (const match of source.matchAll(/\bnew\s+URL\s*\(\s*(?=(['"`])([^'"`\r\n]+)\1)/g)) {
+    for (const match of matches([
+      /\bnew\s+URL\s*\(\s*(?=(['"`])([^'"`\r\n]+)\1)/g,
+      /\bnew\s+URL\s*\(\s*(?=(['"`])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/g,
+    ])) {
       for (const form of forms(match[2])) {
         if (!/^[a-z][a-z0-9+.-]*:|^\/|\$\{/i.test(form)) follow(resolve(dirname(file), form));
       }
     }
-    for (const match of source.matchAll(/(['"`])([^'"`\r\n]+)\1/g)) {
+    // The escape-aware shape is a lookahead, so every quote starts a candidate (a stray
+    // apostrophe in a comment cannot swallow a real literal). Each start stops at the next
+    // unescaped quote of its own kind on the line, which keeps the scan linear.
+    for (const match of matches([
+      /(['"`])([^'"`\r\n]+)\1/g,
+      /(?=(['"`])((?:(?!\1)[^\\\r\n]|\\(?:\r\n|[^]))+)\1)/g,
+    ])) {
       // Non-import literals: file-relative (`setupFiles: ['./x']`, `new URL('../x', import.meta.url)`)
       // and repo-root (spawn/readFile/copy targets, `new URL('./scripts/x', ROOT_URL)`).
       for (const form of forms(match[2])) {
@@ -130,8 +176,9 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
         // Elsewhere only an existing file counts: test fixtures name many fake paths
         // (`backlog/1-x.md`), and a bare folder word (`'docs'`) is not a file dependency.
         // `inside` first: `docs/../../x` names a top-level folder but resolves outside the repo.
+        if (!topLevel.has(path.split('/')[0])) continue;
         const target = resolve(root, path);
-        if (topLevel.has(path.split('/')[0]) && inside(target) && isFile(target)) add(target);
+        if (inside(target) && isFile(target)) add(target);
       }
     }
   }
@@ -216,6 +263,9 @@ async function selfTest() {
   await scopeCase('a deleted runtime copy-list file requests the soak', () => {}, 'schemas/rt.json', true);
   await scopeCase('import URL query strings still reach the dependency', ({ seed }) => {
     writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/dependency.mjs?fresh=1#v';");
+  }, dependency, true);
+  await scopeCase('an escaped import specifier still reaches the dependency', ({ seed }) => {
+    writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/\\u0064ependency.mjs';");
   }, dependency, true);
   await scopeCase('an unreadable runtime copy list requests the soak', ({ seed }) => {
     writeFileSync(join(seed, 'red-green.mjs'), 'export const RUNTIME_PATHS = computed();');
