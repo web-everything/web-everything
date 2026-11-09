@@ -69,9 +69,9 @@ function readOnlyKey(command, args) {
 function requireRepositoryContext(args, executionOptions) {
   // GH_REPO / GH_HOST retarget gh without appearing in argv, so the argv-only key cannot tell targets apart.
   // Refuse both at record and replay time (the env itself is only inspected, never retained).
+  if (process.env.GH_REPO || process.env.GH_HOST) fail();
   if (executionOptions.some(option => option?.env?.GH_REPO || option?.env?.GH_HOST)) fail();
-  const hasWorkingDirectory = executionOptions.some(option => option?.cwd !== undefined);
-  if (!hasWorkingDirectory) return;
+  // An omitted cwd still means the process cwd, so the repository must always be explicit in argv.
   if (args[0] === 'api') {
     // gh expands these placeholders using the working directory's repository.
     if (args.some(arg => /\{(?:owner|repo|branch)\}/.test(arg))) fail();

@@ -137,7 +137,7 @@ describe('world capsule (R649 S1)', () => {
 
   it.each([
     ['api', 'repos/example/repo'], ['api', '-X', 'GET', 'repos/example/repo'],
-    ...['pr', 'issue', 'run'].flatMap(command => ['list', 'view'].map(action => [command, action])),
+    ...['pr', 'issue', 'run'].flatMap(command => ['list', 'view'].map(action => [command, action, '--repo', 'o/r'])),
   ])('records read-only gh arguments %j from string results', async (...argv) => {
     const recorder = createCapsuleRecorder();
     const inner = vi.fn(async () => body);
@@ -186,6 +186,18 @@ describe('world capsule (R649 S1)', () => {
     await expect(recordingRunChild(inner, recorder)('gh', ['api', '--method', 'GET', 'repos/o/x'], { env: { [name]: 'other' } })).rejects.toThrow();
     const replay = replayRunChild(finalizeCapsule(recorder, { stateRoots: [] }));
     await expect(replay('gh', ['api', '--method', 'GET', 'repos/o/r'], { env: { [name]: 'other' } })).rejects.toThrow('world-capsule miss');
+  });
+
+  it('refuses inherited GH_REPO and implicit-cwd repository lookups', async () => {
+    const inner = vi.fn(async () => '[]');
+    const run = recordingRunChild(inner, createCapsuleRecorder());
+    await expect(run('gh', ['pr', 'list', '--json', 'number'])).rejects.toThrow();
+    await expect(run('gh', ['api', '--method', 'GET', 'repos/{owner}/{repo}'])).rejects.toThrow();
+    vi.stubEnv('GH_REPO', 'owner/other');
+    try {
+      await expect(run('gh', ['pr', 'list', '--repo', 'o/r', '--json', 'number'])).rejects.toThrow();
+    } finally { vi.unstubAllEnvs(); }
+    expect(inner).not.toHaveBeenCalled();
   });
 
   it('does not import readPrsFromFile', () => {
