@@ -92,11 +92,15 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   });
   const decisions = (head) => [...new Set(list.filter((r) => r?.head === head && r.base !== head).map((r) => r.base))]
     .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH, ...auditOptions }) })).filter((d) => d.record);
-  const own = decisions(sha);
+  // D2: an invalid pass (made after the cutoff, no readable fingerprint) is dropped here, before any comparison, so it can
+  // never suppress a WEAKENED or lend an older pass. Every WEAKENED is then judged against the valid passes only.
+  const validDecision = (d) => d.record.verdict !== 'NOT WEAKENED'
+    || Date.parse(d.record.at) < Date.parse(SINGLE_RUN_PASS_CUTOFF) || carriesAcross(d.record.fingerprint, d.record.fingerprint);
+  const own = decisions(sha).filter(validDecision);
   // Only string heads carry (main #6353): a non-string head that stringifies to a sha never aliases a real one, and
   // findAudit refuses non-string head/base, so a non-string base never decides either.
   const carriedHeads = new Set(list.filter((r) => typeof r?.head === 'string' && r.head !== sha && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)).map((r) => r.head));
-  const carried = [...carriedHeads].flatMap(decisions);
+  const carried = [...carriedHeads].flatMap(decisions).filter(validDecision);
   // Only an own verdict that could itself pass (its base is in main) is a re-audit that supersedes a carried WEAKENED:
   // a newer audit of a narrow, uncovered base never hides it behind an older covered pass.
   // Ask covers() once per base: a flaky second answer must never let the pass loop disagree with this check.
