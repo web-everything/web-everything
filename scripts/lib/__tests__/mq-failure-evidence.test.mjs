@@ -555,6 +555,27 @@ describe('mq failure evidence: real vitest output shapes', () => {
       changedFiles: { ...removal, complete: true, files: [spaced] } });
     expect(decision).toBe('fix');
   });
+  // Spaced paths whose FIRST component has the space, so no "/" precedes the tail: found by the second review.
+  it.each([
+    ['assertion text, bare filename', 'AssertionError: boom at my widget.test.mjs:3:4'],
+    ['assertion text, nested tail', 'AssertionError: boom at my widget/a.test.mjs:1:1'],
+    ['Error: expect text', 'Error: expect(received) at my widget/b.test.mjs:1:1'],
+    ['labelled failure, two spaces after the label', 'runner:  failure my widget.test.mjs > t'],
+    ['Expected detail', 'Expected: my widget.test.mjs'],
+  ])('bare-word spaced path after a marker (%s) is ambiguous and selects fix', async (_name, line) => {
+    const evidence = await one(` FAIL  tests/other.test.mjs > a\nAssertionError: expected 1 to be 2\n${line}\n`);
+    expect(evidence.complete).toBe(false);
+    const decision = classifyMqFailureIntake({ ...removal, route: { ...removal, ...evidence, stale: false },
+      changedFiles: { ...removal, complete: true, files: [spaced, 'my widget.test.mjs', 'my widget/a.test.mjs', 'my widget/b.test.mjs'] } });
+    expect(decision).toBe('fix');
+  });
+  it.each([
+    ['at', 'AssertionError: boom at tests/a.test.mjs:3:4'],
+    ['in', 'AssertionError: boom in tests/a.test.mjs'],
+    ['a named frame', 'AssertionError: boom\n ❯ Proxy.<anonymous> tests/a.test.mjs:5:3'],
+  ])('a connective or named-frame word before a path (%s) keeps the evidence complete', async (_name, line) => {
+    expect((await one(` FAIL  tests/a.test.mjs > t\n${line}\n`)).complete).toBe(true);
+  });
   it('a list of complete test paths after a marker is not mistaken for a spaced path', async () => {
     const evidence = await one(' FAIL  tests/a.test.mjs > t\nAssertionError: see tests/a.test.mjs tests/b.test.mjs\n');
     expect(evidence).toMatchObject({ complete: true });
@@ -574,6 +595,22 @@ describe('mq failure evidence: pathological log lines are bounded', () => {
     const evidence = await one(`${line}\nAssertionError: x\n`);
     expect(performance.now() - started).toBeLessThan(1000);
     expect(evidence.complete).toBe(false);
+  });
+  // The preceding-word scan once used an unanchored regex: 120 such lines (245KB) blocked the dispatcher for ~9s.
+  it.each([
+    ['a parenthesis-glued run', ` FAIL x${'(a.test.js)'.repeat(185)}`],
+    ['a long non-space word before a path', ` FAIL ${'x'.repeat(1900)} tests/a.test.mjs`],
+  ])('path scan over many marker lines (%s) is linear', async (_name, line) => {
+    const started = performance.now();
+    await one(`${Array.from({ length: 120 }, () => line).join('\n')}\nAssertionError: x\n`);
+    expect(performance.now() - started).toBeLessThan(1500);
+  });
+  it('a long line inside a passing test\'s captured stdout does not cost the refresh route', async () => {
+    const text = ` FAIL  tests/a.test.mjs > t\nAssertionError: x\n\nstdout | tests/b.test.mjs > passes\n${'x'.repeat(5000)}\n\n Test Files  1 failed | 1 passed (2)\n      Tests  1 failed | 1 passed (2)\n`;
+    expect((await one(text)).complete).toBe(true);
+  });
+  it('a long runner line outside a captured block keeps path evidence incomplete', async () => {
+    expect((await one(` FAIL  tests/a.test.mjs > t\nAssertionError: ${'x'.repeat(3000)}\n`)).complete).toBe(false);
   });
   it('a normal trailing "[ file ]" suffix is still cut (the linear strip keeps the old behaviour)', async () => {
     expect(await one(' FAIL  tests/a.test.mjs [ tests/a.test.mjs ]\nAssertionError: x\n')).toMatchObject({ complete: true });

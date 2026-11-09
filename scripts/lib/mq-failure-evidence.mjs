@@ -2,7 +2,7 @@
 const clean = text => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 const infra = /runner has lost communication|runner.*(?:offline|disconnected)|infrastructure failure/i;
 const assertion = /^(?:FAIL\b|AssertionError\b|Error: expect\b|Expected:|Received:|❯(?=\s))/;
-const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|(?:^|[\w-]+:\s)failure\b|^Error: expect\b|^Expected:|^Received:/g;
+const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|(?:^|[\w-]+:\s+)failure\b|^Error: expect\b|^Expected:|^Received:/g;
 // These jobs only aggregate sibling results; no other job name receives this exemption.
 // Lines inside a runner's own failure block that carry no failure identity: blank separators, the
 // "- Expected / + Received" diff body and echoed source code frames ("12|   expect(...)", "  |   ^"). They neither
@@ -43,6 +43,19 @@ function hasOnlyUpstreamFailure(lines) {
 // Longest log line the parser reads. Real runner headings are far shorter; a longer line is not parsed past this
 // bound (every regex below is then bounded) and keeps path evidence incomplete, so it goes to the fixer.
 const MAX_LINE = 2048;
+// Words that may directly precede a path without being the first half of a spaced path name.
+const pathLeaders = new Set(['at', 'in', 'from', 'of', 'on', 'to', 'by', 'for', 'with', 'see', 'file', 'path', 'async', 'new',
+  'fail', 'failed', 'failure']);
+// The whitespace-delimited word that ends right before `end`, found by a linear backward scan ('' when the path is
+// not preceded by whitespace). Never a regex: this runs once per path match on attacker-influenced text.
+function wordBefore(text, end) {
+  let stop = end;
+  while (stop > 0 && /\s/.test(text[stop - 1])) stop--;
+  if (stop === end) return '';
+  let start = stop;
+  while (start > 0 && !/\s/.test(text[start - 1])) start--;
+  return text.slice(start, stop);
+}
 // Linear equivalent of replace(/\s+\[[^\]]*\]\s*$/, ''): drop a trailing " [ ... ]" group with no inner "]".
 function stripBracketSuffix(text) {
   const trimmed = text.trimEnd();
@@ -84,12 +97,17 @@ function failurePaths(text, repo) {
     candidate = candidate.replace(/:\d+(?::\d+)?$/, '');
     if (!/^[^\s"'`()[\]]+$/.test(candidate)) complete = false;
   }
+  let pathsSeen = 0;
   for (const match of text.matchAll(/(?:^|[\s(])((?:[A-Za-z]:)?[\w@./\\-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=[:\s)]|$)/g)) {
-    // A path that follows a directory-looking word after whitespace ("tests/my widget.test.mjs") is the tail of a
-    // spaced path, whatever marker introduced it. A preceding complete test path (a list of files) is not.
-    const before = text.slice(0, match.index + match[0].length - match[1].length);
-    const word = /(\S+)\s+$/.exec(before.length > 512 ? before.slice(-512) : before)?.[1] ?? '';
-    if (/[/\\]/.test(word) && !/\.(?:test|spec)\.[cm]?[jt]sx?(?::\d+){0,2}[,;]?$/.test(word)) complete = false;
+    // A path that follows another word after whitespace may be the tail of a spaced path ("tests/my widget.test.mjs",
+    // "my widget.test.mjs"), whatever marker introduced it. That word is harmless when it is a complete test path (a
+    // list of files), a connective or marker word ("at", "in", "FAIL"), or not bare ("Proxy.<anonymous>", "❯",
+    // "Expected:"). A directory-looking word (a "/" or "\") or any other bare word keeps the path ambiguous.
+    // The heading's own path was already validated as exactly one token above (a "new Widget" frame prefix included).
+    const headingPath = lead !== null && pathsSeen++ === 0;
+    const word = wordBefore(text, match.index + match[0].length - match[1].length);
+    if (word && ((/[/\\]/.test(word) && !/\.(?:test|spec)\.[cm]?[jt]sx?(?::\d+){0,2}[,;]?$/.test(word))
+      || (!headingPath && /^[\w-]+$/.test(word) && !pathLeaders.has(word.toLowerCase())))) complete = false;
     let path = match[1].replace(/\\/g, '/');
     if (path.startsWith('/') || /^[A-Za-z]:/.test(path)) {
       const root = roots.find(prefix => path.startsWith(prefix));
@@ -165,8 +183,8 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         let activePaths = [], capturedOutput = false, unterminatedBlock = false;
         let pathIncomplete = false, blankSince = false, headlineUsed = false, unhandledErrors = false; const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
         for (const rawFull of clean(log.text).split(/\r?\n/)) {
-          let raw = rawFull;
-          if (raw.length > MAX_LINE) { raw = raw.slice(0, MAX_LINE); pathIncomplete = true; }
+          const overlong = rawFull.length > MAX_LINE;
+          const raw = overlong ? rawFull.slice(0, MAX_LINE) : rawFull;
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
           // Vitest echoes passing tests' stdout/stderr verbatim. These blocks can contain fake
           // FAILs/assertions/paths; only the next blank line returns us to the runner's own output.
@@ -179,6 +197,9 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
             if (/^(?:Test Files|Tests)\s/.test(line)) { capturedOutput = false; unterminatedBlock = true; }
             else continue;
           }
+          // Runner output past the bound is unread: path evidence stays incomplete. Lines inside a captured
+          // stdout/stderr block never reach here, so a passing test's long output does not cost the refresh route.
+          if (overlong) pathIncomplete = true;
           if (line) causalityLines.push(line);
           const noise = blockNoise(line);
           const afterBlank = blankSince;
