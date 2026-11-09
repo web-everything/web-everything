@@ -25,6 +25,15 @@ describe('foreignStaleOwnerDead', () => {
   const rec = { host: 'old', pid: 42, pidStart: 'birth-a', pidNamespace: 'ns' };
   const opts = (patch = {}) => ({ host: 'new', namespace: 'ns', statusAt: now - 1_800_001, now, isAlive: () => false, readPidStart: () => 'birth-a', ...patch });
   it('is dead when stale, same namespace and the pid is gone', () => expect(foreignStaleOwnerDead(rec, opts())).toBe(true));
+  it('never judges a record that names this host', () => expect(foreignStaleOwnerDead(rec, opts({ host: 'old' }))).toBe(false));
+  it('honours the stale window setting', () => {
+    const env = { WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '900000' };
+    expect(foreignStaleOwnerDead(rec, opts({ statusAt: now - 1_000_000, env }))).toBe(true);
+    expect(foreignStaleOwnerDead(rec, opts({ statusAt: now - 800_000, env }))).toBe(false);
+  });
+  it('treats an undefined recorded namespace like a null one', () => {
+    expect(foreignStaleOwnerDead({ ...rec, pidNamespace: undefined }, opts({ namespace: 'other' }))).toBe(true);
+  });
   it('holds a fresh record', () => expect(foreignStaleOwnerDead(rec, opts({ statusAt: now - 60_000 }))).toBe(false));
   it('holds a record from another pid namespace, without probing', () => {
     const isAlive = vi.fn(() => false);

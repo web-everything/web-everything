@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { pidNamespace, pidStartTime } from '../../lib/pid-alive.mjs';
+import { pidAlive, pidNamespace, pidStartTime } from '../../lib/pid-alive.mjs';
 import { withFileLock } from '../../lib/atomic-json-file.mjs';
 import * as evidence from '../../lib/drain-red-team-evidence.mjs';
 import * as recovery from '../../lib/review-red-team-on-skip.mjs';
@@ -713,11 +713,16 @@ describe('stale record owned by a foreign host name', () => {
     const { plan } = rebound({ pid: null, host: hostname() }, { expectFresh: false });
     expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
   });
-  it('the production recovery probe supplies host, namespace and birth-time reader', () => {
+  // A record with no host name cannot be shown to belong to another host; the shortcut must hold it (the foreign control is fresh).
+  it('does not apply the foreign-host abandonment shortcut to a record with no host', () => {
+    for (const host of [undefined, '']) {
+      const { plan } = rebound({ pid: null, host }, { expectFresh: false });
+      expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    }
+  });
+  it('the production recovery probe supplies host, namespace and the real pid probes', () => {
     const probe = recovery.recoveryProbe();
-    expect(probe).toMatchObject({ host: hostname(), namespace: pidNamespace() });
-    expect(typeof probe.isAlive).toBe('function');
-    expect(typeof probe.readPidStart).toBe('function');
+    expect(probe).toMatchObject({ host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime });
   });
   it('does not treat a bound abandonment from another pid namespace as proof of death', () => {
     // Same rewrite with the namespace unset is recovered (the control), so the namespace is what holds it.
@@ -766,6 +771,12 @@ describe('stale record owned by a foreign host name', () => {
     const f = fixture({ foreign: true });
     f.probe.isAlive = () => true;
     expect(stale(f)).toMatchObject({ mode: 'skip' });
+  });
+  // Same stale age and no usable pid, but the record names THIS host: only the planner's host argument keeps it out of the stale rule.
+  it('holds a stale record that names this host', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f, { host: hostname(), pid: null })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    expect(stale(fixture({ foreign: true }), { pid: null })).toMatchObject({ mode: 'fresh', abandon: true });
   });
   it('holds a stale foreign-host record from a different pid namespace', () => {
     const f = fixture({ foreign: true });
