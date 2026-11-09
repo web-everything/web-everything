@@ -15,6 +15,92 @@ function harness(status = stored(), extra = {}) {
     publishNeedsYou: vi.fn(), now: () => '2026-10-24T12:00:00.000Z', ...extra };
   return io;
 }
+const legacy = (result = 'ran') => ({ repo: 'o/n', pr: 42, head, status: 'finished', result });
+const seatRow = (extra = {}) => ({ rev: head, foldedVerdict: 'accept', confirmedMissCount: 0,
+  findings: [], provider: 'claude', model: 'test-model', callId: 'legacy-red-team-call', ...extra });
+const confirmedFinding = { summary: 'Confirmed boundary check bypass', file: 'scripts/x.mjs',
+  line: 12, category: 'correctness', confirmedByRecheck: true };
+
+describe('legacy bare-string red-team publication', () => {
+  it('needs publication for a finished legacy ran result', () => {
+    expect(needsPublish(legacy())).toBe(true);
+    expect(needsPublish({ ...legacy(), status: 'running' })).toBe(false);
+  });
+  it.each(['skipped', 'not-owed', 'failed'])('does not publish a legacy %s result', result => {
+    expect(needsPublish(legacy(result))).toBe(false);
+  });
+  it('recovers an accept from the exact-head seat row and persists the posted result', () => {
+    const readSeatRow = vi.fn(() => seatRow());
+    const io = harness(legacy(), { readSeatRow });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'posted' });
+    expect(readSeatRow).toHaveBeenCalledTimes(1);
+    expect(readSeatRow).toHaveBeenCalledWith({ repo: 'o/n', pr: 42, head });
+    expect(io.postComment).toHaveBeenCalledTimes(1);
+    expect(io.postComment).toHaveBeenCalledWith({ repo: 'o/n', pr: 42, body: expect.any(String) });
+    const body = io.postComment.mock.calls[0][0].body;
+    expect(body).toContain(redTeamMarker(42, head));
+    expect(parseRedTeamComment(body)).toEqual({ pr: 42, rev: head, findings: [] });
+    expect(body).toContain('recorded verdict `accept`');
+    expect(io.writeStatus).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: 'ran', comment: 'posted', foldedVerdict: 'accept' }),
+    }));
+    expect(io.status.result).toMatchObject({ status: 'ran', comment: 'posted', foldedVerdict: 'accept' });
+    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+  it('retains a confirmed break when recovering a changes verdict', () => {
+    const io = harness(legacy(), { readSeatRow: () => seatRow({ foldedVerdict: 'changes',
+      confirmedMissCount: 1, findings: [confirmedFinding] }) });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'posted' });
+    expect(io.postComment).toHaveBeenCalledTimes(1);
+    const body = io.postComment.mock.calls[0][0].body;
+    expect(body).toContain(redTeamMarker(42, head));
+    expect(body).toContain('recorded verdict `changes`');
+    expect(parseRedTeamComment(body)).toMatchObject({ pr: 42, rev: head,
+      findings: [{ summary: confirmedFinding.summary, file: confirmedFinding.file,
+        line: confirmedFinding.line, category: confirmedFinding.category, confirmed: true }] });
+    expect(io.status.result).toMatchObject({ status: 'ran', comment: 'posted', foldedVerdict: 'changes' });
+  });
+  it.each([
+    ['missing seat row', () => null],
+    ['seat reader throws', () => { throw Error('seat unreadable'); }],
+    ['accept row from another head', () => seatRow({ rev: 'b'.repeat(40) })],
+    ['missing findings', () => seatRow({ findings: undefined })],
+    ['non-array findings', () => seatRow({ findings: {} })],
+    ['missing folded verdict', () => seatRow({ foldedVerdict: undefined })],
+    ['invalid folded verdict', () => seatRow({ foldedVerdict: 'clear' })],
+    ['count exceeds confirmed findings', () => seatRow({ confirmedMissCount: 1 })],
+    ['count omits a confirmed finding', () => seatRow({ foldedVerdict: 'changes',
+      confirmedMissCount: 0, findings: [confirmedFinding] })],
+  ])('holds unreadable legacy evidence and alerts only once: %s', (_name, readSeatRow) => {
+    const io = harness(legacy(), { readSeatRow: vi.fn(readSeatRow) });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
+    expect(io.readSeatRow).toHaveBeenCalledWith({ repo: 'o/n', pr: 42, head });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'red-team-legacy-ran-unreadable', repo: 'o/n', pr: 42, head,
+    }));
+    expect(io.writeStatus).toHaveBeenCalledWith(expect.objectContaining({ needsYouPublished: true }));
+    expect(io.status.needsYouPublished).toBe(true);
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(io.status.needsYouPublished).toBe(true);
+  });
+  it('persists posted state when a trusted comment already exists without posting again', () => {
+    const io = harness(legacy(), { readSeatRow: () => seatRow(),
+      listComments: () => [{ author: { login: 'web-everything' },
+        body: `${redTeamMarker(42, head)}\n### Post-accept red team — no break found` }] });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.writeStatus).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: 'ran', comment: 'posted' }),
+    }));
+    expect(io.status.result).toMatchObject({ status: 'ran', comment: 'posted' });
+    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+});
+
 describe('stored red-team publication', () => {
   it('only publishes finished ran results with withheld/error comments', () => {
     for (const comment of ['withheld', 'error']) expect(needsPublish(stored(comment))).toBe(true);
