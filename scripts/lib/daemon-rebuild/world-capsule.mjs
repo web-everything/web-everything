@@ -30,10 +30,12 @@ function argumentsKey(command, args) {
 }
 
 // Parse a deliberately small read-only grammar; unknown options need explicit review.
+const LISTABLE_NOUNS = new Set('pr issue run'.split(' '));
+
 function readOnlyKey(command, args) {
   const key = argumentsKey(command, args);
   const api = args[0] === 'api';
-  if (!api && !(['pr', 'issue', 'run'].includes(args[0])
+  if (!api && !(LISTABLE_NOUNS.has(args[0])
     && ['list', 'view'].includes(args[1]))) fail();
   const values = api
     ? new Set(['--method', '-X', '--jq', '-q', '--template', '-t', '--hostname'])
