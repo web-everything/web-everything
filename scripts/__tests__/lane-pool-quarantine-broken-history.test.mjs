@@ -107,6 +107,16 @@ it('list --acquirable does not advertise a quarantined lane', () => {
   expect(JSON.stringify(result.data)).not.toContain(laneDir);
 });
 
+it('a cached list --acquirable is re-filtered once a lane is quarantined', () => {
+  const first = runPool(['list', '--acquirable']);
+  expect(first.status, first.stderr).toBe(0);
+  expect(JSON.stringify(first.data)).toContain(laneDir);
+  quarantine();
+  const second = runPool(['list', '--acquirable']);
+  expect(second.status, second.stderr).toBe(0);
+  expect(JSON.stringify(second.data)).not.toContain(laneDir);
+});
+
 it('retries a single transient history failure without quarantining', () => {
   const fault = `if (args.includes('rev-list') && args.includes('--max-count=200')) {
     fs.appendFileSync(${JSON.stringify(join(base, 'probes'))}, 'probe\\n');

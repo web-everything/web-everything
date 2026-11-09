@@ -4079,7 +4079,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
     }
     return out.filter((n) => !existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n));
   } catch (e) {
-    if (e && e.partialScan) return out.map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
+    if (e && e.partialScan) return out.filter((n) => !existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
     throw e;
   } finally {
     scanDeadlineMs = null;
@@ -4104,7 +4104,13 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
 // holder's scan actually finished or the lock's OWN (far larger) staleness grace elapsed — 3.4x its wait in the
 // worst observed case. `null` (the default, e.g. `list --acquirable`'s own direct callers) reproduces the
 // prior behavior exactly: no caller-side bound, only the scan/lock's own.
-function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
+// A quarantine record can land after a list was cached, so every answer (cache hit or fresh) is re-filtered.
+function acquirableListCached(repo, opts) {
+  const quarantined = new Set(existingLanes(repo).filter((n) => existsSync(historyQuarantinePath(repo, n))).map((n) => laneDir(repo, n)));
+  const paths = acquirableListCachedRaw(repo, opts);
+  return quarantined.size ? paths.filter((p) => !quarantined.has(p)) : paths;
+}
+function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
   const hit = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
   if (hit) return slice(hit);
