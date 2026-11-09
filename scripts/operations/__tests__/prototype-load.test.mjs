@@ -359,6 +359,12 @@ describe('canonicalAuditEvidence: new-format passes need a fingerprint (D2)', ()
     for (const records of [[carriedPass, carriedWeak, invalid], [invalid, carriedWeak, carriedPass]])
       expect(prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FPX)).toEqual({ ok: false, reason: 'weakened' });
   });
+  it('an invalid live-head pass does not let an older carried pass decide (live-head precedence and coverage refusal hold)', () => {
+    const carriedPass = auditRecord({ head: 'd'.repeat(40), base: '8'.repeat(40), at: BEFORE, fingerprint: FPX });
+    const invalid = auditRecord({ at: AFTER, runs, fingerprint: undefined });
+    expect(prototypeLoad.canonicalAuditEvidence([carriedPass, invalid], SHA, () => true, FPX)).toEqual({ ok: false, reason: 'no-record' });
+    expect(prototypeLoad.canonicalAuditEvidence([carriedPass], SHA, () => true, FPX)).toMatchObject({ ok: true });
+  });
   it('still accepts a legacy pass before the cutoff without a fingerprint', () => {
     const legacy = auditRecord({ at: BEFORE, fingerprint: undefined });
     expect(prototypeLoad.canonicalAuditEvidence([legacy], SHA, () => true, FPX)).toEqual({ ok: true, record: legacy });

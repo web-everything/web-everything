@@ -96,7 +96,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // never suppress a WEAKENED or lend an older pass. Every WEAKENED is then judged against the valid passes only.
   const validDecision = (d) => d.record.verdict !== 'NOT WEAKENED'
     || Date.parse(d.record.at) < Date.parse(SINGLE_RUN_PASS_CUTOFF) || carriesAcross(d.record.fingerprint, d.record.fingerprint);
-  const own = decisions(sha).filter(validDecision);
+  // The live head's invalid pass still counts as the live head having a decision, so it never lets a carried pass decide.
+  const ownAny = decisions(sha);
+  const own = ownAny.filter(validDecision);
   // Only string heads carry (main #6353): a non-string head that stringifies to a sha never aliases a real one, and
   // findAudit refuses non-string head/base, so a non-string base never decides either.
   const carriedHeads = new Set(list.filter((r) => typeof r?.head === 'string' && r.head !== sha && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)).map((r) => r.head));
@@ -145,7 +147,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // WEAKENED is judged by findAudit's newer-than-the-pass rule above.
   if (list.some((r) => typeof r?.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head && r.questionHash === QUESTION_HASH && isWeak(r) && carriesAcross(r.fingerprint, liveFp))) return { ok: false, reason: 'weakened' };
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
-  const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
+  const passes = ownAny.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
     // D2: a new-format pass (made after the cutoff) must carry a readable net-diff fingerprint; a legacy one need not.
