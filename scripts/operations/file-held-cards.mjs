@@ -1,6 +1,7 @@
 /** File held handoff cards through file-item in this checkout; never mutate the handoff. */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { readGit } from '../lib/proc-read.mjs';
 import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
@@ -133,9 +134,9 @@ function bornAsOnMain(root, hash) {
   try {
     // The hash is shape-checked to [x0-9a-z]{7}, so it is safe inside the pattern; grep only narrows candidates,
     // the front-matter parse below decides.
-    const hits = execFileSync('git', ['grep', '-l', '-E', `^bornAs:[[:space:]]*["']?${hash}["']?[[:space:]]*$`, 'origin/main', '--', 'backlog/'], opts)
+    const hits = readGit(['grep', '-l', '-E', `^bornAs:[[:space:]]*["']?${hash}["']?[[:space:]]*$`, 'origin/main', '--', 'backlog/'], opts)
       .split('\n').filter(line => line.startsWith('origin/main:backlog/')).slice(0, 20);
-    return hits.some(hit => frontMatterBornAs(execFileSync('git', ['show', hit], opts).slice(0, FRONT_MATTER_BYTES)) === hash);
+    return hits.some(hit => frontMatterBornAs(readGit(['show', hit], opts).slice(0, FRONT_MATTER_BYTES)) === hash);
   } catch { return false; } // exit 1 (no match) and any git failure both fail closed
 }
 
