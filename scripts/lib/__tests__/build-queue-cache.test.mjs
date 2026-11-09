@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from 'vitest';
+import fs from 'node:fs';
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +12,9 @@ function setup() {
   writeFileSync(join(backlogDir, 'a.md'), 'a');
   return { dir, backlogDir, configPath };
 }
-afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
+afterEach(() => {
+  dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true }));
+});
 it('invalidates on markdown mtime, added file, config mtime and next flag', () => {
   const o = setup(); let key = buildQueueCacheKey(o);
   utimesSync(join(o.backlogDir, 'a.md'), 2000000000, 2000000000);
@@ -107,4 +110,77 @@ it('removes the lock on release and allows another caller to acquire it', () => 
   const nextRelease = acquireBuildQueueLock({ file });
   expect(nextRelease).toBeTypeOf('function');
   nextRelease();
+});
+
+it('returns null for live-owner contention without changing lock ownership', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const release = acquireBuildQueueLock({ file });
+  const owner = fs.readFileSync(`${file}.lock/owner.json`, 'utf8');
+  expect(acquireBuildQueueLock({ file })).toBeNull();
+  expect(fs.readFileSync(`${file}.lock/owner.json`, 'utf8')).toBe(owner);
+  release();
+});
+
+it('fails open with a no-op release on filesystem acquisition errors', () => {
+  const { dir } = setup(); const parent = join(dir, 'not-a-directory');
+  writeFileSync(parent, 'unchanged');
+  const file = join(parent, 'cache.json');
+  const release = acquireBuildQueueLock({ file });
+  expect(release).toBeTypeOf('function');
+  expect(() => release()).not.toThrow();
+  expect(fs.readFileSync(parent, 'utf8')).toBe('unchanged');
+  expect(existsSync(`${file}.lock`)).toBe(false);
+});
+
+it('fails open and cleans up when writing the lock owner fails', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  let attempted = false;
+  const release = acquireBuildQueueLock({ file, io: { ...fs, writeFileSync(path, ...args) {
+    if (path === `${file}.lock/owner.json`) {
+      attempted = true;
+      throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    }
+    return fs.writeFileSync(path, ...args);
+  } } });
+  expect(release).toBeTypeOf('function');
+  expect(() => release()).not.toThrow();
+  expect(attempted).toBe(true);
+  expect(existsSync(`${file}.lock`)).toBe(false);
+  expect(existsSync(`${file}.lock.guard`)).toBe(false);
+});
+
+it('serializes concurrent stale-lock recovery before a second contender can inspect the old owner', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const oldRelease = acquireBuildQueueLock({ file, now: 1_000, staleMs: 100 });
+  let contender;
+  let inspections = 0;
+  const io = { ...fs, readFileSync(path, ...args) {
+    const content = fs.readFileSync(path, ...args);
+    if (path === `${file}.lock/owner.json` && ++inspections === 1) {
+      // Pause recovery after reading the old owner, before removing its directory.
+      contender = acquireBuildQueueLock({ file, now: 1_101, staleMs: 100, io });
+    }
+    return content;
+  } };
+  const release = acquireBuildQueueLock({ file, now: 1_101, staleMs: 100, io });
+  expect(release).toBeTypeOf('function');
+  expect(contender).toBeNull();
+  expect(inspections).toBe(1);
+  expect(acquireBuildQueueLock({ file, now: 1_102, staleMs: 100 })).toBeNull();
+  oldRelease();
+  release();
+  expect(existsSync(`${file}.lock`)).toBe(false);
+});
+
+it('an old owner release cannot remove a replacement owner lock', () => {
+  const { dir } = setup(); const file = join(dir, 'cache.json');
+  const oldRelease = acquireBuildQueueLock({ file, now: 1_000, staleMs: 100 });
+  const release = acquireBuildQueueLock({ file, now: 1_101, staleMs: 100 });
+  const owner = fs.readFileSync(`${file}.lock/owner.json`, 'utf8');
+  oldRelease();
+  expect(fs.readFileSync(`${file}.lock/owner.json`, 'utf8')).toBe(owner);
+  expect(acquireBuildQueueLock({ file, now: 1_102, staleMs: 100 })).toBeNull();
+  release();
+  release();
+  expect(existsSync(`${file}.lock`)).toBe(false);
 });

@@ -1164,11 +1164,15 @@ function buildQueue() {
   if (key !== null) {
     const stdout = readBuildQueueCache({ file, key, now: at, maxAgeMs });
     if (stdout !== null) { writeAllSync(1, stdout); process.exit(0); }
-    releaseLock = acquireBuildQueueLock({ file });
-    if (releaseLock) process.on('exit', releaseLock);
-    else {
-      const cached = waitForBuildQueueCache({ file, key, timeoutMs: 30_000, maxAgeMs });
+    // Single-flight: the lock winner computes; losers poll the cache in short slices and re-try the lock, so a winner
+    // that finishes (or dies) without writing OUR key hands over within a slice instead of stalling 30 s.
+    const waitUntil = Date.now() + 30_000;
+    for (;;) {
+      releaseLock = acquireBuildQueueLock({ file });
+      if (releaseLock) { process.on('exit', releaseLock); break; }
+      const cached = waitForBuildQueueCache({ file, key, timeoutMs: 250, maxAgeMs });
       if (cached !== null) { writeAllSync(1, cached); process.exit(0); }
+      if (Date.now() >= waitUntil) break;
     }
   }
   const emit = (payload, human) => {
