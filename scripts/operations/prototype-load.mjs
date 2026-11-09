@@ -25,8 +25,12 @@ export function testCheckEvidence(data, sha) {
   if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
     || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count) return null;
   const runs = data.check_runs.filter((r) => r?.name === 'test' && r.head_sha === sha && r.app?.id === TEST_CHECK_APP_ID);
-  if (!runs.length || runs.some((r) => !Number.isSafeInteger(r.id))) return null;
-  const latest = runs.sort((a, b) => b.id - a.id)[0];
+  if (!runs.length || runs.some((r) => !Number.isSafeInteger(r.id) || !Number.isSafeInteger(r.check_suite?.id))) return null;
+  // Latest run per check suite (a rerun supersedes only its own suite); another workflow's success never hides a failure.
+  const bySuite = new Map();
+  for (const r of runs) if (!bySuite.has(r.check_suite.id) || r.id > bySuite.get(r.check_suite.id).id) bySuite.set(r.check_suite.id, r);
+  const latests = [...bySuite.values()];
+  const latest = latests.find((r) => r.status !== 'completed' || r.conclusion !== 'success') ?? latests.sort((x, y) => y.id - x.id)[0];
   return { sha: latest.head_sha, name: latest.name, status: latest.status, conclusion: latest.conclusion, id: latest.id, appId: latest.app.id };
 }
 /** A WEAKENED fix-ready record loads ONLY as a ruled exception (operator R396): the record must carry

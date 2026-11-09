@@ -2842,7 +2842,7 @@ describe('refuse-only safety properties P1–P9', () => {
 
 
 describe('test check-run evidence bounds (P8)', () => {
-  const pass = { id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 } };
+  const pass = { id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 } };
   it('uses the latest test run on the exact SHA, even when an older success exists', () => {
     expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [pass, { ...pass, id: 2, conclusion: 'failure' }] }, SHA)).toMatchObject({ sha: SHA, conclusion: 'failure' });
     expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, head_sha: TREE }] }, SHA)).toBeNull();
@@ -2854,6 +2854,12 @@ describe('test check-run evidence bounds (P8)', () => {
     const f = fixture({ ready: '', testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 1 }) });
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
     expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('another workflow\'s newer success never hides a failing test suite; a rerun in the same suite does supersede', () => {
+    const other = { ...pass, id: 9, check_suite: { id: 8 } };
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [{ ...pass, conclusion: 'failure' }, other] }, SHA)).toMatchObject({ id: 1, conclusion: 'failure' });
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [{ ...pass, conclusion: 'failure' }, { ...pass, id: 2 }] }, SHA)).toMatchObject({ id: 2, conclusion: 'success' });
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, check_suite: undefined }] }, SHA)).toBeNull();
   });
   it('refuses an oversized or incomplete page rather than treating a truncated success as evidence', () => {
     for (const total_count of [101, -1, null, 2]) expect(prototypeLoad.testCheckEvidence({ total_count, check_runs: [pass] }, SHA)).toBeNull();

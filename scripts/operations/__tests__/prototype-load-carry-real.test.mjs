@@ -45,7 +45,7 @@ describe('prototype-load real R503 candidate fetch', () => {
         };
         const load = createPrototypeLoader({ ...defaultDeps(), exec,
           env: { HOME: tmp, TMPDIR: tmp, WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays') },
-          testCheck: async () => ({ sha, name: 'test', status: 'completed', conclusion: 'success' }),
+          testCheck: async () => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 }),
           settings: { daemons: { control: { clone } }, workspaceRoot: tmp, loaderCli: 'scripts/daemon-overlay.mjs',
             readyRecordPath, auditRecordPath, recordPath, adoption: { timeoutMs: 30, pollMs: 10 } },
         });
