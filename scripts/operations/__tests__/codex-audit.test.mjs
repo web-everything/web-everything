@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
+import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS, SINGLE_RUN_PASS_CUTOFF } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
@@ -308,9 +308,48 @@ describe('deterministic audit: up to audit.runs sequential runs, any WEAKENED wi
     expect(findAudit([pass, weak], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(weak);
   });
 
-  it('findAudit still accepts a legacy single-run NOT WEAKENED record without runs', () => {
-    const legacy = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
-    expect(findAudit([legacy], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(legacy);
+  const Q = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
+  const rec = o => ({ ...Q, verdict: 'NOT WEAKENED', at: AT, ...o });
+  const AFTER = new Date(Date.parse(SINGLE_RUN_PASS_CUTOFF) + 1000).toISOString();
+  const BEFORE = new Date(Date.parse(SINGLE_RUN_PASS_CUTOFF) - 1000).toISOString();
+
+  it('cutoff: a legacy pass without runs from before the cutoff is still accepted', () => {
+    const legacy = rec({ at: BEFORE });
+    expect(findAudit([legacy], Q)).toBe(legacy);
+  });
+
+  it.each([[undefined], [[]], [['NOT WEAKENED']]])('cutoff: a pass with runs=%j from after the cutoff is refused', runs => {
+    expect(findAudit([rec({ at: AFTER, runs })], Q)).toBeNull();
+  });
+
+  it('cutoff: a two-run pass after the cutoff is accepted', () => {
+    const ok = rec({ at: AFTER, runs: ['NOT WEAKENED', 'NOT WEAKENED'] });
+    expect(findAudit([ok], Q)).toBe(ok);
+  });
+
+  it('cutoff: a refused single-run pass does not fall back to nothing-blocks; an older legacy pass still speaks', () => {
+    const legacy = rec({ at: BEFORE });
+    expect(findAudit([legacy, rec({ at: AFTER })], Q)).toBe(legacy);
+  });
+
+  it.each([
+    ['invalid timestamp', { at: 'garbage' }],
+    ['missing timestamp', { at: undefined }],
+    ['contradictory findings', { findings: ['NOT WEAKENED'] }],
+    ['verdict WEAKENED with invalid timestamp', { verdict: 'WEAKENED', at: 'garbage' }],
+    ['verdict WEAKENED with contradictory findings', { verdict: 'WEAKENED', findings: ['NOT WEAKENED'] }],
+  ])('malformed WEAKENED fails closed (%s): it blocks and hides an older valid pass', (_, extra) => {
+    const pass = rec({ at: BEFORE });
+    const bad = rec({ runs: ['NOT WEAKENED', 'WEAKENED'], verdict: 'WEAKENED', ...extra });
+    const got = findAudit([pass, bad], Q);
+    expect(got).not.toBe(pass);
+    expect(got?.verdict).toBe('WEAKENED');
+  });
+
+  it('malformed runs-WEAKENED with a NOT WEAKENED verdict field and a bad timestamp still blocks', () => {
+    const pass = rec({ at: BEFORE });
+    const bad = rec({ at: 'garbage', runs: ['WEAKENED'] });
+    expect(findAudit([pass, bad], Q)?.verdict).toBe('WEAKENED');
   });
 
   it('findAudit does not let a WEAKENED of another head or base block', () => {
