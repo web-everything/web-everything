@@ -74,7 +74,8 @@ describe('canonical audit', () => {
     expect(await main(ARGS, f.deps)).toBe(code);
     expect(f.output.join('')).toBe(`${verdict}\nscripts/example.mjs:12 why\n`);
     expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
-      questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
+      questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'],
+      runs: verdict === 'WEAKENED' ? ['WEAKENED'] : ['NOT WEAKENED', 'NOT WEAKENED'] }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(CANONICAL_QUESTION);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
     expect(f.deps.resolveSha.mock.calls).toEqual([['origin/main'], [HEAD]]);
