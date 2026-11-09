@@ -2,7 +2,7 @@
 const clean = text => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 const infra = /runner has lost communication|runner.*(?:offline|disconnected)|infrastructure failure/i;
 const assertion = /^(?:FAIL\b|AssertionError\b|Error: expect\b|Expected:|Received:|❯(?=\s))/;
-const failureMarkers = /\b(?:FAIL|AssertionError)\b|^failure\b|^Error: expect\b|^Expected:|^Received:|^❯(?=\s)/g;
+const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|^failure\b|^Error: expect\b|^Expected:|^Received:|^❯(?=\s)/g;
 // These jobs only aggregate sibling results; no other job name receives this exemption.
 const derivedFailureJobs = new Set(['coverage-merge', 'test']);
 const localJobName = name => clean(name).split(' / ').at(-1).trim().replace(/\s+\([^()\r\n]*\)$/, '');
@@ -28,7 +28,7 @@ function hasOnlyUpstreamFailure(lines) {
   if (lines.some(line => line.startsWith('##[group]'))) {
     const errors = lines.filter(line => line.startsWith('##[error]'));
     // Un-annotated error text (a thrown Error, fatal:, npm ERR) is an independent failure, never boilerplate.
-    if (lines.some(line => /^(?:Error\b|fatal:|npm ERR)/.test(line))) return false;
+    if (lines.some(line => /Error\b|Exception\b|\bE(?:NOENT|ACCES|PIPE|TIMEDOUT)\b|\bpanic\b|Traceback|^fatal:|^npm ERR/.test(line))) return false;
     return lines.some(line => upstreamFailureOutcomes.has(line))
       && errors.every(line => upstreamFailureOutcomes.has(line) || line === '##[error]Process completed with exit code 1.');
   }
@@ -116,15 +116,19 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         if (log?.complete !== true || typeof log.text !== 'string' || Buffer.byteLength(log.text) > maxLogBytes) return result;
         let parsed = false, hasAssertions = false, markers = 0, attributed = 0;
         const jobAssertions = [], jobPaths = new Set(), causalityLines = [], markerLines = [];
-        let activePaths = [], capturedOutput = false;
+        let activePaths = [], capturedOutput = false, unterminatedBlock = false;
         for (const raw of clean(log.text).split(/\r?\n/)) {
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
           // Vitest echoes passing tests' stdout/stderr verbatim. These blocks can contain fake
           // FAILs/assertions/paths; only the next blank line returns us to the runner's own output.
           if (/^(?:stdout|stderr)\s*\|/.test(line)) { capturedOutput = true; activePaths = []; continue; }
           if (capturedOutput) {
-            if (!line) capturedOutput = false;
-            continue;
+            // A blank line, or vitest's own failure/summary headings, ends the captured block.
+            if (!line) { capturedOutput = false; continue; }
+            // vitest's final summary heading inside a block means the block never ended: whatever it hid is
+            // unknown, so the evidence cannot be complete (fail closed).
+            if (/^(?:Test Files|Tests)\s/.test(line)) { capturedOutput = false; unterminatedBlock = true; }
+            else continue;
           }
           if (line) causalityLines.push(line);
           if (assertion.test(line)) hasAssertions = true;
@@ -146,6 +150,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
             for (const path of paths) jobPaths.add(path);
           }
         }
+        if (capturedOutput || unterminatedBlock) pathsComplete = false; // an unended captured block may hide real failures
         if (jobAssertions.length > 100 || jobPaths.size > 100) return result;
         // Any structured failure marker in a derived job's own log (attributed or not) is real evidence,
         // not boilerplate: it must go through normal attribution instead of being exempted.

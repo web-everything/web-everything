@@ -409,4 +409,22 @@ describe('mq failure evidence: real #6499 log shapes', () => {
         903: ghAggregate('Unit shards did not succeed.') }));
       expect(evidence.complete).toBe(false);
     });
+  it.each(['TypeError: Cannot read properties of undefined', 'artifact merge: Error: ENOENT: missing artifact'])(
+    'hosted aggregate log with embedded error text %j never authorizes refresh', async extra => {
+      const evidence = await collect(io({ 901: shardLog,
+        902: `${ghAggregate('Unit shards did not succeed; refusing incomplete coverage.')}\n${extra}`,
+        903: ghAggregate('Unit shards did not succeed.') }));
+      expect(evidence.complete).toBe(false);
+    });
+  it('an uppercase FAILED failure line in a changed file is still collected', async () => {
+    const evidence = await collect(io({ 901: `${shardLog}\nFAILED tests/inside.test.mjs > breaks`,
+      902: ghAggregate('Unit shards did not succeed; refusing incomplete coverage.'), 903: ghAggregate('Unit shards did not succeed.') }));
+    expect(evidence.testFiles).toContain('tests/inside.test.mjs');
+  });
+  it('an unterminated captured-output block cannot hide a later real FAIL', async () => {
+    const text = `FAIL  scripts/lib/__tests__/delivery-policy.test.mjs > a\nAssertionError: x\nstderr | scripts/a.test.mjs > passing\nnoise without blank line\nFAIL  tests/inside.test.mjs > breaks\nAssertionError: y\nTest Files  1 failed | 1 passed (2)`;
+    const evidence = await collect(io({ 901: text, 902: ghAggregate('Unit shards did not succeed; refusing incomplete coverage.'),
+      903: ghAggregate('Unit shards did not succeed.') }));
+    expect(evidence.complete).toBe(false);
+  });
 });
