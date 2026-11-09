@@ -115,6 +115,7 @@ describe('CI timing refresh publication recovery', () => {
     // Only the blocking review labels count as a hold; a non-blocking review:* label (e.g. awaiting-advisory) does not.
     expect(publish.run).not.toContain('startswith("review:")');
     for (const l of ['review:pending', 'review:human', 'review:changes', 'review:accepted']) expect(publish.run).toContain(`. == "${l}"`);
+    expect(publish.run).toMatch(/held=\$\(gh pr list --head ci\/refresh-test-timings --base main --state open --json labels/);
     const held = publicationProbe({ exists: true, open: true, held: 1 }).second;
     expect(held.status, held.stderr).toBe(0);
     expect(held.stdout).not.toContain('EDIT');
