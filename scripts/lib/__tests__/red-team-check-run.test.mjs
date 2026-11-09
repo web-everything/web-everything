@@ -1,7 +1,24 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { readRedTeamGateSource } from '../red-team-check-run.mjs';
+import { REVIEW_HOLD_LABELS } from '../review-escalation.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+
+let lockDir;
+beforeEach(() => {
+  lockDir = mkdtempSync(join(tmpdir(), 'red-team-lock-'));
+  vi.stubEnv('WE_RED_TEAM_CHECK_LOCK_DIR', lockDir);
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(lockDir, { recursive: true, force: true });
+});
 
 describe('redTeamGate.source cutover cascade', () => {
   it.each(['both', 'check-run', 'drain-scan'])('accepts mode %s from the environment', source => {
@@ -37,6 +54,511 @@ describe('red-team check run contract', () => {
   const run = (over = {}) => ({ id: 10, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7',
     app: { id: APP_ID }, status: 'completed', conclusion: 'success',
     started_at: '2026-11-07T10:00:00Z', ...over });
+
+  describe('publishRedTeamCheckFromLive', () => {
+    const resultComment = (rev = HEAD) => ({ author: { login: 'web-everything', type: 'Bot' },
+      created_at: '2026-11-07T12:00:00Z',
+      body: renderRedTeamComment({ pr: 7, rev, provider: 'codex', model: 'fixture',
+        findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
+    // Reader contract: live PR object, complete comment array, verified standing-ruling scope.
+    // Check history stays behind the injected gh boundary; no test can reach GitHub.
+    function fixture() {
+      const checkRuns = [run({ conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' })];
+      const io = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, env: { WE_RED_TEAM_CHECK_LOCK_DIR: lockDir },
+        readLive: vi.fn(() => ({ headRefOid: HEAD, labels: [] })),
+        readComments: vi.fn(() => [resultComment()]),
+        readStandingRuling: vi.fn(() => null),
+        holdFn: vi.fn(() => null),
+        gh: vi.fn((args, options) => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+          if (args.includes('POST')) {
+            checkRuns.push(run({ ...JSON.parse(options.input), id: 20 }));
+            return JSON.stringify({ id: 20 });
+          }
+          if (args.includes(`repos/o/r/commits/${HEAD}/check-runs?check_name=red-team&filter=all&per_page=100`))
+            return JSON.stringify({ total_count: checkRuns.length, check_runs: checkRuns });
+          throw Error(`unexpected GitHub read: ${JSON.stringify(args)}`);
+        }),
+      };
+      return io;
+    }
+    const allPosts = io => io.gh.mock.calls.filter(([args]) => args.includes('POST'));
+    const posts = io => allPosts(io).filter(([args]) => args.includes('repos/o/r/check-runs'));
+    const statusPosts = io => allPosts(io).filter(([args]) => args.includes(`repos/o/r/statuses/${HEAD}`));
+    const payloads = io => posts(io).map(([, options]) => JSON.parse(options.input));
+    const publish = io => api.publishRedTeamCheckFromLive(io);
+
+    it.each(['', '\n', '\n### Post-accept red team — no break found', '\nrecorded verdict `accept`.'])
+    ('refuses an advisory marker without completed review content: %j', async suffix => {
+      const io = fixture();
+      io.readComments.mockReturnValue([{ ...resultComment(), body: `<!-- we:red-team-advisory pr=7 rev=${HEAD} -->${suffix}` }]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(allPosts(io)).toEqual([]);
+    });
+
+    it('posts success and re-inspects without reading or writing publication statuses', () => {
+      const io = fixture();
+      expect(publish(io)).toMatchObject({ ok: true });
+      expect(allPosts(io)).toHaveLength(1);
+      expect(io.gh.mock.calls.some(([args]) => args[1].includes('/status'))).toBe(false);
+      expect(io.readLive).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(['helper', 'poster', 'policy-clear'])('%s times out without reads or POSTs while the lock is held', kind => {
+      const io = { ...fixture(), lockTimeoutMs: 10 };
+      const result = api.withRedTeamCheckLock(io, () => {
+        if (kind === 'helper') return publish(io);
+        if (kind === 'policy-clear') return api.publishRedTeamPolicyClearCheck(io);
+        return api.postRedTeamCheckRun({ ...io, payload: api.redTeamCheckRunPayload({ ...io, status: 'finished', hold: null }) });
+      });
+      expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/lock.*retry|lock.*operator/i) });
+      expect(io.gh).not.toHaveBeenCalled();
+      expect(io.readLive).not.toHaveBeenCalled();
+    });
+
+    it('the last-resort publication hold is NOT behind the check lock and posts while the lock is held', () => {
+      const io = { ...fixture(), lockTimeoutMs: 10 };
+      const out = api.withRedTeamCheckLock(io, () => api.postRedTeamPublicationHold({ ...io, held: true, reason: 'x' }));
+      expect(out).toEqual({ ok: true });
+      expect(io.gh).toHaveBeenCalled();
+    });
+
+    it.each(['live', 'failure'])('serializes a concurrent %s writer behind the live helper across processes', async secondMode => {
+      const statePath = join(lockDir, 'checks.json');
+      const eventsPath = join(lockDir, 'events.jsonl');
+      writeFileSync(statePath, '[]');
+      writeFileSync(eventsPath, '');
+      const source = String.raw`
+        import * as api from ${JSON.stringify(new URL('../red-team-check-run.mjs', import.meta.url).href)};
+        import { withFileLock } from ${JSON.stringify(new URL('../atomic-json-file.mjs', import.meta.url).href)};
+        import { renderRedTeamComment } from ${JSON.stringify(new URL('../../operations/review-extra-seats.mjs', import.meta.url).href)};
+        import { readFileSync, writeFileSync, appendFileSync, unlinkSync, readSync } from 'node:fs';
+        const [mode, first, statePath, eventsPath] = process.argv.slice(1);
+        const headSha = ${JSON.stringify(HEAD)};
+        const event = value => appendFileSync(eventsPath, JSON.stringify({ mode, first, ...value }) + '\n');
+        const io = { repo: 'o/r', pr: 7, headSha, appId: ${APP_ID}, lockTimeoutMs: 5000,
+          lock: (path, fn, options) => {
+            process.stdout.write('attempting\n');
+            return withFileLock(path, () => {
+              // Independent O_EXCL observer: overlapping callbacks fail even if both POSTs succeed.
+              const active = path + '.active';
+              writeFileSync(active, '', { flag: 'wx' });
+              event({ phase: 'enter' });
+              process.stdout.write('entered\n');
+              try {
+                if (first === 'yes') readSync(0, Buffer.alloc(1), 0, 1, null);
+                return fn();
+              } finally { event({ phase: 'exit' }); unlinkSync(active); }
+            }, options);
+          },
+          readLive: () => ({ headRefOid: headSha, labels: [] }),
+          readComments: () => [{ author: { login: 'web-everything', type: 'Bot' },
+            created_at: '2026-11-07T12:00:00Z',
+            body: renderRedTeamComment({ pr: 7, rev: headSha, provider: 'codex', model: 'fixture',
+              findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) }],
+          readStandingRuling: () => null, holdFn: () => null,
+          gh: (args, options) => {
+            const runs = JSON.parse(readFileSync(statePath, 'utf8'));
+            if (!args.includes('POST')) {
+              event({ phase: 'read', count: runs.length });
+              return JSON.stringify({ total_count: runs.length, check_runs: runs });
+            }
+            const payload = JSON.parse(options.input);
+            if (args[1] !== 'repos/o/r/check-runs') throw Error('unexpected status write');
+            const run = { ...payload, id: runs.length + 1, app: { id: ${APP_ID} },
+              completed_at: '2026-11-07T13:00:00Z' };
+            runs.push(run);
+            writeFileSync(statePath, JSON.stringify(runs));
+            return JSON.stringify(run);
+          },
+        };
+        const out = mode === 'live' ? api.publishRedTeamCheckFromLive(io)
+          : api.postRedTeamCheckRun({ ...io, payload: api.redTeamCheckRunPayload({ ...io,
+              status: 'finished', hold: 'another path found a break' }) });
+        process.stdout.write(JSON.stringify(out) + '\n');
+        if (!out.ok) process.exitCode = 1;
+      `;
+      const children = [];
+      function launch(mode, first) {
+        const child = spawn(process.execPath, ['--input-type=module', '-e', source, mode, first, statePath, eventsPath],
+          { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+        children.push(child);
+        let output = '', errors = '';
+        const signals = new Map();
+        const signal = line => {
+          if (!signals.has(line)) {
+            let resolve;
+            const promise = new Promise(done => { resolve = done; });
+            signals.set(line, { promise, resolve });
+          }
+          return signals.get(line);
+        };
+        child.stdout.on('data', chunk => {
+          output += chunk;
+          if (output.length > 65536) child.kill();
+          for (const line of output.split('\n').slice(0, -1)) signal(line).resolve();
+        });
+        child.stderr.on('data', chunk => { errors += chunk; if (errors.length > 65536) child.kill(); });
+        const done = new Promise((resolve, reject) => {
+          child.on('error', reject);
+          child.on('exit', code => code === 0 ? resolve(output) : reject(Error(errors + output)));
+        });
+        // Observe failures immediately even while awaiting a synchronization signal.
+        done.catch(() => {});
+        return { child, done, wait: line => Promise.race([signal(line).promise, done.then(() => { throw Error('child exited before ' + line); })]) };
+      }
+      const timeout = setTimeout(() => children.forEach(child => child.kill()), 12000);
+      try {
+        const first = launch('live', 'yes');
+        await first.wait('entered');
+        const second = launch(secondMode, 'no');
+        await second.wait('attempting');
+        first.child.stdin.end('x');
+        await Promise.all([first.done, second.done]);
+        const events = readFileSync(eventsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(events.filter(e => ['enter', 'exit'].includes(e.phase)).map(e => [e.first, e.phase]))
+          .toEqual([['yes', 'enter'], ['yes', 'exit'], ['no', 'enter'], ['no', 'exit']]);
+        if (secondMode === 'live') expect(events.find(e => e.first === 'no' && e.phase === 'read').count).toBe(1);
+        expect(JSON.parse(readFileSync(statePath, 'utf8')).map(run => run.conclusion))
+          .toEqual(['success', secondMode === 'live' ? 'success' : 'failure']);
+      } finally {
+        clearTimeout(timeout);
+        children.forEach(child => child.kill());
+      }
+    }, 15000);
+
+    it.each([{ pr: 8 }, { headSha: OLD_HEAD }, { repo: 'o/other' }])('different identities do not contend: %j', identity => {
+      const io = fixture();
+      expect(api.withRedTeamCheckLock(io, () => api.withRedTeamCheckLock({ ...io, ...identity, lockTimeoutMs: 0 },
+        () => ({ ok: true })))).toEqual({ ok: true });
+    });
+
+    it('uses a private recursive directory and a SHA-256 identity filename', () => {
+      const dir = join(lockDir, 'nested', 'locks');
+      let observed;
+      const io = { ...fixture(), env: { WE_RED_TEAM_CHECK_LOCK_DIR: dir }, lock: (path, fn, options) => {
+        observed = { path, options };
+        return fn();
+      } };
+      expect(api.withRedTeamCheckLock(io, () => ({ ok: true }))).toEqual({ ok: true });
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(observed.path).toBe(join(dir, createHash('sha256').update(`o/r#7@${HEAD}`).digest('hex') + '.lock'));
+      expect(observed.options.timeoutMs).toBe(3000);
+    });
+
+    it('directory creation errors fail closed before publication', () => {
+      const dir = join(lockDir, 'not-a-directory');
+      writeFileSync(dir, 'blocked');
+      const io = { ...fixture(), env: { WE_RED_TEAM_CHECK_LOCK_DIR: join(dir, 'locks') } };
+      expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/lock.*operator/i) });
+      expect(io.gh).not.toHaveBeenCalled();
+    });
+
+    it.each(['helper', 'poster', 'policy-clear'])('%s fails closed on lock errors', kind => {
+      const io = { ...fixture(), lock: () => { throw Error('permission denied'); } };
+      const out = kind === 'helper' ? publish(io) : kind === 'poster' ? api.postRedTeamCheckRun(io)
+        : api.publishRedTeamPolicyClearCheck(io);
+      expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('permission denied') });
+      expect(io.gh).not.toHaveBeenCalled();
+    });
+
+    it.each([[null, 'in_progress'], [null, 'completed'], [10, 'in_progress'], [10, 'completed']])
+    ('detects a run hidden between the pre-read (%s) and our success (status=%s)', async (beforeId, status) => {
+        const intervening = run({ id: 15, status, conclusion: status === 'completed' ? 'success' : null });
+        const io = fixture();
+        let posted = false;
+        const prior = beforeId === null ? [] : [run({ id: beforeId })];
+        io.gh.mockImplementation(args => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+          if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+          const check_runs = posted ? [...prior, intervening, run({ id: 20 })] : prior;
+          return JSON.stringify({ total_count: check_runs.length, check_runs });
+        });
+        expect(await publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/raced publication/) });
+        expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+    });
+
+    it.each([null, 10])('accepts exactly the pre-read runs (%s) followed by our success', async beforeId => {
+      const io = fixture();
+      let posted = false;
+      const prior = beforeId === null ? [] : [run({ id: beforeId })];
+      io.gh.mockImplementation(args => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+        const check_runs = posted ? [...prior, run({ id: 20 })] : prior;
+        return JSON.stringify({ total_count: check_runs.length, check_runs });
+      });
+      expect(await publish(io)).toMatchObject({ ok: true });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success']);
+    });
+
+    it.each([
+      '1. [**confirmed**] edge-case broken — missing parenthesised class.',
+      '   1. [**confirmed**] (edge-case, broken) `a.mjs:1` — indented finding.',
+      '1. [**CONFIRMED**] (edge-case, broken) `a.mjs:1` — wrong case.',
+      '1. [not confirmed] malformed advisory finding.',
+      '1. [unverifiable] malformed evidence.',
+    ])('refuses unparsed finding evidence despite a clear enqueue hold: %s', async line => {
+      const io = fixture();
+      const comment = resultComment();
+      io.readComments.mockReturnValue([{ ...comment, body: `${comment.body}\n${line}` }]);
+      expect(await publish(io)).toMatchObject({ ok: false,
+        reason: expect.stringMatching(/unparsed|malformed/i) });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['supersede-succeeds', 'supersede-fails', 'both-fail'])
+    ('a lost success response attempts failure supersession and falls back to a hold: %s', async mode => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
+          if (mode === 'both-fail') throw Error('hold response timed out');
+          return '{}';
+        }
+        if (!args.includes('POST')) return readGh(args, options);
+        const payload = JSON.parse(options.input);
+        if (payload.conclusion === 'success') throw Error('success response timed out');
+        if (payload.conclusion === 'failure') {
+          if (mode !== 'supersede-succeeds') throw Error('failure response timed out');
+          return JSON.stringify({ id: 21 });
+        }
+        if (mode === 'both-fail') throw Error('hold response timed out');
+        return '{}';
+      });
+      const out = await publish(io);
+      expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('success response timed out') });
+      expect(payloads(io).slice(0, 2).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      expect(posts(io).slice(0, 2).map(([args]) => args[1])).toEqual(['repos/o/r/check-runs', 'repos/o/r/check-runs']);
+      if (mode === 'supersede-succeeds') expect(posts(io)).toHaveLength(2);
+      else {
+        expect(posts(io)).toHaveLength(2);
+        expect(statusPosts(io)).toHaveLength(1);
+        expect(statusPosts(io)[0][0]).toContain(`repos/o/r/statuses/${HEAD}`);
+        expect(JSON.parse(statusPosts(io).at(-1)[1].input)).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
+          description: expect.stringMatching(/^held:/) });
+        expect(out.reason).toContain('failure response timed out');
+        if (mode === 'both-fail') expect(out.reason).toContain('hold response timed out');
+      }
+    });
+
+    it.each([
+      ['older result', '2026-11-07T09:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', false],
+      ['newer result', '2026-11-07T12:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', true],
+      ['equal timestamps', '2026-11-07T11:00:00Z', '2026-11-07T11:00:00Z', undefined, false],
+      ['missing result timestamp', undefined, '2026-11-07T11:00:00Z', undefined, false],
+      ['invalid result timestamp', 'unreadable', '2026-11-07T11:00:00Z', undefined, false],
+      ['missing run timestamps', '2026-11-07T12:00:00Z', undefined, undefined, false],
+      ['invalid completion timestamp', '2026-11-07T12:00:00Z', 'unreadable', '2026-11-07T08:00:00Z', false],
+      ['missing completed_at despite an earlier started_at', '2026-11-07T12:00:00Z', undefined, '2026-11-07T11:00:00Z', false],
+    ])('requires a demonstrably newer trusted result before replacing failure: %s', async (_name, created_at, completed_at, started_at, ok) => {
+      const io = fixture();
+      io.readComments.mockReturnValue([{ ...resultComment(), created_at }]);
+      const check_runs = [run({ conclusion: 'failure', completed_at, started_at })];
+      io.gh.mockImplementation((args, options) => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (args.includes('POST')) {
+          check_runs.push(run({ ...JSON.parse(options.input), id: 20 }));
+          return JSON.stringify({ id: 20 });
+        }
+        return JSON.stringify({ total_count: check_runs.length, check_runs });
+      });
+      expect(await publish(io)).toMatchObject({ ok });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
+    });
+
+    it('a newer untrusted or other-head result cannot date an older trusted live-head result', async () => {
+      const io = fixture();
+      io.readComments.mockReturnValue([
+        { ...resultComment(), created_at: '2026-11-07T09:00:00Z' },
+        { ...resultComment(), author: { login: 'outsider' } }, resultComment(OLD_HEAD),
+      ]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each([false, true])('failed failure supersede posts a second-channel hold and never throws (hold fails=%s)', async holdFails => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      let posted = false;
+      io.gh.mockImplementation((args, options) => {
+        if (!args.includes('POST')) return readGh(args, options);
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
+          if (holdFails) throw Error('status write denied');
+          return '{}';
+        }
+        if (posted) throw Error('supersede write denied');
+        posted = true;
+        return JSON.stringify({ id: 20 });
+      });
+      io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
+        labels: posted ? ['red-team:blocked'] : [] }));
+      const out = await publish(io);
+      expect(out).toMatchObject({ ok: false });
+      expect(out.reason).toMatch(/red-team:blocked/);
+      expect(out.reason).toMatch(/supersede write denied/);
+      if (holdFails) expect(out.reason).toMatch(/status write denied/);
+      expect(posts(io).map(([args]) => args[1])).toEqual([
+        'repos/o/r/check-runs', 'repos/o/r/check-runs',
+      ]);
+      expect(JSON.parse(statusPosts(io).at(-1)[1].input)).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
+        description: expect.stringMatching(/^held:/) });
+    });
+
+    it('posts exactly one head-bound success after reading live evidence and consulting the recorded-result hold', async () => {
+      const io = fixture();
+      const comments = [resultComment()];
+      const standingRuling = { scope: 'verified-fixture' };
+      io.readComments.mockReturnValue(comments);
+      io.readStandingRuling.mockReturnValue(standingRuling);
+      expect(await publish(io)).toMatchObject({ ok: true });
+      expect(posts(io)).toHaveLength(1);
+      expect(posts(io)[0][0]).toContain('repos/o/r/check-runs');
+      expect(payloads(io)[0]).toMatchObject({ name: 'red-team', head_sha: HEAD,
+        external_id: 'o/r#7', status: 'completed', conclusion: 'success' });
+      expect(io.readLive.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(io.readComments.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(io.readStandingRuling).toHaveBeenCalled();
+      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/r', pr: 7,
+        head: HEAD, comments, recorded: true, standingRuling }));
+      for (const reader of [io.readLive, io.readComments, io.readStandingRuling, io.holdFn])
+        expect(reader.mock.invocationCallOrder[0]).toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.findIndex(([args]) => args.includes('POST'))]);
+    });
+
+    it.each(['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS])('posts nothing for live label %s', async label => {
+      const io = fixture();
+      io.readLive.mockReturnValue({ headRefOid: HEAD, labels: [{ name: label }] });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the shared enqueue hold reports a held break', async () => {
+      const io = fixture();
+      io.holdFn.mockReturnValue('post-accept red team confirmed a break requiring send-back');
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ recorded: true, head: HEAD }));
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the live head moved', async () => {
+      const io = fixture();
+      io.readLive.mockReturnValue({ headRefOid: OLD_HEAD, labels: [] });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['missing', 'other-head', 'untrusted'])('posts nothing for a %s result even when the injected hold clears', async mode => {
+      const io = fixture();
+      io.readComments.mockReturnValue(mode === 'missing' ? [] : mode === 'other-head'
+        ? [resultComment(OLD_HEAD)] : [{ ...resultComment(), author: { login: 'outsider' } }]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the latest matching check is in_progress despite an older success', async () => {
+      const io = fixture();
+      io.gh.mockReturnValue(JSON.stringify({ total_count: 2, check_runs: [run(),
+        run({ id: 11, status: 'in_progress', conclusion: null })] }));
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('refuses incomplete check history with an operator-visible fallback', async () => {
+      const io = fixture();
+      io.gh.mockReturnValue(JSON.stringify({ total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => run({ id: i + 1 })) }));
+      expect(await publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/operator.*inspect/i) });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['blocking-label', 'new-run'])('supersedes its success with failure when a %s races publication', async mode => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      let posted = false;
+      io.gh.mockImplementation((args, options) => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 + posts(io).length }); }
+        if (posted && mode === 'new-run') return JSON.stringify({ total_count: 1,
+          check_runs: [run({ id: 99, status: 'in_progress', conclusion: null })] });
+        return readGh(args, options);
+      });
+      io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
+        labels: posted && mode === 'blocking-label' ? [{ name: 'red-team:blocked' }] : [] }));
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
+        head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
+    });
+
+    it.each(['head-moved', 'labels-unreadable', 'result-missing', 'live-unreadable', 'comments-unreadable',
+      'standing-ruling-error', 'hold-error', 'held-break', 'history-unreadable', 'completed-run'])
+    ('supersedes success with failure when post-publication evidence is %s', async mode => {
+      const io = fixture();
+      let posted = false;
+      const readGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+        if (posted && mode === 'history-unreadable') throw Error('check history unavailable');
+        if (posted && mode === 'completed-run') return JSON.stringify({ total_count: 1,
+          check_runs: [run({ id: 99 })] });
+        return readGh(args, options);
+      });
+      io.readLive.mockImplementation(() => !posted ? { headRefOid: HEAD, labels: [] }
+        : mode === 'live-unreadable' ? null
+          : { headRefOid: mode === 'head-moved' ? OLD_HEAD : HEAD,
+            labels: mode === 'labels-unreadable' ? null : [] });
+      io.readComments.mockImplementation(() => posted && mode === 'comments-unreadable' ? null
+        : posted && mode === 'result-missing' ? [] : [resultComment()]);
+      io.readStandingRuling.mockImplementation(() => {
+        if (posted && mode === 'standing-ruling-error') throw Error('standing ruling unavailable');
+        return null;
+      });
+      io.holdFn.mockImplementation(() => {
+        if (posted && mode === 'hold-error') throw Error('hold evidence unavailable');
+        return posted && mode === 'held-break' ? 'confirmed break requires send-back' : null;
+      });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
+        head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
+    });
+
+    it.each(['readLive', 'readComments', 'readStandingRuling', 'holdFn', 'gh'])('%s errors return ok:false without throwing or posting', async reader => {
+      const io = fixture();
+      io[reader].mockImplementation(() => { throw Error('reader unavailable'); });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['readLive', 'readComments'])('unreadable %s evidence fails closed without posting', async reader => {
+      const io = fixture();
+      io[reader].mockReturnValue(null);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('a failed success POST returns ok:false without throwing', async () => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (args.includes('POST')) throw Error('HTTP 403: check write denied');
+        return readGh(args, options);
+      });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io).length).toBeGreaterThanOrEqual(1);
+      expect(payloads(io)[0].conclusion).toBe('success');
+    });
+  });
 
   // PR #6535 round 6: the recovery policy-clear writer posts only on a head with no run for this PR.
   describe('publishRedTeamPolicyClearCheck', () => {
