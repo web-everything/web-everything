@@ -11,7 +11,15 @@ export async function readForgeTelemetry({host='forge',exec=execFile}={}) {
     const child=exec('ssh',[
     '-o','BatchMode=yes','-o','ConnectTimeout=5',host,
     'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs telemetry',
-  ],{encoding:'utf8',maxBuffer:65536,timeout:8000},(error,stdout)=>error?reject(new Error('forge-unreachable')):resolve(stdout));
+  ],{encoding:'utf8',maxBuffer:65536,timeout:8000},(error,stdout)=>{
+    if(!error){resolve(stdout);return;}
+    // Remote command refusals (including unreadable run evidence) are not
+    // transport failures and must never authorize last-good health.
+    const transport=error.code===255
+      || ['ETIMEDOUT','ECONNREFUSED','ECONNRESET','ENETUNREACH','EHOSTUNREACH','EAI_AGAIN','ENOTFOUND'].includes(error.code)
+      || (error.code===null && error.killed===true && error.signal==='SIGTERM');
+    reject(Object.assign(new Error('forge-unreachable'),{transport}));
+  });
     // The command/argv stays legacy-compatible. Old runners ignore the stdin envelope.
     if (child?.stdin) {
       child.stdin.on('error',()=>{}); // an old runner may close stdin before reading it

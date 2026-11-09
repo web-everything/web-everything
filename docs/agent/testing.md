@@ -2195,6 +2195,15 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
+Forge last-good health requires an explicitly classified transport failure from
+`readForgeTelemetry`; runner refusals and unreadable run evidence invalidate it even
+if a later retry fails in transport. The R695/R785 operator exception bypasses the
+30-second sample freshness guard only within the configured last-good age, capped
+at 30 minutes. Count each copy-failed attempt toward the circuit breaker and recheck
+health after recording it, before retrying. Regressions in
+`scripts/readiness/__tests__/forge-fallback-lastgood.test.mjs` cover the error
+classification, third-attempt backoff, skipped retries and reservation cleanup.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.

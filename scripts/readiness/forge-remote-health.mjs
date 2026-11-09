@@ -72,7 +72,7 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
           // Only the SSH/timeout failure emitted by readForgeTelemetry permits
           // last-good. Malformed replies and unknown errors invalidate it even
           // if the next attempt fails in transport too.
-          if(error?.message!=='forge-unreachable'){state.lastGoodAt=null;state.lastGoodTelemetry=null;}
+          if(error?.message!=='forge-unreachable'||error.transport!==true){state.lastGoodAt=null;state.lastGoodTelemetry=null;}
           throw error;
         }
       };
@@ -83,8 +83,9 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
       }
     }
     const age=!state.telemetry?clock()-state.lastGoodAt:NaN;
-    // Fresh reads still require the 30s freshness guard. Last-good is the
-    // explicit operator-ruled R695/R785 exception, capped at 30 minutes.
+    // Fresh reads still require the 30s freshness guard. Last-good bypasses
+    // that guard only for transport failures: the explicit operator-ruled
+    // R695/R785 exception, age-capped at <=30 minutes.
     const lastGood=!state.telemetry && state.lastGoodAt!==null && Number.isFinite(age) && age>=0
       && age<=Math.min(settings.lastGoodMaxAgeMin??10,30)*60000;
     const telemetry=lastGood?state.lastGoodTelemetry:state.telemetry;
