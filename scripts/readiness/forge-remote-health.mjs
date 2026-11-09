@@ -61,7 +61,7 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
         state.telemetry=null;
         // Only a transport failure qualifies; malformed or invalid telemetry keeps today's fail-closed backoff.
         let reachable=false;
-        try{reachable=error?.message==='forge-unreachable'&&(await ping({host}))===true;}catch{reachable=false;}
+        try{reachable=error?.message==='forge-unreachable'&&error.transport===true&&(await ping({host}))===true;}catch{reachable=false;}
         if(reachable){
           try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
           catch{state.telemetry=null;}

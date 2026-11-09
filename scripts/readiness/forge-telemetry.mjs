@@ -11,7 +11,14 @@ export async function readForgeTelemetry({host='forge',exec=execFile}={}) {
     const child=exec('ssh',[
     '-o','BatchMode=yes','-o','ConnectTimeout=5',host,
     'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs telemetry',
-  ],{encoding:'utf8',maxBuffer:65536,timeout:8000},(error,stdout)=>error?reject(new Error('forge-unreachable')):resolve(stdout));
+  ],{encoding:'utf8',maxBuffer:65536,timeout:8000},(error,stdout)=>{
+    if(!error)return resolve(stdout);
+    // Mark only connection-level failures (ssh exit 255, timeout kill) so the health check may re-read after a ping.
+    // Oversized output and remote-command failures stay unmarked and keep failing closed.
+    const failure=new Error('forge-unreachable');
+    failure.transport=error.code===255||error.code==='ETIMEDOUT'||(error.killed===true&&error.code==null);
+    reject(failure);
+  });
     // The command/argv stays legacy-compatible. Old runners ignore the stdin envelope.
     if (child?.stdin) {
       child.stdin.on('error',()=>{}); // an old runner may close stdin before reading it
