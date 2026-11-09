@@ -53,7 +53,7 @@
   "ruledWeakened": [
     {
       "ref": "lane/redteam-check-run",
-      "sha": "23e7a097bd186c18bb89fab89dc78ca574c4647c",
+      "sha": "d80516a2372362aba35876cd26e0a32d23105e37",
       "ruling": "R787+R773",
       "findings": [
         "red-team-check-run.mjs:87 policy-clear publication reads then posts without sharing the round writer's claim, so a concurrent round's in_progress check can be superseded by the policy-clear success (carded follow-up)"
