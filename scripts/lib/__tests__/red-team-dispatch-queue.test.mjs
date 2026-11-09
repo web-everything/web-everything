@@ -510,6 +510,21 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       await f.queue.settle(repo, started({ plan: { refusals: [{ prNumber: 1, kind: 'already-reviewed-head' }] } }));
       expect(numbers(f.queue.entries())).not.toContain(1);
     });
+    it('an ordinary refusal after a block clears the exemption', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      await block(f, 1);
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, refused(1, 'lane busy'));
+      expect(f.queue.entries()[0].blocked).toBeUndefined();
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1]);
+    });
+    it('an unrecognized persisted blocked value is corrupt and loads empty', async () => {
+      const f = fixture();
+      f.files.set(f.file, JSON.stringify(candidates([1, 2, 3]).map(c => ({ key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head,
+        enqueuedAt: 1, attempts: 0, blocked: 'unrecognized-reason' }))));
+      expect(f.open().entries()).toEqual([]);
+    });
     it('survives a restart', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2]));

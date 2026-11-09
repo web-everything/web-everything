@@ -32,6 +32,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       if (!entry || typeof entry.repo !== 'string' || !entry.repo
         || !Number.isSafeInteger(entry.pr) || entry.pr < 1 || !isRealHead(entry.head)
         || entry.key !== `${entry.repo}#${entry.pr}` || keys.has(entry.key)
+        || (entry.blocked !== undefined && !NON_RUNNABLE_REASONS.has(entry.blocked))
         || !Number.isFinite(entry.enqueuedAt) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
       keys.add(entry.key);
       return true;
@@ -90,7 +91,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
       const mine = entries.filter(entry => entry.repo === repo);
       // Zero admission (unreadable capacity, fail closed) admits no probe either.
-      const probes = new Set(mine.filter(entry => entry.blocked && bound > 0).map(entry => entry.key));
+      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0).map(entry => entry.key));
       const runnable = mine.filter(entry => !probes.has(entry.key)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
@@ -107,7 +108,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
         const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip' } : undefined);
-        if (entry.blocked && (dispatched.some(matches) || !failure)) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
+        if (entry.blocked && (dispatched.some(matches) || !NON_RUNNABLE_REASONS.has(failure?.reason))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
