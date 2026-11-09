@@ -232,7 +232,8 @@ function empty(fd, depth = 0) {
 cwd(3);
 if (!same(fs.statSync('..'), fs.fstatSync(4))) throw new Error('Cache root substituted; preserving cache');
 const st = fs.lstatSync(e.name);
-if (st.mtimeMs !== e.mtimeMs
+if ((e.name.startsWith('.warm-inputs-') && !st.isFile())
+  || st.mtimeMs !== e.mtimeMs
   || (e.ino !== undefined && (st.ino !== e.ino || st.dev !== e.dev))
   || e.now - st.mtimeMs < e.minAgeMs) {
   process.stdout.write('skipped');
@@ -250,23 +251,6 @@ if (st.mtimeMs !== e.mtimeMs
     if (!same(fs.lstatSync(e.name), fs.fstatSync(fd))) throw new Error('Profile changed before removal');
     fs.rmdirSync(e.name);
   } finally { fs.closeSync(fd); }
-  }
-  for (const name of fs.readdirSync('.')) {
-    if (!name.startsWith('.warm-inputs-')) continue;
-    let fd;
-    try {
-      fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-      const st = fs.fstatSync(fd);
-      if (!st.isFile() || st.size > 4 * 1024 * 1024) continue;
-      const buffer = Buffer.alloc(4 * 1024 * 1024 + 1);
-      let length = 0, count;
-      while (length < buffer.length && (count = fs.readSync(fd, buffer, length, buffer.length - length, null))) length += count;
-      if (length > 4 * 1024 * 1024) continue;
-      const marker = JSON.parse(buffer.subarray(0, length).toString('utf8'));
-      if (typeof marker.profile === 'string' && /^[a-f0-9]{64}(?![\s\S])/.test(marker.profile)
-        && 'dev-v5-' + marker.profile === e.name && same(st, fs.lstatSync(name))) fs.unlinkSync(name);
-    } catch { /* Unknown or concurrently changed indexes survive. */ }
-    finally { if (fd !== undefined) fs.closeSync(fd); }
   }
   process.stdout.write('deleted');
 }
@@ -353,7 +337,10 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
           if (error.code !== 'ENOENT') throw error;
           result.skipped.push(e); continue;
         }
-        if (st.mtimeMs !== e.mtimeMs
+        // Indexes are independent planned entries, never a side effect of
+        // profile deletion. Revalidate their type along with scan metadata.
+        if ((e.name.startsWith('.warm-inputs-') && !st.isFile())
+          || st.mtimeMs !== e.mtimeMs
           || (e.ino !== undefined && (st.ino !== e.ino || st.dev !== e.dev))
           || (plan.now ?? Date.now()) - st.mtimeMs < Math.max(HOUR, plan.minAgeMs ?? HOUR)) {
           result.skipped.push(e); continue;
