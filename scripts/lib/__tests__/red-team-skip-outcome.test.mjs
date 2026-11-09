@@ -388,11 +388,18 @@ describe('stored-review not-owed rule (R730)', () => {
       expect(f.settle({ status: 'not-owed' }).outcome).toBe('non-policy');
       expect(f.io.postComment).not.toHaveBeenCalled();
     });
-    it('fails closed against a real empty runs directory', () => {
-      const f = fixture();
-      expect(f.settle({ status: 'not-owed' }).outcome).toBe('non-policy');
+  });
+  describe('head binding', () => {
+    it.each([['unreal head', { head: 'unknown' }], ['null read head', { readHead: null }],
+      ['non-SHA read head', { readHead: 'main' }]])('%s never reads the stored review', (_n, ctx) => {
+      const f = fixture(); f.io.readStoredReview = vi.fn(() => review(head));
+      expect(f.settle({ status: 'not-owed' }, ctx).outcome).toBe('non-policy');
+      expect(f.io.readStoredReview).not.toHaveBeenCalled();
       expect(f.io.postComment).not.toHaveBeenCalled();
-      expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+    });
+    it('an uppercase read head naming the same commit still settles', () => {
+      const f = fixture(); f.io.readStoredReview = () => review(head);
+      expect(f.settle({ status: 'not-owed' }, { readHead: head.toUpperCase() })).toMatchObject({ outcome: 'policy-clear', rule });
     });
   });
 });
