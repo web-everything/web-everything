@@ -1272,7 +1272,6 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
       } catch { /* Label repair must never block red-team recovery. */ }
       const options = { ...o, rawPrs,
         dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
-      if (process.env.WE_RED_TEAM_DISPATCH_QUEUE === 'off') return runRedTeamOnSkip(options);
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: options.log });
       return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip });
     },

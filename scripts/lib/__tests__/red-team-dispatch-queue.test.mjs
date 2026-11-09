@@ -33,7 +33,7 @@ function fixture({ maxAttempts = 3 } = {}) {
   });
   const rename = vi.fn((from, to) => {
     if (!files.has(from)) throw new Error('rename source missing');
-    JSON.parse(files.get(from));
+    if (from.endsWith('.tmp')) JSON.parse(files.get(from));
     operations.push({ type: 'rename', from, to, visible: files.get(to) });
     files.set(to, files.get(from));
     files.delete(from);
@@ -238,6 +238,15 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     }
     expect(f.queue.entries()).toEqual(before);
     expect(f.open().entries()).toEqual(before);
+  });
+
+  it('corrupt file is preserved for inspection, not overwritten', () => {
+    const f = fixture();
+    f.files.set(f.file, '{ truncated');
+    f.open();
+    expect(f.files.has(f.file)).toBe(false);
+    expect([...f.files.entries()].some(([name, text]) => name.includes('.corrupt-') && text === '{ truncated')).toBe(true);
+    expect(f.logs.some(line => line.startsWith(prefix) && line.includes('preserved'))).toBe(true);
   });
 
   it.each(['corrupt', 'unreadable'])('%s file => empty queue plus log, never throw', kind => {

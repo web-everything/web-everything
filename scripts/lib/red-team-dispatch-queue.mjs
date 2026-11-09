@@ -34,7 +34,12 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     })) throw new Error('invalid persisted entries');
     entries = copy(restored);
   } catch (error) {
-    note(log, `load unreadable or corrupt; starting empty: ${error.message}`);
+    if (error?.code !== 'ENOENT') {
+      // Keep the bad file for inspection instead of silently overwriting its ordering/attempt history.
+      let kept = 'not preserved';
+      try { rename(file, `${file}.corrupt-${now()}`); kept = 'preserved as .corrupt-<time>'; } catch { /* best effort */ }
+      note(log, `load unreadable or corrupt (${kept}); starting empty: ${error.message}`);
+    }
   }
   const persist = data => {
     if (writeFile === writeFileSync) mkdirSync(dirname(file), { recursive: true });
