@@ -268,6 +268,9 @@ describe('pending red-team check before acceptance', () => {
     // Historical fixtures carried no comments; the barrier now reads the thread, so the default is an empty one.
     // `env` defaults to an empty one so the gate source never comes from the machine's shell (standard `both`).
     function setup({ result = { ok: true }, liveHead = head, comments = [], labels = ['review:human'], readComments, env = {}, logs = [] } = {}) {
+      // The stack-hold sink now fails closed without a staged write-up, so these fixtures stage the one effect 0 would have.
+      const staged = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+      mkdirSync(dirname(staged), { recursive: true }); writeFileSync(staged, 'Accept');
       const writes = [];
       const post = vi.fn(async args => { writes.push('pending'); return result; });
       const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, env, out: line => logs.push(line),
@@ -3414,11 +3417,30 @@ describe('held item 177: the stack-hold sink', () => {
     // Only the real marker (the last line) is read — never the quoted one.
     expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0].body }]).map((m) => m.fingerprint)).toEqual(['e'.repeat(64)]);
   });
-  it('still posts the note and marker when the staged write-up is missing', async () => {
+  it('fails closed when the staged write-up is missing and not recoverable: no note, no marker', async () => {
     const posted = [];
-    const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push(body); } });
-    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-none' });
-    expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0] }])).toHaveLength(1);
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => null }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-none' }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(posted).toEqual([]);
+  });
+
+  it('recovers a missing write-up from the run record before posting the stack hold', async () => {
+    const posted = [];
+    const record = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Recovered verdict' } }] };
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => record }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' });
+    expect(posted[0]).toContain('## Recovered verdict');
+  });
+
+  it('refuses when the sidecar root itself is a symlink', async () => {
+    const real = join(root, 'real-review'); mkdirSync(real, { recursive: true });
+    mkdirSync(join(root, '.operations'), { recursive: true });
+    symlinkSync(real, join(root, '.operations', 'review'));
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => ({ id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: 'x' } }] }) }, postComment: () => {} });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(existsSync(join(real, 'run-1'))).toBe(false);
   });
 });
 

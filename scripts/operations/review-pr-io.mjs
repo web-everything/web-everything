@@ -153,6 +153,12 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
  */
 export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   const path = reviewBodyPath({ root, runId, bodyFile });
+  // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included.
+  for (const part of [join(root, '.operations'), reviewSidecarDir(root), dirname(path)]) {
+    let link = false;
+    try { link = lstatSync(part).isSymbolicLink(); } catch { /* not created yet */ }
+    if (link) throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
+  }
   let record = null;
   try { record = (runStore ?? createFileRunStore()).read(runId); } catch (e) {
     // An unreadable or corrupt record is not "no write-up": refuse before anything is published.
@@ -1863,6 +1869,8 @@ export function createReviewPrSinks({
       const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
+      // Fail closed: no staged body and no recoverable write-up means no note and no marker.
+      if (!staged.trim()) throw notApplied(`stack-hold has no staged or recoverable write-up at ${bodyPath}`, {});
       // The staged write-up quotes juror text, which an attacker's diff can steer. Defuse every HTML-comment opener in it
       // so it cannot carry a forged marker (or hide the real one); the note opens and the marker closes the comment, and
       // `parseStackMarkers` reads only those two ends.
