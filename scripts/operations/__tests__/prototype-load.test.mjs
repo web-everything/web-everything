@@ -15,7 +15,7 @@ import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import * as prototypeLoad from '../prototype-load.mjs';
-import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
+import { SINGLE_RUN_PASS_CUTOFF, QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
 import { resolveOperation } from '../run.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
@@ -337,6 +337,23 @@ describe('canonicalAuditEvidence hardening', () => {
   it('rejects a NOT WEAKENED record whose findings contradict the verdict', () => {
     const bad = auditRecord({ findings: ['WEAKENED'] });
     expect(prototypeLoad.canonicalAuditEvidence([bad], SHA)).toEqual({ ok: false, reason: 'no-record' });
+  });
+});
+
+describe('canonicalAuditEvidence: new-format passes need a fingerprint (D2)', () => {
+  const AFTER = new Date(Date.parse(SINGLE_RUN_PASS_CUTOFF) + 60000).toISOString();
+  const BEFORE = new Date(Date.parse(SINGLE_RUN_PASS_CUTOFF) - 60000).toISOString();
+  const runs = ['NOT WEAKENED', 'NOT WEAKENED'];
+  const FPX = 'e'.repeat(64);
+  it('refuses a pass after the cutoff that has no fingerprint, accepts it with one', () => {
+    const bare = auditRecord({ at: AFTER, runs, fingerprint: undefined });
+    expect(prototypeLoad.canonicalAuditEvidence([bare], SHA, () => true, FPX)).toEqual({ ok: false, reason: 'no-record' });
+    const withFp = auditRecord({ at: AFTER, runs, fingerprint: FPX });
+    expect(prototypeLoad.canonicalAuditEvidence([withFp], SHA, () => true, FPX)).toEqual({ ok: true, record: withFp });
+  });
+  it('still accepts a legacy pass before the cutoff without a fingerprint', () => {
+    const legacy = auditRecord({ at: BEFORE, fingerprint: undefined });
+    expect(prototypeLoad.canonicalAuditEvidence([legacy], SHA, () => true, FPX)).toEqual({ ok: true, record: legacy });
   });
 });
 

@@ -27,7 +27,7 @@ function fixture(answer = 'NOT WEAKENED') {
     resolveSha: vi.fn(ref => ref === 'origin/main' ? BASE : HEAD),
     runCodex: vi.fn(async () => answer),
     appendRecord: vi.fn(record => { records.push(record); }),
-    now: () => AT,
+    now: () => AT, fingerprint: vi.fn(async () => 'f'.repeat(64)),
     stdout: text => output.push(text), stderr: text => errors.push(text),
   };
   return { deps, records, output, errors };
@@ -74,7 +74,7 @@ describe('canonical audit', () => {
     expect(await main(ARGS, f.deps)).toBe(code);
     expect(f.output.join('')).toBe(`${verdict}\nscripts/example.mjs:12 why\n`);
     expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
-      questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'],
+      questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'], fingerprint: 'f'.repeat(64),
       runs: verdict === 'WEAKENED' ? ['WEAKENED'] : ['NOT WEAKENED', 'NOT WEAKENED'] }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(CANONICAL_QUESTION);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
@@ -710,16 +710,31 @@ describe('prior question hashes (AU1 PR-B)', () => {
 });
 
 describe('audit record fingerprint (R503)', () => {
-  it('stores the head net-diff fingerprint when readable and omits it when not', async () => {
+  it('stores the head net-diff fingerprint on every record', async () => {
     const fp = 'c'.repeat(64);
     const f = fixture(); f.deps.fingerprint = vi.fn(async () => fp);
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.fingerprint).toHaveBeenCalledWith(BASE, HEAD);
     expect(f.records[0]).toMatchObject({ head: HEAD, fingerprint: fp });
-    for (const bad of [async () => null, async () => { throw new Error('git'); }]) {
+  });
+
+  it.each([['null', async () => null], ['a throw', async () => { throw new Error('git'); }], ['an absent collector', undefined]])(
+    'a pass is never saved without a fingerprint (%s): exit 3, a blocking unparseable record, nothing printed', async (_, bad) => {
+      const earlier = { at: '2026-11-01T00:00:00.000Z', base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], runs: ['NOT WEAKENED', 'NOT WEAKENED'], fingerprint: 'a'.repeat(64) };
       const g = fixture(); g.deps.fingerprint = bad;
-      expect(await main(ARGS, g.deps)).toBe(0);
-      expect(g.records[0]).not.toHaveProperty('fingerprint');
-    }
+      expect(await main(ARGS, g.deps)).toBe(3);
+      expect(g.output).toEqual([]);
+      expect(g.errors.join('')).toMatch(/fingerprint/);
+      expect(g.records).toHaveLength(1);
+      expect(g.records[0]).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
+      expect(g.records[0].runs).toContain('UNPARSEABLE');
+      expect(findAudit([earlier, ...g.records], Q)).toMatchObject({ verdict: 'WEAKENED', unparseable: true });
+    });
+
+  it('a WEAKENED verdict is still saved when the fingerprint cannot be read', async () => {
+    const g = fixture('WEAKENED\nx.mjs:1 gap'); g.deps.fingerprint = async () => null;
+    expect(await main(ARGS, g.deps)).toBe(1);
+    expect(g.records[0]).toMatchObject({ verdict: 'WEAKENED' });
+    expect(g.records[0]).not.toHaveProperty('fingerprint');
   });
 });

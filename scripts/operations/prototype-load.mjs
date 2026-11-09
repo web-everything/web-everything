@@ -5,7 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
+import { QUESTION_HASH, SINGLE_RUN_PASS_CUTOFF, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
@@ -144,6 +144,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
+    // D2: a new-format pass (made after the cutoff) must carry a readable net-diff fingerprint; a legacy one need not.
+    if (!(Date.parse(record.at) < Date.parse(SINGLE_RUN_PASS_CUTOFF)) && !carriesAcross(record.fingerprint, record.fingerprint)) continue;
     // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry
     // eligibility dropped it (no or differing fingerprint): judge against ALL records, fail closed.
     if (record.questionHash !== QUESTION_HASH
