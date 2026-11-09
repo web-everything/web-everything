@@ -72,9 +72,10 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   realRequiredFailures, retryOutcome, wrongSpentStandDowns, buildResolvedSpentComment,
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
+import { recoveryPreflight } from './recovery-preflight.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
-import { decideRequiredContextRetrigger, retriggerRequiredContext, readHeadWorkflowRuns, canReadHeadWorkflowRuns,
-  createMergeGateRetriggerStore } from './merge-gate-retrigger.mjs';
+import { retriggerRequiredContext, readHeadWorkflowRuns, canReadHeadWorkflowRuns,
+  createRetriggerIo, createMergeGateRetriggerStore } from './merge-gate-retrigger.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -1348,6 +1349,8 @@ export function sweepMissingRunRecovery({
   // Injected evidence readers must also supply run-list IO; never mix fixture evidence with live GitHub reads.
   readWorkflowRuns = readRequiredContexts === defaultReadRequiredContexts ? readHeadWorkflowRuns : null,
   labelRetrigger = retriggerRequiredContext,
+  recoveryEnv = process.env, recoveryToken,
+  readRecoveryPr = key => createRetriggerIo(key).readPr(),
   retriggerLedger = createMergeGateRetriggerStore(),
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
@@ -1422,61 +1425,51 @@ export function sweepMissingRunRecovery({
   if (apply) {
     for (const d of plan.dispatch) {
       const pr = prByNumber.get(d.prNumber);
-      if (typeof readWorkflowRuns === 'function'
-        && (readWorkflowRuns !== readHeadWorkflowRuns || canReadHeadWorkflowRuns({ pr: d.prNumber, head: d.headSha }))
-        && d.baseRefName === defaultBranch && defaultBasePartialContexts?.includes('merge-gate')
-        && !pr?.statusCheckRollup?.some(row => (row?.name ?? row?.context) === 'merge-gate')) {
-        let decision;
-        let workflowRuns;
+      // Injected legacy readers without run IO preserve their ordinary push contract.
+      // An unavailable default reader has not attempted live IO. Once entered, this branch
+      // owns every decision, including failed reads, and must never fall through to a push.
+      if (typeof readWorkflowRuns === 'function' && defaultBasePartialContexts?.includes('merge-gate')
+        && !pr?.statusCheckRollup?.some(row => (row?.name ?? row?.context) === 'merge-gate')
+        && (readWorkflowRuns !== readHeadWorkflowRuns
+          || canReadHeadWorkflowRuns({ pr: d.prNumber, head: d.headSha }))) {
+        const candidate = ++retriggerCandidates;
+        let runs, live;
         try {
-          if (++retriggerCandidates <= 8) {
-            workflowRuns = readWorkflowRuns({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha });
-            decision = decideRequiredContextRetrigger({ requiredContexts: defaultBasePartialContexts,
-              rollup: pr?.statusCheckRollup, workflowRuns, alreadyRetriggered: false });
+          if (candidate <= 8) {
+            runs = readWorkflowRuns({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha });
+            live = readRecoveryPr({ repo: repoSlug(repo), pr: d.prNumber });
           }
-        } catch { /* Missing decision below refuses unreadable workflow evidence. */ }
-        if (!decision || decision.reason === 'merge-gate workflow is live'
-          || decision.reason === 'unreadable retrigger evidence; operator inspection required') {
-          const error = retriggerCandidates > 8
-            ? 'merge-gate evidence candidate bound exceeded; operator inspection required'
-            : decision?.reason?.includes('operator inspection required') ? decision.reason
-              : `${decision?.reason ?? 'merge-gate workflow evidence unreadable'}; operator inspection required`;
-          applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
-            ok: false, deferred: true, action: 'label-retrigger', labelCleared: false, error });
-          continue;
-        }
-        if (decision?.action === 'retrigger' && workflowRuns.some(run => run.name === 'Merge gate'
-          && run.event === 'pull_request_target' && run.conclusion === 'startup_failure')) {
-          // Label recovery owns this head for the sweep, including capped or spent claims.
-          // Re-apply both caps to durable markers, even for classic candidates whose
-          // push recovery budget is only per-SHA or refunds an earlier main state.
-          const comments = commentsByPr.get(d.prNumber);
-          const shaAttempts = countMissingRunComments(comments, d.headSha, { defaultBranch });
-          const prAttempts = countMissingRunComments(comments, null, { defaultBranch });
-          if (shaAttempts >= maxRetriesPerSha || prAttempts >= maxRetriesPerPr) {
-            const perSha = shaAttempts >= maxRetriesPerSha;
-            plan.refusals.push({ ...d,
-              kind: perSha ? 'missing-run-cap-exhausted' : 'missing-run-pr-cap-exhausted',
-              attempts: perSha ? shaAttempts : prAttempts,
-              why: `PR #${d.prNumber} exhausted its ${perSha ? 'per-SHA' : 'PR-wide'} missing-run retry cap (${perSha ? maxRetriesPerSha : maxRetriesPerPr}) — needs human/ci-heal inspection`,
-            });
+        } catch { /* Unknown evidence is refused by the shared preflight. */ }
+        const comments = commentsByPr.get(d.prNumber);
+        const evidence = { head: d.headSha, headRefName: d.headRefName, context: 'merge-gate',
+          runs, rollup: pr?.statusCheckRollup, defaultBranch, candidate,
+          token: recoveryToken ?? recoveryEnv.GH_TOKEN ?? recoveryEnv.GITHUB_TOKEN, env: recoveryEnv,
+          claimed: false, attemptsForSha: countMissingRunComments(comments, d.headSha, { defaultBranch }),
+          attemptsForPr: countMissingRunComments(comments, null, { defaultBranch }),
+          maxRetriesPerSha, maxRetriesPerPr };
+        const decision = recoveryPreflight({ ...evidence, pr: live, kind: 'label',
+          labels: Array.isArray(pr?.labels) ? pr.labels.map(label => typeof label === 'string' ? label : label?.name) : null });
+        if (!decision.allow) {
+          if (evidence.attemptsForSha >= maxRetriesPerSha || evidence.attemptsForPr >= maxRetriesPerPr) {
+            const perSha = evidence.attemptsForSha >= maxRetriesPerSha;
+            plan.refusals.push({ ...d, kind: perSha ? 'missing-run-cap-exhausted' : 'missing-run-pr-cap-exhausted',
+              attempts: perSha ? evidence.attemptsForSha : evidence.attemptsForPr, why: decision.reason });
             continue;
           }
-          let result;
-          try {
-            result = labelRetrigger({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha,
-              context: decision.context, defaultBranch, ledger: retriggerLedger });
-          } catch (error) { result = { ok: false, deferred: true, error: String(error.message ?? error) }; }
-          // Record every label attempt through the same durable marker path as push recovery,
-          // so both per-head and PR-wide caps include successes and failures.
-          postComment(d.prNumber, {
-            repo, headRefName: d.headRefName, headSha: d.headSha, mainGreen,
-            ok: result?.ok === true, action: 'label-event', error: result?.error ?? null,
-          });
           applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
-            action: 'label-retrigger', labelCleared: false, ...result });
+            ok: false, deferred: true, action: 'label-retrigger', labelCleared: false, error: decision.reason });
           continue;
         }
+        let result;
+        try {
+          result = labelRetrigger({ ...evidence, repo: repoSlug(repo), pr: d.prNumber,
+            ledger: retriggerLedger });
+        } catch (error) { result = { ok: false, deferred: true, error: String(error.message ?? error) }; }
+        postComment(d.prNumber, { repo, headRefName: d.headRefName, headSha: d.headSha, mainGreen,
+          ok: result?.ok === true, action: 'label-event', error: result?.error ?? null });
+        applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
+          action: 'label-retrigger', labelCleared: false, ...result });
+        continue;
       }
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.

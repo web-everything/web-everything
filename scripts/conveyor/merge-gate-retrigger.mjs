@@ -7,29 +7,9 @@ import { isGhDeferred } from '../lib/gh-deferred.mjs';
 
 // Watched by merge-gate's review: prefix; exact-name review holds ignore this sentinel.
 export const RETRIGGER_LABEL = 'review:merge-gate-retrigger';
-const skip = reason => ({ action: 'skip', reason });
 const text = value => typeof value === 'string' && value.trim().length > 0;
-
-/** Only an absent merge-gate context with no run or a latest startup failure is repairable here. */
-export function decideRequiredContextRetrigger(input) {
-  if (!input || !Array.isArray(input.requiredContexts) || !input.requiredContexts.every(text)
-    || !Array.isArray(input.rollup) || !input.rollup.every(row => row && text(row.name ?? row.context))
-    || !Array.isArray(input.workflowRuns) || typeof input.alreadyRetriggered !== 'boolean'
-    || !input.workflowRuns.every(run => run && text(run.name) && text(run.event)
-      && text(run.status) && Number.isFinite(Date.parse(run.created_at)) && Number.isSafeInteger(run.id)
-      && (run.conclusion === null || text(run.conclusion)))) return skip('unreadable retrigger evidence; operator inspection required');
-  if (input.alreadyRetriggered) return skip('retrigger already spent for this head');
-  if (!input.requiredContexts.includes('merge-gate')) return skip('merge-gate is not required');
-  if (input.rollup.some(row => (row.name ?? row.context) === 'merge-gate')) return skip('merge-gate context is already present');
-  const runs = input.workflowRuns.filter(run => run.name === 'Merge gate' && run.event === 'pull_request_target');
-  if (runs.some(run => ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(run.status)))
-    return skip('merge-gate workflow is live');
-  runs.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
-  if (runs.length && !(runs[0].status === 'completed' && runs[0].conclusion === 'startup_failure'))
-    return skip('latest merge-gate run is not a startup failure; operator inspection required');
-  return { action: 'retrigger', context: 'merge-gate', reason: runs.length ? 'missing context after startup failure' : 'missing context and workflow run' };
-}
-
+export { decideRequiredContextRetrigger } from './recovery-preflight.mjs';
+import { recoveryPreflight } from './recovery-preflight.mjs';
 export const mergeGateRetriggerStatePath = () => join(homedir(), '.claude', 'conveyor', 'merge-gate-retrigger-state.json');
 
 /** Append-only, locked claims. Errors and failed attempts never release a spent key. */
@@ -102,7 +82,7 @@ export function createRetriggerIo({ repo, pr, exec = execFileSyncThrottled }) {
       const live = JSON.parse(api([`repos/${repo}/pulls/${pr}`], exec));
       return {
         state: typeof live?.state === 'string' ? live.state.toUpperCase() : null,
-        baseRefName: live?.base?.ref, headRefOid: live?.head?.sha,
+        headRefName: live?.head?.ref, baseRefName: live?.base?.ref, headRefOid: live?.head?.sha,
         isCrossRepository: text(live?.head?.repo?.full_name) && text(live?.base?.repo?.full_name)
           ? live.head.repo.full_name !== live.base.repo.full_name : null,
         mergeable: live?.mergeable === true ? 'MERGEABLE' : live?.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
@@ -124,7 +104,8 @@ export function createRetriggerIo({ repo, pr, exec = execFileSyncThrottled }) {
 }
 
 /** Synchronous so the synchronous sweep observes completion; also usable with await. */
-export function retriggerRequiredContext({ repo, pr, head, context, defaultBranch = 'main', io, ledger = createMergeGateRetriggerStore() }) {
+export function retriggerRequiredContext({ repo, pr, head, context, defaultBranch = 'main', io, ledger = createMergeGateRetriggerStore(),
+  headRefName, runs, rollup, token, env = process.env, ...evidence }) {
   const defer = error => ({ ok: false, deferred: true, action: 'label-retrigger', error });
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !Number.isSafeInteger(pr) || pr <= 0
     || !/^[a-f0-9]{40}$/i.test(head ?? '') || context !== 'merge-gate') return defer('invalid retrigger key');
@@ -139,12 +120,10 @@ export function retriggerRequiredContext({ repo, pr, head, context, defaultBranc
     let live;
     try { live = io.readPr(); }
     catch { return defer('live PR unreadable; operator inspection required'); }
-    if (live?.state !== 'OPEN' || !text(defaultBranch) || live?.baseRefName !== defaultBranch
-      || live?.isCrossRepository !== false || live?.mergeable !== 'MERGEABLE'
-      || live?.headRefOid !== head)
-      return defer('live PR is ineligible or incomplete; operator inspection required');
-    if (labels.includes(RETRIGGER_LABEL) && io.removeLabel(RETRIGGER_LABEL)?.ok !== true)
-      throw new Error('stale sentinel label removal unconfirmed; operator inspection required');
+    const decision = recoveryPreflight({ ...evidence, pr: live, head, headRefName, context,
+      runs, rollup, token: token ?? env.GH_TOKEN ?? env.GITHUB_TOKEN, env, claimed: evidence.claimed ?? false,
+      defaultBranch, kind: 'label', labels });
+    if (!decision.allow) return defer(decision.reason);
     if (io.addLabel(RETRIGGER_LABEL)?.ok !== true) throw new Error('label addition unconfirmed');
   } catch (error) { return defer(String(error.message ?? error)); }
   const result = { ok: true, action: 'label-retrigger' };

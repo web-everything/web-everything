@@ -8,8 +8,9 @@ import { sweepMissingRunRecovery } from '../ci-red-recovery-watch.mjs';
 
 const repo = 'web-everything/web-everything';
 const head = 'a'.repeat(40);
-const livePr = { state: 'OPEN', baseRefName: 'main', headRefOid: head, isCrossRepository: false, mergeable: 'MERGEABLE' };
-const restPr = { state: 'open', head: { sha: head, repo: { full_name: repo } },
+const admission = { headRefName: 'lane/0', token: 'ghp_fixture', runs: [], rollup: [] };
+const livePr = { headRefName: 'lane/0', state: 'OPEN', baseRefName: 'main', headRefOid: head, isCrossRepository: false, mergeable: 'MERGEABLE' };
+const restPr = { state: 'open', head: { sha: head, ref: 'lane/0', repo: { full_name: repo } },
   base: { ref: 'main', repo: { full_name: repo } }, mergeable: true };
 
 describe('merge-gate retrigger safety', () => {
@@ -57,7 +58,7 @@ describe('merge-gate retrigger safety', () => {
       expect(createMergeGateRetriggerStore({ path }).claim({ ...key, pr: 2 })).toBe(true);
       writeFileSync(path, '{broken');
       const io = { readHead: vi.fn(), addLabel: vi.fn() };
-      expect(retriggerRequiredContext({ ...key, ledger: createMergeGateRetriggerStore({ path }), io }).ok).toBe(false);
+      expect(retriggerRequiredContext({ ...admission, ...key, ledger: createMergeGateRetriggerStore({ path }), io }).ok).toBe(false);
       expect(io.readHead).not.toHaveBeenCalled();
       expect(io.addLabel).not.toHaveBeenCalled();
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -70,11 +71,11 @@ describe('merge-gate retrigger safety', () => {
       const key = { repo, pr: 1, head, context: 'merge-gate' };
       const io = labelIo();
       io.readHead.mockReturnValue('b'.repeat(40));
-      expect(retriggerRequiredContext({ ...key, io, ledger: createMergeGateRetriggerStore({ path }) }))
+      expect(retriggerRequiredContext({ ...admission, ...key, io, ledger: createMergeGateRetriggerStore({ path }) }))
         .toEqual(expect.objectContaining({ ok: false, deferred: true,
           error: 'live head moved or is unreadable; operator inspection required' }));
       expect(createMergeGateRetriggerStore({ path }).claim(key)).toBe(false);
-      expect(retriggerRequiredContext({ ...key, io, ledger: createMergeGateRetriggerStore({ path }) }))
+      expect(retriggerRequiredContext({ ...admission, ...key, io, ledger: createMergeGateRetriggerStore({ path }) }))
         .toEqual(expect.objectContaining({ ok: false, deferred: true,
           error: 'retrigger already spent or claim unavailable' }));
       expect(io.readHead).toHaveBeenCalledTimes(1);
@@ -87,7 +88,7 @@ describe('merge-gate retrigger safety', () => {
   it('unreadable live head spends the claim without sending a label event', () => {
     const io = { readHead: () => { throw new Error('unreadable'); }, addLabel: vi.fn() };
     const claim = vi.fn(() => true);
-    expect(retriggerRequiredContext({ repo, pr: 1, head, context: 'merge-gate', io, ledger: { claim } }).ok).toBe(false);
+    expect(retriggerRequiredContext({ ...admission, repo, pr: 1, head, context: 'merge-gate', io, ledger: { claim } }).ok).toBe(false);
     expect(claim).toHaveBeenCalledTimes(1);
     expect(io.addLabel).not.toHaveBeenCalled();
   });
@@ -115,10 +116,11 @@ describe('merge-gate retrigger safety', () => {
     const labelRetrigger = vi.fn();
     const claim = vi.fn();
     const trigger = vi.fn(() => ({ ok: false, deferred: true, error: 'existing recovery deferred' }));
-    const result = sweepMissingRunRecovery({ repo, apply: true, mainRuns: [],
+    const result = sweepMissingRunRecovery({ recoveryToken: 'ghp_fixture',
+      readRecoveryPr: ({ pr }) => ({ ...livePr, headRefName: `lane/${pr}` }), repo, apply: true, mainRuns: [],
       now: Date.parse('2026-10-13T12:00:00Z'),
       readOpenPrs: () => [{ number: 1, headRefName: 'lane/1', headRefOid: head, baseRefName: 'main',
-        mergeable: 'MERGEABLE', statusCheckRollup: [
+        mergeable: 'MERGEABLE', labels: [], statusCheckRollup: [
           { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
         ] }],
       readRequiredContexts: () => ['test'], readAttributedRequiredChecks: () => ['test', 'merge-gate'],
@@ -175,9 +177,10 @@ describe('merge-gate retrigger safety', () => {
     const postComment = vi.fn();
     const clearLabel = vi.fn(() => true);
     const prs = Array.from({ length: count }, (_, i) => ({ number: i + 1, headRefName: `lane/${i}`,
-      headRefOid: head, baseRefName: 'main', mergeable: 'MERGEABLE',
+      headRefOid: head, baseRefName: 'main', mergeable: 'MERGEABLE', labels: [],
       statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] }));
-    const result = sweepMissingRunRecovery({ repo, apply: true, mainRuns: [],
+    const result = sweepMissingRunRecovery({ recoveryToken: 'ghp_fixture',
+      readRecoveryPr: ({ pr }) => ({ ...livePr, headRefName: `lane/${pr - 1}` }), repo, apply: true, mainRuns: [],
       now: Date.parse('2026-10-13T12:00:00Z'), readOpenPrs: () => prs,
       readRequiredContexts: () => ['test'], readAttributedRequiredChecks: () => ['test', 'merge-gate'],
       readHeadCommittedAt: () => '2026-10-12T00:00:00Z', readPush: () => null, readComments: () => [],
@@ -201,7 +204,7 @@ describe('merge-gate retrigger safety', () => {
       const path = join(root, 'state.json');
       const io = labelIo();
       io.readLabels.mockImplementation(() => { throw new Error('transient label-read failure'); });
-      const labelRetrigger = vi.fn(options => retriggerRequiredContext({ ...options, io }));
+      const labelRetrigger = vi.fn(options => retriggerRequiredContext({ ...admission, ...options, io }));
       const first = sweepWithRuns(() => [startupFailure], 1, {
         labelRetrigger, retriggerLedger: createMergeGateRetriggerStore({ path }),
       });
@@ -248,7 +251,7 @@ describe('merge-gate retrigger safety', () => {
   it('submitted label event with failed cleanup completes recovery without an empty commit', () => {
     const io = labelIo();
     io.removeLabel.mockImplementation(() => { throw new Error('cleanup failed'); });
-    const labelRetrigger = vi.fn(options => retriggerRequiredContext({ ...options, io }));
+    const labelRetrigger = vi.fn(options => retriggerRequiredContext({ ...admission, ...options, io }));
     const { result, trigger, postComment } = sweepWithRuns(() => [startupFailure], 1, {
       labelRetrigger, retriggerLedger: { claim: () => true },
     });
@@ -263,31 +266,32 @@ describe('merge-gate retrigger safety', () => {
   it.each([
     ['no runs', () => []],
     ['unrelated startup failure', () => [{ ...startupFailure, name: 'CI' }]],
-    ['latest successful run', () => [startupFailure, { ...startupFailure, id: 102,
-      created_at: '2026-10-13T12:00:00Z', conclusion: 'success' }]],
-  ])('%s preserves the existing empty-commit recovery and bookkeeping', (_name, readWorkflowRuns) => {
-    const { result, labelRetrigger, trigger, postComment, clearLabel } = sweepWithRuns(readWorkflowRuns);
+  ])('%s uses label recovery without a push', (_name, reader) => {
+    const { labelRetrigger, trigger } = sweepWithRuns(reader);
+    expect(labelRetrigger).toHaveBeenCalledTimes(1);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+  it('latest successful run refuses label and push recovery', () => {
+    const { result, labelRetrigger, trigger } = sweepWithRuns(() => [{ ...startupFailure, conclusion: 'success' }]);
     expect(labelRetrigger).not.toHaveBeenCalled();
-    expect(trigger).toHaveBeenCalledTimes(1);
-    expect(postComment).toHaveBeenCalledTimes(1);
-    expect(clearLabel).toHaveBeenCalledTimes(1);
-    expect(result.applied).toEqual([expect.objectContaining({ ok: true, action: 'pull-request-push', labelCleared: true })]);
+    expect(trigger).not.toHaveBeenCalled();
+    expect(result.applied[0]).toMatchObject({ deferred: true, error: expect.stringContaining('not a startup failure') });
   });
 
   it.each([
-    ['workflow read throws', () => { throw new Error('unreadable'); }],
-    ['workflow read is unreadable', () => null],
-    ['workflow evidence is malformed', () => [{}]],
+    ['workflow read throws', () => { throw new Error('unreadable'); }, 'operator inspection required'],
+    ['workflow read is unreadable', () => null, 'operator inspection required'],
+    ['workflow evidence is malformed', () => [{}], 'operator inspection required'],
     ['workflow run is still live', () => [startupFailure, { ...startupFailure, id: 102,
-      status: 'in_progress', conclusion: null }]],
-  ])('%s defers merge-gate recovery without a push', (_name, reader) => {
+      status: 'in_progress', conclusion: null }], 'merge-gate workflow is live'],
+  ])('%s defers merge-gate recovery without a push', (_name, reader, reason) => {
     const { result, trigger, labelRetrigger, postComment, clearLabel } = sweepWithRuns(reader);
     expect(trigger).not.toHaveBeenCalled();
     expect(labelRetrigger).not.toHaveBeenCalled();
     expect(postComment).not.toHaveBeenCalled();
     expect(clearLabel).not.toHaveBeenCalled();
     expect(result.applied).toEqual([expect.objectContaining({ ok: false, deferred: true,
-      error: expect.stringContaining('operator inspection required') })]);
+      error: expect.stringContaining(reason) })]);
   });
 
   it('non-merge-gate missing contexts retain push recovery without workflow evidence reads or bounds', () => {
@@ -299,6 +303,24 @@ describe('merge-gate retrigger safety', () => {
     expect(trigger).toHaveBeenCalledTimes(9);
     expect(result.applied).toHaveLength(9);
     expect(result.applied.every(row => row.action === 'pull-request-push' && row.ok)).toBe(true);
+  });
+
+  it.each(['SUCCESS', 'FAILURE', 'CANCELLED', 'TIMED_OUT'])('a present %s merge-gate with a missing required test invokes push recovery without label IO', conclusion => {
+    const readWorkflowRuns = vi.fn(() => []);
+    const readRecoveryPr = vi.fn(() => livePr);
+    const { trigger, labelRetrigger, result } = sweepWithRuns(readWorkflowRuns, 1, {
+      readRecoveryPr,
+      readOpenPrs: () => [{ number: 1, ...livePr, labels: [], statusCheckRollup: [
+        { __typename: 'CheckRun', name: 'merge-gate', status: 'COMPLETED', conclusion },
+      ] }],
+    });
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ prNumber: 1, headSha: head }),
+      { repo, defaultBranch: 'main' });
+    expect(labelRetrigger).not.toHaveBeenCalled();
+    expect(readWorkflowRuns).not.toHaveBeenCalled();
+    expect(readRecoveryPr).not.toHaveBeenCalled();
+    expect(result.applied).toEqual([expect.objectContaining({ ok: true, action: 'pull-request-push' })]);
   });
 
   it('injected protection evidence without run-list IO preserves push recovery', () => {
@@ -313,7 +335,7 @@ describe('merge-gate retrigger safety', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('default workflow reader without gh skips the run-list read and preserves push recovery', () => {
+  it('unavailable default workflow reader preserves ordinary push recovery without label IO', () => {
     vi.stubEnv('PATH', '');
     try {
       expect(readHeadWorkflowRuns({ repo, pr: 1, head })).toBeNull();
@@ -338,7 +360,7 @@ describe('merge-gate retrigger safety', () => {
       addLabel: vi.fn(() => ({ ok: true })), removeLabel: vi.fn(() => ({ ok: true })) };
   }
   function retrigger(io) {
-    return retriggerRequiredContext({ repo, pr: 1, head, context: 'merge-gate', io, ledger: { claim: () => true } });
+    return retriggerRequiredContext({ ...admission, repo, pr: 1, head, context: 'merge-gate', io, ledger: { claim: () => true } });
   }
 
   it.each([
@@ -376,22 +398,19 @@ describe('merge-gate retrigger safety', () => {
 
   it('live PR base must match the passed default branch', () => {
     const io = labelIo();
-    expect(retriggerRequiredContext({ repo, pr: 1, head, context: 'merge-gate', defaultBranch: 'trunk',
+    expect(retriggerRequiredContext({ ...admission, repo, pr: 1, head, context: 'merge-gate', defaultBranch: 'trunk',
       io, ledger: { claim: () => true } })).toEqual(expect.objectContaining({ deferred: true }));
     expect(io.addLabel).not.toHaveBeenCalled();
     io.readPr.mockReturnValue({ ...livePr, baseRefName: 'trunk' });
-    expect(retriggerRequiredContext({ repo, pr: 1, head, context: 'merge-gate', defaultBranch: 'trunk',
+    expect(retriggerRequiredContext({ ...admission, repo, pr: 1, head, context: 'merge-gate', defaultBranch: 'trunk',
       io, ledger: { claim: () => true } }).ok).toBe(true);
   });
 
-  it('stale sentinel label is removed before the fresh label transition', () => {
+  it('stale sentinel label refuses every label mutation', () => {
     const io = labelIo(['other', 'review:merge-gate-retrigger']);
-    expect(retrigger(io)).toEqual({ ok: true, action: 'label-retrigger' });
-    expect(io.removeLabel.mock.calls).toEqual([['review:merge-gate-retrigger'], ['review:merge-gate-retrigger']]);
-    const order = [io.readHead.mock.invocationCallOrder[0], io.readLabels.mock.invocationCallOrder[0],
-      io.readPr.mock.invocationCallOrder[0], io.removeLabel.mock.invocationCallOrder[0], io.addLabel.mock.invocationCallOrder[0],
-      io.removeLabel.mock.invocationCallOrder[1]];
-    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(retrigger(io)).toMatchObject({ ok: false, error: expect.stringContaining('stale sentinel') });
+    expect(io.removeLabel).not.toHaveBeenCalled();
+    expect(io.addLabel).not.toHaveBeenCalled();
   });
 
   it.each(['throw', 'unconfirmed'])('failed stale sentinel pre-removal (%s) refuses label addition', kind => {
@@ -401,7 +420,7 @@ describe('merge-gate retrigger safety', () => {
       return { ok: false };
     });
     expect(retrigger(io).ok).toBe(false);
-    expect(io.removeLabel).toHaveBeenCalledTimes(1);
+    expect(io.removeLabel).not.toHaveBeenCalled();
     expect(io.addLabel).not.toHaveBeenCalled();
   });
 

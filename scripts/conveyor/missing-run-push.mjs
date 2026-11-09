@@ -2,6 +2,7 @@
  * Uses a scratch bare repository: no daemon checkout, index or branch is changed.
  * A marked recovery tip is never nudged again, even if posting its comment failed.
  */
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +11,8 @@ import { pushRefusal } from './fix-procedure.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
 import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
+
+import { recoveryPreflight } from './recovery-preflight.mjs';
 
 export const RECOVERY_COMMIT_MARKER = 'Conveyor-Missing-Run-Recovery:';
 
@@ -39,6 +42,7 @@ export function ownerInstallationToken(repo, { env = process.env, readCache = de
 export function pushMissingRunCommit(d, {
   repo, defaultBranch = 'main', exec = execFileSyncThrottled, env = process.env,
   checkClaim = pushRefusal, readCache = defaultReadCache, now = Date.now(),
+  recoveryEvidence = {},
 } = {}) {
   const action = 'pull-request-push';
   const defer = (error) => ({ ok: false, action, deferred: true, error });
@@ -72,6 +76,16 @@ export function pushMissingRunCommit(d, {
     // An ineligible credential is structural (config, not a race): count it so the per-sha cap hands the PR
     // off instead of re-planning it every tick forever.
     if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, action, error: MISSING_RUN_CREDENTIAL_REFUSAL };
+    const admission = recoveryPreflight({ ...recoveryEvidence, pr: {
+      state: pr.state.toUpperCase(), baseRefName: pr.base.ref, headRefOid: pr.head.sha,
+      headRefName: pr.head.ref, isCrossRepository: pr.head.repo.full_name !== repo,
+      mergeable: pr.mergeable === true ? 'MERGEABLE' : 'UNKNOWN',
+    }, head: d.headSha, headRefName: d.headRefName, kind: 'push', claimed: recoveryEvidence.claimed ?? false,
+      defaultBranch, token, env: ownerToken ? { ...env,
+        WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(token).digest('hex'),
+        WE_GH_AUTH_INSTALLATION: String(installationForOwner(ownerOfSlug(repo), env)),
+      } : env });
+    if (!admission.allow) return defer(admission.reason);
     scratch = mkdtempSync(join(tmpdir(), 'we-missing-run-'));
     // Pin git to the credential just validated, overriding stored helpers and auth
     // headers. The secret is only in the child environment, never argv or logs.

@@ -11,6 +11,7 @@ beforeAll(async () => {
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
+const admission = { headRefName: 'lane/recovery', token: 'ghp_fixture', runs: [], rollup: [] };
 const run = (overrides = {}) => ({
   name: 'Merge gate', event: 'pull_request_target', conclusion: 'startup_failure',
   status: 'completed', created_at: '2026-10-13T11:00:00Z', id: 101, ...overrides,
@@ -32,7 +33,7 @@ function claimLedger() {
 
 function effects(overrides = {}) {
   return {
-    readPr: vi.fn(() => ({ state: 'OPEN', baseRefName: 'main', headRefOid: HEAD, isCrossRepository: false, mergeable: 'MERGEABLE' })),
+    readPr: vi.fn(() => ({ headRefName: 'lane/recovery', state: 'OPEN', baseRefName: 'main', headRefOid: HEAD, isCrossRepository: false, mergeable: 'MERGEABLE' })),
     readHead: vi.fn(() => HEAD), readLabels: vi.fn(() => []), addLabel: vi.fn(() => ({ ok: true })),
     removeLabel: vi.fn(() => ({ ok: true })), ...overrides,
   };
@@ -62,7 +63,7 @@ describe('required merge-gate context retrigger', () => {
     expect(RETRIGGER_LABEL).toBe('review:merge-gate-retrigger');
     const ledger = claimLedger();
     const io = effects();
-    const result = await retriggerRequiredContext({ repo: REPO, pr: 5060, head: HEAD, context: decision.context, io, ledger });
+    const result = await retriggerRequiredContext({ ...admission, repo: REPO, pr: 5060, head: HEAD, context: decision.context, io, ledger });
     expect(result.ok).toBe(true);
     expect(ledger.claim).toHaveBeenCalledTimes(1);
     expect(io.readHead).toHaveBeenCalledTimes(1);
@@ -79,7 +80,7 @@ describe('required merge-gate context retrigger', () => {
     const decision = decideRequiredContextRetrigger(facts({ workflowRuns: [] }));
     expect(decision).toEqual(expect.objectContaining({ action: 'retrigger', context: 'merge-gate' }));
     const io = effects();
-    await retriggerRequiredContext({ repo: REPO, pr: 5060, head: HEAD, context: decision.context, io, ledger: claimLedger() });
+    await retriggerRequiredContext({ ...admission, repo: REPO, pr: 5060, head: HEAD, context: decision.context, io, ledger: claimLedger() });
     expect(io.addLabel).toHaveBeenCalledTimes(1);
     expect(io.addLabel).toHaveBeenCalledWith(RETRIGGER_LABEL);
     expect(io.removeLabel).toHaveBeenCalledTimes(1);
@@ -89,7 +90,7 @@ describe('required merge-gate context retrigger', () => {
   it('a second tick on the same head is a no-op', async () => {
     const ledger = claimLedger();
     const io = effects();
-    const args = { repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger };
+    const args = { ...admission, repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger };
     await retriggerRequiredContext(args);
     await retriggerRequiredContext(args);
     expect(ledger.claim).toHaveBeenCalledTimes(2);
@@ -131,7 +132,7 @@ describe('required merge-gate context retrigger', () => {
   it('moved head gives no label event', async () => {
     const ledger = claimLedger();
     const io = effects({ readHead: vi.fn(() => 'b'.repeat(40)) });
-    await retriggerRequiredContext({ repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger });
+    await retriggerRequiredContext({ ...admission, repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger });
     expect(ledger.claim).toHaveBeenCalledTimes(1);
     expect(io.readHead).toHaveBeenCalledTimes(1);
     expect(io.addLabel).not.toHaveBeenCalled();
@@ -140,7 +141,7 @@ describe('required merge-gate context retrigger', () => {
 
   it('add failure skips remove and reports failure', async () => {
     const io = effects({ addLabel: vi.fn(() => { throw new Error('label add rejected'); }) });
-    const result = await retriggerRequiredContext({ repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger: claimLedger() });
+    const result = await retriggerRequiredContext({ ...admission, repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger: claimLedger() });
     expect(result.ok).toBe(false);
     expect(io.addLabel).toHaveBeenCalledTimes(1);
     expect(io.removeLabel).not.toHaveBeenCalled();
@@ -148,7 +149,7 @@ describe('required merge-gate context retrigger', () => {
 
   it('remove failure reports ok with a warning after the label event', async () => {
     const io = effects({ removeLabel: vi.fn(() => { throw new Error('label removal rejected'); }) });
-    const result = await retriggerRequiredContext({ repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger: claimLedger() });
+    const result = await retriggerRequiredContext({ ...admission, repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate', io, ledger: claimLedger() });
     expect(result.ok).toBe(true);
     expect(result.warning).toEqual(expect.any(String));
     expect(result.warning.trim()).not.toBe('');
@@ -171,7 +172,7 @@ describe('required merge-gate context retrigger', () => {
     const ios = Array.from({ length: 5 }, () => effects());
     for (let tick = 0; tick < 3; tick++) {
       for (let index = 0; index < ios.length; index++) {
-        await retriggerRequiredContext({ repo: REPO, pr: 5060 + index, head: HEAD,
+        await retriggerRequiredContext({ ...admission, repo: REPO, pr: 5060 + index, head: HEAD,
           context: 'merge-gate', io: ios[index], ledger });
       }
     }

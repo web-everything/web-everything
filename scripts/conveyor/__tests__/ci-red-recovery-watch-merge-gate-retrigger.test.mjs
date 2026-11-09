@@ -37,6 +37,9 @@ function fixture() {
     status: 'completed', created_at: '2026-10-13T11:00:00Z', id: 101,
   }]);
   const options = {
+    recoveryToken: 'ghp_fixture',
+    readRecoveryPr: () => ({ state: 'OPEN', headRefName: 'lane/5060', baseRefName: 'main',
+      headRefOid: HEAD, isCrossRepository: false, mergeable: 'MERGEABLE' }),
     repo: REPO, mainRuns: [], now: Date.parse('2026-10-13T12:00:00Z'),
     readOpenPrs: () => [{
       number: 5060, headRefName: 'lane/5060', baseRefName: 'main', headRefOid: HEAD,
