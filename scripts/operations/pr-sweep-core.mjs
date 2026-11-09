@@ -27,6 +27,7 @@
  * exact next action. PURE: no fs, no clock, no network, no process in this file (`pr-sweep-io.mjs` has them all).
  */
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { NO_ASK_NOTE_KINDS } from '../lib/pr-comment-policy.mjs';
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
@@ -129,7 +130,15 @@ export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardRea
 export function needsDecisionOpen(comments, { headCommittedAt = null } = {}) {
   const list = sorted(comments);
   let note = null;
-  for (const e of list) if (trusted(e) && NEEDS_DECISION_RE.test(bodyOf(e.c))) note = e;
+  for (const e of list) {
+    if (!trusted(e) || !NEEDS_DECISION_RE.test(bodyOf(e.c))) continue;
+    // Persisted notes used the decision header even when their kind explicitly declared no ask.
+    // Skip them during selection so a later informational note cannot hide an earlier real ask.
+    const headline = bodyOf(e.c).split('\n').map((line) => line.trim()).filter(Boolean)[1] ?? '';
+    const kind = /^needs your decision:\s*(.+)$/i.exec(headline)?.[1];
+    if (NO_ASK_NOTE_KINDS.includes(kind)) continue;
+    note = e;
+  }
   if (!note || note.at === null) return null;
   const pushed = t(headCommittedAt);
   if (pushed !== null && pushed > note.at) return null;

@@ -587,7 +587,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
       && timestamp(run.updated_at) < removedAt);
     const mainRed = ['failure', 'cancelled', 'timed_out'].includes(before?.conclusion);
     newest.sort((a, b) => timestamp(b.created_at) - timestamp(a.created_at) || b.id - a.id);
-    const ignored = new Set([...infraConclusions, 'stale', 'action_required']);
+    // R780: timed_out is red (decides, declines); cancelled and the rest stay skipped.
+    const ignored = new Set([...infraConclusions].filter(c => c !== 'timed_out').concat('stale', 'action_required'));
     const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
     const stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
