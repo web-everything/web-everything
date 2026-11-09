@@ -127,12 +127,13 @@ function readLedger(path) {
   });
 }
 
-async function fileInCheckout(input) {
+export async function fileInCheckout(input, run = runOperationCli) {
   // This binding resolves file-item from script location, so every card lands in this lane.
   const { fileItemForPrevention } = await import('./review-loop-cli.mjs');
   // The shared argv builder expects scope, but unscoped cards must omit that flag.
-  return fileItemForPrevention({ ...input, scope: input.scope ?? '' }, {
-    run: args => runOperationCli({ ...args, argv: args.argv.filter(arg => arg !== '--scope=') }),
+  // size is never set for a held card; an omitted one must reach file-item as absent, not as the string 'undefined'.
+  return fileItemForPrevention({ ...input, scope: input.scope ?? '', size: input.size ?? '' }, {
+    run: args => run({ ...args, argv: args.argv.filter(arg => arg !== '--scope=' && arg !== '--size=') }),
   });
 }
 
@@ -271,8 +272,16 @@ export function fileHeldCardsOperation() {
 }
 
 export function createFileHeldCardsSinks(deps) {
-  return { [BATCH_EFFECT]: input => runFileHeldCards({ ...input, source: input.source || undefined,
-    dryRun: input['dry-run'], deps: { ...deps, log: () => {} } }) };
+  return { [BATCH_EFFECT]: async input => {
+    const result = await runFileHeldCards({ ...input, source: input.source || undefined,
+      dryRun: input['dry-run'], deps: { ...deps, log: () => {} } });
+    // A failed or refused card must fail the run itself (CLI exit and HTTP status alike), not only the CLI finisher.
+    if (result.failed.length || result.refused.length) {
+      const tags = [...result.failed, ...result.refused].map(card => card.tag).join(', ');
+      throw new Error(safeLog(`file-held-cards: ${result.failed.length} failed and ${result.refused.length} refused card(s) (${tags}); ${result.filed.length} filed`));
+    }
+    return result;
+  } };
 }
 
 export function finishFileHeldCards(outcome, json = false) {

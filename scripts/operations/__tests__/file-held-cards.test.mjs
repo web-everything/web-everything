@@ -7,7 +7,7 @@ import { qualifyBareBasenames } from '../file-held-cards.mjs';
 import { sizeRefusal } from '../../backlog/scaffold.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
 import * as heldCards from '../file-held-cards.mjs';
-import { finishFileHeldCards, createFileHeldCardsSinks, parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards } from '../file-held-cards.mjs';
+import { finishFileHeldCards, createFileHeldCardsSinks, fileInCheckout, parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards } from '../file-held-cards.mjs';
 import { operatorControlCliPolicy, resolveOperation } from '../run.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
@@ -337,4 +337,23 @@ it('refuses to proceed while a ledgered card exists nowhere (discarded lane)', a
   rmSync(join(root, 'backlog', 'xtest.md'));
   seed('- [R1] 2026-11-08: one\n- [R1] 2026-11-08: two');
   await expect(run()).rejects.toThrow(/ledgered card/);
+});
+
+it('the production filing binding never sends an undefined or empty size or scope flag', async () => {
+  const run = vi.fn(async () => ({ code: 0, lines: ['{}'] }));
+  await fileInCheckout({ title: 't', kind: 'task', digest: 'd', queue: 'q' }, run);
+  const argv = run.mock.calls[0][0].argv;
+  expect(argv.join(' ')).not.toMatch(/undefined/);
+  expect(argv).not.toContain('--size=');
+  expect(argv).not.toContain('--scope=');
+});
+
+it('a failed or refused card fails the run itself, not only the CLI finisher', async () => {
+  seed('- [R1] 2026-11-08: bad /Users/x/y\n- [R1] 2026-11-08: good one');
+  const sink = createFileHeldCardsSinks({ root, fileItem })['file-held-cards.file'];
+  await expect(sink({ source, max: 10, 'dry-run': false })).rejects.toThrow(/1 refused/);
+  expect(readFileSync(ledger, 'utf8').trim().split('\n')).toHaveLength(1);
+  seed('- [R2] 2026-11-08: Next one');
+  fileItem.mockResolvedValue({ code: 1, lines: ['refused'] });
+  await expect(sink({ source, max: 10, 'dry-run': false })).rejects.toThrow(/1 failed/);
 });
