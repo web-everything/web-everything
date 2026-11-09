@@ -154,7 +154,7 @@ export async function rebuildCloneAsJob({
   mkdirSync(store.dir, { recursive: true });
   const kind = REBUILD_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
-  const snap = snapshot ?? { repoDir: root, install: cloneNodeModulesInstaller(root) };
+  const snap = snapshot ?? { repoDir: root, install: npmCiInstaller() };
   const tickClock = clock ?? clockFor(store.dir);
 
   // 1. Consume finished jobs once (oldest first) and say what each did — the job's outcome reaches the daemon log.

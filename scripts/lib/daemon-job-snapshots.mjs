@@ -16,14 +16,15 @@
  *   Every real child call (`git archive | tar`, `npm ci`) is bounded and injectable for tests.
  */
 
-import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import * as childProcess from 'node:child_process';
 import * as filesystem from 'node:fs';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 
 import { DEFAULT_CHILD_TIMEOUT_MS, NPM_INSTALL_TIMEOUT_MS } from './bounded-child.mjs';
 import { DEFAULT_SNAPSHOT_KEEP, selectEvictions } from './daemon-jobs.mjs';
+import { acquireLockDir, makeLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
 
 const COMPLETE_MARKER = '.snapshot-complete';
 const INTEGRITY_MARKER = '.snapshot-integrity.json';
@@ -70,6 +71,19 @@ function buildOnce(dir, materialize, { acceptConcurrentWinner = true } = {}) {
   return dir;
 }
 
+/** Verification and repair share one cross-process lock; contention defers to the next tick.
+ * Never steal an old lock: an npm/archive child can outlive its parent. Operators must
+ * confirm the owner and its children stopped before removing an abandoned lock.
+ */
+function withSnapshotLock(jobsDir, dir, fn) {
+  const lockRoot = join(snapshotsRoot(jobsDir), '.locks');
+  const entry = makeLockEntry(`snapshot-${process.pid}-${randomUUID()}`, dir, new Date().toISOString(), process.pid);
+  if (!acquireLockDir(lockRoot, dir, entry)) {
+    throw new Error('snapshot verification/repair busy; retry next tick; for an abandoned lock, confirm owner and children stopped before operator removal');
+  }
+  try { return fn(); } finally { releaseLockDirIf(lockRoot, dir, entry); }
+}
+
 /** Default code materializer: bounded archive then extraction; either failure rejects the snapshot. */
 export function gitArchiveMaterializer(repoDir, codeSha, { timeoutMs = DEFAULT_CHILD_TIMEOUT_MS } = {}) {
   return (into) => {
@@ -77,10 +91,10 @@ export function gitArchiveMaterializer(repoDir, codeSha, { timeoutMs = DEFAULT_C
     // publish an empty "complete" snapshot. Keep the archive outside the extracted tree.
     const archive = `${into}.archive.tar`;
     try {
-      execFileSync('git', ['-C', repoDir, 'archive', '--format=tar', `--output=${archive}`, codeSha], {
+      childProcess.execFileSync('git', ['-C', repoDir, 'archive', '--format=tar', `--output=${archive}`, codeSha], {
         stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs,
       });
-      execFileSync('tar', ['-xf', archive, '-C', into], {
+      childProcess.execFileSync('tar', ['-xf', archive, '-C', into], {
         stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs,
       });
     } finally {
@@ -99,11 +113,64 @@ export function ensureCodeSnapshot({ jobsDir, codeSha, repoDir, materialize }) {
   const make = materialize ?? gitArchiveMaterializer(repoDir, codeSha);
   const dir = join(snapshotsRoot(jobsDir), 'code', codeSha);
   mkdirSync(join(snapshotsRoot(jobsDir), 'code'), { recursive: true });
-  return buildOnce(dir, make);
+  return withSnapshotLock(jobsDir, dir, () => {
+    if (verifyCodeSnapshot(dir, codeSha)) return dir;
+    rmSync(dir, { recursive: true, force: true });
+    buildOnce(dir, (into) => {
+      make(into);
+      writeFileSync(join(into, INTEGRITY_MARKER), JSON.stringify({
+        codeSha, treeDigest: codeTreeDigest(into),
+      }));
+    }, { acceptConcurrentWinner: false });
+    if (!verifyCodeSnapshot(dir, codeSha)) {
+      rmSync(dir, { recursive: true, force: true });
+      throw new Error('code snapshot integrity verification failed; retry next tick');
+    }
+    return dir;
+  });
+}
+
+/** Digest archived code separately from the dependency link and publication evidence. */
+function codeTreeDigest(root) {
+  if (!lstatSync(root).isDirectory()) throw new Error('code snapshot is not a directory');
+  const entries = [];
+  function visit(at) {
+    for (const name of readdirSync(at)) {
+      if (at === root && [COMPLETE_MARKER, INTEGRITY_MARKER, 'node_modules'].includes(name)) continue;
+      const path = join(at, name);
+      const info = lstatSync(path);
+      const key = relative(root, path).split(sep).join('/');
+      if (info.isDirectory()) {
+        entries.push({ path: key, type: 'directory' });
+        visit(path);
+      } else if (info.isSymbolicLink()) {
+        const target = relative(realpathSync(root), realpathSync(path));
+        if (isAbsolute(target) || target === '..' || target.startsWith(`..${sep}`)) {
+          throw new Error('code link escapes snapshot');
+        }
+        entries.push({ path: key, type: 'link', target: readlinkSync(path) });
+      } else if (info.isFile()) {
+        const bytes = filesystem.readFileSync(path);
+        entries.push({ path: key, type: 'file', mode: info.mode, size: bytes.length, sha256: sha256(bytes) });
+      } else throw new Error('unsupported code entry');
+    }
+  }
+  visit(root);
+  entries.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  return sha256(JSON.stringify(entries));
+}
+
+function verifyCodeSnapshot(dir, codeSha) {
+  try {
+    if (!lstatSync(dir).isDirectory() || !lstatSync(join(dir, COMPLETE_MARKER)).isFile()
+      || !lstatSync(join(dir, INTEGRITY_MARKER)).isFile()) return false;
+    const record = JSON.parse(readFileSync(join(dir, INTEGRITY_MARKER), 'utf8'));
+    return record.codeSha === codeSha && record.treeDigest === codeTreeDigest(dir);
+  } catch { return false; }
 }
 
 /** Default installer: `npm ci --ignore-scripts` in a directory holding only the manifest and lockfile. */
-export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS, exec = execFileSync } = {}) {
+export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS, exec = childProcess.execFileSync } = {}) {
   return (into) => {
     exec('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: into, stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs });
     if (!existsSync(join(into, 'node_modules'))) {
@@ -173,7 +240,7 @@ function verifyDependencyStore(dir, lockHash) {
 /**
  * The `node_modules` store for the lockfile in `sourceDir`, built on first use.
  * Adopters use a separate npm-installed namespace: shared job stores may be checkout copies.
- * Missing/corrupt evidence discards only the adopter store, installs once, then re-verifies.
+ * Every store requires integrity evidence; missing/corrupt evidence installs once, then re-verifies.
  * @param {{jobsDir: string, sourceDir: string, install?: (into: string) => void, adopter?: boolean}} o
  * @returns {{key: string, dir: string}}
  */
@@ -184,30 +251,25 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
   const dir = join(snapshotsRoot(jobsDir), namespace, key);
   mkdirSync(join(snapshotsRoot(jobsDir), namespace), { recursive: true });
   const lockHash = sha256(lock);
-  if (adopter) {
-    // daemon-job-snapshots-integrity.test.mjs: "C/D: %s causes exactly one clean
-    // rebuild before child execution" covers missing markers, wrong lock hashes,
-    // changed manifests/non-manifests, and added/removed files, with install counts.
+  return withSnapshotLock(jobsDir, dir, () => {
     if (verifyDependencyStore(dir, lockHash)) return { key, dir };
     rmSync(dir, { recursive: true, force: true });
-  }
-  buildOnce(dir, (into) => {
-    copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
-    copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
-    install(into);
-    if (adopter) {
+    buildOnce(dir, (into) => {
+      copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
+      copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
+      install(into);
       writeFileSync(join(into, INTEGRITY_MARKER), JSON.stringify({
         lockHash, treeDigest: dependencyTreeDigest(join(into, 'node_modules')),
       }));
+    }, { acceptConcurrentWinner: false });
+    // "C: a rebuilt tree still changing during verification refuses adoption after
+    // one repair" defends this second read against the freshly recorded digest.
+    if (!verifyDependencyStore(dir, lockHash)) {
+      rmSync(dir, { recursive: true, force: true });
+      throw new Error('dependency integrity verification failed; retry next tick');
     }
-  }, { acceptConcurrentWinner: !adopter });
-  // "C: a rebuilt tree still changing during verification refuses adoption after
-  // one repair" defends this second read against the freshly recorded digest.
-  if (adopter && !verifyDependencyStore(dir, lockHash)) {
-    rmSync(dir, { recursive: true, force: true });
-    throw new Error('adopter dependency integrity verification failed');
-  }
-  return { key, dir };
+    return { key, dir };
+  });
 }
 
 /** Link a store's `node_modules` into a code snapshot (idempotent). */

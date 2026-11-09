@@ -7,7 +7,7 @@ import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFile, execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { readOriginRefSha } from '../daemon-self-sync.mjs';
 import { ensureCodeSnapshot, ensureNodeModulesStore, linkNodeModules } from '../daemon-job-snapshots.mjs';
@@ -23,7 +23,7 @@ import {
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { rebuildStatePath, readyCandidatePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
@@ -232,10 +232,13 @@ async function rebuildCloneInternal({
     return rebuildCloneAsJob({
       root, env, log, mainOnly, entries,
       adopt: () => {
-        // With no smoke-passed evidence there is nothing to adopt. Queue the ready-only
-        // builder; it discovers current inputs without moving the checkout. Never run
-        // the loaded planner as a fallback for an unavailable reviewed adopter.
-        if (!readReadyCandidate(root, { ...env, ...(stateOpts?.env || {}) })) {
+        // Only a pristine clone has no recovery or ready evidence to inspect. Unknown
+        // filesystem evidence goes to the reviewed child, never the loaded planner.
+        const stEnv = { ...env, ...(stateOpts?.env || {}) };
+        const absent = (path) => {
+          try { lstatSync(path); return false; } catch (e) { return e?.code === 'ENOENT'; }
+        };
+        if (absent(rebuildStatePath(root, stEnv)) && absent(readyCandidatePath(root, stEnv))) {
           return { moved: false, reason: 'needs-build', alerts: [] };
         }
         return adoptFromMain({ root, env, log, entries, mainOnly, admissionWaitMs, adoptChild });
