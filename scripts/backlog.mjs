@@ -65,7 +65,7 @@ import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
 import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildPrioritySettings, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
-import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
+import { acquireBuildQueueLock, buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
 import { readQueueFile, resolveQueuePath, resolveQueueSource, normNum, bornAsIndexFromItems, resolveBornAsRefs } from './conveyor/queue-store.mjs';
 import { DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
 import { readSettings, SETTINGS_DIR } from './lib/settings-files.mjs';
@@ -1160,14 +1160,22 @@ function buildQueue() {
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
   const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
   const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
+  let releaseLock;
   if (key !== null) {
     const stdout = readBuildQueueCache({ file, key, now: at, maxAgeMs });
     if (stdout !== null) { writeAllSync(1, stdout); process.exit(0); }
+    releaseLock = acquireBuildQueueLock({ file });
+    if (releaseLock) process.on('exit', releaseLock);
+    else {
+      const cached = waitForBuildQueueCache({ file, key, timeoutMs: 30_000, maxAgeMs });
+      if (cached !== null) { writeAllSync(1, cached); process.exit(0); }
+    }
   }
   const emit = (payload, human) => {
     if (key === null) return ok(payload, human);
     const stdout = `${JSON.stringify({ ok: true, ...payload })}\n`;
     writeBuildQueueCache({ file, key, at, stdout });
+    releaseLock?.();
     writeAllSync(1, stdout);
     process.exit(0);
   };

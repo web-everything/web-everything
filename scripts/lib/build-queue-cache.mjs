@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readdirSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync, rmSync, rmdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -29,6 +29,71 @@ export function readBuildQueueCache({ file, key, now = Date.now(), maxAgeMs = 60
         now - cached.at < maxAgeMs && typeof cached.stdout === 'string') return cached.stdout;
   } catch { /* cache miss */ }
   return null;
+}
+
+/** Null means contention; filesystem errors allow the caller to compute unlocked. */
+export function acquireBuildQueueLock({ file, now = Date.now(), staleMs = 60_000, pid = process.pid,
+  io = { mkdirSync, readFileSync, writeFileSync, rmSync, rmdirSync } }) {
+  const { mkdirSync: mkdir, readFileSync: read, writeFileSync: write, rmSync: remove, rmdirSync: rmdir } = io;
+  const unlocked = () => {};
+  const lock = `${file}.lock`;
+  const guard = `${lock}.guard`;
+  const ownerFile = join(lock, 'owner.json');
+  const owner = JSON.stringify({ pid, at: now, token: Math.random().toString(36).slice(2) });
+  let created = false;
+  let guarded = false;
+  try {
+    mkdir(dirname(file), { recursive: true });
+    // Serialize every lock mutation, including stale inspection and owner-safe release.
+    // A stranded guard uses the caller's bounded wait/unlocked-compute fallback.
+    try { mkdir(guard); guarded = true; }
+    catch (error) { if (error.code === 'EEXIST') return null; throw error; }
+    try { mkdir(lock); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const held = JSON.parse(read(ownerFile, 'utf8'));
+      let dead = false;
+      try { process.kill(held.pid, 0); }
+      catch (error) { dead = error.code === 'ESRCH'; }
+      if (!dead && now - held.at < staleMs) return null;
+      remove(lock, { recursive: true });
+      try { mkdir(lock); }
+      catch (error) { if (error.code === 'EEXIST') return null; throw error; }
+    }
+    created = true;
+    write(ownerFile, owner, 'utf8');
+    let released = false;
+    return () => {
+      if (released) return;
+      let releaseGuarded = false;
+      try {
+        mkdir(guard);
+        releaseGuarded = true;
+        released = true;
+        if (read(ownerFile, 'utf8') === owner) remove(lock, { recursive: true });
+      } catch { /* best-effort release */ }
+      finally {
+        if (releaseGuarded) { try { rmdir(guard); } catch { /* best-effort cleanup */ } }
+      }
+    };
+  } catch {
+    if (created) { try { remove(lock, { recursive: true }); } catch { /* best-effort cleanup */ } }
+    return unlocked;
+  } finally {
+    if (guarded) { try { rmdir(guard); } catch { /* best-effort cleanup */ } }
+  }
+}
+
+export function waitForBuildQueueCache({ file, key, timeoutMs = 30_000, pollMs = 50, maxAgeMs = 60_000 }) {
+  const deadline = Date.now() + timeoutMs;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    const stdout = readBuildQueueCache({ file, key, maxAgeMs });
+    if (stdout !== null) return stdout;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    Atomics.wait(sleeper, 0, 0, Math.min(pollMs, remaining));
+  }
 }
 
 export function writeBuildQueueCache({ file, key, at = Date.now(), stdout }) {
