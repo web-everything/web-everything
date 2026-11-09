@@ -97,10 +97,11 @@ describe('CI timing refresh publication recovery', () => {
     expect(readAuthorActorStamps(body)).toEqual(['github-actions:ci-refresh-test-timings']);
   });
 
-  it('never labels or stamps the automation as author for a branch this run did not create', () => {
+  it('holds for a human and never stamps the automation as author for a branch this run did not create', () => {
     const { second } = publicationProbe({ appears: true });
     expect(second.status, second.stderr).toBe(0);
     expect(second.stdout).toContain('CREATE pr create');
+    expect(second.stdout).toMatch(/--label review:human/);
     expect(second.stdout).not.toContain('review:pending');
     expect(second.stdout).not.toContain('authored-by-actor');
     expect(second.stdout).not.toContain('PUSH');

@@ -109,8 +109,7 @@ jobs:
             if [ "$created" = 1 ]; then
               body="$body"$'\n\n<!-- authored-by-actor: github-actions:ci-refresh-test-timings -->'
             fi
-            # Label only a branch this run created; a pre-existing branch has unknown provenance and routes to a human.
-            label=()
-            if [ "$created" = 1 ]; then label=(--label review:pending); fi
+            # Label only a branch this run created; a pre-existing branch has unknown provenance and is held for a human.
+            if [ "$created" = 1 ]; then label=(--label review:pending); else label=(--label review:human); fi
             gh pr create --base main --head ci/refresh-test-timings "${label[@]}" --title 'ci: refresh measured unit test timings' --body "$body"
           fi
