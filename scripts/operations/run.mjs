@@ -41,6 +41,8 @@ import { compute, effect } from './step-kinds.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
+import { rebuildAdoptOverrideOperation, REBUILD_ADOPT_OVERRIDE_OP } from './rebuild-adopt-override.mjs';
+import { createRebuildAdoptOverrideSinks } from './rebuild-adopt-override-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
 import {
@@ -229,6 +231,7 @@ export function finishCodexAudit({ run, code, lines, json }) {
 export const OPERATIONS = Object.freeze({
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
+  [REBUILD_ADOPT_OVERRIDE_OP]: () => ({ declaration: rebuildAdoptOverrideOperation(), sinks: createRebuildAdoptOverrideSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
   [JUDGE_SWEEP_FACTS_OP]: () => ({
     declaration: judgeSweepFactsOperation({ readFacts: createJudgeSweepFactsReader() }),
