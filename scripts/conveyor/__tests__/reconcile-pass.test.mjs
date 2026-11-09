@@ -1719,3 +1719,36 @@ describe('freshAgentStatus — uncached status read at decision time', () => {
     expect(freshAgentStatus({ sessionId: 'b' }, () => { throw new Error('x'); })).toBeNull();
   });
 });
+
+describe('makeReconcileIdleFinishedInfoFor — the reconcile-only wiring of the idle-row override (R810)', () => {
+  it('opts in with the 3x hung grace and the injected exec for the fresh read; a busy fresh read keeps the session', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'reconcile-idle-wiring-'));
+    const cwd = '/Users/fixture/workspace/dispatch-1';
+    const sessionId = 'sess-wiring-0001';
+    mkdirSync(join(root, cwd.replaceAll('/', '-')), { recursive: true });
+    vi.stubEnv('CLAUDE_PROJECTS_DIR', root);
+    vi.resetModules();
+    try {
+      const { makeReconcileIdleFinishedInfoFor } = await import('../reconcile-pass.mjs');
+      const now = Date.now();
+      const MIN = 60_000;
+      const write = (minsAgo) => writeFileSync(join(root, cwd.replaceAll('/', '-'), `${sessionId}.jsonl`), `${JSON.stringify({
+        type: 'assistant', timestamp: new Date(now - minsAgo * MIN).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'x' } }] },
+      })}\n`);
+      const execFor = (status) => () => JSON.stringify([{ sessionId, status }]);
+      const row = { cwd, sessionId, status: 'idle' };
+      write(100);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(true);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('busy') })(row, now, 10 * MIN).finished).toBe(false);
+      write(75); // inside 3 x 30 min
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

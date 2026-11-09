@@ -533,13 +533,13 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
   it('cached row says idle but the FRESH read says busy → not finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 100));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { ...{ trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }, freshStatusFor: () => 'busy' }).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'busy' }).finished).toBe(false);
   });
 
   it('fresh status read throws or is missing → fails closed, not finished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 100));
-    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { ...{ trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => 'idle' }, freshStatusFor: () => { throw new Error('boom'); } }).finished).toBe(false);
+    expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000, freshStatusFor: () => { throw new Error('boom'); } }).finished).toBe(false);
     expect(readIdleFinishedInfo({ cwd, sessionId, status: 'idle' }, now, 10 * 60_000, { trustIdleRow: true, pendingGraceMs: 90 * 60_000 }).finished).toBe(false);
   });
 

@@ -505,6 +505,23 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   return Array.isArray(rows) ? enrich(rows) : rows;
 }
 
+/** UNCACHED `claude agents --json` status for one row's sessionId, or null when unreadable/absent (fail closed). */
+export function freshAgentStatus(row, exec = execFileSync) {
+  try {
+    const rows = JSON.parse(String(exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' }) || '[]'));
+    const hit = Array.isArray(rows) ? rows.find((r) => r?.sessionId && r.sessionId === row?.sessionId) : null;
+    return hit && typeof hit.status === 'string' ? hit.status : null;
+  } catch { return null; }
+}
+
+/** The reconcile-only idle-finished reader: opts in to the idle-row override with the full 3x hung pending-call grace
+ *  and an UNCACHED status read (R810); the session reaper never passes these opts. */
+export function makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec = execFileSync } = {}) {
+  return (a, n, t) => readIdleFinishedInfo(a, n, t, {
+    trustIdleRow: true, pendingGraceMs: hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER, freshStatusFor: (row) => freshAgentStatus(row, exec),
+  });
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#defaultReadAgents — the live-session listing. A THIN DELEGATION to
  * `defaultListAgents` (`we:scripts/operations/dispatch-lane-io.mjs`), not a second builder of the same argv: one
@@ -533,22 +550,11 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
  *   `listJobs` (x26lw6u) defaults to the live review-job rows; a test injects `() => []` or fakes.
  * @returns {Array<object>}
  */
-/** UNCACHED `claude agents --json` status for one row's sessionId, or null when unreadable/absent (fail closed). */
-export function freshAgentStatus(row, exec = execFileSync) {
-  try {
-    const rows = JSON.parse(String(exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' }) || '[]'));
-    const hit = Array.isArray(rows) ? rows.find((r) => r?.sessionId && r.sessionId === row?.sessionId) : null;
-    return hit && typeof hit.status === 'string' ? hit.status : null;
-  } catch { return null; }
-}
-
 export function defaultReadAgents({
   exec = execFileSync, env = process.env, completionFor = tryReadCompletion,
   hungInfoFor = readHungInfo, now = Date.now(), hungThresholdMs = resolveHungThresholdMs(env),
   authExpiredInfoFor = readClaudeAuthExpiredInfo,
-  idleFinishedInfoFor = (a, n, t) => readIdleFinishedInfo(a, n, t, {
-    trustIdleRow: true, pendingGraceMs: hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER, freshStatusFor: (row) => freshAgentStatus(row, exec),
-  }), idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
+  idleFinishedInfoFor = makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec }), idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
   bgIsolationStallInfoFor = readBgIsolationStallInfo,
   listJobs = undefined,
 } = {}) {

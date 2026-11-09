@@ -421,10 +421,11 @@ export const DEFAULT_IDLE_FINISHED_THRESHOLD_MS = 10 * 60 * 1000;
 
 /**
  * we:scripts/conveyor/hung-session.mjs#classifyIdleFinished — PURE. See file header for the full contract.
- * Unlike {@link classifyHungSession}, a pending tool call is an ABSOLUTE gate here, never merely a grace
- * period: this axis exists specifically for "the turn ended and nothing followed", so a session still mid a
- * tool call never counts as finished by this axis, at any age (the hung axis, with its own longer threshold and
- * grace multiplier, is still what eventually catches a session genuinely stuck mid a long call).
+ * Unlike {@link classifyHungSession}, a pending tool call is a gate here, not merely a grace period: this axis
+ * exists for "the turn ended and nothing followed", so a session mid a tool call does not count as finished by
+ * this axis. The ONE ruled exception (R810): a caller that opts in with `rowIdle` (the harness lists the session
+ * as idle) AND a positive `pendingGraceMs` (>= the idle threshold) treats a dangling call as finished once the
+ * transcript has been silent past that grace; any other pending call is never finished, at any age.
  * @param {{lastActivityMs:number, nowMs:number, thresholdMs:number, pendingToolUse?:boolean, rowIdle?:boolean, pendingGraceMs?:number}} o
  * @returns {{finished:boolean, reason:string, ageMs:number|null}}
  */
