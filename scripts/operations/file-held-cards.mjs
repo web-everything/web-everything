@@ -1,14 +1,12 @@
 /** File held handoff cards through file-item in this checkout; never mutate the handoff. */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync, statSync } from 'node:fs';
+import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { op, createRegistry } from './registry.mjs';
+import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { runOperationCli, parseOperationArgv } from './cli-adapter.mjs';
-import { createMemoryRunStore, newRunId } from './run-store.mjs';
+import { runOperationCli } from './cli-adapter.mjs';
 import { REPO_ROOT } from './scaffold-io.mjs';
 import { assertPublishableContent } from '../backlog/guarded-write.mjs';
 import { PATH_PATTERNS } from '../lib/secret-scrub.mjs';
@@ -36,28 +34,6 @@ function resolveLedgerPath(path) {
     return realpathSync(path);
   } catch (error) {
     throw new Error('--ledger cannot be resolved; repair its symlink or choose an existing accessible directory', { cause: error });
-  }
-}
-
-function assertLedgerIdentity(root, ledger, source) {
-  try {
-    const identity = statSync(ledger, { bigint: true, throwIfNoEntry: false });
-    // New files and single-link files cannot already share an inode with another path.
-    if (!identity || identity.nlink < 2n) return;
-    const sameFile = path => {
-      const candidate = lstatSync(path, { bigint: true });
-      return candidate.dev === identity.dev && candidate.ino === identity.ino;
-    };
-    const containsIdentity = directory => readdirSync(directory, { withFileTypes: true }).some(entry => {
-      const path = join(directory, entry.name);
-      // Do not follow directory symlinks outside the repository or into cycles.
-      return entry.isDirectory() ? containsIdentity(path) : sameFile(path);
-    });
-    if (sameFile(realpathSync(source)) || containsIdentity(root)) {
-      throw new Error('ledger shares a file identity with the source or repository');
-    }
-  } catch (error) {
-    throw new Error('--ledger identity is unsafe or could not be verified; choose a separate ledger outside the repository and distinct from --source', { cause: error });
   }
 }
 
@@ -161,21 +137,21 @@ async function fileInCheckout(input) {
 }
 
 async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md'),
-  ledger, dryRun = false, select, since, max = 10, deps = {} } = {}) {
+  dryRun = false, select, since, max = 10, deps = {} } = {}) {
   validateOptions({ max, since, select });
   const { root = REPO_ROOT, fileItem = fileInCheckout, log = console.log, now = () => new Date().toISOString() } = deps;
   source = resolve(expandHome(source));
-  ledger = resolve(expandHome(ledger || join(dirname(source), 'cards-filed.jsonl')));
+  // The ledger path is fixed beside the source; it is not an input.
+  let ledger = resolve(join(dirname(source), 'cards-filed.jsonl'));
   const lexicalOutside = outsideRepository(resolve(root), ledger);
   ledger = resolveLedgerPath(ledger);
   if (!lexicalOutside || !outsideRepository(realpathSync(root), ledger) || ledger === realpathSync(source)) {
     throw new Error('--ledger must be outside the repository and distinct from --source');
   }
-  assertLedgerIdentity(realpathSync(root), ledger, source);
   const tracked = deps.trackedFiles ? deps.trackedFiles() : gitTrackedFiles(root);
   const ledgerRows = readLedger(ledger);
   // A ledger row is only trusted while its card still exists here or on main; a discarded lane must not hide the card.
-  const missing = ledgerRows.filter(row => !row.status && !cardExists(root, row.card));
+  const missing = ledgerRows.filter(row => !cardExists(root, row.card));
   if (missing.length) {
     throw new Error(`${missing.length} ledgered card(s) are in neither this checkout nor origin/main (unmerged or discarded lane); land that PR or remove those ledger rows before filing more`);
   }
@@ -192,7 +168,7 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   const result = { planned: [], filed: [], duplicates: [], refused: [], failed: [] };
   for (const card of cards) {
     // Refusals stay retryable but do not use the budget, so they cannot starve later valid cards.
-    if (result.planned.length + result.filed.length + result.duplicates.length >= max) break;
+    if (result.planned.length + result.filed.length >= max) break;
     const qualified = qualifyBareBasenames(card.text, tracked);
     for (const [name, found] of Object.entries(qualified.ambiguous)) {
       log(safeLog(`ambiguous ${card.tag}: ${name} matches ${found.slice(0, 5).map(f => `we:${f}`).join(', ')}${found.length > 5 ? ', ...' : ''}`));
@@ -220,9 +196,10 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     // A truncated title is not a full identity: two distinct cards can share its first 110 chars.
     const duplicate = input.title.endsWith('…') ? undefined : titles.get(titleKey(input.title));
     if (duplicate) {
-      Object.assign(row, { card: duplicate, status: 'duplicate' });
-      result.duplicates.push(row);
+      // Never ledgered: the twin may close later, and then this handoff must be filed on a re-run.
+      result.duplicates.push({ ...summary, card: duplicate });
       log(safeLog(`duplicate ${card.tag}: ${input.title}`));
+      continue;
     } else {
       try {
         const response = await fileItem(input);
@@ -258,12 +235,10 @@ export async function runFileHeldCards(options = {}) {
   if (options.dryRun) return runFileHeldCardsLocked(options);
   // Ledger-scoped lock held through select, filing and append, so overlapping runs cannot double-file a card.
   const source = resolve(expandHome(options.source || join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md')));
-  const lexical = resolve(expandHome(options.ledger || join(dirname(source), 'cards-filed.jsonl')));
+  const lexical = resolve(expandHome(join(dirname(source), 'cards-filed.jsonl')));
   const canonical = resolveLedgerPath(lexical);
-  // Two locks: one by path (exists from the first run, even before the ledger does) and one by inode when the
-  // ledger exists (hard-linked aliases share it). A run holds both through select, filing and append.
+  // One lock by canonical ledger path (exists from the first run, even before the ledger does), held through select, filing and append.
   const ids = [createHash('sha256').update(canonical).digest('hex').slice(0, 24)];
-  try { const { dev, ino } = statSync(canonical); ids.push(`${dev}-${ino}`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const held = [];
   const release = () => { for (const lock of held) { try { unlinkSync(lock); } catch { /* already gone */ } } };
   for (const id of ids) {
@@ -281,7 +256,6 @@ export function fileHeldCardsOperation() {
   return op(FILE_HELD_CARDS_OP, {
     input: {
       source: { type: 'string', required: false, default: '' },
-      ledger: { type: 'string', required: false, default: '' },
       select: { type: 'string', required: false, default: '' },
       since: { type: 'string', required: false, default: '' },
       max: { type: 'number', required: false, default: 10 },
@@ -307,24 +281,5 @@ export function finishFileHeldCards(outcome, json = false) {
   const lines = json ? [JSON.stringify(result)] : Object.entries(result).flatMap(([status, cards]) => cards.map(card =>
     safeLog(`${status} ${card.tag} ${card.date}: ${card.title} [${card.scope || 'unscoped'}]`)));
   // A file-item failure must not look like success to automated callers.
-  return { ...outcome, lines, ...(result.failed?.length || (result.refused?.length && !result.filed?.length && !result.duplicates?.length && !result.planned?.length) ? { code: 1 } : {}) };
+  return { ...outcome, lines, ...(result.failed?.length || result.refused?.length ? { code: 1 } : {}) };
 }
-
-export async function main(argv = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr, ...deps } = {}) {
-  try {
-    const declaration = fileHeldCardsOperation();
-    const parsed = parseOperationArgv(declaration, argv);
-    if (!parsed.ok) throw new Error(parsed.errors.join('\n'));
-    if (!parsed.control.help) validateOptions(parsed.input);
-    const registry = createRegistry();
-    registry.register(declaration);
-    // Memory-only outer runs keep --dry-run free of even operation-store writes.
-    const outcome = finishFileHeldCards(await runOperationCli({ declaration, argv, registry,
-      store: createMemoryRunStore(), sinks: createFileHeldCardsSinks(deps), newRunId: () => newRunId(FILE_HELD_CARDS_OP),
-    }), argv.includes('--json'));
-    for (const line of outcome.lines) stdout.write(`${line}\n`);
-    return outcome.code;
-  } catch (error) { stderr.write(`${safeLog(error.message)}\n`); return 2; }
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) process.exitCode = await main();
