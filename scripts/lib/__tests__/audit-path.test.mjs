@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { canonicalPaths } from '../audit-path.mjs';
 import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern, oracleMatchesPath } from './fixtures/audit-path-old-oracle.mjs';
 
-const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/', 'guard-*.mjs'];
+const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/', 'guard-*.mjs', '4-9', 'L3-L9', '1', 'L42', '42-50'];
 const lower = a => a.map(x => x.toLowerCase());
 const globOk = (p, pat) => {
   if (pat.endsWith('/')) return p.startsWith(pat);
@@ -88,10 +88,10 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
   });
   it('reads the accepted shapes', () => {
     expect(canonicalPaths('scripts/x.mjs')).toEqual(['scripts/x.mjs']);
-    expect(canonicalPaths('  "./scripts//x.mjs":4-9 ')).toEqual(['scripts/x.mjs', '"./scripts/x.mjs":4-9', '4', '9']);
+    expect(canonicalPaths('  "./scripts//x.mjs":4-9 ')).toEqual(['scripts/x.mjs', '"./scripts/x.mjs":4-9', '4-9', '4', '9']);
     expect(canonicalPaths('+++ b/scripts/x.mjs')).toEqual(['b/scripts/x.mjs', 'scripts/x.mjs', '+++ b/scripts/x.mjs']);
-    expect(canonicalPaths('a/x.mjs#L3-L9')).toEqual(['a/x.mjs', 'x.mjs', 'a/x.mjs#L3-L9', '3', '9']);
-    expect(canonicalPaths('scripts/x.mjs:1:2')).toEqual(['scripts/x.mjs', 'scripts/x.mjs:1:2', '1', '2']);
+    expect(canonicalPaths('a/x.mjs#L3-L9')).toEqual(['a/x.mjs', 'x.mjs', 'a/x.mjs#L3-L9', 'L3-L9', '3', '9']);
+    expect(canonicalPaths('scripts/x.mjs:1:2')).toEqual(['scripts/x.mjs', 'scripts/x.mjs:1:2', '1:2', '1', '2']);
     expect(canonicalPaths('scripts/x.mjs.')).toEqual(['scripts/x.mjs.', 'scripts/x.mjs']);
     expect(canonicalPaths('-docs/a.md')).toEqual(['-docs/a.md', 'docs/a.md']);
     expect(canonicalPaths('./x.mjs')).toEqual(['x.mjs']);
@@ -145,6 +145,8 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     expect(oracleMatchesSome(many, pats)).toBe(true);
     expect(canonicalPaths(many, anchors)).toBeNull();
     expect(canonicalPaths('custom/x.mjs:42')).toContain('42');
+    expect(canonicalPaths('public/readme.md#L42')).toContain('L42');
+    expect(canonicalPaths('public/readme.md:42-50')).toContain('42-50');
     expect(canonicalPaths('"custom/x.mjs":42')).toContain('"custom/x.mjs":42');
   });
   it('5000 seeded fuzz strings: nothing the oracle protected is lost', () => {

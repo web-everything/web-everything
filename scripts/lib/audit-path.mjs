@@ -74,6 +74,7 @@ export function canonicalPaths(file, anchors = null) {
   // protected is lost. Both are extra candidates only: they can protect more, never less.
   const raw = normalise(text);
   if (raw !== null) out.add(raw);
-  for (const d of (m[4] ?? '').match(/\d+/g) ?? []) out.add(d);
+  const loc = (m[4] ?? '').slice(1);
+  if (loc) for (const d of [loc, ...loc.split(':'), ...(loc.match(/\d+/g) ?? [])]) out.add(d);
   return out.size > MAX_AUDIT_CANDIDATES ? null : [...out];
 }
