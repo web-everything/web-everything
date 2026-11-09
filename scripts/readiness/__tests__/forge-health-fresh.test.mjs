@@ -12,12 +12,12 @@ afterEach(()=>{
   for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});
 });
 const now=Date.parse('2026-10-29T12:00:00.000-04:00');
-const settings={backoffMs:120000,maxLoadPerCore:0.8,minFreeRamPct:15,lastGoodMaxAgeMin:10};
+const settings={backoffMs:120000,maxLoadPerCore:0.8,minFreeRamPct:15};
 const sample=(ms=now)=>({sampledAtET:easternTimestamp(ms),cores:8,loadPerCore:0.12,memFreePct:96,activeRuns:0,recent:[]});
 const saved=(telemetry,lastReadAt)=>({v:1,lastReadAt,telemetry,failures:0,backoffUntil:0,trigger:''});
 const persist=(root,state)=>writeFileSync(join(root,'health.json'),JSON.stringify(state));
 const load=root=>JSON.parse(readFileSync(join(root,'health.json'),'utf8'));
-const check=(root,readTelemetry,time=now)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,sleep:async()=>{}});
+const check=(root,readTelemetry,time=now,ping=async()=>false)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,ping});
 
 describe('Forge health freshness',()=>{
   it.each([now-60000,now-1000])('refreshes stale persisted telemetry exactly once with lastReadAt=%s',async lastReadAt=>{
@@ -26,7 +26,7 @@ describe('Forge health freshness',()=>{
     expect(await check(root,readTelemetry)).toEqual({ok:true});
     expect(readTelemetry).toHaveBeenCalledTimes(1);
     expect(readTelemetry).toHaveBeenCalledWith({host:'forge'});
-    expect(load(root)).toEqual({...saved(fresh,now),lastGoodAt:now,lastGoodTelemetry:fresh});
+    expect(load(root)).toEqual(saved(fresh,now));
   });
 
   it.each([
@@ -48,34 +48,23 @@ describe('Forge health freshness',()=>{
     expect(readTelemetry).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    ['offline','expired last-good'],
-    ['offline','stale legacy telemetry'],
-    ['still-stale','recent last-good'],
-  ])('refreshes a stale cached sample and fails closed when %s with %s',async(outcome,evidence)=>{
+  it.each(['offline','still-stale'])('refreshes a stale cached sample once and fails closed when %s',async outcome=>{
     const root=scratch(),readTelemetry=vi.fn(async()=>{
-      if(outcome==='offline')throw new Error('forge-unreachable');
+      if(outcome==='offline')throw new Error('offline');
       return sample(now-30001);
     });
-    const state=saved(sample(now-60000),now-1000);
-    if(evidence==='expired last-good'){
-      const lastGoodAt=now-settings.lastGoodMaxAgeMin*60000-1;
-      Object.assign(state,{lastGoodAt,lastGoodTelemetry:sample(lastGoodAt)});
-    }else if(evidence==='recent last-good'){
-      Object.assign(state,{lastGoodAt:now-1000,lastGoodTelemetry:sample(now-1000)});
-    }
-    persist(root,state);
+    persist(root,saved(sample(now-60000),now-1000));
     const reason=outcome==='offline'?'forge-unreachable':'telemetry-stale';
     expect(await check(root,readTelemetry)).toEqual({ok:false,reason});
     expect(load(root)).toMatchObject({lastReadAt:now,trigger:reason,backoffUntil:now+settings.backoffMs});
     expect(await check(root,readTelemetry,now+10000)).toEqual({ok:false,reason:`backoff-${reason}`});
-    expect(readTelemetry).toHaveBeenCalledTimes(outcome==='offline'?2:1);
+    expect(readTelemetry).toHaveBeenCalledTimes(1);
   });
 
   it('reports a cold-start read failure as forge-unreachable',async()=>{
-    const readTelemetry=vi.fn(async()=>{throw new Error('forge-unreachable');});
+    const readTelemetry=vi.fn(async()=>{throw new Error('offline');});
     expect(await check(scratch(),readTelemetry)).toEqual({ok:false,reason:'forge-unreachable'});
-    expect(readTelemetry).toHaveBeenCalledTimes(2);
+    expect(readTelemetry).toHaveBeenCalledTimes(1);
   });
 
   it('fails closed for a non-finite age without a second read',async()=>{
@@ -125,5 +114,86 @@ describe('Forge optional prewarmed telemetry',()=>{
   it.each([{extra:true},{stageMs:{install:1000,run:4000,extra:0}},{code:256},{runId:'invalid'}])
   ('keeps recent entry validation strict with prewarmed: %j',patch=>{
     expect(()=>parseTelemetry(JSON.stringify({...sample(),recent:[{...recent(),prewarmed:true,...patch}]}))).toThrow('Invalid telemetry schema');
+  });
+});
+
+describe('Forge ping-gated fresh re-read',()=>{
+  const transportError=()=>Object.assign(new Error('forge-unreachable'),{transport:true});
+  const flaky=(...results)=>{
+    const queue=[...results];
+    return vi.fn(async()=>{const next=queue.shift();if(next instanceof Error)throw next;return next;});
+  };
+  it('re-reads once when the first read throws and the ping succeeds',async()=>{
+    const root=scratch(),ping=vi.fn(async()=>true),readTelemetry=flaky(transportError(),sample());
+    expect(await check(root,readTelemetry,now,ping)).toEqual({ok:true});
+    expect(ping).toHaveBeenCalledTimes(1);
+    expect(readTelemetry).toHaveBeenCalledTimes(2);
+  });
+  it('does not ping or re-read when the first read fails validation rather than transport',async()=>{
+    const root=scratch(),ping=vi.fn(async()=>true),readTelemetry=flaky(new Error('invalid telemetry'),sample());
+    expect(await check(root,readTelemetry,now,ping)).toEqual({ok:false,reason:'forge-unreachable'});
+    expect(ping).not.toHaveBeenCalled();
+    expect(readTelemetry).toHaveBeenCalledTimes(1);
+  });
+  it('does not ping when the failure is not transport-level (remote command or oversized output)',async()=>{
+    const root=scratch(),ping=vi.fn(async()=>true),readTelemetry=flaky(new Error('forge-unreachable'),sample());
+    expect(await check(root,readTelemetry,now,ping)).toEqual({ok:false,reason:'forge-unreachable'});
+    expect(ping).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['ssh exit 255',{code:255}],['timeout kill',{killed:true,code:null}],
+    ['oversized output',{killed:true,code:'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'}],['remote command exit 1',{code:1}],
+  ])('marks %s correctly in readForgeTelemetry',async(name,props)=>{
+    const {readForgeTelemetry}=await import('../forge-telemetry.mjs');
+    const exec=(c,a,o,cb)=>{cb(Object.assign(new Error('x'),props));return {};};
+    const error=await readForgeTelemetry({exec}).catch(e=>e);
+    expect(error.message).toBe('forge-unreachable');
+    expect(error.transport).toBe(name==='ssh exit 255'||name==='timeout kill');
+  });
+  it('never pings after a good first read',async()=>{
+    const root=scratch(),ping=vi.fn(async()=>true),readTelemetry=vi.fn(async()=>sample());
+    expect(await check(root,readTelemetry,now,ping)).toEqual({ok:true});
+    expect(ping).not.toHaveBeenCalled();
+  });
+  it('a failed ping is not health evidence and does not re-read',async()=>{
+    const root=scratch(),ping=vi.fn(async()=>false),readTelemetry=flaky(transportError(),sample());
+    expect(await check(root,readTelemetry,now,ping)).toEqual({ok:false,reason:'forge-unreachable'});
+    expect(readTelemetry).toHaveBeenCalledTimes(1);
+    expect(load(root)).toMatchObject({trigger:'forge-unreachable',backoffUntil:now+settings.backoffMs});
+  });
+  it.each([
+    ['a retry that throws',()=>transportError(),'forge-unreachable'],
+    ['a retry 31s old',()=>sample(now-31000),'telemetry-stale'],
+    ['an overloaded retry',()=>({...sample(),loadPerCore:0.95}),'maxLoadPerCore'],
+  ])('arms backoff for %s',async(_n,retry,reason)=>{
+    const root=scratch(),ping=async()=>true,readTelemetry=flaky(transportError(),retry());
+    expect(await check(root,readTelemetry,now,ping)).toEqual({ok:false,reason});
+    expect(readTelemetry).toHaveBeenCalledTimes(2);
+    expect(load(root)).toMatchObject({trigger:reason,backoffUntil:now+settings.backoffMs});
+  });
+  it('does not reuse a 5-minute-old saved sample when read and retry both fail',async()=>{
+    const root=scratch(),ping=async()=>true,readTelemetry=flaky(transportError(),transportError());
+    persist(root,saved(sample(now-300000),now-60000));
+    expect(await check(root,readTelemetry,now,ping)).toEqual({ok:false,reason:'forge-unreachable'});
+    expect(load(root).telemetry).toBeNull();
+  });
+});
+
+describe('pingForge',()=>{
+  it('never throws and returns a boolean',async()=>{
+    const {pingForge}=await import('../forge-telemetry.mjs');
+    const ok=await pingForge({host:'forge',exec:(c,a,o,cb)=>{cb(null,'');}});
+    const bad=await pingForge({host:'forge',exec:(c,a,o,cb)=>{cb(new Error('x'));}});
+    const thrown=await pingForge({host:'forge',exec:()=>{throw new Error('boom');}});
+    const badHost=await pingForge({host:'-oProxy',exec:()=>{throw new Error('no');}});
+    expect([ok,bad,thrown,badHost]).toEqual([true,false,false,false]);
+  });
+  it('uses a short BatchMode ssh true',async()=>{
+    const {pingForge}=await import('../forge-telemetry.mjs');
+    const calls=[];
+    await pingForge({host:'forge',exec:(c,a,o,cb)=>{calls.push([c,a,o]);cb(null,'');}});
+    expect(calls[0][0]).toBe('ssh');
+    expect(calls[0][1]).toEqual(['-o','BatchMode=yes','-o','ConnectTimeout=2','forge','true']);
+    expect(calls[0][2].timeout).toBe(3000);
   });
 });

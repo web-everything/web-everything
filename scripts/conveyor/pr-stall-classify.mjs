@@ -109,6 +109,7 @@ const EXPECTED_ACTOR = Object.freeze({
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
+  'drain-skip:mq-same-head-failed': 'drain', 'drain-skip:card-grouped': 'drain',
 });
 /** Operator-owned states the judge does not cover: why a person is needed. */
 const OPERATOR_STATES = Object.freeze({
@@ -118,6 +119,8 @@ const OPERATOR_STATES = Object.freeze({
   'needs-you': 'the PR carries status:needs-you',
   'human-review': 'the human review is owed',
   'drain-skip:not-certified': 'the drain will not merge it uncertified',
+  'drain-skip:mq-same-head-failed': 'the same-head merge-queue attempt failed; held until the head changes',
+  'drain-skip:card-grouped': 'the PR is grouped into an open card group; waiting for that group to land',
   unclassified: 'no signal says who moves next',
 });
 

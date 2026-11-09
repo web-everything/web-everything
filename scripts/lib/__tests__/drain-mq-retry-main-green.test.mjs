@@ -87,7 +87,7 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
     expect(f.declineLog()).toContain(failedName);
   });
 
-  it.each(['cancelled', 'timed_out', 'startup_failure', 'stale', 'action_required'])(
+  it.each(['cancelled', 'startup_failure', 'stale', 'action_required'])(
     'skips a completed %s run and accepts the next completed green run, logging its deciding id', conclusion => {
       const f = fixture([run(102, conclusion), run(101, 'success', '2026-11-01T13:00:00Z', '2026-11-01T13:10:00Z')]);
       expect(f.guard().hold).toBe(false);
@@ -97,6 +97,15 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
       expect(f.retryLog()).toContain(failedName);
     },
   );
+
+  it('counts a newest completed timed_out run as red (R780), declining with a reason naming it even when an older run is green', () => {
+    const f = fixture([run(102, 'timed_out'), run(101, 'success', '2026-11-01T13:00:00Z', '2026-11-01T13:10:00Z')]);
+    expect(f.guard().hold).toBe(true);
+    expect(f.retryLog()).toBeUndefined();
+    expect(f.declineLog()).toContain('main CI is not green');
+    expect(f.declineLog()).toContain('102');
+    expect(f.declineLog()).toContain('timed_out');
+  });
 
   it('declines green evidence updated more than two hours ago, naming the stale run and failed check', () => {
     const f = fixture([run(102, 'success', '2026-11-01T11:00:00Z', '2026-11-01T11:59:59.999Z')]);

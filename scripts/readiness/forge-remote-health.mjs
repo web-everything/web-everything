@@ -5,30 +5,19 @@ import {join} from 'node:path';
 import {randomBytes, createHash} from 'node:crypto';
 import {reserve, readLockEntry, releaseLockDir} from './file-locks.mjs';
 import {parseTelemetry} from './forge-exec-run.mjs';
-import {readForgeTelemetry} from './forge-telemetry.mjs';
+import {readForgeTelemetry, pingForge} from './forge-telemetry.mjs';
 
-const freshState=()=>({v:1,lastReadAt:null,telemetry:null,lastGoodAt:null,lastGoodTelemetry:null,failures:0,backoffUntil:0,trigger:''});
+const freshState=()=>({v:1,lastReadAt:null,telemetry:null,failures:0,backoffUntil:0,trigger:''});
 const integer=v=>Number.isSafeInteger(v)&&v>=0;
 function readState(file) {
   try {
     const st=lstatSync(file);
-    if(!st.isFile() || st.isSymbolicLink() || st.size>140000)throw new Error('invalid state size');
+    if(!st.isFile() || st.isSymbolicLink() || st.size>70000)throw new Error('invalid state size');
     const s=JSON.parse(readFileSync(file,'utf8'));
-    const keys=s&&Object.keys(s).sort().join(',');
-    const legacy=keys==='backoffUntil,failures,lastReadAt,telemetry,trigger,v';
-    if(!s || (!legacy && keys!=='backoffUntil,failures,lastGoodAt,lastGoodTelemetry,lastReadAt,telemetry,trigger,v') || s.v!==1
+    if(!s || Object.keys(s).sort().join(',')!=='backoffUntil,failures,lastReadAt,telemetry,trigger,v' || s.v!==1
       || !(s.lastReadAt===null||integer(s.lastReadAt)) || !integer(s.failures) || !integer(s.backoffUntil)
       || typeof s.trigger!=='string' || !/^[a-zA-Z0-9.-]{0,80}$/.test(s.trigger))throw new Error('invalid state');
     if(s.telemetry!==null)parseTelemetry(JSON.stringify(s.telemetry));
-    if(legacy){
-      // Only a sample that was fresh at the original successful read can seed
-      // last-good. Migration must not grant old/stale or refused evidence a new age.
-      const age=s.lastReadAt-Date.parse(s.telemetry?.sampledAtET);
-      const good=s.lastReadAt!==null&&s.telemetry&&Number.isFinite(age)&&age>=-60000&&age<=30000&&!s.trigger&&!s.backoffUntil;
-      s.lastGoodAt=good?s.lastReadAt:null;s.lastGoodTelemetry=good?s.telemetry:null;
-    }
-    if(!(s.lastGoodAt===null||integer(s.lastGoodAt)) || (s.lastGoodAt===null)!==(s.lastGoodTelemetry===null))throw new Error('invalid last-good state');
-    if(s.lastGoodTelemetry!==null)parseTelemetry(JSON.stringify(s.lastGoodTelemetry));
     return s;
   } catch(error){if(error.code==='ENOENT')return freshState();throw new Error('remote-health-unreadable');}
 }
@@ -52,8 +41,7 @@ async function transaction(root,action,host='forge') {
     return result;
   } finally {rmSync(pending,{force:true});releaseLockDir(root,key);}
 }
-export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',
-  sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))}) {
+export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',ping=pingForge}) {
   try{return await transaction(root,async state=>{
     const now=clock();
     if(now<state.backoffUntil)return {ok:false,reason:`backoff-${state.trigger}`};
@@ -66,46 +54,30 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     // Stale cached telemetry gets one refresh even inside the ten-second cache.
     if(state.lastReadAt===null || now-state.lastReadAt>=10000 || (state.telemetry && stale())) {
       state.lastReadAt=now;
-      const read=async()=>{
-        try{return parseTelemetry(JSON.stringify(await readTelemetry({host})));}
-        catch(error){
-          // Only the SSH/timeout failure emitted by readForgeTelemetry permits
-          // last-good. Malformed replies and unknown errors invalidate it even
-          // if the next attempt fails in transport too.
-          if(error?.message!=='forge-unreachable'||error.transport!==true){state.lastGoodAt=null;state.lastGoodTelemetry=null;}
-          throw error;
+      try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
+      catch(error){
+        // A reachable host (quick ping) earns exactly ONE fresh re-read. The ping is never health evidence; the retry
+        // still passes the freshness/skew and load/RAM checks below. No last-good sample is ever kept.
+        state.telemetry=null;
+        // Only a transport failure qualifies; malformed or invalid telemetry keeps today's fail-closed backoff.
+        let reachable=false;
+        try{reachable=error?.message==='forge-unreachable'&&error.transport===true&&(await ping({host}))===true;}catch{reachable=false;}
+        if(reachable){
+          try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
+          catch{state.telemetry=null;}
         }
-      };
-      try{state.telemetry=await read();}
-      catch{
-        await sleep(500);
-        try{state.telemetry=await read();}catch{state.telemetry=null;}
       }
     }
-    const age=!state.telemetry?clock()-state.lastGoodAt:NaN;
-    // Fresh reads still require the 30s freshness guard. Last-good bypasses
-    // that guard only for transport failures: the explicit operator-ruled
-    // R695/R785 exception, age-capped at <=30 minutes.
-    const lastGood=!state.telemetry && state.lastGoodAt!==null && Number.isFinite(age) && age>=0
-      && age<=Math.min(settings.lastGoodMaxAgeMin??10,30)*60000;
-    const telemetry=lastGood?state.lastGoodTelemetry:state.telemetry;
     let trigger;
-    if(!telemetry)trigger='forge-unreachable';
-    else if(!lastGood&&stale())trigger='telemetry-stale';
-    else if(telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
-    else if(telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
-    if(trigger){
-      // Explicit unhealthy evidence supersedes any older healthy observation.
-      if(trigger!=='forge-unreachable'){state.lastGoodAt=null;state.lastGoodTelemetry=null;}
-      state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};
-    }
-    if(lastGood)return {ok:true,lastGood:true};
-    // Cached reads must never renew the last-good age.
-    if(state.lastReadAt!==state.lastGoodAt){state.lastGoodAt=state.lastReadAt;state.lastGoodTelemetry=state.telemetry;}
+    if(!state.telemetry)trigger='forge-unreachable';
+    else if(stale())trigger='telemetry-stale';
+    else if(state.telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
+    else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
+    if(trigger){state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};}
     return {ok:true};
   },host);}catch(error){return {ok:false,reason:error.message==='remote-health-busy'?error.message:'remote-health-unreadable'};}
 }
-export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge',countFailure=true}) {
+export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge'}) {
   return transaction(root,state=>{
     if(result?.mode==='remote'&&Number.isInteger(result.code)&&result.code>=0&&result.code<=254){
       state.failures=0;state.backoffUntil=0;state.trigger='';return;
@@ -113,7 +85,7 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
     const confirmed=(result?.mode==='not-started'||result?.mode==='cancelled')&&result.terminated===true;
     const reason=!confirmed?'unconfirmed':result.reason;
     if(['unconfirmed','forge-unreachable','copy-failed','forge-busy'].includes(reason)) {
-      if(countFailure)state.failures=Math.min(Number.MAX_SAFE_INTEGER,state.failures+1);
+      state.failures=Math.min(Number.MAX_SAFE_INTEGER,state.failures+1);
       if(state.failures>=settings.backoffFailures){state.backoffUntil=clock()+settings.backoffMs;state.trigger=reason;}
     } else state.failures=0;
   },host);
@@ -122,5 +94,5 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
 /** Latest persisted Forge telemetry sample (read-only; null when absent or unreadable). */
 export function peekRemoteTelemetry({root,host='forge'}) {
   const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
-  try{const state=readState(join(root,key+'.json'));return state.telemetry??state.lastGoodTelemetry;}catch{return null;}
+  try{return readState(join(root,key+'.json')).telemetry;}catch{return null;}
 }
