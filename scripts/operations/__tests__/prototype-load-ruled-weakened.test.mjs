@@ -65,6 +65,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/redteam-pending-on-accept-m1', '166689d13b300960fbf2f458ff3ba18f560b097a', 'R796'],
       ['lane/review-early-start', 'bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2', 'R464+R468+R474'],
       ['lane/runs-scan-bound-aff4', 'aff4a567812cd837234ceeadd0cd7d8a0f658fdb', 'R545'],
+      ['lane/stall-sweep-live', 'c305b4d9990be329d41d4577cf193ef729282899', 'R803+R804'],
       ['lane/verify-forge-route', '2b6ac7d67b5e4fc1b7137c6d7e59d202eb45a41b', 'R396'],
     ]);
     for (const e of shipped.ruledWeakened) { expect(e.sha).toMatch(/^[a-f0-9]{40}$/); expect(e.findings.length).toBeGreaterThan(0); }
