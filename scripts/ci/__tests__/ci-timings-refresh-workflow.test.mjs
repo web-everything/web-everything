@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
+import { readAuthorActorStamps } from '../../lib/review-independence.mjs';
 
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci-timings-refresh.yml', import.meta.url), 'utf8'));
 const steps = workflow.jobs.refresh.steps;
@@ -41,7 +42,7 @@ function publicationProbe({ exists = false, open = false, failCreate = false, fa
           if [ "\${FAIL_LOOKUP:-0}" = 1 ]; then return 1; fi
           echo "$open" ;;
         'pr create')
-          echo CREATE
+          echo "CREATE $*"
           if [ "\${FAIL_CREATE:-0}" = 1 ]; then return 1; fi
           open=1 ;;
         *) echo "Unexpected gh call: $*" >&2; return 99 ;;
@@ -82,6 +83,30 @@ function publicationProbe({ exists = false, open = false, failCreate = false, fa
 }
 
 describe('CI timing refresh publication recovery', () => {
+  it('labels newly created timing PRs for review discovery', () => {
+    const { second } = publicationProbe();
+    expect(second.status, second.stderr).toBe(0);
+    expect(second.stdout).toMatch(/^CREATE pr create .* --label review:pending(?: |$)/m);
+  });
+
+  it('appends exactly one author actor stamp after a blank line in the PR body', () => {
+    const { second } = publicationProbe();
+    expect(second.status, second.stderr).toBe(0);
+    const body = second.stdout.match(/^CREATE pr create .* --body ([\s\S]*)/m)?.[1]?.trimEnd();
+    expect(body).toBe('Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.\n\n<!-- authored-by-actor: github-actions:ci-refresh-test-timings -->');
+    expect(readAuthorActorStamps(body)).toEqual(['github-actions:ci-refresh-test-timings']);
+  });
+
+  it('does not create or emit a review label or author stamp when the PR is already open', () => {
+    const { second } = publicationProbe({ exists: true, open: true });
+    expect(second.status, second.stderr).toBe(0);
+    expect(second.stderr).toContain('LOOKUP');
+    expect(second.stdout).not.toContain('CREATE');
+    expect(second.stdout + second.stderr).not.toContain('review:pending');
+    expect(second.stdout + second.stderr).not.toContain('authored-by-actor:');
+    expect(readAuthorActorStamps(second.stdout + second.stderr)).toEqual([]);
+  });
+
   it('recovers after a successful push followed by failed PR creation without rewriting the branch', () => {
     const { first, second, refreshed, token } = publicationProbe({ failCreate: true });
     expect(first.status).not.toBe(0);
