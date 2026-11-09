@@ -576,6 +576,12 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       }
       expect(numbers(f.queue.entries())).toEqual([2, 1]); // rotated to the tail after maxAttempts
     });
+    it('an invalid admission count admits nothing, probes included (fail closed)', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      for (const bad of [undefined, NaN, '1']) expect(f.queue.admit(repo, bad)).toEqual([]);
+    });
     it('survives a restart', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2]));
