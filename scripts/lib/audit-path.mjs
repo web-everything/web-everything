@@ -11,8 +11,8 @@
  * is refused rather than decoded, so no decoding can ever reduce what is protected.
  */
 export const MAX_AUDIT_PATH = 512;
-/** Most candidates one report may yield; more cannot be matched at bounded cost and fail closed (protected). */
-export const MAX_AUDIT_CANDIDATES = 32;
+/** Most candidates one report may yield (below the old matcher's 32, which counted more forms per path); more cannot be matched at bounded cost and fail closed (protected). */
+export const MAX_AUDIT_CANDIDATES = 16;
 const GRAMMAR = /^(?:(?:\+\+\+|---) )?(?:(["'`])([A-Za-z0-9._/-]+)\1|([A-Za-z0-9._/-]+))(:\d+(?:-\d+|:\d+)?|#L\d+(?:-L\d+)?)?$/;
 
 /** Collapses `.` and empty segments; null for an empty path, a rooted one, or one holding a `..` segment. */
