@@ -137,7 +137,7 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     throw new Error('--ledger must be outside the repository and distinct from --source');
   }
   assertLedgerIdentity(realpathSync(root), ledger, source);
-  const cards = selectUnfiled(parseCards(readFileSync(source, 'utf8')), readLedger(ledger), { select, since, max });
+  const cards = selectUnfiled(parseCards(readFileSync(source, 'utf8')), readLedger(ledger), { select, since, max: Infinity });
   const titles = new Map();
   for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
     const content = readFileSync(join(root, 'backlog', name), 'utf8');
@@ -147,6 +147,8 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   }
   const result = { planned: [], filed: [], duplicates: [], refused: [] };
   for (const card of cards) {
+    // Refusals stay retryable but do not use the budget, so they cannot starve later valid cards.
+    if (result.planned.length + result.filed.length + result.duplicates.length >= max) break;
     const input = composeFileItemInput(card);
     const summary = { tag: card.tag, date: card.date, title: input.title, ...(input.scope ? { scope: input.scope } : {}) };
     if (dryRun) { result.planned.push(summary); continue; }
@@ -207,7 +209,8 @@ export async function runFileHeldCards(options = {}) {
   if (options.dryRun) return runFileHeldCardsLocked(options);
   // Ledger-scoped lock held through select, filing and append, so overlapping runs cannot double-file a card.
   const source = resolve(expandHome(options.source || join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md')));
-  const lock = `${resolve(expandHome(options.ledger || join(dirname(source), 'cards-filed.jsonl')))}.lock`;
+  const lexical = resolve(expandHome(options.ledger || join(dirname(source), 'cards-filed.jsonl')));
+  const lock = `${resolveLedgerPath(lexical)}.lock`;
   try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); } catch (error) {
     if (error.code === 'EEXIST') throw new Error('another file-held-cards run holds the ledger lock; retry when it finishes');
     throw error;
