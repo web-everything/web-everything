@@ -66,7 +66,7 @@ export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activit
 export const NON_READ_OPERATIONS = Object.freeze([
   'land-human-only', 'manual-daemon-pass',
   'review-pr', 'review-prep', 'record-verdict', 'verify', 'pr-size', 'mutation-check', 'revert-red-check', 'gap-sweep-status', 'clear-stuck-session',
-  'resolve', 'close-items', 'reopen-items', 'scaffold', 'file-item', 'suggest-next', 'pr-status', 'land-advance', 'pr-reconcile', 'pr-ownership', 'pr-sweep',
+  'resolve', 'close-items', 'reopen-items', 'scaffold', 'file-item', 'file-held-cards', 'suggest-next', 'pr-status', 'land-advance', 'pr-reconcile', 'pr-ownership', 'pr-sweep',
   'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'host-capacity', 'review-seat-caps', 'gate-health', 'telemetry-summary',
   'graduation-progress-report', 'graduate-chain', 'judge-sweep-facts', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',
   'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'sessions', 'record-referral-ruling', 'extend-rounds',
