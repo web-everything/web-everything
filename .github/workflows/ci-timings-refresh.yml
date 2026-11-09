@@ -114,6 +114,6 @@ jobs:
             gh pr create --base main --head ci/refresh-test-timings "${label[@]}" --title 'ci: refresh measured unit test timings' --body "$body"
           else
             # An already-open refresh PR with no review hold (e.g. opened before labelling) is held for a human, not left unreviewed.
-            held=$(gh pr list --head ci/refresh-test-timings --state open --json labels --jq '[.[].labels[].name | select(startswith("review:"))] | length')
+            held=$(gh pr list --head ci/refresh-test-timings --state open --json labels --jq '[.[].labels[].name | select(. == "review:pending" or . == "review:human" or . == "review:changes" or . == "review:accepted")] | length')
             if [ "$held" = 0 ]; then gh pr edit ci/refresh-test-timings --add-label review:human; fi
           fi
