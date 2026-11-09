@@ -73,6 +73,8 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
+import { decideRequiredContextRetrigger, retriggerRequiredContext, readHeadWorkflowRuns,
+  createMergeGateRetriggerStore } from './merge-gate-retrigger.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -1343,6 +1345,8 @@ export function sweepMissingRunRecovery({
     ? defaultReadAttributedRequiredChecks : readRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
+  readWorkflowRuns = readHeadWorkflowRuns, labelRetrigger = retriggerRequiredContext,
+  retriggerLedger = createMergeGateRetriggerStore(),
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
 } = {}) {
@@ -1408,8 +1412,39 @@ export function sweepMissingRunRecovery({
   });
 
   const applied = [];
+  // Each label candidate costs at most two run reads, a head read, a label read and three label writes.
+  // Bound evidence reads to eight candidates (56 new GitHub calls); others use existing recovery.
+  let retriggerCandidates = 0;
   if (apply) {
     for (const d of plan.dispatch) {
+      const pr = prByNumber.get(d.prNumber);
+      if (d.baseRefName === defaultBranch && defaultBasePartialContexts?.includes('merge-gate')
+        && !pr?.statusCheckRollup?.some(row => (row?.name ?? row?.context) === 'merge-gate')) {
+        let decision;
+        let workflowRuns;
+        try {
+          if (++retriggerCandidates <= 8) {
+            workflowRuns = readWorkflowRuns({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha });
+            decision = decideRequiredContextRetrigger({ requiredContexts: defaultBasePartialContexts,
+              rollup: pr?.statusCheckRollup, workflowRuns, alreadyRetriggered: false });
+          }
+        } catch { /* Unavailable evidence leaves the existing recovery path in charge. */ }
+        if (decision?.action === 'retrigger' && workflowRuns.some(run => run.name === 'Merge gate'
+          && run.event === 'pull_request_target' && run.conclusion === 'startup_failure')) {
+          let result;
+          try {
+            result = labelRetrigger({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha,
+              context: decision.context, ledger: retriggerLedger });
+          } catch (error) { result = { ok: false, deferred: true, error: String(error.message ?? error) }; }
+          // Only a submitted label event completes recovery. Failed attempts retain their
+          // ledger claim, so both failures and spent claims must allow existing recovery.
+          if (result?.ok === true) {
+            applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
+              action: 'label-retrigger', labelCleared: false, ...result });
+            continue;
+          }
+        }
+      }
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;
@@ -1430,7 +1465,6 @@ export function sweepMissingRunRecovery({
       });
       // The push requested CI; only a later rollup proves a run actually started.
       // Clear the stale label on successful submission; the reconciler owns future CI truth.
-      const pr = prByNumber.get(d.prNumber);
       const currentLabels = (Array.isArray(pr?.labels) ? pr.labels : [])
         .map((l) => (typeof l === 'string' ? l : l?.name))
         .filter(Boolean);

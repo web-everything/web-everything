@@ -31,7 +31,7 @@ function claimLedger() {
 
 function effects(overrides = {}) {
   return {
-    readHead: vi.fn(() => HEAD), addLabel: vi.fn(() => ({ ok: true })),
+    readHead: vi.fn(() => HEAD), readLabels: vi.fn(() => []), addLabel: vi.fn(() => ({ ok: true })),
     removeLabel: vi.fn(() => ({ ok: true })), ...overrides,
   };
 }
