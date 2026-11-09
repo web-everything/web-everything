@@ -43,10 +43,10 @@ export function canonicalPaths(file, anchors = null) {
   const forms = [path];
   if (/^[abciwo]\//.test(path)) forms.push(path.slice(2));
   // Prose wraps a name in edge punctuation (a bullet `-docs/a.md`, a sentence-final `x.mjs.`, a hidden-folder dot),
-  // so the name with its leading and trailing `-`, `_` and `.` runs trimmed is a candidate too. Extra candidates only
+  // so the name with its leading and trailing `-`, `_`, `.` and `/` runs trimmed is a candidate too. Extra candidates only
   // ever protect more; the first candidate is always the path exactly as reported.
   for (const f of [...forms]) {
-    const t = f.replace(/^[-_.]+/, '').replace(/[-_.]+$/, '');
+    const t = f.replace(/^[-_./]+/, '').replace(/[-_./]+$/, '');
     if (t !== f) forms.push(t);
   }
   const first = normalise(forms[0]);
@@ -56,10 +56,16 @@ export function canonicalPaths(file, anchors = null) {
     const c = normalise(f);
     if (c !== null) out.add(c);
   }
+  // Anchored sub-paths are cut from the report's own segments BEFORE `..` is resolved, as the old matcher did:
+  // `repo/scripts/../guard-x.mjs` must still yield `scripts/../guard-x.mjs` -> `guard-x.mjs`.
   if (anchors && anchors.size) {
-    for (const c of [...out]) {
-      const segs = c.split('/');
-      for (let i = 1; i < segs.length; i++) if (anchors.has(segs[i].toLowerCase())) out.add(segs.slice(i).join('/'));
+    for (const f of forms) {
+      const segs = f.split('/').filter(x => x !== '' && x !== '.');
+      for (let i = 1; i < segs.length; i++) {
+        if (!anchors.has(segs[i].toLowerCase())) continue;
+        const c = normalise(segs.slice(i).join('/'));
+        if (c !== null) out.add(c);
+      }
     }
   }
   return [...out];

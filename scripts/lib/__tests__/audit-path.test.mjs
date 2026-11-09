@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { canonicalPaths } from '../audit-path.mjs';
 import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern, oracleMatchesPath } from './fixtures/audit-path-old-oracle.mjs';
 
-const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/'];
+const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/', 'guard-*.mjs'];
 const lower = a => a.map(x => x.toLowerCase());
 const globOk = (p, pat) => {
   if (pat.endsWith('/')) return p.startsWith(pat);
@@ -133,13 +133,20 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
       expect(protects(f)).toBe(true);
     }
   });
+  it('anchored sub-paths are cut before ".." resolves (round-2 audit finding)', () => {
+    const pats = ['scripts/**', 'guard-*.mjs'];
+    const anchors = oracleAnchorsOf(pats.map(oracleCleanPattern));
+    expect(oracleMatchesSome('repo/scripts/../guard-x.mjs', pats)).toBe(true);
+    expect(canonicalPaths('repo/scripts/../guard-x.mjs', anchors)).toContain('guard-x.mjs');
+    expect(canonicalPaths('repo/scripts/../guard-x.mjs', anchors).some(c => globOk(c, 'guard-*.mjs'))).toBe(true);
+  });
   it('5000 seeded fuzz strings: nothing the oracle protected is lost', () => {
     const r = rng(0x6381);
     for (let i = 0; i < 5000; i++) check(fuzz(r));
   });
   it('5000 more fuzz strings built around protected names', () => {
     const r = rng(0x5eed);
-    const names = ['scripts/guard-bash.mjs', 'scripts/lib/a.mjs', '.claude/s.json', 'custom/q/r.mjs', 'review-x.mjs', 'docs/a.md'];
+    const names = ['guard-q.mjs', 'scripts/guard-bash.mjs', 'scripts/lib/a.mjs', '.claude/s.json', 'custom/q/r.mjs', 'review-x.mjs', 'docs/a.md'];
     for (let i = 0; i < 5000; i++) check(fuzz(r) + names[Math.floor(r() * names.length)] + fuzz(r));
   });
   it('folder above the repo: without anchors a nested path, with anchors the anchored sub-path too', () => {
