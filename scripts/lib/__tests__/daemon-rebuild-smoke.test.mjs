@@ -405,12 +405,19 @@ describe('dispatch-smoke module unavailable fails closed for overlay builds only
     expect((await unavailable(f, runSmoke)).adopted).toBe(true);
     expect(runSmoke).toHaveBeenCalled();
   });
-  it('an overlay already adopted at the same sha does not hold a later main-only move', async () => {
+  it("an overlay adopted while dispatchSmoke was 'off' still holds a later build when the module is unavailable", async () => {
     const f = makeFixture();
     addDispatchOverlay(f, 'lane/docs', 'docs/x.md');
     expect((await rebuild(f, vi.fn(), { settings: { ...SETTINGS, dispatchSmoke: 'off' } })).adopted).toBe(true);
+    const adopted = head(f);
     pushBranch(f.originDir, 'main', (dir) => writeFile(dir, 'b.txt', 'b'));
-    expect((await unavailable(f, vi.fn(async () => PASS))).adopted).toBe(true);
+    const runSmoke = vi.fn(async () => PASS);
+    const r = await unavailable(f, runSmoke);
+    expect(r.adopted).toBeFalsy();
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(head(f)).toBe(adopted);
+    expect(refs(f)).toEqual(['lane/docs']);
+    expect(readRebuildState(f.cloneDir, f.env).held.reason).toBe('dispatch-smoke-unavailable');
   });
   it("dispatchSmoke 'off' with an available module still adopts a new overlay", async () => {
     const f = makeFixture();
