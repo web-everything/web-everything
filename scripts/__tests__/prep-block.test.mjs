@@ -164,7 +164,7 @@ describe('slot verdict', () => {
     const prep = 'PREP:\nAcceptance: concrete criteria here\nPre-mortem: concrete risk here\nFiles: scripts/a.mjs path\nTests:\nSlot: plan:backlog item 123';
     expect(prepVerdict(prep).ok).toBe(false);
   });
-  it.each([undefined, null, 123, {}, '', 'Slot:', 'Slot: unknown: concrete placement', 'Slot: plan:x', 'Slot: plan:"<placement>"', 'Slot: waived — "<reason>"', 'Slot: plan:`<placement>`', 'Slot: operator:abcdefgh', 'Slot: operator:"<placement>"', 'Slot: operator:"unmatched placement'])('refuses missing, empty or invalid Slot %j with all accepted forms', (text) => {
+  it.each([undefined, null, 123, {}, '', 'Slot:', 'Slot: unknown: concrete placement', 'Slot: plan:x', "Slot: plan:'<placement>'", "Slot: waived — '<reason>'", 'Slot: plan:"<placement>"', 'Slot: waived — "<reason>"', 'Slot: plan:`<placement>`', 'Slot: operator:abcdefgh', 'Slot: operator:"<placement>"', 'Slot: operator:"unmatched placement'])('refuses missing, empty or invalid Slot %j with all accepted forms', (text) => {
     expect(slotVerdict(text)).toEqual({ ok: false, waived: false, reason: expect.stringMatching(/^Slot required \(.*\)/) });
     for (const form of ['Slot: plan:<item>', 'Slot: blocker:<what it unblocks>', 'Slot: operator:<quoted placement>', 'Slot: waived — <reason>']) {
       expect(slotVerdict(text).reason).toContain(form);
