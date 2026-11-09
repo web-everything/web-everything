@@ -69,6 +69,7 @@ export function auditWorkflow(yamlText) {
     if (Array.isArray(value)) { value.forEach(walk); return; }
     if (!record(value)) return;
     if (Object.hasOwn(value, 'permissions') && !permissions(value.permissions)) problems.push('unsafe permissions');
+    if (Object.hasOwn(value, 'continue-on-error')) problems.push('continue-on-error would suppress failures');
     if (Object.hasOwn(value, 'env')) {
       if (!record(value.env)) problems.push('invalid environment');
       else for (const [name, token] of Object.entries(value.env)) {
