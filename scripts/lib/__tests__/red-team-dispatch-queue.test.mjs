@@ -476,4 +476,125 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const override = join('fixture-state', 'custom-queue.json');
     expect(defaultQueueFile({ WE_RED_TEAM_QUEUE_FILE: override }, home)).toBe(override);
   });
+  describe('non-runnable head does not consume an admission', () => {
+    const block = async (f, pr) => {
+      f.queue.admit(repo, pr);
+      await f.queue.settle(repo, refused(pr, 'review-unfinished'));
+    };
+    it('a review-unfinished head is probed each tick but the next runnable PR is admitted in the same tick', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      await block(f, 1);
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2]);
+      expect(f.logs.some(line => line.includes('probe example/project#1'))).toBe(true);
+      expect(f.logs.some(line => line.includes('admit example/project#2: capacity 1'))).toBe(true);
+      expect(f.logs.some(line => line.includes('hold example/project#3: capacity 1'))).toBe(true);
+    });
+    it('keeps FIFO order and the capacity bound among runnable PRs', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
+      await block(f, 1);
+      expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
+      expect(numbers(f.queue.admit(repo, 0))).toEqual([1]); // a probe uses no slot, so it still runs at zero admission
+    });
+    it('bounds probes per tick and rotates a head that stays blocked to the tail after maxAttempts', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3, 4]));
+      for (const pr of [1, 2, 3]) {
+        f.queue.admit(repo, 3);
+        await f.queue.settle(repo, { rows: [1, 2, 3].map(n => ({ prNumber: n, action: 'skip', why: 'review-unfinished' })),
+          dispatched: [], notStarted: [1, 2, 3].map(n => ({ prNumber: n, reason: 'review-unfinished' })) });
+        break;
+      }
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 4]); // 2 probes max, 1 runnable slot; #3 held
+      for (let tick = 0; tick < 3; tick++) {
+        const ids = numbers(f.queue.admit(repo, 1));
+        const why = n => (n === 4 ? 'no review capacity left' : 'review-unfinished');
+        await f.queue.settle(repo, { rows: ids.map(n => ({ prNumber: n, action: 'skip', why: why(n) })),
+          dispatched: [], notStarted: ids.map(n => ({ prNumber: n, reason: why(n) })) });
+      }
+      expect(numbers(f.queue.entries()).slice(-2)).toEqual([1, 2]); // rotated behind #3/#4
+      expect(numbers(f.queue.entries())).toContain(3);
+    });
+    it('a dispatched blocked head leaves the queue', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, started({ plan: { refusals: [{ prNumber: 1, kind: 'already-reviewed-head' }] } }));
+      expect(numbers(f.queue.entries())).not.toContain(1);
+    });
+    it('an ordinary refusal after a block clears the exemption', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      await block(f, 1);
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, refused(1, 'lane busy'));
+      expect(f.queue.entries()[0].blocked).toBeUndefined();
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1]);
+    });
+    it('an unrecognized persisted blocked value is corrupt and loads empty', async () => {
+      const f = fixture();
+      f.files.set(f.file, JSON.stringify(candidates([1, 2, 3]).map(c => ({ key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head,
+        enqueuedAt: 1, attempts: 0, blocked: 'unrecognized-reason' }))));
+      expect(f.open().entries()).toEqual([]);
+    });
+    const planned = async (f, capacityValue) => {
+      let seen, cap;
+      runWithRedTeamQueue({ ...inputs([1, 2, 3], { capacity: capacityValue }), queue: f.queue,
+        run: options => { seen = options.plan.refusals.map(row => row.prNumber); cap = options.capacity; return { rows: [], dispatched: [], notStarted: [] }; } });
+      return { seen, cap };
+    };
+    it('normalizes capacity at intake: 0.5 gives 0 (runner sees 0), 1.7 gives 1', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      expect((await planned(f, { lanes: 0.5, remainingStarts: 0.5, budget: { left: 0.5 } })).cap).toEqual({ lanes: 0, remainingStarts: 0, budget: { left: 0 } });
+      const g = fixture();
+      await g.queue.sync(repo, candidates([1, 2, 3]));
+      const { seen, cap } = await planned(g, { lanes: 1.7, remainingStarts: 1.7, budget: { left: 1.7 } });
+      expect(seen).toEqual([1]);
+      expect(cap).toEqual({ lanes: 1, remainingStarts: 1, budget: { left: 1 } });
+    });
+    it('floors the shared budget in place and never lets a negative figure through', async () => {
+      const f = fixture();
+      const budget = { left: 0.5 };
+      await planned(f, { lanes: 1, remainingStarts: 1, budget });
+      expect(budget.left).toBe(0);
+      expect((await planned(f, { lanes: -0.5, remainingStarts: 1 })).cap.lanes).toBe(0);
+    });
+    it('at capacity 0 blocked heads are still probed and rotated, counters stay >= 0', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      for (let tick = 0; tick < 3; tick++) {
+        let cap;
+        runWithRedTeamQueue({ ...inputs([1, 2], { capacity: { lanes: 0.5, remainingStarts: 0.5 } }), queue: f.queue,
+          run: options => { cap = options.capacity; const r = refused(1, 'review-unfinished');
+            return { rows: [...r.rows, { prNumber: 2, action: 'skip', why: 'no review capacity left' }], dispatched: [],
+              notStarted: [...r.notStarted, { prNumber: 2, reason: 'no review capacity left' }] }; } });
+        expect(cap.lanes).toBeGreaterThanOrEqual(0);
+      }
+      expect(numbers(f.queue.entries())).toEqual([2, 1]); // rotated to the tail after maxAttempts
+    });
+    it('an invalid admission count admits nothing, probes included (fail closed)', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      for (const bad of [undefined, NaN, '1']) expect(f.queue.admit(repo, bad)).toEqual([]);
+    });
+    it('floors the caller capacity object in place so runner decrements reach it', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1]));
+      const cap = { lanes: 1.7, remainingStarts: 2.2 };
+      runWithRedTeamQueue({ ...inputs([1], { capacity: cap }), queue: f.queue,
+        run: options => { expect(options.capacity).toBe(cap); options.capacity.lanes--; return { rows: [], dispatched: [], notStarted: [] }; } });
+      expect(cap).toEqual({ lanes: 0, remainingStarts: 2 });
+    });
+    it('survives a restart', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      expect(numbers(f.open().admit(repo, 1))).toEqual([1, 2]);
+    });
+  });
 });
