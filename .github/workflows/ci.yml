@@ -549,7 +549,8 @@ jobs:
           if [ "${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           # Only the PR's contribution: base may have advanced, and HEAD is checkout's synthetic merge.
           # --no-renames preserves the source path when daemon code is moved outside the scope.
-          changed="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
+          # core.quotePath=false keeps non-ASCII paths unquoted, so they compare equal to the scope keys.
+          changed="$(git -c core.quotePath=false diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
           hits="$(printf '%s\n' "$changed" | grep -E '^(skills-src/conveyor/|scripts/conveyor/|scripts/lib/daemon-|scripts/lib/gh-app-shim|scripts/lib/main-staleness|scripts/lane-pool|scripts/review-set-label\.mjs$|scripts/operations/[^/]*dispatch[^/]*$|vitest\.soak\.config\.ts$)' || true)"
           derived="$(printf '%s\n' "$changed" | node scripts/conveyor/soak/soak-scope.mjs)" || derived="run=true"
           if [ -n "$hits" ] || [ "$derived" != "run=false" ]; then

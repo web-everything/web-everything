@@ -66,6 +66,11 @@ describe('soak scope', () => {
     expect(closure.has(RED_TEAM)).toBe(true);
     expect(closure.has('scripts/conveyor/soak/breaks/red-team-skip-never-settles.soak.test.mjs')).toBe(true);
     expect(closure.has('vitest.soak.config.ts')).toBe(true);
+    // The soak config's own dependencies (dotted `./vitest.shared`, setupFiles/globalSetup literals).
+    for (const path of ['vitest.shared.ts', 'vitest.setup.ts', 'vitest.globalSetup.mjs',
+      ['scripts', 'lib', 'test-tmp-root.mjs'].join('/')]) {
+      expect(closure.has(path), path).toBe(true);
+    }
   }, 25_000);
 
   it.each([
@@ -147,17 +152,38 @@ describe('soak scope', () => {
     ['require with a template literal', 'require(`../../../fixture/dep.mjs`);'],
     ['extensionless import', "import '../../../fixture/dep';"],
     ['dot-slash repo-root literal', "new URL('./scripts/x/dep.mjs', ROOT_URL);"],
+    ['import after a quoted keyword', "const K = 'import'; import '../../../fixture/dep.mjs';"],
+    ['import after a quoted from', "const K = 'from'; import '../../../fixture/dep.mjs';"],
+    ['template import after a quoted require(', 'const K = `require(`; import(`../../../fixture/dep.mjs`);'],
+    ['file-relative non-import literal', "new URL('../../../fixture/dep.mjs', import.meta.url);"],
+    ['config-style relative literal', "export default { setupFiles: ['../../../fixture/dep.mjs'] };"],
+    ['dotted extensionless basename', "import '../../../fixture/dep.v2';"],
   ])('follows %s', (_name, source) => {
     const root = fixtureRoot();
     writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
     writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', `${source}\n`);
     writeFixture(root, 'fixture/dep.mjs', 'export const x = 1;\n');
     writeFixture(root, 'scripts/x/dep.mjs', 'export const x = 1;\n');
+    writeFixture(root, 'fixture/dep.v2.mjs', 'export const x = 2;\n');
 
     const closure = computeSoakClosure({ root });
-    const target = source.includes('./scripts/x/') ? 'scripts/x/dep.mjs' : 'fixture/dep.mjs';
+    const target = source.includes('./scripts/x/') ? 'scripts/x/dep.mjs'
+      : source.includes('dep.v2') ? 'fixture/dep.v2.mjs' : 'fixture/dep.mjs';
     expect(closure.has(target)).toBe(true);
     expect(soakScopeRun({ root, changed: [target] })).toBe(true);
+  });
+
+  it('never resolves a literal naming the root itself to a sibling outside the repository', () => {
+    const parent = fixtureRoot();
+    const root = join(parent, 'repo');
+    writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "new URL('../../../', import.meta.url);\n");
+    // `<root>.mjs` beside the repository must stay out of the closure.
+    writeFixture(parent, 'repo.mjs', "import './repo/outside-dep.mjs';\n");
+
+    const closure = computeSoakClosure({ root });
+    expect([...closure].some((path) => path.startsWith('..'))).toBe(false);
+    expect(closure.has('repo.mjs')).toBe(false);
   });
 
   it('discovers dependencies without executing their source', () => {
@@ -201,7 +227,8 @@ describe('ci.yml daemon-soak scope step wiring', () => {
       return values[key];
     });
     const script = `git() { printf '%s\\n' "$SCOPE_FILES"; }\n${node}\n${substitute(scopeStep.run)}`;
-    const result = spawnSync('bash', ['-e', '-c', script], {
+    // GitHub runs `run:` steps as `bash --noprofile --norc -eo pipefail {0}`.
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], {
       cwd: ROOT,
       encoding: 'utf8',
       timeout: 25_000,
@@ -216,6 +243,10 @@ describe('ci.yml daemon-soak scope step wiring', () => {
     expect(result.status, result.stderr).toBe(0);
     return readFileSync(output, 'utf8').trim();
   }
+
+  it('lists changed paths unquoted so non-ASCII names match the scope keys', () => {
+    expect(scopeStep.run).toMatch(/git -c core\.quotePath=false diff --name-only/);
+  });
 
   it('runs the soak for a derived-only path outside the legacy grep', () => {
     expect(runStep({ files: RED_TEAM })).toBe('run=true');

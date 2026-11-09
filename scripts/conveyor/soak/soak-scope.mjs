@@ -5,7 +5,7 @@
  * evidence makes the CLI request the soak rather than silently skipping it.
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const DEFAULT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -42,13 +42,14 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     }
   };
   const follow = (base) => {
-    if (!inside(base)) return;
+    // Always try the suffixes: a dotted basename (`./vitest.shared`) has an extname but is
+    // still extensionless to the resolver. Each candidate is checked: `<root>.mjs` (from a
+    // literal naming the root itself) lies outside the repository and is never touched.
     const candidates = [base];
-    if (!extname(base)) {
-      for (const suffix of ['.mjs', '.js', '.cjs', '.ts', '.mts', '.tsx', '/index.mjs', '/index.js', '/index.ts']) {
-        candidates.push(`${base}${suffix}`);
-      }
+    for (const suffix of ['.mjs', '.js', '.cjs', '.ts', '.mts', '.tsx', '/index.mjs', '/index.js', '/index.ts']) {
+      candidates.push(`${base}${suffix}`);
     }
+    candidates.splice(0, candidates.length, ...candidates.filter(inside));
     for (const candidate of candidates) {
       if (isFile(candidate)) { add(candidate); return; }
     }
@@ -66,15 +67,17 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     if (!SOURCE.test(file)) continue;
     const source = readFileSync(file, 'utf8');
     // Over-approximate: literals in comments/fixtures may widen scope too.
+    const isRelative = (specifier) => specifier.startsWith('./') || specifier.startsWith('../');
     // `import'x'`, `export*from"x"` and `import(\`x\`)` are valid: whitespace is optional, and
-    // dynamic import/require may take a template literal.
-    for (const match of source.matchAll(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(['"`])([^'"`\r\n]+)\1/g)) {
-      if (match[2].startsWith('./') || match[2].startsWith('../')) {
-        follow(resolve(dirname(file), match[2]));
-      }
+    // dynamic import/require may take a template literal. The specifier is matched in a
+    // lookahead so a quoted keyword (`'import'`) cannot consume a real import after it.
+    for (const match of source.matchAll(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])([^'"`\r\n]+)\1)/g)) {
+      if (isRelative(match[2])) follow(resolve(dirname(file), match[2]));
     }
     for (const match of source.matchAll(/(['"`])([^'"`\r\n]+)\1/g)) {
-      // Repo-root literals cover spawn/readFile/new URL targets that are not imports.
+      // Non-import literals: file-relative (`setupFiles: ['./x']`, `new URL('../x', import.meta.url)`)
+      // and repo-root (spawn/readFile targets, `new URL('./scripts/x', ROOT_URL)`).
+      if (isRelative(match[2])) follow(resolve(dirname(file), match[2]));
       const path = match[2].replace(/^\.\//, '');
       if (/^(?:scripts|src|tools|skills-src)\//.test(path)) follow(resolve(root, path));
     }
@@ -96,13 +99,13 @@ export function soakScopeRun({ root = DEFAULT_ROOT, changed } = {}) {
 async function selfTest() {
   const { test } = await import('node:test');
   const assert = await import('node:assert/strict');
-  const { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } = await import('node:fs');
+  const { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { spawnSync } = await import('node:child_process');
   const cli = fileURLToPath(import.meta.url);
   const dependency = 'fixture/dependency.mjs';
-  const scopeCase = (name, prepare, changed, expected) => test(name, () => {
+  const scopeCase = (name, prepare, changed, expected, check = () => {}) => test(name, () => {
     const root = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'soak-scope-self-test-'));
     const seed = join(root, 'scripts/conveyor/soak');
     try {
@@ -120,6 +123,7 @@ async function selfTest() {
       assert.ifError(result.error);
       assert.equal(result.status, 0, result.stderr);
       assert.equal(result.stdout, `run=${expected}\n`);
+      check({ root });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -141,10 +145,20 @@ async function selfTest() {
     writeFileSync(join(seed, 'scope.soak.test.mjs'), "import '../../../fixture/dependency';");
     rmSync(join(root, dependency));
   }, dependency, true);
+  // run=true alone cannot tell scanning from executing (a throw also fails open), so check the
+  // closure directly and that the dependency's side effect never happened.
   await scopeCase('discovers dependencies without executing their source', ({ root }) => {
-    writeFileSync(join(root, dependency), "throw new Error('executed');\nimport'./transitive.mjs';");
+    writeFileSync(join(root, dependency), [
+      "import { writeFileSync } from 'node:fs';",
+      `writeFileSync(${JSON.stringify(join(root, 'executed'))}, 'ran');`,
+      "throw new Error('executed');",
+      "import'./transitive.mjs';",
+    ].join('\n'));
     writeFileSync(join(root, 'fixture/transitive.mjs'), 'export const t = 1;');
-  }, 'fixture/transitive.mjs', true);
+  }, 'fixture/transitive.mjs', true, ({ root }) => {
+    assert.ok(computeSoakClosure({ root }).has('fixture/transitive.mjs'));
+    assert.equal(existsSync(join(root, 'executed')), false);
+  });
   await scopeCase('unrelated changes skip the soak with readable evidence', () => {}, 'backlog/unrelated.md', false);
 }
 
