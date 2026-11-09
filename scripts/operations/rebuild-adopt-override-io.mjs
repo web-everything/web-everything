@@ -3,7 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { resolveDaemonClones } from '../lib/daemon-clones.mjs';
 import { withWriteLock } from '../lib/daemon-clone-lock.mjs';
-import { readReadyCandidate } from '../lib/daemon-rebuild/state.mjs';
+import { readReadyCandidate, readRebuildState } from '../lib/daemon-rebuild/state.mjs';
+import { READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS } from '../lib/daemon-rebuild/lease.mjs';
 import { readyBuildVerified, finalizeRebuild } from '../lib/daemon-rebuild/adopt.mjs';
 import { makeGit, verifyRev, FULL_SHA_RE } from '../lib/daemon-rebuild/shared.mjs';
 import { recordedEdgeSha } from '../lib/daemon-rebuild/edge-fetch.mjs';
@@ -29,11 +30,11 @@ export function resolveRebuildDaemonRoot(daemon, { discover = resolveDaemonClone
 export function createRebuildAdoptOverrideSinks(deps = {}) {
   // Explicitly injected missing verification evidence must refuse, rather than fall back to production IO.
   const { env, stateOpts, log, now, run, resolveRoot, withWriteLock: lock,
-    readReadyCandidate: readReady, readOverlayState: readOverlays, verifyBuilt,
+    readReadyCandidate: readReady, readRebuildState: readState, readOverlayState: readOverlays, verifyBuilt,
     appendOverlayEvent: appendEvent, finalizeRebuild: finalize } = {
     env: process.env, stateOpts: {}, log: console, now: Date.now,
     run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8', maxBuffer: 1024 * 1024 }),
-    resolveRoot: resolveRebuildDaemonRoot, withWriteLock, readReadyCandidate, readOverlayState,
+    resolveRoot: resolveRebuildDaemonRoot, withWriteLock, readReadyCandidate, readRebuildState, readOverlayState,
     verifyBuilt: readyBuildVerified, appendOverlayEvent, finalizeRebuild,
     ...deps,
   };
@@ -41,14 +42,35 @@ export function createRebuildAdoptOverrideSinks(deps = {}) {
     const { sha, daemon } = validateRebuildAdoptOverride(raw);
     const root = await resolveRoot(daemon, { env });
     const result = await lock(root, async () => {
-      const ready = await readReady(root, { ...env, ...(stateOpts?.env || {}) });
+      const stEnv = { ...env, ...(stateOpts?.env || {}) };
+      const ready = await readReady(root, stEnv);
       if (!ready) throw new Error('rebuild-adopt-override: no ready record; wait for a successful rebuild before retrying');
       if (ready.adopt?.finalSha !== sha) throw new Error('rebuild-adopt-override: sha mismatch with ready record');
       const plan = ready.adopt;
+      if (ready.forced) throw new Error('rebuild-adopt-override: forced ready record; wait for a plain verified rebuild before retrying');
+      if (ready.kind === 'fallback' || ['dropRefs', 'suspects', 'fallback'].some(field =>
+        Array.isArray(ready[field]) ? ready[field].length > 0 : !!ready[field])) {
+        throw new Error('rebuild-adopt-override: requires a plain verified adopt without dropped or suspect overlays');
+      }
       for (const field of ['dropRefs', 'suspects']) {
         if (plan[field] != null && (!Array.isArray(plan[field]) || plan[field].length !== 0)) {
           throw new Error('rebuild-adopt-override: requires a plain verified adopt without dropped or suspect overlays');
         }
+      }
+      const passedMs = Date.parse(ready.passedAt || ready.at || '');
+      const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
+      if (!Number.isFinite(passedMs) || now() - passedMs > maxAgeMs) {
+        throw new Error('rebuild-adopt-override: expired or missing pass time; wait for a fresh successful rebuild before retrying');
+      }
+      let state;
+      try {
+        state = await readState(root, stEnv, { strict: true });
+        if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('invalid state');
+      } catch {
+        throw new Error('rebuild-adopt-override: unreadable rebuild state; repair it before retrying');
+      }
+      if (state.rejected && state.rejected.inputsKey === plan.inputsKey && Date.parse(state.rejected.at || '') > passedMs) {
+        throw new Error('rebuild-adopt-override: inputs rejected since the pass; wait for a new successful rebuild before retrying');
       }
       const git = makeGit({ run, cwd: root, env });
       const prevHead = verifyRev(git, 'HEAD');
@@ -56,10 +78,20 @@ export function createRebuildAdoptOverrideSinks(deps = {}) {
       if (!FULL_SHA_RE.test(prevHead ?? '') || !FULL_SHA_RE.test(mainTip ?? '')) {
         throw new Error('rebuild-adopt-override: unreadable HEAD or origin/main; repair git evidence before retrying');
       }
+      if (ready.prevHead && ready.prevHead !== prevHead) {
+        throw new Error('rebuild-adopt-override: ready base differs from current HEAD; wait for a new successful rebuild before retrying');
+      }
       const overlays = await readOverlays(root, { env });
       if (overlays?.corrupt !== false || !Array.isArray(overlays.overlays)) {
         throw new Error('rebuild-adopt-override: unreadable overlay approval state; repair it before retrying');
       }
+      const registeredRefs = new Set(overlays.overlays.map(entry => entry?.ref).filter(Boolean));
+      if (!Array.isArray(plan.applied) || !plan.applied.every(entry => registeredRefs.has(entry?.ref))) {
+        throw new Error('rebuild-adopt-override: applied overlay is not currently registered; rebuild from the current overlay list before retrying');
+      }
+      // The ONLY matchReadyCandidate refusal this operator override bypasses is
+      // superseded-omits-live-overlay: a verified candidate may omit a live overlay.
+      // Every overlay it DOES carry must still be registered, and all other evidence must pass.
       if (typeof verifyBuilt !== 'function' || await verifyBuilt({
         git, adopt: plan, mainTip, prevHead,
         approvedEdgeShaFor: ref => recordedEdgeSha(overlays.overlays.find(entry => entry?.ref === ref)),
