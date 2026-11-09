@@ -89,6 +89,15 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
   if ([...latest].some(([sha, i]) => sha !== live && i > pick && !hasFp(list[i].fingerprint) && !judge(list[i]))) return null;
   return judge(list[pick]);
 }
+/** True when a stored ready record for this branch speaks about THIS head's code: it names the live sha (any case),
+ * carries the live net-diff fingerprint, or is too malformed to classify (fail closed). A record for other code never
+ * counts, so an iterated branch is not stranded by its own earlier load. Pair with readyEvidence: refuse only when
+ * readyEvidence is null AND a record speaks for this head. */
+export function readyRecordSpeaksFor(records, input, liveFp = null) {
+  const live = lowerSha(input.sha);
+  return (Array.isArray(records) ? records : []).some((r) => r && typeof r === 'object' && r.ref === input.branch
+    && (!validSha(r.sha) || lowerSha(r.sha) === live || carriesAcross(r.fingerprint, liveFp)));
+}
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the

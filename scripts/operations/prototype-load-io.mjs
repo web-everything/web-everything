@@ -21,7 +21,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -198,7 +198,7 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, removeRegistration = null }) {
+  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -451,9 +451,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
+      let readyFp = null;
       out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,
-        () => liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])]));
-      const hasReady = readyRecords.some((r) => r?.ref === input.branch);
+        () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])));
+      // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an
+      // earlier load of different code must not strand the branch: the check-run path below writes fresh readiness.
+      const hasReady = readyRecordSpeaksFor(readyRecords, input, readyFp);
       if (!out.gate && hasReady) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Fix the latest readiness evidence; arguments are labels only.' });
       stage = 'no-canonical-audit';
       let auditRecords = [];
@@ -516,10 +519,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             requireGit('worktree', 'add', '--detach', tree, input.sha);
             const actual = requireGit('-C', tree, 'rev-parse', 'HEAD');
             if (actual !== input.sha) throw new Error('smoke candidate moved');
-            out.dispatchSmoke = { ...await runRealDispatchSmoke({ tree, env: childEnv }), sha: actual };
+            out.dispatchSmoke = { ...await realDispatchSmoke({ tree, env: childEnv }), sha: actual };
           } finally {
-            requireGit('worktree', 'remove', '--force', tree);
-            fs.rmSync(scratch, { recursive: true, force: true });
+            // Cleanup is best-effort: a failing remove must never replace the smoke verdict (a throw here would).
+            git('worktree', 'remove', '--force', tree);
+            try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* leftover scratch is only litter */ }
           }
         }
         if (out.dispatchSmoke?.ok !== true || out.dispatchSmoke.sha !== input.sha || out.dispatchSmoke.skipped || out.dispatchSmoke.ran === false)

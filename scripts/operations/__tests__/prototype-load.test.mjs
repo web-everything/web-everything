@@ -247,7 +247,8 @@ function fixture(options = {}) {
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
   const load = createPrototypeLoader({ exec, fs, env, retirePlanner,
-    testCheck: options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
+    // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
+    testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
@@ -863,11 +864,18 @@ describe('default combined-tree test proof', () => {
 
 describe('prototype-load', () => {
   it.each([
-    ['missing', ''], ['wrong sha', JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' })],
+    ['missing', ''],
     ['weakened', JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED' })],
   ])('no-ready: %s stops before git and records', async (_, ready) => {
     const f = fixture({ ready, testCheck: async () => null }); expect((await f.run()).stopReason).toBe('no-ready');
     expect(f.calls).toHaveLength(ready ? 0 : 2); expect(f.records[0].stopReason).toBe('no-ready');
+  });
+  it('no-ready: a record for another sha is not evidence about this head, so the check-run path decides', async () => {
+    // Was pinned as a zero-call refusal (PR #6610 review): that stranded every iterated branch after its first load.
+    const stale = JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' });
+    const f = fixture({ ready: stale, testCheck: async () => null });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(f.calls).toHaveLength(2); expect(f.readyWrites).toEqual([]);
   });
   it('refuses explicit tests-run and NOT WEAKENED without a passing check-run', async () => {
     const f = fixture({ ready: '', testCheck: async () => null }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(false);
@@ -2824,8 +2832,15 @@ describe('refuse-only safety properties P1–P9', () => {
   });
   it('P9 an already-live registration is never removed or rebuilt, and an unaudited re-load is still refused', async () => {
     const f = auditedFixture('refuse', { ready: '', list: [BASE.branch, 'lane/old'] });
-    expect(await f.run()).toMatchObject({ ok: false });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
     expect(mutations(f, 'add')).toHaveLength(0); expect(mutations(f, 'remove')).toHaveLength(0); expect(f.retirePlanner).not.toHaveBeenCalled();
+  });
+  it('P9 an audited re-load of a live ref passes the admission gates, then reports already without any mutation', async () => {
+    const f = fixture({ list: [BASE.branch, 'lane/old'] });
+    expect(await f.run()).toMatchObject({ ok: true, registered: 'already', canonicalAudit: { ok: true } });
+    for (const action of ['add', 'remove', 'replace', 'retire']) expect(mutations(f, action)).toHaveLength(0);
+    expect(f.calls.some((c) => c.args[0] === 'push')).toBe(false);
+    expect(f.retirePlanner).not.toHaveBeenCalled();
   });
   it('real settings R786 (#6588), R790 (a7200c728), R796 (166689d) pass the canonical ruled gate using fake IO', async () => {
     const shipped = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
@@ -2882,6 +2897,101 @@ describe('test check-run evidence bounds (P8)', () => {
   });
 });
 
+
+// PR #6610 review: stored readiness for other code must not strand an iterated branch, but negative evidence about
+// THIS head (its own sha, or the same net diff) must still refuse.
+describe('stale readiness never blocks a code-changed head', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const rec = (o = {}) => ({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED', ...o });
+  it('a second load of the same ref at a code-different sha writes fresh readiness from the first load\'s record', async () => {
+    const first = fixture({ ready: '', sha: OLD });
+    expect(await first.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(first.readyWrites).toHaveLength(1);
+    const { path: _path, ...stored } = first.readyWrites[0];
+    const second = fixture({ ready: auditLines([stored]) });
+    expect(await second.run()).toMatchObject({ ok: true, stopReason: null, gate: { source: 'canonical-check-run' } });
+    expect(second.readyWrites).toHaveLength(1);
+    expect(second.readyWrites[0]).toMatchObject({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' });
+  });
+  it.each([
+    ['a green record for another sha', [rec({ sha: OLD })]],
+    ['an unruled WEAKENED record for another sha with no fingerprint', [rec({ sha: OLD, audit: 'WEAKENED' })]],
+    ['a red record for another sha', [rec({ sha: OLD, tests: 'red' })]],
+  ])('%s does not refuse the new head', async (_, records) => {
+    const f = fixture({ ready: auditLines(records) });
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(f.readyWrites).toHaveLength(1);
+  });
+  it('a record carrying a DIFFERENT net-diff fingerprint is other code and does not refuse', async () => {
+    const f = fixture({ ready: auditLines([rec({ sha: OLD, audit: 'WEAKENED', fingerprint: FP })]), fingerprint: () => OTHER_FP });
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+  });
+  it.each([
+    ['its own latest record is red after an older green one', [rec(), rec({ tests: 'red' })]],
+    ['its own record is unruled WEAKENED', [rec({ audit: 'WEAKENED' })]],
+    ['an upper-case --sha still finds its own negative record', [rec({ tests: 'red', sha: SHA.toUpperCase() })]],
+    ['a record with no usable sha cannot be classified, so it refuses', [{ ref: BASE.branch, tests: 'red', audit: 'NOT WEAKENED' }]],
+  ])('still refuses when %s', async (_, records) => {
+    const f = fixture({ ready: auditLines(records) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+    expect(f.calls).toEqual([]); expect(f.readyWrites).toEqual([]);
+  });
+  it('still refuses when negative evidence for the same net diff sits on another sha (carried), and never writes readiness', async () => {
+    const f = fixture({ ready: auditLines([rec({ sha: OLD, audit: 'WEAKENED', fingerprint: FP })]), fingerprint: () => FP });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+});
+
+// PR #6610 review: every loader-level test above injects `testCheck`; these leave the seam at its default so the
+// production reader (gh api, completeness checks, workflow binding, configured workflow path) is what admits or refuses.
+describe('default test check-run reader (production wiring)', () => {
+  const REPO_SLUG = 'web-everything/web-everything';
+  const run = (o = {}) => ({ id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 }, ...o });
+  const wf = (o = {}) => ({ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml', ...o });
+  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, ...options } = {}) {
+    const gh = [];
+    const combinedIO = { fs: {},
+      handles: (cmd, args) => cmd === 'gh' || (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url'),
+      exec: (cmd, args) => {
+        if (cmd === 'git') return `https://github.com/${REPO_SLUG}.git\n`;
+        gh.push(args.join(' '));
+        const bad = () => { throw Object.assign(new Error('gh: HTTP 500'), { status: 1, stdout: '', stderr: 'HTTP 500' }); };
+        if (args[0] === 'repo' && args[1] === 'view') return JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
+        if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : JSON.stringify(checks);
+        if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : JSON.stringify(runs);
+        throw new Error(`unexpected gh call ${args.join(' ')}`);
+      } };
+    return { gh, ...fixture({ ready: '', defaultTestCheck: true, combinedIO, ...options }) };
+  }
+  const refused = async (f) => {
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  };
+  it('admits a passing test bound to the expected workflow file and writes fresh readiness', async () => {
+    const f = ghFixture();
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(f.readyWrites[0]).toMatchObject({ sha: SHA, testCheck: { sha: SHA, name: 'test', conclusion: 'success', appId: 15368 } });
+    expect(f.gh.some((c) => c.includes(`commits/${SHA}/check-runs`))).toBe(true);
+    expect(f.gh.some((c) => c.includes(`actions/runs?head_sha=${SHA}`))).toBe(true);
+  });
+  it('refuses a same-named success from a foreign workflow file', async () => {
+    await refused(ghFixture({ runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }));
+  });
+  it('binds to the CONFIGURED workflow path, not a hard-coded one', async () => {
+    await refused(ghFixture({ settings: { testWorkflowPath: '.github/workflows/other.yml' } }));
+    expect(await ghFixture({ settings: { testWorkflowPath: '.github/workflows/other.yml' },
+      runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }).run()).toMatchObject({ ok: true });
+  });
+  it.each([
+    ['a failed workflow-runs read', { fail: 'runs' }],
+    ['a failed check-runs read', { fail: 'checks' }],
+    ['a truncated workflow-runs page', { runs: { total_count: 2, workflow_runs: [wf()] } }],
+    ['a truncated check-runs page', { checks: { total_count: 101, check_runs: [run()] } }],
+    ['a check-run from another GitHub app', { checks: { total_count: 1, check_runs: [run({ app: { id: 1 } })] } }],
+    ['a failing test check-run', { checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } }],
+  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options)); });
+});
 
 const shippedRuledSettings = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
 it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))('real settings #6603 R803 passes the canonical ruled gate (requires its settings entry)', async () => {

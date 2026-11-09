@@ -32,7 +32,9 @@ node scripts/operations/run.mjs prototype-load --daemon=<name> --remove=<registe
 
 Drop `--dry-run` to apply. Removal refuses stacked dependents and uses the existing guarded retirement transaction, with expected entry identity and pre/post removal tip checks; a moved tip restores the entry. Do not combine removal with add, replace or retire.
 
-Already-live registrations return `registered: "already"` without fetching, rebuilding, retiring or retroactively applying admission. Registration-audit classification is deferred; inspect live entries before choosing explicit removal.
+Re-loading an already-live registration runs the same admission gates as a first load (readiness, canonical audit, passing `test` check-run, fetches) and is refused with `no-ready` or `no-canonical-audit` if they fail. Once they pass it returns `registered: "already"` and never adds, removes, rebuilds or retires anything. Registration-audit classification is deferred; inspect live entries before choosing explicit removal.
+
+Stored readiness only speaks for the code it was written for. A `fix-ready.jsonl` record for another sha of the same branch (different net diff) never blocks a new head: the operation writes fresh readiness from the canonical audit and a passing `test` check-run. A record that names this sha, or carries this head's net-diff fingerprint, and is not green and NOT WEAKENED (or ruled) still refuses with `no-ready`.
 
 What it does, in order, stopping at the first failure (`stopReason`):
 1. Resolves the daemon to its clone from `scripts/settings/prototype-load.json` (plist WorkingDirectory, with an override for drain's code clone). The source is printed.
