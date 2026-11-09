@@ -11,7 +11,8 @@ import { MAX_TOTAL_ROUND_EXTENSIONS } from '../round-extension-mark.mjs';
 const REPO = 'web-everything/web-everything';
 const HEAD = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
 const mqWhy = (reason) => `the drain skipped it: mq-same-head-failed: #77 head ${HEAD} — ${reason}`;
-const groupWhy = 'the drain skipped it: grouped into #88 (lands with it; drain.group)';
+const mqRoute = `mq-recovery-route:${REPO}#77@${HEAD.toLowerCase()}`;
+const groupWhy = 'the drain skipped it: grouped into #77 (closure pending; drain.group)';
 const ACTOR = { 'system:fix-stood-down': 'system', 'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'red-team-sent-back-cleared': 'nobody',
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
@@ -111,13 +112,31 @@ describe('every state x every verdict', () => {
 
 describe('known drain waits explain what releases them', () => {
   it.each([
+    ['no route', []],
+    ['route for another PR', [mqRoute.replace('#77@', '#88@')]],
+    ['route for another repository', [mqRoute.replace(REPO, 'o/other')]],
+    ['stale route for another head', [mqRoute.replace(HEAD.toLowerCase(), 'f'.repeat(40))]],
+    ['non-exact route', [`prefix ${mqRoute}`]],
+  ])('same-head MQ %s requires operator inspection', (_name, evidence) => {
+    const why = mqWhy('failed_checks');
+    expect(at('drain-skip:mq-same-head-failed', { row: { actor: 'drain', why, evidence } })).toMatchObject({
+      lane: 'operator', action: 'drain-skip:mq-same-head-failed', reason: expect.stringContaining(why), command: 'operator must inspect',
+    });
+  });
+  it('checks the bound route after the first three evidence entries before truncating output', () => {
+    const result = at('drain-skip:mq-same-head-failed', {
+      row: { actor: 'drain', why: mqWhy('failed_checks'), evidence: ['e1', 'e2', 'e3', mqRoute] },
+    });
+    expect(result).toMatchObject({ lane: 'system', action: 'await-mq-failure-recovery', evidence: ['e1', 'e2', 'e3'] });
+  });
+  it.each([
     'failed_checks',
     'failed_checks infra retry',
     'failed_checks infra retry 1/1 (main green, PR CLEAN, infra)',
     'failed_checks quarantine retry',
     'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)',
   ])('recoverable same-head MQ reason %s waits for system recovery', (reason) => {
-    const result = at('drain-skip:mq-same-head-failed', { row: { actor: 'drain', why: mqWhy(reason) } });
+    const result = at('drain-skip:mq-same-head-failed', { row: { actor: 'drain', why: mqWhy(reason), evidence: ['e1', 'e2', 'e3', mqRoute] } });
     expect(result).toMatchObject({ lane: 'system', action: 'await-mq-failure-recovery' });
     expect(result.reason).toMatch(/waiting on mq-failure recovery/i);
     expect(result.reason).toMatch(/same.head/i);
@@ -141,13 +160,13 @@ describe('known drain waits explain what releases them', () => {
     '',
   ])('same-head MQ hold %j needs an operator and preserves its reason', (reason) => {
     const why = mqWhy(reason);
-    expect(at('drain-skip:mq-same-head-failed', { row: { actor: 'drain', why } })).toMatchObject({
+    expect(at('drain-skip:mq-same-head-failed', { row: { actor: 'drain', why, evidence: [mqRoute] } })).toMatchObject({
       lane: 'operator', action: 'drain-skip:mq-same-head-failed', reason: expect.stringContaining(why), command: 'operator must inspect',
     });
   });
   it.each([
     groupWhy,
-    'the drain skipped it: we:backlog/card.md is reserved by open card group #88 (drain.group)',
+    'the drain skipped it: we:backlog/card.md is reserved by open card group #77 (drain.group)',
   ])('confirmed card membership %s waits for the group', (why) => {
     const result = at('drain-skip:card-grouped', { row: { actor: 'drain', why } });
     expect(result).toMatchObject({ lane: 'system', action: 'await-card-group' });
@@ -156,6 +175,9 @@ describe('known drain waits explain what releases them', () => {
   it.each([
     'card-group state unreadable — holding (fail closed)',
     'card-group repository identity missing — holding (fail closed)',
+    'grouped into #88 (lands with it; drain.group)',
+    'grouped into #770 (lands with it; drain.group)',
+    'we:backlog/card.md is reserved by open card group #88 (drain.group)',
     'unrecognised card-group hold',
     '',
   ])('card-group hold %j needs an operator and preserves its reason', (reason) => {
@@ -176,7 +198,7 @@ describe('known drain waits explain what releases them', () => {
     'failed_checks',
     `unexpected prefix: mq-same-head-failed: #77 head ${HEAD} — failed_checks`,
   ])('malformed MQ evidence %s fails closed with its hold text', (why) => {
-    expect(at('drain-skip:mq-same-head-failed', { row: { actor: 'drain', why } })).toMatchObject({
+    expect(at('drain-skip:mq-same-head-failed', { row: { actor: 'drain', why, evidence: [mqRoute] } })).toMatchObject({
       lane: 'operator', action: 'drain-skip:mq-same-head-failed', reason: expect.stringContaining(why), command: 'operator must inspect',
     });
   });
@@ -184,7 +206,7 @@ describe('known drain waits explain what releases them', () => {
     ['drain-skip:mq-same-head-failed', 'await-mq-failure-recovery', mqWhy('failed_checks')],
     ['drain-skip:card-grouped', 'await-card-group', groupWhy],
   ])('%s goes to the operator when systemActions.%s is off', (state, action, why) => {
-    const result = at(state, { row: { actor: 'drain', why }, settings: { systemActions: { [action]: false } } });
+    const result = at(state, { row: { actor: 'drain', why, evidence: [mqRoute] }, settings: { systemActions: { [action]: false } } });
     expect(result).toMatchObject({ lane: 'operator', action, command: expect.any(String) });
     expect(result.reason).toContain(`systemActions.${action}`);
   });
@@ -418,7 +440,7 @@ describe('every policy is a setting, and settings only make it stricter', () => 
   const actionCases = {
     systemActions: {
       'await-ledger-outbox': ['system:ledger-write-miss'],
-      'await-mq-failure-recovery': ['drain-skip:mq-same-head-failed', null, {}, { row: { actor: 'drain', why: mqWhy('failed_checks') } }],
+      'await-mq-failure-recovery': ['drain-skip:mq-same-head-failed', null, {}, { row: { actor: 'drain', why: mqWhy('failed_checks'), evidence: [mqRoute] } }],
       'await-card-group': ['drain-skip:card-grouped', null, {}, { row: { actor: 'drain', why: groupWhy } }],
       'resume-stale-hold': ['system:stale-hold', null, { staleHoldAutoResume: true }],
       'rerun-red-team-gate': ['red-team-sent-back-cleared'],

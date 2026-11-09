@@ -17,6 +17,7 @@ import {
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { createPrSweepReader, parseDrainSkips, parseLiveJobs, resolveStalledAfter, LIST_LIMIT } from '../pr-sweep-io.mjs';
+import { buildMqFailureRoute } from '../../lib/mq-failure-route.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 import { NO_ASK_NOTE_KINDS } from '../../lib/pr-comment-policy.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
@@ -31,6 +32,37 @@ const mkPr = (o) => ({ repo: REPO, number: 5485, title: 't', isDraft: false, hea
   updatedAt: '2026-10-21T11:00:00Z', labels: [], comments: [], statusCheckRollup: [], ...o });
 const sweep = (prs, extra = {}) => assessPrSweep({ now: NOW, stalledAfterMinutes: 45, prs, liveJobs: [], drainSkips: [], ...extra });
 const row = (report, n) => report.prs.find((r) => r.number === n);
+
+describe('same-head MQ recovery route evidence', () => {
+  const route = (patch = {}) => buildMqFailureRoute({ repo: REPO, pr: 5485, head: HEAD,
+    failedJobs: ['test'], testFiles: ['test.mjs'], assertions: ['failure'], complete: true, ...patch });
+  const held = (comments, patch = {}) => row(sweep([mkPr({ labels: L('ready-to-merge'), comments, ...patch })], {
+    drainSkips: [{ num: 5485, repo: REPO, kind: 'mq-same-head-failed', reason: `mq-same-head-failed: #5485 head ${HEAD} — failed_checks` }],
+  }), 5485);
+  const evidence = `mq-recovery-route:${REPO}#5485@${HEAD}`;
+  it('adds a trusted route bound to the live repo, PR and head without changing the drain state', () => {
+    const result = held([c('plateau-worker[bot]', '2026-10-21T10:00:00Z', route())]);
+    expect(result.waitingOn).toBe('drain-skip:mq-same-head-failed');
+    expect(result.evidence).toContain(evidence);
+  });
+  it('normalizes the live head to lowercase for route matching and evidence', () => {
+    const result = held([c('plateau-worker[bot]', '2026-10-21T10:00:00Z', route())], { headRefOid: HEAD.toUpperCase() });
+    expect(result.evidence).toContain(evidence);
+  });
+  it.each([
+    ['no route', []],
+    ['untrusted route', [c('outsider', '2026-10-21T10:00:00Z', route())]],
+    ['another PR', [c('plateau-worker[bot]', '2026-10-21T10:00:00Z', route({ pr: 77 }))]],
+    ['another repository', [c('plateau-worker[bot]', '2026-10-21T10:00:00Z', route({ repo: 'o/other' }))]],
+    ['stale route', [c('plateau-worker[bot]', '2026-10-21T10:00:00Z', route({ head: 'f'.repeat(40) }))]],
+    ['malformed route', [c('plateau-worker[bot]', '2026-10-21T10:00:00Z', '<!-- mq-failure-recovery:v1 bad -->')]],
+    ['oversized route', [c('plateau-worker[bot]', '2026-10-21T10:00:00Z', `<!-- mq-failure-recovery:v1 ${'x'.repeat(128 * 1024 + 40)} -->`)]],
+  ])('%s does not establish recovery ownership', (_name, comments) => {
+    const result = held(comments);
+    expect(result.waitingOn).toBe('drain-skip:mq-same-head-failed');
+    expect(result.evidence).not.toContain(evidence);
+  });
+});
 
 describe('repair process identity at a terminal stand-down', async () => {
   const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');

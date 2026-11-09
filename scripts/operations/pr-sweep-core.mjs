@@ -27,6 +27,7 @@
  * exact next action. PURE: no fs, no clock, no network, no process in this file (`pr-sweep-io.mjs` has them all).
  */
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { NO_ASK_NOTE_KINDS } from '../lib/pr-comment-policy.mjs';
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -346,8 +347,17 @@ export function deriveWaitingOn(pr, ctx) {
   if (has('ready-to-merge') || has('review:accepted')) {
     if (skip) {
       const actor = DRAIN_SKIP_ACTOR[skip.kind] ?? 'drain';
+      const evidence = ['merge-ai-prs skip-reasons'];
+      if (skip.kind === 'mq-same-head-failed') {
+        const expected = { repo: pr.repo, pr: pr.number, head: typeof head === 'string' ? head.toLowerCase() : head };
+        const routed = (Array.isArray(pr.comments) ? pr.comments : []).some(comment => {
+          const route = parseMqFailureRoute({ comment, expected });
+          return route !== null && !route.stale;
+        });
+        if (routed) evidence.push(`mq-recovery-route:${pr.repo}#${pr.number}@${expected.head}`);
+      }
       return done(`drain-skip:${skip.kind}`, actor, moved('ready-to-merge', 'review:accepted'), `the drain skipped it: ${skip.reason}`,
-        actor === 'red-team' ? actions.rerunReview : actions.why, ['merge-ai-prs skip-reasons']);
+        actor === 'red-team' ? actions.rerunReview : actions.why, evidence);
     }
     if (enqueued) return done('in-merge-queue', 'drain', enqueued.at, 'enqueued on the merge queue', null, ['we-drain-enqueue-clearance']);
     return done('ready-to-merge', 'drain', moved('ready-to-merge', 'review:accepted'), 'ready; the drain has not merged it yet', null, ['label ready-to-merge']);

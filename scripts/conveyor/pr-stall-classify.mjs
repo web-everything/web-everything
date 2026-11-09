@@ -180,6 +180,7 @@ function classifyUnsafe(o = {}) {
   if (typeof head !== 'string' || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(head)) throw new Error('unreadable head');
   const key = keyOf(row, head);
   const acts = nextActions({ repo: row.repo, number: row.number });
+  const mqRecoveryRouted = row.evidence.includes(`mq-recovery-route:${row.repo}#${row.number}@${head.toLowerCase()}`);
   const evidence = row.evidence.slice(0, 3);
   const state = row.waitingOn;
   const out = (lane, action, reason, extra = {}) => {
@@ -229,14 +230,15 @@ function classifyUnsafe(o = {}) {
   }
   if (state === 'drain-skip:mq-same-head-failed') {
     const reason = /^the drain skipped it: mq-same-head-failed: #[0-9]+ head \S+ — ([\s\S]*)/.exec(row.why)?.[1];
-    // Only the first failed-check removal has an R772 recovery path. Every other hold needs inspection.
-    if (reason === 'failed_checks' || reason?.startsWith('failed_checks infra retry') || reason?.startsWith('failed_checks quarantine retry')) {
+    // A recoverable hold also needs a trusted, live-head R772 route from the producer.
+    if (mqRecoveryRouted && (reason === 'failed_checks' || reason?.startsWith('failed_checks infra retry') || reason?.startsWith('failed_checks quarantine retry'))) {
       return out('system', 'await-mq-failure-recovery', 'waiting on mq-failure recovery: the same-head merge-queue attempt failed; recovery (R772) retries it, held until the head changes');
     }
     return operator(state, `merge-queue hold requires inspection: ${row.why}`, 'operator must inspect');
   }
   if (state === 'drain-skip:card-grouped') {
-    if (/grouped into | is reserved by open card group /.test(row.why)) {
+    // cardGroupHold names the destination PR after these phrases; require this row's exact number.
+    if (new RegExp(`(?:grouped into | is reserved by open card group )#${row.number}(?=\\s|$)`).test(row.why)) {
       return out('system', 'await-card-group', 'waiting on the card group: the PR is grouped into an open card group and waits for the group to land');
     }
     return operator(state, `card-group hold requires inspection: ${row.why}`, 'operator must inspect');
