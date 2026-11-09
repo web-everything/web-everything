@@ -66,6 +66,51 @@ describe('red-team check run contract', () => {
     const publish = io => api.publishRedTeamCheckFromLive(io);
 
     it.each([
+      '1. [**confirmed**] edge-case broken — missing parenthesised class.',
+      '   1. [**confirmed**] (edge-case, broken) `a.mjs:1` — indented finding.',
+      '1. [**CONFIRMED**] (edge-case, broken) `a.mjs:1` — wrong case.',
+      '1. [not confirmed] malformed advisory finding.',
+      '1. [unverifiable] malformed evidence.',
+    ])('refuses unparsed finding evidence despite a clear enqueue hold: %s', async line => {
+      const io = fixture();
+      const comment = resultComment();
+      io.readComments.mockReturnValue([{ ...comment, body: `${comment.body}\n${line}` }]);
+      expect(await publish(io)).toMatchObject({ ok: false,
+        reason: expect.stringMatching(/unparsed|malformed/i) });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['supersede-succeeds', 'supersede-fails', 'both-fail'])
+    ('a lost success response attempts failure supersession and falls back to a hold: %s', async mode => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+        if (!args.includes('POST')) return readGh(args, options);
+        const payload = JSON.parse(options.input);
+        if (payload.conclusion === 'success') throw Error('success response timed out');
+        if (payload.conclusion === 'failure') {
+          if (mode !== 'supersede-succeeds') throw Error('failure response timed out');
+          return JSON.stringify({ id: 21 });
+        }
+        if (mode === 'both-fail') throw Error('hold response timed out');
+        return '{}';
+      });
+      const out = await publish(io);
+      expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('success response timed out') });
+      expect(payloads(io).slice(0, 2).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      expect(posts(io).slice(0, 2).map(([args]) => args[1])).toEqual(['repos/o/r/check-runs', 'repos/o/r/check-runs']);
+      if (mode === 'supersede-succeeds') expect(posts(io)).toHaveLength(2);
+      else {
+        expect(posts(io)).toHaveLength(3);
+        expect(posts(io)[2][0]).toContain(`repos/o/r/statuses/${HEAD}`);
+        expect(payloads(io)[2]).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
+          description: expect.stringMatching(/^held:/) });
+        expect(out.reason).toContain('failure response timed out');
+        if (mode === 'both-fail') expect(out.reason).toContain('hold response timed out');
+      }
+    });
+
+    it.each([
       ['older result', '2026-11-07T09:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', false],
       ['newer result', '2026-11-07T12:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', true],
       ['equal timestamps', '2026-11-07T11:00:00Z', '2026-11-07T11:00:00Z', undefined, false],

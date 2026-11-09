@@ -120,6 +120,8 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
       const standingRuling = readStandingRuling({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } });
       const disposition = readRedTeamDisposition({ repo, pr, head: headSha, comments, standingRuling, env });
       if (!disposition.result) throw Error('no trusted red-team result on live head');
+      if (!Array.isArray(disposition.result.shapedLines) || disposition.result.shapedLines.length)
+        throw Error('red-team result has malformed or unparsed finding evidence; operator must inspect the full result');
       const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
       if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);
       const history = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
@@ -154,9 +156,11 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
     let postedId;
     const posted = postRedTeamCheckRun({ repo, pr, headSha,
       gh: (args, options) => {
+        // A timeout can lose the response after GitHub accepted the success. Treat every attempted
+        // write as potentially published so errors still supersede it (or set the publication hold).
+        published = true;
         const response = gh(args, options);
         // The response id distinguishes our check from a racing writer's check.
-        published = true;
         postedId = JSON.parse(response)?.id;
         if (!Number.isSafeInteger(postedId) || postedId <= 0) throw Error('published check id unreadable');
         return response;
