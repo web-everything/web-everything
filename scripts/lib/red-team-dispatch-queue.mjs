@@ -89,12 +89,12 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         changed(`enqueue ${key}`);
       }
     },
-    admit(repo, count, { probes = true } = {}) {
+    admit(repo, count, { allowProbes = true } = {}) {
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
       const mine = entries.filter(entry => entry.repo === repo);
       // Zero admission (unreadable capacity, fail closed) admits no probe either.
-      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0 && probes).slice(0, MAX_PROBES).map(entry => entry.key));
+      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0 && allowProbes).slice(0, MAX_PROBES).map(entry => entry.key));
       const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
@@ -208,7 +208,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
     const exhausted = bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { probes: wholeCapacity(capacity) });
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: wholeCapacity(capacity) });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
