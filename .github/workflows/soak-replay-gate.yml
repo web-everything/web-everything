@@ -62,7 +62,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 0
+          fetch-depth: 1 # tip only; the history comes from the blobless fetch below (no blobs of old commits)
+
+      # NARROW FETCH (R696): `fetch-depth: 0` pulled every branch and every old blob (593 s measured). The gate walks
+      # ancestry (merge-base of main and the PR head) but never reads an old file's contents, so keep the complete
+      # ancestry of main and drop the blobs. FAILS CLOSED: a repo still shallow, or a missing main tip, stops the job.
+      - name: Fetch main history (blobless)
+        run: |
+          git fetch --no-tags --unshallow --filter=blob:none origin '+refs/heads/main:refs/remotes/origin/main' || { echo "::error::soak-replay gate: could not fetch main history — failing closed." >&2; exit 1; }
+          [ "$(git rev-parse --is-shallow-repository)" = "false" ] || { echo "::error::soak-replay gate: history is still shallow after the blobless fetch — failing closed." >&2; exit 1; }
+          git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}' >/dev/null || { echo "::error::soak-replay gate: main tip does not resolve — failing closed." >&2; exit 1; }
 
       - uses: actions/setup-node@v4
         with:
@@ -91,8 +100,8 @@ jobs:
             echo "::error::Failed to retrieve live PR body for $PR_REPO#$PR_NUMBER; soak-replay gate cannot evaluate." >&2
             exit 1
           fi
-          # Fetch the PR's own head sha's FULL ancestry (no --depth) — the checkout above already unshallowed
-          # `main` completely (fetch-depth: 0), so this only pulls the commits unique to the PR branch itself,
+          # Fetch the PR's own head sha's FULL ancestry (no --depth) — the blobless step above already unshallowed
+          # `main` completely, so this only pulls the commits unique to the PR branch itself (blobs stay filtered),
           # and a `git merge-base` can then find the true fork point rather than the two endpoints directly
           # (backlog/4264 — a shallow `--depth=1` head fetch left no shared history for `merge-base` to walk
           # back to, which is exactly why the old two-endpoint diff was the only thing that could run before).
@@ -119,6 +128,18 @@ jobs:
             BASE_SHA=$MAIN_TIP
           else
             echo "soak-replay-gate: base = event base $BASE_SHA (target $BASE_REF), head = $HEAD_SHA"
+            # A stacked PR's base is an open lane branch commit: the old full checkout carried every branch, the narrow
+            # one does not, so fetch that exact sha. An unfetchable base fails closed.
+            if ! git fetch origin "$BASE_SHA"; then
+              echo "::error::Failed to fetch event base $BASE_SHA; soak-replay gate cannot evaluate." >&2
+              exit 1
+            fi
+          fi
+          # ANCESTRY ASSERTION: the CLI silently falls back to the base itself when no merge-base exists, which on
+          # partial history would misattribute main's changes to the PR. Refuse that here, loudly.
+          if ! git merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null; then
+            echo "::error::No merge-base between $BASE_SHA and $HEAD_SHA after the narrowed fetch; soak-replay gate cannot evaluate." >&2
+            exit 1
           fi
           # BOOTSTRAP for the `--base-sha`/`--head-sha` mode itself: the CLI above is main's copy, so until the PR
           # that adds that mode has landed, main's CLI does not know it (exit 3, usage error). Fall back to
@@ -141,6 +162,7 @@ jobs:
           MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
         run: |
+          set -o pipefail # no `shell:` key ⇒ `bash -e` without pipefail; keep every pipe below fail-closed
           if [ ! -f scripts/soak-replay-gate-cli.mjs ] || [ ! -f scripts/merge-gate-check.mjs ]; then
             echo "::error::soak-replay gate: merge-group support not on main yet — failing closed." >&2
             exit 1
@@ -157,6 +179,7 @@ jobs:
             BASE=$(printf '%s' "$PR_JSON" | jq -r '.base.sha')
             HEAD=$(printf '%s' "$PR_JSON" | jq -r '.head.sha')
             git fetch origin "$HEAD" "$BASE"
+            git merge-base "$BASE" "$HEAD" >/dev/null || { echo "::error::no merge-base for PR #$N after the narrowed fetch — failing closed." >&2; rc=1; continue; }
             node scripts/soak-replay-gate-cli.mjs --title="$TITLE" --body="$BODY" --base-sha="$BASE" --head-sha="$HEAD" || rc=1
           done
           exit $rc
