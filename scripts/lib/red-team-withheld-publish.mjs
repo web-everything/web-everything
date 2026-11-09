@@ -3,15 +3,16 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
-import { renderRedTeamComment, redTeamCommentPosted as markerPosted } from '../operations/review-extra-seats.mjs';
+import { renderRedTeamComment, redTeamCommentPosted as markerPosted, priorRedTeamRow } from '../operations/review-extra-seats.mjs';
+import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { redTeamMarker } from './red-team-gate.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 
 export function needsPublish(status) {
-  return status?.status === 'finished' && status.result?.status === 'ran'
-    && ['withheld', 'error'].includes(status.result.comment);
+  return status?.status === 'finished' && (status.result === 'ran'
+    || (status.result?.status === 'ran' && ['withheld', 'error'].includes(status.result.comment)));
 }
 
 /** Only fixed text plus scrubbed, single-line category/location fields; keep the gate's exact grammar. */
@@ -36,6 +37,8 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
   redTeamCommentPosted = markerPosted, scrub = scrubPublish,
   statusDir = redTeamStatusDir(), withLock = withFileLock,
   readStatus = path => JSON.parse(readFileSync(path, 'utf8')),
+  readSeatRow = ({ repo, pr, head }) => priorRedTeamRow(
+    readStore({ path: resolveScorecardStorePath(process.env), strict: true }).records, pr, head, repo),
   writeStatus,
   publishNeedsYou = publishAttention, now = () => new Date().toISOString(),
 } = {}) {
@@ -50,6 +53,29 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       throw Error('red-team publication status identity mismatch');
     }
     if (!needsPublish(status)) return { status: 'skipped' };
+    const legacy = status.result === 'ran';
+    let result = status.result;
+    if (legacy) {
+      try {
+        const row = readSeatRow({ repo, pr, head });
+        if (!row || row.rev !== head || !Array.isArray(row.findings)
+          || !['accept', 'changes', 'needs-human'].includes(row.foldedVerdict)
+          || !Number.isInteger(row.confirmedMissCount) || row.confirmedMissCount < 0
+          || row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck === true).length) {
+          throw Error('invalid legacy red-team evidence');
+        }
+        result = { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
+          callId: row.callId, foldedVerdict: row.foldedVerdict, confirmedMissCount: row.confirmedMissCount,
+          findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true })) };
+      } catch {
+        if (!status.needsYouPublished) {
+          publishNeedsYou({ kind: 'red-team-legacy-ran-unreadable', pr, repo, head,
+            reason: 'Legacy red-team evidence is unreadable; operator review required.' });
+          writeStatus({ ...status, needsYouPublished: true });
+        }
+        return { status: 'held' };
+      }
+    }
     const escalate = () => {
       if (!status.needsYouPublished) {
         publishNeedsYou({ kind: 'red-team-publish-failed', pr, repo, head,
@@ -71,14 +97,17 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     try {
       const comments = listComments ? listComments() : provider.readComments(repo, pr);
       if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
-      if (redTeamCommentPosted(comments, pr, head)) return { status: 'skipped' };
+      if (redTeamCommentPosted(comments, pr, head)) {
+        if (legacy) writeStatus({ ...status, result: { ...result, comment: 'posted' } });
+        return { status: 'skipped' };
+      }
     } catch { return failedAttempt(); }
     if (status.publishAttempts >= 2) return escalate();
     try {
-      if (!Array.isArray(status.result.findings)) throw Error('red-team findings unreadable');
-      const findings = status.result.findings.map(f => ({ ...f,
+      if (!Array.isArray(result.findings)) throw Error('red-team findings unreadable');
+      const findings = result.findings.map(f => ({ ...f,
         confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true }));
-      const input = { ...status.result, pr, rev: head, findings };
+      const input = { ...result, pr, rev: head, findings };
       let body = renderFull(input);
       if (scrub(body).length) body = renderMinimal(input);
       if (scrub(body).length) body = renderMinimal({ ...input, omitLocation: true });
@@ -86,7 +115,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       if (postComment) postComment({ repo, pr, body });
       else provider.postComment(repo, pr, body);
     } catch { return failedAttempt(); }
-    writeStatus({ ...status, publishedAt: now(), result: { ...status.result, comment: 'posted' } });
+    writeStatus({ ...status, publishedAt: now(), result: { ...result, comment: 'posted' } });
     return { status: 'posted' };
   });
 }
