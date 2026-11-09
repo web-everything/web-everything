@@ -19,6 +19,12 @@ import { decideSkipRebuild, makeSkipCheck, resolveSkipUnrelated, smokeSurfaceEnt
 
 const LOCK_OPTS = { waitMs: 0 };
 
+// Same precedent as daemon-rebuild-fallback.test.mjs / -keep-established.test.mjs: every case drives real `git` through
+// rebuildClone (about 40 git calls per rebuild), measured at several seconds per case on a loaded CI shard, so the 5s
+// vitest default timed out ("a lockfile or package.json change still builds and smokes", main red @ 9b97d2775: two
+// rebuilds in one case). 60s stays a hang guard.
+vi.setConfig({ testTimeout: 60_000 });
+
 const tempDirs = [];
 
 function mktemp(prefix) {
