@@ -490,6 +490,16 @@ describe('mq failure evidence: real vitest output shapes', () => {
   it('a single outside-diff vitest failure with summary, diff body, code frame and stack rows is complete', async () => {
     expect(await one(vitestGolden)).toMatchObject({ testFiles: ['scripts/lib/__tests__/widget.test.mjs'], complete: true });
   });
+  it('a Playwright-shaped failure is never refresh-eligible: paths unattributed, but the failure is proven for the normal fixer', async () => {
+    // Policy pin: Playwright prints its spec path on a "N) [project] › path" row that carries no failure marker, so
+    // attribution stays unproven (complete=false) and the PR goes to the ordinary fixer, never a mechanical refresh.
+    const text = ['Running 3 tests using 1 worker', '', '  1) [chromium] › tests/e2e/login.spec.ts:12:5 › login › shows error ───', '',
+      '    Error: expect(received).toBe(expected) // Object.is equality', '', '    Expected: "a"', '    Received: "b"', '',
+      '        at /workspace/tests/e2e/login.spec.ts:12:13', '', '  1 failed', '  2 passed (4s)'].join('\n');
+    const evidence = await one(text);
+    expect(evidence).toMatchObject({ complete: false, failureProven: true });
+    expect(classifyMqFailureEvidence(evidence)).toBe('real');
+  });
   it('blank lines and the diff body between FAIL and its assertion detail do not break attribution', async () => {
     const text = ' FAIL  tests/x.test.mjs > a > b\n\nAssertionError: expected 2 to be 3\n\n- Expected\n+ Received\n\nExpected: 3\nReceived: 2\n';
     expect(await one(text)).toMatchObject({ testFiles: ['tests/x.test.mjs'], complete: true });
