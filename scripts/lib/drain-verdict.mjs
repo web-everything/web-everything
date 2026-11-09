@@ -19,6 +19,9 @@ export function canonicalJson(value) {
 
 export const digest = obj => createHash('sha256').update(canonicalJson(obj)).digest('hex');
 
+/** Tamper evidence over the decision-bearing body: decision, gates, localRequired, actions. */
+export const verdictDigest = v => digest({ decision: v.decision, gates: v.gates, localRequired: v.localRequired, actions: v.actions });
+
 export function build(inputs) {
   if (!DECISIONS.includes(inputs?.decision)) throw new TypeError('invalid decision');
   for (const field of ['repo', 'codeSha', 'computedAt', ...BINDINGS]) {
@@ -39,6 +42,7 @@ export function build(inputs) {
     mainSha: inputs.mainSha, codeSha: inputs.codeSha, gateTree: inputs.gateTree,
     settingsDigest: inputs.settingsDigest, inputsDigest: inputs.inputsDigest, decision: inputs.decision,
     gates, localRequired: [...LOCAL_REQUIRED], actions: inputs.actions, computedAt: inputs.computedAt };
+  verdict.verdictDigest = verdictDigest(verdict);
   // Validate and detach the supplied evidence.
   return JSON.parse(canonicalJson(verdict));
 }
@@ -54,8 +58,13 @@ export function verify(verdict, live, { maxAgeMinutes = 10, now = Date.now() } =
   for (const field of BINDINGS) {
     if (typeof verdict[field] !== 'string' || !verdict[field] || verdict[field] !== live?.[field]) return refuse(field);
   }
-  // codeSha is informational (every main commit changes it); gateTree is the binding. It must still be present.
   if (typeof verdict.codeSha !== 'string' || !verdict.codeSha) return refuse('codeSha');
+  if (typeof verdict.verdictDigest !== 'string' || verdict.verdictDigest !== verdictDigest(verdict)) return refuse('verdictDigest');
+  if (!Array.isArray(verdict.gates) || !verdict.gates.length || !Array.isArray(verdict.actions)) return refuse('gates');
+  if (live?.decision !== undefined && live.decision !== verdict.decision) return refuse('decision');
+  if (verdict.decision === 'enqueue' && (verdict.gates.some(g => g.result === 'fail') ||
+      !verdict.actions.some(x => x?.type === 'enqueue' && x.pr === verdict.pr && x.headSha === verdict.headSha))) return refuse('actions');
+  // codeSha is informational (every main commit changes it); gateTree is the binding. It must still be present.
   const age = Number(new Date(now)) - Date.parse(verdict.computedAt);
   if (!Number.isFinite(age) || age < 0 || !Number.isFinite(maxAgeMinutes) || maxAgeMinutes < 0 || age > maxAgeMinutes * 60_000) return refuse('computedAt');
   return { ok: true, reason: 'verified' };

@@ -172,3 +172,41 @@ describe('the drain\'s real diff reads stay admitted', () => {
     expect(isMutatingGhCall('git', ['diff', '--end-of-options', 'a'])).toBe(true);
   });
 });
+
+describe('fail-closed executables and forwarded commands', () => {
+  it('refuses unknown executables and forwarded gh mutations, admits forwarded reads and read-only tools', () => {
+    expect(isMutatingGhCall('rm', ['-rf', 'x'])).toBe(true);
+    expect(isMutatingGhCall('curl', ['-X', 'POST', 'https://x'])).toBe(true);
+    expect(isMutatingGhCall('node', ['scripts/lib/gh-throttle.mjs', 'pr', 'merge', '1'])).toBe(true);
+    expect(isMutatingGhCall('node', ['scripts/lib/gh-throttle.mjs', 'pr', 'view', '1'])).toBe(false);
+    expect(isMutatingGhCall('ls', ['-la'])).toBe(false);
+  });
+  it('injects --no-ext-diff and --no-textconv into every admitted git diff', async () => {
+    const { hardenGitArgs } = await import('../drain-classify-guard.mjs');
+    expect(hardenGitArgs('git', ['diff', '--no-ext-diff', '--end-of-options', 'a'])).toEqual(['diff', '--no-textconv', '--no-ext-diff', '--end-of-options', 'a']);
+    expect(hardenGitArgs('git', ['diff', '--numstat', 'a'])).toEqual(['diff', '--no-ext-diff', '--no-textconv', '--numstat', 'a']);
+    expect(hardenGitArgs('git', ['status'])).toEqual(['status']);
+  });
+});
+
+describe('read-only git metadata forms', () => {
+  it('admits remote/config/branch/ref reads and refuses their write forms', () => {
+    for (const args of [['remote'], ['remote', '-v'], ['remote', 'get-url', 'origin'], ['config', '--get', 'remote.origin.url'], ['branch', '--show-current'], ['for-each-ref', 'refs/heads'], ['rev-list', '-n1', 'HEAD'], ['symbolic-ref', 'HEAD']]) {
+      expect(isMutatingGhCall('git', args)).toBe(false);
+    }
+    for (const args of [['remote', 'add', 'x', 'y'], ['remote', 'set-url', 'origin', 'x'], ['config', 'user.name', 'x'], ['config', '--unset', 'a'], ['branch', '-D', 'x'], ['branch', 'new'], ['symbolic-ref', 'HEAD', 'refs/heads/x'], ['symbolic-ref', '-d', 'HEAD']]) {
+      expect(isMutatingGhCall('git', args)).toBe(true);
+    }
+  });
+});
+
+describe('read-only graphql', () => {
+  it('admits a plain query and refuses mutations, extra input and method overrides', () => {
+    expect(isMutatingGhCall('gh', ['api', 'graphql', '-f', 'query=query{viewer{login}}'])).toBe(false);
+    expect(isMutatingGhCall('gh', ['api', 'graphql', '-f', 'query=mutation{x}'])).toBe(true);
+    expect(isMutatingGhCall('gh', ['api', 'graphql', '-f', 'query={a} mutation{b}'])).toBe(true);
+    expect(isMutatingGhCall('gh', ['api', 'graphql', '--input', 'x.json'])).toBe(true);
+    expect(isMutatingGhCall('gh', ['api', 'graphql', '-X', 'GET', '-f', 'query=query{a}'])).toBe(true);
+    expect(isMutatingGhCall('gh', ['api', 'graphql'])).toBe(true);
+  });
+});

@@ -3,6 +3,9 @@ import { syncBuiltinESMExports } from 'node:module';
 import { basename } from 'node:path';
 import { promisify } from 'node:util';
 
+const READ_ONLY_TOOLS = new Set(['ls', 'cat', 'head', 'tail', 'wc', 'grep', 'sort', 'uniq', 'sleep', 'date', 'uname', 'hostname',
+  'which', 'stat', 'pwd', 'true', 'false', 'ps', 'pgrep', 'sysctl', 'vm_stat', 'uptime', 'id', 'whoami', 'df', 'basename', 'dirname']);
+
 /** A command seam guard, not a sandbox for executing untrusted programs. */
 export function isMutatingGhCall(cmd, args = []) {
   const name = basename(String(cmd));
@@ -26,6 +29,13 @@ export function isMutatingGhCall(cmd, args = []) {
       return a.slice(1).some(arg => arg.startsWith('-') ? !(okOpts.has(arg) || /^--depth=\d+$/.test(arg)) :
         (arg.includes(':') && !/^\+?[\w./-]*:refs\/remotes\/[\w./-]+$/.test(arg)) || arg.includes('..') || arg.startsWith('ext::'));
     }
+    // Read-only metadata forms the gh shim and drain use (remote URLs, config reads, ref listings).
+    if (a[0] === 'remote') return !(a.length === 1 || (a[1] === '-v' && a.length === 2) || (a[1] === 'get-url' && a.length <= 4 && !a.includes('--push-all')));
+    if (a[0] === 'config') return !['--get', '--get-all', '--get-regexp', '--list', '-l'].includes(a.find(x => x.startsWith('-')) || '') || a.some(x => /^--(?:unset|add|replace|edit|set)/.test(x));
+    if (a[0] === 'branch') return !(a.length === 1 || ['--show-current', '--list', '-l', '-a', '-r', '-v', '-vv', '--contains'].includes(a[1]));
+    if (['symbolic-ref', 'rev-list', 'for-each-ref', 'show-ref', 'describe', 'name-rev', 'ls-remote'].includes(a[0])) {
+      return a[0] === 'symbolic-ref' && a.some(x => x === '-d' || x === '--delete' || (!x.startsWith('-') && a.filter(y => !y.startsWith('-')).length > 2));
+    }
     if (!['rev-parse', 'status', 'diff', 'show', 'log', 'ls-tree', 'merge-base', 'ls-files', 'cat-file'].includes(a[0])) return true;
     // Diff-producing commands can execute configured helpers even without an
     // explicit enabling flag. Require the protections first, before options that
@@ -36,6 +46,7 @@ export function isMutatingGhCall(cmd, args = []) {
       const head = a.slice(1, a.findIndex((x, i) => i > 0 && (x === '--' || x === '--end-of-options')) > 0 ? a.findIndex((x, i) => i > 0 && (x === '--' || x === '--end-of-options')) : a.length);
       const statOnly = a[0] === 'diff' && head.some(x => ['--numstat', '--name-only', '--name-status', '--shortstat', '--stat'].includes(x));
       const both = head.includes('--no-ext-diff') && head.includes('--no-textconv');
+      // `diff` is admitted here because the wrapper injects --no-ext-diff --no-textconv (see hardenGitArgs).
       // Only `diff` gets the relaxed forms (the drain's own calls); show/log keep requiring both protections.
       if (!statOnly && !(a[0] === 'diff' ? head.includes('--no-ext-diff') : both)) return true;
     }
@@ -50,7 +61,15 @@ export function isMutatingGhCall(cmd, args = []) {
       return normalized.startsWith('--') && normalized.length > 2 && unsafe.some(option => option.startsWith(normalized));
     });
   }
-  if (name !== 'gh') return /(?:enqueue|refresh|numbering|number-at-birth)/i.test([cmd, ...a].join(' '));
+  if (name === 'node' || cmd === process.execPath) {
+    // The gh-throttle wrapper is how the drain reaches gh: judge its argv as the gh call it forwards.
+    const i = a.findIndex(x => basename(x) === 'gh-throttle.mjs');
+    if (i >= 0) return isMutatingGhCall('gh', a.slice(i + 1));
+    // Other node children are guarded too: installGuard() propagates the preload through NODE_OPTIONS.
+    return /(?:enqueue|refresh|numbering|number-at-birth)/i.test(a.join(' '));
+  }
+  // Fail closed: only an explicit allowlist of read-only utilities may run; everything else is refused.
+  if (name !== 'gh') return !READ_ONLY_TOOLS.has(name) || /(?:enqueue|refresh|numbering|number-at-birth)/i.test(a.join(' '));
   if (a[0] === 'api') {
     let method = null;
     let fields = false;
@@ -67,12 +86,26 @@ export function isMutatingGhCall(cmd, args = []) {
       }
       if (/^(?:-[fF]|--(?:raw-)?field(?:=|$)|--input(?:=|$))/.test(arg)) fields = true;
     }
-    // GraphQL uses POST even for queries. No GraphQL exception in this slice.
-    if (a.includes('graphql')) return true;
+    // GraphQL is POST even for reads: admit it only when the query document is a plain query (no mutation/subscription
+    // anywhere in it) and any method override is absent. Anything unparseable fails closed.
+    if (a.includes('graphql')) {
+      if (method !== null) return true;
+      const q = a.map((x, i) => (/^(?:-[fF]|--(?:raw-)?field)$/.test(a[i - 1] || '') ? x : /^(?:-[fF]|--(?:raw-)?field)=/.test(x) ? x.replace(/^[^=]*=/, '') : null))
+        .filter(x => typeof x === 'string' && x.startsWith('query=')).map(x => x.slice(6));
+      if (q.length !== 1 || a.some(x => /^--input(?:=|$)/.test(x))) return true;
+      return !/^\s*(?:query\b|\{)/.test(q[0]) || /\b(?:mutation|subscription)\b/i.test(q[0]);
+    }
     return fields && method !== 'GET';
   }
   const reads = { pr: ['view', 'list', 'diff', 'checks'], repo: ['view'], run: ['list', 'view'], auth: ['status'] };
   return !reads[a[0]]?.includes(a[1]) || a.includes('--web');
+}
+
+/** Returns argv with the protections a caller omitted: every admitted `git diff` runs with --no-ext-diff --no-textconv. */
+export function hardenGitArgs(cmd, args) {
+  if (basename(String(cmd)) !== 'git' || !Array.isArray(args) || args[0] !== 'diff') return args;
+  const extra = ['--no-ext-diff', '--no-textconv'].filter(f => !args.includes(f));
+  return extra.length ? ['diff', ...extra, ...args.slice(1)] : args;
 }
 
 function assertRead(cmd, args, shell = false) {
@@ -92,15 +125,22 @@ let installed = false;
 export function installGuard() {
   if (installed) return;
   installed = true;
+  // Every node child inherits the guard, so a forwarded gh-throttle / script child cannot escape it.
+  const preload = `--import=${import.meta.url}`;
+  if (!String(process.env.NODE_OPTIONS || '').includes(preload)) process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS || ''} ${preload}`.trim();
   for (const key of ['execFile', 'execFileSync', 'spawn', 'spawnSync', 'exec', 'execSync']) {
     const original = childProcess[key];
     const check = argv => {
       const options = Array.isArray(argv[1]) ? argv[2] : argv[1];
       assertRead(argv[0], argv[1], key === 'exec' || key === 'execSync' || !!options?.shell);
     };
-    const wrapped = function (...argv) { check(argv); return Reflect.apply(original, this, argv); };
+    const harden = argv => {
+      if (Array.isArray(argv[1]) && !(key === 'exec' || key === 'execSync')) argv[1] = hardenGitArgs(argv[0], argv[1]);
+      return argv;
+    };
+    const wrapped = function (...argv) { check(argv); return Reflect.apply(original, this, harden(argv)); };
     if (original[promisify.custom]) {
-      wrapped[promisify.custom] = function (...argv) { check(argv); return Reflect.apply(original[promisify.custom], this, argv); };
+      wrapped[promisify.custom] = function (...argv) { check(argv); return Reflect.apply(original[promisify.custom], this, harden(argv)); };
     }
     childProcess[key] = wrapped;
   }

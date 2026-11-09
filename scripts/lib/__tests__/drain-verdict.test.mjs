@@ -4,7 +4,7 @@ import { build, canonicalJson, digest, verify, LOCAL_REQUIRED } from '../drain-v
 
 const inputs = () => ({ repo: 'o/r', pr: 7, headSha: 'head', mainSha: 'main', codeSha: 'code',
   gateTree: 'tree', settingsDigest: digest({ a: 1 }), inputsDigest: digest({ b: 2 }),
-  decision: 'enqueue', gates: [], actions: [], computedAt: '2026-11-09T12:00:00.000Z' });
+  decision: 'enqueue', gates: [], actions: [{ type: 'enqueue', repo: 'o/r', pr: 7, headSha: 'head' }], computedAt: '2026-11-09T12:00:00.000Z' });
 const now = Date.parse('2026-11-09T12:05:00.000Z');
 
 describe('drain-verdict/1', () => {
@@ -66,12 +66,33 @@ describe('drain-verdict/1', () => {
 });
 
 describe('codeSha presence', () => {
-  it('refuses a verdict whose codeSha was removed', async () => {
-    const { verify } = await import('../drain-verdict.mjs');
-    const v = { schema: 'drain-verdict/1', decision: 'local', localRequired: ['red-main-freeze', 'card-group'], repo: 'o/r', pr: 1,
-      headSha: 'h', mainSha: 'm', gateTree: 't', settingsDigest: 's', inputsDigest: 'i', computedAt: new Date(0).toISOString() };
-    const live = { repo: 'o/r', pr: 1, headSha: 'h', mainSha: 'm', gateTree: 't', settingsDigest: 's', inputsDigest: 'i' };
-    expect(verify(v, live, { now: 1000 })).toMatchObject({ ok: false, reason: 'codeSha' });
-    expect(verify({ ...v, codeSha: 'c' }, live, { now: 1000 }).ok).toBe(true);
+  it('refuses a verdict whose codeSha was removed', () => {
+    const v = build(inputs());
+    const { codeSha, ...rest } = v;
+    expect(verify(rest, inputs(), { now })).toMatchObject({ ok: false, reason: 'codeSha' });
+    expect(verify(v, inputs(), { now }).ok).toBe(true);
+  });
+});
+
+describe('decision-bearing body is tamper-evident', () => {
+  const inputs = { repo: 'o/r', pr: 1, headSha: 'h', mainSha: 'm', codeSha: 'c', gateTree: 't', settingsDigest: 's', inputsDigest: 'i',
+    decision: 'enqueue', gates: [{ id: 'required-check-green', result: 'pass', evidence: 'ok' }],
+    actions: [{ type: 'enqueue', repo: 'o/r', pr: 1, headSha: 'h' }], computedAt: new Date(0).toISOString() };
+  const live = { repo: 'o/r', pr: 1, headSha: 'h', mainSha: 'm', gateTree: 't', settingsDigest: 's', inputsDigest: 'i' };
+  it('accepts an untouched verdict and refuses hold->enqueue, stripped gates, replaced actions, live decision mismatch', async () => {
+    const { build, verify } = await import('../drain-verdict.mjs');
+    const v = build(inputs);
+    expect(verify(v, live, { now: 1000 }).ok).toBe(true);
+    expect(verify({ ...v, decision: 'hold' }, live, { now: 1000 })).toMatchObject({ ok: false, reason: 'verdictDigest' });
+    expect(verify({ ...v, gates: [] }, live, { now: 1000 }).ok).toBe(false);
+    expect(verify({ ...v, actions: [] }, live, { now: 1000 }).ok).toBe(false);
+    expect(verify(v, { ...live, decision: 'hold' }, { now: 1000 })).toMatchObject({ ok: false, reason: 'decision' });
+    const h = build({ ...inputs, decision: 'hold', actions: [] });
+    expect(verify({ ...h, decision: 'enqueue' }, live, { now: 1000 }).ok).toBe(false);
+  });
+  it('refuses an enqueue verdict carrying a failing gate even if re-digested', async () => {
+    const { build, verify } = await import('../drain-verdict.mjs');
+    const v = build({ ...inputs, gates: [{ id: 'required-check-green', result: 'fail', evidence: 'x' }] });
+    expect(verify(v, live, { now: 1000 })).toMatchObject({ ok: false, reason: 'actions' });
   });
 });
