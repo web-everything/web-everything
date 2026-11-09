@@ -107,6 +107,21 @@ describe('every state x every verdict', () => {
   });
 });
 
+describe('known drain waits explain what releases them', () => {
+  it('same-head merge-queue failure is held until the head changes', () => {
+    const result = at('drain-skip:mq-same-head-failed', { row: { actor: 'drain' } });
+    expect(result.reason).not.toContain('unknown waiting state');
+    expect(result.reason).toMatch(/same.head.*merge.queue.*fail/i);
+    expect(result.reason).toMatch(/until.*head.*chang/i);
+  });
+  it('a PR grouped into an open card group waits for that group', () => {
+    const result = at('drain-skip:card-grouped', { row: { actor: 'drain' } });
+    expect(result.reason).not.toContain('unknown waiting state');
+    expect(result.reason).toMatch(/grouped.*open card group/i);
+    expect(result.reason).toMatch(/wait.*group/i);
+  });
+});
+
 describe('not stalled / live job', () => {
   it('a row that is not stalled is nothing to do', () => expect(at('fixing', { row: { stalled: false } })).toBeNull());
   it('an automation wait with a live job is nothing to do', () => {

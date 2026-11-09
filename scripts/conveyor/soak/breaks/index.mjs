@@ -34,6 +34,7 @@
  * `clone-object-maintenance-borrowed-or-busy.mjs` registers the R657 maintenance break through discovery.
  * `refused-stage-pending-referrals-never-resume.mjs` uses the same automatic registration.
  * `overlay-main-sync-tests-stderr-tail.mjs` uses the same automatic registration.
+ * `no-ask-note-not-needs-decision.mjs` uses the same automatic registration.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and
