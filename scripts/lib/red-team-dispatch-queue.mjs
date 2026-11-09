@@ -89,12 +89,12 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         changed(`enqueue ${key}`);
       }
     },
-    admit(repo, count) {
+    admit(repo, count, { probes = true } = {}) {
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
       const mine = entries.filter(entry => entry.repo === repo);
       // Zero admission (unreadable capacity, fail closed) admits no probe either.
-      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0).slice(0, MAX_PROBES).map(entry => entry.key));
+      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && bound > 0 && probes).slice(0, MAX_PROBES).map(entry => entry.key));
       const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
@@ -134,8 +134,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   };
   const admissions = new Map();
   const admit = queue.admit;
-  queue.admit = (repo, count) => {
-    const result = admit(repo, count);
+  queue.admit = (repo, count, options) => {
+    const result = admit(repo, count, options);
     admissions.set(repo, result);
     return result;
   };
@@ -185,14 +185,10 @@ export function redTeamQueueAdmitCount(capacity) {
   return Math.max(0, Math.floor(Math.min(...bounds)));
 }
 
-// Probes ride along outside the admission bound, so a probe that turns runnable must not push total starts past it:
-// hand the runner whole-number capacity (its own check is only "> 0", so 1.5 would allow two starts).
-function wholeStarts(capacity) {
-  if (!capacity || typeof capacity !== 'object') return capacity;
-  const floor = value => (typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : value);
-  return { ...capacity, lanes: floor(capacity.lanes), remainingStarts: floor(capacity.remainingStarts),
-    ...(capacity.budget && typeof capacity.budget === 'object' ? { budget: { ...capacity.budget, left: floor(capacity.budget.left) } } : {}) };
-}
+// Probes ride along outside the admission bound, so they are only allowed when every capacity figure is a whole
+// number: the runner then cannot start more reviews than the bound (fractional lanes, e.g. 1.5, would allow two).
+const wholeCapacity = capacity => !!capacity && [capacity.lanes, capacity.remainingStarts, capacity.budget?.left]
+  .every(value => value == null || Number.isInteger(value) || value === Infinity || value === -Infinity);
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, log = () => {}, ...rest }) {
   const candidates = [];
@@ -212,7 +208,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
     const exhausted = bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, exhausted ? Infinity : bound);
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { probes: wholeCapacity(capacity) });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
@@ -223,7 +219,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
     let index = 0;
     const options = { repo, plan: { ...plan, refusals: refusals.map(row =>
       row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
-    rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity: wholeStarts(capacity), log, ...rest };
+    rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
     const finish = result => {
       queue.settle(repo, result);
       transaction?.commit();
