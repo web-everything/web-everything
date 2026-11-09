@@ -14,7 +14,7 @@ PR #6319 hardened the we:scripts/lane-pool.mjs release guard against index flags
 ## Acceptance
 
 - [A1] **Executable** — a new case in `we:scripts/__tests__/lane-pool-release-unpushed-guard.test.mjs` edits a tracked file, then rewrites `.git/index` so the entry's stat fields match the edited file (e.g. `git update-index --refresh` under `core.checkStat=minimal` written by a lane process before release), and asserts `release` refuses with `UNPUSHED_WORK` naming the file. It fails on main and passes after.
-- [A2] **Bounded** — the check's cost on a 15k-file lane stays within a stated budget (documented in the test or the code), and exceeding it refuses with the `--discard` fallback named, never a silent pass.
+- [A2] **Bounded** — the check has a named entry budget in we:scripts/lane-pool.mjs. A case in `we:scripts/__tests__/lane-pool-release-unpushed-guard.test.mjs` named `fails closed over the stat-rehash budget` puts one entry more than that budget in a lane and asserts two things: release refuses with `--discard` named, and `git hash-object` runs zero times (counted with that file's `countHashes` interceptor). A sibling case at exactly the budget asserts the rehash runs and refuses on a forged entry.
 
 ## Non-goals
 

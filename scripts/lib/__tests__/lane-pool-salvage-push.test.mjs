@@ -6,9 +6,36 @@ import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
 // Intentionally absent in this red-first change: no implementation or import stub.
-let salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD;
+let salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD, redactUrlCredentials, releasePushTarget;
 beforeEach(async () => {
-  ({ salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD } = await import('../lane-pool-salvage-push.mjs'));
+  ({ salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD, redactUrlCredentials, releasePushTarget } = await import('../lane-pool-salvage-push.mjs'));
+});
+
+// The release guard prints `git -C <lane> push <target> …` and journals git error text: credentials never survive,
+// while an ssh user name (not a secret, and needed to log in) and scp-style origins do.
+describe('releasePushTarget / redactUrlCredentials', () => {
+  it.each([
+    ['a relative local path', 'some/origin.git', resolve('some/origin.git')],
+    ['an absolute local path', '/srv/origin.git', '/srv/origin.git'],
+    ['https with user and token', 'https://user:s3cret@github.com/org/repo.git', 'https://github.com/org/repo.git'],
+    ['https with a bare token', 'https://s3cret@github.com/org/repo.git', 'https://github.com/org/repo.git'],
+    ['https with a raw @ in the password', 'https://user:p@s3cret@host/repo.git', 'https://host/repo.git'],
+    ['ssh:// with a user', 'ssh://git@github.com/org/repo.git', 'ssh://git@github.com/org/repo.git'],
+    ['ssh:// with a user and password', 'ssh://git:s3cret@host/repo.git', 'ssh://git@host/repo.git'],
+    ['scp-style', 'git@github.com:org/repo.git', 'git@github.com:org/repo.git'],
+  ])('push target for %s', (_, url, expected) => {
+    expect(releasePushTarget(url)).toBe(expected);
+    expect(releasePushTarget(url)).not.toContain('s3cret');
+  });
+  it('strips every credentialed URL inside a git error message, leaving the rest', () => {
+    const text = "Command failed: git ls-remote https://u:s3cret@host/x.git refs/heads/*\nfatal: unable to access 'https://s3cret@host/x.git/'";
+    expect(redactUrlCredentials(text)).toBe("Command failed: git ls-remote https://host/x.git refs/heads/*\nfatal: unable to access 'https://host/x.git/'");
+  });
+  it('redacts a failed salvage push reason', async () => {
+    const io = { aheadShas: async () => { throw new Error('git push https://u:s3cret@host/x.git failed'); } };
+    const result = await salvagePushLane({ lane: 1, laneDir: 'lane', io });
+    expect(result).toMatchObject({ status: 'failed', reason: 'git push https://host/x.git failed' });
+  });
 });
 
 const date = new Date('2026-01-02T03:04:59.999Z');

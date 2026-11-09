@@ -15,24 +15,21 @@ lane-pool release now keeps a lane with unpushed work, exits 1, lists it under k
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — the three caller test files `we:scripts/__tests__/lane-drain.test.mjs`, `we:scripts/operations/__tests__/dispatch-lane-io.test.mjs` and `we:scripts/conveyor/__tests__/build-dispatch-orphan-adopt.test.mjs` (run with `npm run test:unit -- <those files>`) fail before this item lands and pass after: each gains a case named `surfaces a lane kept by the release guard` whose stubbed `lane-pool release --json` exits 1 with `kept: [{ lane, reason: 'unpushed-work', details }]`, and asserts the caller's own output (the drain land event, the dispatch result, the orphan-adopt result) names that lane and reason instead of reporting a clean release.
+- [A2] **Fail closed** — the same three files gain a case where release exits non-zero with unparseable or missing `--json` stdout, asserting the caller reports the release as failed (never as released).
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] The release guard itself (we:scripts/lane-pool.mjs) is unchanged; this card only changes how its callers read and report the result.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — `kept[].details` is lane-derived text; callers print it through the control-character scrub and never into a shell string.
+2. **Truncated reads** — a non-JSON or truncated stdout is a failed release (A2), not an empty `kept`.
+3. **Shared state files** — n/a: callers read release's stdout only, no shared file.
+4. **Fail closed** — a non-zero exit is never reported as released, whatever stdout holds (A2).
+5. **Identity scoping** — callers report only the lanes their own release call returned.
+6. **State over time** — n/a: the result is read once per call.
+7. **Who wrote it** — n/a: the JSON comes from the caller's own child process.

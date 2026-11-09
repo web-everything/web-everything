@@ -7,7 +7,28 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 
-const clean = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, 2000);
+/** Strip URL credentials from text bound for logs, the lane journal or `--json` (a failed git transport call's
+ *  message carries its argv, origin URL included). An ssh:// URL keeps its user name, which is not a secret and
+ *  which the operator's push needs; every other scheme drops its whole userinfo, since a token often stands alone
+ *  there (`https://<token>@host`). Greedy up to the host, so a raw `@` inside a password is stripped too. scp-style
+ *  `user@host:path` holds no secret and is left as is. */
+export function redactUrlCredentials(text) {
+  return String(text).replace(/\b([a-z][a-z0-9+.-]*):\/\/([^\s/?#]*)@/gi, (_, scheme, userinfo) => {
+    // An ssh user ends at the first ':' (the password) and never contains '@'; anything else drops whole.
+    const user = /^[^:@]*/.exec(userinfo)[0];
+    const keep = /^(?:ssh|git\+ssh|ssh\+git)$/i.test(scheme) && user && (userinfo === user || userinfo[user.length] === ':');
+    return keep ? `${scheme}://${user}@` : `${scheme}://`;
+  });
+}
+
+/** The canonical origin as an operator push target: a local path is made absolute; a URL keeps its scheme and host,
+ *  with credentials stripped as `redactUrlCredentials` does. */
+export function releasePushTarget(url) {
+  if (!/^[^/]*:/.test(url)) return resolve(url);
+  return redactUrlCredentials(url);
+}
+
+const clean = value => redactUrlCredentials(String(value)).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, 2000);
 
 export function salvageStamp(date) {
   return date.toISOString().slice(0, 16).replaceAll('-', '').replace('T', '-').replace(':', '');

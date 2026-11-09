@@ -15,8 +15,8 @@ const git = (args, cwd) => execFileSync('git', args, {
 let fixtureRoot, fixture, origin, reference, base, poolRoot, laneDir, marker, lease;
 function runPool(args, fault = '', remoteFault = '', extraEnv = {}) {
   // `remoteFault` runs for the canonical-origin listing (the only ls-remote here: recovery is off), which executes
-  // outside the lane (checked against the primary checkout, run outside any repository).
-  const preload = `import os from 'node:os'; import cp from 'node:child_process';
+  // outside the lane (checked against the primary checkout, run outside any repository). `fs` lets a fault record calls.
+  const preload = `import os from 'node:os'; import cp from 'node:child_process'; import fs from 'node:fs';
     import { syncBuiltinESMExports } from 'node:module';
     os.userInfo = () => ({ homedir: ${JSON.stringify(base)} });
     const original = cp.execFileSync;
@@ -120,6 +120,33 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(journal).toEqual([expect.objectContaining({ loud: true, unpushed: true, reason: expect.stringContaining('UNPUSHED_WORK') })]);
     release();
     expect(readLaneJournal(join(poolRoot, 'releaseguard')).filter(e => e.lane === 1 && e.action === 'release-refused')).toHaveLength(1);
+  });
+  // A failed canonical-origin listing's message carries the origin URL (execFileSync puts argv in it). With a
+  // credentialed origin, the secret must reach none of stderr, the journal or `--json`.
+  it('never echoes origin URL credentials from a failed listing into stderr, the journal or --json', () => {
+    const sha = commitWork();
+    const url = 'https://user:S3CRET-TOKEN@127.0.0.1:9/origin.git';
+    const remoteFault = `const error = new Error(${JSON.stringify(`Command failed: git ls-remote ${url} refs/heads/*`)});
+      error.stderr = ${JSON.stringify(`fatal: unable to access '${url}/': Failed to connect`)}; throw error;`;
+    const result = release([], '', remoteFault);
+    refused(result, sha);
+    expect(result.stderr).toContain('https://127.0.0.1:9/origin.git');
+    const journal = JSON.stringify(readLaneJournal(join(poolRoot, 'releaseguard')).filter(e => e.lane === 1));
+    expect(journal).toContain('https://127.0.0.1:9/origin.git');
+    for (const text of [result.stderr, result.stdout, journal]) expect(text).not.toContain('S3CRET-TOKEN');
+  });
+  // `--ignore-missing` (for unfetched origin tips) must not drop a LOCAL tip: a branch whose commit object the lane
+  // deleted proves nothing, so the guard fails closed instead of releasing.
+  it('fails closed when a local branch tip has no object', () => {
+    const pushed = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['update-ref', 'refs/heads/work/gone', sha], laneDir);
+    git(['reset', '--quiet', '--hard', pushed], laneDir);
+    rmSync(join(laneDir, '.git', 'objects', sha.slice(0, 2), sha.slice(2)));
+    expect(git(['for-each-ref', '--format=%(objectname)', 'refs/heads/work/gone'], laneDir)).toBe(sha);
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain('commit evidence unreadable');
   });
   it('reports a clean release with an empty kept list', () => {
     commitWork();
@@ -669,7 +696,13 @@ describe('release guard hidden-entry hash bound', () => {
   const HIDDEN_ENTRY_HASH_LIMIT = 1000; // scripts/lane-pool.mjs
   // Zero-padded names keep this array in `git ls-files` order, so "first" and "last" are the first and last entries
   // the guard hashes. Only the first `flagged` files get assume-unchanged; the rest stay plain tracked files.
-  const release = (extra = []) => runPool(['release', '--lane=1', ...extra]);
+  const release = (extra = [], fault = '') => runPool(['release', '--lane=1', ...extra], fault);
+  // Records every `git hash-object` the guard runs in the lane (one line per call) without changing its result.
+  const countHashes = () => {
+    const log = join(base, 'hash-object-calls.log');
+    return { fault: `if (args.includes('hash-object')) fs.appendFileSync(${JSON.stringify(log)}, 'call\\n');`,
+      calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).length : 0) };
+  };
   const flagFiles = flagged => {
     const files = Array.from({ length: HIDDEN_ENTRY_HASH_LIMIT + 1 }, (_, i) => `many/f${String(i).padStart(4, '0')}.txt`);
     mkdirSync(join(laneDir, 'many'));
@@ -688,7 +721,9 @@ describe('release guard hidden-entry hash bound', () => {
     for (const file of [files[HIDDEN_ENTRY_HASH_LIMIT - 1], files[0]]) {
       writeFileSync(join(laneDir, file), 'tampered\n');
       expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
-      const result = release();
+      const hashes = countHashes();
+      const result = release([], hashes.fault);
+      expect(hashes.calls()).toBeGreaterThan(0); // control: the counter sees the guard's hash-object call
       refused(result);
       expect(result.stderr).toContain(`${file} (hidden by index flags: modified)`);
       expect(result.stderr).not.toContain('exceeds');
@@ -700,7 +735,9 @@ describe('release guard hidden-entry hash bound', () => {
   // --discard is the documented operator fallback.
   it('fails closed with LIMIT+1 flagged entries, with --discard as the fallback', () => {
     flagFiles(HIDDEN_ENTRY_HASH_LIMIT + 1);
-    const result = release();
+    const hashes = countHashes();
+    const result = release([], hashes.fault);
+    expect(hashes.calls()).toBe(0); // over the bound nothing is hashed, so cost stays bounded
     refused(result);
     expect(result.stderr).toContain('tracked status unreadable or exceeds');
     const override = release(['--discard']);

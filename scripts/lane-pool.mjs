@@ -176,7 +176,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
-import { realSalvageIo, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
+import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
 import {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
 } from './lib/lane-salvage.mjs';
@@ -2935,10 +2935,23 @@ function releaseUnprovenCommits(dir, salvage, proof) {
   const stashes = stashRef ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : stashRef;
   if (stashes === null) return { commits: null };
   // The ref itself too: a stash ref with an expired, deleted or never-written reflog lists no entries.
-  const tips = [...(stashRef ? stashRef.split('\n') : []), ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  // Every local tip is listed explicitly and must have its object: `--ignore-missing` (needed for the unfetched origin
+  // tips below) would otherwise silently drop a branch, HEAD or stash tip whose object the lane deleted, and so prove
+  // nothing about it. for-each-ref still lists a broken ref, so a missing object is caught here and fails closed.
+  // Only HEAD, local branches and the stash are lane work: lane acquire resets the checked-out branch and worktree
+  // only, so a commit held under another namespace (refs/tags/*, refs/salvage/*, refs/work/*) stays in the clone.
+  const localHeads = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/heads/'], dir);
+  const headSha = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
+  if (localHeads === null || !headSha) return { commits: null };
+  const tips = [headSha, ...localHeads.split('\n'), ...(stashRef ? stashRef.split('\n') : []),
+    ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  const present = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], dir,
+    { stdio: ['pipe', 'pipe', 'pipe'], input: tips.map(sha => `${sha}\n`).join('') });
+  const presentLines = present === null ? [] : present.split('\n');
+  if (presentLines.length !== tips.length || !presentLines.every(line => / commit$/.test(line))) return { commits: null };
   const input = [...tips, ...[...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
     .map(line => `${line}\n`).join('');
-  const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin', 'HEAD', '--branches'], dir,
+  const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir,
     { stdio: ['pipe', 'pipe', 'pipe'], input });
   let commits = unproven();
   if (commits === '') return { commits };
@@ -3013,14 +3026,10 @@ function releaseRedirectRefuses(dir, label) {
   return { reason: 'git-dir-redirected', details };
 }
 
-// The canonical origin as the salvage io resolves it (scripts/lib/lane-pool-salvage-push.mjs): a local path is made
-// absolute; a URL keeps its scheme and host, minus any userinfo.
-function releasePushTarget(url) {
-  if (!/^[^/]*:/.test(url)) return resolve(url);
-  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, '$1');
-}
+// Every refusal string (the stderr log, the journal line and `--json` details) passes `safe`, which strips URL
+// credentials: a failed listing or fetch message carries the origin URL (scripts/lib/lane-pool-salvage-push.mjs).
 function releaseWorkRefuses(dir, label, salvage, proof) {
-  const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+  const safe = value => redactUrlCredentials(String(value)).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
   const { commits, why, hint, note } = releaseUnprovenCommits(dir, salvage, proof);
   const tracked = releaseTrackedChanges(dir);
