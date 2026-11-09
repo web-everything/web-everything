@@ -57,11 +57,16 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
     collectEvidence({ removal }) {
       return collectMqFailureEvidence({ removal, io: {
         listRuns({ repo, page }) {
-          const result = countPage(`repos/${repo}/actions/runs?event=merge_group&head_sha=${removal.mergeGroupHead}&branch=${encodeURIComponent(removal.mergeGroupBranch)}`, 'workflow_runs', page);
+          const result = countPage(`repos/${repo}/actions/runs?event=merge_group&head_sha=${removal.mergeGroupHead}`, 'workflow_runs', page);
           const valid = result.workflow_runs.every(run => oid(run.head_sha) && typeof run.event === 'string'
             && typeof run.head_branch === 'string' && typeof run.conclusion === 'string');
           return { runs: result.workflow_runs.filter(run => run.head_sha === removal.mergeGroupHead),
             complete: valid, nextPage: result.nextPage };
+        },
+        isAncestor({ repo, ancestor, descendant }) {
+          if (!oid(ancestor) || !oid(descendant)) throw new Error('Unknown ancestry identity');
+          const comparison = json(['api', `repos/${repo}/compare/${ancestor}...${descendant}`]);
+          return ['ahead', 'identical'].includes(comparison?.status) && comparison.behind_by === 0;
         },
         listJobs({ repo, runId, page }) {
           const result = countPage(`repos/${repo}/actions/runs/${runId}/jobs`, 'jobs', page);
@@ -111,8 +116,7 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard, dryRun = fal
     const live = await active.readPr({ repo, pr });
     if (live?.headRefOid !== head || live.mergeStateStatus !== 'CLEAN' || live.baseRefName !== 'main')
       return finish(false, 'Live head or CLEAN main-base evidence unavailable; operator inspection required');
-    const removal = { ...identity, mergeGroupHead: event.beforeCommit.oid,
-      mergeGroupBranch: `gh-readonly-queue/main/pr-${pr}-${head}` };
+    const removal = { ...identity, mergeGroupHead: event.beforeCommit.oid };
     const currentHead = async () => {
       const current = await active.readPr({ repo, pr });
       if (current?.headRefOid !== head || current.mergeStateStatus !== 'CLEAN' || current.baseRefName !== 'main')
