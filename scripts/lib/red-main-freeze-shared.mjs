@@ -50,6 +50,7 @@ export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 export const PUBLISH_ATTEMPTS = 4;
 /** Per-git-call ceiling: a hung fetch/push FAILS (writer: reported + exit 1; reader: `{error}`, fail closed). */
 export const GIT_TIMEOUT_MS = 20_000;
+const FREEZE_READ_ATTEMPTS = 3;
 /** Captured git output cap: the freeze doc is a few hundred bytes; anything near this is not our file (fail). */
 const GIT_MAX_BUFFER = 4 * 1024 * 1024;
 
@@ -230,9 +231,16 @@ export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBran
   // R546: GitHub REST + ETag by default (setting drain.reads.source); an injected git `run` means the git path.
   // An API failure is a named transient error, never a git fallback.
   if (run === undefined && (readsSource ?? resolveDrainReadsSource().value) === 'api') {
-    // The whole read (ref, commit, each tree, contents: several calls) shares ONE 20 s deadline, like the old single git call.
-    try { text = unwrap(readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, source: reader, timeoutMs: GIT_TIMEOUT_MS, deadlineAt: Date.now() + GIT_TIMEOUT_MS })); }
-    catch (e) { return { source, error: flatText(`branch unreadable: ${e.message}`), transient: e instanceof DrainReadError && e.transient }; }
+    // Retry only deadline failures; each whole read gets a fresh 20 s deadline.
+    for (let attempt = 1; attempt <= FREEZE_READ_ATTEMPTS; attempt += 1) {
+      try {
+        text = unwrap(readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, source: reader, timeoutMs: GIT_TIMEOUT_MS, deadlineAt: Date.now() + GIT_TIMEOUT_MS }));
+        break;
+      } catch (e) {
+        if (attempt < FREEZE_READ_ATTEMPTS && e instanceof DrainReadError && e.transient && e.reason === 'deadline') continue;
+        return { source, error: flatText(`branch unreadable: ${e.message}`), transient: e instanceof DrainReadError && e.transient };
+      }
+    }
     if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   } else {
     run ??= timedGit();
