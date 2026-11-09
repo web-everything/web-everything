@@ -665,7 +665,9 @@ export async function runReviewLoopOnce({
       // A run parked on a confirm, or one an earlier resume rewound and never finished (it died or threw part-way).
       // "Unfinished" = the earlier resume never got through `advise` (the same test `reviewRunEvidence` applies).
       const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
-      const attempts = unfinishedResume ? Number(parked.resumeOf.attempts) || 1 : 0;
+      const suspendedEffect = !parked?.resumeOf && parked?.pending?.kind === 'effect' && parked.pending.step === RESUME_STEP;
+      const effectAttempts = Math.max(0, Number(parked?.referralEffectResumeAttempts) || 0);
+      const attempts = suspendedEffect ? effectAttempts : unfinishedResume ? Number(parked.resumeOf.attempts) || 1 : 0;
       // A resume that keeps failing is bounded: after RESUME_MAX_ATTEMPTS the round falls back to a fresh review.
       // `review.seatsByTouchSet` — a parked run is resumed only under the roster it was judged with; a declaration that
       // seats the security juror differently would reason about a run shape that no longer exists, so that case
@@ -694,14 +696,17 @@ export async function runReviewLoopOnce({
         return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} has an unresolved advisory effect; `
           + 'automatic retries are spent and no fresh panel is started. Resolve the saved effect outcome first.'] };
       }
+      if (suspendedEffect && effectAttempts >= RESUME_MAX_ATTEMPTS) {
+        return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} suspended referral resume attempts spent; inspect run store and ruling.`] };
+      }
       if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
         persistSpent = parked.id;
       } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
-        && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused)) {
+        && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused || suspendedEffect)) {
         // Continue an interrupted advisory step in place: its effect history skips applied writes and refuses
         // unknown non-idempotent outcomes. Rewinding it would discard both protections. Persistence attempts do
         // not consume this later step's retry budget.
-        rewound = resumeAdvise ? { ...parked, resumedAt: now() }
+        rewound = suspendedEffect ? { ...parked, resumedAt: now(), referralEffectResumeAttempts: effectAttempts + 1 } : resumeAdvise ? { ...parked, resumedAt: now() }
           : rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
         // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass
         // finishes. Keep what it set aside (`resumeOf`) so a resume that fails part-way still reads as the parked run
@@ -712,7 +717,7 @@ export async function runReviewLoopOnce({
         // budget too, never reach the RESUME_MAX_ATTEMPTS fresh-panel fallback with the budget unspent.
         const persistRetries = Math.max(0, Number(parked.resumeOf?.persistRetries) || 0)
           + (reviewRunEvidence(parked)?.persistenceFailed ? 1 : 0);
-        rewound = { ...rewound, resumeOf: unfinishedResume
+        if (!suspendedEffect) rewound = { ...rewound, resumeOf: unfinishedResume
           ? { ...parked.resumeOf, attempts: attempts + 1, ...(persistRetries ? { persistRetries } : {}),
             ...(resumeAdvise ? { adviseAttempts: adviseAttempts + 1 } : {}) }
           : { verdict: parked.findings?.referralVerdict ?? parked.verdict ?? null,
