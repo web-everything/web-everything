@@ -54,7 +54,7 @@ describe('Forge health freshness',()=>{
     ['still-stale','recent last-good'],
   ])('refreshes a stale cached sample and fails closed when %s with %s',async(outcome,evidence)=>{
     const root=scratch(),readTelemetry=vi.fn(async()=>{
-      if(outcome==='offline')throw new Error('offline');
+      if(outcome==='offline')throw new Error('forge-unreachable');
       return sample(now-30001);
     });
     const state=saved(sample(now-60000),now-1000);
@@ -73,7 +73,7 @@ describe('Forge health freshness',()=>{
   });
 
   it('reports a cold-start read failure as forge-unreachable',async()=>{
-    const readTelemetry=vi.fn(async()=>{throw new Error('offline');});
+    const readTelemetry=vi.fn(async()=>{throw new Error('forge-unreachable');});
     expect(await check(scratch(),readTelemetry)).toEqual({ok:false,reason:'forge-unreachable'});
     expect(readTelemetry).toHaveBeenCalledTimes(2);
   });

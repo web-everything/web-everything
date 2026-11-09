@@ -458,7 +458,12 @@ describe('remote controls', () => {
   it.each(['unconfirmed','forge-unreachable','copy-failed','forge-busy'])('persists three consecutive %s failures and resets on success', async reason => {
     const f=fixture();
     f.remoteExec.mockResolvedValue(reason==='unconfirmed'?{mode:'unconfirmed'}:{mode:'not-started',terminated:true,reason});
-    for(let i=0;i<3;i++)await runWithRemoteDecision(f);
+    for(let i=0;i<3;i++){
+      await runWithRemoteDecision(f);
+      const health=JSON.parse(readFileSync(join(f.cwd,'remote','health.json'),'utf8'));
+      expect(health.failures).toBe(i+1);
+      expect(health.backoffUntil).toBe(i===2?now+120000:0);
+    }
     const count=f.remoteExec.mock.calls.length;
     expect(count).toBe(reason==='copy-failed'?6:3);
     expect(JSON.parse(readFileSync(join(f.cwd,'remote','health.json'),'utf8')).failures).toBe(3);

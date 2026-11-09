@@ -19,7 +19,7 @@ function healthFixture() {
   return {root,sleep,advance:ms=>{time+=ms;},
     check:(readTelemetry,overrides={})=>checkRemoteHealth({root,settings,clock:()=>time,sleep,readTelemetry,...overrides})};
 }
-const offline=()=>vi.fn(async()=>{throw new Error('telemetry timeout');});
+const offline=()=>vi.fn(async()=>{throw new Error('forge-unreachable');});
 
 describe('Forge transient read fallback',()=>{
   it('persists last-good telemetry and uses it after two failed reads without extending its age',async()=>{
@@ -41,9 +41,34 @@ describe('Forge transient read fallback',()=>{
     expect(f.sleep).toHaveBeenCalledTimes(1);
     expect(f.sleep).toHaveBeenCalledWith(500);
   });
+  it.each([
+    ['malformed schema',async()=>({invalid:true})],
+    ['unparseable reply',async()=>{throw new SyntaxError('Unexpected token');}],
+    ['unknown read error',async()=>{throw new Error('unknown');}],
+  ])('fails closed on %s despite last-good, including a transport failure on retry',async(_name,badRead)=>{
+    const f=healthFixture();await f.check(async()=>sample());f.advance(60000);
+    const read=vi.fn().mockImplementationOnce(badRead).mockRejectedValue(new Error('forge-unreachable'));
+    expect(await f.check(read)).toEqual({ok:false,reason:'forge-unreachable'});
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(saved(f.root)).toMatchObject({lastGoodAt:null,lastGoodTelemetry:null});
+    f.advance(settings.backoffMs+1);
+    expect(await f.check(offline())).toEqual({ok:false,reason:'forge-unreachable'});
+  });
   it.each([600000,600001])('uses an inclusive last-good age cap at %i ms',async age=>{
     const f=healthFixture();await f.check(async()=>sample());f.advance(age);
     expect(await f.check(offline())).toEqual(age===600000?{ok:true,lastGood:true}:{ok:false,reason:'forge-unreachable'});
+  });
+  it('hard-caps last-good at thirty minutes even when a caller bypasses setting validation',async()=>{
+    const f=healthFixture();await f.check(async()=>sample());f.advance(1800001);
+    expect(await f.check(offline(),{settings:{...settings,lastGoodMaxAgeMin:1440}}))
+      .toEqual({ok:false,reason:'forge-unreachable'});
+  });
+  it('rejects repeated malformed replies despite a recent last-good sample',async()=>{
+    const f=healthFixture();await f.check(async()=>sample());f.advance(60000);
+    const read=vi.fn(async()=>({invalid:true}));
+    expect(await f.check(read)).toEqual({ok:false,reason:'forge-unreachable'});
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(saved(f.root)).toMatchObject({lastGoodAt:null,lastGoodTelemetry:null});
   });
   it('recovers on the single retry with fresh telemetry',async()=>{
     const f=healthFixture(),read=vi.fn().mockRejectedValueOnce(new Error('timeout')).mockResolvedValue(sample());
@@ -118,7 +143,10 @@ describe('last-good setting provenance',()=>{
     expect(policy.settings.remote.lastGoodMaxAgeMin).toBe(2);
     expect(formatAdmissionPolicy(policy)).toContain('remote.lastGoodMaxAgeMin=2 (platform)');
   });
-  it.each([-1,0,1441,Infinity,'10'])('rejects invalid/oversized last-good bound %s with visible default',value=>{
+  it('accepts the thirty-minute maximum',()=>{
+    expect(resolveAdmissionPolicy({platform:{remote:{lastGoodMaxAgeMin:30}},env:{}}).settings.remote.lastGoodMaxAgeMin).toBe(30);
+  });
+  it.each([-1,0,31,1440,1441,Infinity,'10'])('rejects invalid/oversized last-good bound %s with visible default',value=>{
     const policy=resolveAdmissionPolicy({platform:{remote:{lastGoodMaxAgeMin:value}},env:{}});
     expect(policy.settings.remote.lastGoodMaxAgeMin).toBe(10);
     expect(formatAdmissionPolicy(policy)).toContain('invalid: platform.remote.lastGoodMaxAgeMin=');
@@ -176,9 +204,13 @@ describe('remote copy retry and fallback evidence',()=>{
     expect(f.log).toHaveBeenLastCalledWith(expect.stringMatching(/copy-failed.*retried.*falling back to local/i));
   });
   it('returns remote when the copy retry succeeds',async()=>{
-    const f=remoteFixture();f.remoteExec.mockResolvedValueOnce(copyFailed).mockResolvedValue({mode:'remote',code:0});
+    const f=remoteFixture();f.remoteExec.mockResolvedValueOnce(copyFailed).mockImplementation(async()=>{
+      expect(saved(join(f.lockRoot,'..','remote')).failures).toBe(1);
+      return {mode:'remote',code:0};
+    });
     expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0,remoteResult:{mode:'remote',code:0}});
     expect(f.remoteExec).toHaveBeenCalledTimes(2);
+    expect(saved(join(f.lockRoot,'..','remote'))).toMatchObject({failures:0,backoffUntil:0,trigger:''});
     expect(existsSync(join(f.lockRoot,'remote-fallbacks.jsonl'))).toBe(false);
   });
   it.each([

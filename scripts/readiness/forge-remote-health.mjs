@@ -66,7 +66,16 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     // Stale cached telemetry gets one refresh even inside the ten-second cache.
     if(state.lastReadAt===null || now-state.lastReadAt>=10000 || (state.telemetry && stale())) {
       state.lastReadAt=now;
-      const read=async()=>parseTelemetry(JSON.stringify(await readTelemetry({host})));
+      const read=async()=>{
+        try{return parseTelemetry(JSON.stringify(await readTelemetry({host})));}
+        catch(error){
+          // Only the SSH/timeout failure emitted by readForgeTelemetry permits
+          // last-good. Malformed replies and unknown errors invalidate it even
+          // if the next attempt fails in transport too.
+          if(error?.message!=='forge-unreachable'){state.lastGoodAt=null;state.lastGoodTelemetry=null;}
+          throw error;
+        }
+      };
       try{state.telemetry=await read();}
       catch{
         await sleep(500);
@@ -74,8 +83,10 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
       }
     }
     const age=!state.telemetry?clock()-state.lastGoodAt:NaN;
+    // Fresh reads still require the 30s freshness guard. Last-good is the
+    // explicit operator-ruled R695/R785 exception, capped at 30 minutes.
     const lastGood=!state.telemetry && state.lastGoodAt!==null && Number.isFinite(age) && age>=0
-      && age<=(settings.lastGoodMaxAgeMin??10)*60000;
+      && age<=Math.min(settings.lastGoodMaxAgeMin??10,30)*60000;
     const telemetry=lastGood?state.lastGoodTelemetry:state.telemetry;
     let trigger;
     if(!telemetry)trigger='forge-unreachable';
@@ -93,7 +104,7 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     return {ok:true};
   },host);}catch(error){return {ok:false,reason:error.message==='remote-health-busy'?error.message:'remote-health-unreadable'};}
 }
-export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge'}) {
+export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge',countFailure=true}) {
   return transaction(root,state=>{
     if(result?.mode==='remote'&&Number.isInteger(result.code)&&result.code>=0&&result.code<=254){
       state.failures=0;state.backoffUntil=0;state.trigger='';return;
@@ -101,7 +112,7 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
     const confirmed=(result?.mode==='not-started'||result?.mode==='cancelled')&&result.terminated===true;
     const reason=!confirmed?'unconfirmed':result.reason;
     if(['unconfirmed','forge-unreachable','copy-failed','forge-busy'].includes(reason)) {
-      state.failures=Math.min(Number.MAX_SAFE_INTEGER,state.failures+1);
+      if(countFailure)state.failures=Math.min(Number.MAX_SAFE_INTEGER,state.failures+1);
       if(state.failures>=settings.backoffFailures){state.backoffUntil=clock()+settings.backoffMs;state.trigger=reason;}
     } else state.failures=0;
   },host);

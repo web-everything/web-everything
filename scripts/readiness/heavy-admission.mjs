@@ -288,7 +288,7 @@ const ADMISSION_VALID = {
   'remote.slotUnitsByKind': (v) => admissionObject(v) && Object.keys(v).length <= ADMISSION_MAX_SLOTS
     && Object.entries(v).every(([key, n]) =>  /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) && (n === 'auto' || admissionInt(1)(n))),
   'remote.backoffMs': isValidRunWaitMs,
-  'remote.lastGoodMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
+  'remote.lastGoodMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 30,
   'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
   'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
   'remote.minFreeRamPct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
@@ -1000,12 +1000,16 @@ export async function runWithRemoteDecision({
   },60000);
   heartbeat.unref();
   let resultRecorded = false;
-  const record = async result => {
-    // Retry attempts are internal; health tracks only one final outcome per run.
+  let failureRecorded = false;
+  const record = async (result, { final = true } = {}) => {
+    // Record every attempt, but count at most one failure per run. A successful
+    // retry still reaches recordRemoteResult and resets the circuit breaker.
     if (resultRecorded) return;
-    resultRecorded = true;
+    resultRecorded = final;
+    const countFailure = !failureRecorded;
+    failureRecorded = true;
     // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).
-    try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host}),escalatePromise]);}
+    try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host,countFailure}),escalatePromise]);}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
   };
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
@@ -1075,6 +1079,8 @@ export async function runWithRemoteDecision({
         && !controller.signal.aborted && !cancelController.signal.aborted) {
         log('heavy-admission: remote copy-failed (termination confirmed) - retrying remote execution once\n');
         retried = true;
+        await record(first, { final: false });
+        if (controller.signal.aborted || cancelController.signal.aborted) return first;
         return execute();
       }
       return first;
