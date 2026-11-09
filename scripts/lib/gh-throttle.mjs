@@ -2115,15 +2115,13 @@ function runGhSyncUnmemoized(args, opts = {}) {
       return result;
     }
 
-    // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound; the freeze holds and the next tick re-reads.
-    if (reserved) throw failure;
     const text = `${failure && failure.stderr ? String(failure.stderr) : ''}\n${failure && failure.message ? String(failure.message) : ''}`;
     if (usedPersonalToken && (looksLikeGhAuthFailure(text) || looksLikePersonalAccessDenial(text))) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'personal_token_rejected', caller, w: isWrite, resource, id: identity, auth: ghAuthProvenance(callEnv), inv });
       fallbackToOriginal(attempt);
       continue;
     }
-    const transient = jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(args, text) : null;
+    const transient = !reserved && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(args, text) : null;
     if (transient) {
       jsonRetry.used += 1;
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: transient, caller, w: isWrite, resource, id: identity, inv });
@@ -2159,7 +2157,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
       }
     }
 
-    if (attempt >= maxAttempts) {
+    // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
+    if (attempt >= maxAttempts || reserved) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'retry_exhausted', caller, w: isWrite, id: identity });
       recordGhThrottleMetric('gh.throttle.rate_limited', 1, { op: opLabel, attempt, source: classifyRateLimitSignal(headers).kind, outcome: 'exhausted' });
       recordGhThrottleMetric('gh.throttle.exhausted', 1, { op: opLabel, attempt });
@@ -2408,10 +2407,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // The call ran and spent points, so it is logged above before the overflow is raised.
     if (stdoutOverflow) throw captureStdoutOverflow(bin, argv);
     if (!failed && isWrite) markPrSnapshotDirty({ repo: repoFromGhArgs(argv), env }); // #gh-graphql-budget
-    // A reserved read makes exactly ONE attempt (no retry or backoff past its call bound).
-    if (reserved && !r.error) return { status: r.status == null ? (r.signal ? 128 : 1) : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: (r.stderr || Buffer.alloc(0)) };
     // A nested call leaves the truncated-JSON retry to its outer runGhSync (one retry per logical call).
-    const transient = failed && !outer && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(argv, stderrText) : null;
+    const transient = failed && !outer && !reserved && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(argv, stderrText) : null;
     if (transient) {
       jsonRetry.used += 1;
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: transient, caller, w: isWrite, resource, id: identity, inv });
@@ -2456,7 +2453,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
         return { status: r.status == null ? 1 : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
       }
     }
-    if (attempt >= maxAttempts) {
+    // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
+    if (attempt >= maxAttempts || reserved) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'retry_exhausted', caller, w: isWrite, id: identity });
       recordGhThrottleMetric('gh.throttle.rate_limited', 1, { op: opLabel, attempt, source: classifyRateLimitSignal(headers).kind, outcome: 'exhausted' });
       recordGhThrottleMetric('gh.throttle.exhausted', 1, { op: opLabel, attempt });

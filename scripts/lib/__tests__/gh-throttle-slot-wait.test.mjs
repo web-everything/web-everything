@@ -304,7 +304,8 @@ describe('reserved priority slot (drain freeze read)', () => {
   it('a reserved read makes exactly one attempt: a rate-limit failure is thrown, not retried or slept on', () => {
     const f = fullPool('red-main-freeze-read');
     const exec = vi.fn(() => { throw Object.assign(new Error('HTTP 403: API rate limit exceeded'), { status: 1, stderr: 'HTTP 403: API rate limit exceeded' }); });
-    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', throttle: { ...f.throttle, reservedSlot: true, exec } })).toThrow(/rate limit/);
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', throttle: { ...f.throttle, reservedSlot: true, exec, env: { ...f.throttle.env, WE_GH_THROTTLE_NO_BUDGET_PROBE: '1' } } })).toThrow(/rate limit/);
     expect(exec).toHaveBeenCalledTimes(1);
+    expect(f.throttle.sleep).not.toHaveBeenCalled();
   });
 });
