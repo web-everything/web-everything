@@ -137,9 +137,11 @@ describe('MQ infrastructure retry with derived aggregate jobs', () => {
     expect(f.logReads.map(read => read.id)).toContain(9022);
   });
 
-  it('accepts an aggregate with a readable steps array and no failed step of its own', () => {
+  it('accepts an aggregate with a readable steps array with only its dependency summary step failed', () => {
     const f = fixture({ jobData: new Map(aggregates.map(c => [c.id + 9000, {
-      name: c.name, head_sha: commit, steps: [step('Set up job', 'success'), step('Complete job', 'success')],
+      id: c.id + 9000, name: c.name, head_sha: commit, status: 'completed', conclusion: 'failure',
+      steps: [step('Set up job', 'success'), step(summarySteps.get(localName(c.name)), 'failure'),
+        step('Complete job', 'success')],
     }])) });
     expectRetry(f.guard());
   });
