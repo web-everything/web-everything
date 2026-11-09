@@ -290,7 +290,7 @@
     {
       "ref": "lane/redteam-ran-verdict",
       "sha": "e9cce536ad8cfebb3b343b52ee58de387d9b3a78",
-      "ruling": "R813+R813b",
+      "ruling": "R813",
       "findings": [
         "scripts/lib/red-team-withheld-publish.mjs:103 \u2014 Legacy recovery relies on marker-only deduplication without comparing the posted comment against recovered findings. Reproduced: a seat row containing one confirmed break plus an existing trusted \u201cno break found\u201d comment returns `skipped`, writes nothing, raises no alert, and leaves the gate seeing zero findings. Conflicting evidence silently bypasses the hold."
       ]
