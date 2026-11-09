@@ -734,8 +734,8 @@ describe('planRedTeamOnSkip', () => {
 describe('settings cascade', () => {
   it('loads the default tool settings from the filesystem under Vite', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' } });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30 });
-    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool' });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
+    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool', staleRedispatchDailyCap: 'tool' });
   });
   it('environment disables recovery and logs its source', () => {
     resetCascadeLogForTest(); const log = vi.fn();
@@ -745,10 +745,25 @@ describe('settings cascade', () => {
     expect(resolved.sources.enabled).toBe('env');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('enabled=false (env)'));
   });
+  it.each(['0', '-1', '1.5', 'bad'])('rejects invalid stale daily cap %s', cap => {
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy',
+      WE_REVIEW_RED_TEAM_ON_SKIP_STALE_REDISPATCH_DAILY_CAP: cap },
+      readFile: () => '{"staleRedispatchDailyCap":0}' });
+    expect(resolved.value.staleRedispatchDailyCap).toBe(3);
+    expect(resolved.sources.staleRedispatchDailyCap).toBe('standard');
+  });
+  it('environment overrides the stale daily cap and logs provenance', () => {
+    resetCascadeLogForTest(); const log = vi.fn();
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_REVIEW_RED_TEAM_ON_SKIP_STALE_REDISPATCH_DAILY_CAP: '5',
+      WE_POLICY_CASCADE_LOG: '1' }, readFile: () => '{"staleRedispatchDailyCap":2}', log });
+    expect(resolved.value.staleRedispatchDailyCap).toBe(5);
+    expect(resolved.sources.staleRedispatchDailyCap).toBe('env');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('staleRedispatchDailyCap=5 (env)'));
+  });
   it('malformed tool and environment values retain lower layers', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_REVIEW_RED_TEAM_ON_SKIP: 'garbage', WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN: '-1', WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' },
       readFile: () => '{"enabled":"bad","retryCooldownMin":-1}' });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30 });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
   });
 });
 
@@ -1897,5 +1912,47 @@ describe('unprovable accepted head move — fresh full review', () => {
     const o = moved({ readEvidence: () => ({ loopPayload: payload(), inFlight: false, recorded: false, seatRecorded: false }) });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
     expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+  });
+});
+
+
+describe('R756 independent backlog-only pass', () => {
+  function backlogOptions(over = {}) {
+    return { repo, rawPrs: [{ number: pr, headRefOid: head,
+      labels: ['ready-to-merge', 'review:prep', 'red-team:pending'],
+      netFiles: { ok: true, files: ['backlog/742.md'] }, comments: [] }],
+      plan: { refusals: [] }, setting: { enabled: false }, syncLabels: vi.fn(),
+      env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '1' }, ...over };
+  }
+  it('settles without prep comments even when on-skip is disabled; own setting off preserves behavior', () => {
+    const options = backlogOptions(); vi.mocked(runGhSync).mockClear();
+    expect(runRedTeamOnSkip(options).rows).toMatchObject([{ action: 'clear', rule: 'backlog-only' }]);
+    expect(runGhSync).toHaveBeenCalledWith(expect.arrayContaining(['comment']), expect.objectContaining({
+      input: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: backlog-only`,
+    }));
+    expect(options.syncLabels).toHaveBeenCalledTimes(1);
+    vi.mocked(runGhSync).mockClear(); options.syncLabels.mockClear();
+    expect(runRedTeamOnSkip({ ...options, env: { WE_RED_TEAM_SKIP_BACKLOG_ONLY_PREP: '0' } }).rows).toEqual([]);
+    expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
+  });
+  it('passes the pinned identity to an injected net reader', () => {
+    const readHeadFiles = vi.fn(() => ({ ok: true, files: ['backlog/742.md'] }));
+    const options = backlogOptions({ readHeadFiles });
+    expect(runRedTeamOnSkip(options).rows[0].action).toBe('clear');
+    expect(readHeadFiles).toHaveBeenCalledWith({ repo, number: pr, headRefOid: head });
+  });
+  it('holds a rename from outside backlog reported by the net reader', () => {
+    const options = backlogOptions({ readHeadFiles: () => ({ ok: true, files: ['src/old', 'backlog/new'] }) });
+    vi.mocked(runGhSync).mockClear();
+    expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
+  });
+  it('never falls back to GitHub files when the net read is unavailable', () => {
+    const options = backlogOptions();
+    delete options.rawPrs[0].netFiles;
+    options.rawPrs[0].files = [{ filename: 'backlog/a', status: 'modified' }];
+    vi.mocked(runGhSync).mockClear();
+    expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
   });
 });
