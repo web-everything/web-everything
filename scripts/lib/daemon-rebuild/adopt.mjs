@@ -159,7 +159,9 @@ export async function redecideWithCandidate({ m, ready, git, args, alert, loadCa
       leftForMain: (applied, build) => args.leftForMain(applied, build, candidate.overlayGraduated),
     });
     if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('candidate returned a non-object decision');
-    if (result.adopt?.finalSha !== finalSha || !Array.isArray(result.dropRefs) || result.dropRefs.length !== 0) return m;
+    // Bound the candidate's answer: exactly the ready record's own adopt metadata, never a rewritten plan.
+    const sameAdopt = JSON.stringify(result.adopt) === JSON.stringify(ready.adopt);
+    if (!sameAdopt || result.adopt?.finalSha !== finalSha || !Array.isArray(result.dropRefs) || result.dropRefs.length !== 0) return m;
     alert('ready-candidate-redecided', { match: 'redecided-by-candidate', target: finalSha });
     return { ...result, match: 'redecided-by-candidate' };
   } catch (error) {
