@@ -2,7 +2,7 @@
 const clean = text => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 const infra = /runner has lost communication|runner.*(?:offline|disconnected)|infrastructure failure/i;
 const assertion = /^(?:FAIL\b|AssertionError\b|Error: expect\b|Expected:|Received:|❯(?=\s))/;
-const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|^failure\b|^Error: expect\b|^Expected:|^Received:|^❯(?=\s)/g;
+const failureMarkers = /\b(?:FAIL|FAILED|AssertionError)\b|(?:^|[\w-]+:\s)failure\b|^Error: expect\b|^Expected:|^Received:|^❯(?=\s)/g;
 // These jobs only aggregate sibling results; no other job name receives this exemption.
 const derivedFailureJobs = new Set(['coverage-merge', 'test']);
 const localJobName = name => clean(name).split(' / ').at(-1).trim().replace(/\s+\([^()\r\n]*\)$/, '');
@@ -28,7 +28,7 @@ function hasOnlyUpstreamFailure(lines) {
   if (lines.some(line => line.startsWith('##[group]'))) {
     const errors = lines.filter(line => line.startsWith('##[error]'));
     // Un-annotated error text (a thrown Error, fatal:, npm ERR) is an independent failure, never boilerplate.
-    if (lines.some(line => /Error\b|Exception\b|\bE(?:NOENT|ACCES|PIPE|TIMEDOUT)\b|\bpanic\b|Traceback|^fatal:|^npm ERR/.test(line))) return false;
+    if (lines.some(line => /Error\b|Exception\b|\bE(?:NOENT|ACCES|PIPE|TIMEDOUT)\b|\bpanic\b|Traceback|^fatal:|^npm ERR|[Uu]nexpected|[Tt]erminated|[Cc]rash|[Tt]imed? ?out|[Cc]ancel|[Kk]illed|[Aa]bort/.test(line))) return false;
     return lines.some(line => upstreamFailureOutcomes.has(line))
       && errors.every(line => upstreamFailureOutcomes.has(line) || line === '##[error]Process completed with exit code 1.');
   }
@@ -117,6 +117,7 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
         let parsed = false, hasAssertions = false, markers = 0, attributed = 0;
         const jobAssertions = [], jobPaths = new Set(), causalityLines = [], markerLines = [];
         let activePaths = [], capturedOutput = false, unterminatedBlock = false;
+        const failHeadingFiles = new Set(); let failHeadings = 0, summaryFiles = null, summaryTests = null;
         for (const raw of clean(log.text).split(/\r?\n/)) {
           const line = raw.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim();
           // Vitest echoes passing tests' stdout/stderr verbatim. These blocks can contain fake
@@ -131,6 +132,10 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
             else continue;
           }
           if (line) causalityLines.push(line);
+          const summary = /^(Test Files|Tests)\s+(?:(\d+) failed)?/.exec(line);
+          if (summary) { const n = summary[2] === undefined ? 0 : Number(summary[2]); if (summary[1] === 'Tests') summaryTests = n; else summaryFiles = n; }
+          const heading = /^FAIL\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>/.exec(line);
+          if (heading) { failHeadings++; failHeadingFiles.add(heading[1]); }
           if (assertion.test(line)) hasAssertions = true;
           if (assertion.test(line) || infra.test(line)) { jobAssertions.push(line); parsed = true; }
           const found = [...line.matchAll(failureMarkers)];
@@ -150,6 +155,10 @@ export async function collectMqFailureEvidence({ removal, io, limits = {} }) {
             for (const path of paths) jobPaths.add(path);
           }
         }
+        // Cross-check against vitest's own summary: a captured block, odd formatting or an embedded marker
+        // can hide a failing test from the parser, but not from the totals the runner printed itself.
+        if ((summaryFiles !== null && summaryFiles !== failHeadingFiles.size)
+          || (summaryTests !== null && summaryTests !== failHeadings)) pathsComplete = false;
         if (capturedOutput || unterminatedBlock) pathsComplete = false; // an unended captured block may hide real failures
         if (jobAssertions.length > 100 || jobPaths.size > 100) return result;
         // Any structured failure marker in a derived job's own log (attributed or not) is real evidence,

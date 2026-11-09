@@ -427,4 +427,23 @@ describe('mq failure evidence: real #6499 log shapes', () => {
       903: ghAggregate('Unit shards did not succeed.') }));
     expect(evidence.complete).toBe(false);
   });
+  it('hosted aggregate with an independent diagnostic (artifact merge unexpectedly terminated) never authorizes refresh', async () => {
+    const evidence = await collect(io({ 901: shardLog,
+      902: `${ghAggregate('Unit shards did not succeed; refusing incomplete coverage.')}\nartifact merge unexpectedly terminated`,
+      903: ghAggregate('Unit shards did not succeed.') }));
+    expect(evidence.complete).toBe(false);
+  });
+  it('a captured block that swallows a FAIL before a later blank is caught by the runner summary totals', async () => {
+    const text = ['FAIL  scripts/lib/__tests__/delivery-policy.test.mjs > a', 'AssertionError: x',
+      'stderr | scripts/a.test.mjs > passing', 'FAIL  tests/inside.test.mjs > breaks', 'AssertionError: y', '',
+      'Test Files  2 failed | 1 passed (3)', 'Tests  2 failed | 5 passed (7)'].join('\n');
+    const evidence = await collect(io({ 901: text, 902: ghAggregate('Unit shards did not succeed; refusing incomplete coverage.'),
+      903: ghAggregate('Unit shards did not succeed.') }));
+    expect(evidence.complete).toBe(false);
+  });
+  it('an embedded labelled lowercase failure line is collected so a changed file blocks refresh', async () => {
+    const evidence = await collect(io({ 901: `${shardLog}\nrunner: failure tests/inside.test.mjs > breaks`,
+      902: ghAggregate('Unit shards did not succeed; refusing incomplete coverage.'), 903: ghAggregate('Unit shards did not succeed.') }));
+    expect(evidence.testFiles).toContain('tests/inside.test.mjs');
+  });
 });
