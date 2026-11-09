@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readdirSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync, rmSync, rmdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -31,13 +31,86 @@ export function readBuildQueueCache({ file, key, now = Date.now(), maxAgeMs = 60
   return null;
 }
 
-export function writeBuildQueueCache({ file, key, at = Date.now(), stdout }) {
+/** Null means not owner; the caller bounds retries before computing unlocked. */
+export function acquireBuildQueueLock({ file, now = Date.now(), staleMs = 600_000, pid = process.pid,
+  io = { mkdirSync, readFileSync, writeFileSync, rmSync, rmdirSync } }) {
+  const { mkdirSync: mkdir, readFileSync: read, writeFileSync: write, rmSync: remove, rmdirSync: rmdir } = io;
+  const lock = `${file}.lock`;
+  const guard = `${lock}.guard`;
+  const ownerFile = join(lock, 'owner.json');
+  const owner = JSON.stringify({ pid, at: now, token: Math.random().toString(36).slice(2) });
+  let created = false;
+  let guarded = false;
+  try {
+    mkdir(dirname(file), { recursive: true });
+    // Serialize every lock mutation, including stale inspection and owner-safe release.
+    // A stranded guard uses the caller's bounded wait/unlocked-compute fallback.
+    try { mkdir(guard); guarded = true; }
+    catch (error) { if (error.code === 'EEXIST') return null; throw error; }
+    try { mkdir(lock); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const held = JSON.parse(read(ownerFile, 'utf8'));
+      if (!held || !Number.isInteger(held.pid) || held.pid <= 0 || !Number.isFinite(held.at) ||
+          typeof held.token !== 'string' || held.token.length === 0) return null;
+      let dead = false;
+      try { process.kill(held.pid, 0); }
+      catch (error) { dead = error.code === 'ESRCH'; }
+      if (!dead && now - held.at < staleMs) return null;
+      remove(lock, { recursive: true });
+      try { mkdir(lock); }
+      catch (error) { if (error.code === 'EEXIST') return null; throw error; }
+    }
+    created = true;
+    write(ownerFile, owner, 'utf8');
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      let releaseGuarded = false;
+      try {
+        mkdir(guard);
+        releaseGuarded = true;
+        if (read(ownerFile, 'utf8') === owner) remove(lock, { recursive: true });
+      } catch { /* best-effort release */ }
+      finally {
+        if (releaseGuarded) { try { rmdir(guard); } catch { /* best-effort cleanup */ } }
+      }
+    };
+    release.holds = () => {
+      if (released) return false;
+      try { return read(ownerFile, 'utf8') === owner; }
+      catch { return false; }
+    };
+    return release;
+  } catch {
+    if (created) { try { remove(lock, { recursive: true }); } catch { /* best-effort cleanup */ } }
+    return null;
+  } finally {
+    if (guarded) { try { rmdir(guard); } catch { /* best-effort cleanup */ } }
+  }
+}
+
+export function waitForBuildQueueCache({ file, key, timeoutMs = 30_000, pollMs = 50, maxAgeMs = 60_000 }) {
+  const deadline = Date.now() + timeoutMs;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    const stdout = readBuildQueueCache({ file, key, maxAgeMs });
+    if (stdout !== null) return stdout;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    Atomics.wait(sleeper, 0, 0, Math.min(pollMs, remaining));
+  }
+}
+
+export function writeBuildQueueCache({ file, key, at = Date.now(), stdout, fence }) {
   if (key === null) return;
   let temp;
   try {
     mkdirSync(dirname(file), { recursive: true });
     temp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     writeFileSync(temp, JSON.stringify({ key, at, stdout }), 'utf8');
+    if (fence !== undefined && !fence()) return;
     renameSync(temp, file);
   } catch { /* best-effort cache */ }
   finally { if (temp) { try { unlinkSync(temp); } catch { /* renamed or unavailable */ } } }

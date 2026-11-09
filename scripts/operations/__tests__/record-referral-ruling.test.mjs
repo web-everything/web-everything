@@ -27,6 +27,9 @@ const head = 'a'.repeat(40);
 const newHead = 'b'.repeat(40);
 const CARD = 'we:backlog/xvm9vbu-follow-up.md';
 const gh = (body, login = 'web-everything', extra = {}) => ({ body, author: { login }, ...extra });
+// An operator's ruling, authored by that operator (PR #6529: an unstamped ruling posted by automation after poster
+// stamping shipped keeps only its block rows).
+const op = (r) => gh(buildOperatorRulingComment(r), r.actor);
 const finding = (summary) => ({ summary, file: 'scripts/x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' });
 
 function referral({ runId = 'review-pr-1', h = head, summaries = ['protected list misses edits'], rulings = [] } = {}) {
@@ -50,21 +53,21 @@ describe('#4979 gate: operator rulings alongside reviewer rulings', () => {
 
   it('a reviewer block holds until the operator rules; an operator card on a readable card clears it', () => {
     expect(mandatoryReferralState(thread(), ctx()).blocked).toEqual([blocked.referrals[0].key]);
-    const state = mandatoryReferralState(thread(gh(buildOperatorRulingComment(ruling(blocked)))), ctx());
+    const state = mandatoryReferralState(thread(op(ruling(blocked))), ctx());
     expect(state).toMatchObject({ pending: [], blocked: [] });
     expect(state.operatorRulings).toHaveLength(1);
   });
   it('card needs a readable card, both when written and at the gate', () => {
     expect(validateOperatorRuling({ ...ruling(blocked), rulings: [{ runId: blocked.runId, key: blocked.referrals[0].key, result: 'card' }] })).toBe(false);
     expect(validateOperatorRuling({ ...ruling(blocked, { result: 'not-real' }), rulings: [{ runId: blocked.runId, key: blocked.referrals[0].key, result: 'not-real', card: CARD }] })).toBe(false);
-    const state = mandatoryReferralState(thread(gh(buildOperatorRulingComment(ruling(blocked)))), ctx({ cardReadable: () => false }));
+    const state = mandatoryReferralState(thread(op(ruling(blocked))), ctx({ cardReadable: () => false }));
     expect(state.pending).toEqual([blocked.referrals[0].key]);
   });
   it('an operator block holds even over a reviewer not-real; the latest operator ruling decides', () => {
     const cleared = referral({ rulings: ['not-real'] });
     const base = [gh(renderReferralRecord(cleared))];
-    const block = gh(buildOperatorRulingComment(ruling(cleared, { result: 'block' })));
-    const notReal = gh(buildOperatorRulingComment(ruling(cleared, { result: 'not-real', at: '2026-10-04T15:00:00Z' })));
+    const block = op(ruling(cleared, { result: 'block' }));
+    const notReal = op(ruling(cleared, { result: 'not-real', at: '2026-10-04T15:00:00Z' }));
     expect(mandatoryReferralState([...base, block], ctx()).blocked).toEqual([cleared.referrals[0].key]);
     expect(mandatoryReferralState([...base, block, notReal], ctx())).toMatchObject({ pending: [], blocked: [] });
     expect(mandatoryReferralState([...base, notReal, block], ctx()).blocked).toEqual([cleared.referrals[0].key]);
@@ -99,15 +102,15 @@ describe('#4979 gate: operator rulings alongside reviewer rulings', () => {
     const r = ruling(blocked, { reason: `Accept\n<!-- ${OPERATOR_RULING_MARKER}: ZZZZ -->` });
     const body = buildOperatorRulingComment(r);
     expect(body.match(new RegExp(`<!-- ${OPERATOR_RULING_MARKER}:`, 'g'))).toHaveLength(1);
-    expect(parseOperatorRulingComment(gh(body)).record.reason).toBe(r.reason);
+    expect(parseOperatorRulingComment(gh(body, r.actor)).record.reason).toBe(r.reason);
   });
   it('a ruling binds to its exact run, finding and head; a new head invalidates it', () => {
-    const wrongRun = gh(buildOperatorRulingComment(ruling(blocked, { runId: 'review-pr-other' })));
-    const wrongKey = gh(buildOperatorRulingComment(ruling(blocked, { key: '["x","y","","z"]' })));
+    const wrongRun = op(ruling(blocked, { runId: 'review-pr-other' }));
+    const wrongKey = op(ruling(blocked, { key: '["x","y","","z"]' }));
     for (const c of [wrongRun, wrongKey]) expect(mandatoryReferralState(thread(c), ctx()).blocked).toEqual([blocked.referrals[0].key]);
     // The PR moved: the new head's own record is pending, and the old-head ruling does not reach it.
     const fresh = referral({ runId: 'review-pr-2', h: newHead });
-    const old = gh(buildOperatorRulingComment(ruling(blocked)));
+    const old = op(ruling(blocked));
     const onNew = mandatoryReferralState([...thread(old), gh(renderReferralRecord(fresh))], ctx({ head: newHead }));
     expect(onNew.pending).toEqual([fresh.referrals[0].key]);
     // A broken ruling that provably belongs to the OLD head does not hold the new one.
@@ -121,14 +124,15 @@ describe('#4979 the sanctioned writer', () => {
   const rec = referral({ summaries: ['first', 'second'], rulings: ['block'] });
   const comments = [gh(renderReferralRecord(rec))];
   const read = (over = {}) => ({ head, ...openReferralFindings({ comments, repo, pr: 7, head, body: rec.authorBody, cardReadable: (c) => c === CARD }),
-    card: { requested: 'xvm9vbu', ref: CARD, readable: true }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
+    identity: { login: 'chalbert', type: 'User' }, card: { requested: 'xvm9vbu', ref: CARD, readable: true }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
   const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'Accept', ...over });
 
   it('persists optional not-real cause and finding lens through the marked comment', () => {
     const plan = planOperatorRuling(read({ card: null }), input({ ruling: 'not-real', cause: 'stale-head-reraise' }));
-    const parsed = parseOperatorRulingComment(gh(plan.body)).record;
+    // PR #6529: a planned ruling is stamped with its checked poster, so it is read as posted by that operator.
+    const parsed = parseOperatorRulingComment(gh(plan.body, 'chalbert')).record;
     expect(parsed.rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
-    expect(readOperatorRulings([gh(plan.body)]).rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
+    expect(readOperatorRulings([gh(plan.body, 'chalbert')]).rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
     expect(() => planOperatorRuling(read(), input({ cause: 'test-nit' }))).toThrow(/--cause/);
     expect(() => planOperatorRuling(read(), input({ ruling: 'not-real', cause: 'invented' }))).toThrow(/--cause/);
   });
@@ -142,9 +146,13 @@ describe('#4979 the sanctioned writer', () => {
   it('plans one record bound to PR, head, run and finding, carrying actor, channel, words and time', () => {
     const plan = planOperatorRuling(read(), input());
     expect(plan.record).toMatchObject({ repo, pr: 7, head, actor: 'chalbert', channel: 'claude-code-chat', reason: 'Accept',
-      at: '2026-10-04T14:30:00Z', clearerId: 's' });
+      at: '2026-10-04T14:30:00Z', clearerId: 's', poster: 'chalbert' });
     expect(plan.record.rulings).toEqual(rec.referrals.map((f) => ({ runId: rec.runId, key: f.key, result: 'card', card: CARD })));
-    expect(mandatoryReferralState([...comments, gh(plan.body)], ctx())).toMatchObject({ pending: [], blocked: [] });
+    expect(mandatoryReferralState([...comments, gh(plan.body, 'chalbert')], ctx())).toMatchObject({ pending: [], blocked: [] });
+    // PR #6529: the same stamped body authored by the App (a credential split) is not this operator's ruling.
+    const unruled = mandatoryReferralState(comments, ctx());
+    expect(unruled.pending.length).toBeGreaterThan(0);
+    expect(mandatoryReferralState([...comments, gh(plan.body)], ctx())).toMatchObject({ pending: unruled.pending, blocked: unruled.blocked });
   });
   it.each([
     ['a non-operator actor', {}, { actor: 'web-everything' }, /registered operator login/],
@@ -160,11 +168,11 @@ describe('#4979 the sanctioned writer', () => {
 
   it('the sink refuses a moved head, never double-posts, and proves the gate can read what it wrote', async () => {
     const plan = planOperatorRuling(read(), input());
-    const payload = { repo, pr: 7, head, body: plan.body };
+    const payload = { repo, pr: 7, head, body: plan.body, actor: 'chalbert' };
     let thread = { headRefOid: head, comments: [...comments] };
     const posts = [];
-    const sinks = (login = 'web-everything') => createRecordReferralRulingSinks({
-      readJson: () => structuredClone(thread),
+    const sinks = (login = 'chalbert') => createRecordReferralRulingSinks({
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
       post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, login)); },
     })[OPERATOR_RULING_POST_EFFECT];
     await expect(sinks()(payload)).resolves.toMatchObject({ posted: true });
@@ -245,7 +253,7 @@ describe('#4979 the sanctioned writer', () => {
       const reader = createRecordReferralRulingReader({ root, assertFresh: () => {},
         readable: (ref) => ref.endsWith('@pr7'),
         openPrHead: (args) => { seen.push(args); return { list: () => ['x0e6tik-follow-up.md'], read: () => '---\na: 1\n---\n' }; },
-        readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
+        readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
       const context = reader({ repo, pr: 7, card: 'x0e6tik' });
       expect(seen).toEqual([{ repo, pr: 7, head }]);
       expect(context.card).toMatchObject({ ref: 'we:backlog/x0e6tik-follow-up.md@pr7', readable: true, foundIn: 'pr-head' });
@@ -262,7 +270,7 @@ describe('#4979 acceptance and wake-up read the operator ruling', () => {
     const state = { headRefOid: head, body: rec.authorBody, comments: [gh(renderReferralRecord(rec))] };
     const opts = { repo, pr: 7, cardReadable: (c) => c === CARD, readRuns: () => [] };
     expect(() => assertMandatoryReferralsCleared(state, opts)).toThrow(/mandatory referral hold/);
-    state.comments.push(gh(buildOperatorRulingComment(ruling(rec))));
+    state.comments.push(op(ruling(rec)));
     expect(assertMandatoryReferralsCleared(state, opts)).toMatchObject({ pending: [], blocked: [] });
     expect(() => assertMandatoryReferralsCleared({ ...state, comments: [...state.comments, gh(state.comments[1].body, 'mallory')] }, opts)).toThrow(/malformed-operator-ruling/);
   });
@@ -279,9 +287,9 @@ describe('#4979 acceptance and wake-up read the operator ruling', () => {
     const pr = (comments) => ({ number: 7, headRefOid: head, comments });
     const later = new Date(at + 1000).toISOString();
     expect(decideReferralHold(pr([]), runs, { repo, now: at + 2000 })).not.toBeNull();
-    const ok = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real' })), 'web-everything', { createdAt: later });
+    const ok = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real' })), 'chalbert', { createdAt: later });
     expect(decideReferralHold(pr([ok]), runs, { repo, now: at + 2000 })).toBeNull();
-    const other = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real', h: newHead })), 'web-everything', { createdAt: later });
+    const other = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real', h: newHead })), 'chalbert', { createdAt: later });
     expect(decideReferralHold(pr([other]), runs, { repo, now: at + 2000 })).not.toBeNull();
   });
 });
@@ -293,7 +301,7 @@ describe('operator finding selectors and follow-up', () => {
     { index: 2, runId: 'r', key: 'second-key', seat: 'security', file: 'src/y.ts', line: null, summary: 'second', state: 'pending', rationale: '' },
   ];
   const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'block', actor: 'chalbert', channel: 'chat', reason: 'Fix it', ...over });
-  const read = (over = {}) => ({ head, open, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
+  const read = (over = {}) => ({ head, open, identity: { login: 'chalbert', type: 'User' }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
   const follow = (over = {}) => planRulingFollowUp({ open, selected: open, ruling: 'block', reason: 'Fix it', enabled: true, head, ...over });
 
   it('selects file:line, a no-line file, and exact keys before file matching', () => {
@@ -342,7 +350,7 @@ describe('operator finding selectors and follow-up', () => {
   it('reads the environment opt-out in the reader', () => {
     const rec = referral();
     const reader = createRecordReferralRulingReader({ env: { WE_REFERRAL_RULING_FOLLOW_UP: '0' },
-      readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
     const context = reader({ repo, pr: 7 });
     expect(context.followUpEnabled).toBe(false);
     expect(planOperatorRuling(context, input()).followUp).toBeNull();
@@ -451,11 +459,11 @@ describe('unattended live-referral gate', () => {
   });
   it.each(['card', 'not-real'])('all referrals operator-ruled %s plus clean accept can accept', result => {
     const rec = referral();
-    expect(hold([gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec, { result })))])).toBeNull();
+    expect(hold([gh(renderReferralRecord(rec)), op(ruling(rec, { result }))])).toBeNull();
   });
   it.each([null, 'card', 'not-real'])('prevention-outstanding broken finding requires a clearing ruling: %s', result => {
     const rec = referral();
-    const comments = result ? [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec, { result })))] : [];
+    const comments = result ? [gh(renderReferralRecord(rec)), op(ruling(rec, { result }))] : [];
     const verdict = { verdict: 'prevention-outstanding', findings: [rec.referrals[0].finding] };
     const reason = unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict });
     if (result) expect(reason).toBeNull();
@@ -463,7 +471,7 @@ describe('unattended live-referral gate', () => {
   });
   it('a clearing ruling for a different finding does not clear a broken finding', () => {
     const rec = referral();
-    const comments = [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec)))];
+    const comments = [gh(renderReferralRecord(rec)), op(ruling(rec))];
     expect(unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict: { verdict: 'prevention-outstanding',
       findings: [finding('a different broken guard')] } })).toMatch(/broken finding is not ruled/);
   });
@@ -522,9 +530,10 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
       gh(gate.redTeamGateMarker(7, head, 'round-cap'), 'web-everything', { createdAt: '2026-10-04T14:01:00Z' }),
     ];
     const snapshot = { head, comments, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's',
+      identity: { login: 'chalbert', type: 'User' },
       cardFileMode: { value: mode, source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false,
       ...(kind === 'referral' ? openReferralFindings({ comments, ...ctx(), cardReadable: () => false }) : {
-        identity: { login: 'chalbert', type: 'User' }, labels: [{ name: 'review:human' }],
+        labels: [{ name: 'review:human' }],
         setting: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} }, scope: { value: { anyState: true } },
       }) };
     const readRulingContext = vi.fn(({ card }) => ({ ...snapshot,
@@ -700,7 +709,7 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
         const common = { env, tool, log: line => lines.push(line), assertFresh: () => {},
           now: () => '2026-10-04T14:30:00Z' };
         const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
-          readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null,
+          readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null,
           readable: () => false, openPrHead: () => { throw new Error('unexpected PR read'); },
         }) : rtIO.createRecordRedTeamRulingReader({ ...common,
           readThread: () => ({ headRefOid: head, comments: [], labels: [] }), readEvents: () => ({ status: 'ok', rows: [] }),
@@ -1032,10 +1041,11 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       gh(gate.redTeamGateMarker(7, head, 'round-cap'), 'web-everything', { createdAt: '2026-10-04T14:01:00Z' }),
     ];
     const snapshot = { head, comments, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's',
+      identity: { login: 'chalbert', type: 'User' },
       judgeNotRealMode: { value: mode, source: 'standard' }, disagreements: 0,
       cardFileMode: { value: 'one-call', source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false,
       ...(kind === 'referral' ? openReferralFindings({ comments, ...ctx() }) : {
-        identity: { login: 'chalbert', type: 'User' }, labels: [{ name: 'review:human' }],
+        labels: [{ name: 'review:human' }],
         setting: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} }, scope: { value: { anyState: true } },
       }), ...readOver };
     const judgeConfirm = vi.fn(async () => {
@@ -1238,7 +1248,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       }
       if (kind === 'referral' && unknown) comments.push(gh('<!-- mandatory-referrals-v1: broken -->'));
       const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
-        readJson: () => ({ headRefOid: head, body: '', comments }), readable: () => false, changedLines: () => null,
+        readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, body: '', comments }), readable: () => false, changedLines: () => null,
       }) : rtIO.createRecordRedTeamRulingReader({ ...common,
         readThread: () => ({ headRefOid: head, comments, labels: h.snapshot.labels }),
         readSetting: () => ({ value: h.snapshot.setting }), readScope: () => h.snapshot.scope,
@@ -1415,7 +1425,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       const common = { env: { WE_PLATFORM_PREFERENCES_FILE: prefsFile(prefs), WE_POLICY_CASCADE_LOG: '1', ...envOver },
         tool, log: line => lines.push(line), assertFresh: () => {} };
       const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
-        readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null, readable: () => false,
+        readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null, readable: () => false,
         openPrHead: () => { throw new Error('unexpected PR read'); },
       }) : rtIO.createRecordRedTeamRulingReader({ ...common,
         readThread: () => ({ headRefOid: head, comments: [], labels: [] }), readEvents: () => ({ status: 'ok', rows: [] }),
@@ -1483,7 +1493,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     // Strip the encoded record: evidence must also be visible to the operator.
     const text = stripComments(body);
     for (const value of [...Object.values(evidence()), 'evidence-required', 'agree']) expect(text).toContain(value);
-    expect(storedEvidence(parseOperatorRulingComment(gh(body)).record)).toMatchObject(evidence());
+    expect(storedEvidence(parseOperatorRulingComment(gh(body, 'chalbert')).record)).toMatchObject(evidence());
   });
   it('red-team record AND posted comment text store evidence, mode and confirm verdict', async () => {
     const [, rt] = await modules;
@@ -1551,7 +1561,7 @@ describe('R671 v1 acting judge referral blocks', () => {
   });
   it('operator referral reasons retain the existing treatment of review tokens', () => {
     const reason = 'reviewed-sha and CLEARED-HUMAN in operator prose';
-    const plan = planOperatorRuling(snapshot(), request('block', { actor: 'chalbert', reason }));
+    const plan = planOperatorRuling(snapshot({ identity: { login: 'chalbert', type: 'User' } }), request('block', { actor: 'chalbert', reason }));
     expect(plan.record.reason).toBe(reason);
     expect(plan.body).toContain(reason);
   });
@@ -1594,7 +1604,7 @@ describe('R671 v1 acting judge referral blocks', () => {
   });
   it('unknown actor stays refused and the existing operator record stays operator-worded', () => {
     expect(() => planOperatorRuling(snapshot(), request('block', { actor: 'judge:unknown' }))).toThrow(/actor|operator/i);
-    const plan = planOperatorRuling(snapshot(), request('block', { actor: 'chalbert' }));
+    const plan = planOperatorRuling(snapshot({ identity: { login: 'chalbert', type: 'User' } }), request('block', { actor: 'chalbert' }));
     expect(plan.record.actor).toBe('chalbert');
     expect(plan.body).toMatch(/operator ruling/i);
     expect(plan.body).not.toContain(attribution);
@@ -1627,7 +1637,7 @@ describe('R671 v1 acting judge referral blocks', () => {
     const plan = planOperatorRuling(snapshot(), request());
     await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true, head });
     expect(h.posted).toEqual([plan.body]);
-    expect(h.readJson).toHaveBeenCalledWith(['api', 'user']);
+    expect(h.readJson).toHaveBeenCalledWith(['api', 'user'], expect.objectContaining({ throttle: { personalRoute: false } }));
     expect(h.events).toHaveLength(1);
     expect(h.events[0].actor.declared).toBe('judge:r10');
     expect(JSON.stringify(h.events[0])).toContain(attribution);
@@ -1661,7 +1671,7 @@ describe('R671 v1 acting judge referral blocks', () => {
     const read = snapshot({ open: [], disputed });
     expect(() => planOperatorRuling(read, request())).toThrow('judge cannot supersede rulings; operator-only');
     // control: the operator's auto-supersede of the same disputed finding still plans
-    expect(planOperatorRuling(read, request('block', { actor: 'chalbert' })).supersedes).toEqual(['operator:aaaaaaaaa:0123456789ab']);
+    expect(planOperatorRuling({ ...read, identity: { login: 'chalbert', type: 'User' } }, request('block', { actor: 'chalbert' })).supersedes).toEqual(['operator:aaaaaaaaa:0123456789ab']);
   });
 
   // The structured-referral READER enforces the same judge refusals the writer does (a crafted canonical record).
@@ -1690,7 +1700,7 @@ describe('R671 v1 acting judge referral blocks', () => {
   });
   it('judge referral planning refuses a clearance token in the rendered body, not only in the reason', () => {
     // the channel is rendered into the body; the reason is clean
-    expect(planOperatorRuling(snapshot(), request('block', { actor: 'chalbert', channel: 'chat reviewed-sha' })).body).toMatch(/reviewed-sha/);
+    expect(planOperatorRuling(snapshot({ identity: { login: 'chalbert', type: 'User' } }), request('block', { actor: 'chalbert', channel: 'chat reviewed-sha' })).body).toMatch(/reviewed-sha/);
     expect(() => planOperatorRuling(snapshot(), request('block', { channel: 'chat reviewed-sha' }))).toThrow(/judge.*reserved.*review.*token/i);
   });
   it('persisted judge referral block carrying supersedes is ignored', () => {
@@ -1739,5 +1749,103 @@ describe('R671 v1 acting judge referral blocks', () => {
     const plan = planOperatorRuling({ ...read, now: '2026-11-07T12:00:00Z', clearerId: 'judge-session' }, request());
     await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true });
     expect(h.posted).toEqual([plan.body]);
+  });
+
+  describe('human actor rulings bind the authenticated poster (red-first)', () => {
+    const human = { login: 'chalbert', type: 'User' };
+    const operatorRequest = (ruling = 'block') => request(ruling, { actor: 'chalbert' });
+    const operatorSnapshot = (identity, ruling = 'block') => snapshot({ identity,
+      card: ruling === 'card' ? { ref: CARD, readable: true } : null });
+
+    it.each(['not-real', 'block', 'card'])('plan refuses a bot poster declaring a human actor for %s', ruling => {
+      expect(() => planOperatorRuling(operatorSnapshot(bot, ruling), operatorRequest(ruling)))
+        .toThrow(/human account|posting identity/i);
+    });
+
+    it.each(['not-real', 'block', 'card'])('plan records %s for the matching human poster', ruling => {
+      const plan = planOperatorRuling(operatorSnapshot(human, ruling), operatorRequest(ruling));
+      expect(plan.record.actor).toBe('chalbert');
+      expect(plan.record.rulings).toHaveLength(1);
+      expect(plan.record.rulings[0].result).toBe(ruling);
+      expect(parseOperatorRulingComment(gh(plan.body, human.login)).record.actor).toBe('chalbert');
+    });
+
+    it('plan fails closed when poster identity is missing', () => {
+      const read = operatorSnapshot(human);
+      delete read.identity;
+      expect(() => planOperatorRuling(read, operatorRequest())).toThrow(/human account|posting identity/i);
+    });
+
+    it('plan fails closed when poster identity is undefined', () => {
+      expect(() => planOperatorRuling(operatorSnapshot(undefined), operatorRequest()))
+        .toThrow(/human account|posting identity/i);
+    });
+
+    it('plan refuses an unregistered or mismatched human poster', () => {
+      expect(() => planOperatorRuling(operatorSnapshot({ login: 'mallory', type: 'User' }), operatorRequest()))
+        .toThrow(/not a registered operator|does not match/i);
+    });
+
+    it.each(['not-real', 'block', 'card'])('POST refuses a bot poster for human-actor %s before any writes', async ruling => {
+      const h = postHarness({ identity: bot });
+      const plan = planOperatorRuling(operatorSnapshot(human, ruling), operatorRequest(ruling));
+      await expect(h.sink(payloadOf(plan))).rejects.toThrow(/human account|posting identity/i);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
+    it.each(['not-real', 'block', 'card'])('POST records human-actor %s for the matching human poster', async ruling => {
+      const h = postHarness({ identity: human, login: human.login });
+      const plan = planOperatorRuling(operatorSnapshot(human, ruling), operatorRequest(ruling));
+      await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true, head });
+      expect(h.posted).toEqual([plan.body]);
+      expect(h.events).toHaveLength(1);
+      expect(h.events[0].actor.declared).toBe('chalbert');
+    });
+
+    it('POST refuses an unregistered human poster before any writes', async () => {
+      const mallory = { login: 'mallory', type: 'User' };
+      const h = postHarness({ identity: mallory, login: mallory.login });
+      const plan = planOperatorRuling(operatorSnapshot(human), operatorRequest());
+      await expect(h.sink(payloadOf(plan))).rejects.toThrow(/not a registered operator/i);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
+    it('POST refuses a human poster who does not match the declared actor before any writes', async () => {
+      const h = postHarness({ identity: human, login: human.login });
+      const plan = planOperatorRuling(operatorSnapshot(human), operatorRequest());
+      await expect(h.sink({ ...payloadOf(plan), actor: 'mallory' })).rejects.toThrow(/does not match the authenticated poster/);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
+    it('POST fails closed on an unreadable poster identity before any writes', async () => {
+      const h = postHarness({ identity: human, login: human.login });
+      const readJson = h.readJson.getMockImplementation();
+      h.readJson.mockImplementation(args => {
+        if (args[0] === 'api') throw new Error('poster identity unreadable');
+        return readJson(args);
+      });
+      const plan = planOperatorRuling(operatorSnapshot(human), operatorRequest());
+      await expect(h.sink(payloadOf(plan))).rejects.toThrow(/poster identity unreadable/);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
+    it('reader populates poster identity from gh api user for a human actor', () => {
+      // realReader injects a Bot response for gh api user: the declared actor must not replace it.
+      const read = realReader({ env: prefsEnv() })({ repo, pr: 7, actor: 'chalbert' });
+      expect(read.identity).toEqual(bot);
+    });
+
+    it('reader leaves auto-policy poster identity absent and its block plan still works', () => {
+      const read = realReader({ env: prefsEnv() })({ repo, pr: 7, actor: 'auto-policy' });
+      expect(read.identity).toBeUndefined();
+      const plan = planOperatorRuling(read, request('block', { actor: 'auto-policy' }));
+      expect(plan.record.actor).toBe('auto-policy');
+      expect(plan.record.rulings).toHaveLength(1);
+      expect(plan.record.rulings[0].result).toBe('block');
+    });
   });
 });

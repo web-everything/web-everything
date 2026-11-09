@@ -18,6 +18,7 @@ import { parseOperationArgv } from '../cli-adapter.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { createPrSweepReader, parseDrainSkips, parseLiveJobs, resolveStalledAfter, LIST_LIMIT } from '../pr-sweep-io.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
+import { NO_ASK_NOTE_KINDS } from '../../lib/pr-comment-policy.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 
@@ -271,6 +272,38 @@ describe.each([
         ? { waitingOn: 'awaiting-review', actor: 'reviewer', stalled: false }
         : { waitingOn: state, actor: 'operator', stalled: true });
     }
+  });
+});
+
+describe('informational referral resolution is not a decision request', () => {
+  const oldInfo = c('plateau-worker[bot]', '2026-10-21T06:00:00Z',
+    '🔔 conveyor — needs your decision\n\nneeds your decision: referral-hold-auto-resolved');
+  const realNote = c('plateau-worker[bot]', '2026-10-21T05:00:00Z',
+    '🔔 conveyor — needs your decision\n\nneeds your decision: fix attempts exhausted');
+
+  it('ignores the persisted old decision-header format for a no-ask kind', () => {
+    expect(needsDecisionOpen([oldInfo])).toBeNull();
+  });
+  it('ignores the new informational header', () => {
+    expect(needsDecisionOpen([c('plateau-worker[bot]', '2026-10-21T06:00:00Z',
+      'ℹ️ conveyor — note\n\nreferral-hold-auto-resolved')])).toBeNull();
+  });
+  it('keeps a real decision note open', () => {
+    expect(needsDecisionOpen([realNote])).toEqual({
+      at: Date.parse(realNote.createdAt), dispute: false, text: 'needs your decision: fix attempts exhausted',
+    });
+  });
+  it('a later old no-ask note does not mask the latest real ask', () => {
+    expect(needsDecisionOpen([realNote, oldInfo])).toEqual({
+      at: Date.parse(realNote.createdAt), dispute: false, text: 'needs your decision: fix attempts exhausted',
+    });
+  });
+  it.each(NO_ASK_NOTE_KINDS)('a later legacy %s note preserves the earlier trusted decision request', (kind) => {
+    const laterInfo = c('plateau-worker[bot]', '2026-10-21T06:00:00Z',
+      `🔔 conveyor — needs your decision\n\nneeds your decision: ${kind}`);
+    expect(needsDecisionOpen([realNote, laterInfo])).toEqual({
+      at: Date.parse(realNote.createdAt), dispute: false, text: 'needs your decision: fix attempts exhausted',
+    });
   });
 });
 
