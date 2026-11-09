@@ -1,5 +1,23 @@
 import { execFileSync } from 'node:child_process';
+import { userInfo } from 'node:os';
 import { basename } from 'node:path';
+
+/** Strip URL credentials from text bound for logs, the lane journal or `--json`: a failed git transport call's
+ *  message carries its argv (origin URL included), and a lane config key can embed a URL
+ *  (`url.https://oauth2:<token>@host/.insteadof`). An ssh:// URL keeps its user name, which is not a secret and which
+ *  the operator's push needs; every other scheme drops its whole userinfo, since a token often stands alone there
+ *  (`https://<token>@host`). Greedy up to the host, so a raw `@` inside a password is stripped too. No word boundary
+ *  before the scheme, so `x_https://…` is caught. scp-style `user@host:path` holds no secret and is left as is. */
+export function redactUrlCredentials(text) {
+  return String(text).replace(/([a-z][a-z0-9+.-]*):\/\/([^\s/?#]*)@/gi, (_, scheme, userinfo) => {
+    // An ssh user ends at the first ':' (the password) and never contains '@'; anything else drops whole.
+    const user = /^[^:@]*/.exec(userinfo)[0];
+    const keep = /^(?:ssh|git\+ssh|ssh\+git)$/i.test(scheme) && user && (userinfo === user || userinfo[user.length] === ':');
+    return keep ? `${scheme}://${user}@` : `${scheme}://`;
+  });
+}
+
+const accountHome = () => { try { return userInfo().homedir || ''; } catch { return ''; } };
 
 /**
  * Git hardening for a process that runs git inside an AGENT-WRITABLE lane clone (we:backlog/5137 review).
@@ -21,6 +39,15 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.hooksPath', '/dev/null'],
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
+  // PR #6319 send-back: no credential helper or askpass program from any config scope runs during an unattended
+  // transport in a lane. An empty `credential.helper` resets the helper list; an empty `core.askPass` counts as unset.
+  // The matching env (`GIT_ASKPASS`, `SSH_ASKPASS`) is dropped in laneGitHardeningEnv, which also disables terminal
+  // prompts. Only a git call that runs in the operator's VALIDATED primary checkout (never a lane) may leave these two
+  // out — `laneGitHardeningEnv(env, { credentialPins: false })` — so its own helper (osxkeychain, `gh auth
+  // git-credential`) authenticates (PR #6319 operator ruling, R674 route a). That helper comes from the account's
+  // global / system config only: the caller refuses local / worktree credential keys in the primary (salvage-push).
+  ['credential.helper', ''],
+  ['core.askPass', ''],
   ['commit.gpgsign', 'false'],
   ['push.gpgSign', 'false'],
   // PR #5775 self-review: `log.showSignature` makes every `git log` run `gpg.program` (lane-chosen) on a commit the
@@ -31,6 +58,12 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['gpg.ssh.program', 'ssh-keygen'],
   ['gpg.x509.program', 'gpgsm'],
   ['core.alternateRefsCommand', 'true'],
+  // PR #6319 self-review: lane config can make `status` trust stat data the lane controls (`checkStat=minimal`,
+  // `trustctime=false`, `ignoreStat`), so a same-size edit with a restored mtime reads clean — and the refreshing
+  // status of any daemon-side caller then writes that stat into the index, hiding the edit for every later check.
+  ['core.checkStat', 'default'],
+  ['core.trustctime', 'true'],
+  ['core.ignoreStat', 'false'],
 ]);
 
 // Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
@@ -42,6 +75,9 @@ const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
   ['protocol.git.allow', 'always'],
   ['protocol.ssh.allow', 'always'],
 ]);
+
+/** The two pins that switch off credential helpers and askpass. Left out only for a call in the validated primary. */
+const CREDENTIAL_PIN_KEYS = Object.freeze(['credential.helper', 'core.askPass']);
 
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
 export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => ['-c', `${k}=${v}`]);
@@ -57,6 +93,10 @@ export const GIT_REPO_LOCATION_ENV_KEYS = Object.freeze(['GIT_DIR', 'GIT_COMMON_
 export const GIT_REPO_ENV_KEYS = Object.freeze([...GIT_REPO_LOCATION_ENV_KEYS, 'GIT_CONFIG_PARAMETERS',
   'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']);
 const INHERITED_GIT_INDEXED_CONFIG_RE = /^GIT_CONFIG_(KEY|VALUE)_.*$/s;
+/** Env that records an HTTP exchange (traces, curl verbosity, redaction off) or routes / unverifies it (proxies, TLS and
+ *  CA settings). Dropped from the primary form only: there a real credential crosses the transport. Case-insensitive,
+ *  since curl reads lower-case proxy variables. Exported for its test. */
+export const CREDENTIAL_ROUTING_ENV_RE = /^(GIT_TRACE.*|GIT_CURL_.*|GIT_SSL_.*|GIT_HTTP_.*|GIT_PROXY_.*|GIT_REDIRECT_STDERR|SSL_CERT_(FILE|DIR)|CURL_CA_BUNDLE|CURL_HOME|(HTTPS?|ALL|NO)_PROXY)$/is;
 
 /**
  * A copy of `env` with every inherited git config override and repository-location variable removed, including orphaned
@@ -118,18 +158,50 @@ export function scrubGitRepoEnv(env) {
 /**
  * `env` with the pins appended to git's environment config list. An existing `GIT_CONFIG_COUNT` is preserved (the pins
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
+ * `credentialPins: false` leaves out only the `credential.helper` / `core.askPass` resets, for a git call that runs in
+ * the operator's validated primary checkout (its own helper must authenticate); every other pin, the dropped askpass /
+ * ssh env and `GIT_TERMINAL_PROMPT=0` stay. Never pass it for a call whose cwd is a lane. `home` (default: the OS
+ * account's home, never `env.HOME`) is where that form reads global config; tests point it at a fixture.
  * @param {Record<string,string|undefined>} env
- * @param {{remoteProbe?: boolean}} options Restrict transports only for an isolated remote proof.
+ * @param {{remoteProbe?: boolean, credentialPins?: boolean, home?: string}} options `remoteProbe` restricts transports only for an isolated remote proof.
  * @returns {Record<string,string|undefined>}
  */
-export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } = {}) {
+export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, credentialPins = true, home = credentialPins === false ? accountHome() : '' } = {}) {
   // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
   // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
-  const out = { ...env, GIT_NO_LAZY_FETCH: '1' };
+  // No prompt either: an inherited askpass program (a caller inside a lane controls its env) would run on a credential
+  // request, and a terminal prompt would hang an unattended transport.
+  const out = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
   delete out.GIT_EXTERNAL_DIFF;
+  delete out.GIT_ASKPASS;
+  delete out.SSH_ASKPASS;
+  // The same caller-env rule for ssh: an inherited GIT_SSH_COMMAND beats the core.sshCommand pin and would run (and
+  // could forge the head listing of) any SSH transport; GIT_SSH is dropped with it so the pin alone decides.
+  delete out.GIT_SSH_COMMAND;
+  delete out.GIT_SSH;
+  // Git applies GIT_CONFIG_PARAMETERS AFTER the GIT_CONFIG_COUNT list, so an inherited one would outrank every pin
+  // below (an inherited `credential.helper` lands after the reset; `core.fsmonitor` beats its pin).
+  delete out.GIT_CONFIG_PARAMETERS;
+  // Without the credential resets nothing would reset an inherited helper, so the primary form keeps no inherited
+  // command-scope entry at all, and reads global / system config only from the OS account's own locations: a caller
+  // (a lane CLI controls its env) must not point HOME / XDG_CONFIG_HOME / GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM at a
+  // file holding its own `credential.helper` or `core.askPass` (PR #6319 self-review). No account home → no HOME.
+  // The primary form also hands a real credential to git, so no caller env may choose where it goes or who sees it: a
+  // trace file with redaction off records the Authorization header, and a caller proxy with TLS checks off or a caller
+  // CA reads it on the wire (PR #6319 self-review). The operator's own proxy / TLS config in the account's global or
+  // the primary's local config still applies.
+  if (credentialPins === false) {
+    for (const key of Object.keys(out)) if (key === 'GIT_CONFIG_COUNT' || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)
+      || CREDENTIAL_ROUTING_ENV_RE.test(key)) delete out[key];
+    // `GIT_CONFIG` too: it replaces the repository config file a `git config` read lists, so a caller-set one could hide
+    // config from the check (callers scrub it already; the primary form does not rely on that).
+    for (const key of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXEC_PATH', 'GIT_CONFIG']) delete out[key];
+    if (home) out.HOME = home; else delete out.HOME;
+  }
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
-  const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;
+  const pins = [...LANE_GIT_CONFIG_PINS.filter(([k]) => credentialPins !== false || !CREDENTIAL_PIN_KEYS.includes(k)),
+    ...(remoteProbe ? REMOTE_PROBE_CONFIG_PINS : [])];
   pins.forEach(([k, v], i) => {
     out[`GIT_CONFIG_KEY_${start + i}`] = k;
     out[`GIT_CONFIG_VALUE_${start + i}`] = v;
@@ -276,7 +348,8 @@ export function scrubRiskyLaneConfig(dir, {
   } catch (e) { kept.push(`config list failed (${String(e?.message ?? e).split('\n')[0]})`); }
   if (removed.length || kept.length) {
     try {
-      log(`${basename(dir)}: scrubbed unsafe git config keys (${removed.join(', ')}) before hand-out${kept.length ? `; kept (${kept.join(', ')})` : ''}`);
+      // Keys stay raw in the returned lists (callers act on them); every report of them is redacted.
+      log(redactUrlCredentials(`${basename(dir)}: scrubbed unsafe git config keys (${removed.join(', ')}) before hand-out${kept.length ? `; kept (${kept.join(', ')})` : ''}`));
     } catch { /* diagnostics must not interrupt acquisition */ }
   }
   return { removed, kept };

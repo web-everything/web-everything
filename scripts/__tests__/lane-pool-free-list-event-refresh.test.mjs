@@ -244,7 +244,10 @@ describe('free-lane list is refreshed by lane-pool events (real CLI, one pool pr
     const before = Date.now();
     const r4 = await runPool(['release', '--lane=4', ...poolArgs(), '--session=first', '--json']);
     expect(r4.code, r4.err).toBe(0);
-    const r5 = await runPool(['release', '--lane=5', ...poolArgs(), '--session=second', '--json']);
+    // Lane 5's commit is on no remote ref, so the release guard (PR #6319) refuses a plain release as UNPUSHED_WORK;
+    // `--discard` is the deliberate release it names, which keeps this test on its subject: the free list. (The refusal
+    // itself is pinned by lane-pool-release-unpushed-guard.test.mjs; a second spawn here would eat the 10-child cap.)
+    const r5 = await runPool(['release', '--lane=5', '--discard', ...poolArgs(), '--session=second', '--json']);
     expect(r5.code, r5.err).toBe(0);
     const list = readFreeLaneList(listFile());
     expect(isFreeLaneListFresh(list, Date.now(), 60_000)).toBe(true);

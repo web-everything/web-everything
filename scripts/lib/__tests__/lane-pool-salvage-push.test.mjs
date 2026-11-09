@@ -1,14 +1,48 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join, resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
 // Intentionally absent in this red-first change: no implementation or import stub.
-let salvageStamp, salvageRefName, salvagePushLane, realSalvageIo;
+let salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD, redactUrlCredentials, releasePushTarget;
 beforeEach(async () => {
-  ({ salvageStamp, salvageRefName, salvagePushLane, realSalvageIo } = await import('../lane-pool-salvage-push.mjs'));
+  ({ salvageStamp, salvageRefName, salvagePushLane, realSalvageIo, NO_REPO_CWD, redactUrlCredentials, releasePushTarget } = await import('../lane-pool-salvage-push.mjs'));
+});
+
+// The release guard prints `git -C <lane> push <target> …` and journals git error text: credentials never survive,
+// while an ssh user name (not a secret, and needed to log in) and scp-style origins do.
+describe('releasePushTarget / redactUrlCredentials', () => {
+  it.each([
+    ['a relative local path', 'some/origin.git', resolve('some/origin.git')],
+    ['an absolute local path', '/srv/origin.git', '/srv/origin.git'],
+    ['https with user and token', 'https://user:s3cret@github.com/org/repo.git', 'https://github.com/org/repo.git'],
+    ['https with a bare token', 'https://s3cret@github.com/org/repo.git', 'https://github.com/org/repo.git'],
+    ['https with a raw @ in the password', 'https://user:p@s3cret@host/repo.git', 'https://host/repo.git'],
+    ['ssh:// with a user', 'ssh://git@github.com/org/repo.git', 'ssh://git@github.com/org/repo.git'],
+    ['ssh:// with a user and password', 'ssh://git:s3cret@host/repo.git', 'ssh://git@host/repo.git'],
+    ['scp-style', 'git@github.com:org/repo.git', 'git@github.com:org/repo.git'],
+  ])('push target for %s', (_, url, expected) => {
+    expect(releasePushTarget(url)).toBe(expected);
+    expect(releasePushTarget(url)).not.toContain('s3cret');
+  });
+  it('strips every credentialed URL inside a git error message, leaving the rest', () => {
+    const text = "Command failed: git ls-remote https://u:s3cret@host/x.git refs/heads/*\nfatal: unable to access 'https://s3cret@host/x.git/'";
+    expect(redactUrlCredentials(text)).toBe("Command failed: git ls-remote https://host/x.git refs/heads/*\nfatal: unable to access 'https://host/x.git/'");
+  });
+  it.each([
+    ['a config key with an insteadOf URL', 'url.https://oauth2:s3cret@gitlab.com/.insteadof', 'url.https://gitlab.com/.insteadof'],
+    ['a scheme glued to a word character', 'x_https://u:s3cret@h/x', 'x_https://h/x'],
+    ['a scheme glued to a digit', '1https://s3cret@h/x', '1https://h/x'],
+  ])('redacts %s', (_, text, expected) => {
+    expect(redactUrlCredentials(text)).toBe(expected);
+  });
+  it('redacts a failed salvage push reason', async () => {
+    const io = { aheadShas: async () => { throw new Error('git push https://u:s3cret@host/x.git failed'); } };
+    const result = await salvagePushLane({ lane: 1, laneDir: 'lane', io });
+    expect(result).toMatchObject({ status: 'failed', reason: 'git push https://host/x.git failed' });
+  });
 });
 
 const date = new Date('2026-01-02T03:04:59.999Z');
@@ -63,7 +97,7 @@ describe('salvage push contract', () => {
 
   it('pushes HEAD rather than only the unmatched ancestor, with exactly three arguments and no force option', async () => {
     const h = harness();
-    expect(await h.run()).toMatchObject({ status: 'pushed', ref, unmatched: [older] });
+    expect(await h.run()).toMatchObject({ status: 'pushed', ref, sha: head, unmatched: [older] });
     expect(h.io.push.mock.calls).toEqual([[laneDir, ref, head]]);
     expect(h.io.push.mock.calls.flat().some(arg => /force|^\+|^-f$/.test(String(arg)))).toBe(false);
   });
@@ -131,7 +165,7 @@ describe('salvage push contract', () => {
     expect(h.io.record).toHaveBeenCalledTimes(1); expect(h.io.record).toHaveBeenCalledWith(7, `${ref} ${head}\n`);
     expect(settled).toBe(false);
     finishRecord();
-    expect(await pending).toMatchObject({ status: 'pushed', ref, unmatched: [older] });
+    expect(await pending).toMatchObject({ status: 'pushed', ref, sha: head, unmatched: [older] });
     expect(settled).toBe(true);
   });
 
@@ -155,6 +189,242 @@ describe('salvage push contract', () => {
   it('exports realSalvageIo with the five IO functions', () => {
     const io = realSalvageIo({ repo: { name: 'fixture', poolDir: 'pool', referencePath: 'reference', originUrl: 'origin.git', branch: 'main' }, backupRoot: 'backups' });
     for (const method of ['aheadShas', 'unmatchedShas', 'push', 'remoteSha', 'record']) expect(io[method]).toBeTypeOf('function');
+  });
+});
+
+describe('remoteHeads (the release proof) reads the canonical origin from the primary checkout', () => {
+  const setup = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'salvage-heads-'));
+    const origin = join(dir, 'origin.git'), primary = join(dir, 'primary');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', origin]);
+    execFileSync('git', ['clone', '-q', origin, primary], { stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '-q', '--allow-empty', '-m', 'base'], { cwd: primary });
+    execFileSync('git', ['push', '-q', 'origin', 'HEAD:refs/heads/main', 'HEAD:refs/heads/ops/ledger'], { cwd: primary });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: primary, encoding: 'utf8' }).trim();
+    const io = realSalvageIo({ repo: { branch: 'main', originUrl: origin, referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups') });
+    return { dir, primary, sha, io };
+  };
+  // PR #6319 send-back: the auth exemption follows a VALIDATED primary (resolveRepo's primaryPath), never the
+  // invoking checkout. A release run inside a lane keeps that lane as referencePath: without a validated primary its
+  // credential helper refuses; with one, the listing runs in the primary and the lane's config is never consulted.
+  // `hook.<name>.command`: a config-defined hook runs during a transport even with the core.hooksPath pin (git 2.54).
+  it.each(['credential.helper', 'http.extraHeader', 'core.askPass', 'hook.lanehook.command'])('refuses %s in a referencePath that is not the validated primary', key => {
+    const { dir, primary, sha } = setup();
+    try {
+      const lane = join(dir, 'lane-1');
+      execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
+      execFileSync('git', ['config', key, '!touch marker'], { cwd: lane });
+      const unvalidated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane }, backupRoot: join(dir, 'backups') });
+      expect(() => unvalidated.remoteHeads()).toThrow(/lane-controlled transport/);
+      // The salvage ref check is the same canonical-origin listing: same cwd rule, same refusal.
+      expect(() => unvalidated.remoteSha('main')).toThrow(/lane-controlled transport/);
+      const runGit = vi.fn(execFileSync);
+      const validated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      expect(validated.remoteHeads()).toEqual([sha]);
+      expect(validated.remoteSha('main')).toBe(sha);
+      expect(runGit.mock.calls.filter(([, args]) => args.includes('ls-remote'))).toHaveLength(2);
+      // The config checks read the validated primary; the no-pins listing itself runs outside any repository.
+      for (const [, args, options] of runGit.mock.calls) expect(options.cwd, args.join(' ')).toBe(args.includes('ls-remote') ? NO_REPO_CWD : primary);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('pins lane transports to no credential helper and no askpass; every transport drops inherited askpass / ssh and prompts', () => {
+    const { dir, primary } = setup();
+    try {
+      // A caller inside a lane controls its own env: an inherited askpass program must not reach the transport.
+      vi.stubEnv('GIT_ASKPASS', join(dir, 'lane-askpass'));
+      vi.stubEnv('SSH_ASKPASS', join(dir, 'lane-ssh-askpass'));
+      vi.stubEnv('GIT_SSH_COMMAND', join(dir, 'lane-ssh'));
+      vi.stubEnv('GIT_SSH', join(dir, 'lane-ssh'));
+      const lane = join(dir, 'lane-1');
+      execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      io.remoteHeads();
+      io.fetchHeads(lane);
+      // The same listing without a validated primary runs where it can (here the lane): it keeps the reset pins.
+      const fallbackGit = vi.fn(execFileSync);
+      realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane }, backupRoot: join(dir, 'backups'), runGit: fallbackGit }).remoteHeads();
+      const pinsOf = ({ env }) => Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      const transports = {
+        primaryListing: runGit.mock.calls.find(([, args]) => args.includes('ls-remote'))[2],
+        laneFetch: runGit.mock.calls.find(([, args]) => args.includes('fetch'))[2],
+        fallbackListing: fallbackGit.mock.calls.find(([, args]) => args.includes('ls-remote'))[2],
+      };
+      expect(transports.primaryListing.cwd).toBe(NO_REPO_CWD);
+      expect(pinsOf(transports.primaryListing)).not.toHaveProperty('credential.helper');
+      expect(pinsOf(transports.primaryListing)).not.toHaveProperty('core.askPass');
+      for (const name of ['laneFetch', 'fallbackListing']) {
+        expect(transports[name].cwd, name).toBe(lane);
+        expect(pinsOf(transports[name]), name).toMatchObject({ 'credential.helper': '', 'core.askPass': '' });
+      }
+      for (const [name, options] of Object.entries(transports)) {
+        const { env } = options;
+        expect(env.GIT_TERMINAL_PROMPT, name).toBe('0');
+        for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH']) expect(env, `${name} ${key}`).not.toHaveProperty(key);
+        expect(pinsOf(options)['core.sshCommand'], name).toBe('ssh');
+        expect(pinsOf(options)['core.hooksPath'], name).toBe('/dev/null');
+      }
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  // PR #6319 operator ruling (R674 route a): the operator's own credential helper (account-home global scope)
+  // authenticates the canonical-origin listing run in the validated primary; a lane-set helper never runs on a lane
+  // transport. A helper in the primary's LOCAL config is refused instead (next test): the send-back trusts
+  // global/system scope only, and any non-pool clone with the right origin can be the "primary".
+  it('the primary listing authenticates with a global dummy helper while a lane-set helper stays blocked', () => {
+    const { dir, primary } = setup();
+    try {
+      const home = join(dir, 'home');
+      mkdirSync(home);
+      const primaryRan = join(dir, 'primary-helper-ran'), evilRan = join(dir, 'lane-helper-ran');
+      const helper = `!f() { touch '${primaryRan}'; [ "$1" = get ] && printf 'username=operator\\npassword=primary-pass\\n'; }; f`;
+      execFileSync('git', ['config', '--file', join(home, '.gitconfig'), 'credential.helper', helper]);
+      // The caller (a release run inside a lane) points HOME / XDG_CONFIG_HOME at a lane-written config with its own
+      // helper: the primary listing reads global config from the account home (`accountHome`) instead.
+      const callerHome = join(dir, 'caller-home');
+      mkdirSync(join(callerHome, 'git'), { recursive: true });
+      const evilHelper = `!f() { touch '${evilRan}'; echo username=evil; echo password=evil; }; f`;
+      for (const file of [join(callerHome, '.gitconfig'), join(callerHome, 'git', 'config')]) execFileSync('git', ['config', '--file', file, 'credential.helper', evilHelper]);
+      vi.stubEnv('HOME', callerHome);
+      vi.stubEnv('XDG_CONFIG_HOME', callerHome);
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      const lane = join(dir, 'lane-1');
+      execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: home });
+      io.remoteHeads();
+      io.fetchHeads(lane);
+      const envOf = command => runGit.mock.calls.find(([, args]) => args.includes(command))[2].env;
+      const fill = (cwd, env) => spawnSync('git', ['credential', 'fill'], { cwd, env, input: 'protocol=https\nhost=example.invalid\n\n', encoding: 'utf8', timeout: 20_000 });
+      const listingEnv = envOf('ls-remote');
+      expect(listingEnv.GIT_TERMINAL_PROMPT).toBe('0');
+      const filled = fill(primary, listingEnv);
+      expect(filled.status, filled.stderr).toBe(0);
+      expect(filled.stdout).toContain('password=primary-pass');
+      expect(existsSync(primaryRan)).toBe(true);
+      expect(existsSync(evilRan), 'the caller-home helper ran in the primary listing').toBe(false);
+      // The lane transport keeps the reset pins: a helper the lane sets afterwards is not run and nothing answers.
+      execFileSync('git', ['config', 'credential.helper', `!f() { touch '${evilRan}'; echo username=evil; echo password=evil; }; f`], { cwd: lane });
+      execFileSync('git', ['config', 'core.askPass', `${join(dir, 'lane-askpass')}`], { cwd: lane });
+      const laneFill = fill(lane, envOf('fetch'));
+      expect(laneFill.status).not.toBe(0);
+      expect(existsSync(evilRan), 'the lane credential helper ran').toBe(false);
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  // PR #6319 self-review (check-then-run race): the primary's local config passes the check, then an agent with write
+  // access to that `.git/config` plants a helper and a URL rewrite before the no-pins listing starts. The listing must
+  // not read the primary's local config at all, so neither runs: it runs outside any repository.
+  it('a helper or URL rewrite planted in the primary after the config check never reaches the no-pins listing', () => {
+    const { dir, primary, sha } = setup();
+    try {
+      const home = join(dir, 'home'), marker = join(dir, 'planted-ran'), decoy = join(dir, 'decoy.git');
+      mkdirSync(home);
+      execFileSync('git', ['init', '--bare', '-q', '-b', 'main', decoy]);
+      execFileSync('git', ['push', '-q', decoy, `${sha}:refs/heads/main`, `${sha}:refs/heads/decoy-only`], { cwd: primary });
+      const seen = [];
+      const runGit = vi.fn((file, args, options) => {
+        if (args.includes('ls-remote')) {
+          // The race: the check has passed; the primary's local config changes before the listing runs.
+          execFileSync('git', ['config', 'credential.helper', `!f() { touch '${marker}'; echo username=evil; echo password=evil; }; f`], { cwd: primary });
+          execFileSync('git', ['config', `url.${decoy}.insteadOf`, join(dir, 'origin.git')], { cwd: primary });
+          const helpers = spawnSync('git', ['config', '--get-all', 'credential.helper'], { cwd: options.cwd, env: options.env, encoding: 'utf8' });
+          const fill = spawnSync('git', ['credential', 'fill'], { cwd: options.cwd, env: options.env, input: 'protocol=https\nhost=example.invalid\n\n', encoding: 'utf8', timeout: 20_000 });
+          const gitDir = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: options.cwd, env: options.env, encoding: 'utf8' });
+          seen.push({ cwd: options.cwd, helpers: helpers.stdout, filled: fill.stdout, gitDirStatus: gitDir.status });
+        }
+        return execFileSync(file, args, options);
+      });
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: home });
+      // The decoy carries an extra head: a rewrite that reached the listing would add it to the result.
+      expect(io.remoteHeads()).toEqual([sha]);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].cwd).not.toBe(primary);
+      expect(seen[0].gitDirStatus, 'the no-pins listing cwd is inside a repository').not.toBe(0);
+      expect(seen[0].helpers).not.toContain(marker);
+      expect(seen[0].filled).not.toContain('password=evil');
+      expect(existsSync(marker), 'the planted primary helper ran').toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // PR #6319 self-review: the primary listing's config check reads the SAME global config the listing applies (the
+  // account home), so a caller-set HOME cannot hide an account-level URL rewrite of the canonical origin from it.
+  it('the primary listing refuses a URL rewrite in the account home even when the caller points HOME elsewhere', () => {
+    const { dir, primary } = setup();
+    try {
+      const home = join(dir, 'home'), callerHome = join(dir, 'caller-home');
+      mkdirSync(home);
+      mkdirSync(callerHome);
+      execFileSync('git', ['config', '--file', join(home, '.gitconfig'), `url.${join(dir, 'elsewhere.git')}.insteadOf`, join(dir, 'origin.git')]);
+      vi.stubEnv('HOME', callerHome);
+      vi.stubEnv('XDG_CONFIG_HOME', callerHome);
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: home });
+      expect(() => io.remoteHeads()).toThrow(/URL rewriting configured/);
+      expect(runGit.mock.calls.some(([, args]) => args.includes('ls-remote'))).toBe(false);
+      // Every config read of that check ran under the listing's env (account home), not the caller's HOME.
+      for (const [, args, options] of runGit.mock.calls.filter(([, args]) => args.includes('config'))) expect(options.env.HOME, args.join(' ')).toBe(home);
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('accepts operator signing keys in the primary, a global credential helper, and excludes ops/* heads', () => {
+    const { dir, primary, sha } = setup();
+    try {
+      // An agent-writable lane may not carry these; the operator's primary legitimately can.
+      execFileSync('git', ['config', 'commit.gpgSign', 'false'], { cwd: primary });
+      const home = join(dir, 'home');
+      mkdirSync(home);
+      execFileSync('git', ['config', '--file', join(home, '.gitconfig'), 'credential.helper', 'store']);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), accountHome: home });
+      expect(io.remoteHeads()).toEqual([sha]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // PR #6319 self-review: the primary listing drops the credential resets, and "validated primary" means only a clone
+  // outside the pool roots with the right origin — an agent can `git init` one under the workspace. So a credential
+  // helper, askpass, proxy, TLS or gitProxy key in the primary's LOCAL (or worktree) config is refused, never run.
+  it.each([
+    ['credential.helper', marker => `!touch '${marker}'`],
+    ['credential.https://example.invalid.helper', marker => `!touch '${marker}'`],
+    ['core.askPass', marker => marker],
+    ['core.gitProxy', marker => `!touch '${marker}'`],
+    ['http.proxy', () => 'http://127.0.0.1:9'],
+    ['http.sslVerify', () => 'false'],
+  ])('refuses a planted primary whose local config sets %s, and runs nothing', (key, value) => {
+    const { dir, primary } = setup();
+    try {
+      const marker = join(dir, 'planted-ran');
+      execFileSync('git', ['config', key, value(marker)], { cwd: primary });
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: join(dir, 'home') });
+      expect(() => io.remoteHeads()).toThrow(/lane-controlled transport/);
+      expect(() => io.remoteSha('main')).toThrow(/lane-controlled transport/);
+      expect(runGit.mock.calls.some(([, args]) => args.includes('ls-remote'))).toBe(false);
+      expect(existsSync(marker), 'a planted primary helper ran').toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // The primary is the operator's own checkout: an upstream or fork remote there is normal, and the transport names
+  // the canonical origin URL explicitly, so a remote under any other name cannot redirect it.
+  it('accepts ordinary non-origin remotes (upstream, fork) in the primary for the release proof', () => {
+    const { dir, primary, sha, io } = setup();
+    try {
+      execFileSync('git', ['remote', 'add', 'upstream', 'https://example.invalid/upstream/repo.git'], { cwd: primary });
+      execFileSync('git', ['remote', 'add', 'fork', join(dir, 'fork.git')], { cwd: primary });
+      execFileSync('git', ['config', 'remote.fork.pushurl', 'https://example.invalid/fork/repo.git'], { cwd: primary });
+      expect(io.remoteHeads()).toEqual([sha]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // A remote NAMED like the canonical origin is what git resolves the explicit URL argument to: that stays refused.
+  it.each(['url', 'pushurl', 'uploadpack'])('still refuses a primary remote aliasing the canonical origin (%s)', key => {
+    const { dir, primary, io } = setup();
+    try {
+      execFileSync('git', ['config', `remote.${join(dir, 'origin.git')}.${key}`, join(dir, 'decoy.git')], { cwd: primary });
+      expect(() => io.remoteHeads()).toThrow(/lane-controlled transport/);
+      expect(() => io.remoteSha('main')).toThrow(/lane-controlled transport/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('still refuses a URL rewrite in the primary', () => {
+    const { dir, primary, io } = setup();
+    try {
+      execFileSync('git', ['config', 'url.https://example.invalid/.insteadOf', '/'], { cwd: primary });
+      expect(() => io.remoteHeads()).toThrow(/URL rewriting/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -465,16 +735,116 @@ describe('real salvage preservation and transport', () => {
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
   });
 
-  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', fail } = {}) {
+  const SYMREF_LISTING = '--format=%(refname)%00%(symref)';
+  const containsCalls = runGit => runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref') && args.includes('--contains'));
+  // A git dir that does not exist: no ref directory on the fetch paths is present, so none is a symlink.
+  const NO_GIT_DIR = resolve(tmpdir(), 'salvage-push-no-such-git-dir');
+  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', symrefs = 'refs/remotes/origin/HEAD\0refs/remotes/origin/main\nrefs/remotes/origin/main\0', verifyRefs = '', gitDir = NO_GIT_DIR, fail } = {}) {
     const runGit = vi.fn((_command, args) => {
       if (fail && args.includes(fail)) throw new Error(`${fail} unavailable`);
       if (args.includes('rev-list')) return `${head}\n${older}`;
       if (args.includes('cherry')) return cherry;
+      if (args.includes(SYMREF_LISTING)) return symrefs;
+      if (args.includes('--git-common-dir')) return gitDir;
+      if (args.includes('for-each-ref') && args.some(arg => arg.startsWith('refs/release-verify/'))) return verifyRefs;
       if (args.includes('for-each-ref')) return contains;
       return '';
     });
     return { runGit, io: realSalvageIo({ repo, runGit }) };
   }
+
+  // PR #6319 send-back (R639): a fetch writes THROUGH a symbolic ref, so a lane-made tracking symref aimed at a local
+  // branch would reset that branch. Every transport fetch refuses one before running; the ordinary origin/HEAD alias passes.
+  it.each([
+    ['refs/remotes/origin/main\0refs/heads/work/keep', 'refs/remotes/origin/main'],
+    ['refs/remotes/origin/HEAD\0refs/heads/work/keep', 'refs/remotes/origin/HEAD'],
+    ['refs/remotes/origin/HEAD\0refs/remotes/origin/HEAD', 'refs/remotes/origin/HEAD'],
+    ['refs/remotes/origin/x\0refs/remotes/origin/main', 'refs/remotes/origin/x'],
+  ])('refuses every fetch, before fetching, when the lane has the tracking symref %j', (symrefs, name) => {
+    const { io, runGit } = realHarness({ symrefs });
+    for (const operation of [() => io.fetchHeads(laneDir), () => io.fetchVerifyObjects(laneDir), () => io.unmatchedShas(laneDir, [head])]) {
+      expect(operation).toThrow(new RegExp(`${name.replaceAll('/', '\\/')} is a symbolic ref`));
+    }
+    expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  // A filesystem symlink on a fetch's write path redirects it without any symbolic ref showing (PR #6319 self-review).
+  it.each([
+    ['refs/remotes/origin', 'dir'], ['refs/remotes', 'dir'], ['refs/remotes/origin/work', 'dir'], ['refs/remotes/origin/main', 'file'],
+    ['refs/release-verify', 'dir'], ['logs/refs/remotes/origin/main', 'file'], ['logs/refs/release-verify', 'dir'], ['logs/refs', 'dir'],
+  ])('refuses every fetch, before fetching, when %s is a filesystem symlink (%s)', (link, kind) => {
+    const gitDir = mkdtempSync(join(tmpdir(), 'salvage-symlink-'));
+    try {
+      mkdirSync(join(gitDir, 'refs', 'remotes', 'origin'), { recursive: true });
+      mkdirSync(join(gitDir, 'refs', 'heads'), { recursive: true });
+      const target = join(gitDir, 'elsewhere');
+      if (kind === 'dir') mkdirSync(target); else writeFileSync(target, `${head}\n`);
+      rmSync(join(gitDir, link), { recursive: true, force: true });
+      mkdirSync(join(gitDir, link, '..'), { recursive: true });
+      symlinkSync(target, join(gitDir, link));
+      const { io, runGit } = realHarness({ gitDir, symrefs: '' });
+      for (const operation of [() => io.fetchHeads(laneDir), () => io.fetchVerifyObjects(laneDir), () => io.unmatchedShas(laneDir, [head])]) {
+        expect(operation).toThrow(`${link} is a filesystem symlink`);
+      }
+      expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    } finally { rmSync(gitDir, { recursive: true, force: true }); }
+  });
+  it('allows real ref directories and refuses an unreadable or relative git dir', () => {
+    const gitDir = mkdtempSync(join(tmpdir(), 'salvage-real-'));
+    try {
+      mkdirSync(join(gitDir, 'refs', 'remotes', 'origin', 'work'), { recursive: true });
+      mkdirSync(join(gitDir, 'logs', 'refs', 'release-verify'), { recursive: true });
+      writeFileSync(join(gitDir, 'refs', 'remotes', 'origin', 'work', 'x'), `${head}\n`);
+      const { io, runGit } = realHarness({ gitDir, symrefs: '' });
+      io.fetchHeads(laneDir);
+      // The salvage fetch writes no FETCH_HEAD and runs no lane-configured maintenance (reflog expiry, gc, pack-refs).
+      const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
+      expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-auto-maintenance', '--recurse-submodules=no']));
+    } finally { rmSync(gitDir, { recursive: true, force: true }); }
+    const relative = realHarness({ gitDir: '.git', symrefs: '' });
+    expect(() => relative.io.fetchHeads(laneDir)).toThrow(/unreadable lane git dir/);
+    expect(relative.runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it.each(['unreadable', 'malformed'])('refuses every fetch when the tracking symref listing is %s', failure => {
+    const { io, runGit } = failure === 'unreadable' ? realHarness({ fail: SYMREF_LISTING })
+      : realHarness({ symrefs: 'refs/remotes/origin/main\0refs/heads/a\0extra' });
+    expect(() => io.fetchHeads(laneDir)).toThrow();
+    expect(() => io.fetchVerifyObjects(laneDir)).toThrow();
+    expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it('fetchVerifyObjects fetches into a fresh private namespace with no FETCH_HEAD and deletes it without dereferencing', () => {
+    let fetched = null;
+    const runGit = vi.fn((_command, args, options) => {
+      if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('--git-common-dir')) return NO_GIT_DIR;
+      if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); return ''; }
+      if (args.includes('for-each-ref')) return fetched ? `${fetched}/main\n${fetched}/work/x` : '';
+      if (args.includes('update-ref')) { expect(options.input).toBe(`option no-deref\ndelete ${fetched}/main\noption no-deref\ndelete ${fetched}/work/x\n`); }
+      return '';
+    });
+    const io = realSalvageIo({ repo, runGit });
+    io.fetchVerifyObjects(laneDir);
+    expect(fetched).toMatch(/^refs\/release-verify\/[a-f0-9]{16}$/);
+    const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
+    expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-auto-maintenance', '--no-tags', repo.originUrl, `+refs/heads/*:${fetched}/*`, '^refs/heads/ops/*']));
+    expect(fetchArgs).not.toContain('--prune');
+    expect(fetchArgs.some(arg => arg.includes('refs/remotes/'))).toBe(false);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('update-ref'))).toHaveLength(1);
+  });
+  it('fetchVerifyObjects deletes its namespace even when the fetch fails, and refuses an occupied namespace', () => {
+    let fetched = null;
+    const runGit = vi.fn((_command, args) => {
+      if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('--git-common-dir')) return NO_GIT_DIR;
+      if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); throw new Error('fetch died'); }
+      if (args.includes('for-each-ref')) return fetched ? `${fetched}/main` : '';
+      return '';
+    });
+    expect(() => realSalvageIo({ repo, runGit }).fetchVerifyObjects(laneDir)).toThrow('fetch died');
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('update-ref'))).toHaveLength(1);
+    const { io, runGit: occupied } = realHarness({ verifyRefs: 'refs/release-verify/x/main' });
+    expect(() => io.fetchVerifyObjects(laneDir)).toThrow(/already holds refs/);
+    expect(occupied.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
 
   it('fetches pruned branch refs and pushes/verifies against the explicit canonical URL with transport pins and hardened env', () => {
     const { io, runGit } = realHarness();
@@ -502,8 +872,10 @@ describe('real salvage preservation and transport', () => {
     expect(fetchArgs).toEqual(expect.arrayContaining(['--recurse-submodules=no', '--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*', '^refs/heads/ops/*']));
     const pushArgs = runGit.mock.calls.find(([, args]) => args.includes('push'))[1];
     expect(pushArgs.slice(pushArgs.indexOf('push'))).toEqual(['push', '--recurse-submodules=no', repo.originUrl, `${head}:refs/heads/${ref}`]);
+    expect(runGit.mock.calls.findIndex(([, args]) => args.includes(SYMREF_LISTING)))
+      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')));
     expect(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')))
-      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('for-each-ref')));
+      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('--contains')));
   });
 
   it('uses one integration-branch patch check and exact-SHA reachability without enumerating or capping remote refs', () => {
@@ -511,15 +883,16 @@ describe('real salvage preservation and transport', () => {
     expect(io.unmatchedShas(laneDir, [head, older])).toEqual([older]);
     expect(runGit.mock.calls.filter(([, args]) => args.includes('cherry')).map(([, args]) => args))
       .toEqual([['cherry', 'origin/main', 'HEAD']]);
-    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref')).map(([, args]) => args))
+    expect(containsCalls(runGit).map(([, args]) => args))
       .toEqual([['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', older, '--format=%(refname)\t%(symref)', 'refs/remotes/origin']]);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes(SYMREF_LISTING))).toHaveLength(1);
   });
 
   it('returns matched without pushing when the exact SHAs are reachable from remote branches', async () => {
     const { io, runGit } = realHarness({ contains: 'refs/remotes/origin/work/published' });
     expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({ status: 'matched', unmatched: [] });
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
-    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref'))).toHaveLength(2);
+    expect(containsCalls(runGit)).toHaveLength(2);
   });
 
   it('does not accept a symbolic ref (such as one aimed at origin/ops) as reachability evidence', async () => {
