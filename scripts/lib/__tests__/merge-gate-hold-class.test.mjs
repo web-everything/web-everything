@@ -289,6 +289,40 @@ describe('fresh review CI merge-gate holds', () => {
   });
 });
 
+// PR #6535 round 6: the red-team check is produced by the accepted review, so a fresh head's missing check is
+// review work (a candidacy hold), never a CI failure that refuses that same review. A candidate still needs it.
+describe('red-team hold is candidacy, not CI repair', () => {
+  const freshHead = `#4965: HOLD
+  hold              review-acceptance      no review:accepted on the pinned head
+  hold              red-team               no red-team check run on head
+  pass              codeql                 no failed CodeQL run
+merge-gate: HOLD — held`;
+  const failed = { name: 'merge-gate', status: 'completed', conclusion: 'failure', head_sha: sha,
+    details_url: 'https://github.com/owner/repo/actions/runs/100/job/123' };
+  const probe = (extra = {}) => readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'owner/repo', pr: 4965,
+    readHead: () => sha, readLabels: () => [], readChecks: () => [failed, { name: 'test', status: 'completed', conclusion: 'success', head_sha: sha }],
+    readRequired: () => ({ source: 'live', checks: ['test', 'merge-gate'] }),
+    readMergeGateVerdict: () => verdict(freshHead), readFreeze: () => ({ error: 'unused' }), mergeGateSetting: 'on', ...extra });
+  it('lets the review that produces the red-team check start on a fresh head', () => {
+    expect(probe()).toMatchObject({ allowed: true });
+  });
+  it('still refuses a candidate, and an unreadable red-team fact stays real', () => {
+    expect(probe({ readLabels: () => [{ name: 'ready-to-merge' }] })).toMatchObject({ allowed: false });
+    expect(probe({ readMergeGateVerdict: () => verdict(freshHead.replace('hold              red-team', 'fail-closed       red-team')) }))
+      .toMatchObject({ allowed: false });
+  });
+  it('classifies only a red-team hold as candidacy, never its fail-closed form', () => {
+    expect(isCandidacyHold({ id: 'red-team', status: 'hold', reason: 'no red-team check run on head' })).toBe(true);
+    expect(isCandidacyHold({ id: 'red-team', status: 'fail-closed', reason: 'red-team check runs unreadable' })).toBe(false);
+  });
+  it('defers the red-team hold on the PR leg only; merge_group and an omitted event still block', () => {
+    const results = [{ id: 'red-team', status: 'hold', reason: 'no red-team check run on head' }];
+    const input = { num: 4965, ok: false, results, blocking: results };
+    expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting: 'on' })).toMatchObject({ ok: true, blocking: [] });
+    for (const mergeEvent of ['merge_group', undefined]) expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent, setting: 'on' })).toEqual(input);
+  });
+});
+
 describe('facts-first review CI merge-gate refusals', () => {
   const repo = 'owner/repo';
   const pr = 4965;

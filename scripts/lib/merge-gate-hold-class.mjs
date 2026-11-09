@@ -15,7 +15,9 @@ import { runGhSync } from './gh-throttle.mjs';
 
 const statuses = new Set(['pass', 'hold', 'fail-closed', 'queue', 'enqueue', 'skipped-by-policy']);
 const gates = new Set(GATE_IDS);
-const candidacy = new Set(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance']);
+// `red-team`: the accepted review produces the head's red-team check, so its absence before review is review work.
+// Only its `hold` form counts (an unreadable fact is fail-closed), and a candidate or merge_group still needs it.
+const candidacy = new Set(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance', 'red-team']);
 const blocking = r => r.status === 'hold' || r.status === 'fail-closed';
 // The evaluator wraps both main-CI failures and manual freezes in `(freeze: ...)`.
 // Only combineRedMain's explicit manual origin can be cleared by the shared document.

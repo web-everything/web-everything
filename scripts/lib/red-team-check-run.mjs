@@ -69,6 +69,18 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
   } catch (error) { return failure(`red-team check publication failed: ${message(error)}`); }
 }
 
+/**
+ * A policy-clear settlement (red team not owed on this head: card-only, a stored not-owed review, or a carried
+ * policy-clear) settles the head without a round, so no round writer publishes its check. It publishes the same
+ * head-bound success here BEFORE its result comment: a comment without a check would strand the head, because
+ * recovery skips a head that already shows a result. A failed post returns `ok:false` and the caller posts no
+ * comment, so the next pass retries. Never call this for a head that ran (or owes) a real round.
+ */
+export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, gh = runGhSync } = {}) {
+  return postRedTeamCheckRun({ repo, pr, headSha, gh,
+    payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false }) });
+}
+
 /** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a
  * second channel beside the check-runs API. The drain posts it when a red-team transition AND its failure supersede
  * both fail to publish, and posts `success` on the same context once publication is confirmed. Any CI host reads it,
