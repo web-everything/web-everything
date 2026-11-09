@@ -219,6 +219,16 @@ describe('PR #6529: the ruling identity check uses the poster\'s credential', ()
       expect(readOperatorRulings([at(buildOperatorRulingComment(record(['card'])), 'web-everything', when)])).toEqual({ rulings: [], malformed: false });
     });
 
+    // The creation-date half on its own: a full edit proof never rescues a comment GitHub dated at/after the cutoff.
+    it.each([
+      ['after the cutoff', '2026-11-09T11:00:00Z'],
+      ['exactly at the cutoff', CUTOFF],
+      ['missing', undefined],
+    ])('an unedited automation copy whose createdAt is %s keeps only its block rows', (_label, when) => {
+      const body = buildOperatorRulingComment(record(['not-real', 'block', 'card']));
+      expect(results([{ ...at(body, 'web-everything', when), includesCreatedEdit: false, updatedAt: '2026-10-01T00:00:00Z' }])).toEqual(['block']);
+    });
+
     it('the REST spellings created_at / updated_at are read the same way', () => {
       const body = buildOperatorRulingComment(record(['not-real', 'block']));
       expect(results([{ ...gh(body, 'web-everything'), created_at: '2026-11-09T11:00:00Z', updated_at: '2026-11-09T11:00:00Z' }])).toEqual(['block']);
