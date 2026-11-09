@@ -539,6 +539,15 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
         enqueuedAt: 1, attempts: 0, blocked: 'unrecognized-reason' }))));
       expect(f.open().entries()).toEqual([]);
     });
+    it('hands the runner whole-number capacity so a probe turning runnable cannot exceed the bound', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2]));
+      await block(f, 1);
+      let seen;
+      runWithRedTeamQueue({ ...inputs([1, 2], { capacity: { lanes: 1.5, remainingStarts: 1.5, budget: { left: 1.5 } } }),
+        queue: f.queue, run: options => { seen = options.capacity; return { rows: [], dispatched: [], notStarted: [] }; } });
+      expect(seen).toEqual({ lanes: 1, remainingStarts: 1, budget: { left: 1 } });
+    });
     it('survives a restart', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2]));

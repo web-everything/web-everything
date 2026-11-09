@@ -185,6 +185,15 @@ export function redTeamQueueAdmitCount(capacity) {
   return Math.max(0, Math.floor(Math.min(...bounds)));
 }
 
+// Probes ride along outside the admission bound, so a probe that turns runnable must not push total starts past it:
+// hand the runner whole-number capacity (its own check is only "> 0", so 1.5 would allow two starts).
+function wholeStarts(capacity) {
+  if (!capacity || typeof capacity !== 'object') return capacity;
+  const floor = value => (typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : value);
+  return { ...capacity, lanes: floor(capacity.lanes), remainingStarts: floor(capacity.remainingStarts),
+    ...(capacity.budget && typeof capacity.budget === 'object' ? { budget: { ...capacity.budget, left: floor(capacity.budget.left) } } : {}) };
+}
+
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, log = () => {}, ...rest }) {
   const candidates = [];
   for (const row of plan?.refusals ?? []) {
@@ -214,7 +223,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
     let index = 0;
     const options = { repo, plan: { ...plan, refusals: refusals.map(row =>
       row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
-    rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
+    rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity: wholeStarts(capacity), log, ...rest };
     const finish = result => {
       queue.settle(repo, result);
       transaction?.commit();
