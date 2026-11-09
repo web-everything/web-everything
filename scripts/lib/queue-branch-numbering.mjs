@@ -16,6 +16,11 @@ import { appendDaemonEvent } from './daemon-events.mjs';
 const SETTING = 'scripts/settings/merge-queue-numbering.json';
 const ENV = 'WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE';
 const lines = (value) => Array.isArray(value) ? value : String(value).split(/\r?\n/).filter(Boolean);
+// Path lists come from `git ls-tree/ls-files -z`: line output C-quotes non-ASCII and special-character
+// names, which every backlog regex would then miss. NUL-free text (arrays aside) is a newline list.
+const paths = (value) => Array.isArray(value) ? value
+  : String(value).includes('\0') ? String(value).split('\0').filter(Boolean) : lines(value);
+const LS_BACKLOG = (tree) => ['ls-tree', '-r', '-z', '--name-only', tree, '--', 'backlog/'];
 const cardId = (path) => idFromName(basename(path, '.md'));
 const jitSubject = /^drain: JIT-number (.+) at land \(#2288\)$/;
 /**
@@ -39,7 +44,7 @@ export function trustedDrainSubject(commit, authors) {
   return commit && authors?.has(`${commit.author?.name}\0${commit.author?.email}`)
     && jitSubject.test(commit.subject ?? '') ? commit.subject : null;
 }
-export const hashBacklogFiles = (files) => lines(files).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isHash(cardId(p)));
+export const hashBacklogFiles = (files) => paths(files).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isHash(cardId(p)));
 export const isMergeGroupCiRun = (env = process.env) => env.GITHUB_ACTIONS === 'true' && env.GITHUB_EVENT_NAME === 'merge_group';
 /** Temporary ids are unconditionally refused in merge-group CI, independent of drain settings. */
 export function mergeGroupHashRefusals({ env = process.env, files }) {
@@ -126,7 +131,7 @@ export function logQueueNumbering(setting = resolveQueueNumbering(), log = proce
 }
 
 export function reservationPlan(mainFiles, reservations, isOpen) {
-  const mainIds = new Set(lines(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number));
+  const mainIds = new Set(paths(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number));
   const kept = reservations.filter((r) => !r.nnns.every((n) => mainIds.has(Number(n))) && isOpen(r.repo, r.num) !== false);
   const max = [...mainIds, ...kept.flatMap((r) => r.nnns.map(Number))].reduce((m, n) => Math.max(m, n), 0);
   return { reservations: kept, minNext: max + 1 };
@@ -175,7 +180,7 @@ const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => String(exec('git'
 
 /** Caller holds the numbering mutex and has refreshed origin/main. Unknown PRs retain reservations. */
 export function fallbackMinNext({ cwd = process.cwd(), exec = execFileSync, fs = nodeFs, statePath = numberingStatePath() } = {}) {
-  const files = safeGit(exec, cwd)(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/']);
+  const files = safeGit(exec, cwd)(LS_BACKLOG('origin/main'));
   return reservationPlan(files, readReservations(fs, statePath), () => undefined).minNext;
 }
 
@@ -217,7 +222,7 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
     try {
       const outcome = lock(() => {
         git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-        const files = hashBacklogFiles(git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/']));
+        const files = hashBacklogFiles(git(LS_BACKLOG('origin/main')));
         if (!files.length) return { assigned: [], committed: false, pushed: false, files };
         const minNext = fallbackMinNext({ cwd, exec, fs, statePath });
         temporary = fs.mkdtempSync(join(tmpdir(), 'queue-main-repair-'));
@@ -225,7 +230,7 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
         git(['worktree', 'add', '--detach', worktree, 'origin/main']);
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = number(worktree, { minNext });
-        if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/'], worktree)).length)
+        if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/', '-z'], worktree)).length)
           throw new Error(n.error || 'hash numbering did not commit a complete repair');
         git(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main'], worktree, { MAIN_PUSH_OK: '1' });
         log.write(`  ⚠ FALLBACK: hash card(s) ${files.join(', ')} on main — numbered and pushed to main so the queue is not blocked\n`);
@@ -268,7 +273,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       temporary = fs.mkdtempSync(join(tmpdir(), 'queue-numbering-'));
       const worktree = join(temporary, 'tree');
       git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
-      const tracked = () => lines(git(['ls-files', 'backlog/'], worktree));
+      const tracked = () => paths(git(['ls-files', 'backlog/', '-z'], worktree));
       const files = tracked();
       // A hash-free pinned tree needs no numbering writes. Ordinary tracked symlinks
       // must not block enqueue just because serial mode always requests preparation.
@@ -276,13 +281,13 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       for (const path of files) assertWorktreeCard(worktree, path, fs);
       // Numbering also rewrites references in docs, memory, flows and soak files.
       // Validate the entire tracked tree, including ledger parents, before calling it.
-      for (const path of lines(git(['ls-files'], worktree))) assertWorktreeFile(worktree, path, fs);
+      for (const path of paths(git(['ls-files', '-z'], worktree))) assertWorktreeFile(worktree, path, fs);
       const outcome = lock(() => {
         pinned();
         const state = readReservations(fs, statePath);
         // Refresh the main floor while holding the same mutex as every allocation writer.
         git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-        const plan = reservationPlan(git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/']), state, isOpen);
+        const plan = reservationPlan(git(LS_BACKLOG('origin/main')), state, isOpen);
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = number(worktree, { minNext: plan.minNext });
@@ -383,7 +388,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
       if (pr.isCrossRepository) continue;
       try {
         run('git', ['fetch', 'origin', `refs/heads/${pr.headRefName}`]);
-        const files = hashBacklogFiles(run('git', ['ls-tree', '-r', '--name-only', pr.headRefOid, '--', 'backlog/']));
+        const files = hashBacklogFiles(run('git', LS_BACKLOG(pr.headRefOid)));
         if (!files.length) continue;
         let changedFiles;
         try {
@@ -425,7 +430,7 @@ export function probeQueuedLand(cwd, { exec = execFileSync, log = process.stderr
   const assigned = [];
   try {
     exec('git', ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    const files = hashBacklogFiles(exec('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, encoding: 'utf8' }));
+    const files = hashBacklogFiles(exec('git', LS_BACKLOG('origin/main'), { cwd, encoding: 'utf8' }));
     if (!files.length) return { assigned, committed: false, files };
     const warning = `hash card(s) ${files.join(', ')} on main after a queued land — not pushed; the merge_group gate should have refused it`;
     log.write(`  ⚠ WARNING: ${warning}\n`);

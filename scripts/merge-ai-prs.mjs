@@ -6920,7 +6920,8 @@ async function runCli() {
   if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
   const branchPreparationRequired = createBranchPreparationRequired({ enabled: numberingOnBranch,
     serial: resolvedMergePolicy.policy.concurrency.enqueue === 1,
-    readFiles: (c, sha) => readGit(['ls-tree', '-r', '--name-only', sha, '--', 'backlog/'], {
+    // -z: line output C-quotes non-ASCII names, which would hide a pending hash card.
+    readFiles: (c, sha) => readGit(['ls-tree', '-r', '-z', '--name-only', sha, '--', 'backlog/'], {
       cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo), encoding: 'utf8',
     }), hasPendingCards: (files) => hashBacklogFiles(files).length > 0 });
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the

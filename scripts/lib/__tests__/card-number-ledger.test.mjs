@@ -618,14 +618,14 @@ it('allowsCompleteLedgerExactlyAtReadCap', () => {
 it.each([{ floor: 10, expected: 43 }, { floor: 80, expected: 81 }])(
   'explicitReservationFloorNeverReplacesNumericFilenameEvidence ($floor)', ({ floor, expected }) => {
     let text = '';
-    const run = vi.fn(() => 'backlog/010-canonical.md\nbacklog/042-legacy-alias.md\n');
+    const run = vi.fn(() => 'backlog/010-canonical.md\0backlog/042-legacy-alias.md\0');
     const stage = vi.fn(options => { text = options.files[0].content({ existing: text }); return { pushed: true }; });
     const assigned = assignCardNumbers({ repo: 'we', board: 'fixture', ids: ['xabc123'], floor, run, stage,
       readLedger: () => parseCardLedger(text), lock });
     expect(assigned.get('xabc123')).toBe(expected);
     expect(assigned.get('xabc123')).toBeGreaterThan(42);
     expect(run).toHaveBeenCalledTimes(1);
-    expect(run).toHaveBeenCalledWith(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], expect.objectContaining({ cwd: 'fixture' }));
+    expect(run).toHaveBeenCalledWith(['ls-tree', '-r', '-z', '--name-only', 'origin/main', '--', 'backlog/'], expect.objectContaining({ cwd: 'fixture' }));
     expect(stage).toHaveBeenCalledTimes(1);
   });
 it('explicitReservationFloorDoesNotPermitAllocationWhenNumericFilenamesAreUnreadable', () => {
@@ -677,6 +677,45 @@ describe('numeric backlog inventory read bound', () => {
     const w = writer();
     expect(() => assignCardNumbers({ repo: 'we', board, ids: ['xabc123'], lock, inventoryMaxBytes, ...w })).toThrow(/invalid backlog inventory read cap/);
     expect(w.stage).not.toHaveBeenCalled();
+  });
+});
+
+// Git C-quotes non-ASCII and special-character paths in line output; the floor must still count them.
+describe('numeric backlog inventory with Git-quoted names', () => {
+  let root, board;
+  const special = ['001-café.md', '002-a"b.md', '003-a\tb.md', '004-a\nb.md', '005-a\\b.md'];
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'card-ledger-quoted-')));
+    board = join(root, 'repo'); mkdirSync(board);
+    const env = { ...process.env, GIT_AUTHOR_NAME: 'drain', GIT_AUTHOR_EMAIL: 'drain@example.test',
+      GIT_COMMITTER_NAME: 'drain', GIT_COMMITTER_EMAIL: 'drain@example.test' };
+    for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) delete env[name];
+    const git = (args, input) => String(execFileSync('git', args,
+      { cwd: board, env, input, encoding: 'utf8', stdio: 'pipe', maxBuffer: 65536 })).trim();
+    git(['init', '-q', '-b', 'main']);
+    const blob = git(['hash-object', '-w', '--stdin'], '');
+    const backlog = git(['mktree', '-z'], special.map(n => `100644 blob ${blob}\t${n}\0`).join(''));
+    const tree = git(['mktree'], `040000 tree ${backlog}\tbacklog\n`);
+    git(['update-ref', 'refs/remotes/origin/main', git(['commit-tree', tree, '-m', 'quoted'])]);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  it.each(special.map((name, i) => [name, i + 1]))('assignCardNumbersCountsTheGitQuotedName %j', (name, num) => {
+    let text = '';
+    const stage = vi.fn(options => { text = options.files[0].content({ existing: text }); return { pushed: true }; });
+    const run = (args, opts) => {
+      // Keep only the one special name so each case proves its own number is seen.
+      const out = String(execFileSync('git', args, { cwd: board, encoding: 'utf8', stdio: 'pipe', ...opts }));
+      const sep = args.includes('-z') ? '\0' : '\n';
+      return out.split(sep).filter(line => line.includes(String(num).padStart(3, '0'))).map(line => line + sep).join('');
+    };
+    const assigned = assignCardNumbers({ repo: 'we', board, ids: ['xabc123'], lock, run, stage, readLedger: () => parseCardLedger(text) });
+    expect(assigned.get('xabc123')).toBe(num + 1);
+  });
+  it('assignCardNumbersAllocatesAboveEveryGitQuotedName', () => {
+    let text = '';
+    const stage = vi.fn(options => { text = options.files[0].content({ existing: text }); return { pushed: true }; });
+    const assigned = assignCardNumbers({ repo: 'we', board, ids: ['xabc123'], lock, stage, readLedger: () => parseCardLedger(text) });
+    expect(assigned.get('xabc123')).toBe(special.length + 1);
   });
 });
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import * as realFs from 'node:fs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
@@ -473,7 +473,7 @@ it.each([false, true])('permits confined convenience links and refuses escaping 
       if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
       if (args[0] === 'ls-files') {
         const card = existsSync(join(tree, 'backlog/xabc123-card.md')) ? 'backlog/xabc123-card.md' : 'backlog/041-card.md';
-        return args.length === 1 ? `${card}\n.claude/skills` : card;
+        return args.includes('backlog/') ? card : `${card}\n.claude/skills`;
       }
       if (args[0] === 'ls-tree') return 'backlog/040-main.md';
       if (args[0] === 'rev-parse') return 'numbered-head';
@@ -508,14 +508,14 @@ it('returns final for a hash-free tree with external and dangling tracked links 
     symlinkSync(join(root, 'outside'), join(tree, '.claude/skills'));
     symlinkSync('missing.md', join(tree, 'dangling.md'));
     const exec = vi.fn((_cmd, args) => args[0] === 'ls-remote' ? 'head\trefs/heads/lane/example' : args[0] === 'ls-files'
-      ? (args.length === 1 ? 'backlog/041-card.md\n.claude/skills\ndangling.md' : 'backlog/041-card.md') : '');
+      ? (!args.includes('backlog/') ? 'backlog/041-card.md\n.claude/skills\ndangling.md' : 'backlog/041-card.md') : '');
     const unexpected = vi.fn(() => { throw new Error('unexpected numbering IO'); });
     const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example' }, traceHeadSha: 'head', exec,
       fs: { ...realFs, mkdtempSync: () => root, lstatSync: unexpected, writeFileSync: unexpected },
       lock: unexpected, number: unexpected });
     expect(out).toEqual({ action: 'final' });
     expect(unexpected).not.toHaveBeenCalled();
-    expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && args.length === 1))).toBe(false);
+    expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && !args.includes('backlog/')))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -613,7 +613,7 @@ describe('sweepQueuedHashCards', () => {
     } }));
     const exec = vi.fn((cmd, args) => {
       if (cmd === 'gh' && args[3].startsWith('query=query(')) return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes } } } } });
-      if (args[0] === 'ls-tree') return args[3] === 'sha-2' ? 'backlog/012-clean.md' : 'backlog/xabc123-card.md';
+      if (args[0] === 'ls-tree') return args.includes('sha-2') ?'backlog/012-clean.md' : 'backlog/xabc123-card.md';
       if (args[0] === 'diff') return 'src/example.mjs\0backlog/xabc123-card.md\0';
       return '{}';
     });
@@ -752,6 +752,33 @@ it('fallback allocation retains queue reservations above main', () => {
   const exec = vi.fn(() => 'backlog/100-main.md');
   const fs = { readFileSync: () => JSON.stringify({ reservations: [{ repo: null, num: 9, headRef: 'topic', nnns: [101], at: 'now' }] }) };
   expect(fallbackMinNext({ cwd: '/clone', exec, fs, statePath: '/state' })).toBe(102);
+});
+
+// Git C-quotes non-ASCII and special-character paths in line output; every path list must still see them.
+describe('Git-quoted backlog names', () => {
+  const special = ['101-café.md', '102-a"b.md', '103-a\tb.md', '104-a\nb.md', 'xabc123-café.md'];
+  let root, board;
+  const git = (args, input) => String(execFileSync('git', args, { cwd: board, input, encoding: 'utf8', stdio: 'pipe',
+    env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined,
+      GIT_AUTHOR_NAME: 'drain', GIT_AUTHOR_EMAIL: 'drain@example.test', GIT_COMMITTER_NAME: 'drain', GIT_COMMITTER_EMAIL: 'drain@example.test' } })).trim();
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'queue-quoted-')); board = join(root, 'repo'); mkdirSync(board);
+    git(['init', '-q', '-b', 'main']);
+    const blob = git(['hash-object', '-w', '--stdin'], '');
+    const backlog = git(['mktree', '-z'], special.map(n => `100644 blob ${blob}\t${n}\0`).join(''));
+    const tree = git(['mktree'], `040000 tree ${backlog}\tbacklog\n`);
+    git(['update-ref', 'refs/remotes/origin/main', git(['commit-tree', tree, '-m', 'quoted'])]);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  it('fallbackMinNextCountsGitQuotedNumberedNames', () => {
+    const fs = { readFileSync: () => JSON.stringify({ reservations: [] }) };
+    expect(fallbackMinNext({ cwd: board, fs, statePath: join(root, 'state.json') })).toBe(105);
+  });
+  it('probeQueuedLandSeesAGitQuotedHashCard', () => {
+    const exec = (cmd, args, opts) => args[0] === 'fetch' ? '' : execFileSync(cmd, args, opts);
+    const result = probeQueuedLand(board, { exec, log: { write: () => {} } });
+    expect(result.files).toEqual(['backlog/xabc123-café.md']);
+  });
 });
 
 it('probes on every live queue pass and repairs when inline numbering will not run', () => {

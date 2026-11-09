@@ -195,11 +195,12 @@ export function readCardLedger(o = {}) {
   } catch (e) { errors.push(failure(e)); }
   return { ...indexRows(trusted, errors, burned), text, trust, quarantinedLines, quarantinedCommits: [...quarantinedCommits] };
 }
-/** List main's backlog paths under an explicit cap; an overflow fails closed and names the operator fallback. */
+/** List main's backlog paths under an explicit cap; an overflow fails closed and names the operator fallback.
+ *  NUL-delimited (-z): line output C-quotes non-ASCII and special-character names, which the floor would miss. */
 function readNumericCardInventory({ run, cwd, maxBytes }) {
   let text;
   try {
-    text = String(run(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, maxBuffer: maxBytes + 1, timeout: 15000 }));
+    text = String(run(['ls-tree', '-r', '-z', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, maxBuffer: maxBytes + 1, timeout: 15000 }));
   } catch (e) {
     if (e?.code === 'ENOBUFS' || /ENOBUFS|maxBuffer/i.test(String(e?.message))) {
       throw new Error(`backlog inventory exceeds read cap ${maxBytes}; pass numericFiles or raise inventoryMaxBytes after review`);
@@ -207,7 +208,7 @@ function readNumericCardInventory({ run, cwd, maxBytes }) {
     throw e;
   }
   if (Buffer.byteLength(text) > maxBytes) throw new Error(`backlog inventory exceeds read cap ${maxBytes}; pass numericFiles or raise inventoryMaxBytes after review`);
-  return text.split(/\r?\n/);
+  return text.split('\0').filter(Boolean);
 }
 export function numericCardFloor(files) {
   let max = 0;
