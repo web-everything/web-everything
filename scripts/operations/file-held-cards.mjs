@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { op, createRegistry } from './registry.mjs';
@@ -170,9 +170,11 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     const content = readFileSync(join(root, 'backlog', name), 'utf8');
     const title = content.match(/^#\s+(.+)$/m)?.[1];
     if (!title) continue; // legacy untitled cards cannot be title-matched; they never block a run
+    // A finished card does not cover a fresh handoff: only live cards suppress a same-titled line.
+    if (/^status:\s*["']?(resolved|closed|dropped|rejected|superseded|wontfix)/m.test(content)) continue;
     titles.set(titleKey(title), name);
   }
-  const result = { planned: [], filed: [], duplicates: [], refused: [] };
+  const result = { planned: [], filed: [], duplicates: [], refused: [], failed: [] };
   for (const card of cards) {
     // Refusals stay retryable but do not use the budget, so they cannot starve later valid cards.
     if (result.planned.length + result.filed.length + result.duplicates.length >= max) break;
@@ -218,8 +220,8 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
         row.card = payload.verdict.num;
         if (payload.pr != null) row.pr = payload.pr;
       } catch {
-        result.refused.push(summary);
-        log(safeLog(`refused ${card.tag}: correct the source card or inspect the file-item run before retrying`));
+        result.failed.push(summary);
+        log(safeLog(`failed ${card.tag}: file-item did not file this card; inspect its run before retrying`));
         continue;
       }
       result.filed.push(row);
@@ -243,7 +245,13 @@ export async function runFileHeldCards(options = {}) {
   const source = resolve(expandHome(options.source || join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md')));
   const lexical = resolve(expandHome(options.ledger || join(dirname(source), 'cards-filed.jsonl')));
   const canonical = resolveLedgerPath(lexical);
-  const lock = `${canonical}.lock`;
+  // Identity-based lock: hard-linked aliases of one ledger share an inode, so they share the lock.
+  let id;
+  try { const { dev, ino } = statSync(canonical); id = `${dev}-${ino}`; } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    id = createHash('sha256').update(canonical).digest('hex').slice(0, 24); // no ledger yet: nothing to alias
+  }
+  const lock = join(tmpdir(), `file-held-cards-${id}.lock`);
   try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); } catch (error) {
     if (error.code === 'EEXIST') throw new Error('another file-held-cards run holds the ledger lock; retry when it finishes');
     throw error;
@@ -280,7 +288,8 @@ export function finishFileHeldCards(outcome, json = false) {
   if (!result) return outcome;
   const lines = json ? [JSON.stringify(result)] : Object.entries(result).flatMap(([status, cards]) => cards.map(card =>
     safeLog(`${status} ${card.tag} ${card.date}: ${card.title} [${card.scope || 'unscoped'}]`)));
-  return { ...outcome, lines };
+  // A file-item failure must not look like success to automated callers.
+  return { ...outcome, lines, ...(result.failed?.length ? { code: 1 } : {}) };
 }
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr, ...deps } = {}) {

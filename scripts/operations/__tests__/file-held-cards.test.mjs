@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, symlinkSync, linkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, statSync, symlinkSync, linkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { qualifyBareBasenames } from '../file-held-cards.mjs';
 import { sizeRefusal } from '../../backlog/scaffold.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
-import { parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards, main } from '../file-held-cards.mjs';
+import { finishFileHeldCards, parseCards, hashLine, selectUnfiled, composeFileItemInput, runFileHeldCards, main } from '../file-held-cards.mjs';
 import { operatorControlCliPolicy, resolveOperation } from '../run.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
@@ -125,9 +125,9 @@ it('fails closed on malformed ledger or missing backlog evidence before filing',
 it('does not ledger a failed or incomplete file-item response', async () => {
   seed('- [R1] 2026-11-08: Repair behavior');
   fileItem.mockResolvedValue({ code: 1, lines: ['refused'] });
-  expect((await run()).refused).toHaveLength(1);
+  expect((await run()).failed).toHaveLength(1);
   fileItem.mockResolvedValue({ code: 0, lines: ['{}'] });
-  expect((await run()).refused).toHaveLength(1);
+  expect((await run()).failed).toHaveLength(1);
   expect(existsSync(ledger)).toBe(false);
 });
 
@@ -248,8 +248,10 @@ it('keeps truncated-title cards distinct and refuses an overlapping run via the 
   seed(`- [R1] 2026-11-08: ${long} one\n- [R1] 2026-11-08: ${long} two`);
   expect((await run()).filed).toHaveLength(2);
   seed('- [R2] 2026-11-08: Lock probe');
-  writeFileSync(`${ledger}.lock`, '1');
-  await expect(run()).rejects.toThrow(/ledger lock/);
+  const st = statSync(ledger);
+  const lockFile = join(tmpdir(), `file-held-cards-${st.dev}-${st.ino}.lock`);
+  writeFileSync(lockFile, '1');
+  try { await expect(run()).rejects.toThrow(/ledger lock/); } finally { rmSync(lockFile, { force: true }); }
   expect(fileItem).toHaveBeenCalledTimes(2);
 });
 
@@ -285,4 +287,17 @@ it('files a card with a unique bare basename and refuses an ambiguous one, listi
   expect(fileItem.mock.calls[0][0].scope).toBe('we:scripts/audit-settings.mjs');
   expect(result.refused).toHaveLength(1);
   expect(log).toHaveBeenCalledWith(expect.stringContaining('we:a/dup.mjs'));
+});
+
+it('a closed card with the same title does not suppress a fresh handoff', async () => {
+  seed('- [R1] 2026-11-08: Repair behavior');
+  writeFileSync(join(root, 'backlog', '9-old.md'), '---\nstatus: resolved\n---\n# Repair behavior\n');
+  const result = await run();
+  expect(result.duplicates).toHaveLength(0);
+  expect(result.filed).toHaveLength(1);
+});
+
+it('a file-item failure makes the finished outcome exit non-zero', () => {
+  const outcome = { code: 0, run: { effects: [{ type: 'file-held-cards.file', result: { failed: [{ tag: 'R1', date: 'd', title: 't' }] } }] } };
+  expect(finishFileHeldCards(outcome).code).toBe(1);
 });
