@@ -11,7 +11,7 @@
  *   `pass`, `would-do`, `would-skip`, `operator`, `intent`, `did`, `error`, and identity-bound `operator-reset`.
  */
 import fs, { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeSync, closeSync, unlinkSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { runGhSync } from '../lib/gh-throttle.mjs';
 import { homedir, hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -186,11 +186,13 @@ export function planStallActions(items, { history = [], now, limits }) {
   const done = spending(afterRestartResets(history));
   let hour = spending(history).filter((h) => Date.parse(h.ts) >= now - 3_600_000).length;
   const perHead = new Map();
+  const livePerHead = new Map();
   const perAction = new Map();
   const bucket = it => `${it.prHead}|${it.action}`;
   for (const h of done) perAction.set(bucket(h), (perAction.get(bucket(h)) ?? 0) + 1);
-  // R452: red-team restarts have their OWN per-head budget (maxRedTeamRestartsPerHead) and neither spend nor are blocked by
-  // the shared maxActionsPerPrHead, which stays in force, unchanged, for every other action kind.
+  // Shadow restarts retain R452's separate allowance. Live restarts also obey the shared
+  // ceiling, including historical shadow restarts and intent/did spend since the latest reset.
+  for (const h of done) livePerHead.set(h.prHead, (livePerHead.get(h.prHead) ?? 0) + 1);
   for (const h of done) if (h.action !== 'restart-red-team') perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
   const seen = new Set(done.map((h) => `${h.key}|${h.action}`));
   const once = new Set(done.map((h) => h.onceKey).filter(Boolean));
@@ -203,13 +205,15 @@ export function planStallActions(items, { history = [], now, limits }) {
     const restartFull = restart
       && (!CLASSIFY_VALID.maxRedTeamRestartsPerHead(restartCap) || (perAction.get(bucket(it)) ?? 0) >= restartCap);
     const liveRestart = restart && limits.actionModes?.['restart-red-team'] === 'on';
-    const headFull = (!restart || liveRestart) && (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead;
+    const headFull = (!restart || liveRestart)
+      && ((liveRestart ? livePerHead : perHead).get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead;
     const why = act.length >= limits.maxActionsPerSweep ? 'per-sweep cap' : hour >= limits.maxActionsPerHour ? 'per-hour cap'
       : restartFull ? 'red-team restart per-head cap; operator must inspect the pending head'
         : headFull ? 'per-PR-head cap' : null;
     if (why) { held.push({ ...it, held: why }); continue; }
     act.push(it); seen.add(`${it.key}|${it.action}`); if (it.onceKey) once.add(it.onceKey);
     perAction.set(bucket(it), (perAction.get(bucket(it)) ?? 0) + 1); hour += 1;
+    livePerHead.set(it.prHead, (livePerHead.get(it.prHead) ?? 0) + 1);
     if (!restart) perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
   }
   return { act, held };
@@ -253,8 +257,11 @@ const ghFiles = (gh) => (repo, n) => {
  * One pass. Only the restart opt-in can mutate, via the shared manual-pass dispatcher.
  * `gh` remains a read-only seam; `dispatchRestart` is the sole execution seam.
  */
-export async function runStallSweep({ now = Date.now(), env = process.env, state = {}, settings, gh = (f, a, o) => execFileSync(f, a, o),
-  read, readFiles, readRedTeamStatus = defaultReadRedTeamStatus,
+export async function runStallSweep({ now = Date.now(), env = process.env, state = {}, settings, gh = (_f, a, o) => runGhSync(a, o),
+  read, readFiles,
+  readPrHead = ({ repo, pr }) => JSON.parse(gh('gh', ['pr', 'view', String(pr), '-R', repo, '--json', 'headRefOid'],
+    { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 })).headRefOid,
+  readRedTeamStatus = defaultReadRedTeamStatus,
   readStatusAt = ({ repo, pr, head, env }) => statSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`)).mtimeMs,
   probe, judge = judgeRound, dir, log = console.error, force = false, dispatchRestart = dispatchManualPass } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
@@ -294,6 +301,55 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     && Array.isArray(p.comments) && p.comments.every((c) => typeof c?.author?.login === 'string' && typeof c.body === 'string' && Number.isFinite(Date.parse(c.createdAt)));
   let readFailed = !Array.isArray(raw.prs) || !raw.prs.every(readable);
   const pending = [];
+  async function pendingEvidence(row, head) {
+    let status; let ownerAlive = null;
+    try {
+      status = await readRedTeamStatus({ repo: row.repo, pr: row.number, head, env });
+      if (status !== null) {
+        const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+        if (!object(status) || status.unreadable
+          || !['queued', 'running', 'finished', 'failed', 'skipped'].includes(status.status)
+          || !(status.result == null || typeof status.result === 'string' || object(status.result))) {
+          throw new Error('unreadable red-team status content');
+        }
+        if (status.repo !== row.repo || Number(status.pr) !== row.number || status.head !== head) throw new Error('red-team status identity mismatch');
+        if (['queued', 'running'].includes(status.status)) {
+          // Missing timing uses the pending-age deadline; malformed owner fields cannot be evidence.
+          const text = value => typeof value === 'string' && value.trim().length > 0;
+          if (['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => status[field] != null && !text(status[field]))
+            || (status.pid != null && (!Number.isSafeInteger(status.pid) || status.pid <= 0))
+            || !['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => text(status[field]))) {
+            throw new Error('unreadable active red-team status shape');
+          }
+        }
+      }
+    } catch (e) { status = { unreadable: true }; readFailed = true; base.errors.push(`red-team ${row.repo}#${row.number}: ${msg(e)}`); }
+    try {
+      if (['queued', 'running'].includes(status?.status)) {
+        const local = probe ?? { host: hostname(), namespace: pidNamespace(), isAlive: pendingOwnerPidAlive, readPidStart: pidStartTime };
+        if (status.host === local.host && status.pidNamespace === local.namespace && Number.isSafeInteger(status.pid) && status.pid > 0) {
+          const alive = await local.isAlive(status.pid);
+          if (alive === false) ownerAlive = false;
+          else if (alive === true) {
+            const start = status.pidStart ? await local.readPidStart(status.pid) : null;
+            // A missing birth time cannot prove PID reuse; retain the live-owner hold.
+            ownerAlive = !start || !status.pidStart || start === status.pidStart;
+          }
+        } else if (Number.isSafeInteger(status.pid) && status.pid > 0) {
+          const statusAt = await readStatusAt({ repo: row.repo, pr: row.number, head, env });
+          // Only a probe that answers exactly false counts as dead (null = unknown holds), and the record must
+          // have been silent past the sweep's own stale-run window, not only the 30 minute foreign-host floor.
+          const sameTable = status.pidNamespace == null || status.pidNamespace === local.namespace;
+          const alive = sameTable && Number.isFinite(statusAt) && now - statusAt > STALE_RUN_MS ? await local.isAlive(status.pid) : null;
+          if (alive !== null && alive !== undefined
+            && foreignStaleOwnerDead(status, { host: local.host, namespace: local.namespace, statusAt, now, env,
+              isAlive: () => alive, readPidStart: local.readPidStart })) ownerAlive = false;
+        }
+      }
+    // Probe failure leaves ownership unknown; preserve classification and shadow records.
+    } catch (e) { ownerAlive = null; base.errors.push(`red-team owner ${row.repo}#${row.number}: ${msg(e)}`); }
+    return { status, ownerAlive };
+  }
   // A live job proves ownership, so its pending row is not stalled; restarting it risks a duplicate run.
   for (const row of report.prs.filter((r) => r.stalled)) {
     const pr = prs.get(`${row.repo}#${row.number}`);
@@ -311,53 +367,8 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     const context = { row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) };
     const metadata = { repo: row.repo, pr: row.number, head, prHead: `${row.repo}#${row.number}@${head.toLowerCase()}`, state: row.waitingOn, title: String(row.title ?? '').slice(0, 120), verdict: verdict?.verdict ?? null };
     if (['red-team-pending', 'drain-skip:red-team-pending'].includes(row.waitingOn)) {
-      let status; let ownerAlive = null;
-      try {
-        status = await readRedTeamStatus({ repo: row.repo, pr: row.number, head, env });
-        if (status !== null) {
-          const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-          if (!object(status) || status.unreadable
-            || !['queued', 'running', 'finished', 'failed', 'skipped'].includes(status.status)
-            || !(status.result == null || typeof status.result === 'string' || object(status.result))) {
-            throw new Error('unreadable red-team status content');
-          }
-          if (status.repo !== row.repo || Number(status.pr) !== row.number || status.head !== head) throw new Error('red-team status identity mismatch');
-          if (['queued', 'running'].includes(status.status)) {
-            // Missing timing uses the pending-age deadline; malformed owner fields cannot be evidence.
-            const text = value => typeof value === 'string' && value.trim().length > 0;
-            if (['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => status[field] != null && !text(status[field]))
-              || (status.pid != null && (!Number.isSafeInteger(status.pid) || status.pid <= 0))
-              || !['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => text(status[field]))) {
-              throw new Error('unreadable active red-team status shape');
-            }
-          }
-        }
-      } catch (e) { status = { unreadable: true }; readFailed = true; base.errors.push(`red-team ${row.repo}#${row.number}: ${msg(e)}`); }
-      try {
-        if (['queued', 'running'].includes(status?.status)) {
-          const local = probe ?? { host: hostname(), namespace: pidNamespace(), isAlive: pendingOwnerPidAlive, readPidStart: pidStartTime };
-          if (status.host === local.host && status.pidNamespace === local.namespace && Number.isSafeInteger(status.pid) && status.pid > 0) {
-            const alive = await local.isAlive(status.pid);
-            if (alive === false) ownerAlive = false;
-            else if (alive === true) {
-              const start = status.pidStart ? await local.readPidStart(status.pid) : null;
-              // A missing birth time cannot prove PID reuse; retain the live-owner hold.
-              ownerAlive = !start || !status.pidStart || start === status.pidStart;
-            }
-          } else if (Number.isSafeInteger(status.pid) && status.pid > 0) {
-            const statusAt = await readStatusAt({ repo: row.repo, pr: row.number, head, env });
-            // Only a probe that answers exactly false counts as dead (null = unknown holds), and the record must
-            // have been silent past the sweep's own stale-run window, not only the 30 minute foreign-host floor.
-            const sameTable = status.pidNamespace == null || status.pidNamespace === local.namespace;
-            const alive = sameTable && Number.isFinite(statusAt) && now - statusAt > STALE_RUN_MS ? await local.isAlive(status.pid) : null;
-            if (alive !== null && alive !== undefined
-              && foreignStaleOwnerDead(status, { host: local.host, namespace: local.namespace, statusAt, now, env,
-                isAlive: () => alive, readPidStart: local.readPidStart })) ownerAlive = false;
-          }
-        }
-      // Probe failure leaves ownership unknown; preserve classification and shadow records.
-      } catch (e) { ownerAlive = null; base.errors.push(`red-team owner ${row.repo}#${row.number}: ${msg(e)}`); }
-      pending.push({ context, metadata, status, ownerAlive });
+      const { status, ownerAlive } = await pendingEvidence(row, head);
+      pending.push({ context, metadata, status, ownerAlive, statusSnapshot: JSON.stringify(status) });
       continue;
     }
     const c = classifyStall(context);
@@ -399,7 +410,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   }
   for (const held of plan.held.filter(i => i.action === 'restart-red-team' && i.held === 'per-PR-head cap')) {
     const entry = pending.find(p => p.metadata.prHead === held.prHead);
-    const restarts = [...history.filter(h => ['would-do', 'intent'].includes(h.phase)), ...plan.act]
+    const restarts = [...spending(afterRestartResets(history)), ...plan.act]
       .filter(h => h.prHead === held.prHead && h.action === 'restart-red-team').length;
     items.push({ ...held, lane: 'operator', action: 'red-team-restart-exhausted',
       key: `${held.prHead}:red-team-restart-exhausted`, held: undefined,
@@ -425,11 +436,6 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   const record = r => { appendAudit(outDir, now, [r]); records.push(r); };
   if (!incomplete && !base.errors.length) for (const i of plan.act.filter(live)) {
     try {
-      const entry = pending.find(p => p.metadata.prHead === i.prHead);
-      if (entry?.ownerAlive !== false) {
-        record({ ...i, ts, phase: 'would-skip', held: 'owner death not proven (R803); operator must inspect' });
-        continue;
-      }
       // Re-read immediately before intent, still under the lock, including this pass's preceding spend.
       const current = readAuditHistory(outDir);
       if (!current.complete) throw new Error('execute-time audit history incomplete; operator must inspect');
@@ -442,9 +448,30 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         record({ ...i, ts, phase: 'would-skip', held: check.held[0]?.held ?? 'already has durable intent/did' });
         continue;
       }
+      const assessed = pending.find(p => p.metadata.prHead === i.prHead);
+      const entry = assessed ? await pendingEvidence(assessed.context.row, i.head) : null;
+      if (JSON.stringify(entry?.status) !== assessed?.statusSnapshot) {
+        record({ ...i, ts, phase: 'would-skip', held: 'red-team status changed; operator must inspect' });
+        continue;
+      }
+      if (entry?.ownerAlive !== false) {
+        record({ ...i, ts, phase: 'would-skip', held: 'owner death not proven (R803); operator must inspect' });
+        continue;
+      }
+      let head;
+      try { head = await readPrHead({ repo: i.repo, pr: i.pr }); } catch { head = null; }
+      if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head) || head !== i.head) {
+        record({ ...i, ts, phase: 'would-skip', held: 'PR head changed or unreadable; operator must inspect' });
+        continue;
+      }
+      i.expectedHead = i.head;
       record({ ...i, ts, phase: 'intent', mode: cfg.mode });
-      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason });
+      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead });
       if (result?.error || result?.skipped || result?.ok === false) throw new Error(`restart refused: ${msg(result.error ?? result.skipped ?? 'unsuccessful dispatch')}`);
+      if (result?.jobPid === null || result?.launched === false || !(result?.launched === true
+        || (Number.isSafeInteger(result?.jobPid) && result.jobPid > 0))) {
+        throw new Error('restart launch unproven; operator must inspect before retrying');
+      }
       record({ ...i, ts, phase: 'did', mode: cfg.mode });
     } catch (e) {
       incomplete = true;

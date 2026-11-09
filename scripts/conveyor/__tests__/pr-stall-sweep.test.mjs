@@ -18,7 +18,7 @@ import { sidecarsOf, replay, runOnce, unacknowledged } from '../../operations/ne
 import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
 
 // Keep the future default live-dispatch path hermetic as well as the injected seam.
-vi.mock('../../operations/manual-daemon-pass-io.mjs', () => ({ dispatchManualPass: vi.fn(async () => ({ status: 'dispatched' })) }));
+vi.mock('../../operations/manual-daemon-pass-io.mjs', () => ({ dispatchManualPass: vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 })) }));
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -40,6 +40,9 @@ function fakeGh({ prs = PRS, truncated = false } = {}) {
   const gh = (_bin, args) => {
     calls.push(args);
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(prs);
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid')) {
+      return JSON.stringify({ headRefOid: prs.find(p => String(p.number) === String(args[2]))?.headRefOid });
+    }
     if (args[0] === 'pr' && args[1] === 'view' && args.includes('commits')) {
       const pr = prs.find((p) => String(p.number) === String(args[2]));
       return JSON.stringify({ commits: [{ oid: pr?.commitOid ?? pr?.headRefOid, committedDate: old }] });
@@ -873,7 +876,7 @@ describe('R804 restart-only live acceptance', () => {
   };
   const run = async ({ dir = auditDir(), prs = [pendingPr], alive = false, status, ...options } = {}) => {
     const { gh, calls } = fakeGh({ prs });
-    const dispatchRestart = options.dispatchRestart ?? vi.fn(async () => ({ status: 'dispatched' }));
+    const dispatchRestart = options.dispatchRestart ?? vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 }));
     const out = await runStallSweep({ now: NOW, env: {}, settings: live(), dir, gh, read: reader(gh), log: () => {},
       readRedTeamStatus: () => status === undefined
         ? { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old } : status,
@@ -882,6 +885,133 @@ describe('R804 restart-only live acceptance', () => {
     return { out, dir, dispatchRestart, calls };
   };
   afterEach(() => { vi.restoreAllMocks(); vi.mocked(dispatchManualPass).mockClear(); });
+
+  it.each([
+    ['replacement owner', { pid: 54321 }],
+    ['replacement birth time', { pidStart: 'new-owner' }],
+    ['finished result', { status: 'finished', result: { status: 'ran' } }],
+    ['missing status', null],
+    ['unreadable status', { unreadable: true }],
+  ])('execution refuses %s appearing after assessment inside the lock', async (_name, patch) => {
+    const dir = auditDir();
+    const status = { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old };
+    const readRedTeamStatus = vi.fn(() => {
+      if (!existsSync(join(dir, '.lock'))) return status;
+      return patch === null ? null : { ...status, ...patch };
+    });
+    const { dispatchRestart } = await run({ dir, readRedTeamStatus });
+    expect(readRedTeamStatus).toHaveBeenCalledTimes(2);
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/status changed.*operator/) }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it.each([true, null])('execution re-probes the same owner and refuses newly live or unknown liveness %s', async alive => {
+    const dir = auditDir();
+    const isAlive = vi.fn(() => existsSync(join(dir, '.lock')) ? alive : false);
+    const { dispatchRestart } = await run({ dir,
+      probe: { host: owner.host, namespace: owner.pidNamespace, isAlive, readPidStart: () => owner.pidStart } });
+    expect(isAlive).toHaveBeenCalledTimes(2);
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/owner death not proven.*operator/) }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it('execution detects a replacement owner even when the status reader reuses an object', async () => {
+    const dir = auditDir();
+    const status = { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old };
+    const { dispatchRestart } = await run({ dir, readRedTeamStatus: () => {
+      if (existsSync(join(dir, '.lock'))) status.pid = 54321;
+      return status;
+    } });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/status changed/) }));
+  });
+  it('execution fails closed when the locked status reread throws', async () => {
+    const dir = auditDir();
+    const readRedTeamStatus = () => {
+      if (existsSync(join(dir, '.lock'))) throw new Error('status unreadable');
+      return { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old };
+    };
+    const { dispatchRestart } = await run({ dir, readRedTeamStatus });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/operator/) }));
+  });
+  it.each(['b'.repeat(40), null, 'bad', 'a'.repeat(41)])('execution refuses changed or unreadable live head %j', async head => {
+    const dir = auditDir();
+    const readPrHead = vi.fn(() => {
+      expect(existsSync(join(dir, '.lock'))).toBe(true);
+      return head;
+    });
+    const { dispatchRestart } = await run({ dir, readPrHead });
+    expect(readPrHead).toHaveBeenCalledWith({ repo: REPO, pr: 11 });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', head: HEAD,
+      held: expect.stringMatching(/head changed or unreadable.*operator/) }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it('execution refuses a failed live-head read without dispatch', async () => {
+    const { dir, dispatchRestart } = await run({ readPrHead: () => { throw new Error('head unavailable'); } });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/head changed or unreadable.*operator/) }));
+  });
+  it('launch receipts and durable spend carry the assessed expected head', async () => {
+    const { dir, dispatchRestart } = await run();
+    expect(dispatchRestart).toHaveBeenCalledWith(expect.objectContaining({ expectedHead: HEAD }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase)))
+      .toEqual(['intent', 'did'].map(phase => expect.objectContaining({ phase, head: HEAD, expectedHead: HEAD, prHead })));
+  });
+  it.each(['would-do', 'intent', 'did'])('live shared ceiling counts prior %s restarts in planner and execution after spacing expires', async phase => {
+    const dir = auditDir();
+    const history = [record({ phase })];
+    append(dir, history);
+    const item = { ...record({ key: `${prHead}:red-team-pending:restart-2` }), lane: 'system' };
+    const limits = live().value;
+    expect(planStallActions([item], { history, now: NOW, limits }))
+      .toEqual({ act: [], held: [{ ...item, held: 'per-PR-head cap' }] });
+    const { dispatchRestart } = await run({ dir });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: 'per-PR-head cap' }));
+  });
+  it('latest exact-head reset clears older spend but retains a spaced post-reset restart', () => {
+    const reset = minutes => ({ phase: 'operator-reset', repo: REPO, pr: 11, head: HEAD, prHead,
+      actor: 'operator', reason: 'inspected', ruling: 'R804', ts: new Date(NOW - minutes * 60_000).toISOString() });
+    const older = record({ ts: new Date(NOW - 180 * 60_000).toISOString() });
+    const first = record();
+    const second = { ...first, key: `${prHead}:red-team-pending:restart-2`, lane: 'system' };
+    expect(planStallActions([second], { now: NOW, limits: live().value,
+      history: [older, reset(150), reset(120), first, { ...first, phase: 'did' }] }))
+      .toEqual({ act: [], held: [{ ...second, held: 'per-PR-head cap' }] });
+    expect(planStallActions([second], { now: NOW, limits: live().value,
+      history: [older, reset(150), first, reset(60)] }).act).toEqual([second]);
+  });
+  it('planner charges planned live restarts to both ceilings and counts intent/did only once', () => {
+    const first = { ...record(), lane: 'system' };
+    const second = { ...first, key: `${prHead}:red-team-pending:restart-2` };
+    expect(planStallActions([first, second], { history: [], now: NOW, limits: live().value }))
+      .toEqual({ act: [first], held: [{ ...second, held: 'per-PR-head cap' }] });
+    expect(planStallActions([second], { history: [record(), record({ phase: 'did' })], now: NOW,
+      limits: live({ maxActionsPerPrHead: 2 }).value }).act).toEqual([second]);
+  });
+  it.each([null, undefined, {}, { status: 'dispatched' }, { jobPid: null }, { jobPid: 0 },
+    { jobPid: -1 }, { jobPid: '123' }, { launched: true, jobPid: null }, { launched: false, jobPid: 123 }])(
+    'unproven launch %j records intent and error without did or retry', async result => {
+      const dir = auditDir();
+      const dispatchRestart = vi.fn(async () => result);
+      const options = { dir, dispatchRestart, prs: [pendingPr, { ...pendingPr, number: 12 }],
+        readRedTeamStatus: ({ pr }) => ({ ...owner, repo: REPO, pr, head: HEAD, status: 'running', startedAt: old }) };
+      const { out } = await run(options);
+      expect(out.incomplete).toBe(true);
+      expect(dispatchRestart).toHaveBeenCalledTimes(1);
+      expect(lines(dir).filter(r => r.action === 'restart-red-team').map(r => r.phase)).toEqual(['intent', 'error']);
+      expect(lines(dir).find(r => r.phase === 'error').error).toMatch(/launch unproven.*operator/);
+      await run({ dir, dispatchRestart });
+      expect(dispatchRestart).toHaveBeenCalledTimes(1);
+      expect(lines(dir).filter(r => r.phase === 'did')).toEqual([]);
+    });
+  it('an explicit launched flag proves dispatch without a PID receipt', async () => {
+    const { dir, out } = await run({ dispatchRestart: vi.fn(async () => ({ launched: true })) });
+    expect(out.incomplete).toBe(false);
+    expect(lines(dir).filter(r => r.action === 'restart-red-team').map(r => r.phase)).toEqual(['intent', 'did']);
+  });
 
   it('R804 shipped settings opt in only restart-red-team while global mode stays shadow', () => {
     const { prStallSweep } = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
@@ -914,11 +1044,11 @@ describe('R804 restart-only live acceptance', () => {
   it('R804 proven dead owner dispatches once under lock after durable intent then appends did; other actions stay shadow', async () => {
     const dir = auditDir();
     const dispatchRestart = vi.fn(async input => {
-      expect(input).toEqual({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String) });
+      expect(input).toEqual({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD });
       expect(input.reason.trim()).not.toBe('');
       expect(existsSync(join(dir, '.lock'))).toBe(true);
       expect(lines(dir).filter(r => r.action === 'restart-red-team')).toMatchObject([{ phase: 'intent', prHead, key }]);
-      return { status: 'dispatched' };
+      return { status: 'dispatched', jobPid: 24680 };
     });
     // The first PR produces tooling-card; the pending PR produces the sole live action.
     const { out, calls } = await run({ dir, prs: [{ ...PRS[0], number: 13 }, pendingPr], dispatchRestart });
@@ -937,7 +1067,7 @@ describe('R804 restart-only live acceptance', () => {
       readRedTeamStatus: () => ({ ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old }),
       probe: { host: owner.host, namespace: owner.pidNamespace, isAlive: () => false, readPidStart: () => owner.pidStart } });
     expect(dispatchManualPass).toHaveBeenCalledTimes(1);
-    expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String) });
+    expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD });
   });
   it.each([true, null])('R804 ownerAlive=%s cannot dispatch a restart', async alive => {
     const { out, dir, dispatchRestart } = await run({ alive });
@@ -989,7 +1119,7 @@ describe('R804 restart-only live acceptance', () => {
     });
   it('R804 same tick and key with durable intent and did never dispatches twice', async () => {
     const dir = auditDir();
-    const dispatchRestart = vi.fn(async () => ({ status: 'dispatched' }));
+    const dispatchRestart = vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 }));
     await run({ dir, dispatchRestart });
     expect(dispatchRestart).toHaveBeenCalledTimes(1);
     await run({ dir, dispatchRestart, force: true });

@@ -3427,6 +3427,12 @@ the client and removes each cross-check (d) guard independently, including the w
 check; the same bad inventory must escape only in the mutant. Production files are
 never rewritten by these probes, and a missing mutation target fails the test.
 
+For named Node filesystem imports, fault injection in an in-memory mutation suite must
+load its unchanged control through the same native loader as its mutants. Vitest's
+transformed named imports can retain earlier bindings despite `syncBuiltinESMExports()`.
+`pr-stall-live-safety.test.mjs` pairs each passing control contract with a failing mutant
+assertion, including evidence appended after planning and refusal to persist intent.
+
 Keep direct bound-exec missing-cwd cases and the delta builder's default-cwd case.
 Row 13 configures a side-effecting fsmonitor hook: require its sentinel to stay absent
 and pin `-c core.fsmonitor=false` on every manifest Git command after binding.
