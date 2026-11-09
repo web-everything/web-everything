@@ -83,11 +83,14 @@ export function qualifyBareBasenames(text, trackedFiles) {
 // resolve through that front-matter line, here and on origin/main.
 const BIRTH_HASH = /^x[0-9a-z]{6}$/;
 
-const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
+// A leading BOM, trailing spaces on a delimiter and an empty block are all still front matter; the lazy optional
+// group (`??`) prefers the empty block so a later body rule is never read as its closing delimiter.
+const FRONT_MATTER = /^﻿?---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)??---[ \t]*(?:\r?\n|$)/;
 
 /** A card's leading front-matter block (between the first two `---` lines), or null; body lines never count. */
 function frontMatterBlock(text) {
-  return text.match(FRONT_MATTER)?.[1] ?? null;
+  const match = text.match(FRONT_MATTER);
+  return match ? match[1] ?? '' : null;
 }
 
 /** Offset where the body starts: 0 when the card has no front matter. */

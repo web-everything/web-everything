@@ -302,6 +302,17 @@ it('body status examples do not suppress live-card duplicate detection', async (
   expect(result.duplicates.map(entry => entry.tag).sort()).toEqual(['R1', 'R2', 'R3']);
 });
 
+it('a finished card is still skipped with a BOM or trailing-space delimiters, and an empty block never swallows the body', async () => {
+  writeFileSync(join(root, 'backlog', '9-bom.md'), '﻿---\nstatus: resolved\n---\n# Bom thing\n');
+  writeFileSync(join(root, 'backlog', '8-space.md'), '---  \r\nstatus: closed\r\n---  \r\n# Space thing\r\n');
+  // Empty front matter, then a body rule: the body status example must not be read as front matter.
+  writeFileSync(join(root, 'backlog', '7-empty.md'), '---\n---\n# Empty thing\n\nstatus: resolved\n\n---\n');
+  seed('- [R1] 2026-11-08: Bom thing\n- [R2] 2026-11-08: Space thing\n- [R3] 2026-11-08: Empty thing');
+  const result = await run();
+  expect(result.filed.map(entry => entry.tag)).toEqual(['R1', 'R2']);
+  expect(result.duplicates.map(entry => entry.tag)).toEqual(['R3']);
+});
+
 it('a comment line inside front matter is not read as the card title', async () => {
   writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: open\n# note: not a title\n---\n# Repair behavior\n');
   seed('- [R1] 2026-11-08: Repair behavior\n- [R2] 2026-11-08: note: not a title');
