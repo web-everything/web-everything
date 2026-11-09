@@ -1812,7 +1812,7 @@ describe('R671 v1 acting judge referral blocks', () => {
     it('POST refuses a human poster who does not match the declared actor before any writes', async () => {
       const h = postHarness({ identity: human, login: human.login });
       const plan = planOperatorRuling(operatorSnapshot(human), operatorRequest());
-      await expect(h.sink({ ...payloadOf(plan), actor: 'mallory' })).rejects.toThrow(/not a registered operator|does not match/i);
+      await expect(h.sink({ ...payloadOf(plan), actor: 'mallory' })).rejects.toThrow(/does not match the authenticated poster/);
       expect(h.posted).toEqual([]);
       expect(h.events).toEqual([]);
     });
