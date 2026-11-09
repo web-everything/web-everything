@@ -11,6 +11,7 @@ function fixture() {
     carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
     readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] }),
     contributionPatchId: () => p, restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),
+    publishCarriedCheck: vi.fn(() => ({ ok: true })),
     runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ stopped: 'complete', verdict: { verdict: 'accept', loop: { outcome: 'converged' } } }) })),
     runExtraSeats: vi.fn(), runRedTeam: vi.fn(), startSpeculativeRedTeam: vi.fn(), speculativeRedTeamSetting: () => ({ enabled: true }),
   };
@@ -25,6 +26,24 @@ describe('review job rebase carry', () => {
     expect([...gateOutcomesForHead([trusted(body)], 1, b)]).toEqual(['card-queued']);
     for (const key of ['runLoop', 'runExtraSeats', 'runRedTeam', 'startSpeculativeRedTeam']) expect(io[key]).not.toHaveBeenCalled();
     expect(io.restampVerdict.mock.invocationCallOrder[0]).toBeLessThan(io.postCarryComment.mock.invocationCallOrder[0]);
+    expect(io.publishCarriedCheck).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      pr: 1, repo: 'web-everything/web-everything', headSha: b,
+    }));
+    expect(io.postCarryComment.mock.invocationCallOrder[0]).toBeLessThan(io.publishCarriedCheck.mock.invocationCallOrder[0]);
+    expect(out.checkPublished).toBe(true);
+  });
+  it.each(['refused', 'throws'])('a %s check publication preserves the carried verdict without throwing', mode => {
+    const io = fixture();
+    io.publishCarriedCheck.mockImplementation(() => {
+      if (mode === 'throws') throw Error('check API unavailable');
+      return { ok: false, reason: 'check API unavailable' };
+    });
+    const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
+    expect(out).toMatchObject({ outcome: 'carried', headSha: b, checkPublished: false });
+    expect(io.publishCarriedCheck).toHaveBeenCalledTimes(1);
+    expect(io.postCarryComment).toHaveBeenCalledTimes(1);
+    expect(io.postCarryComment.mock.invocationCallOrder[0]).toBeLessThan(io.publishCarriedCheck.mock.invocationCallOrder[0]);
+    expect(io.runLoop).not.toHaveBeenCalled();
   });
   it.each(['off', 'unequal', 'unreadable', 'restamp-failed', 'red-team-pending', 'gate-with-hold'])('%s runs the normal arc without a carry comment', mode => {
     const io = fixture();
@@ -37,6 +56,7 @@ describe('review job rebase carry', () => {
       trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->\nunknown hold`)] });
     const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
     expect(out.outcome).not.toBe('carried'); expect(io.runLoop).toHaveBeenCalledTimes(1); expect(io.postCarryComment).not.toHaveBeenCalled();
+    expect(io.publishCarriedCheck).not.toHaveBeenCalled();
     if (['red-team-pending', 'gate-with-hold'].includes(mode)) expect(io.restampVerdict).not.toHaveBeenCalled();
   });
 });

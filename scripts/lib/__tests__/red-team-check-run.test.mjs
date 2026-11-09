@@ -2,6 +2,8 @@
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { readRedTeamGateSource } from '../red-team-check-run.mjs';
+import { REVIEW_HOLD_LABELS } from '../review-escalation.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 describe('redTeamGate.source cutover cascade', () => {
   it.each(['both', 'check-run', 'drain-scan'])('accepts mode %s from the environment', source => {
@@ -37,6 +39,140 @@ describe('red-team check run contract', () => {
   const run = (over = {}) => ({ id: 10, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7',
     app: { id: APP_ID }, status: 'completed', conclusion: 'success',
     started_at: '2026-11-07T10:00:00Z', ...over });
+
+  describe('publishRedTeamCheckFromLive', () => {
+    const resultComment = (rev = HEAD) => ({ author: { login: 'web-everything', type: 'Bot' },
+      body: renderRedTeamComment({ pr: 7, rev, provider: 'codex', model: 'fixture',
+        findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
+    // Reader contract: live PR object, complete comment array, verified standing-ruling scope.
+    // Check history stays behind the injected gh boundary; no test can reach GitHub.
+    function fixture() {
+      return { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, env: {},
+        readLive: vi.fn(() => ({ headRefOid: HEAD, labels: [] })),
+        readComments: vi.fn(() => [resultComment()]),
+        readStandingRuling: vi.fn(() => null),
+        holdFn: vi.fn(() => null),
+        gh: vi.fn(args => {
+          if (args.includes('POST')) return JSON.stringify({ id: 20 });
+          if (args.includes(`repos/o/r/commits/${HEAD}/check-runs?check_name=red-team&filter=all&per_page=100`))
+            return JSON.stringify({ total_count: 1, check_runs: [run({ conclusion: 'failure' })] });
+          throw Error(`unexpected GitHub read: ${JSON.stringify(args)}`);
+        }),
+      };
+    }
+    const posts = io => io.gh.mock.calls.filter(([args]) => args.includes('POST'));
+    const payloads = io => posts(io).map(([, options]) => JSON.parse(options.input));
+    const publish = io => api.publishRedTeamCheckFromLive(io);
+
+    it('posts exactly one head-bound success after reading live evidence and consulting the recorded-result hold', async () => {
+      const io = fixture();
+      const comments = [resultComment()];
+      const standingRuling = { scope: 'verified-fixture' };
+      io.readComments.mockReturnValue(comments);
+      io.readStandingRuling.mockReturnValue(standingRuling);
+      expect(await publish(io)).toMatchObject({ ok: true });
+      expect(posts(io)).toHaveLength(1);
+      expect(posts(io)[0][0]).toContain('repos/o/r/check-runs');
+      expect(payloads(io)[0]).toMatchObject({ name: 'red-team', head_sha: HEAD,
+        external_id: 'o/r#7', status: 'completed', conclusion: 'success' });
+      expect(io.readLive.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(io.readComments.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(io.readStandingRuling).toHaveBeenCalled();
+      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/r', pr: 7,
+        head: HEAD, comments, recorded: true, standingRuling }));
+      for (const reader of [io.readLive, io.readComments, io.readStandingRuling, io.holdFn])
+        expect(reader.mock.invocationCallOrder[0]).toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.findIndex(([args]) => args.includes('POST'))]);
+    });
+
+    it.each(['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS])('posts nothing for live label %s', async label => {
+      const io = fixture();
+      io.readLive.mockReturnValue({ headRefOid: HEAD, labels: [{ name: label }] });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the shared enqueue hold reports a held break', async () => {
+      const io = fixture();
+      io.holdFn.mockReturnValue('post-accept red team confirmed a break requiring send-back');
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ recorded: true, head: HEAD }));
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the live head moved', async () => {
+      const io = fixture();
+      io.readLive.mockReturnValue({ headRefOid: OLD_HEAD, labels: [] });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['missing', 'other-head', 'untrusted'])('posts nothing for a %s result even when the injected hold clears', async mode => {
+      const io = fixture();
+      io.readComments.mockReturnValue(mode === 'missing' ? [] : mode === 'other-head'
+        ? [resultComment(OLD_HEAD)] : [{ ...resultComment(), author: { login: 'outsider' } }]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the latest matching check is in_progress despite an older success', async () => {
+      const io = fixture();
+      io.gh.mockReturnValue(JSON.stringify({ total_count: 2, check_runs: [run(),
+        run({ id: 11, status: 'in_progress', conclusion: null })] }));
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('refuses incomplete check history with an operator-visible fallback', async () => {
+      const io = fixture();
+      io.gh.mockReturnValue(JSON.stringify({ total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => run({ id: i + 1 })) }));
+      expect(await publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/operator.*inspect/i) });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['blocking-label', 'new-run'])('supersedes its success with failure when a %s races publication', async mode => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      let posted = false;
+      io.gh.mockImplementation((args, options) => {
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 + posts(io).length }); }
+        if (posted && mode === 'new-run') return JSON.stringify({ total_count: 1,
+          check_runs: [run({ id: 99, status: 'in_progress', conclusion: null })] });
+        return readGh(args, options);
+      });
+      io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
+        labels: posted && mode === 'blocking-label' ? [{ name: 'red-team:blocked' }] : [] }));
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
+        head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
+    });
+
+    it.each(['readLive', 'readComments', 'readStandingRuling', 'holdFn', 'gh'])('%s errors return ok:false without throwing or posting', async reader => {
+      const io = fixture();
+      io[reader].mockImplementation(() => { throw Error('reader unavailable'); });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['readLive', 'readComments'])('unreadable %s evidence fails closed without posting', async reader => {
+      const io = fixture();
+      io[reader].mockReturnValue(null);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('a failed success POST returns ok:false without throwing', async () => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+        if (args.includes('POST')) throw Error('HTTP 403: check write denied');
+        return readGh(args, options);
+      });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io).length).toBeGreaterThanOrEqual(1);
+      expect(payloads(io)[0].conclusion).toBe('success');
+    });
+  });
 
   // PR #6535 round 6: the recovery policy-clear writer posts only on a head with no run for this PR.
   describe('publishRedTeamPolicyClearCheck', () => {
