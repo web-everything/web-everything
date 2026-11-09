@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { isNumberingTolerableLaterBody, planNumberingRestamp } from '../numbering-carry.mjs';
 import { applyHumanClearanceCarry, latestHumanClearance } from '../human-clearance-carry.mjs';
-import { normalizeDiffFingerprint } from '../review-escalation.mjs';
+import { buildClearedFromMarker, normalizeDiffFingerprint } from '../review-escalation.mjs';
 import { buildLandingRetractionComment } from '../../operations/land-prevention-card.mjs';
 import { buildClearanceComment } from '../drain-merge-strategy.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
@@ -75,9 +75,9 @@ describe('numbering carry recognises trusted machine comments with author metada
 function acceptedThread() {
   const markers = `<!-- reviewed-sha: ${FROM} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(BEFORE)} -->\n<!-- cleared-human: chalbert -->`;
   return [
-    comment(`✅ review — human cleared\n${markers}`, 'chalbert', 0),
+    { ...comment(`✅ review — human cleared\n${markers}`, 'chalbert', 0), id: 'IC_clearance' },
     // The acceptance record retains the human clearance on the same head.
-    comment(`✅ review — accepted\n${markers}`, 'web-everything[bot]', 1),
+    comment(`✅ review — accepted\n${markers}\n${buildClearedFromMarker('IC_clearance')}`, 'web-everything[bot]', 1),
   ];
 }
 function machineNotes() {
@@ -100,7 +100,7 @@ function applyWithLiveThread(liveComments) {
   const exec = vi.fn(() => '');
   const readNumberingLiveEvidence = vi.fn(() => ({ headSha: TO, comments: liveComments, reviews: [] }));
   const result = applyHumanClearanceCarry({
-    pr: 5759, numberingOnly: true, equivalence: 'strict',
+    mechanicalCarry: { value: 'trust-drain-record', source: 'test' }, pr: 5759, numberingOnly: true, equivalence: 'strict',
     setting: ON, numberingSetting: ON, netPatchSetting: { value: false, source: 'test' },
     evidence: {
       humanClearance: latestHumanClearance(initial),
@@ -116,6 +116,23 @@ function applyWithLiveThread(liveComments) {
 }
 
 describe('#5759 numbering move after human clearance', () => {
+  it('default refuses a proven numbering carry without recording it', () => {
+    const exec = vi.fn(() => '');
+    const log = vi.fn();
+    const result = applyHumanClearanceCarry({
+      pr: 5759, numberingOnly: true, equivalence: 'strict',
+      setting: ON, numberingSetting: ON, netPatchSetting: { value: false, source: 'test' },
+      evidence: { humanClearance: latestHumanClearance(acceptedThread()),
+        headSha: TO, headDiffSha: TO, headDiff: AFTER },
+      proveNumbering: () => ({ ok: true, reason: 'only numbering changed' }),
+      readLiveEvidence: () => ({ headSha: TO, comments: acceptedThread(), reviews: [] }),
+      exec, log,
+    });
+    expect(result).toBeNull();
+    expect(log.mock.calls.some(([line]) => line.includes('humanClearance.mechanicalCarry=refuse'))).toBe(true);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it('the planner nominates the human acceptance across trusted retraction and drain notes', () => {
     expect(plan([...acceptedThread(), ...machineNotes()])).toMatchObject({
       candidate: true, from: FROM, to: TO, human: true, actor: 'chalbert',

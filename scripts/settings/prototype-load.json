@@ -223,6 +223,41 @@
       "findings": [
         "scripts/lib/drain-red-team-evidence.mjs:541 — Replaces the foreign-host fail-closed hold with an age-based local PID check. Different machines can both have null PID namespaces; an absent or mismatched local PID cannot prove the remote writer stopped. After 30 minutes (configurable down to 10), a live remote review can lose its in-flight/queued protection, allowing review-job.mjs:387 to admit a replacement writer and overwrite its status."
       ]
+    },
+    {
+        "ref": "lane/redteam-dispatch-queue",
+        "sha": "f86f066e17bd0eeb3a8c2f945d4d4f6236d30c75",
+        "ruling": "R786",
+        "findings": [
+            "scripts/lib/review-red-team-on-skip.mjs:791 — Pre-existing limitation relied on by scripts/lib/red-team-dispatch-queue.mjs:171: worker-free `carry` publishes policy-clear without revalidating live holds or complete formal reviews. A read-only probe selected `carry` with zero live-state or complete-review reads despite readers configured to report a hold; a hold arriving after the snapshot can therefore be bypassed."
+        ]
+    },
+    {
+        "ref": "lane/rebuild-adopt-chase",
+        "sha": "a7200c7282fd29ac9c792bb4fad48bd65a94110e",
+        "ruling": "R790",
+        "findings": [
+            "scripts/lib/daemon-rebuild/adopt.mjs:132 — The legacy allowlist bypasses tip binding and recorded `contentInMain`/`cleanMerges` evidence for the specified event, allowing superseded adoption previously refused. Direct probes confirmed acceptance with both a missing and a mismatched tip; candidate tree, driver, and time checks remain."
+        ]
+    },
+    {
+        "ref": "lane/redteam-pending-on-accept-m1",
+        "sha": "166689d13b300960fbf2f458ff3ba18f560b097a",
+        "ruling": "R796",
+        "findings": [
+            "scripts/lib/drain-merge-strategy.mjs:432 — Check-run mode skips live evidence and disposition validation. An older successful check can authorize enqueue despite a later confirmed-break comment, operator block, or revoked deferral when blocking labels are absent.",
+            "scripts/merge-gate-check.mjs:194 — Publication holds do not prevent stale-success admission: after the check read, a writer can publish a newer pending check and clear its publication hold before the status read. An injected read-only probe returned success while the latest check was in progress."
+        ]
+    },
+    {
+      "ref": "lane/stall-sweep-live",
+      "sha": "c305b4d9990be329d41d4577cf193ef729282899",
+      "ruling": "R803+R804",
+      "findings": [
+        "scripts/settings/pr-stall-sweep.json:10 — Enables live restarts under global `mode: \"shadow\"`; shadow no longer guarantees zero dispatches. (R804: per-action live with global shadow is the ruled change)",
+        "scripts/conveyor/pr-stall-sweep.mjs:342 — Treats a missing PID namespace as matching locally. A stale record from another machine can therefore be declared dead by a local PID probe. (R803: ruled single-host exception inherited from #6603)",
+        "scripts/conveyor/pr-stall-sweep.mjs:152 — Operator resets discard earlier restart spend from lifetime caps, spacing, and idempotency checks. (R804: the recorded operator reset is the ruled action)"
+      ]
     }
   ]
 }

@@ -17,6 +17,10 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('tells dispatchers every Agent brief needs a Slot line with all four forms', () => {
+    expect(renderWorkerBrief(params)).toContain('Every build Agent brief (the ones the prep gate covers) needs a `Slot:` line: `Slot: plan:<item>`, `Slot: blocker:<what it unblocks>`, `Slot: operator:<quoted placement>`, or `Slot: waived — <reason>`.');
+  });
+
   it.each([
     ['Alice1', 'alice1'],
     ['abcdEFGhiJKlmnop', 'AbcDeFgHIjKLmnop'],
@@ -221,6 +225,7 @@ describe('renderWorkerBrief', () => {
       'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=full',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
+      'committed and its PR opened BEFORE you release the lane', '~/.claude/lane-salvage',
       `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,
       defaultProof, 'report it as PENDING', 'exact command', '10\nminutes',
       '`pkill`, `killall`', 'operator\'s dev server', 'No `--force`', 'no `--no-verify`',

@@ -22,7 +22,7 @@ function repository({ mainFirst = true, conflict = false } = {}) {
   const main = commit(conflict ? 'src/x.txt' : 'unrelated.txt', 'main change\n');
   git('update-ref', 'refs/remotes/origin/main', main);
   const diff = (sha) => git('diff', git('merge-base', main, sha), sha);
-  const humanClearance = latestHumanClearance([{ viewerDidAuthor: true, body: [buildReviewedShaMarker(a), buildReviewedDiffMarker(diff(a)), buildClearedHumanMarker('op')].join('\n') }]);
+  const humanClearance = latestHumanClearance([{ id: 'IC_clearance', author: { login: 'chalbert' }, body: [buildReviewedShaMarker(a), buildReviewedDiffMarker(diff(a)), buildClearedHumanMarker('op')].join('\n') }]);
   if (!mainFirst) git('checkout', '-q', 'lane');
   try { git('merge', '--no-ff', '--no-edit', mainFirst ? 'lane' : 'main'); }
   catch (e) { if (!conflict) throw e; commit('src/x.txt', 'resolved differently\n'); }
@@ -61,7 +61,7 @@ describe('shared carry proof against real git', () => {
     r.git('commit', '--allow-empty', '-qm', 'ci: recover missing PR checks');
     const head = r.git('rev-parse', 'HEAD');
     const evidence = r.evidence(head);
-    const comment = { viewerDidAuthor: true, body: [buildReviewedShaMarker(r.a),
+    const comment = { id: 'IC_clearance', author: { login: 'chalbert' }, body: [buildReviewedShaMarker(r.a),
       buildReviewedDiffMarker(r.evidence(r.a).headDiff), buildClearedHumanMarker('op')].join('\n') };
     const writer = vi.fn();
     let patchReads = 0;
@@ -71,6 +71,7 @@ describe('shared carry proof against real git', () => {
       return cmd === 'git' ? execFileSync(cmd, args, opts) : writer(cmd, args);
     };
     const result = applyHumanClearanceCarry({ evidence, exec, cwd: r.cwd, pr: 5414,
+      mechanicalCarry: { value: 'trust-drain-record', source: 'test' },
       setting: { value: true, source: 'test' }, netPatchSetting: { value: netPatch, source: 'test' }, log: () => {},
       readNumberingLiveEvidence: () => ({ headSha: head, comments: [comment], reviews: [] }) });
     expect(patchReads).toBe(netPatch ? 2 : 0);
@@ -81,7 +82,7 @@ describe('shared carry proof against real git', () => {
       expect(writer).toHaveBeenCalledTimes(1);
       const [cmd, args] = writer.mock.calls[0];
       expect([cmd, ...args.slice(0, 2)]).toEqual(['gh', 'pr', 'comment']);
-      expect(latestHumanClearance([{ viewerDidAuthor: true, body: args.at(-1) }])).toMatchObject({ sha: head, actor: 'op' });
+      expect(latestHumanClearance([comment, { viewerDidAuthor: true, author: { login: 'web-everything' }, body: args.at(-1) }])).toMatchObject({ sha: head, actor: 'op' });
     }
   });
   it.each(['missing fingerprint', 'mismatched head', 'unknown head', 'unreadable diff', 'unknown equivalence'])('never calls the writer for %s', (kind) => {

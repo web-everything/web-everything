@@ -33,7 +33,7 @@ const rec = { version: 1, repo, pr: 7, head, runId, reviewer, authorBody: '<!-- 
   rulings: [{ id: `${runId}:0`, key, reviewerId: reviewer.id, lens: 'correctness', result: 'block', rationale: 'gap', evidence: ['d'] }] };
 const comments = [gh(renderReferralRecord(rec))];
 const readCtx = (over = {}) => ({ head, ...openReferralFindings({ comments, repo, pr: 7, head, body: rec.authorBody, cardReadable: () => true }),
-  card: null, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
+  identity: { login: 'chalbert', type: 'User' }, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
 const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'block', actor: 'chalbert', channel: 'chat', reason: 'Fix it', ...over });
 
 /** Run the operation's write step's effects through the real sinks, in order, as the runner would. */
@@ -43,8 +43,8 @@ async function drive({ ruling = 'block', card = null, appendEvents, thread = { h
   const op = recordReferralRulingOperation({ readRulingContext: () => readCtx({ card }) });
   const effects = op.steps.find((x) => x.name === 'write').step.effects({ verdict: plan, input: {} });
   const sinks = createRecordReferralRulingSinks({
-    readJson: () => structuredClone(thread),
-    post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+    readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
+    post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, 'chalbert')); },
     readPr: () => ({ headRefOid: head, labels: labels.map((name) => ({ name })) }),
     runSetLabel: () => '{"ok":true}',
     setLabels: () => {},
@@ -94,11 +94,11 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     const posts = [];
     const attempted = [];
     const sinks = createRecordReferralRulingSinks({
-      readJson: () => ({ headRefOid: head, comments: [] }), post: (_r, _p, b) => posts.push(b),
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, comments: [] }), post: (_r, _p, b) => posts.push(b),
       appendEvents: (list) => { attempted.push(...list.map((e) => e.findingKey)); throw new Error('transport down'); },
       warn: () => {}, now: () => '2026-10-04T14:31:00Z',
     });
-    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'chalbert', channel: 'chat',
       rulings: [{ key: 'k1', result: 'card' }, { key: 'k2', result: 'not-real' }] })).rejects.toThrow(/does not clear/);
     expect(attempted).toEqual([ledgerFindingKey('k1')]);
     expect(posts).toEqual([]);
@@ -110,13 +110,13 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     const rec2 = { ...rec, referrals: [...rec.referrals, { key: key2, seat, original: f2, finding: normalizeFinding(f2) }], rulings: [] };
     const thread = { headRefOid: head, comments: [gh(renderReferralRecord(rec2))] };
     const ctx = () => ({ head, ...openReferralFindings({ comments: thread.comments, repo, pr: 7, head, body: rec2.authorBody, cardReadable: () => true }),
-      card: null, now: '2026-10-04T14:30:00Z', clearerId: 's' });
+      identity: { login: 'chalbert', type: 'User' }, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's' });
     const written = [];
     const posts = [];
     let failOn = ledgerFindingKey(key2);
     const sinks = createRecordReferralRulingSinks({
-      readJson: () => structuredClone(thread),
-      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
+      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, 'chalbert')); },
       readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
       appendEvents: (list) => {
         for (const e of list) {
@@ -155,12 +155,12 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
   it('wiring: a clearing row recorded and then a failed POST is reverted to a hold, so no clearing row stays live without a comment', async () => {
     const written = [];
     const sinks = createRecordReferralRulingSinks({
-      readJson: () => ({ headRefOid: head, comments: [] }),
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, comments: [] }),
       post: () => { throw new Error('gh: 502'); },
       appendEvents: (list) => { written.push(...list.map((e) => `${e.findingKey}:${e.ruling}`)); },
       warn: () => {}, now: () => '2026-10-04T14:31:00Z',
     });
-    const err = await sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+    const err = await sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'chalbert', channel: 'chat',
       rulings: [{ key: 'k1', result: 'card' }] }).then(() => null, (e) => e);
     expect(err?.message).toMatch(/gh: 502/);
     expect(err.message).toMatch(/reverted to a holding block ruling/);
@@ -170,12 +170,12 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
   it('wiring: a failed post of a HOLDING-only batch changes nothing in the ledger (no revert row)', async () => {
     const written = [];
     const sinks = createRecordReferralRulingSinks({
-      readJson: () => ({ headRefOid: head, comments: [] }),
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, comments: [] }),
       post: () => { throw new Error('gh: 502'); },
       appendEvents: (list) => { written.push(...list.map((e) => e.ruling)); },
       warn: () => {}, now: () => '2026-10-04T14:31:00Z',
     });
-    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'chalbert', channel: 'chat',
       rulings: [{ key: 'k1', result: 'block' }] })).rejects.toThrow(/gh: 502/);
     expect(written).toEqual([]);
   });
@@ -186,12 +186,12 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     const rec2 = { ...rec, referrals: [...rec.referrals, { key: key2, seat, original: f2, finding: normalizeFinding(f2) }], rulings: [] };
     const thread = { headRefOid: head, comments: [gh(renderReferralRecord(rec2))] };
     const ctx = () => ({ head, ...openReferralFindings({ comments: thread.comments, repo, pr: 7, head, body: rec2.authorBody, cardReadable: () => true }),
-      card: null, now: '2026-10-04T14:30:00Z', clearerId: 's' });
+      identity: { login: 'chalbert', type: 'User' }, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's' });
     const written = [];
     const posts = [];
     const sinks = createRecordReferralRulingSinks({
-      readJson: () => structuredClone(thread),
-      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+      readJson: (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : structuredClone(thread),
+      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body, 'chalbert')); },
       readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
       appendEvents: (list) => {
         for (const e of list) {
