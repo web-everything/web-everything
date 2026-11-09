@@ -185,10 +185,10 @@ function trueMainBase(git, head, mainTip, isAncestor) {
     const rebuildMerge = /^daemon-rebuild: merge overlay /.test(rest.join('\t'))
       && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length);
     if (!rebuildMerge) { base = sha; break; }
-    stripped.push(ps[1]);
+    stripped.push(...ps.slice(1));
     base = ps[0];
   }
-  // An overlay not (yet) in main keeps the strict floor: use the plain merge-base of the head.
+  // An overlay (or approved edge parent) not (yet) in main keeps the strict floor: use the plain merge-base of the head.
   if (stripped.some((o) => !isAncestor(o, mainTip))) base = head;
   if (!/^[0-9a-f]{40}$/.test(base ?? '')) return '';
   const mb = git(['merge-base', base, mainTip]);
