@@ -147,14 +147,14 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
  * The write-up is staged under the checkout that ran effect 0, but a `--resume` may run from another lane, whose
  * sidecar has no such file. The durable run record keeps the frozen `WRITE_UP` payload, so a missing file is
  * regenerated from it (same bytes the first stage wrote), and a staged file that differs from the frozen payload is
- * rewritten from it. A record with no matching write-up changes nothing; an unreadable record refuses (not-applied).
+ * rewritten from it. A missing, unreadable or write-up-less record refuses (not-applied): the frozen payload is the only evidence.
  *
  * @returns {string} the body path (whether or not it could be recovered).
  */
 export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   const path = reviewBodyPath({ root, runId, bodyFile });
   // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included.
-  for (const part of [join(root, '.operations'), reviewSidecarDir(root), dirname(path)]) {
+  for (const part of [join(root, '.operations'), reviewSidecarDir(root), dirname(path), path]) {
     let link = false;
     try { link = lstatSync(part).isSymbolicLink(); } catch { /* not created yet */ }
     if (link) throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
@@ -166,9 +166,8 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
   }
   const entry = (record?.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string');
   // A record that exists but holds no matching write-up gives no evidence the staged bytes are the verdict.
-  if (!entry) {
-    if (record) throw notApplied(`the run record for ${runId} holds no frozen write-up for ${bodyFile}; refusing to publish an unverified staged file`, {});
-    return path;
+  if (!entry || !entry.payload.body.trim()) {
+    throw notApplied(`the run record for ${runId} ${record ? 'holds no frozen write-up' : 'was not found'} for ${bodyFile}; refusing to publish an unverified staged file`, {});
   }
   // The frozen payload is the durable truth: a missing, truncated or altered staged file is rewritten from it.
   let current = null;

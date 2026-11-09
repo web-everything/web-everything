@@ -30,7 +30,15 @@ import {
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
 } from '../review-pr-io.mjs';
-const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
+// The sinks now verify the staged body against the run record's frozen write-up. Fixtures that do not care default to a
+// record whose write-up equals whatever was staged under the fixture root (or 'Accept'); tests of the recovery itself
+// pass their own `runStore`.
+const fixtureRunStore = (root) => ({ read: (id) => {
+  let body = 'Accept';
+  try { body = readFileSync(join(root ?? '', '.operations', 'review', id, 'o-n-7-verdict.md'), 'utf8'); } catch { /* none staged */ }
+  return { id, effects: ['o-n-7-verdict.md', 'v.md'].map((bodyFile, i) => ({ key: `${id}#0#${i}`, type: 'review.write-up', status: 'applied', payload: { bodyFile, body: body || 'Accept' } })) };
+} });
+const createReviewPrSinks = (o = {}) => createSinks({ runStore: fixtureRunStore(o.root), readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.mjs';
@@ -494,15 +502,16 @@ describe('the label sink', () => {
     expect(readFileSync(path, 'utf8')).toBe('# frozen verdict');
   });
 
-  it('a symlinked staged file is replaced, never written through', async () => {
+  it('a symlinked staged file is refused, even when its contents match the frozen write-up', async () => {
     const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
-    const outside = join(root, 'outside.txt'); writeFileSync(outside, 'keep me');
+    const outside = join(root, 'outside.txt'); writeFileSync(outside, '# frozen verdict');
     mkdirSync(dirname(path), { recursive: true }); symlinkSync(outside, path);
+    const seen = [];
     const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
-      runNode: () => '{"ok":true,"pr":7,"to":"accepted"}' });
-    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
-    expect(readFileSync(outside, 'utf8')).toBe('keep me');
-    expect(readFileSync(path, 'utf8')).toBe('# frozen verdict');
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(readFileSync(outside, 'utf8')).toBe('# frozen verdict');
   });
 
   it('a symlinked run directory is refused: nothing is written outside the sidecar', async () => {
