@@ -13,4 +13,9 @@ it('setting parses, bad value falls back to 30 min', () => {
   expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '900000' })).toBe(900000);
   expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '0' })).toBe(600000);
   expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: 'x' })).toBe(1_800_000);
+  expect(foreignHostStaleMs({})).toBe(1_800_000);
+});
+it('any value below the 10 minute floor is raised to it', () => {
+  for (const v of ['1', '60000', '599999']) expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: v })).toBe(600_000);
+  expect(foreignHostStaleMs({ WE_RED_TEAM_FOREIGN_HOST_STALE_MS: '600001' })).toBe(600_001);
 });

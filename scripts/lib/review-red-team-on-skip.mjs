@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
+import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
@@ -76,9 +76,11 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
       // evidence reader uses, so recovery and the reader never disagree. An unprobeable owner stays held.
       try {
         // Our own abandonment rewrites the file and resets the mtime this rule reads, so a foreign-host abandonment whose
-        // marker still binds this exact writer and evidence stays proven dead (it was proven under the claim).
+        // marker still binds this exact writer AND evidence stays proven dead (it was proven under the claim). It is still
+        // probed: a pid that is alive here with its recorded birth time keeps the record held, and a throwing probe holds it.
         const m = w.markers.redispatch;
-        dead = Boolean(raw.staleAbandoned && raw.host && raw.host !== probe.host && m?.writer === w.rawWriter.sha256 && m?.evidence === w.evidenceSha256)
+        const boundAbandonment = Boolean(raw.staleAbandoned && raw.host && raw.host !== probe.host && m?.writer === w.rawWriter.sha256 && m?.evidence === w.evidenceSha256);
+        dead = (boundAbandonment && !localPidLive(raw, { isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) }))
           || foreignStaleOwnerDead(raw, { host: probe.host, namespace: probe.namespace, statusAt: w.statusAt, now, env, isAlive: probe.isAlive, readPidStart: probe.readPidStart ?? (() => null) });
       } catch { dead = false; }
     }

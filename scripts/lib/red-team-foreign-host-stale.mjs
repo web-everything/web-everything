@@ -22,6 +22,11 @@ export function foreignHostDead(status, { host, statusAt, now = Date.now(), env 
 export function foreignStaleOwnerDead(status, { host, namespace, statusAt, now = Date.now(), env = process.env, isAlive, readPidStart } = {}) {
   if (!foreignHostDead(status, { host, statusAt, now, env })) return false;
   if (status.pidNamespace != null && status.pidNamespace !== namespace) return false;
-  const localPidLive = isAlive(status.pid) && (!status.pidStart || (readPidStart(status.pid) ?? status.pidStart) === status.pidStart);
-  return !localPidLive;
+  return !localPidLive(status, { isAlive, readPidStart });
+}
+
+// True while the recorded pid is alive here with the recorded birth time. An unreadable birth time keeps it live; a probe
+// that throws propagates so the caller holds the record.
+export function localPidLive(status, { isAlive, readPidStart }) {
+  return Boolean(isAlive(status.pid)) && (!status.pidStart || (readPidStart(status.pid) ?? status.pidStart) === status.pidStart);
 }

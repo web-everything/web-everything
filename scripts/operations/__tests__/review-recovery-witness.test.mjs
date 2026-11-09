@@ -650,12 +650,75 @@ describe('stale record owned by a foreign host name', () => {
     expect(recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env }))
       .toMatchObject({ mode: 'fresh', abandon: false });
   });
-  it('does not treat an abandonment whose marker no longer binds the writer as proof of death', () => {
+  // After the abandonment the file is freshly rewritten, so the stale-age rule cannot kill it: only the marker-binding shortcut
+  // can. Each clause of that shortcut (writer, evidence) is therefore defended by its own test that tampers with ONLY that field.
+  const abandoned = () => {
     const f = fixture({ foreign: true });
     stale(f);
     expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
-    writeFileSync(`${f.path}.stale-redispatch-1`, JSON.stringify({ writer: 'x'.repeat(64), evidence: 'y', priorWriter: 'z', abandonedAt: new Date().toISOString() }));
-    expect(recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env }))
+    const markerPath = `${f.path}.stale-redispatch-1`, marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+    const plan = () => recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env });
+    expect(marker.writer).toBe(f.readWitness().rawWriter.sha256);
+    expect(marker.evidence).toBe(f.readWitness().evidenceSha256);
+    expect(plan()).toMatchObject({ mode: 'fresh', abandon: false });
+    return { f, markerPath, marker, plan };
+  };
+  it('does not treat an abandonment whose marker names a different writer as proof of death', () => {
+    const { markerPath, marker, plan } = abandoned();
+    writeFileSync(markerPath, JSON.stringify({ ...marker, writer: 'x'.repeat(64) }));
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('does not treat an abandonment whose marker names different evidence as proof of death', () => {
+    const { markerPath, marker, plan } = abandoned();
+    writeFileSync(markerPath, JSON.stringify({ ...marker, evidence: 'y'.repeat(64) }));
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('does not treat an abandonment with no marker as proof of death', () => {
+    const { f, markerPath, plan } = abandoned();
+    rmSync(markerPath);
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    expect(f.readWitness().markers.redispatch).toBeNull();
+  });
+  it('does not treat a bound abandonment as proof of death while its pid is alive here with the recorded birth time', () => {
+    const { f, plan } = abandoned();
+    writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, pidStart: 'birth-a' }));
+    const marker = JSON.parse(readFileSync(`${f.path}.stale-redispatch-1`, 'utf8'));
+    writeFileSync(`${f.path}.stale-redispatch-1`, JSON.stringify({ ...marker, writer: f.readWitness().rawWriter.sha256 }));
+    f.probe.isAlive = () => true; f.probe.readPidStart = () => 'birth-a';
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    f.probe.readPidStart = () => 'birth-b';
+    expect(plan()).toMatchObject({ mode: 'fresh' });
+  });
+
+  // The planner-side "pid alive here" rule for a stale foreign-host record that DOES carry a birth time: a matching birth time
+  // holds, a verified mismatch (pid reuse) recovers, and an unreadable birth time (null or a throwing probe) holds.
+  describe('with a recorded birth time and the pid alive here', () => {
+    const recent = () => new Date(Date.now() - 60_000).toISOString();
+    const withBirth = (readPidStart) => {
+      const f = fixture({ foreign: true });
+      f.probe.isAlive = () => true; f.probe.readPidStart = readPidStart;
+      return stale(f, { pidStart: recent() });
+    };
+    it('holds on a matching birth time', () => {
+      let birth; const f = fixture({ foreign: true });
+      birth = recent(); f.probe.isAlive = () => true; f.probe.readPidStart = () => birth;
+      expect(stale(f, { pidStart: birth })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    });
+    it('recovers on a verified birth-time mismatch (pid reuse)', () => {
+      expect(withBirth(() => 'a different birth time')).toMatchObject({ mode: 'fresh', abandon: true });
+    });
+    it('holds when the birth time is unreadable', () => {
+      expect(withBirth(() => null)).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    });
+    it('holds when the birth-time probe throws', () => {
+      expect(withBirth(() => { throw Error('ps failed'); })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    });
+  });
+  it('holds a stale foreign-host record whose status mtime is unreadable', () => {
+    const f = fixture({ foreign: true });
+    stale(f);
+    const w = { ...f.readWitness(), statusAt: undefined };
+    expect(recovery.planRedTeamRecovery(w, { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env }))
       .toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
   });
   it('holds a fresh foreign-host record', () => {
