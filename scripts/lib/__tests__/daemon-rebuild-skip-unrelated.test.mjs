@@ -207,12 +207,12 @@ describe('decideSkipRebuild / resolveSkipUnrelated', () => {
     expect(decideSkipRebuild({ changedFiles: null, closure }).skip).toBe(false);
     expect(decideSkipRebuild({ changedFiles: ['docs/a.md'], closure: { ...closure, complete: false } }).skip).toBe(true);
     expect(decideSkipRebuild({ changedFiles: ['scripts/other.mjs'], closure: { ...closure, complete: false } }).skip).toBe(false);
-  }, 60000);
+  });
   it('knob: default on, env turns off', () => {
     expect(resolveSkipUnrelated({}, { path: '/nonexistent' })).toBe(true);
     expect(resolveSkipUnrelated({ WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' })).toBe(false);
     expect(resolveSkipUnrelated({})).toBe(true);
-  }, 60000);
+  });
 });
 
 // ── review round 1 (#4272): the skip must consider the WHOLE smoke surface, not the caller's closure alone ──────
@@ -226,7 +226,7 @@ describe('the skip decision covers everything the shared candidate smoke exercis
     expect(surface).toContain('scripts/conveyor/reconcile-pass.mjs');
     expect(surface).toContain('scripts/lib/daemon-live-smoke.mjs');
     expect(smokeSurfaceEntries({ WE_SMOKE_DAEMON_ENTRIES: 'x/extra-daemon.mjs' })).toContain('x/extra-daemon.mjs');
-  }, 60000);
+  });
 
   it.each([
     ['a sibling daemon entry', 'skills-src/conveyor/review-daemon.mjs'],
@@ -279,7 +279,7 @@ describe('a file the daemon can run or read without importing it is never "unrel
   });
   it('plain docs/backlog markdown still skips', () => {
     expect(decideSkipRebuild({ changedFiles: ['docs/a.md', 'backlog/1-x.md'], closure }).skip).toBe(true);
-  }, 60000);
+  });
 });
 
 describe('a rename out of the closure is not hidden', () => {
@@ -444,7 +444,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     expect(check(['scripts/lib/helper.mjs']).skip).toBe(false);
     expect(check(['scripts/other.mjs']).skip).toBe(true); // a code file nobody runs still skips
     expect(check(['docs/a.md']).skip).toBe(true);
-  }, 60000);
+  });
 
   it('variants: join(__dirname, x), a repo-relative literal, a template literal, .js/.cjs, a spawn of a spawn', () => {
     const check = treeCheck({
@@ -466,12 +466,12 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     for (const f of ['viadir.mjs', 'tools/rel.mjs', 'tpl.cjs', 'plain.js', 'hop1.mjs', 'hop2.mjs', 'deep.mjs']) {
       expect(check([`scripts/${f}`]).skip, f).toBe(false);
     }
-  }, 60000);
+  });
 
   it('a spawned script the move ADDS (absent before it) is still relevant', () => {
     const check = treeCheck({ 'scripts/d.mjs': spawnUrl });
     expect(check(['scripts/child.mjs']).skip).toBe(false);
-  }, 60000);
+  });
 
   /** Same, but the tree is a git repo: the basename fallback for a path assembled from pieces reads `git ls-files`. */
   function gitTreeCheck(files, entries = ['scripts/d.mjs'], extra = {}) {
@@ -492,7 +492,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     expect(check(['scripts/tools/c.mjs']).skip).toBe(false);
     expect(check(['scripts/lib/helper.mjs']).skip).toBe(false); // the only change is the child's own import
     expect(check(['scripts/lib/unrelated.mjs']).skip).toBe(true);
-  }, 60000);
+  });
 
   it('a shell command string with arguments (exec("node scripts/x.mjs --flag")) and a query suffix are scanned', () => {
     const check = gitTreeCheck({
@@ -502,7 +502,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
       'scripts/y.mjs': '1;\n',
     });
     for (const f of ['x.mjs', 'xdep.mjs', 'y.mjs']) expect(check([`scripts/${f}`]).skip, f).toBe(false);
-  }, 60000);
+  });
 
   it('a package.json scripts entry names a script the daemon runs by name', () => {
     const check = gitTreeCheck({
@@ -511,7 +511,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
       'scripts/sweep.mjs': '1;\n',
     });
     expect(check(['scripts/sweep.mjs']).skip).toBe(false);
-  }, 60000);
+  });
 
   it('code after a leading block comment on the same line is scanned; a wholly-prose line is not', () => {
     const check = treeCheck({
@@ -521,19 +521,19 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     });
     expect(check(['scripts/live.mjs']).skip).toBe(false);
     expect(check(['scripts/dead.mjs']).skip).toBe(true);
-  }, 60000);
+  });
 
   it('path text is compared case- and Unicode-form-insensitively (git spelling vs the closure spelling)', () => {
     const closure = { complete: true, files: new Set(['scripts/Child.mjs', 'scripts/caf\u00e9.mjs']), bareDeps: false, jsonNames: new Set(), spawnedNames: new Set(['x.mjs']) };
     expect(decideSkipRebuild({ changedFiles: ['scripts/child.mjs'], closure }).skip).toBe(false);
     expect(decideSkipRebuild({ changedFiles: ['scripts/cafe\u0301.mjs'], closure }).skip).toBe(false);
     expect(decideSkipRebuild({ changedFiles: ['scripts/X.MJS'], closure }).skip).toBe(false);
-  }, 60000);
+  });
 
   it('a .ts file nothing imports is never "unrelated" (it can be run directly)', () => {
     const closure = { complete: true, files: new Set(['scripts/d.mjs']), bareDeps: false, jsonNames: new Set() };
     expect(decideSkipRebuild({ changedFiles: ['scripts/tool.ts'], closure }).skip).toBe(false);
-  }, 60000);
+  });
 
   it('an unreadable closure file makes the closure incomplete: any code file takes the smoke', () => {
     const check = treeCheck({ 'scripts/d.mjs': spawnUrl, 'scripts/other.mjs': '1;\n' });
@@ -544,13 +544,13 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     expect(check(['scripts/other.mjs']).skip).toBe(true);
     expect(broken(['scripts/other.mjs']).skip).toBe(false);
     expect(broken(['docs/a.md']).skip).toBe(true);
-  }, 60000);
+  });
 
   it('the pure decision honours closure.spawnedNames and still skips unrelated code', () => {
     const closure = { complete: true, files: new Set(['scripts/d.mjs']), bareDeps: false, jsonNames: new Set(), spawnedNames: new Set(['child.mjs']) };
     expect(decideSkipRebuild({ changedFiles: ['scripts/child.mjs'], closure }).skip).toBe(false);
     expect(decideSkipRebuild({ changedFiles: ['scripts/other.mjs'], closure }).skip).toBe(true);
-  }, 60000);
+  });
 
   it('end to end through rebuildClone: a move changing only a spawned sibling is smoked', async () => {
     const f = makeFixture();
