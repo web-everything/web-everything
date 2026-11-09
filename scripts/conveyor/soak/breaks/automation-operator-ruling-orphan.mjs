@@ -27,7 +27,9 @@ export default {
     const body = '<!-- authored-by-actor: author -->';
     const card = 'we:backlog/x1b8hlo-follow-up.md';
     const cardReadable = ref => ref === card;
-    const comment = (at, body) => ({ createdAt: `2026-10-25T${at}:00Z`, body, author: { login: 'web-everything' } });
+    // The live PR #5925 thread as `gh pr view --json comments` reads it: never edited (`includesCreatedEdit: false`),
+    // which an unstamped automation-posted ruling needs to clear (PR #6529).
+    const comment = (at, body) => ({ createdAt: `2026-10-25T${at}:00Z`, includesCreatedEdit: false, body, author: { login: 'web-everything' } });
     const runId = 'review-pr-5925', seat = 'judgeCorrectnessAdvisory';
     const reviewer = mandatoryReferralReviewer(runId);
     const original = { summary: 'referral bounce', file: 'scripts/x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };

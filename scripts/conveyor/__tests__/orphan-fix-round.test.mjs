@@ -18,7 +18,9 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 import * as referralGate from '../../operations/record-referral-ruling.mjs';
 
 const BOT = { login: 'web-everything' };
-const c = (createdAt, body, author = BOT) => ({ createdAt, body, author });
+// Never-edited comments, as a live `gh pr view --json comments` read reports them; an unstamped automation-posted
+// operator ruling needs that proof to clear (PR #6529).
+const c = (createdAt, body, author = BOT) => ({ createdAt, includesCreatedEdit: false, body, author });
 const NOW = Date.parse('2026-10-10T15:48:00Z');
 const HEAD = '124e242dac0adc572aaa013a35ff007b8e6f859a';
 const VERDICT = c('2026-10-09T22:42:48Z', `${CHANGES_VERDICT_PREFIX}\n\nRecorded by agent.\n\nNet basis: \`0c6c1fb5caf43602aeff444ed5731b4c39e1c1ec..d9829f557f3f264ac885722cb9afef18bd91ca7f\` (rev at review time)`);
