@@ -40,7 +40,7 @@ function writeFixture(root, path, source) {
 }
 
 // The minimal soak tree: its config plus the runtime copy list (red-green.mjs#RUNTIME_PATHS).
-function soakFixture(root, runtimePaths = []) {
+function soakFixture(root, runtimePaths = ['runtime/neutral.json']) {
   writeFixture(root, 'vitest.soak.config.ts', 'export default {};\n');
   writeFixture(root, 'scripts/conveyor/soak/red-green.mjs',
     `export const RUNTIME_PATHS = Object.freeze(${JSON.stringify(runtimePaths)});\n`);
@@ -254,6 +254,50 @@ describe('soak scope', () => {
     expect(soakScopeRun({ root, changed: ['backlog/1-x.md'] })).toBe(true);
     expectCliOutput(runCli('backlog/1-x.md\n', root), 'run=true');
   }, 30_000);
+
+  // Any list shape that could hide an entry must fail open rather than parse partially.
+  it.each([
+    ['a spread entry', "export const RUNTIME_PATHS = Object.freeze([...BASE, 'a.json']);"],
+    ['a template entry', "export const RUNTIME_PATHS = Object.freeze([`schemas/${v}.json`, 'a.json']);"],
+    ['an empty list', 'export const RUNTIME_PATHS = Object.freeze([]);'],
+    ['a second definition', "export const RUNTIME_PATHS = Object.freeze(['a.json']);\nRUNTIME_PATHS = ['b.json'];"],
+    ['a bracket inside an entry', "export const RUNTIME_PATHS = Object.freeze(['a]b.json', 'c.json']);"],
+    ['an entry that is not a string', "export const RUNTIME_PATHS = Object.freeze(['a.json', B]);"],
+  ])('fails open (run=true) on a runtime copy list with %s', (_name, source) => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/red-green.mjs', `${source}\n`);
+    expect(soakScopeRun({ root, changed: ['backlog/1-x.md'] })).toBe(true);
+  });
+
+  it('reads the exported runtime copy list, not an earlier prefixed identifier', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/red-green.mjs',
+      "const OLD_RUNTIME_PATHS = Object.freeze([]);\nexport const RUNTIME_PATHS = Object.freeze(['schemas/a.json']);\n");
+    expect(computeSoakClosure({ root }).has('schemas/a.json')).toBe(true);
+    expect(soakScopeRun({ root, changed: ['backlog/1-x.md'] })).toBe(false);
+  });
+
+  it('accepts the plain runtime copy list shape', () => {
+    const root = fixtureRoot();
+    soakFixture(root, ['a.json', 'schemas/b.json']);
+    expect(soakScopeRun({ root, changed: ['schemas/b.json'] })).toBe(true);
+    expect(soakScopeRun({ root, changed: ['backlog/1-x.md'] })).toBe(false);
+  });
+
+  it('follows a file-relative new URL literal without a ./ prefix', () => {
+    const root = fixtureRoot();
+    soakFixture(root);
+    writeFixture(root, 'scripts/conveyor/soak/a.soak.test.mjs', "import '../../../fixture/loader.mjs';\n");
+    // Outside the soak seed, so only the new URL literal can bring data.json in.
+    writeFixture(root, 'fixture/loader.mjs',
+      "readFileSync(new URL('data.json', import.meta.url)); new URL('https://example.test/x');\n");
+    writeFixture(root, 'fixture/data.json', '{}\n');
+    const closure = computeSoakClosure({ root });
+    expect(closure.has('fixture/data.json')).toBe(true);
+    expect([...closure].some((path) => path.includes('example.test'))).toBe(false);
+  });
 
   it('follows a percent-encoded import URL to the decoded file', () => {
     const root = fixtureRoot();

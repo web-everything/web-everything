@@ -81,10 +81,16 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
   add(config);
   // The files the soak world copies by name (red-green.mjs#RUNTIME_PATHS, which mirrors
   // sim/world.mjs#buildWeTemplate) are in scope even when a PR deletes one. Folders in that
-  // list are covered by the import graph. A list that cannot be read fails open (run=true).
-  const runtime = /RUNTIME_PATHS\s*=\s*Object\.freeze\(\[([^\]]*)\]\)/.exec(
-    readFileSync(resolve(root, 'scripts/conveyor/soak/red-green.mjs'), 'utf8'));
-  if (!runtime) throw new Error('Unreadable soak runtime path list');
+  // list are covered by the import graph. The list must be exactly one non-empty array of
+  // plain quoted strings: a spread, a template entry or a second definition could hide entries,
+  // so any other shape throws and the CLI requests the soak (run=true).
+  const runtimeSource = readFileSync(resolve(root, 'scripts/conveyor/soak/red-green.mjs'), 'utf8');
+  const definitions = [...runtimeSource.matchAll(/\bRUNTIME_PATHS\s*=(?!=)/g)].length;
+  const runtime = /^export const RUNTIME_PATHS = Object\.freeze\(\[([^\]]*)\]\);$/m.exec(runtimeSource);
+  const ENTRY = String.raw`\s*(?:'[^'"\\\r\n$]+'|"[^'"\\\r\n$]+")\s*`;
+  if (definitions !== 1 || !runtime || !new RegExp(`^(?:${ENTRY},)*${ENTRY},?\\s*$`).test(runtime[1])) {
+    throw new Error('Unreadable soak runtime path list');
+  }
   for (const [, , path] of runtime[1].matchAll(/(['"])([^'"]+)\1/g)) {
     const target = resolve(root, path);
     if (!inside(target)) continue;
@@ -106,6 +112,12 @@ export function computeSoakClosure({ root = DEFAULT_ROOT } = {}) {
     for (const match of source.matchAll(/(?:\bfrom|\bimport(?:\s*\()?|\brequire\s*\()\s*(?=(['"`])([^'"`\r\n]+)\1)/g)) {
       for (const form of forms(match[2])) {
         if (isRelative(form)) follow(resolve(dirname(file), form));
+      }
+    }
+    // `new URL('data.json', import.meta.url)` is file-relative without a `./` prefix.
+    for (const match of source.matchAll(/\bnew\s+URL\s*\(\s*(?=(['"`])([^'"`\r\n]+)\1)/g)) {
+      for (const form of forms(match[2])) {
+        if (!/^[a-z][a-z0-9+.-]*:|^\/|\$\{/i.test(form)) follow(resolve(dirname(file), form));
       }
     }
     for (const match of source.matchAll(/(['"`])([^'"`\r\n]+)\1/g)) {
