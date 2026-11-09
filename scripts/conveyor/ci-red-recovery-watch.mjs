@@ -1332,7 +1332,7 @@ export function restackStackedPr(d, {
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
  *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
- *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps only ruleset-only candidates across SHAs.
+ *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps ruleset-only candidates and label recovery across SHAs.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepMissingRunRecovery({
@@ -1387,9 +1387,11 @@ export function sweepMissingRunRecovery({
   // Every per-candidate extra read below only runs for a PR {@link buildMissingRunCandidates} already narrowed
   // to (zero required-check rollup entries at all) — mirrors {@link sweepCiRedRecovery}/{@link sweepHungCiRecovery}'s
   // own "pay for it only when needed" discipline; never one extra `gh` call per ordinary open PR on every tick.
+  const commentsByPr = new Map();
   const candidates = rawCandidates.map((c) => {
     const headCommittedAt = readPush({ repo: repoSlug(repo), pr: c.prNumber, head: c.headSha })?.pushedAt ?? readHeadCommittedAt(c.headSha, { repo });
     const comments = readComments(c.prNumber, { repo });
+    commentsByPr.set(c.prNumber, comments);
     return {
       ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch }),
       // Bound checks discovered only by the ruleset expansion across pushes. Classic/declared candidates
@@ -1431,6 +1433,21 @@ export function sweepMissingRunRecovery({
         } catch { /* Unavailable evidence leaves the existing recovery path in charge. */ }
         if (decision?.action === 'retrigger' && workflowRuns.some(run => run.name === 'Merge gate'
           && run.event === 'pull_request_target' && run.conclusion === 'startup_failure')) {
+          // Label recovery owns this head for the sweep, including capped or spent claims.
+          // Re-apply both caps to durable markers, even for classic candidates whose
+          // push recovery budget is only per-SHA or refunds an earlier main state.
+          const comments = commentsByPr.get(d.prNumber);
+          const shaAttempts = countMissingRunComments(comments, d.headSha, { defaultBranch });
+          const prAttempts = countMissingRunComments(comments, null, { defaultBranch });
+          if (shaAttempts >= maxRetriesPerSha || prAttempts >= maxRetriesPerPr) {
+            const perSha = shaAttempts >= maxRetriesPerSha;
+            plan.refusals.push({ ...d,
+              kind: perSha ? 'missing-run-cap-exhausted' : 'missing-run-pr-cap-exhausted',
+              attempts: perSha ? shaAttempts : prAttempts,
+              why: `PR #${d.prNumber} exhausted its ${perSha ? 'per-SHA' : 'PR-wide'} missing-run retry cap (${perSha ? maxRetriesPerSha : maxRetriesPerPr}) — needs human/ci-heal inspection`,
+            });
+            continue;
+          }
           let result;
           try {
             result = labelRetrigger({ repo: repoSlug(repo), pr: d.prNumber, head: d.headSha,
@@ -1442,13 +1459,9 @@ export function sweepMissingRunRecovery({
             repo, headRefName: d.headRefName, headSha: d.headSha, mainGreen,
             ok: result?.ok === true, action: 'label-event', error: result?.error ?? null,
           });
-          // Only a submitted label event completes recovery. Failed attempts retain their
-          // ledger claim, so both failures and spent claims must allow existing recovery.
-          if (result?.ok === true) {
-            applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
-              action: 'label-retrigger', labelCleared: false, ...result });
-            continue;
-          }
+          applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
+            action: 'label-retrigger', labelCleared: false, ...result });
+          continue;
         }
       }
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the

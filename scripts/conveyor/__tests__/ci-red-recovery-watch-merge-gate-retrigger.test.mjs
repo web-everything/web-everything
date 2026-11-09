@@ -22,7 +22,9 @@ function fixture() {
   const labelPair = vi.fn();
   // Model the injected writer's once-only contract, retaining its ledger across sweeps.
   const labelRetrigger = vi.fn(({ repo, pr, head, context, ledger }) => {
-    if (!ledger.claim({ repo, pr, head, context })) return { ok: true, deferred: true };
+    if (!ledger.claim({ repo, pr, head, context })) return {
+      ok: false, deferred: true, action: 'label-retrigger', error: 'retrigger already spent or claim unavailable',
+    };
     labelPair({ repo, pr, head, context });
     return { ok: true, action: 'label-retrigger' };
   });
@@ -131,8 +133,68 @@ describe('missing-run sweep merge-gate label recovery', () => {
     const f = fixture();
     sweepMissingRunRecovery({ ...f.options, apply: true });
     expect(f.labelPair).toHaveBeenCalledTimes(1);
-    sweepMissingRunRecovery({ ...f.options, apply: true });
+    const second = sweepMissingRunRecovery({ ...f.options, apply: true });
+    expect(second.applied).toEqual([expect.objectContaining({
+      ok: false, deferred: true, action: 'label-retrigger', error: 'retrigger already spent or claim unavailable',
+    })]);
     expect(f.labelPair).toHaveBeenCalledTimes(1);
+    expect(f.trigger).not.toHaveBeenCalled();
+    expect(f.restack).not.toHaveBeenCalled();
+  });
+
+  it.each(['failure', 'throw'])('failed label attempt does not fall through to push recovery: %s', outcome => {
+    const f = fixture();
+    f.labelRetrigger.mockImplementation(() => {
+      if (outcome === 'throw') throw new Error('label rejected');
+      return { ok: false, action: 'label-retrigger', error: 'label rejected' };
+    });
+    const result = sweepMissingRunRecovery({ ...f.options, apply: true });
+    expect(result.applied).toEqual([expect.objectContaining({
+      ok: false, action: 'label-retrigger', error: 'label rejected', labelCleared: false,
+    })]);
+    expect(f.postComment).toHaveBeenCalledTimes(1);
+    expect(f.trigger).not.toHaveBeenCalled();
+    expect(f.restack).not.toHaveBeenCalled();
+    expect(f.clearLabel).not.toHaveBeenCalled();
+  });
+
+  it('already-claimed head does not fall through to push recovery', () => {
+    const f = fixture();
+    f.retriggerLedger.claim({ repo: REPO, pr: 5060, head: HEAD, context: 'merge-gate' });
+    const result = sweepMissingRunRecovery({ ...f.options, apply: true });
+    expect(result.applied).toEqual([expect.objectContaining({
+      ok: false, deferred: true, action: 'label-retrigger', error: 'retrigger already spent or claim unavailable',
+    })]);
+    expect(f.labelPair).not.toHaveBeenCalled();
+    expect(f.trigger).not.toHaveBeenCalled();
+    expect(f.restack).not.toHaveBeenCalled();
+    expect(f.clearLabel).not.toHaveBeenCalled();
+  });
+
+  it.each(['per-SHA', 'PR-wide'])('caps of 1 refuse a second label attempt: %s', cap => {
+    const f = fixture();
+    const comments = [];
+    f.postComment.mockImplementation((_pr, options) => comments.push({
+      body: buildMissingRunComment(options), author: { login: 'web-everything' },
+    }));
+    // Missing a classic check too: the general planner exempts these from the PR-wide cap.
+    const readOpenPrs = f.options.readOpenPrs;
+    let head = HEAD;
+    const options = { ...f.options, apply: true, readComments: () => comments,
+      readOpenPrs: () => readOpenPrs().map(pr => ({ ...pr, headRefOid: head,
+        statusCheckRollup: pr.statusCheckRollup.filter(row => row.name !== 'test'),
+      })), maxRetriesPerSha: cap === 'per-SHA' ? 1 : 10, maxRetriesPerPr: 1 };
+    sweepMissingRunRecovery(options);
+    if (cap === 'PR-wide') head = 'b'.repeat(40);
+    const second = sweepMissingRunRecovery(options);
+    expect(second.refusals).toContainEqual(expect.objectContaining({
+      kind: cap === 'per-SHA' ? 'missing-run-cap-exhausted' : 'missing-run-pr-cap-exhausted', attempts: 1,
+      why: expect.stringMatching(/human\/ci-heal/),
+    }));
+    expect(second.applied).toEqual([]);
+    expect(f.labelRetrigger).toHaveBeenCalledTimes(1);
+    expect(f.labelPair).toHaveBeenCalledTimes(1);
+    expect(f.postComment).toHaveBeenCalledTimes(1);
     expect(f.trigger).not.toHaveBeenCalled();
     expect(f.restack).not.toHaveBeenCalled();
   });
