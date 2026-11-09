@@ -42,6 +42,7 @@ describe('red-team check run contract', () => {
 
   describe('publishRedTeamCheckFromLive', () => {
     const resultComment = (rev = HEAD) => ({ author: { login: 'web-everything', type: 'Bot' },
+      created_at: '2026-11-07T12:00:00Z',
       body: renderRedTeamComment({ pr: 7, rev, provider: 'codex', model: 'fixture',
         findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
     // Reader contract: live PR object, complete comment array, verified standing-ruling scope.
@@ -63,6 +64,62 @@ describe('red-team check run contract', () => {
     const posts = io => io.gh.mock.calls.filter(([args]) => args.includes('POST'));
     const payloads = io => posts(io).map(([, options]) => JSON.parse(options.input));
     const publish = io => api.publishRedTeamCheckFromLive(io);
+
+    it.each([
+      ['older result', '2026-11-07T09:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', false],
+      ['newer result', '2026-11-07T12:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', true],
+      ['equal timestamps', '2026-11-07T11:00:00Z', '2026-11-07T11:00:00Z', undefined, false],
+      ['missing result timestamp', undefined, '2026-11-07T11:00:00Z', undefined, false],
+      ['invalid result timestamp', 'unreadable', '2026-11-07T11:00:00Z', undefined, false],
+      ['missing run timestamps', '2026-11-07T12:00:00Z', undefined, undefined, false],
+      ['invalid completion timestamp', '2026-11-07T12:00:00Z', 'unreadable', '2026-11-07T08:00:00Z', false],
+      ['started_at fallback', '2026-11-07T12:00:00Z', undefined, '2026-11-07T11:00:00Z', true],
+    ])('requires a demonstrably newer trusted result before replacing failure: %s', async (_name, created_at, completed_at, started_at, ok) => {
+      const io = fixture();
+      io.readComments.mockReturnValue([{ ...resultComment(), created_at }]);
+      io.gh.mockImplementation(args => args.includes('POST') ? JSON.stringify({ id: 20 })
+        : JSON.stringify({ total_count: 1, check_runs: [run({ conclusion: 'failure', completed_at, started_at })] }));
+      expect(await publish(io)).toMatchObject({ ok });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
+    });
+
+    it('a newer untrusted or other-head result cannot date an older trusted live-head result', async () => {
+      const io = fixture();
+      io.readComments.mockReturnValue([
+        { ...resultComment(), created_at: '2026-11-07T09:00:00Z' },
+        { ...resultComment(), author: { login: 'outsider' } }, resultComment(OLD_HEAD),
+      ]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each([false, true])('failed failure supersede posts a second-channel hold and never throws (hold fails=%s)', async holdFails => {
+      const io = fixture();
+      const readGh = io.gh.getMockImplementation();
+      let posted = false;
+      io.gh.mockImplementation((args, options) => {
+        if (!args.includes('POST')) return readGh(args, options);
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
+          if (holdFails) throw Error('status write denied');
+          return '{}';
+        }
+        if (posted) throw Error('supersede write denied');
+        posted = true;
+        return JSON.stringify({ id: 20 });
+      });
+      io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
+        labels: posted ? ['red-team:blocked'] : [] }));
+      const out = await publish(io);
+      expect(out).toMatchObject({ ok: false });
+      expect(out.reason).toMatch(/red-team:blocked/);
+      expect(out.reason).toMatch(/supersede write denied/);
+      if (holdFails) expect(out.reason).toMatch(/status write denied/);
+      expect(posts(io).map(([args]) => args[1])).toEqual([
+        'repos/o/r/check-runs', 'repos/o/r/check-runs', `repos/o/r/statuses/${HEAD}`,
+      ]);
+      expect(payloads(io)[2]).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
+        description: expect.stringMatching(/^held:/) });
+    });
 
     it('posts exactly one head-bound success after reading live evidence and consulting the recorded-result hold', async () => {
       const io = fixture();

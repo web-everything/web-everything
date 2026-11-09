@@ -3,7 +3,8 @@ import { runGhSync } from './gh-throttle.mjs';
 import { readFileSync } from 'node:fs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { readRedTeamDisposition } from './red-team-gate.mjs';
+import { readRedTeamDisposition, parseRedTeamComment, redTeamResultId } from './red-team-gate.mjs';
+import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -132,6 +133,21 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
         throw Error('red-team check ordering unreadable; operator must inspect full check history');
       const latest = runs.sort((a, b) => b.id - a.id)[0];
       if (latest && latest.status !== 'completed') throw Error('red-team check run in progress or incomplete');
+      if (latest && latest.conclusion !== 'success') {
+        // Parsed dispositions omit comment metadata. Bind the clock evidence to the same trusted
+        // head/result, never a later unrelated comment. Ambiguous legacy timestamps cannot clear failure.
+        const resultId = redTeamResultId(disposition.result);
+        const dates = comments.filter(comment => {
+          if (!isTrustedMarkerAuthor(comment)) return false;
+          const parsed = parseRedTeamComment(comment?.body);
+          return parsed?.pr === Number(pr) && parsed.rev === headSha.toLowerCase()
+            && redTeamResultId(parsed) === resultId;
+        }).map(comment => Date.parse(commentCreatedAt(comment)));
+        const failedAt = Date.parse(latest.completed_at ?? latest.started_at);
+        if (!dates.length || dates.some(date => !Number.isFinite(date)) || !Number.isFinite(failedAt)
+          || Math.max(...dates) <= failedAt)
+          throw Error('trusted live result not demonstrably newer than failed check; operator must inspect result and run timestamps');
+      }
       return latest?.id ?? null;
     };
     const before = inspect();
@@ -154,7 +170,11 @@ export function publishRedTeamCheckFromLive({ repo, pr, headSha, appId, gh = run
     if (published) {
       const supersede = postRedTeamCheckRun({ repo, pr, headSha, gh,
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason }) });
-      if (!supersede.ok) return failure(`${reason}; ${supersede.reason}`);
+      if (!supersede.ok) {
+        const failures = `${reason}; ${supersede.reason}`;
+        const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
+        return failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}`);
+      }
     }
     return failure(reason);
   }
