@@ -192,7 +192,7 @@ describe('overlayGraduated auto-dropped in-main evidence', () => {
     ...['pr-closed', 'ref-gone'].map((reason) => [
       `reason is ${reason} without a merge sha`, () => ({ event: { reason } }),
     ]),
-    ['reason is pr-merged without content proof', () => ({ event: { reason: 'pr-merged' }, git: () => undefined })],
+    ['reason is pr-merged without content proof', () => ({ event: { reason: 'pr-merged', pr: 6554 }, git: () => undefined })],
     ['a later added event exists for the ref', () => ({ events: [
       ...autoDropped().events, { kind: 'added', ref: 'lane/daemon-heap-log-m2' },
     ] })],
@@ -238,6 +238,10 @@ describe('overlayGraduated auto-dropped pr-merged evidence', () => {
 
   it.each([['no pr number', undefined], ['non-integer pr', '6554'], ['zero pr', 0]])('refuses pr-merged with %s', (_n, pr) => {
     expect(adoption.overlayGraduated(prMerged({ event: { reason: 'pr-merged', pr } }))).toBe(false);
+  });
+
+  it('refuses pr-merged when the event names a different tip than the applied sha', () => {
+    expect(adoption.overlayGraduated(prMerged({ event: { reason: 'pr-merged', pr: 6554, tip: 'f'.repeat(40) } }))).toBe(false);
   });
 
   it('refuses pr-merged when overlay content is not in the candidate build', () => {
@@ -344,7 +348,7 @@ describe('overlayGraduated evidence', () => {
 describe.each([
   ['graduated-merged', graduation],
   ['auto-dropped in-main', autoDropped],
-  ['auto-dropped pr-merged', () => autoDropped({ event: { reason: 'pr-merged' } })],
+  ['auto-dropped pr-merged', () => autoDropped({ event: { reason: 'pr-merged', pr: 6554 } })],
 ])('overlayGraduated %s merge driver evidence', (_name, makeEvidence) => {
   const configArgs = ['config', '--get-regexp', '^merge\\..*\\.driver$'];
 

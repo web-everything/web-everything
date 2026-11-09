@@ -125,7 +125,8 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
     // `pr-merged` (the PR may have merged into a stacked branch, not main) is bound to its PR number and, like every
     // route here, graduates only through the independent content/driver checks below: nothing the build lacks is dropped.
     const droppedForMain = last?.kind === 'auto-dropped'
-      && (last.reason === 'in-main' || (last.reason === 'pr-merged' && Number.isInteger(last.pr) && last.pr > 0));
+      && (last.reason === 'in-main' || (last.reason === 'pr-merged' && Number.isInteger(last.pr) && last.pr > 0
+        && (last.tip === undefined || last.tip === sha)));
     if (droppedForMain || retiredWithProof) {
       const droppedMs = timeMs(last.at);
       const readyMs = timeMs(readyAt);
