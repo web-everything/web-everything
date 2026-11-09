@@ -471,7 +471,9 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
       && MQ_AGGREGATE_SUMMARY_STEPS.has(localJob(check.name)));
     const failedNames = failed.map(check => (typeof check.name === 'string' ? check.name : 'unnamed')
       .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')).slice(0, 5);
-    if (!hasAggregateCandidates && failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
+    // readQuarantineCover validates the aggregators itself (positive evidence, no uncovered failure), so a
+    // quarantined shard failure still earns its single retry when `test`/`coverage-merge` fail with it.
+    if (failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
       return { mainGreen: false, mainRunId: null, infra: 'quarantined', failedNames, mergeState: readMqMergeState({ repo, pr, head, exec }) };
     // Runner terminology alone also appears in ordinary assertion failures.
     const runnerLoss = /\blost communication\b|\b(?:self-hosted[ \t]+)?runner[ \t]+(?:(?:has|was|is)[ \t]+)?(?:disconnected|went away|lost connection|stopped responding|failed to (?:start|connect))\b/i;
