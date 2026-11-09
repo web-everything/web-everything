@@ -6,7 +6,7 @@
 	The advisory label sweep, pass `advisory-label-sweep-we`. Drops an `advisory:*` label whose head moved, and repairs a
 	human-gated PR whose newest covering advisory note disagrees with its labels (live: PR 4015, 2026-10-05, an old
 	advisory:changes sat under an accept note after the advise label write hit a rate limit). The manifest entry and the
-	script existed, but only the retired runner ever ran it. Run from the wev-review-daemon clone (self-synced).
+	script existed, but only the retired runner ever ran it. Run from the wev-pass-readers clone (self-synced).
 	Sibling repos: copy this file and change the pass name (the ProgramArguments entry after the pass flag) to
 	advisory-label-sweep-frontierui or advisory-label-sweep-plateau-app. (No double hyphen may appear inside an XML
 	comment, so the flag itself is not spelled out here.)
@@ -40,18 +40,18 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
-		<string>/Users/nicolasgilbert/workspace/wev-review-daemon/skills-src/conveyor/pass-daemon.mjs</string>
+		<string>/Users/nicolasgilbert/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs</string>
 		<string>--pass=advisory-label-sweep-we</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.advisory-label-sweep-we.log</string>
+	<string>/Users/nicolasgilbert/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-we.log</string>
 	<key>StandardOutPath</key>
-	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.advisory-label-sweep-we.log</string>
+	<string>/Users/nicolasgilbert/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-we.log</string>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/nicolasgilbert/workspace/wev-review-daemon</string>
+	<string>/Users/nicolasgilbert/workspace/wev-pass-readers</string>
 </dict>
 </plist>
