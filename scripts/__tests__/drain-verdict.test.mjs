@@ -251,6 +251,17 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
 });
 
 const argv = ['--only=7', '--verdict-out=verdict.json', '--repo=o/r'];
+// Variables the runner sets for every `run:` step (plus common image vars): none is a credential.
+const RUNNER_STEP_ENV = Object.freeze({
+  CI: 'true', HOME: '/home/runner', PATH: '/usr/bin:/bin',
+  GITHUB_PATH: '/home/runner/work/_temp/_runner_file_commands/add_path_x', GITHUB_ENV: '/home/runner/work/_temp/set_env_x',
+  GITHUB_OUTPUT: '/home/runner/work/_temp/set_output_x', GITHUB_STEP_SUMMARY: '/home/runner/work/_temp/step_summary_x',
+  GITHUB_STATE: '/home/runner/work/_temp/save_state_x', GITHUB_EVENT_PATH: '/home/runner/work/_temp/_github_workflow/event.json',
+  GITHUB_WORKSPACE: '/home/runner/work/r/r', GITHUB_ACTION_PATH: '', GITHUB_API_URL: 'https://api.github.com',
+  RUNNER_TEMP: '/home/runner/work/_temp', RUNNER_OS: 'Linux', RUNNER_ARCH: 'X64', RUNNER_NAME: 'GitHub Actions 1',
+  RUNNER_TOOL_CACHE: '/opt/hostedtoolcache', RUNNER_WORKSPACE: '/home/runner/work/r', RUNNER_ENVIRONMENT: 'github-hosted',
+  SELENIUM_JAR_PATH: '/usr/share/java/selenium-server.jar', SWIFT_PATH: '/usr/share/swift/usr/bin', GIT_PATCH_LEVEL: '1',
+});
 function ioFor() {
   return {
     env: { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'schedule',
@@ -275,7 +286,8 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     ...['pull_request', 'pull_request_target', 'push', ''].map(event => [`event ${event}`, env => { env.GITHUB_EVENT_NAME = event; }]),
     ['missing run ID', env => { delete env.GITHUB_RUN_ID; }],
     ['empty run ID', env => { env.GITHUB_RUN_ID = ''; }],
-    ...['APP_PRIVATE_KEY', 'MY_APP_ID', 'SOME_SECRET', 'BOT_PAT', 'GH_TOKEN', 'EXTRA_TOKEN', 'private_key', 'app_id', 'secret', 'bot_pat']
+    ...['APP_PRIVATE_KEY', 'MY_APP_ID', 'SOME_SECRET', 'BOT_PAT', 'GH_TOKEN', 'EXTRA_TOKEN', 'private_key', 'app_id', 'secret', 'bot_pat',
+      'PAT', 'GH_PAT2', 'ORG_PAT_RW', 'pat_bot']
       .map(name => [`credential ${name}`, env => { env[name] = 'foreign-credential'; }]),
     ['empty forbidden credential still present', env => { env.APP_PRIVATE_KEY = ''; }],
   ])('refuses %s before any process or write', async (_name, mutate) => {
@@ -314,6 +326,11 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     expect(args.some(arg => arg === '--import' || arg.startsWith('--import='))).toBe(false);
     expect(options.env).not.toHaveProperty('DRAIN_CLASSIFY_ONLY');
     expect(options.env.NODE_OPTIONS || '').not.toMatch(/--import|drain-classify-guard/);
+  });
+  it('accepts a real runner step environment (GITHUB_PATH and other *_PATH files are not PATs)', async () => {
+    const io = ioFor(); Object.assign(io.env, RUNNER_STEP_ENV);
+    await runCli(argv, io);
+    expect(io.writeFileSync).toHaveBeenCalledTimes(1);
   });
   it('resolves the optional repo from the injected environment', async () => {
     const io = ioFor();
@@ -388,6 +405,10 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
   });
   it.each(['9; echo', '-1', 'x', '0'])('schedule ignores non-numeric PR list entry %j as a failure', bad => {
     expect(runBatch(batchArgv, batchIo({ prs: `${bad}\n` }))).toMatchObject({ written: 0, failed: 1 });
+  });
+  it('accepts a real runner step environment, as the workflow invokes it', () => {
+    const io = batchIo(); Object.assign(io.env, RUNNER_STEP_ENV);
+    expect(runBatch(batchArgv, io)).toMatchObject({ written: 2, failed: 0 });
   });
   it('refuses unsafe env before any process', () => {
     const io = batchIo(); io.env.GITHUB_REF = 'refs/heads/feature';
