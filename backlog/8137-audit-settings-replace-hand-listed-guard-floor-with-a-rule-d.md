@@ -1,15 +1,16 @@
 ---
+bornAs: xti420e
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/audit-verdict.mjs", "we:scripts/operations/__tests__/audit-verdict.test.mjs"]
+scope: ["we:scripts/lib/audit-settings.mjs", "we:scripts/lib/__tests__/audit-settings.test.mjs"]
 dateOpened: "2026-11-08"
 tags: []
 ---
 
-# audit-verdict: path hardening (U+0600 bypass, unknown-key and trailing-slash globs)
+# audit-settings: replace hand-listed GUARD_FLOOR with a rule-derived floor plus coverage test
 
-Slice 3 of PR #6381 (R763, follow-up of PR #6381). Audit path hardening: the U+0600 path bypass (we:scripts/operations/audit-verdict.mjs:162 strips only Default_Ignorable_Code_Point), plus unknown-key and trailing-slash glob handling.
+Slice 2 of PR #6381 (R763, follow-up of PR #6381). The hand-listed GUARD_FLOOR in we:scripts/lib/audit-settings.mjs keeps omitting modules (recurring 'floor omits module X' class, e.g. we:scripts/lib/lane-git-hardening.mjs). Derive the floor from the rules and add a coverage test so a new guard module cannot be missed.
 
 ## Acceptance
 
