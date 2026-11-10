@@ -21,6 +21,9 @@
  * tick's `already-landed` refusal needs git reads (blob identity against `main`'s history) that a fast step must not
  * pay; a conflicting green draft is rare and the tick still promotes it when it is not already landed.
  */
+import * as nodeFs from 'node:fs';
+import { join } from 'node:path';
+import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -42,6 +45,32 @@ import {
 export const DRAFT_LIST_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,isCrossRepository';
 /** The one fresh read per candidate: everything the tick's pre-`promote-draft` refusals and the rule decide on. */
 export const PR_VIEW_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,comments,body,statusCheckRollup,mergeStateStatus,isCrossRepository';
+
+/** Best-effort nudge only; review still re-reads promotion evidence on its next tick. */
+export function touchReviewWake({ dir = RUNNER_LOCK_ROOT, fs = nodeFs, now = Date.now } = {}) {
+  try {
+    const path = join(dir, 'review-wake');
+    const time = new Date(now());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path, '', { flag: 'a' });
+    fs.utimesSync(path, time, time);
+    return true;
+  } catch { return false; }
+}
+
+/** Missing or unreadable wake evidence leaves the normal review cadence in place. */
+export function hasReviewWakeSince(sinceMs, { dir = RUNNER_LOCK_ROOT, fs = nodeFs } = {}) {
+  try {
+    const { mtimeMs } = fs.statSync(join(dir, 'review-wake'));
+    return Number.isFinite(sinceMs) && Number.isFinite(mtimeMs) && mtimeMs > sinceMs;
+  } catch { return false; }
+}
+
+function wakeAfterPromotion(result, touchWake) {
+  if (result?.rows?.some(row => row.action === 'promoted')) {
+    try { touchWake(); } catch { /* The normal review tick is the fallback. */ }
+  }
+}
 
 /** The one list read per repo: open drafts only. */
 export function defaultListDrafts({ repoSlug, runGh = runGhSync } = {}) {
@@ -94,6 +123,7 @@ export function runDraftPromotionStep({
   readRequiredChecks = ({ repoSlug }) => getRequiredStatusChecks({ repo: repoSlug }),
   ready = (repoSlug, pr) => createDraftPromoteProvider({ repo: repoSlug }).ready(pr),
   clearAwaiting = (repoSlug, pr) => applyReviewStatus({ pr, repo: repoSlug, state: null }),
+  touchWake = touchReviewWake,
   now = Date.now,
 } = {}) {
   const rows = [];
@@ -171,6 +201,7 @@ export function runDraftPromotionStep({
       row('promoted', decision.why);
     }
   }
+  wakeAfterPromotion({ rows }, touchWake);
   return { rows };
 }
 
@@ -188,13 +219,16 @@ export function formatDraftPromotionLines(result) {
 export function runDraftPromotionIfDue({
   lastRunAtMs = null, lastSkipKey = '', write, now = Date.now,
   resolveSettings = () => resolveDraftPromotionSettings(), step = runDraftPromotionStep,
+  touchWake = touchReviewWake,
 } = {}) {
   let settings;
   try { settings = resolveSettings(); } catch { return { lastRunAtMs, lastSkipKey, ran: false }; }
   const nowMs = now();
   if (!promotionStepDue({ settings, lastRunAtMs, nowMs })) return { lastRunAtMs, lastSkipKey, ran: false };
   let result;
-  try { result = step(); } catch (e) { result = { rows: [{ repo: '?', pr: null, action: 'error', why: oneLine(e) }] }; }
+  // The hook owns the wake when invoking the real step, so a batch nudges only once.
+  try { result = step({ touchWake: () => {} }); } catch (e) { result = { rows: [{ repo: '?', pr: null, action: 'error', why: oneLine(e) }] }; }
+  wakeAfterPromotion(result, touchWake);
   const lines = formatDraftPromotionLines(result);
   const skipLines = lines.filter((l) => l.startsWith('draft-promotion: skip '));
   const key = skipLines.join('\n');

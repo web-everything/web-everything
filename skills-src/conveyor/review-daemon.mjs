@@ -130,6 +130,7 @@ import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents, makeDrainNudgeForward } from '../../scripts/lib/pr-events.mjs';
+import { hasReviewWakeSince } from '../../scripts/conveyor/draft-promotion-loop.mjs';
 import { makePoolExhaustionLogger } from '../../scripts/conveyor/pool-exhaustion.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
 import {
@@ -168,6 +169,24 @@ export function resolveReviewIntervalMs({ env = process.env, argv = process.argv
 }
 
 const WE_SLUG = CONSTELLATION_REPOS.we.slug;
+
+/** Poll local promotion nudges while retaining the normal interval as the fallback. */
+export function withReviewWake(effects, { poll = hasReviewWakeSince, pollEveryMs = 5_000, sinceFn = Date.now } = {}) {
+  const pollMs = Number.isFinite(pollEveryMs) && pollEveryMs > 0 ? pollEveryMs : 5_000;
+  return {
+    ...effects,
+    async sleep(ms) {
+      const since = sinceFn();
+      for (let remaining = ms; remaining > 0;) {
+        const slice = Math.min(remaining, pollMs);
+        const result = await effects.sleep(slice);
+        try { if (poll(since) === true) return; } catch { /* Keep the normal cadence on unreadable evidence. */ }
+        if (result?.woke) return;
+        remaining -= slice;
+      }
+    },
+  };
+}
 
 // ── PURE CORE (no IO — every effect is injected; unit-tested directly) ─────────────────────────────────────
 
@@ -1912,10 +1931,11 @@ async function main() {
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged): a relevant PR event ends the sleep
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
+  // Keep the inner healthy-feed sleep within the outer local-wake polling slice.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+    withReviewWake(withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
-    }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
+    }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()], healthyIntervalMs: 5_000 })),
   );
   if (!stopping) {
     console.error(`review-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);

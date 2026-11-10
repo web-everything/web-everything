@@ -119,6 +119,30 @@ describe('withReviewWake interruptible sleep', () => {
     },
   );
 
+  it('sleeps the full interval when the wake file is unreadable', async () => {
+    const run = setup();
+    const fs = { statSync: vi.fn(() => { throw new Error('EACCES'); }) };
+    run.poll.mockImplementation(since => promotion.hasReviewWakeSince(since, { dir: 'fixture-locks', fs }));
+
+    await expect(run.wrapped.sleep(12_345)).resolves.toBeUndefined();
+
+    expect(run.elapsed()).toBe(12_345);
+    expect(run.sleep.mock.calls).toEqual([[5_000], [5_000], [2_345]]);
+    expect(fs.statSync).toHaveBeenCalledTimes(3);
+    expect(run.poll.mock.calls).toEqual([[run.start], [run.start], [run.start]]);
+  });
+
+  it('sleeps the full interval when the wake predicate throws', async () => {
+    const run = setup();
+    run.poll.mockImplementation(() => { throw new Error('wake unavailable'); });
+
+    await expect(run.wrapped.sleep(12_345)).resolves.toBeUndefined();
+
+    expect(run.elapsed()).toBe(12_345);
+    expect(run.sleep.mock.calls).toEqual([[5_000], [5_000], [2_345]]);
+    expect(run.poll.mock.calls).toEqual([[run.start], [run.start], [run.start]]);
+  });
+
   it('does not reuse a previous sleep start and wake repeatedly for the same file', async () => {
     const run = setup({ onSleep: ({ files, nowMs, calls, path }) => {
       if (calls === 1) files.set(path, { mtimeMs: nowMs });
