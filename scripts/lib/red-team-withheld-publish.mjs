@@ -91,8 +91,11 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       const input = renderInput(res);
       return [() => renderFull(input), () => renderMinimal(input), () => renderMinimal({ ...input, omitLocation: true })]
         .some(render => {
-          try { return JSON.stringify(confirmedKeys(parseRedTeamComment(render()) ?? { findings: [] })) === want; }
-          catch { return false; }
+          try {
+            const keys = confirmedKeys(parseRedTeamComment(render()) ?? { findings: [] });
+            // A lossy rendering (one that drops a confirmed break) proves nothing: two empty lists would "agree".
+            return keys.length === res.confirmedMissCount && JSON.stringify(keys) === want;
+          } catch { return false; }
         });
     };
     const escalate = () => {

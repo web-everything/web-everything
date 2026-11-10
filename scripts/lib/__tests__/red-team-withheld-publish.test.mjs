@@ -145,6 +145,37 @@ describe('legacy bare-string red-team publication', () => {
     expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
     expect(io.publishNeedsYou).not.toHaveBeenCalled();
   });
+  const twoRow = () => seatRow({ foldedVerdict: 'changes', confirmedMissCount: 2, findings: [confirmedFinding,
+    { ...confirmedFinding, summary: 'Second confirmed defect', file: 'scripts/y.mjs', line: 99 }] });
+  it('skips when the posted confirmed findings appear in a different order', () => {
+    const [a, b] = twoRow().findings;
+    const io = harness(legacy(), { readSeatRow: twoRow,
+      listComments: () => [{ author: { login: 'web-everything' }, body: fullBody([b, a]) }] });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.writeStatus).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+  it('skips for the location-free fallback rendering of the same break', () => {
+    const body = renderMinimalRedTeamComment({ pr: 42, rev: head, findings: [confirmedFinding], omitLocation: true });
+    expect(parseRedTeamComment(body).findings[0]).toMatchObject({ confirmed: true, file: null });
+    const io = harness(legacy(), { readSeatRow: changesRow,
+      listComments: () => [{ author: { login: 'web-everything' }, body }] });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.writeStatus).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+  it('holds when an existing clear comment matches a lossy rendering of a confirmed break', () => {
+    // A blank file makes every rendering drop the break, so both sides parse to "no findings".
+    const lossy = seatRow({ foldedVerdict: 'changes', confirmedMissCount: 1,
+      findings: [{ summary: 's', file: ' ', category: 'correctness', confirmedByRecheck: true }] });
+    const io = harness(legacy(), { readSeatRow: () => lossy, listComments: () => posted() });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ kind: 'red-team-legacy-ran-unreadable' }));
+  });
   it('holds when a trusted marker comment does not parse to this head', () => {
     const io = harness(legacy(), { readSeatRow: changesRow, redTeamCommentPosted: () => true });
     expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
