@@ -92,6 +92,24 @@ it('failed adoption and rollback quarantine aborts after reacquiring the read lo
   expect(tail).not.toHaveBeenCalled(); expect(restart).not.toHaveBeenCalled();
   expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
 });
+it.each(['head-moved', 'clone-recloned'])('failed adoption rechecks %s after read reacquisition and never executes the tick tail', async (reason) => {
+  const tail = vi.fn();
+  let head = 'boot';
+  let identity = 'original';
+  const { w, acquire, release, restart } = setup(async (h) => {
+    h.setReady({ ...h.f.ready, prevHead: head });
+    h.rebuild.mockResolvedValue({ moved: false, reason: 'tick-in-progress' });
+    h.acquire.mockImplementation(() => {
+      if (reason === 'head-moved') head = h.f.target;
+      else identity = 'replacement';
+      return { ok: true };
+    });
+    await safePoint('fix'); tail();
+  }, { readHead: () => head, cloneIdentity: () => identity });
+  expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: `safe-point-abort: ${reason}` });
+  expect(tail).not.toHaveBeenCalled(); expect(restart).not.toHaveBeenCalled();
+  expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
+});
 it('refused read reacquisition aborts cleanly and never continues unlocked', async () => {
   const tail = vi.fn();
   const { w, release } = setup(async (h) => {

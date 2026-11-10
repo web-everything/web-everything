@@ -1340,6 +1340,12 @@ export function withSelfSync(effects, {
             say('skipped (quarantine; tick-ended)');
             throw new SafePointAbort('quarantine');
           }
+          if (recloneBlocks()) throw new SafePointAbort('clone-recloned');
+          const headNow = readHead(syncOpts());
+          if (bootSha != null && headNow != null && headNow !== bootSha) {
+            say('skipped (head-moved; tick-ended)');
+            throw new SafePointAbort('head-moved');
+          }
           return { adopted: false };
         } };
         let tickResult;

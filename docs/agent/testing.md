@@ -4121,8 +4121,9 @@ repo isolation must rethrow them to the self-sync wrapper. Safe-point adoption u
 with the finalize lock wait and re-reads the overlay registry under the write lock, without fetching,
 planning or starting a build. A successful adoption always ends the current tick: restart when the gate
 allows it, otherwise return a skipped tick without reacquiring the read slot or running the tick tail.
-An unsuccessful adoption reacquires the read slot and rechecks quarantine before continuing; a refused
-read or quarantined clone ends the tick. Safe-point exact matches must also pass the normal live-overlay
+An unsuccessful adoption reacquires the read slot and repeats the tick-entry HEAD and checkout-replacement
+checks alongside quarantine; a refused read, quarantined clone, changed HEAD or replaced checkout ends
+the tick without running its tail (restart waits until the next tick). Safe-point exact matches must also pass the normal live-overlay
 preservation check using current registry tips and running-build history; unknown evidence refuses
 adoption. A wrong-branch or detached HEAD cannot be reset at a safe point. Pin these guarantees with injected lock/rebuild effects and the focused
 `daemon-self-sync-safepoint`, `daemon-safepoint-wiring` and `rebuild-abort-overlay-removed` tests.
