@@ -1,6 +1,6 @@
 /** @file Mechanical refresh admission: injected evidence, never network. */
 import { describe, it, expect } from 'vitest';
-import { validateMechanicalClearance, readMechanicalClearanceFacts, recordMechanicalClearance, decideMechanicalLabelStrip,
+import { isMechanicalCertificationClass, validateMechanicalClearance, readMechanicalClearanceFacts, recordMechanicalClearance, decideMechanicalLabelStrip,
   REQUIRED_MECHANICAL_CHECKS, GITHUB_ACTIONS_APP_ID } from '../mechanical-clearance.mjs';
 
 const head = 'a'.repeat(40);
@@ -16,6 +16,18 @@ const facts = () => ({ head, author: { login: 'web-everything[bot]', type: 'Bot'
   existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, appId: GITHUB_ACTIONS_APP_ID, conclusion: 'SUCCESS', status: 'completed', id: 1 })) });
 
 describe('mechanical clearance', () => {
+  it.each(['web-everything[bot]', 'app/web-everything', null, undefined, ''])('bot/unknown author uses mechanical certification (%s)', login => {
+    expect(isMechanicalCertificationClass({ author: { login } })).toBe(true);
+    expect(isMechanicalCertificationClass({ authorLogin: login })).toBe(true);
+  });
+  it('missing PR evidence uses mechanical certification', () => {
+    expect(isMechanicalCertificationClass()).toBe(true);
+    expect(isMechanicalCertificationClass({})).toBe(true);
+  });
+  it.each(['chalbert', 'plateau-worker'])('known author keeps ordinary certification (%s)', login => {
+    expect(isMechanicalCertificationClass({ author: { login } })).toBe(false);
+    expect(isMechanicalCertificationClass({ authorLogin: login })).toBe(false);
+  });
   it('clears the refresh workflow identities and seconds', () => expect(validateMechanicalClearance(facts()).cleared).toBe(true));
   const fail = (name, rule, change) => it(name, () => {
     const f = facts(); change(f); expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule, head });

@@ -228,7 +228,7 @@ import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetti
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
-import { decideMechanicalClearance, recordMechanicalClearance, decideMechanicalLabelStrip, decideMechanicalMergeGuard } from './lib/mechanical-clearance.mjs';
+import { isMechanicalCertificationClass, decideMechanicalClearance, recordMechanicalClearance, decideMechanicalLabelStrip, decideMechanicalMergeGuard } from './lib/mechanical-clearance.mjs';
 
 const mechanicalClearanceRefusals = new Set(); // Only stderr refusals are memoized; evidence is live every pass.
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
@@ -2170,7 +2170,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       p.commits = read.commits || [];
       const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
       v.authorLogin = p.author?.login ?? null;
-      v.labelOnlyCertified = !v.authorLogin || ['web-everything[bot]', 'app/web-everything'].includes(v.authorLogin)
+      v.labelOnlyCertified = isMechanicalCertificationClass(p)
         || (!isAiGeneratedPr(p) && !hasLabel(p, REVIEW_LABELS.accepted));
       // #2502 — the tip commit's SHA, threaded onto every emitted verdict and, via the `{...v}` spread used to
       // build `remaining`/`plan.ready`/`plan.deferred`, onto each of the six result buckets a caller (the
@@ -3065,7 +3065,7 @@ export function reconcileMechanicalClearance(pr, { repo, dryRun = false,
   refusalLogs = mechanicalClearanceRefusals, decide = decideMechanicalClearance,
   record = recordMechanicalClearance, exec = execFileSync,
   log = line => process.stderr.write(line) } = {}) {
-  if ((pr?.author?.login && !['web-everything[bot]', 'app/web-everything'].includes(pr.author.login))
+  if (!isMechanicalCertificationClass(pr)
     || ['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())) return null;
   const labelled = hasLabel(pr, READY_TO_MERGE_LABEL);
   if (labelled && !decideMechanicalLabelStrip(pr, null).strip) return null;
@@ -6017,7 +6017,7 @@ async function runCli() {
   // R861 — live mechanical merge guard, independent of reconcile, escalation and dry-run.
   for (const v of verdicts) {
     if (v.decision !== 'merge' || !v.labelOnlyCertified
-      || (v.authorLogin && !['web-everything[bot]', 'app/web-everything'].includes(v.authorLogin))) continue;
+      || !isMechanicalCertificationClass(v)) continue;
     let result;
     try {
       const repo = memoRepo(v.repo).replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$/, '');
@@ -7001,7 +7001,8 @@ async function runCli() {
         branchPreparationRequired: branchPreparationRequired(c), queueAdmission });
       prestageCache.put(c.repo || localSlug, c.num, {
         headSha: c.listedHeadSha, labels: labelSignature(row.labels), body: row.body, baseRefName: row.baseRefName,
-        requiredChecks: prestageRequiredChecks(queueRequiredChecksOf(c.repo), REQUIRED), candidate: c, eligible, queueAdmission,
+        requiredChecks: prestageRequiredChecks(queueRequiredChecksOf(c.repo), REQUIRED),
+        candidate: { ...c, authorLogin: row.author?.login ?? null }, eligible, queueAdmission,
         conflict: c.mergeable, mergeability: c.state, gate: c.reviewGate,
         mergeGateInputs: { candidacy: c.decision, couple: { carrier: c.coupleCarrier ?? null, refs: c.manifestRepoRefs ?? [], defer: c.coupleDeferReason ?? null }, blockedBy: c.blockedBy },
         humanOnlySurface: { files: c.prestageHumanBasisFiles ?? c.changedFiles, humanRequired: c.humanRequired, reasons: c.escalateReasons },
@@ -7231,7 +7232,7 @@ async function runCli() {
           });
           // R861 — repeat clearance at final pre-merge revalidation, against the same merge pin.
           if (revalidated.decision === 'merge' && c.labelOnlyCertified
-            && (!c.authorLogin || ['web-everything[bot]', 'app/web-everything'].includes(c.authorLogin))) {
+            && isMechanicalCertificationClass(c)) {
             let result;
             try {
               const repo = memoRepo(c.repo).replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$/, '');

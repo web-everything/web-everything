@@ -1,4 +1,5 @@
 /** Head-bound preparation only. A cache entry never grants permission to enqueue before CI is green. */
+import { isMechanicalCertificationClass } from './mechanical-clearance.mjs';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -57,6 +58,9 @@ export function createPrestageCache({ env = process.env, root = join(resolveCoor
         const e = JSON.parse(readFileSync(path(repo, num), 'utf8'));
         if (e.version !== 1 || e.repo !== repo.toLowerCase() || e.num !== num || !e.headSha || !Number.isFinite(e.at)
             || now() < e.at || now() - e.at >= ttlMin * 60_000) { drop(repo, num); return null; }
+        // v1 never proved live mechanical clearance. Preserve the entry, but route bot/unknown
+        // authors through the guarded cascade even when its stored eligible bit is true.
+        if (isMechanicalCertificationClass(e.candidate)) return null;
         return e;
       } catch { return null; }
     },

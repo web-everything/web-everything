@@ -22,7 +22,11 @@ const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRE
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\\n');
 // Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\\n\\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
-const page = ${openPrPageFixture};
+const page = (prs, query) => {
+  const result = (${openPrPageFixture})(prs, query);
+  for (const node of result.data.repository.pullRequests.nodes) node.author = prs.find(p => p.number === node.number)?.author;
+  return result;
+};
 if (a[0] === 'repo') out('main');
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
@@ -80,7 +84,7 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
     for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), body, { mode: 0o755 });
     const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json'), coord = join(dir, 'coord'), ledger = join(dir, 'ledger');
     writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
-    const pr = { number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
+    const pr = { number: 42, author: { login: 'chalbert' }, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
       headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
       labels: [{name:'review:accepted'},{name:'ready-to-merge'}], files: [{path:'README.md',changeType:'MODIFIED'}],
       commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
@@ -104,6 +108,28 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
 }
 
 describe('real drain pre-stage path', () => {
+  it.each(['web-everything[bot]', 'app/web-everything', null])('cached v1 admission routes a bot/unknown README diff through the guarded cascade (%s)', authorLogin => world(({pr,run,coord}) => {
+    expect(run().stderr).toContain('eligible=true');
+    const cacheDir = join(coord, 'drain-prestage');
+    const file = join(cacheDir, readdirSync(cacheDir)[0]);
+    const entry = JSON.parse(readFileSync(file, 'utf8'));
+    expect(entry).toMatchObject({ version: 1, eligible: true });
+    entry.candidate.authorLogin = authorLogin;
+    writeFileSync(file, JSON.stringify(entry));
+    pr.author = authorLogin ? { login: authorLogin } : null;
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.report.prestaged, next.stderr).not.toBe(true);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+    expect(next.calls.some(a => a.some(x => x.includes('pullRequests(')))).toBe(true);
+  }));
+  it.each(['chalbert', 'plateau-worker'])('cached v1 admission still prestages a known author (%s)', authorLogin => world(({pr,run}) => {
+    pr.author = { login: authorLogin };
+    expect(run().stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+  }));
   it.each(['dependency-held', 'cascade', 'prestage'])('shadow adds zero gh calls compared with off (%s)', async path => {
     const traces = [];
     for (const shadowMode of ['off', 'shadow']) {
@@ -468,7 +494,10 @@ describe('real drain pre-stage path', () => {
     const first = run();
     expect(first.stderr).toContain('prepared while CI pending (eligible=true)');
     expect(first.report.enqueueOutcomes ?? []).toHaveLength(0);
-    expect(readdirSync(join(coord,'drain-prestage'))).toHaveLength(1);
+    const cacheDir = join(coord, 'drain-prestage');
+    expect(readdirSync(cacheDir)).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(cacheDir, readdirSync(cacheDir)[0]), 'utf8')))
+      .toMatchObject({ candidate: { authorLogin: 'chalbert' } });
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = run(true);
     expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});

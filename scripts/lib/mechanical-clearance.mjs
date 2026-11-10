@@ -181,10 +181,16 @@ export function decideMechanicalClearance(options) {
   return validateMechanicalClearance(readMechanicalClearanceFacts(options));
 }
 
+/** Bot/unknown author class shared by PR readers and drain verdicts (authorLogin). */
+export function isMechanicalCertificationClass(pr) {
+  const login = pr?.author?.login ?? pr?.authorLogin;
+  return !login || ['web-everything[bot]', 'app/web-everything'].includes(login);
+}
+
 /** R861: bot/unknown label-only authors need live evidence matching every known merge pin. */
 export function decideMechanicalMergeGuard(v, result) {
   if (v.decision !== 'merge' || !v.labelOnlyCertified
-    || (v.authorLogin && !['web-everything[bot]', 'app/web-everything'].includes(v.authorLogin))) return v;
+    || !isMechanicalCertificationClass(v)) return v;
   const pins = [v.listedHeadSha, v.headSha].filter(sha => sha != null && sha !== '');
   const rule = !result || result.rule === 'read-error' ? 'read-error'
     : result.cleared !== true ? result.rule || 'read-error'
@@ -197,7 +203,7 @@ export function decideMechanicalMergeGuard(v, result) {
 /** Bot/unknown PRs depend on mechanical clearance, regardless of accepted review or AI trailers. */
 export function decideMechanicalLabelStrip(pr, result) {
   const eligible = !['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())
-    && (!pr?.author?.login || ['web-everything[bot]', 'app/web-everything'].includes(pr.author.login))
+    && isMechanicalCertificationClass(pr)
     && hasLabel(pr, 'ready-to-merge');
   const current = result?.cleared === true && typeof result.head === 'string' && result.head.length > 0
     && typeof pr?.headRefOid === 'string' && result.head.toLowerCase() === pr.headRefOid.toLowerCase();

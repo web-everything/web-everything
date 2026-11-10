@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPrestageCache, resolvePrestageSettings, prestageCi, labelSignature, enqueuePrestage, prestageRequiredChecks } from '../drain-prestage.mjs';
@@ -9,7 +9,7 @@ import { aiPr } from '../../__tests__/fixtures/merge-ai-prs-fixtures.mjs';
 const roots = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const repo = 'owner/repo', head = 'a'.repeat(40);
-const pending = () => aiPr({ number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
+const pending = () => aiPr({ number: 42, author: { login: 'chalbert' }, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
   labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], mergeStateStatus: 'BLOCKED', mergeable: 'MERGEABLE',
   statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null, head_sha: head }] });
 function fixture(options = {}) {
@@ -18,7 +18,7 @@ function fixture(options = {}) {
   const cache = createPrestageCache({ root, now: () => clock });
   const pr = pending();
   cache.put(repo, 42, { headSha: head, labels: labelSignature(pr.labels), body: pr.body, baseRefName: 'main', requiredChecks: ['test'],
-    eligible: true, candidate: { num: 42, repo, listedHeadSha: head }, queueAdmission: { allowed: true } });
+    eligible: true, candidate: { num: 42, repo, listedHeadSha: head, authorLogin: 'chalbert' }, queueAdmission: { allowed: true } });
   const enqueue = vi.fn(() => ({ enqueued: true }));
   const recordLanded = vi.fn();
   const beforeEnqueue = vi.fn();
@@ -26,11 +26,33 @@ function fixture(options = {}) {
   const readPr = vi.fn(async () => pr);
   const run = () => enqueuePrestage({ cache, repo, num: 42, settings, readPr, enqueue, recordLanded, beforeEnqueue, fixClaimHeld: () => false,
     withLock: fn => ({ ran: true, result: fn() }), ...options });
-  return { cache, pr, enqueue, recordLanded, beforeEnqueue, settings, run, readPr, advance: ms => { clock += ms; } };
+  return { root, cache, pr, enqueue, recordLanded, beforeEnqueue, settings, run, readPr, advance: ms => { clock += ms; } };
 }
 const green = f => { f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }; };
 
 describe('CI pre-stage', () => {
+  it.each(['web-everything[bot]', 'app/web-everything', null, undefined])('ignores v1 mechanical-class cache without deleting it (author: %s)', async authorLogin => {
+    const f = fixture();
+    const entry = f.cache.get(repo, 42, 30);
+    f.cache.put(repo, 42, { ...entry, candidate: { ...entry.candidate, authorLogin } });
+    green(f);
+    const file = join(f.root, readdirSync(f.root)[0]);
+    const persisted = readFileSync(file, 'utf8');
+    expect(JSON.parse(persisted)).toMatchObject({ version: 1, eligible: true });
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.readPr).not.toHaveBeenCalled();
+    expect(readFileSync(file, 'utf8')).toBe(persisted);
+  });
+  it.each(['chalbert', 'plateau-worker'])('retains v1 prestage enqueue for a known author (%s)', async authorLogin => {
+    const f = fixture();
+    const entry = f.cache.get(repo, 42, 30);
+    f.cache.put(repo, 42, { ...entry, candidate: { ...entry.candidate, authorLogin } });
+    green(f);
+    expect(await f.run()).toEqual({ enqueued: true });
+    expect(f.enqueue).toHaveBeenCalledTimes(1);
+  });
   it.each([{hasManifest:true}, {coupleCarrier:{num:43}}])('invalidates older unsafe cache entries (%j)', async candidate => {
     const f = fixture();
     const entry = f.cache.get(repo, 42, 30);
