@@ -14,7 +14,7 @@ afterEach(()=>{
 const now=Date.parse('2026-10-29T12:00:00.000-04:00');
 const settings={backoffMs:120000,maxLoadPerCore:0.8,minFreeRamPct:15};
 const sample=(ms=now)=>({sampledAtET:easternTimestamp(ms),cores:8,loadPerCore:0.12,memFreePct:96,activeRuns:0,recent:[]});
-const saved=(telemetry,lastReadAt)=>({v:1,lastReadAt,telemetry,failures:0,backoffUntil:0,trigger:''});
+const saved=(telemetry,lastReadAt)=>({v:1,lastReadAt,telemetry,failures:0,backoffUntil:0,trigger:'',infraFailures:0,breakerUntil:0,breakerPhase:''});
 const persist=(root,state)=>writeFileSync(join(root,'health.json'),JSON.stringify(state));
 const load=root=>JSON.parse(readFileSync(join(root,'health.json'),'utf8'));
 const check=(root,readTelemetry,time=now,ping=async()=>false)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,ping});
