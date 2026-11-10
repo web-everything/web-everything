@@ -1,4 +1,5 @@
 ---
+bornAs: xwso2n2
 kind: story
 size: 3
 status: open
@@ -7,13 +8,13 @@ dateOpened: "2026-11-09"
 tags: []
 ---
 
-# Per-PR ownership of the red-team check when PRs share a SHA so policy-clear publication is not blocked (R789 break)
+# Recovery sweep backfills the red-team check for heads with a completed result and no published check (R789 break)
 
-Red-team break on #6535 (confirmed, liveness only, ruled under R789 and R794): when two PRs share a head SHA, a successful check bound to the other PR makes policy-clear publication in we:scripts/lib/red-team-check-run.mjs return ok:false with zero POSTs, stranding the second PR. Bind each check to its own PR via external_id and create the PR own check when absent, without superseding the other PR evidence. Design context: operator handoff design note for the 6535 follow-ups.
+Red-team break on #6535 (confirmed, liveness only, ruled under R789 and R794): a head with a trusted completed red-team result comment but no published check run is held forever by we:scripts/merge-gate-check.mjs. Add a recovery sweep that calls the shared publish helper from the R789 follow-up design (operator handoff design note for the 6535 follow-ups, residual section) on such heads, with no new model round. Fail closed on any refusal.
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/red-team-check-run.test.mjs` passes: with PR 7 success on a shared SHA, PR 8 policy-clear publishes its own check; PR 7 check is untouched.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/review-red-team-on-skip.test.mjs` passes: a head with a clean result comment and no check gets one success publish; a blocked label, in_progress run or head move posts nothing.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not change the in-progress race guard or the carry and ruling republish cards.
+- [N1] Does not change merge-gate-check hold logic and does not start a new red-team round.
 
 ## Edge cases this change must handle
 
