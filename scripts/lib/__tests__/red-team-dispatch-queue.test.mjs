@@ -248,7 +248,7 @@ describe('setting-driven red-team queue floor', () => {
 
   it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j alone falls back to 10', value => {
     expect(load(settings(2, value))).toEqual(floor);
-    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual(floor);
+    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0 });
   });
 
   it.each([0, 100])('accepts idle threshold boundary %s', idlePct => {
