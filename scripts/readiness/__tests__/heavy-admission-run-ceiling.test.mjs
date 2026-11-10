@@ -1,6 +1,7 @@
 // The run ceiling (--run-ceiling-ms) starts at slot grant, not at wrapper launch: queue wait never counts against it.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runUnderAdmission, admittedArgv, heldSlots } from '../heavy-admission.mjs';
@@ -31,6 +32,22 @@ describe('runUnderAdmission — run ceiling counted from slot grant', () => {
     const ok = await runUnderAdmission({ lockRoot, cap: 1, owner: 'I', command: 'exit 3', runCeilingMs: 5000, log: () => {}, now: () => T0, sleep: async () => {} });
     expect(ok.exitCode).toBe(3);
   });
+  it('a files-kind run (inherited fast timeout) still kills descendants, and a SIGKILLed wrapper leaves no orphan', async () => {
+    const pidFile = join(lockRoot, 'pid2');
+    const r = await runUnderAdmission({ lockRoot, cap: 1, owner: 'F', command: `sleep 30 & echo $! > ${pidFile}; wait`, kind: 'files', env: { WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS: '1000' }, runCeilingMs: 60_000, log: () => {}, now: () => T0, sleep: async () => {} });
+    expect(r.exitCode).toBe(124);
+    expect(() => process.kill(Number(readFileSync(pidFile, 'utf8')), 0)).toThrow();
+    // Wrapper killed with SIGKILL: no handler runs, the watchdog must reap the group.
+    const pidFile3 = join(lockRoot, 'pid3');
+    const url = `file://${join(process.cwd(), 'scripts/readiness/heavy-admission.mjs')}`;
+    const wrapper = spawn(process.execPath, ['--input-type=module', '-e',
+      `import{runUnderAdmission}from${JSON.stringify(url)};await runUnderAdmission({lockRoot:${JSON.stringify(lockRoot)},cap:1,owner:'W',command:${JSON.stringify(`sleep 60 & echo $! > ${pidFile3}; wait`)},runCeilingMs:60000,bypass:'no-pool',log:()=>{}});`], { stdio: ['ignore', 'ignore', 'inherit'] });
+    for (let i = 0; i < 150 && !existsSync(pidFile3); i++) await new Promise((res) => setTimeout(res, 100));
+    const orphan = Number(readFileSync(pidFile3, 'utf8'));
+    wrapper.kill('SIGKILL');
+    for (let i = 0; i < 40; i++) { try { process.kill(orphan, 0); } catch { break; } await new Promise((res) => setTimeout(res, 250)); }
+    expect(() => process.kill(orphan, 0)).toThrow();
+  }, 30_000);
   it('no runCeilingMs means no exec timeout; admittedArgv carries the flag only when asked', async () => {
     const seen = [];
     await runUnderAdmission({ lockRoot, cap: 1, owner: 'B', command: 'x', exec: (_c, o) => seen.push(o.timeout), now: () => T0, sleep: async () => {} });

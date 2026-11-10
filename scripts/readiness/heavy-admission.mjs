@@ -2448,14 +2448,25 @@ function execWithRunCeiling(command, opts, ceilingMs, exec) {
     return Promise.resolve().then(() => exec(command, { ...opts, timeout: ceilingMs, killSignal: 'SIGKILL' }));
   }
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn('/bin/sh', ['-c', command], { ...opts, detached: true });
+    // An inherited exec `timeout` (the fast-run limit) must not reach spawn: its SIGTERM hits only the shell. Both limits
+    // are enforced through the group kill instead, so the effective ceiling is the smaller of the two.
+    const { timeout: inheritedTimeout, killSignal: _ks, ...spawnOpts } = opts;
+    const effectiveMs = inheritedTimeout > 0 ? Math.min(ceilingMs, inheritedTimeout) : ceilingMs;
+    const child = spawn('/bin/sh', ['-c', command], { ...spawnOpts, detached: true });
     const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
+    // Independent parent-death protection: a SIGKILLed wrapper runs no handlers, so a tiny watchdog outside the group
+    // kills the group when the wrapper is gone or the deadline passes. It is local to this process, never part of the argv.
+    const watchdog = spawn(process.execPath, ['-e',
+      'const [g,p,ms]=process.argv.slice(1).map(Number);const end=Date.now()+ms;const k=()=>{try{process.kill(-g,"SIGKILL")}catch{}};'
+      + 'const i=setInterval(()=>{let alive=true;try{process.kill(p,0)}catch{alive=false}if(!alive||Date.now()>end){k();process.exit(0)}},500);',
+      String(child.pid), String(process.pid), String(effectiveMs + 5000)], { detached: true, stdio: 'ignore' });
+    watchdog.unref();
     let expired = false;
-    const timer = setTimeout(() => { expired = true; killGroup(); }, ceilingMs);
+    const timer = setTimeout(() => { expired = true; killGroup(); }, effectiveMs);
     const forward = (sig) => () => { killGroup(); process.exit(128 + (sig === 'SIGINT' ? 2 : sig === 'SIGHUP' ? 1 : 15)); };
     const sigs = ['SIGTERM', 'SIGINT', 'SIGHUP'].map((sig) => [sig, forward(sig)]);
     for (const [sig, h] of sigs) process.once(sig, h);
-    const done = () => { clearTimeout(timer); for (const [sig, h] of sigs) process.removeListener(sig, h); };
+    const done = () => { clearTimeout(timer); try { watchdog.kill('SIGKILL'); } catch { /* gone */ } for (const [sig, h] of sigs) process.removeListener(sig, h); };
     child.on('error', (e) => { done(); rejectRun(e); });
     child.on('exit', (code, signal) => {
       done();
