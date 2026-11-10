@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/readiness/forge-exec-manifest.mjs", "we:scripts/readiness/__tests__/forge-exec-manifest.test.mjs"]
+scope: ["we:scripts/readiness/forge-exec-manifest.mjs", "we:scripts/readiness/__tests__/forge-exec-manifest.test.mjs", "we:scripts/readiness/__tests__/forge-scan-code-expression.test.mjs"]
 dateOpened: "2026-11-09"
 tags: []
 ---
