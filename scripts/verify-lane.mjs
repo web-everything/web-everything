@@ -85,8 +85,8 @@ import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
-import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { SHARD_RUN_SCRIPT, localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind, recordRemoteFallback, ADMISSION_DEFERRED_EXIT, loadAdmissionPolicy } from './readiness/heavy-admission.mjs';
+import { SHARD_RUN_SCRIPT, localPhaseReason, phaseAdmissionPlan, localPhaseAdmissionRecord, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -108,6 +108,7 @@ Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
   reset     clear a stale marker
   run       synchronous marker-less run
 Flags: --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
+  --local-justification="<text>"  justify FULL/soak local work under heavyAdmission.fullLocalFallback=justified
 Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
 `);
   process.exit(0);
@@ -642,9 +643,17 @@ async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
+  const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: REPO });
+  const fallback = localPhaseAdmissionRecord({ command, decision, kind: routing.kind, forceLocal,
+    env: process.env, policy, justification: flags['local-justification'] });
+  recordRemoteFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: fallback.reason, detail: fallback.detail,
+    cwd: REPO, argv: command.split(/\s+/), env: process.env });
+  if (fallback.refused) emit({ sha: headSha, status: 'deferred', reason: fallback.reason,
+    exitCode: ADMISSION_DEFERRED_EXIT, detail: fallback.detail }, ADMISSION_DEFERRED_EXIT);
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
+    command, route: 'local', routeReason: fallback.reason, policy,
   });
   if (acquired.timedOut) {
     process.stderr.write(`⚠ heavy-command admission: timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);

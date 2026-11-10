@@ -852,7 +852,7 @@ export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmis
 }
 
 // Diagnostic history is best-effort and bounded, including oversized refusal details.
-function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, clock}) {
+export function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env = process.env, clock = Date.now}) {
   try {
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
     const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
@@ -1945,7 +1945,7 @@ export async function acquireSlotBlocking({
   policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot,
   hostAdmission = (o) => env[ADMISSION_HELD_ENV] === '1'
     ? { admitted: true, reason: 'host admission already held' } : hostLoadAdmission(o),
-  interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, location = null, ...seams
+  interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, location = null, route = null, routeReason = null, ...seams
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
   // heavy-run-wait — a wait budget applies only to a caller that would otherwise defer; anything else is unchanged.
@@ -2070,7 +2070,7 @@ export async function acquireSlotBlocking({
         // Card xmh9mtr — WHO holds it is fixed here, at acquire (env first, then the lane lease as it is NOW);
         // reading it at release mis-attributes a lane whose lease was reaped or re-leased meanwhile.
         const identity = resolveHoldIdentity({ env, repo: repo ?? repoOfOwner(owner), readLease: seams.readLease });
-        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...(location ? { location } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
+        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...(location ? { location } : {}), ...(route ? { route } : {}), ...(routeReason ? { routeReason } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
         const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
         if (r.ok) {
           if (cls.class === 'P0') log(`heavy-command admission: red-main repair admitted — class P0, slot ${r.slot}, after ${Math.round((attempt - startedAt) / 1000)}s [${prioritySrc}]\n`);
@@ -2121,7 +2121,7 @@ const DURATIONS_LOG = 'durations.jsonl';
 export const DURATIONS_LOG_MAX_LINES = 2000;
 
 /** Append one hold-duration record. Never throws. */
-export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null, command = null, holder = null, runId = null, priority = null }) {
+export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null, command = null, holder = null, runId = null, priority = null, route = null, routeReason = null }) {
   if (!Number.isFinite(ms) || ms < 0) return false;
   const file = join(lockRoot, DURATIONS_LOG);
   try {
@@ -2135,6 +2135,8 @@ export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = nul
       ...(command ? { command } : {}),
       ...(holder ? { holder } : {}),
       ...(priority ? { priority } : {}),
+      ...(route ? { route } : {}),
+      ...(routeReason ? { routeReason } : {}),
     }) + '\n', 'utf8');
     const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
     if (lines.length > DURATIONS_LOG_MAX_LINES) writeFileSync(file, lines.slice(-Math.floor(DURATIONS_LOG_MAX_LINES / 2)).join('\n') + '\n', 'utf8');
@@ -2163,6 +2165,7 @@ function recordReleasedHold(lockRoot, entry, nowMs = Date.now()) {
     leaseAcquiredAt: m.leaseAcquiredAt ?? (m.session ? null : fromLease.leaseAcquiredAt ?? null),
     runId: m.runId ?? null,
     command: m.command ?? null, holder: m.holder ?? null, priority: m.priority ?? null,
+    route: m.route ?? null, routeReason: m.routeReason ?? null,
   });
 }
 

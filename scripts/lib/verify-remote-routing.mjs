@@ -2,7 +2,7 @@ import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 
 import { cpus, loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
+import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient, classifyCommandKind } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
@@ -112,6 +112,25 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
       && resolve(cwd, words[1]) === resolve(cwd, 'scripts/readiness/heavy-admission.mjs')));
   const remote = eligible && decision?.remote === true;
   return { command, takeLocalSlot: !remote, setHeld: !remote };
+}
+
+// Evidence for a phase that will take a local slot. R834's shared admission policy
+// controls whether full-suite or soak work may consume the Mac's capacity.
+export function localPhaseAdmissionRecord({ command, decision, kind, forceLocal = false, env = process.env,
+  policy, justification }) {
+  const reason = forceLocal ? 'remote-red-confirm'
+    : decision?.remote ? 'unwrappable-command' : decision?.reason ?? localPhaseReason(command);
+  const full = ['FULL', 'soak'].includes(kind) || ['FULL', 'soak'].includes(classifyCommandKind(command, env));
+  // TODO(R834 heavy-admission PR): rely on its fullLocalFallback schema/default once integrated.
+  const configured = policy?.settings?.fullLocalFallback;
+  const mode = ['refuse', 'justified', 'allow'].includes(configured) ? configured : 'refuse';
+  const text = typeof justification === 'string' ? justification.trim() : '';
+  const refused = full && !(mode === 'allow' || (mode === 'justified' && text));
+  const source = configured === mode ? policy?.sources?.fullLocalFallback ?? 'standard' : 'standard';
+  return { refused, reason: refused ? 'full-local-refused' : reason,
+    detail: full ? `heavyAdmission.fullLocalFallback=${mode} (source: ${source}); ` + (refused
+      ? 'Restore remote routing, or select justified with --local-justification="<text>" / allow in admission policy.'
+      : text ? `--local-justification (source: flag): ${text}` : 'local FULL/soak permitted by admission policy.') : null };
 }
 
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn, failureDetails } = {}) {

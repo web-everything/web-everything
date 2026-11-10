@@ -4088,3 +4088,15 @@ The judge facts reader observes the shared run store; hermetic facts fixtures mu
 cascade; judge facts IO tests cover durable per-run alert claims and ruled-finding suppression.
 Alert claims never expire automatically: uncertain publication requires operator inspection
 of `referral-judge-alert-claims` in the shared runs directory, rather than a liveness probe.
+
+## Verify-lane local routing evidence (R834)
+
+`scripts/__tests__/verify-lane-admission.test.mjs` exercises the phase admission function
+with injected routing and real temporary admission journals. Remote phases must acquire no
+outer Mac slot. Local phases record the same reason in `remote-fallbacks.jsonl` and released
+`durations.jsonl` holds, including `remote-red-confirm` for forced local confirmation.
+FULL/soak local admission reads `heavyAdmission.fullLocalFallback` from the shared admission
+policy, defaulting defensively to `refuse` (exit 75). `justified` requires a non-empty
+`--local-justification="<text>"` flag; `allow` permits local work without one. Fallback details
+record the policy source and any supplied flag justification. The shared setting schema is
+owned by the parallel heavy-admission R834 PR; verify consumes the loader's policy result.
