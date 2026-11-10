@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const MINUTE = 60_000, HOUR = 60 * MINUTE;
-export const LIVE_OWNER_DEFAULTS = Object.freeze({ intervalMinutes: 5, mode: 'shadow', progressMinutes: 20,
+export const LIVE_OWNER_DEFAULTS = Object.freeze({ intervalMinutes: 5, mode: 'shadow', actEnabled: false, progressMinutes: 20,
   ciMinutes: 60, stackMinutes: 120, redTeamMinutes: 120, reviewQueueMinutes: 20,
   noMergeMinutes: 30, overlayMinutes: 20, maxPrs: 100, maxActions: 3, tickBudgetMs: 30_000 });
 export const RULE_CLASSES = Object.freeze(['dead-red-team', 'stale-label', 'overlay-not-adopted', 'no-merge',
@@ -132,12 +132,12 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
   const result = { considered: 0, byOwner: { 'live-process': 0, 'external-wait': 0, operator: 0, none: 0 }, actions: [], held: [], smells: [], selfAudit: null };
   let release;
   const started = Date.now(), inBudget = () => Date.now() - started < config.tickBudgetMs;
-  const notify = async (key, reason, pr = {}, window = HOUR) => {
+  const notify = async (key, reason, pr = {}, window = HOUR, details = {}) => {
     const state = await io.readSmellState();
     if (state[key] && recent({ ts: state[key] }, now, window)) return false;
     await io.emit({ at: new Date(now).toISOString(), repo: pr.repo ?? io.repo, pr: pr.number ?? 0,
       head: pr.headRefOid ?? '', kind: `live-owner-${key.split(':')[0].toLowerCase().replace(/[^a-z0-9-]/g, '-')}`.slice(0, 40),
-      reason: `${key}: ${reason}`, evidence: [reason] });
+      reason: `${key}: ${reason}`, evidence: [reason], ...details });
     state[key] = new Date(now).toISOString();
     await io.writeSmellState(state);
     return true;
@@ -147,7 +147,7 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
     const gaps = await io.readGaps();
     if (!Array.isArray(gaps) || gaps.length > 5000) throw Error('hook gaps incomplete or oversized; operator must inspect full input');
     result.selfAudit = selfAudit(gaps);
-    if (result.selfAudit.unruled.length) await notify('SELF-AUDIT', result.selfAudit.summary, {}, 24 * HOUR);
+    if (config.actEnabled !== true || result.selfAudit.unruled.length) await notify('SELF-AUDIT', result.selfAudit.summary, {}, 24 * HOUR);
     const history = await io.readHistory(), sweep = await io.readSweepHistory();
     if (sweep.complete !== true) throw Error('stall-sweep audit incomplete');
     const prs = await io.listPRs();
@@ -170,20 +170,31 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
       }
     }
     const planned = planActions(classified, history, now, { mode });
+    if (config.actEnabled !== true) {
+      // Report every ownerless head, even when an old decision spent the action budget.
+      const wouldDo = planActions(classified, [], now, { mode });
+      for (const { pr, classification: c } of classified) {
+        if (c.owner !== 'none') continue;
+        const action = wouldDo.find(a => keyOf(a.pr) === keyOf(pr))?.action ?? 'hold-for-operator';
+        await notify(`no-live-owner:${keyOf(pr)}:${pr.headRefOid}`,
+          `owner=${c.owner}; detail=${c.detail}; progressAgeMin=${c.progressAgeMin ?? 'unknown'}; would-do=${action}`,
+          pr, HOUR, { kind: 'no-live-owner', ownerClass: c.owner, progressAgeMin: c.progressAgeMin, wouldDo: action });
+      }
+    }
     let spent = 0;
     for (const action of planned) {
       if (action.action === 'needs-you') { await notify(`${action.reason}:${keyOf(action.pr)}`, action.reason, action.pr); continue; }
       if (!inBudget() || spent >= config.maxActions) { result.held.push({ pr: action.pr.number, reason: 'pass budget; retry next pass' }); continue; }
       // This read is deliberately inside the critical section, immediately before the durable spend.
-      const gate = await io.checkAdmission(action.pr, action);
+      const gate = config.actEnabled === true ? await io.checkAdmission(action.pr, action) : { ok: true };
       if (gate?.ok !== true) { result.held.push({ pr: action.pr.number, reason: gate?.reason ?? 'admission unknown; operator inspection required' }); continue; }
       const pr = action.pr;
       const record = { ts: new Date(now).toISOString(), et: new Date(now).toLocaleString('en-CA', { timeZone: 'America/New_York' }),
         repo: pr.repo, pr: pr.number, head: pr.headRefOid, ownerClass: 'none', action: action.action,
-        phase: mode === 'shadow' ? 'would-do' : 'intent', reason: action.reason };
+        phase: config.actEnabled !== true || mode === 'shadow' ? 'would-do' : 'intent', reason: action.reason };
       await io.appendDecision(record); spent++;
       result.actions.push(record);
-      if (mode === 'shadow') continue;
+      if (config.actEnabled !== true || mode === 'shadow') continue;
       try {
         const receipt = await io.execute(action);
         if (receipt?.ok !== true) throw Error(receipt?.reason ?? 'action completion unproven');

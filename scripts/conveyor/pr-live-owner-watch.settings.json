@@ -1,5 +1,6 @@
 {
   "liveOwnerWatch": {
-    "mode": "shadow"
+    "mode": "shadow",
+    "actEnabled": false
   }
 }

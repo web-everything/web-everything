@@ -36,13 +36,15 @@ export function feedTail(path, { read = readSync } = {}) {
 export function resolveLiveOwnerSettings({ env = process.env, tool = {}, platform, log = console.error } = {}) {
   const settings = platform === undefined ? readPlatformPreferences({ env }) : { prefs: platform, errors: [] };
   const envValues = env.WE_LIVE_OWNER_WATCH_MODE === undefined ? {} : { mode: env.WE_LIVE_OWNER_WATCH_MODE };
-  const valid = Object.fromEntries(Object.keys(LIVE_OWNER_DEFAULTS).map(k => [k, k === 'mode'
+  if (env.WE_LIVE_OWNER_WATCH_ACT !== undefined) envValues.actEnabled = env.WE_LIVE_OWNER_WATCH_ACT === '1';
+  const valid = Object.fromEntries(Object.keys(LIVE_OWNER_DEFAULTS).map(k => [k, k === 'actEnabled' ? v => typeof v === 'boolean' : k === 'mode'
     ? v => ['shadow', 'on'].includes(v) : v => Number.isFinite(v) && v > 0 && v <= (k === 'maxPrs' ? 100 : k === 'tickBudgetMs' ? 60_000 : 1440)
       && (!['maxPrs', 'maxActions', 'tickBudgetMs'].includes(k) || Number.isSafeInteger(v))]));
   const resolved = cascadePolicy('liveOwnerWatch', tool, { standard: LIVE_OWNER_DEFAULTS,
     platform: settings.prefs.liveOwnerWatch ?? {}, envValues, valid, env, log });
   if (settings.errors.length || resolved.invalid.length || !['shadow', 'on'].includes(tool.mode ?? 'shadow')) {
     resolved.value.mode = 'shadow'; resolved.sources.mode = 'fail-closed (invalid policy)';
+    resolved.value.actEnabled = false; resolved.sources.actEnabled = 'fail-closed (invalid policy)';
   }
   log(`liveOwnerWatch effective=${JSON.stringify(resolved.value)} sources=${JSON.stringify(resolved.sources)}`);
   return resolved.value;
@@ -261,6 +263,8 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
       return { ok: true };
     },
     async execute(action) {
+      // Single mutation choke point: refuse before reading or constructing any action adapter.
+      if (config.actEnabled !== true) return { ok: false, reason: 'live-owner acting disabled; report-only' };
       if (!['clear-label', 'fix-dispatch', 'refresh-check', 'validate-data-refresh', 'review-dispatch', 'red-team-dispatch'].includes(action.action))
         throw Error('unknown live-owner action; operator inspection required');
       const pr = action.pr, input = { repo: pr.repo, pr: pr.number, head: pr.headRefOid, env };
@@ -345,6 +349,9 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
         if (plan.abandon !== false || !['fresh', 'resume'].includes(plan.mode)) throw Error('red-team recovery not admissible');
         redTeamMode = plan.mode;
       }
+      const head = readGh(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'headRefOid'])?.headRefOid;
+      if (typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) throw Error('PR head unreadable; operator must inspect before retrying');
+      if (head.toLowerCase() !== pr.headRefOid.toLowerCase()) throw Error('PR head changed; operator must inspect before retrying');
       const result = await (adapters.dispatchManualPass ?? dispatchManualPass)({ daemon: action.action === 'review-dispatch' ? 'review' : 'red-team',
         repo: pr.repo, pr: pr.number, expectedHead: pr.headRefOid, ...(redTeamMode ? { redTeamMode } : {}) }, { env, readHead: () => readGh(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'headRefOid']).headRefOid });
       return { ok: !result?.error && !result?.skipped && result?.ok !== false

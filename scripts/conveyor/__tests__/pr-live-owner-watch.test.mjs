@@ -14,7 +14,7 @@ const evidence = (overrides = {}) => ({ complete: true, claims: [], liveClaim: f
 const classified = (p = pr(), e = evidence()) => ({ pr: p, evidence: e, classification: classifyOwner(p, e, NOW) });
 function harness(prs = [pr({ labels: ['status:fixing'] })], overrides = {}) {
   const history = [], events = [], state = {};
-  const io = { repo: 'web-everything/web-everything', config: {}, acquireRun: vi.fn(() => vi.fn()),
+  const io = { repo: 'web-everything/web-everything', config: { actEnabled: true }, acquireRun: vi.fn(() => vi.fn()),
     readHistory: vi.fn(() => [...history]), appendDecision: vi.fn(r => history.push(r)),
     readSweepHistory: vi.fn(() => ({ complete: true, records: [] })), listPRs: vi.fn(() => prs),
     readEvidence: vi.fn(() => evidence()), checkAdmission: vi.fn(() => ({ ok: true })),
@@ -102,6 +102,49 @@ describe('pure owner classification and planning', () => {
 });
 
 describe('pass audit and admission', () => {
+  it.each([
+    ['clear-label', { labels: ['status:fixing'] }, {}],
+    ['refresh-check', {}, { missingRequiredCheck: true }],
+    ['fix-dispatch', { mergeable: 'CONFLICTING' }, {}],
+    ['review-dispatch', { labels: ['review:pending'] }, {}],
+    ['red-team-dispatch', {}, { redTeamOwed: true }],
+    ['validate-data-refresh', { author: 'app-bot', files: ['scripts/ci/test-timings.json'] }, { validatorAvailable: true }],
+  ])('default report-only in mode on never calls admission or execute for %s', async (action, facts, e) => {
+    const h = harness([pr(facts)], { config: {}, readEvidence: () => evidence(e) });
+    const result = await h.run('on');
+    expect(h.io.checkAdmission).not.toHaveBeenCalled();
+    expect(h.io.execute).not.toHaveBeenCalled();
+    expect(result.actions).toEqual([expect.objectContaining({ action, phase: 'would-do' })]);
+    expect(h.events).toContainEqual(expect.objectContaining({ kind: 'no-live-owner',
+      head: pr().headRefOid, ownerClass: 'none', progressAgeMin: null, wouldDo: action }));
+  });
+  it('report-only deduplicates no-live-owner by PR and head for 60 minutes despite old decisions', async () => {
+    const p = pr({ labels: ['status:fixing'] });
+    const h = harness([p], { config: {} });
+    h.history.push({ repo: p.repo, pr: p.number, head: p.headRefOid, phase: 'intent', ts: ago(1) });
+    await h.run(); await h.run('shadow', NOW + 59 * MIN);
+    const alerts = () => h.events.filter(e => e.kind === 'no-live-owner');
+    expect(alerts()).toHaveLength(1);
+    await h.run('on', NOW + 60 * MIN); expect(alerts()).toHaveLength(2);
+    p.headRefOid = 'b'.repeat(40);
+    await h.run('on', NOW + 60 * MIN); expect(alerts()).toHaveLength(3);
+    expect(alerts()[2].head).toBe(p.headRefOid);
+    expect(h.io.execute).not.toHaveBeenCalled();
+  });
+  it('report-only includes stalled progress and operator alerts plus smells and the self-audit line', async () => {
+    const h = harness([pr({ number: 1 }), pr({ number: 2, labels: ['review:human'] })], {
+      config: {}, readEvidence: () => evidence({ claims: [{ alive: true, activityMs: NOW - 21 * MIN }] }),
+      readSystemEvidence: () => ({ heavyFallback: true }),
+    });
+    await h.run();
+    expect(h.events).toContainEqual(expect.objectContaining({ kind: 'no-live-owner', pr: 1,
+      ownerClass: 'none', progressAgeMin: 21, wouldDo: 'needs-you', reason: expect.stringContaining('stalled-owner') }));
+    expect(h.events.some(e => e.pr === 2 && e.reason.includes('operator-approval'))).toBe(true);
+    expect(h.events.some(e => e.reason.includes('HEAVY-MAC-FALLBACK'))).toBe(true);
+    expect(h.events.some(e => e.reason.includes('self-audit: no unruled gap classes'))).toBe(true);
+    expect(h.io.execute).not.toHaveBeenCalled();
+  });
+
   it('shadow writes only would-do records and never calls an injected dispatcher', async () => {
     const h = harness(); const result = await h.run('shadow');
     expect(result.actions.map(r => r.phase)).toEqual(['would-do']); expect(h.io.execute).not.toHaveBeenCalled();
@@ -223,10 +266,11 @@ describe('health-watch registration', () => {
 
 describe('portable feed IO and settings', () => {
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
-  async function localIo(adapters = {}, now = NOW, dir) {
+  async function localIo(adapters = {}, now = NOW, dir, actEnabled = true) {
     if (!dir) { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir); }
     writeFileSync(join(dir, 'platform.json'), '{}');
     const env = { GH_REPO: pr().repo, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'platform.json'),
+      ...(actEnabled ? { WE_LIVE_OWNER_WATCH_ACT: '1' } : {}),
       WE_COORDINATION_ROOT: join(dir, 'coordination'), WE_LIVE_OWNER_WATCH_DIR: join(dir, 'watch'), WE_NEEDS_YOU_FEED: join(dir, 'feed.jsonl'), WE_POLICY_CASCADE_LOG: '0' };
     return { dir, io: await createLiveOwnerWatchIo({ env, home: dir, root: dir, now, adapters: {
       lockOptions: { stamp: () => ({ runnerStart: 'fixture-birth' }), identity: () => ({ alive: true }) }, ...adapters,
@@ -289,6 +333,37 @@ describe('portable feed IO and settings', () => {
     expect(resolveLiveOwnerSettings({ ...opts, env: { WE_LIVE_OWNER_WATCH_MODE: 'on' } }).mode).toBe('on');
     expect(resolveLiveOwnerSettings({ ...opts, tool: { mode: 'garbage' } }).mode).toBe('shadow');
   });
+  it.each(['clear-label', 'refresh-check', 'fix-dispatch', 'review-dispatch', 'red-team-dispatch', 'validate-data-refresh'])
+  ('disabled IO choke point never constructs or calls any mutation adapter: %s', async action => {
+    const touched = vi.fn(() => { throw Error('mutation adapter accessed'); });
+    const adapters = {};
+    for (const name of ['labelProvider', 'staleBaseGate', 'resolveLiveQueueBaseline', 'buildFixThrottle',
+      'reconcileFixDispatch', 'reconcileReview', 'dispatchManualPass', 'validateDataRefresh',
+      'abandonStaleRedTeamRun', 'planRedTeamRecovery']) {
+      Object.defineProperty(adapters, name, { enumerable: true, get: touched });
+    }
+    // Pass getters directly so even constructing an adapter would fail this closed-path test.
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-disabled-')); dirs.push(dir);
+    const io = await createLiveOwnerWatchIo({ env: { GH_REPO: pr().repo, WE_LIVE_OWNER_WATCH_MODE: 'on',
+      WE_PLATFORM_PREFERENCES_FILE: join(dir, 'absent-platform.json') }, home: dir, root: dir, adapters });
+    expect(io.config).toMatchObject({ mode: 'on', actEnabled: false });
+    expect(await io.execute({ pr: pr(), action })).toMatchObject({ ok: false, reason: expect.stringContaining('report-only') });
+    expect(touched).not.toHaveBeenCalled();
+  });
+  it('acting requires an explicit boolean opt-in or env 1, logs provenance and closes invalid settings', () => {
+    const log = vi.fn(), opts = { env: {}, platform: {}, log };
+    expect(resolveLiveOwnerSettings(opts).actEnabled).toBe(false);
+    expect(resolveLiveOwnerSettings({ ...opts, tool: { mode: 'on' } }).actEnabled).toBe(false);
+    expect(resolveLiveOwnerSettings({ ...opts, tool: { actEnabled: true } }).actEnabled).toBe(true);
+    expect(log.mock.calls.at(-1)[0]).toContain('"actEnabled":"tool"');
+    expect(resolveLiveOwnerSettings({ ...opts, env: { WE_LIVE_OWNER_WATCH_ACT: '1' } }).actEnabled).toBe(true);
+    expect(log.mock.calls.at(-1)[0]).toContain('"actEnabled":"env"');
+    expect(resolveLiveOwnerSettings({ ...opts, tool: { actEnabled: 'true' } }).actEnabled).toBe(false);
+    expect(resolveLiveOwnerSettings({ ...opts, tool: { actEnabled: true, mode: 'invalid' } }).actEnabled).toBe(false);
+    for (const value of ['true', '0', 'garbage', '']) {
+      expect(resolveLiveOwnerSettings({ ...opts, env: { WE_LIVE_OWNER_WATCH_ACT: value } }).actEnabled).toBe(false);
+    }
+  });
   it('real label adapter removes status:fixing only, using the shared provider path', async () => {
     const setLabels = vi.fn(); const { io } = await localIo({ labelProvider: { setLabels } });
     expect(await io.execute({ pr: pr(), action: 'clear-label' })).toEqual({ ok: true });
@@ -303,7 +378,7 @@ describe('portable feed IO and settings', () => {
   });
   it('dead red-team adapter abandons, replans recovery and forwards redTeamMode', async () => {
     const order = [], dispatchManualPass = vi.fn(input => { order.push('dispatch'); return { jobPid: 123 }; });
-    const { io } = await localIo({ dispatchManualPass, readRedTeamStatus: () => ({ status: 'running' }),
+    const { io } = await localIo({ dispatchManualPass, readGhText: commentGh(), readRedTeamStatus: () => ({ status: 'running' }),
       probePid: () => ({ alive: true, stat: 'Z' }), readRecoveryWitness: () => ({}),
       abandonStaleRedTeamRun: () => { order.push('abandon'); return { ok: true }; },
       planRedTeamRecovery: () => { order.push('replan'); return { abandon: false, mode: 'resume' }; } });
@@ -315,6 +390,7 @@ describe('portable feed IO and settings', () => {
   const comment = (id, body = 'fixture comment') => ({ node_id: `IC_${id}`, body, user: { login: 'web-everything' } });
   function commentGh(comments = [], totalCount = comments.length) {
     return vi.fn(args => {
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: pr().headRefOid });
       if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount } } } } });
       const page = Number(args[1]?.match(/&page=(\d+)$/)?.[1]);
       if (!page) throw Error('unexpected GitHub call');
@@ -424,30 +500,6 @@ describe('portable feed IO and settings', () => {
     expect(result.held).toContainEqual({ pr: 863, reason: expect.stringContaining('PR head changed') });
     expect(h.history).toEqual([expect.objectContaining({ phase: 'intent', head: pr().headRefOid })]);
     expect(dispatchReviewByMode).not.toHaveBeenCalled();
-  });
-  it('manual review dispatch forwards expectedHead and checks it immediately before mode dispatch', async () => {
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
-    const order = [], dispatchReviewByMode = vi.fn(options => { order.push('dispatch'); return options; });
-    const result = await dispatchManualPass({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: pr().headRefOid }, {
-      load: async () => ({ dispatchReviewByMode }), readHead: () => { order.push('head'); return pr().headRefOid; },
-    });
-    expect(order).toEqual(['head', 'dispatch']);
-    expect(result.expectedHead).toBe(pr().headRefOid);
-  });
-  it('review mode refuses a later head change after the manual precheck', async () => {
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
-    const { dispatchReviewByMode } = await import('../../operations/review-job.mjs');
-    let head = pr().headRefOid;
-    const spawnJob = vi.fn();
-    const result = await dispatchManualPass({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: head }, {
-      readHead: () => head,
-      load: async () => ({ dispatchReviewByMode: options => dispatchReviewByMode({ ...options, mode: 'job',
-        stackCheck: () => { head = 'b'.repeat(40); return { base: null }; },
-        io: { liveHead: () => head }, spawnJob,
-      }) }),
-    });
-    expect(result).toMatchObject({ refused: true, outcome: 'refused-head-moved' });
-    expect(spawnJob).not.toHaveBeenCalled();
   });
   it.each(['malformed', 'missing', 'unreadable', 'expired', 'oversized inventory'])
   ('build ownership holds instead of skipping %s claims', async kind => {

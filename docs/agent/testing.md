@@ -4129,3 +4129,11 @@ thread before the manual single-PR launcher. Re-arm comments, rather than the di
 label, carry the durable attempt budget. Preserve `expectedHead` through the mode dispatcher
 so the job also refuses a head changed after the manual precheck. Unknown build-claim metadata
 blocks ownership classification; lease expiry alone never proves that its owner is gone.
+
+Live-owner watch ships report-only (R876): `actEnabled` defaults false regardless of mode.
+The policy cascade logs its value and source; an explicit settings boolean true or
+`WE_LIVE_OWNER_WATCH_ACT=1` opts in, and invalid policy closes acting. The pass keeps
+would-do records and emits head-bound `no-live-owner` feed events (60-minute dedup),
+system smells, and the self-audit line. The IO execution choke point refuses all mutations
+before constructing action adapters, including red-team claim abandonment. Acting fixtures
+must opt in explicitly; disabled-path tests cover each action kind even in mode on.
