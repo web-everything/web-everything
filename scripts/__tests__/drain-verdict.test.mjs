@@ -1,10 +1,15 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeAll } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 import { SCHEMA, LOCAL_ONLY, build, verify, auditWorkflow } from '../lib/drain-verdict.mjs';
 import { DRAIN_GATES } from '../lib/merge-gate-inventory.mjs';
 import { resultToVerdictInputs, runCli } from '../drain-classify-only.mjs';
+import { buildSkipReasons } from '../lib/drain-skip-reasons.mjs';
 
 const computedAt = '2026-11-09T12:00:00.000Z';
 const now = Date.parse(computedAt);
@@ -23,6 +28,12 @@ const refuse = (v, lookup = live(), opts = {}) => {
 };
 const row = { num: 7, repo: 'o/r', headSha };
 const base = () => ({ ok: true, dryRun: true, heldCoupleMembers: 0, toMerge: [], skipped: [], parked: [], skipReasons: [] });
+// The real dry-run shape for one ready PR: the drain lands nothing in --dry-run (merged is empty), so the REAL
+// producer (buildSkipReasons) emits a `ready-not-reached` accounting row for the candidate. Verdict repo is null
+// for the drain's own repo, exactly as the live `--this-repo` JSON shows.
+const readyDryRun = (num = 7, extra = {}) => ({ ...base(),
+  toMerge: [{ ...row, num }],
+  skipReasons: buildSkipReasons({ verdicts: [{ num, repo: null, decision: 'merge', headSha }], merged: [] }), ...extra });
 
 describe('T1: strict v2 shape and forged verdict refusals', () => {
   it('builds exactly the v2 contract and verifies a valid verdict', () => {
@@ -172,6 +183,48 @@ describe('T3: result mapping preserves local fallback', () => {
   });
 });
 
+describe('T3b: the dry-run ready-not-reached accounting row is not an admission hold', () => {
+  const merge = (num, more = {}) => ({ num, repo: null, decision: 'merge', headSha, ...more });
+  it('pins the real producer: a lone ready candidate with an empty merged set gets ready-not-reached / unaccounted', () => {
+    expect(readyDryRun().skipReasons).toEqual([
+      { num: 7, repo: null, kind: 'ready-not-reached', reason: expect.any(String), source: 'unaccounted' }]);
+  });
+  it.each([['the drain-repo null', null], ['a slug', 'o/r']])('exact repro maps to enqueue (verdict repo %s)', (_n, repo) => {
+    const result = { ...base(), toMerge: [row], skipReasons: buildSkipReasons({ verdicts: [merge(7, { repo })], merged: [] }) };
+    expect(result.skipReasons.map(r => r.kind)).toEqual(['ready-not-reached']);
+    const mapped = resultToVerdictInputs(result, structuredClone(ctx));
+    expect(mapped).toMatchObject({ ...ctx, headSha, decision: 'enqueue' });
+    expect(verify(build(mapped), live(), { now })).toEqual({ ok: true });
+  });
+  it('another PR\'s hold row does not hold the target', () => {
+    const skipReasons = buildSkipReasons({ verdicts: [merge(7), merge(8)], deferred: [{ num: 8, repo: null, waitOn: ['#1'] }] });
+    expect(resultToVerdictInputs({ ...base(), toMerge: [row], skipReasons }, ctx).decision).toBe('enqueue');
+  });
+  it.each([
+    ['partner-pending (real couple partner)', () => ({ skipReasons: buildSkipReasons({
+      verdicts: [merge(7, { item: '4242' }), merge(8, { item: '4242' })], merged: [] }) }), 'partner-pending'],
+    ['deferred (real blocked-by row plus the deferred list)', () => {
+      const deferred = [{ num: 7, repo: null, waitOn: ['#1'] }];
+      return { deferred, skipReasons: buildSkipReasons({ verdicts: [merge(7)], deferred }) };
+    }, 'blocked-by'],
+    ['blocked-by row alone (no deferred list)', () => ({ skipReasons: buildSkipReasons({
+      verdicts: [merge(7)], deferred: [{ num: 7, repo: null, waitOn: ['#1'] }] }) }), 'blocked-by'],
+    ['batching-deferred (real enqueue hold)', () => ({ skipReasons: buildSkipReasons({ verdicts: [merge(7)],
+      enqueueOutcomes: [{ num: 7, repo: null, outcome: 'not-enqueued', reason: 'admission deferred' }] }) }), 'batching-deferred'],
+    ['red-main-hold (real enqueue hold kind)', () => ({ skipReasons: buildSkipReasons({ verdicts: [merge(7)],
+      enqueueOutcomes: [{ num: 7, repo: null, outcome: 'not-enqueued', kind: 'red-main-hold', reason: 'red-main-hold: main is red' }] }) }), 'red-main-hold'],
+    ['red-main-hold (hand-built row)', () => ({ skipReasons: [{ ...row, kind: 'red-main-hold', reason: 'red-main-hold', source: 'skipped' }] }), 'red-main-hold'],
+    ['ready-not-reached from another source', () => ({ skipReasons: [{ ...row, kind: 'ready-not-reached', reason: 'x', source: 'skipped' }] }), 'ready-not-reached'],
+    ['an unknown kind', () => ({ skipReasons: [{ ...row, kind: 'brand-new-hold', reason: 'x', source: 'unaccounted' }] }), 'brand-new-hold'],
+    ['an accounting row plus a hold for the same target under the slug key', () => ({ skipReasons: [
+      ...readyDryRun().skipReasons, { ...row, kind: 'blocked-by', reason: 'blocked-by #1', source: 'deferred' }] }), 'blocked-by'],
+  ])('still refuses %s with the local drain fallback', (_name, extra, kind) => {
+    const result = { ...base(), toMerge: [row], ...extra() };
+    expect(result.skipReasons.some(r => r.kind === kind)).toBe(true);
+    expect(() => resultToVerdictInputs(result, ctx)).toThrow(/run the local drain/);
+  });
+});
+
 // Always mutate the shipped workflow, never a synthetic replacement for missing evidence.
 const workflowText = () => readFileSync(new URL('../../.github/workflows/drain-verdict.yml', import.meta.url), 'utf8');
 const mutateWorkflow = mutate => {
@@ -281,7 +334,7 @@ function ioFor() {
       if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === 'origin/main') return mainSha + '\n';
       if (cmd === 'gh' && args[0] === 'repo') return ctx.repo + '\n';
       if (cmd === process.execPath && args.some(arg => /(?:^|\/)merge-ai-prs\.mjs$/.test(arg)))
-        return JSON.stringify({ ...base(), toMerge: [row] });
+        return JSON.stringify(readyDryRun());
       throw new Error(`Unexpected injected command: ${cmd} ${args.join(' ')}`);
     }),
     writeFileSync: vi.fn(),
@@ -341,6 +394,17 @@ describe('T5: CLI refuses unsafe environments and arguments before exec', () => 
     const io = ioFor(); Object.assign(io.env, RUNNER_STEP_ENV);
     await runCli(argv, io);
     expect(io.writeFileSync).toHaveBeenCalledTimes(1);
+  });
+  it('refuses when origin/main moves during the dry-run (main changed) and writes nothing', () => {
+    const io = ioFor(), inner = io.execFileSync;
+    let reads = 0;
+    io.execFileSync = vi.fn((cmd, args, opts) => {
+      if (cmd === 'git' && args[1] === 'origin/main') return `${reads++ ? movedSha : mainSha}\n`;
+      return inner(cmd, args, opts);
+    });
+    expect(() => runCli(argv, io)).toThrow(/main changed; run the local drain/);
+    expect(reads).toBe(2);
+    expect(io.writeFileSync).not.toHaveBeenCalled();
   });
   it('resolves the optional repo from the injected environment', async () => {
     const io = ioFor();
@@ -430,7 +494,7 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
   const READY = [{ name: 'ready-to-merge' }];
   // The plain open-PR listing as gh returns it: rows with number + labels (`prs` are labelled ready-to-merge).
   const listing = (prs, extra = []) => JSON.stringify([...prs.map(number => ({ number, labels: READY })), ...extra]);
-  function batchIo({ prs = [7, 8], raw, failPr = null, event = 'schedule', requested } = {}) {
+  function batchIo({ prs = [7, 8], raw, failPr = null, event = 'schedule', requested, dryRunFor = readyDryRun } = {}) {
     const io = ioFor();
     io.env.GITHUB_EVENT_NAME = event;
     if (requested !== undefined) io.env.REQUESTED_PR = requested;
@@ -441,7 +505,7 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
       if (cmd === process.execPath && failPr && args.includes(`--only=${failPr}`)) throw new Error('boom');
       if (cmd === process.execPath) {
         const n = args.find(a => a.startsWith('--only=')).slice(7);
-        return JSON.stringify({ ...base(), toMerge: [{ ...row, num: Number(n) }] });
+        return JSON.stringify(dryRunFor(Number(n)));
       }
       return inner(cmd, args, opts);
     });
@@ -452,6 +516,42 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
     const out = runBatch(batchArgv, io);
     expect(out).toMatchObject({ written: 2, failed: 0 });
     expect(io.writeFileSync.mock.calls.map(c => c[0])).toEqual(['verdicts/pr-7.json', 'verdicts/pr-8.json']);
+  });
+  it('send-back repro: one uncoupled ready PR #7 with the real ready-not-reached row writes enqueue (written=1, failed=0)', () => {
+    const io = batchIo({ prs: [7] });
+    expect(runBatch(batchArgv, io)).toEqual({ written: 1, failed: 0 });
+    const child = io.execFileSync.mock.results.find((_r, i) => io.execFileSync.mock.calls[i][0] === process.execPath);
+    expect(JSON.parse(child.value).skipReasons).toEqual([expect.objectContaining({ num: 7, kind: 'ready-not-reached', source: 'unaccounted' })]);
+    expect(JSON.parse(String(io.writeFileSync.mock.calls[0][1])).decision).toBe('enqueue');
+  });
+  it('a couple partner-pending row still fails the PR to the local drain (written=0, failed=1)', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const io = batchIo({ prs: [7], dryRunFor: num => readyDryRun(num, { skipReasons: buildSkipReasons({ verdicts: [
+        { num, repo: null, item: '4242', decision: 'merge', headSha }, { num: num + 1, repo: null, item: '4242', decision: 'merge', headSha }] }) }) });
+      expect(runBatch(batchArgv, io)).toEqual({ written: 0, failed: 1 });
+      expect(io.writeFileSync).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.map(c => String(c[0])).join('')).toMatch(/#7: .*run the local drain/);
+    } finally { stderr.mockRestore(); }
+  });
+  it('the real CLI process exits 1 when the batch has a failure, and 0 for an empty scheduled batch', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'drain-verdict-exit-'));
+    try {
+      mkdirSync(join(dir, 'bin'));
+      writeFileSync(join(dir, 'bin', 'gh'), '#!/bin/sh\necho "[]"\n', { mode: 0o755 });
+      const script = fileURLToPath(new URL('../drain-classify-only.mjs', import.meta.url));
+      // A clean env: nothing inherited from the session, so assertSafeEnv passes and the batch result decides.
+      const env = event => ({ PATH: `${join(dir, 'bin')}:${process.env.PATH}`, GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main',
+        GITHUB_EVENT_NAME: event, GITHUB_RUN_ID: '1', GITHUB_REPOSITORY: 'o/r', GITHUB_TOKEN: 'read-only-fixture', REQUESTED_PR: 'abc' });
+      const run = event => spawnSync(process.execPath, [script, '--batch', '--verdict-dir=verdicts'],
+        { cwd: dir, encoding: 'utf8', timeout: 60_000, env: env(event) });
+      const failed = run('workflow_dispatch');
+      expect(failed.stderr).toMatch(/#abc: invalid PR number/);
+      expect(failed.status).toBe(1);
+      const empty = run('schedule');
+      expect(empty.stderr).toBe('');
+      expect(empty.status).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('one failing PR still attempts the others, then reports failure', () => {
     const io = batchIo({ failPr: 7 });

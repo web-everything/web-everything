@@ -7,6 +7,18 @@ import { filterOpenPrsByLabel, OPEN_PR_LIST_LIMIT } from './lib/no-search-backed
 /** At most this many labelled PRs are classified per scheduled run (each spawns a full dry-run drain). */
 const BATCH_PR_CAP = 10;
 
+/**
+ * The one admission-hold decision for a toMerge candidate. A dry-run lands nothing (its `merged` set is empty),
+ * so drain-skip-reasons emits a `ready-not-reached` accounting row (source `unaccounted`) for EVERY ready
+ * candidate: that row alone is not a hold. Any other row for the target — partner-pending, batching-deferred,
+ * red-main-hold, blocked-by, an unknown kind or source — is, and so is any deferred entry. Every matching row is
+ * checked: the producer keys rows by `repo ?? ''`, so one target can carry several.
+ */
+export function heldBeforeAdmission(result, matches) {
+  if ((result.deferred || []).some(matches)) return true;
+  return result.skipReasons.some(row => matches(row) && !(row.kind === 'ready-not-reached' && row.source === 'unaccounted'));
+}
+
 /** Only evidence exposed by the existing dry-run is asserted. */
 export function resultToVerdictInputs(result, ctx) {
   if (result?.dryRun !== true || result.ok !== true ||
@@ -43,7 +55,7 @@ export function resultToVerdictInputs(result, ctx) {
   if (heads.size !== 1 || !/^[a-f0-9]{40}$/i.test(rows[0].headSha ?? '')) throw new Error('ambiguous headSha/repo; run the local drain');
   if (merge.length && (merge.length !== 1 || skipped.length || parked.length)) throw new Error('contradictory classification; run the local drain');
   // toMerge is captured before dependency planning: deferred candidates are not admitted.
-  if (merge.length && ((result.deferred || []).some(matches) || result.skipReasons.some(matches))) {
+  if (merge.length && heldBeforeAdmission(result, matches)) {
     throw new Error('toMerge candidate deferred or skip-reasoned; run the local drain');
   }
   // --dry-run --json skips planCoupleCascadeStep and cannot detect separated couples:
