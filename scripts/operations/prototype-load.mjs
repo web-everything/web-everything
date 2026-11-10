@@ -23,6 +23,21 @@ export function jsonLines(text) {
  *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
  *  never claim it. Never a blanket bypass. */
 const RULING = /^R\d+(?:\+R\d+)*$/;
+/** Operator rulings may live in the platform prefs or the repo settings. The allowlist is the UNION of both layers,
+ *  de-duplicated by ref+sha+ruling (the tool entry wins); each entry carries its source `layer`. Platform entries get
+ *  the same shape checks as repo entries; a malformed one is ignored with a warning, never trusted. */
+export function mergeRuledWeakened(platform, tool, warn = () => {}) {
+  const wellFormed = (e) => e && typeof e.ref === 'string' && e.ref && validSha(e.sha) && /^R\d+$/.test(e.ruling || '')
+    && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim());
+  const seen = new Set();
+  const out = [];
+  const add = (e, layer) => { const k = `${e.ref}|${lowerSha(e.sha)}|${e.ruling}`; if (!seen.has(k)) { seen.add(k); out.push({ ...e, layer }); } };
+  (Array.isArray(tool) ? tool : []).forEach((e) => { if (e && typeof e === 'object') add(e, 'tool'); });
+  (Array.isArray(platform) ? platform : []).forEach((e, i) => {
+    if (wellFormed(e)) add(e, 'platform'); else warn(`WARNING: ignoring malformed platform prototypeLoad.ruledWeakened[${i}] (needs ref, 40-hex sha, ruling /^R\\d+$/, non-empty findings)`);
+  });
+  return out;
+}
 export function readyEvidence(records, input, ruledWeakened = [], liveFpSource = null) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
   // The live fingerprint may be passed lazily (a function): the arguments path above never pays for the git read.
@@ -37,13 +52,13 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
   const binds = (e, r) => lowerSha(e.sha) === r.sha && r.sha === live || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
   const judge = (r) => {
     if (r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || '')) return { source: 'ready-record', record: r };
-    const ruled = r.tests === 'green' && r.audit === 'WEAKENED'
+    const match = r.tests === 'green' && r.audit === 'WEAKENED'
       && validSha(r.sha) && RULING.test(r.auditRuling || '')
       && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
-      && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
+      && Array.isArray(ruledWeakened) && ruledWeakened.find((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
         && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
         && e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i]));
-    return ruled ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: r.auditDisclosed } } : null;
+    return match ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: r.auditDisclosed, ...(match.layer ? { layer: match.layer } : {}) } } : null;
   };
   // Precedence (R503 red team rounds 1–2). The records file is append-only, so file order is time order:
   //  - per sha, only its LATEST record counts (a superseded WEAKENED or red record never blocks forever);
