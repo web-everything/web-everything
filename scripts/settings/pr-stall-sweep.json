@@ -7,6 +7,7 @@
   },
   "prStallSweep": {
     "mode": "shadow",
+    "actionModes": { "restart-red-team": "on" },
     "intervalMinutes": 15,
     "maxActionsPerSweep": 3,
     "maxActionsPerHour": 6,
