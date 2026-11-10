@@ -117,7 +117,7 @@ import {
   // PR #2793 review — the per-PR evidence the green-check path now also requires (see `isMainGreenFixOwed`).
   mainLatestGreenShaForCheck,
 } from './main-red-recovery.mjs';
-import { readHungInfo, resolveHungThresholdMs, readClaudeAuthExpiredInfo, readIdleFinishedInfo, resolveIdleFinishedThresholdMs } from './hung-session.mjs';
+import { readHungInfo, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER, readClaudeAuthExpiredInfo, readIdleFinishedInfo, resolveIdleFinishedThresholdMs } from './hung-session.mjs';
 import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 // #4263 — the pure escalation reader (no fs/network of its own) reconcile-core.mjs already imports; re-scanning
 // comments HERE with the SAME function, never a re-derived copy, is what lets this enrich step find exactly the
@@ -505,6 +505,23 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   return Array.isArray(rows) ? enrich(rows) : rows;
 }
 
+/** UNCACHED `claude agents --json` status for one row's sessionId, or null when unreadable/absent (fail closed). */
+export function freshAgentStatus(row, exec = execFileSync) {
+  try {
+    const rows = JSON.parse(String(exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' }) || '[]'));
+    const hit = Array.isArray(rows) ? rows.find((r) => r?.sessionId && r.sessionId === row?.sessionId) : null;
+    return hit && typeof hit.status === 'string' ? hit.status : null;
+  } catch { return null; }
+}
+
+/** The reconcile-only idle-finished reader: opts in to the idle-row override with the full 3x hung pending-call grace
+ *  and an UNCACHED status read (R810); the session reaper never passes these opts. */
+export function makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec = execFileSync } = {}) {
+  return (a, n, t) => readIdleFinishedInfo(a, n, t, {
+    trustIdleRow: true, pendingGraceMs: hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER, freshStatusFor: (row) => freshAgentStatus(row, exec),
+  });
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#defaultReadAgents — the live-session listing. A THIN DELEGATION to
  * `defaultListAgents` (`we:scripts/operations/dispatch-lane-io.mjs`), not a second builder of the same argv: one
@@ -537,7 +554,7 @@ export function defaultReadAgents({
   exec = execFileSync, env = process.env, completionFor = tryReadCompletion,
   hungInfoFor = readHungInfo, now = Date.now(), hungThresholdMs = resolveHungThresholdMs(env),
   authExpiredInfoFor = readClaudeAuthExpiredInfo,
-  idleFinishedInfoFor = readIdleFinishedInfo, idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
+  idleFinishedInfoFor = makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec }), idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
   bgIsolationStallInfoFor = readBgIsolationStallInfo,
   listJobs = undefined,
 } = {}) {

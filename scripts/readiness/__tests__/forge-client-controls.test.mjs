@@ -1,10 +1,12 @@
 // @vitest-environment node
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, existsSync, utimesSync} from 'node:fs';
+import {mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, existsSync, readdirSync, utimesSync} from 'node:fs';
 import {join} from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
+// Hermetic: the reachability ping must never touch the real Forge. These cases exercise the no-retry path.
+vi.mock('../forge-telemetry.mjs',async importOriginal=>({...await importOriginal(),pingForge:async()=>false}));
 import * as runner from '../forge-exec-run.mjs';
 import {isAllowedCommand, verifyReceipt, runRemote} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, formatAdmissionPolicy, runWithRemoteDecision, heldSlots} from '../heavy-admission.mjs';
@@ -528,11 +530,18 @@ describe('remote controls', () => {
       release?.({mode:'remote',code:0});await first;
     }
   });
-  it('fails closed on corrupt persisted evidence and names local fallback', async () => {
+  it('keeps an active backoff when quarantining extra-key persisted evidence', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));
-    writeFileSync(join(f.cwd,'remote','health.json'),'{}');
+    writeFileSync(join(f.cwd,'remote','health.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:Number.MAX_SAFE_INTEGER,trigger:'copy-failed',lastGoodAt:1}));
     expect(await runWithRemoteDecision(f)).toEqual({handled:false});
     expect(f.remoteExec).not.toHaveBeenCalled();
-    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-health-unreadable'));
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('backoff-copy-failed'));
+  });
+  it('quarantines corrupt persisted evidence and continues from a fresh read', async () => {
+    const f=fixture();mkdirSync(join(f.cwd,'remote'));
+    writeFileSync(join(f.cwd,'remote','health.json'),'{}');
+    await runWithRemoteDecision(f);
+    expect(readdirSync(join(f.cwd,'remote')).some(n=>n.startsWith('health.json.invalid-'))).toBe(true);
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('remote-health-unreadable'));
   });
 });

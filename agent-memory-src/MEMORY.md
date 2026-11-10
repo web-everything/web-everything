@@ -15,6 +15,7 @@
 - 105. Claim Ignores Git State — backlog ownership=status:active NOT the working tree; uncommitted edits never a drop-reason
 - 148. Worker Model Routing — Sonnet default; Opus = design of hard stuff only and delegates execution; never Fable; never hand-set the model; fix limiting operations on the prototype
 - 149. Operation Limit Fixed On The Prototype — an operation with a limitation is fixed on the prototype, never worked around in private notes
+- 152. New Work Gets Placed, Not Started — triage operator points into priorities + propose a slot; only blockers start now ([[new-work-gets-placed-not-started]])
 
 <!-- categories: everything else, recall-gated — open the sub-index whose keywords match the task -->
 - **[Constellation & Placement](index-arch.md)** — placement · WE/FUI/Plateau · boundary · contract · impl · home · migration (21 rules)
