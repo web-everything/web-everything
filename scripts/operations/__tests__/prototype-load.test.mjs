@@ -878,6 +878,12 @@ describe('prototype-load', () => {
     expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
     expect(mutations(f, 'register')).toEqual([]);
   });
+  it('refuses a free-text claim backed only by a fingerprint-carried record of another head', async () => {
+    const OLDH = 'd'.repeat(40);
+    const f = auditedFixture('refuse', { ready: '', auditBaseInMain: TREE, fingerprint: () => 'fp1', audits: auditLines([auditRecord({ head: OLDH, fingerprint: 'fp1' })]) });
+    const out = await f.run({ testsRun: 'test-1', audit: 'NOT WEAKENED' });
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'free-text-audit-not-canonical' });
+  });
   it.each(['warn', 'refuse'])('refuses a free-text NOT WEAKENED claim that contradicts the latest canonical WEAKENED record, naming it (mode %s)', async (mode) => {
     const f = auditedFixture(mode, { ready: '', audits: auditLines([auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })]) });
     const out = await f.run({ testsRun: 'test-1', audit: 'NOT WEAKENED' });

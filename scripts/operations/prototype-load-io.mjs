@@ -410,6 +410,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
       out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp) };
+      // Free text needs the exact sha's OWN record: a fingerprint-carried record of another head is not that sha's audit.
+      if (freeText && out.canonicalAudit.ok && String(out.canonicalAudit.record?.head).toLowerCase() !== String(input.sha).toLowerCase()) {
+        out.canonicalAudit = { mode, ok: false, reason: 'no-record' };
+      }
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (freeText) {
