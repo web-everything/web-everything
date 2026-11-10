@@ -158,7 +158,7 @@ export function credentialContentFinding(path,content) {
   if(text.includes('\0'))return 'unsupported-text-encoding';
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
-  const finding=assignmentFinding(text);
+  const finding=assignmentFinding(text,true);
   return finding?.startsWith('unbounded-continuation-')?finding:null;
 }
 // Field names are diagnostic data too; never echo a credential-bearing or unbounded name.
@@ -172,7 +172,8 @@ export function credentialContentWarning(path,content) {
   const finding=assignmentFinding(text);
   return /^(?:high-entropy|secret-assignment)-/.test(finding??'')?finding:null;
 }
-function assignmentFinding(text) {
+// blockOnly: report only blocking evidence (unbounded continuation); generic findings never mask it.
+function assignmentFinding(text,blockOnly=false) {
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This advisory heuristic is not a parser for arbitrary formats.
   for(const match of text.matchAll(assignmentLine)) {
@@ -194,13 +195,14 @@ function assignmentFinding(text) {
       continuation=continuationLines(text,match.index+match[0].length+tail.length,indent.length);
       if(!continuation)return `unbounded-continuation-${findingField(field)}`;
       if(credentialNamed) {
-        for(const line of [...continuation,continuation.join('')]) {
+        if(!blockOnly)for(const line of [...continuation,continuation.join('')]) {
           if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${findingField(field)}`;
         }
       }
     }
     // A whole-value reference with no continuation line cannot hide a literal.
     if(reference&&!continuation.length)continue;
+    if(blockOnly)continue;
     if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${findingField(field)}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.

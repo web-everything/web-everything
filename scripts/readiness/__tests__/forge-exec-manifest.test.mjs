@@ -156,3 +156,11 @@ describe('strict credential regression', () => {
       expect(credentialContentWarning(path,content)).toMatch(/^(high-entropy|secret-assignment)-/);
     });
 });
+
+describe('generic evidence never masks a blocking continuation bound', () => {
+  it('still blocks when password=short precedes an unbounded continuation', () => {
+    const lines=Array.from({length:300},(_,i)=>`  line${i}`).join('\n');
+    const content=Buffer.from(`password=short\nprivate-key: \${{ secrets.X }}\n${lines}\n`);
+    expect(credentialContentFinding(path,content)).toBe('unbounded-continuation-private-key');
+  });
+});
