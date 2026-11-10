@@ -286,6 +286,41 @@ it('a closed card with the same title does not suppress a fresh handoff', async 
   const result = await run();
   expect(result.duplicates).toHaveLength(0);
   expect(result.filed).toHaveLength(1);
+  // file-item's own duplicate search sees closed cards, so the filing declares the vetted closed twin (preflight and filing agree).
+  expect(fileItem.mock.calls[0][0].notDuplicateReason).toBe('9-old.md is closed and does not cover this fresh handoff');
+});
+
+const LONG = 'Rebuild the conveyor dispatch state after a runner restart while preserving every pending lane lease and review assignment across the entire machine';
+
+it('a long (truncated-title) card gets the closed-twin declaration too, in dry run and filing', async () => {
+  seed(`- [R3] 2026-11-10: ${LONG}`);
+  const title = composeFileItemInput({ text: LONG }).title;
+  expect(title.endsWith('…')).toBe(true);
+  writeFileSync(join(root, 'backlog', '9-old.md'), `---\nstatus: resolved\n---\n# ${title}\n`);
+  expect((await run({ dryRun: true })).planned).toHaveLength(1);
+  const result = await run();
+  expect(result.filed).toHaveLength(1);
+  expect(fileItem.mock.calls[0][0].notDuplicateReason).toBe('9-old.md is closed and does not cover this fresh handoff');
+});
+
+it('a truncated title with a live twin as well as a closed one is never declared not-duplicate', async () => {
+  seed(`- [R3] 2026-11-10: ${LONG}`);
+  const title = composeFileItemInput({ text: LONG }).title;
+  writeFileSync(join(root, 'backlog', '9-old.md'), `---\nstatus: resolved\n---\n# ${title}\n`);
+  writeFileSync(join(root, 'backlog', '8-live.md'), `---\nstatus: open\n---\n# ${title}\n`);
+  await run();
+  expect(fileItem.mock.calls[0][0]).not.toHaveProperty('notDuplicateReason');
+});
+
+it('a card with no closed twin carries no duplicate declaration, and the binding passes one through only when present', async () => {
+  seed('- [R1] 2026-11-08: Fresh unrelated card');
+  await run();
+  expect(fileItem.mock.calls[0][0]).not.toHaveProperty('notDuplicateReason');
+  const spy = vi.fn(async () => ({ code: 0, lines: ['{}'] }));
+  await fileInCheckout({ title: 't', kind: 'task', digest: 'd', queue: 'false' }, spy);
+  await fileInCheckout({ title: 't', kind: 'task', digest: 'd', queue: 'false', notDuplicateReason: 'old.md is closed' }, spy);
+  expect(spy.mock.calls[0][0].argv.some(arg => arg.startsWith('--notDuplicateReason'))).toBe(false);
+  expect(spy.mock.calls[1][0].argv).toContain('--notDuplicateReason=old.md is closed');
 });
 
 it('body status examples do not suppress live-card duplicate detection', async () => {
@@ -324,17 +359,15 @@ it('files every card of a batch through the same file-item binding with no per-c
   expect(flags(calls[0].argv)).toEqual(expect.arrayContaining(['--title', '--kind', '--digest', '--queue']));
 });
 
-it.skipIf(process.getuid?.() === 0)('stops before filing the next card when the ledger append fails', async () => {
-  seed('- [R1] 2026-11-08: one');
-  await run();
+it('stops before filing the next card when the ledger append fails', async () => {
+  seed('- [R1] 2026-11-08: one\n- [R2] 2026-11-08: two\n- [R3] 2026-11-08: three');
+  // Fault injection (no filesystem permissions, so it also runs as root): the first append fails after card one is filed.
+  const appendFile = vi.fn(() => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); });
+  await expect(runFileHeldCards({ source, deps: { root, fileItem, log, appendFile, now: () => '2026-11-09T12:00:00Z' } }))
+    .rejects.toThrow(/ledger append failed \(ENOSPC\); filed but not ledgered: xtest \(R1\)/);
+  expect(appendFile).toHaveBeenCalledTimes(1);
   expect(fileItem).toHaveBeenCalledTimes(1);
-  // The ledger can be read but not appended to: the first card of the next batch files, then the append fails.
-  chmodSync(ledger, 0o444);
-  seed('- [R2] 2026-11-08: two\n- [R3] 2026-11-08: three');
-  await expect(run()).rejects.toThrow(/EACCES|EPERM|permission/i);
-  expect(fileItem).toHaveBeenCalledTimes(2);
-  chmodSync(ledger, 0o644);
-  expect(readFileSync(ledger, 'utf8').trim().split('\n')).toHaveLength(1);
+  expect(existsSync(ledger)).toBe(false);
 });
 
 it('resolves a ledgered birth hash through bornAs only on origin/main, and refuses an unrelated remote bornAs', async () => {
@@ -471,4 +504,147 @@ it('refuses a hard-linked ledger without changing the linked file or calling fil
   await expect(run()).rejects.toThrow(/hard link/);
   expect(readFileSync(target, 'utf8')).toBe('');
   expect(fileItem).not.toHaveBeenCalled();
+});
+
+const lockPath = () => join(tmpdir(), `file-held-cards-${createHash('sha256').update(join(realpathSync(temp), 'cards-filed.jsonl')).digest('hex').slice(0, 24)}.lock`);
+
+it('sink dry-run with a refused card returns the plan and the refusal instead of throwing, and writes nothing', async () => {
+  seed('- [R1] 2026-11-08: bad /Users/x/y\n- [R2] 2026-11-08: good one');
+  const sink = createFileHeldCardsSinks({ root, fileItem })['file-held-cards.file'];
+  const result = await sink({ source, max: 10, 'dry-run': true });
+  expect(result.planned.map(card => card.tag)).toEqual(['R2']);
+  expect(result.refused.map(card => card.tag)).toEqual(['R1']);
+  expect(fileItem).not.toHaveBeenCalled();
+  expect(existsSync(ledger)).toBe(false);
+  // The finisher still exits non-zero on the refusal while keeping the planned line visible.
+  const outcome = finishFileHeldCards({ code: 0, run: { effects: [{ type: 'file-held-cards.file', result }] } });
+  expect(outcome.code).toBe(1);
+  expect(outcome.lines.join('\n')).toContain('planned R2');
+  expect(outcome.lines.join('\n')).toContain('refused R1 2026-11-08: (withheld)');
+  expect(outcome.lines.join('\n')).not.toContain('undefined');
+});
+
+it('sink real run with a refused card throws after ledgering and names the filed card', async () => {
+  seed('- [R1] 2026-11-08: bad /Users/x/y\n- [R2] 2026-11-08: good one');
+  const sink = createFileHeldCardsSinks({ root, fileItem })['file-held-cards.file'];
+  await expect(sink({ source, max: 10, 'dry-run': false })).rejects.toThrow(/1 filed: xtest \(R2\)/);
+  expect(readFileSync(ledger, 'utf8').trim().split('\n')).toHaveLength(1);
+});
+
+it('dry-run reports a live-twin duplicate instead of planning it', async () => {
+  writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: open\n---\n# Repair behavior\n');
+  seed('- [R1] 2026-11-08: Repair behavior\n- [R2] 2026-11-08: Fresh card');
+  const result = await run({ dryRun: true });
+  expect(result.planned.map(card => card.tag)).toEqual(['R2']);
+  expect(result.duplicates.map(card => card.tag)).toEqual(['R1']);
+  expect(fileItem).not.toHaveBeenCalled();
+});
+
+it('reclaims a ledger lock whose recorded owner process is dead', async () => {
+  seed('- [R1] 2026-11-08: Stale lock probe');
+  const dead = execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  writeFileSync(lockPath(), dead);
+  try {
+    expect((await run()).filed).toHaveLength(1);
+    expect(existsSync(lockPath())).toBe(false);
+  } finally { rmSync(lockPath(), { force: true }); }
+});
+
+it('refuses a lock held by a live process, or with an unreadable owner, and names the lock file', async () => {
+  seed('- [R1] 2026-11-08: Live lock probe');
+  try {
+    for (const owner of [String(process.pid), 'not-a-pid', '']) {
+      writeFileSync(lockPath(), owner);
+      await expect(run()).rejects.toThrow(lockPath());
+      expect(readFileSync(lockPath(), 'utf8')).toBe(owner);
+    }
+  } finally { rmSync(lockPath(), { force: true }); }
+  expect(fileItem).not.toHaveBeenCalled();
+});
+
+it('the real append failure is surfaced with the filed card named (read-only ledger directory)', async () => {
+  seed('- [R1] 2026-11-08: First card\n- [R2] 2026-11-08: Second card');
+  chmodSync(temp, 0o555);
+  try {
+    // Skipped in effect when the process can write anyway (root): then the batch simply files both cards.
+    const outcome = await run().then(() => 'wrote', error => error.message);
+    if (outcome !== 'wrote') expect(outcome).toMatch(/ledger append failed \(EACCES\); filed but not ledgered: xtest \(R1\)/);
+  } finally { chmodSync(temp, 0o755); }
+});
+
+it('files an entire batch in one checkout and PR', async () => {
+  seed('- [R1] 2026-11-08: Card one\n- [R2] 2026-11-08: Card two\n- [R3] 2026-11-08: Card three');
+  const calls = [];
+  const spy = vi.fn(async args => {
+    calls.push(args);
+    return { code: 0, lines: [JSON.stringify({ verdict: { num: `x00000${calls.length}`, rel: `backlog/x00000${calls.length}.md` }, pr: 77 })] };
+  });
+  const result = await runFileHeldCards({ source, deps: { root, log, now: () => '2026-11-09T12:00:00Z', fileItem: input => fileInCheckout(input, spy) } });
+  expect(result.filed).toHaveLength(3);
+  const rows = readFileSync(ledger, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(rows.map(row => row.pr)).toEqual([77, 77, 77]);
+  expect(new Set(rows.map(row => row.card)).size).toBe(3);
+  // Every filing goes through the same file-item binding in this checkout, with no per-card destination flag.
+  expect(calls.map(call => call.declaration.name)).toEqual(['file-item', 'file-item', 'file-item']);
+  for (const { argv } of calls) expect(argv.map(arg => arg.split('=')[0]).filter(flag => /^--(pr|branch|lane|repo|checkout)$/.test(flag))).toEqual([]);
+});
+
+it('a dry run takes no ledger lock: a held lock is neither waited on nor touched', async () => {
+  seed('- [R1] 2026-11-08: Dry lock probe');
+  writeFileSync(lockPath(), String(process.pid));
+  try {
+    const result = await run({ dryRun: true });
+    expect(result.planned).toHaveLength(1);
+    expect(readFileSync(lockPath(), 'utf8')).toBe(String(process.pid));
+    expect(existsSync(ledger)).toBe(false);
+  } finally { rmSync(lockPath(), { force: true }); }
+});
+
+it('mixed dry-run reports valid plans while refusing unsafe text', async () => {
+  seed('- [R1] 2026-11-08: leak ghp_abcdefghijklmnopqrstuvwxyz0123456789 end\n- [R2] 2026-11-08: fine card');
+  const { declaration, registry, finish } = resolveOperation('file-held-cards', {});
+  const sinks = createFileHeldCardsSinks({ root, fileItem });
+  const outcome = await runOperationCli({ declaration, registry, argv: [`--source=${source}`, '--dry-run'],
+    store: createMemoryRunStore(), newRunId: () => 'held-mixed', sinks });
+  const done = finish(outcome);
+  const text = done.lines.join('\n');
+  expect(done.code).toBe(1);
+  expect(text).toContain('planned R2');
+  expect(text).toContain('refused R1');
+  expect(text).not.toContain('ghp_');
+  expect(fileItem).not.toHaveBeenCalled();
+  expect(existsSync(ledger)).toBe(false);
+});
+
+it('a reclaim in progress (guard file held) refuses without touching the stale lock', async () => {
+  seed('- [R1] 2026-11-08: Guard probe');
+  const dead = execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  writeFileSync(lockPath(), dead);
+  writeFileSync(`${lockPath()}.reclaim`, '1');
+  try {
+    await expect(run()).rejects.toThrow(`${lockPath()}.reclaim`);
+    expect(readFileSync(lockPath(), 'utf8')).toBe(dead);
+  } finally { rmSync(lockPath(), { force: true }); rmSync(`${lockPath()}.reclaim`, { force: true }); }
+  expect(fileItem).not.toHaveBeenCalled();
+});
+
+it('an out-of-range pid in the lock fails closed instead of being reclaimed', async () => {
+  seed('- [R1] 2026-11-08: Huge pid probe');
+  writeFileSync(lockPath(), '4294967297');
+  try {
+    await expect(run()).rejects.toThrow(lockPath());
+    expect(readFileSync(lockPath(), 'utf8')).toBe('4294967297');
+  } finally { rmSync(lockPath(), { force: true }); }
+});
+
+it('releases only a lock that still names this run, so a retaken lock survives', async () => {
+  seed('- [R1] 2026-11-08: Release probe');
+  fileItem.mockImplementationOnce(async () => {
+    writeFileSync(lockPath(), '1'); // another run now owns the lock path
+    return { code: 0, lines: [JSON.stringify({ verdict: { num: 'xtest', rel: 'backlog/xtest.md' } })] };
+  });
+  try {
+    expect((await run()).filed).toHaveLength(1);
+    expect(readFileSync(lockPath(), 'utf8')).toBe('1');
+  } finally { rmSync(lockPath(), { force: true }); }
 });
