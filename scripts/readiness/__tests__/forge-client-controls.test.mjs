@@ -453,7 +453,7 @@ describe('remote controls', () => {
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-execution-marker-unwritable'));
     expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(0);
   });
-  it.each(['forge-unreachable','copy-failed'])('persists three consecutive %s failures and resets on success', async reason => {
+  it.each(['unconfirmed','forge-unreachable','copy-failed','forge-busy'])('persists three consecutive %s failures and resets on success', async reason => {
     const f=fixture();
     f.remoteExec.mockResolvedValue(reason==='unconfirmed'?{mode:'unconfirmed'}:{mode:'not-started',terminated:true,reason});
     for(let i=0;i<3;i++)await runWithRemoteDecision(f);
@@ -535,7 +535,7 @@ describe('remote controls', () => {
     writeFileSync(join(f.cwd,'remote','health.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:Number.MAX_SAFE_INTEGER,trigger:'copy-failed',lastGoodAt:1}));
     expect(await runWithRemoteDecision(f)).toEqual({handled:false});
     expect(f.remoteExec).not.toHaveBeenCalled();
-    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-breaker-open'));
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('backoff-copy-failed'));
   });
   it('quarantines corrupt persisted evidence and continues from a fresh read', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));

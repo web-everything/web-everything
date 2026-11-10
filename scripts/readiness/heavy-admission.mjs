@@ -252,7 +252,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
     elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 600000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
-    forgeDownMinutes: 15, forgeDownShare: 0.3, forgeDownMinRuns: 5,
+    forgeFallbackMinutes: 15, forgeDownMinutes: 15, forgeDownShare: 0.3, forgeDownMinRuns: 5,
     stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
 });
 
@@ -290,6 +290,7 @@ const ADMISSION_VALID = {
   'remote.slotUnitsByKind': (v) => admissionObject(v) && Object.keys(v).length <= ADMISSION_MAX_SLOTS
     && Object.entries(v).every(([key, n]) =>  /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) && (n === 'auto' || admissionInt(1)(n))),
   'remote.backoffMs': isValidRunWaitMs,
+  'remote.forgeFallbackMinutes': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.forgeDownMinutes': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.forgeDownShare': (v) => Number.isFinite(v) && v > 0 && v <= 1,
   'remote.forgeDownMinRuns': (v) => Number.isSafeInteger(v) && v >= 1 && v <= 100000,
@@ -891,7 +892,7 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec, remoteClientOverride = null, onDecision, canaryRunner,
+  remoteExec, remoteClientOverride = null, onDecision, canaryRunner, recoveryProbe = false, onRemoteResult,
   log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
@@ -924,11 +925,11 @@ export async function runWithRemoteDecision({
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
-  const breaker = await checkForgeBreaker({root:remoteRoot, settings:policy.settings.remote, clock, host,
+  const breaker = recoveryProbe ? {ok:true} : await checkForgeBreaker({root:remoteRoot, settings:policy.settings.remote, clock, host,
     canary: async () => (await import('./forge-canary.mjs')).runForgeCanary({lockRoot,cwd,host,clock,
-      trigger:'breaker-half-open', ...(canaryRunner ? {runner:canaryRunner} : {})})});
+      trigger:'breaker-half-open',policy,readTelemetry, ...(canaryRunner ? {runner:canaryRunner} : {})})});
   if (!breaker.ok) return localFallback(breaker.reason);
-  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
+  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host,recoveryProbe});
   const healthy = await health();
   if (!healthy.ok) return localFallback(healthy.reason);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
@@ -1017,6 +1018,7 @@ export async function runWithRemoteDecision({
   },60000);
   heartbeat.unref();
   const record = async result => {
+    onRemoteResult?.(result);
     if(result?.infraFailure==='install-failed' || (result?.mode==='unconfirmed' && isForgeInfraFailure(result)))
       recordRemoteFallback({lockRoot, reason:result.infraFailure ?? result.reason, detail:result.infraFailure ? 'verified install receipt code 97' : null, cwd, argv, env, clock});
     // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).

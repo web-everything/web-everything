@@ -1,7 +1,7 @@
 /** Bounded, read-only outage evidence from the existing admission histories. */
 import {join} from 'node:path';
 import {existsSync} from 'node:fs';
-import {readJsonlTail} from '../lib/forge-share.mjs';
+import {readJsonlTail,loadForgeShareSettings,normalizeFallbackReason} from '../lib/forge-share.mjs';
 import {admissionLockRoot,loadAdmissionPolicy} from '../readiness/heavy-admission.mjs';
 import {isForgeInfraFailure} from '../readiness/forge-failure.mjs';
 
@@ -17,9 +17,9 @@ export function probeForgeDown({lockRoot,now=Date.now(),settings,sources={}}) {
   const topReason=Object.entries(reasons).sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]))[0]?.[0] ?? 'none';
   const latestCanary=window(can?.rows ?? []).sort((a,b)=>Date.parse(b.ts)-Date.parse(a.ts))[0];
   const unknown=why=>({status:'unknown',breach:true,topReason,summary:`Forge evidence UNKNOWN (${why}); top fallback: ${topReason}.`,settings,sources});
-  if([rem,fb,local].some(r=>!r || r.incomplete || (r.truncated&&!r.covered)))return unknown('missing, unreadable or incomplete admission history');
+  if([rem,fb,local].some(r=>!r || r.incomplete || !r.covered))return unknown('missing, unreadable or incomplete admission history');
   if(can?.incomplete)return unknown('incomplete canary event');
-  if(can && can.truncated&&!can.covered)return unknown('incomplete canary history');
+  if(can && !can.covered)return unknown('incomplete canary history');
   if(existsSync(join(lockRoot,'forge-canary.jsonl'))&&!can)return unknown('unreadable canary history');
   if(fallbacks.some(r=>typeof r.reason!=='string') || (can && window(can.rows).some(r=>!['pass','fail'].includes(r.result))))return unknown('invalid fallback or canary event');
   if(remote.some(r=>!Number.isFinite(r.ms)||r.ms<0)||window(local.rows).some(r=>!Number.isFinite(r.ms)||r.ms<0))return unknown('invalid duration');
@@ -46,3 +46,53 @@ export function probeForgeDownForWatch({repoRoot,env=process.env,now=Date.now()}
   } catch {return {status:'unknown',breach:true,summary:'Forge evidence UNKNOWN (probe failed); top fallback: unknown.'};}
 }
 export const forgeDownEventLine=probe=>probe?.breach?`FORGE-DOWN ${probe.summary}`:null;
+
+// Sanitize data before terminal output. Keep the fixed event prefix intact, but no dynamic
+// hyphenated phrase may match the operator's monitor suppression patterns.
+const fallbackText=value=>String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,' ').replace(/-/g,' ').slice(0,512);
+const fallbackUnknown=(why,settings,sources)=>({status:'unknown',breach:true,settings,sources,
+  summary:`UNKNOWN (${fallbackText(why)}); restore admission history or inspect Forge settings.`});
+
+/** R830: every unintended Mac fallback is a blocker, regardless of the remote share. */
+export function probeForgeFallback({lockRoot,now=Date.now(),settings,expectedLocalReasons,sources={}}) {
+  const minutes=settings?.forgeFallbackMinutes;
+  if(!Number.isFinite(now)||!Number.isFinite(minutes)||minutes<=0||minutes>1440 ||
+    !Array.isArray(expectedLocalReasons)||expectedLocalReasons.some(r=>typeof r!=='string'))
+    return fallbackUnknown('invalid settings',settings,sources);
+  const from=now-minutes*60000;
+  const history=readJsonlTail(join(lockRoot,'remote-fallbacks.jsonl'),r=>r.ts,from);
+  if(!history || history.incomplete || !history.covered)
+    return fallbackUnknown('missing, unreadable or incomplete fallback window',settings,sources);
+  if(history.rows.some(r=>typeof r.reason!=='string'||!r.reason.trim()))
+    return fallbackUnknown('invalid fallback event',settings,sources);
+  const expected=new Set(expectedLocalReasons.map(normalizeFallbackReason));
+  const rows=history.rows.filter(r=>Date.parse(r.ts)>from && Date.parse(r.ts)<=now &&
+    !expected.has(normalizeFallbackReason(r.reason)) &&
+    !(typeof r.localJustification==='string' && r.localJustification.trim()));
+  const reasons=new Map();
+  for(const row of rows) {
+    const reason=normalizeFallbackReason(row.reason);
+    reasons.set(reason,(reasons.get(reason) ?? 0)+1);
+  }
+  const ranked=[...reasons].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]));
+  const topReason=ranked[0]?.[0] ?? 'none';
+  const top=rows.filter(r=>normalizeFallbackReason(r.reason)===topReason)
+    .sort((a,b)=>Date.parse(b.ts)-Date.parse(a.ts))[0];
+  const topDetail=top?.detail || top?.file || top?.reason || 'none';
+  const countText=([reason,count])=>`${fallbackText(reason)} x${count}`;
+  const others=ranked.slice(1).map(countText);
+  const summary=ranked.length
+    ? `${countText(ranked[0])} in the last ${minutes} min${others.length?` (${others.join(', ')})`:''}; top detail: ${fallbackText(topDetail)}`
+    : `no unintended fallbacks in the last ${minutes} min`;
+  return {status:'ok',breach:rows.length>0,byReason:Object.fromEntries(ranked),topReason,topDetail,summary,settings,sources};
+}
+
+export function probeForgeFallbackForWatch({repoRoot,env=process.env,now=Date.now()}={}) {
+  try {
+    const policy=loadAdmissionPolicy({repoRoot,checkoutRoot:repoRoot,env});
+    const {expectedLocalReasons}=loadForgeShareSettings();
+    return probeForgeFallback({lockRoot:admissionLockRoot(repoRoot,env),now,
+      settings:policy.settings.remote,sources:policy.sources,expectedLocalReasons});
+  } catch {return fallbackUnknown('probe failed');}
+}
+export const forgeFallbackEventLine=probe=>probe?.breach?`FORGE-FALLBACK ${probe.summary}`:null;

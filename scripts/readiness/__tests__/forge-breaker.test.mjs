@@ -21,14 +21,14 @@ it('closed -> open -> half-open -> closed; late results cannot reset an open bre
   expect(await checkForgeBreaker({...f.opts,canary})).toMatchObject({reason:'forge-breaker-open'});
   expect(canary).not.toHaveBeenCalled();f.advance();
   expect(await checkForgeBreaker({...f.opts,canary:async()=>{
-    expect(f.state().trigger).toBe('forge-breaker-half-open');return {result:'pass'};
+    expect(f.state().breakerPhase).toBe('half-open');return {result:'pass'};
   }})).toEqual({ok:true});expect(f.state()).toMatchObject({failures:0,backoffUntil:0,trigger:''});
 });
 it('uses nondefault policy backoffMs for opening and reopening deadlines and admission across expiry',async()=>{
   const f=fixture();f.settings.backoffMs=12345;
   const openedAt=f.opts.clock();
   await open(f);
-  expect(f.state()).toMatchObject({trigger:'forge-breaker-open',backoffUntil:openedAt+12345});
+  expect(f.state()).toMatchObject({breakerPhase:'open',breakerUntil:openedAt+12345});
   const canary=vi.fn(async()=>({result:'fail'}));
   f.advance(12344);
   expect(await checkForgeBreaker({...f.opts,canary})).toMatchObject({ok:false,reason:'forge-breaker-open'});
@@ -36,7 +36,7 @@ it('uses nondefault policy backoffMs for opening and reopening deadlines and adm
   f.advance(2);
   expect(await checkForgeBreaker({...f.opts,canary})).toMatchObject({ok:false,reason:'forge-breaker-open'});
   expect(canary).toHaveBeenCalledTimes(1);
-  expect(f.state()).toMatchObject({trigger:'forge-breaker-open',backoffUntil:f.opts.clock()+12345});
+  expect(f.state()).toMatchObject({breakerPhase:'open',breakerUntil:f.opts.clock()+12345});
   canary.mockResolvedValue({result:'pass'});
   f.advance(12344);
   expect(await checkForgeBreaker({...f.opts,canary})).toMatchObject({ok:false,reason:'forge-breaker-open'});
@@ -50,10 +50,10 @@ it('admits exactly one half-open canary and reopens on its failure',async()=>{
   const f=fixture();await open(f);f.advance();
   let enter,finish;const entered=new Promise(r=>{enter=r;});
   const first=checkForgeBreaker({...f.opts,canary:()=>{enter();return new Promise(r=>{finish=r;});}});
-  await entered;expect(f.state().trigger).toBe('forge-breaker-half-open');
+  await entered;expect(f.state().breakerPhase).toBe('half-open');
   const second=vi.fn();expect(await checkForgeBreaker({...f.opts,canary:second})).toMatchObject({reason:'forge-breaker-open'});
   expect(second).not.toHaveBeenCalled();finish({result:'fail'});
-  expect(await first).toMatchObject({reason:'forge-breaker-open'});expect(f.state().backoffUntil).toBeGreaterThan(f.opts.clock());
+  expect(await first).toMatchObject({reason:'forge-breaker-open'});expect(f.state().breakerUntil).toBeGreaterThan(f.opts.clock());
 });
 it.each([
   {mode:'not-started',terminated:true,reason:'forge-busy'},{mode:'unconfirmed'},
@@ -61,15 +61,15 @@ it.each([
   {mode:'not-started',terminated:true,reason:'command-not-allowed',detail:'timeout'},
 ])('does not open on test failure or policy refusal: %j',async result=>{
   const f=fixture();for(let i=0;i<4;i++)await recordRemoteResult({...f.opts,result});
-  expect(f.state()).toMatchObject({failures:0,backoffUntil:0});
+  expect(f.state()).toMatchObject({infraFailures:0,breakerUntil:0,breakerPhase:''});
 });
 it.each(['ENOENT','remote-timeout','ssh-error','transport-error','install-failed','copy-failed'])('opens on consecutive %s failures',async reason=>{
   const f=fixture();for(let i=0;i<3;i++)await recordRemoteResult({...f.opts,result:{...infra,reason}});
-  expect(f.state().trigger).toBe('forge-breaker-open');
+  expect(f.state().breakerPhase).toBe('open');
 });
 it('opens on verified install-97 evidence',async()=>{
   const f=fixture();for(let i=0;i<3;i++)await recordRemoteResult({...f.opts,result:{mode:'unconfirmed',reason:'ambiguous-result',infraFailure:'install-failed'}});
-  expect(f.state().trigger).toBe('forge-breaker-open');
+  expect(f.state().breakerPhase).toBe('open');
 });
 it('open breaker falls back locally with named history and zero remote dispatch',async()=>{
   const f=fixture();await open(f);const lockRoot=join(f.root,'heavy');mkdirSync(lockRoot);
@@ -82,7 +82,7 @@ it('open breaker falls back locally with named history and zero remote dispatch'
   expect(result).toEqual({handled:false});expect(remoteExec).not.toHaveBeenCalled();expect(canaryRunner).not.toHaveBeenCalled();
   expect(JSON.parse(readFileSync(join(lockRoot,'remote-fallbacks.jsonl'),'utf8')).reason).toBe('forge-breaker-open');
 });
-it('migrates historical threshold infra backoff and requires fresh health after oversized state quarantine',async()=>{
+it('preserves breaker state and requires fresh health after oversized state quarantine',async()=>{
   const f=fixture();await open(f);const state=f.state();state.trigger='copy-failed';writeFileSync(join(f.root,'health.json'),JSON.stringify(state));
   expect(await checkForgeBreaker(f.opts)).toMatchObject({reason:'forge-breaker-open'});
   writeFileSync(join(f.root,'health.json'),'x'.repeat(80000));
@@ -111,14 +111,14 @@ it.each(['pass','fail'])('admission half-open invokes and records the canary %s 
  expect(canaryRunner).toHaveBeenCalledTimes(1);
  expect(JSON.parse(readFileSync(join(lockRoot,'forge-canary.jsonl'),'utf8'))).toMatchObject({trigger:'breaker-half-open',result:verdict});
  if(verdict==='fail') {
-  expect(result).toEqual({handled:false});expect(remoteExec).not.toHaveBeenCalled();expect(readTelemetry).not.toHaveBeenCalled();
+  expect(result).toEqual({handled:false});expect(remoteExec).not.toHaveBeenCalled();expect(readTelemetry).toHaveBeenCalled();
   expect(JSON.parse(readFileSync(join(lockRoot,'remote-fallbacks.jsonl'),'utf8')).reason).toBe('forge-breaker-open');
  } else {expect(result).toMatchObject({handled:true,exitCode:0});expect(remoteExec).toHaveBeenCalledTimes(1);}
 });
 
 it('counts verified install receipt evidence while retaining the existing unconfirmed-run refusal',async()=>{
  const f=fixture();for(let i=0;i<3;i++)await recordRemoteResult({...f.opts,result:{mode:'unconfirmed',reason:'ambiguous-result',infraFailure:'install-failed'}});
- expect(f.state().trigger).toBe('forge-breaker-open');
+ expect(f.state().breakerPhase).toBe('open');
 });
 
 it.each(['ENOENT','timeout'])('admission records and counts thrown or timed-out infrastructure evidence: %s',async kind=>{
@@ -143,8 +143,8 @@ it.each([
     enterAbandoned();return new Promise(resolve=>{finishAbandoned=resolve;});
   }});
   await abandonedEntered;
-  const abandonedLease=f.state().backoffUntil;
-  expect(f.state().trigger).toBe('forge-breaker-half-open');
+  const abandonedLease=f.state().breakerUntil;
+  expect(f.state().breakerPhase).toBe('half-open');
 
   // Leave the first canary unresolved, modeling a claimant that stopped making progress.
   f.advance(300001);
@@ -157,9 +157,9 @@ it.each([
   const replacement=checkForgeBreaker({...f.opts,canary:replacementCanary});
   await replacementEntered;
   const replacementState=f.state();
-  expect(replacementState.trigger).toBe('forge-breaker-half-open');
-  expect(replacementState.backoffUntil).toBe(f.opts.clock()+300000);
-  expect(replacementState.backoffUntil).not.toBe(abandonedLease);
+  expect(replacementState.breakerPhase).toBe('half-open');
+  expect(replacementState.breakerUntil).toBe(f.opts.clock()+300000);
+  expect(replacementState.breakerUntil).not.toBe(abandonedLease);
   const competingCanary=vi.fn();
   expect(await checkForgeBreaker({...f.opts,canary:competingCanary})).toEqual({ok:false,reason:'forge-breaker-open'});
   expect(competingCanary).not.toHaveBeenCalled();
@@ -177,8 +177,32 @@ it.each([
   expect(await replacement).toEqual(result==='pass'?{ok:true}:{ok:false,reason:'forge-breaker-open'});
   const finalState=f.state();
   expect(finalState).toMatchObject(result==='pass'
-    ? {trigger:'',failures:0,backoffUntil:0}
-    : {trigger:'forge-breaker-open',backoffUntil:f.opts.clock()+f.settings.backoffMs});
+    ? {breakerPhase:'',infraFailures:0,breakerUntil:0}
+    : {breakerPhase:'open',breakerUntil:f.opts.clock()+f.settings.backoffMs});
   if(timing==='after')await settleStale();
   expect(f.state()).toEqual(finalState);
+});
+
+it.each([undefined,null,'0',NaN,Infinity,-1,255,0.5])('invalid remote exit %s increments legacy failures and retains backoff',async code=>{
+ const f=fixture();
+ const prior={v:1,lastReadAt:null,telemetry:null,failures:1,backoffUntil:2000000,trigger:'forge-busy'};
+ writeFileSync(join(f.root,'health.json'),JSON.stringify(prior));
+ await recordRemoteResult({...f.opts,result:{mode:'remote',code}});
+ expect(f.state()).toMatchObject({failures:2,backoffUntil:prior.backoffUntil,trigger:'forge-busy',infraFailures:0});
+});
+it.each([0,1,97,254])('validated remote exit %s clears legacy accounting without closing the breaker',async code=>{
+ const f=fixture();await open(f);
+ await recordRemoteResult({...f.opts,result:{mode:'remote',code}});
+ expect(f.state()).toMatchObject({failures:0,backoffUntil:0,trigger:'',breakerPhase:'open',infraFailures:3});
+});
+it('keeps legacy busy and ambiguous failures additive to an independent infrastructure streak',async()=>{
+ const f=fixture();
+ for(const result of [infra,{mode:'unconfirmed'},infra,{mode:'not-started',terminated:true,reason:'forge-busy'}])await recordRemoteResult({...f.opts,result});
+ expect(f.state()).toMatchObject({failures:4,trigger:'forge-busy',infraFailures:0,breakerPhase:''});
+ expect(await checkForgeBreaker(f.opts)).toEqual({ok:true});
+});
+it.each([{}, {lastGoodAt:1}])('migrates pre-separation breaker state without dropping its open deadline (extra fields %j)',async extra=>{
+ const f=fixture();writeFileSync(join(f.root,'health.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:2000000,trigger:'forge-breaker-open',...extra}));
+ expect(await checkForgeBreaker(f.opts)).toMatchObject({reason:'forge-breaker-open'});
+ expect(f.state()).toMatchObject({infraFailures:3,breakerUntil:2000000,breakerPhase:'open'});
 });

@@ -4117,23 +4117,30 @@ now control the existing infrastructure breaker as well as telemetry backoff. Th
 through the existing standard → platform → tool → environment policy rules (host-shared
 settings reject per-process overrides outside private pools); `formatAdmissionPolicy` logs
 values and sources. Unreachable, missing executable, SSH/transport, timeout, copy and
-installation failures count. Ordinary test exits, bundle credential refusals and
-command-not-allowed never count. A late completion cannot close an already open breaker.
-Persisted older infra backoffs with a threshold failure count migrate to open, preserving
-their deadline. After the deadline one mutex-claimed canary runs; other callers fall back
+installation failures count toward a separate `infraFailures` streak. The legacy `failures`
+counter still counts ambiguous/unconfirmed results, unreachable/copy failures and Forge busy
+exactly as before; only a validated remote exit (integer 0–254) clears its backoff.
+Ordinary test exits, bundle credential refusals and command-not-allowed never count toward
+the infrastructure breaker. A late completion cannot close an already open breaker.
+Persisted breaker-specific triggers migrate to separate breaker fields, preserving their
+deadline. Legacy backoff counts alone do not establish an infrastructure streak. After the deadline one mutex-claimed canary runs; other callers fall back
 locally with `forge-breaker-open`. A passing canary closes it; a failed canary reopens it.
 The five-minute half-open lease permits recovery if the claimant dies.
 
 Run `node scripts/readiness/forge-canary.mjs --json --trigger=on-demand` for the fixed,
-credential-free node:test fixture through Forge's existing exec/receipt path. Other triggers
+credential-free Vitest fixture through Forge's normal admission health/slot/marker path. Other triggers
 are `breaker-half-open`, `forge-setup`, and `overlay-adopt`. Setup invokes it non-fatally.
-The runner command contract allows only that exact node command, never arbitrary node code.
+The canary uses the existing Vitest command class. Half-open probes require a claimed
+breaker lease and pass fresh telemetry checks while bypassing backoff. A dedicated
+`remote/canary.unconfirmed` intent prevents another canary while termination is unknown,
+even if another slot is free. An abandoned intent needs operator confirmation of remote
+termination before removal; ordinary per-slot execution markers remain authoritative too.
 Events append to `forge-canary.jsonl` in the admission lock root. A failed recent canary,
 sustained infra fallback window, or low heavy-minute share raises `forge-down`, including
 in shadow mode, and prints `FORGE-DOWN <summary>` in watch output. Missing/corrupt evidence
 also alerts as UNKNOWN with an instruction to restore the histories; it never reports healthy.
-The probe uses bounded existing JSONL tail reads; a truncated tail without window coverage
-alerts as incomplete. `remote.forgeDownMinutes` (15, positive minutes ≤1440),
+The probe uses bounded existing JSONL tail reads; any history without window coverage
+(including empty or rotated files) alerts as UNKNOWN, even when the entire file was read. `remote.forgeDownMinutes` (15, positive minutes ≤1440),
 `remote.forgeDownShare` (0.3, >0 and ≤1), and `remote.forgeDownMinRuns` (5, integer 1–100000)
 use the same policy cascade and provenance. Heavy-minute share reads local completion durations
 from `durations.jsonl`, since fallback rows contain no duration. Its window is fixed at 60 minutes.
@@ -4141,3 +4148,15 @@ from `durations.jsonl`, since fallback rows contain no duration. Its window is f
 Outage evidence includes `forge-breaker-open` fallback rows: they extend an infrastructure
 outage even when no runs complete. Keep this probe-specific classification separate from
 execution failures that increment the breaker; a refusal is not another failed execution.
+
+`forge-fallback` is a high severity host blocker that notifies even in shadow. Any
+unintended fallback in the trailing `remote.forgeFallbackMinutes` (default 15, positive
+minutes ≤1440, admission policy cascade with provenance) breaches. It reads only
+`remote-fallbacks.jsonl` through the same bounded reader as Forge down; missing,
+corrupt, incomplete, oversized without coverage, or rotated histories breach UNKNOWN.
+Restore the admission history to resolve UNKNOWN; never assume an empty file proves
+an empty window. Normalized `expectedLocalReasons` from Forge share and nonempty
+explicit `localJustification` values are intended local runs and excluded. Watch output
+prints `FORGE-FALLBACK <reason> x<count> in the last 15 min (<other counts>); top detail: <detail>`.
+Dynamic text has control characters removed and hyphens replaced with spaces so monitor
+filters cannot hide the event; raw reasons remain in the probe measure.

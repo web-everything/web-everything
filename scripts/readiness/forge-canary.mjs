@@ -1,27 +1,40 @@
 #!/usr/bin/env node
-import {appendFileSync,mkdirSync} from 'node:fs';
-import {join,resolve} from 'node:path';
+import {appendFileSync,mkdirSync,writeFileSync,unlinkSync} from 'node:fs';
+import {join,resolve,dirname} from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {admissionLockRoot} from './heavy-admission.mjs';
+import {admissionLockRoot,loadAdmissionPolicy,runWithRemoteDecision} from './heavy-admission.mjs';
 const TRIGGERS=new Set(['on-demand','breaker-half-open','forge-setup','overlay-adopt']);
 export const CANARY_ARGV=Object.freeze(['npx','vitest','run','scripts/readiness/__tests__/forge-canary-fixture.test.mjs']);
 
-/** Direct Forge execution, never local fallback. Use the existing Vitest command class so installed runners need no refresh.
- * No AI credentials are supplied. The real transport retains its normal bundle scan and receipt validation. */
+/** A canary uses normal health, slot reservation and persistent execution markers, with no local rerun.
+ * The half-open claimant alone bypasses backoff; telemetry must still pass. The canary intent marker
+ * also prevents another canary using a different free slot while termination remains unconfirmed.
+ * An abandoned intent requires operator confirmation of termination before removal. */
 export async function runForgeCanary({cwd=process.cwd(),lockRoot=admissionLockRoot(cwd),host='forge',
-  trigger='on-demand',clock=Date.now,runner,timeoutMs=120000}={}) {
+  trigger='on-demand',clock=Date.now,runner,timeoutMs=120000,policy,readTelemetry}={}) {
   if(!TRIGGERS.has(trigger))throw new Error('invalid canary trigger');
-  const start=clock();
-  let result,timer;
-  const controller=new AbortController();
+  const start=clock(),remoteRoot=join(dirname(lockRoot),'remote');
+  mkdirSync(remoteRoot,{recursive:true});
+  const intent=join(remoteRoot,'canary.unconfirmed');
+  let result,claimed=false,confirmed=false;
   try {
-    runner ??= (await import('./remote-exec.mjs')).runRemote;
-    result=await Promise.race([
-    Promise.resolve().then(()=>runner({argv:[...CANARY_ARGV],cwd,host,env:{},cancelSignal:controller.signal})),
-    new Promise(resolve=>{timer=setTimeout(()=>{controller.abort();resolve({reason:'canary-timeout'});},timeoutMs);}),
-  ]);}
-  catch(error){result={reason:error?.code ?? 'canary-runner-failed'};}
-  finally {clearTimeout(timer);}
+    try {writeFileSync(intent,JSON.stringify({pid:process.pid,at:start})+'\n',{flag:'wx',mode:0o600});claimed=true;}
+    catch {throw Object.assign(new Error('canary termination unconfirmed'),{code:'canary-unconfirmed'});}
+    const resolved=policy ?? loadAdmissionPolicy({repoRoot:cwd,checkoutRoot:cwd,env:{}});
+    // An explicit operator probe selects remote routing; all resource and health limits remain in force.
+    const canaryPolicy={...resolved,settings:{...resolved.settings,remote:{...resolved.settings.remote,enabled:true,mode:'always'}}};
+    let refusal,observed;
+    const admission=await runWithRemoteDecision({argv:[...CANARY_ARGV],cwd,lockRoot,host,clock,env:{},
+      policy:canaryPolicy,readTelemetry,timeoutMs,remoteExec:runner,onRemoteResult:result=>{observed=result;},
+      recoveryProbe:trigger==='breaker-half-open',
+      log:line=>{refusal=line;}});
+    confirmed=admission.handled===false
+      || (observed?.mode==='remote' && Number.isInteger(observed.code) && observed.code>=0 && observed.code<=254)
+      || (['not-started','cancelled'].includes(observed?.mode) && observed.terminated===true);
+    result=admission.remoteResult ?? (observed?.reason==='remote-timeout'?{reason:'canary-timeout'}:observed)
+      ?? {reason:refusal ?? 'canary-admission-refused'};
+  } catch(error){result={reason:error?.code ?? 'canary-runner-failed'};}
+  finally {if(claimed && confirmed)unlinkSync(intent);}
   const pass=result?.mode==='remote' && result.code===0;
   const reason=pass?'ok':String(result?.infraFailure ?? result?.reason ?? `remote-exit-${result?.code ?? 'unknown'}`)
     .replace(/[\x00-\x1f\x7f-\x9f]/g,'?').slice(0,200);

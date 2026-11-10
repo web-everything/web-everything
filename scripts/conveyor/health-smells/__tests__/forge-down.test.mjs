@@ -11,16 +11,16 @@ const roots=[],now=Date.parse('2026-11-10T13:00:00Z');
 const settings={forgeDownMinutes:15,forgeDownShare:0.3,forgeDownMinRuns:5};
 afterEach(()=>roots.splice(0).forEach(r=>rmSync(r,{recursive:true,force:true})));
 function fixture(){const lockRoot=mkdtempSync(join(process.env.TMPDIR,'forge-down-'));roots.push(lockRoot);
- for(const name of ['remote-runs.jsonl','remote-fallbacks.jsonl','durations.jsonl'])writeFileSync(join(lockRoot,name),'');
+ for(const name of ['remote-runs.jsonl','remote-fallbacks.jsonl','durations.jsonl'])rows({lockRoot},name,[]);
  return {lockRoot,now,settings};}
-function rows(f,name,values){writeFileSync(join(f.lockRoot,name),values.map(r=>JSON.stringify(r)+'\n').join(''));}
+function rows(f,name,values){writeFileSync(join(f.lockRoot,name),[{ts:at(300),at:at(300),ms:0,reason:'history-start',result:'pass'},...values].map(r=>JSON.stringify(r)+'\n').join(''));}
 const at=min=>new Date(now-min*60000).toISOString();
 it('registers high host alert, shadow notification, and shape contract',()=>{
  expect(validateSmellShape(smell,'forge-down.mjs')).toBe(smell);expect(SMELLS).toContain(smell);
  expect(smell).toMatchObject({scope:'host',severity:'high',probes:['forgeDown']});expect(NOTIFY_EVEN_IN_SHADOW.has(smell.id)).toBe(true);
 });
 it('fires on a replayed 35 minute outage and prints the operator FORGE-DOWN summary',()=>{
- const f=fixture();writeFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),readFileSync(new URL('./fixtures/forge-down-outage.jsonl',import.meta.url)));
+ const f=fixture();rows(f,'remote-fallbacks.jsonl',readFileSync(new URL('./fixtures/forge-down-outage.jsonl',import.meta.url),'utf8').trim().split('\n').map(line=>JSON.parse(line)));
  const p=probeForgeDown(f);expect(p).toMatchObject({breach:true,topReason:'ENOENT',span:35*60000});
  expect(smell.evaluate({forgeDown:p})[0].breach).toBe(true);expect(forgeDownEventLine(p)).toBe(`FORGE-DOWN ${p.summary}`);
 });
@@ -77,4 +77,14 @@ it('breaches after the configured outage duration when breaker-open fallbacks co
  // A later completed remote run ends the outage even though breaker refusals remain in the history.
  rows(f,'remote-runs.jsonl',[{ts:at(5),ms:1000}]);
  expect(probeForgeDown({...f,settings:configured})).toMatchObject({breach:false,span:0,runs:1});
+});
+
+it.each(['remote-runs.jsonl','remote-fallbacks.jsonl','durations.jsonl','forge-canary.jsonl'])('fails closed on empty or rotated %s without window coverage',name=>{
+ const f=fixture();
+ for(const content of ['',JSON.stringify({ts:at(1),at:at(1),ms:1,reason:'healthy',result:'pass'})+'\n']) {
+  writeFileSync(join(f.lockRoot,name),content);
+  const p=probeForgeDown(f);
+  expect(p).toMatchObject({status:'unknown',breach:true});
+  expect(forgeDownEventLine(p)).toContain('FORGE-DOWN Forge evidence UNKNOWN');
+ }
 });
