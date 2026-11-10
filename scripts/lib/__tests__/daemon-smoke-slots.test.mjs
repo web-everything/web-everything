@@ -46,6 +46,13 @@ async function wake() {
 }
 
 describe('daemon smoke slots', () => {
+  it('ships a 15-minute queue default below the rebuild lease safety ceiling', () => {
+    settings.value = undefined;
+    const shipped = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json'), 'utf8'));
+    expect(shipped.smokeQueueMaxWaitMs).toBe(900000);
+    expect(shipped.smokeQueueMaxWaitMs).toBeLessThan(leases.DEFAULT_REBUILD_LEASE_STALE_MS - 120000);
+  });
+
   it('cap 2 admits two callers, queues the third, and release frees it on the next poll', async () => {
     const a = await acquire(11), b = await acquire(12);
     let admitted = false;
@@ -120,7 +127,9 @@ describe('daemon smoke slots', () => {
     [{ smokeMaxConcurrent: 3 }, {}, 3, 'tool'],
     [{ smokeMaxConcurrent: 3 }, { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' }, 1, 'env'],
     [{ smokeMaxConcurrent: 0 }, {}, 2, 'default'],
-    [{ smokeMaxConcurrent: 3 }, { WE_DAEMON_SMOKE_MAX_CONCURRENT: 'garbage' }, 2, 'default'],
+    ...['garbage', '0', '-1', '1.5', '', '9007199254740992'].map(raw =>
+      [{ smokeMaxConcurrent: 3 }, { WE_DAEMON_SMOKE_MAX_CONCURRENT: raw }, 3, 'tool']),
+    [{ smokeMaxConcurrent: 0 }, { WE_DAEMON_SMOKE_MAX_CONCURRENT: 'garbage' }, 2, 'default'],
     [{}, {}, 2, 'default'],
     [{ smokeMaxConcurrent: 1.5 }, {}, 2, 'default'],
     [{}, { WE_DAEMON_SMOKE_MAX_CONCURRENT: '9007199254740992' }, 2, 'default'],
@@ -329,14 +338,21 @@ describe('daemon smoke slots', () => {
   });
 
   it.each([
-    [{}, {}, 1800000, 'default'],
+    [{}, {}, 900000, 'default'],
     [{ smokeQueueMaxWaitMs: 5001 }, {}, 5001, 'tool'],
     [{ smokeQueueMaxWaitMs: 5001 }, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '3001' }, 3001, 'env'],
-    [{ smokeQueueMaxWaitMs: 0 }, {}, 1800000, 'default'],
-    [{ smokeQueueMaxWaitMs: 5001 }, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: 'invalid' }, 1800000, 'default'],
-    [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '-1' }, 1800000, 'default'],
-    [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1.5' }, 1800000, 'default'],
-    [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '9007199254740992' }, 1800000, 'default'],
+    [{ smokeQueueMaxWaitMs: 0 }, {}, 900000, 'default'],
+    ...['invalid', '0', '-1', '1.5', '', '9007199254740992'].map(raw =>
+      [{ smokeQueueMaxWaitMs: 5001 }, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: raw }, 5001, 'tool']),
+    [{ smokeQueueMaxWaitMs: 0 }, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: 'invalid' }, 900000, 'default'],
+    [{ smokeQueueMaxWaitMs: 1800000 }, {}, leases.DEFAULT_REBUILD_LEASE_STALE_MS - 120000, 'tool'],
+    [{ smokeQueueMaxWaitMs: 5001 }, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '9007199254740991' },
+      leases.DEFAULT_REBUILD_LEASE_STALE_MS - 120000, 'env'],
+    [{ smokeQueueMaxWaitMs: leases.DEFAULT_REBUILD_LEASE_STALE_MS - 120000 }, {},
+      leases.DEFAULT_REBUILD_LEASE_STALE_MS - 120000, 'tool'],
+    [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '-1' }, 900000, 'default'],
+    [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1.5' }, 900000, 'default'],
+    [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '9007199254740992' }, 900000, 'default'],
   ])('bounds queue residence with setting %j env %j at %sms (%s)', async (value, env, bound, source) => {
     settings.value = { ...value, smokeMaxConcurrent: 1 };
     const holder = await acquire(11);
@@ -346,8 +362,13 @@ describe('daemon smoke slots', () => {
       if (time > bound + 2000) throw new Error('queue exceeded bound');
     } });
     expect(time).toBe(bound);
+    const requested = Number(env.WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS ?? value.smokeQueueMaxWaitMs);
+    if (Number.isSafeInteger(requested) && requested > bound) {
+      expect(log.error).toHaveBeenCalledWith(
+        `daemon-live-smoke: smokeQueueMaxWaitMs clamped from ${requested} to ${bound}ms (rebuild lease lifetime minus 2min)`);
+    }
     expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smokeQueueMaxWaitMs=${bound} (${source})`);
-    expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smoke-queue-timeout (waited ${bound}ms) — running without a slot`);
+    expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smoke-queue-timeout (waited ${bound}ms) — running without a slot (bounded availability trade-off; concurrency cap may be exceeded)`);
     expect(state().waiters).toEqual([]);
     expect(state().holders.map(e => e.pid)).toEqual([11]);
     await slot.release();
@@ -371,7 +392,7 @@ describe('daemon smoke slots', () => {
       if (time > 5001) throw new Error('cleanup exceeded queue bound');
     } });
     expect(time).toBe(3001);
-    expect(log.error).toHaveBeenCalledWith('daemon-live-smoke: smoke-queue-timeout (waited 3001ms) — running without a slot');
+    expect(log.error).toHaveBeenCalledWith('daemon-live-smoke: smoke-queue-timeout (waited 3001ms) — running without a slot (bounded availability trade-off; concurrency cap may be exceeded)');
     await slot.release();
     expect(state().holders.map(e => e.pid)).toEqual([11]);
     // An unavailable transaction cannot remove a ticket; later transactions reclaim it.

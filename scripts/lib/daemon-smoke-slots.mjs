@@ -1,5 +1,7 @@
 /**
  * Purpose: cap host-wide daemon rebuild live smokes with persistent FIFO tickets.
+ * Queue expiry intentionally fails open: a bounded availability trade-off that lets a rebuild
+ * continue after the queue deadline even though the host concurrency cap may be exceeded.
  * Exports: acquireSmokeSlot({env, log, stateDir, pid, isAlive, now, sleep}) → {release()}.
  */
 import fs, { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -9,26 +11,32 @@ import { homedir } from 'node:os';
 import { setTimeout } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { DEFAULT_REBUILD_LEASE_STALE_MS } from './daemon-rebuild/lease.mjs';
 
 // Retain only failed releases; a later acquire by this process retries them under the state lock.
 const failedTickets = new Set();
 
+const MAX_QUEUE_WAIT_MS = DEFAULT_REBUILD_LEASE_STALE_MS - 2 * 60_000;
+
 const positive = value => Number.isSafeInteger(value) && value > 0;
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
 
-function setting(env, log, key, envKey, fallback) {
+function setting(env, log, key, envKey, fallback, ceiling = Infinity) {
   let tool;
   try { tool = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'))?.[key]; } catch { /* default */ }
   const raw = env[envKey];
   const override = raw === undefined ? undefined : /^\d+$/.test(raw) ? Number(raw) : NaN;
-  // An explicitly invalid bound always falls back to its default.
-  const invalid = override !== undefined ? !positive(override) : tool !== undefined && !positive(tool);
-  const resolved = cascadePolicy(key, invalid ? fallback : tool, {
-    env, standard: fallback, valid: positive, envValues: { '': invalid ? fallback : override },
+  // Invalid layers are ignored independently: env → configured settings → default.
+  const resolved = cascadePolicy(key, tool, {
+    env, standard: fallback, valid: positive, envValues: { '': override },
   });
-  const source = invalid ? 'default' : resolved.sources[''] === 'standard' ? 'default' : resolved.sources[''];
-  log.error?.(`daemon-live-smoke: ${key}=${resolved.value} (${source})`);
-  return resolved.value;
+  const source = resolved.sources[''] === 'standard' ? 'default' : resolved.sources[''];
+  const value = Math.min(resolved.value, ceiling);
+  if (value !== resolved.value) {
+    log.error?.(`daemon-live-smoke: ${key} clamped from ${resolved.value} to ${value}ms (rebuild lease lifetime minus 2min)`);
+  }
+  log.error?.(`daemon-live-smoke: ${key}=${value} (${source})`);
+  return value;
 }
 
 function processAlive(pid) {
@@ -70,7 +78,7 @@ export async function acquireSmokeSlot({
 } = {}) {
   if (!positive(pid)) throw new Error('daemon-live-smoke: invalid slot pid');
   const cap = setting(env, log, 'smokeMaxConcurrent', 'WE_DAEMON_SMOKE_MAX_CONCURRENT', 2);
-  const maxWait = setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 1_800_000);
+  const maxWait = setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 900_000, MAX_QUEUE_WAIT_MS);
   const queuedAt = now();
   const deadline = queuedAt + maxWait;
   const expired = new Error('smoke queue expired');
@@ -215,7 +223,7 @@ export async function acquireSmokeSlot({
   } catch (error) {
     if (error === expired) {
       if (ticket !== undefined) await release(now());
-      log.error?.(`daemon-live-smoke: smoke-queue-timeout (waited ${now() - queuedAt}ms) — running without a slot`);
+      log.error?.(`daemon-live-smoke: smoke-queue-timeout (waited ${now() - queuedAt}ms) — running without a slot (bounded availability trade-off; concurrency cap may be exceeded)`);
       return { release: async () => {} };
     }
     if (ticket !== undefined) await release();
