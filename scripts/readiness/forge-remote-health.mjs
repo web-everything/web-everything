@@ -1,6 +1,6 @@
 // Host-shared health/cache state. Missing state is a cold start; malformed state
 // is an operator-visible local fallback, never permission to dispatch remotely.
-import {readFileSync, writeFileSync, renameSync, rmSync, lstatSync} from 'node:fs';
+import {readFileSync, writeFileSync, renameSync, rmSync, lstatSync, readdirSync} from 'node:fs';
 import {join} from 'node:path';
 import {randomBytes, createHash} from 'node:crypto';
 import {reserve, readLockEntry, releaseLockDir} from './file-locks.mjs';
@@ -19,7 +19,21 @@ function readState(file) {
       || typeof s.trigger!=='string' || !/^[a-zA-Z0-9.-]{0,80}$/.test(s.trigger))throw new Error('invalid state');
     if(s.telemetry!==null)parseTelemetry(JSON.stringify(s.telemetry));
     return s;
-  } catch(error){if(error.code==='ENOENT')return freshState();throw new Error('remote-health-unreadable');}
+  } catch(error){
+    if(error.code==='ENOENT')return freshState();
+    const e=new Error('remote-health-unreadable');e.detail=String(error.message||error).slice(0,200);throw e;
+  }
+}
+// A malformed state file can never repair itself (the write path needs a readable state), so it is moved aside,
+// never deleted or followed, and the run continues from a fresh state: that forces a new telemetry read which must
+// still pass every freshness, skew, load and RAM check. Only the newest few quarantined files are kept.
+const KEEP_INVALID=3;
+function quarantine(root,key,file,detail) {
+  const prefix=key+'.json.invalid-';
+  renameSync(file,join(root,prefix+new Date().toISOString()));
+  const old=readdirSync(root).filter(n=>n.startsWith(prefix)).sort().slice(0,-KEEP_INVALID);
+  for(const n of old)rmSync(join(root,n),{force:true});
+  console.error(`forge-remote-health: quarantined malformed state ${key}.json (${detail}); continuing from fresh state`);
 }
 async function transaction(root,action,host='forge') {
   const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
@@ -36,7 +50,15 @@ async function transaction(root,action,host='forge') {
   await acquire();
   const file=join(root,key+'.json'),pending=file+'-'+randomBytes(8).toString('hex');
   try {
-    const state=readState(file),result=await action(state);
+    let state;
+    try{state=readState(file);}
+    catch(error){
+      if(error.message!=='remote-health-unreadable')throw error;
+      try{quarantine(root,key,file,error.detail);}
+      catch(qe){const e=new Error('remote-health-unreadable');e.detail=`${error.detail}; quarantine failed: ${qe.message}`.slice(0,300);throw e;}
+      state=freshState();
+    }
+    const result=await action(state);
     writeFileSync(pending,JSON.stringify(state),{flag:'wx',mode:0o600});renameSync(pending,file);
     return result;
   } finally {rmSync(pending,{force:true});releaseLockDir(root,key);}
@@ -75,7 +97,10 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
     if(trigger){state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};}
     return {ok:true};
-  },host);}catch(error){return {ok:false,reason:error.message==='remote-health-busy'?error.message:'remote-health-unreadable'};}
+  },host);}catch(error){
+    if(error.message==='remote-health-busy')return {ok:false,reason:error.message};
+    return {ok:false,reason:'remote-health-unreadable',detail:error.detail||String(error.message||error).slice(0,200)};
+  }
 }
 export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge'}) {
   return transaction(root,state=>{
