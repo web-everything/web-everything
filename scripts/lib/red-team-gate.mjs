@@ -860,7 +860,19 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (effectiveAction === 'send-back') sendBack.push(f);
   }
   // The sealed stored evidence decides the hold (undefined = read this head's persisted seal; no caller reads it itself).
-  const hold = redTeamHoldDecision({ comments, pr, head: live, sealed: sealed === undefined ? readSealedStatus({ repo, pr, head: live, env }) : sealed });
+  // A carried result keeps the seal of the head it was carried from (the carry re-keys the comment, not the stored evidence).
+  let seal = sealed;
+  if (seal === undefined) {
+    seal = readSealedStatus({ repo, pr, head: live, env });
+    let hit = latestResult(records, pr, live), rs = records;
+    for (let hop = 0; seal === null && hit?.from && hop < 8; hop++) {
+      const at = hit.at;
+      rs = rs.filter(r => r.at < at);
+      seal = readSealedStatus({ repo, pr, head: hit.from, env });
+      hit = latestResult(rs, pr, hit.from);
+    }
+  }
+  const hold = redTeamHoldDecision({ comments, pr, head: live, sealed: seal });
   if (legacyHold === true || hold.held) held.push({ index: 0, confirmed: true, category: 'legacy-conflict', file: null, line: null,
     summary: hold.reason ?? 'Legacy red-team evidence conflicts with the posted comment; operator review required.', legacyHold: true });
   return { result, sendBack, held, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };

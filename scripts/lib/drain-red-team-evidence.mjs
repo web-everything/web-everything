@@ -460,6 +460,9 @@ function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retr
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
   writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
     ...(admissionId ? { admissionId } : {}),
+    // The sealed stored breaks and the legacy hold flag survive every rewrite (PR #6622): dropping them lifts the hold.
+    ...(prior?.sealedBreaks !== undefined ? { sealedBreaks: prior.sealedBreaks } : {}),
+    ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),
     ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }

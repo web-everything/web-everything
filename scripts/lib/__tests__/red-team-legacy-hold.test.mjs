@@ -11,6 +11,7 @@ import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-st
 import { readRedTeamDisposition, redTeamHoldDecision, redTeamRulingNeeded, redTeamMarker } from '../red-team-gate.mjs';
 import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { writeStore, resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
@@ -205,6 +206,40 @@ describe('the sealed status reader fails closed', () => {
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: null }).held).toBe(false);
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: { breaks: [] } }).held).toBe(false);
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: { unreadable: true } }).held).toBe(true);
+  });
+});
+
+describe('the seal survives the rest of the pipeline (self-review round 1)', () => {
+  it('a later status rewrite for the same head (retry, recovery) keeps the seal and the legacy flag', () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]); // seals and holds
+    expect(readStatusFile().sealedBreaks).toHaveLength(1);
+    const loopPayload = { findings: { read: { netBasis: { rev: head } } } };
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'ran' }, { env: process.env });
+    expect(readStatusFile()).toMatchObject({ legacyHoldPublished: true, result: 'ran' });
+    expect(readStatusFile().sealedBreaks).toHaveLength(1);
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('a carried "no break" comment on a new head keeps the hold of the head it was carried from', () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]);
+    const next = 'b'.repeat(40);
+    const carried = trusted([`<!-- review-verdict-carried from=${head} to=${next} patch-id=${'c'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', redTeamMarker(42, next),
+      '### Post-accept red team — no break found'].join('\n'));
+    expect(readSealedStatus({ repo, pr: 42, head: next, env: process.env })).toBeNull(); // the new head has no status of its own
+    const d = readRedTeamDisposition({ comments: [clearComment, carried], pr: 42, head: next, repo, env: process.env });
+    expect(d.held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('the planner reads the persisted seal, not the snapshot it was handed', () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]);
+    const snapshotWithoutHold = { ...legacyStatus(), sealedBreaks: [] };
+    expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: [], comments: [clearComment],
+      evidence: { status: snapshotWithoutHold } }).add).toBe('red-team:blocked');
   });
 });
 

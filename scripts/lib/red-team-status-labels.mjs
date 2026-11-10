@@ -1,7 +1,6 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
-import { sealedFromStatus } from './red-team-sealed-status.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
@@ -10,10 +9,9 @@ export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
   // The shared hold decision (PR #6622): the sealed stored evidence holds the head unless the posted comment shows the same
-  // confirmed breaks. A snapshot status that carries a seal is used; a stale one (taken before a publish) falls through to the
-  // persisted status, so one pass never plans clear for a conflict it just recorded.
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling,
-    sealed: sealedFromStatus(evidence.status, head) ?? undefined });
+  // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
+  // pass never plans clear for a conflict it just recorded.
+  const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
   const broken = disposition.sendBack.length || disposition.held.length;
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
