@@ -177,7 +177,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
-import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
+import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane, salvageRefName } from './lib/lane-pool-salvage-push.mjs';
 import {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
 } from './lib/lane-salvage.mjs';
@@ -2292,7 +2292,7 @@ function scrubClaimedLaneConfig(dir, reason) {
   return removed.length ? undefined : dietConfig;
 }
 
-function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructiveStep = () => {}, beforeReset = () => {} } = {}) {
+function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructiveStep = () => {}, beforeFetch = () => {}, beforeReset = () => {} } = {}) {
   const dir = laneDir(repo, chosen);
   const dietConfig = scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
@@ -2309,6 +2309,9 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
         throw new Error(`lane-${chosen} is no longer provably safe to reset: origin fetch failed (${msgOf(e).trim()})`, { cause: e });
       }
     };
+    // Inspect canonical preservation evidence before the ordinary fetch fills missing objects or moves tracking
+    // refs. This only primes object-only verification; the fresh pre-reset guard still decides whether to reset.
+    beforeFetch();
     let fetchedSpecs = fetchForReset(dietConfig);
     const repairUnhealthyClone = () => {
       let health = diagnoseLane(dir);
@@ -2759,7 +2762,10 @@ async function cmdAcquire(repo) {
             const doa = effectiveDirtyOrAhead(laneDir(repo, pick), repo.branch, noResetRemoteShas);
             if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
           }
-          provisionClaimedLane(repo, pick, false, { beforeReset: () => assertNoUnpushedLaneWork(repo, pick) }); // auto-pick never targets a reserved lane
+          provisionClaimedLane(repo, pick, false, {
+            beforeFetch: () => unpushedLaneWork(repo, laneDir(repo, pick), { allowFetch: true }),
+            beforeReset: () => assertNoUnpushedLaneWork(repo, pick),
+          }); // auto-pick never targets a reserved lane
           chosen = pick;
           break;
         } catch (e) {
@@ -2901,7 +2907,10 @@ async function cmdAcquire(repo) {
   if (flags.lane !== undefined) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
-      provisionClaimedLane(repo, chosen, targetWasReserved, { beforeReset: () => assertNoUnpushedLaneWork(repo, chosen) });
+      provisionClaimedLane(repo, chosen, targetWasReserved, {
+        beforeFetch: () => unpushedLaneWork(repo, dir, { allowFetch: true }),
+        beforeReset: () => assertNoUnpushedLaneWork(repo, chosen),
+      });
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
       fail(e && e.message ? e.message : String(e));
@@ -3209,7 +3218,7 @@ function assertNoUnpushedLaneWork(repo, chosen) {
 /** Park abandoned commits on the canonical remote before recycling a free lane. An exclusive lease spans
  *  the evidence read, every push + SHA verification, and the normal acquire reset. No live holder is touched.
  *  Unknown evidence fails closed: restore/inspect the lane manually, then retry salvage-unpushed. */
-async function salvageUnpushed(repo, { dryRun = false } = {}) {
+async function salvageUnpushed(repo, { dryRun = false, refBase = (n, stamp) => `lane/salvage-lane-${n}-${stamp}-parked` } = {}) {
   if (flags['no-reset'] || flags.base || flags.force || flags.reserve) throw new Error('salvage-unpushed requires the normal reset (no --no-reset, --base, --force or --reserve)');
   let failed = false;
   for (const n of existingLanes(repo)) {
@@ -3234,7 +3243,7 @@ async function salvageUnpushed(repo, { dryRun = false } = {}) {
       const tracked = releaseTrackedChanges(dir);
       if (tracked !== '') throw new Error('tracked changes or unreadable worktree evidence; commit/stash work and retry');
       const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
-      const base = `lane/salvage-lane-${n}-${stamp}-parked`;
+      const base = refBase(n, stamp);
       const stashSet = new Set(local.stashes);
       const refs = local.tips.filter(sha => !stashSet.has(sha)).map((sha, i) => ({ sha, ref: i ? `${base}-tip${i}` : base }));
       refs.push(...local.stashes.map((sha, i) => ({ sha, ref: `${base}-stash${i}` })));
@@ -5459,7 +5468,8 @@ async function cmdGc(repo) {
   // A lane whose salvage is refused is KEPT and logged + journaled loud (salvageUnpushed), and the gc recovery
   // below still handles it by its own preservation path — so a per-lane refusal must not flip gc's exit status
   // (gc exited 0 before salvage joined it). A thrown error (bad flags) still fails the run.
-  const salvage = async () => { try { const prior = process.exitCode; const ok = await salvageUnpushed(repo, { dryRun: !!flags['dry-run'] }); process.exitCode = prior; return ok; } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
+  // Preserve GC recovery's established salvage namespace while covering every branch and stash tip.
+  const salvage = async () => { try { const prior = process.exitCode; const ok = await salvageUnpushed(repo, { dryRun: !!flags['dry-run'], refBase: n => salvageRefName(n, new Date()) }); process.exitCode = prior; return ok; } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
   const heal = () => { try { healSiblings(repo); } catch (e) { log(`heal-siblings skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); } };
   const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
   const recover = async () => {
