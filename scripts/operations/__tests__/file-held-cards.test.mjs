@@ -472,3 +472,68 @@ it('refuses a hard-linked ledger without changing the linked file or calling fil
   expect(readFileSync(target, 'utf8')).toBe('');
   expect(fileItem).not.toHaveBeenCalled();
 });
+
+const lockPath = () => join(tmpdir(), `file-held-cards-${createHash('sha256').update(join(realpathSync(temp), 'cards-filed.jsonl')).digest('hex').slice(0, 24)}.lock`);
+
+it('sink dry-run with a refused card returns the plan and the refusal instead of throwing, and writes nothing', async () => {
+  seed('- [R1] 2026-11-08: bad /Users/x/y\n- [R2] 2026-11-08: good one');
+  const sink = createFileHeldCardsSinks({ root, fileItem })['file-held-cards.file'];
+  const result = await sink({ source, max: 10, 'dry-run': true });
+  expect(result.planned.map(card => card.tag)).toEqual(['R2']);
+  expect(result.refused.map(card => card.tag)).toEqual(['R1']);
+  expect(fileItem).not.toHaveBeenCalled();
+  expect(existsSync(ledger)).toBe(false);
+  // The finisher still exits non-zero on the refusal while keeping the planned line visible.
+  const outcome = finishFileHeldCards({ code: 0, run: { effects: [{ type: 'file-held-cards.file', result }] } });
+  expect(outcome.code).toBe(1);
+  expect(outcome.lines.join('\n')).toContain('planned R2');
+});
+
+it('sink real run with a refused card throws after ledgering and names the filed card', async () => {
+  seed('- [R1] 2026-11-08: bad /Users/x/y\n- [R2] 2026-11-08: good one');
+  const sink = createFileHeldCardsSinks({ root, fileItem })['file-held-cards.file'];
+  await expect(sink({ source, max: 10, 'dry-run': false })).rejects.toThrow(/1 filed: xtest \(R2\)/);
+  expect(readFileSync(ledger, 'utf8').trim().split('\n')).toHaveLength(1);
+});
+
+it('dry-run reports a live-twin duplicate instead of planning it', async () => {
+  writeFileSync(join(root, 'backlog', '9-live.md'), '---\nstatus: open\n---\n# Repair behavior\n');
+  seed('- [R1] 2026-11-08: Repair behavior\n- [R2] 2026-11-08: Fresh card');
+  const result = await run({ dryRun: true });
+  expect(result.planned.map(card => card.tag)).toEqual(['R2']);
+  expect(result.duplicates.map(card => card.tag)).toEqual(['R1']);
+  expect(fileItem).not.toHaveBeenCalled();
+});
+
+it('reclaims a ledger lock whose recorded owner process is dead', async () => {
+  seed('- [R1] 2026-11-08: Stale lock probe');
+  const dead = execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  writeFileSync(lockPath(), dead);
+  try {
+    expect((await run()).filed).toHaveLength(1);
+    expect(existsSync(lockPath())).toBe(false);
+  } finally { rmSync(lockPath(), { force: true }); }
+});
+
+it('refuses a lock held by a live process, or with an unreadable owner, and names the lock file', async () => {
+  seed('- [R1] 2026-11-08: Live lock probe');
+  try {
+    for (const owner of [String(process.pid), 'not-a-pid', '']) {
+      writeFileSync(lockPath(), owner);
+      await expect(run()).rejects.toThrow(lockPath());
+      expect(readFileSync(lockPath(), 'utf8')).toBe(owner);
+    }
+  } finally { rmSync(lockPath(), { force: true }); }
+  expect(fileItem).not.toHaveBeenCalled();
+});
+
+it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a ledger append failure stops the batch: later cards are not filed and the error surfaces', async () => {
+  seed('- [R1] 2026-11-08: First card\n- [R2] 2026-11-08: Second card');
+  // The ledger does not exist yet and its directory is read-only, so the first append fails after the first filing.
+  chmodSync(temp, 0o555);
+  try {
+    await expect(run()).rejects.toThrow(/EACCES/);
+  } finally { chmodSync(temp, 0o755); }
+  expect(fileItem).toHaveBeenCalledTimes(1);
+  expect(existsSync(ledger)).toBe(false);
+});
