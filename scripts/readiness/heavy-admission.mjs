@@ -708,6 +708,8 @@ export function createRemoteExec({
       (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
   }),
   notice = remoteClientNotice, runOverride = null,
+  // Best-effort persistence deadline; injectable so a loaded host (CI coverage shard) cannot race the audit write in tests.
+  provenanceBudgetMs = 100,
 } = {}) {
   return async (options) => {
     const scope = runOverride != null ? 'run' : 'host';
@@ -742,7 +744,7 @@ export function createRemoteExec({
         }
         if (scope === 'run') { // per-run: never touches the shared host provenance state
           await boundedClientProvenance(() => appendEvent({ kind: 'remote-client-override',
-            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), 100);
+            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), provenanceBudgetMs);
           return;
         }
         await boundedClientProvenance(async (signal) => {
@@ -777,7 +779,7 @@ export function createRemoteExec({
             if (signal.aborted) return;
             await provenanceFs.writeFile(file, JSON.stringify({ ...pair, pathKey }) + '\n', { encoding: 'utf8', signal });
           }
-        }, 100);
+        }, provenanceBudgetMs);
       })().catch(() => {}).finally(() => pendingClientProvenance.delete(provenance));
       pendingClientProvenance.add(provenance);
     }
