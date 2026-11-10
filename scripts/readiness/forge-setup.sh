@@ -492,3 +492,6 @@ PRUNE
 chown root:root /etc/cron.daily/forge-exec-prune
 chmod 755 /etc/cron.daily/forge-exec-prune
 printf 'forge-setup: ok\n'
+
+# Advisory end-to-end check; setup remains usable when client SSH/binding is not yet configured.
+(cd "$(dirname -- "$0")/../.." && node scripts/readiness/forge-canary.mjs --trigger=forge-setup --json) || printf 'forge-setup: canary failed; inspect forge-canary.jsonl\n' >&2

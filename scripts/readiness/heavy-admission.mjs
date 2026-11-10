@@ -174,6 +174,7 @@ import {
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { routeNeedsGit } from './needs-git-route.mjs';
 import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
+import {isForgeInfraFailure} from './forge-failure.mjs';
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
@@ -248,9 +249,10 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
-    elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
+    elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 600000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
+    forgeFallbackMinutes: 15, forgeDownMinutes: 15, forgeDownShare: 0.3, forgeDownMinRuns: 5,
     stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
 });
 
@@ -288,6 +290,10 @@ const ADMISSION_VALID = {
   'remote.slotUnitsByKind': (v) => admissionObject(v) && Object.keys(v).length <= ADMISSION_MAX_SLOTS
     && Object.entries(v).every(([key, n]) =>  /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) && (n === 'auto' || admissionInt(1)(n))),
   'remote.backoffMs': isValidRunWaitMs,
+  'remote.forgeFallbackMinutes': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
+  'remote.forgeDownMinutes': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
+  'remote.forgeDownShare': (v) => Number.isFinite(v) && v > 0 && v <= 1,
+  'remote.forgeDownMinRuns': (v) => Number.isSafeInteger(v) && v >= 1 && v <= 100000,
   'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
   'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
   'remote.minFreeRamPct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
@@ -886,7 +892,7 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec, remoteClientOverride = null, onDecision,
+  remoteExec, remoteClientOverride = null, onDecision, canaryRunner, recoveryProbe = false, onRemoteResult,
   log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
@@ -912,14 +918,18 @@ export async function runWithRemoteDecision({
   if (!decision.remote) return { handled: false };
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
-  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
+  const { checkRemoteHealth, checkForgeBreaker, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     recordRemoteFallback({lockRoot, reason, cwd, argv, env, clock});
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
-  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
+  const breaker = recoveryProbe ? {ok:true} : await checkForgeBreaker({root:remoteRoot, settings:policy.settings.remote, clock, host,
+    canary: async () => (await import('./forge-canary.mjs')).runForgeCanary({lockRoot,cwd,host,clock,
+      trigger:'breaker-half-open',policy,readTelemetry, ...(canaryRunner ? {runner:canaryRunner} : {})})});
+  if (!breaker.ok) return localFallback(breaker.reason);
+  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host,recoveryProbe});
   const healthy = await health();
   if (!healthy.ok) return localFallback(healthy.reason);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
@@ -1008,6 +1018,9 @@ export async function runWithRemoteDecision({
   },60000);
   heartbeat.unref();
   const record = async result => {
+    onRemoteResult?.(result);
+    if(result?.infraFailure==='install-failed' || (result?.mode==='unconfirmed' && isForgeInfraFailure(result)))
+      recordRemoteFallback({lockRoot, reason:result.infraFailure ?? result.reason, detail:result.infraFailure ? 'verified install receipt code 97' : null, cwd, argv, env, clock});
     // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).
     try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host}),escalatePromise]);}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
@@ -1103,12 +1116,12 @@ export async function runWithRemoteDecision({
       // A client kill during the timeout grace period still cancels and exits with the signal code.
       if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
-        await record({mode:'unconfirmed'});
+        await record({mode:'unconfirmed',reason:'remote-timeout'});
         return killedExit() ?? refuseLocal('remote-timeout');
       }
       reason = 'remote-timeout';
       terminated = true;
-      await record(termination);
+      await record({...termination,reason:'remote-timeout'});
       if (killedExit()) return killedExit();
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
@@ -1122,7 +1135,7 @@ export async function runWithRemoteDecision({
       reason = result?.reason ?? 'unconfirmed remote result';
       detail = result?.detail;
     }
-  } catch (error) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(error?.message ?? error); }
+  } catch (error) { await record({mode:'unconfirmed',reason:error?.code ?? String(error?.message ?? 'unconfirmed')}); return killedExit() ?? refuseLocal(error?.message ?? error); }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
     for (const [name, h] of signalHandlers) process.removeListener(name, h);

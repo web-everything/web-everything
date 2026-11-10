@@ -3,11 +3,12 @@
 import {readFileSync, writeFileSync, renameSync, rmSync, lstatSync, readdirSync} from 'node:fs';
 import {join} from 'node:path';
 import {randomBytes, createHash} from 'node:crypto';
+import {isForgeInfraFailure} from './forge-failure.mjs';
 import {reserve, readLockEntry, releaseLockDir} from './file-locks.mjs';
 import {parseTelemetry} from './forge-exec-run.mjs';
 import {readForgeTelemetry, pingForge} from './forge-telemetry.mjs';
 
-const freshState=()=>({v:1,lastReadAt:null,telemetry:null,failures:0,backoffUntil:0,trigger:''});
+const freshState=()=>({v:1,lastReadAt:null,telemetry:null,failures:0,backoffUntil:0,trigger:'',infraFailures:0,breakerUntil:0,breakerPhase:''});
 const integer=v=>Number.isSafeInteger(v)&&v>=0;
 function readState(file) {
   let parsed=null;
@@ -15,9 +16,16 @@ function readState(file) {
     const st=lstatSync(file);
     if(!st.isFile() || st.isSymbolicLink() || st.size>70000)throw new Error('invalid state size');
     const s=parsed=JSON.parse(readFileSync(file,'utf8'));
-    if(!s || Object.keys(s).sort().join(',')!=='backoffUntil,failures,lastReadAt,telemetry,trigger,v' || s.v!==1
+    if(!s || Object.keys(s).filter(k=>!['infraFailures','breakerUntil','breakerPhase'].includes(k)).sort().join(',')!=='backoffUntil,failures,lastReadAt,telemetry,trigger,v' || s.v!==1
       || !(s.lastReadAt===null||integer(s.lastReadAt)) || !integer(s.failures) || !integer(s.backoffUntil)
       || typeof s.trigger!=='string' || !/^[a-zA-Z0-9.-]{0,80}$/.test(s.trigger))throw new Error('invalid state');
+    if(['infraFailures','breakerUntil'].some(k=>s[k]!==undefined&&!integer(s[k])) || (s.breakerPhase!==undefined&&!['','open','half-open'].includes(s.breakerPhase)))throw new Error('invalid breaker state');
+    // Migrate the previous breaker representation without reopening an unconfirmed outage.
+    if(s.breakerPhase===undefined && ['forge-breaker-open','forge-breaker-half-open'].includes(s.trigger)) {
+      s.infraFailures=s.failures;s.breakerUntil=s.backoffUntil;
+      s.breakerPhase=s.trigger==='forge-breaker-open'?'open':'half-open';s.trigger='';
+    }
+    s.infraFailures ??= 0;s.breakerUntil ??= 0;s.breakerPhase ??= '';
     if(s.telemetry!==null)parseTelemetry(JSON.stringify(s.telemetry));
     return s;
   } catch(error){
@@ -27,7 +35,15 @@ function readState(file) {
     // lastGood* data are never carried over.
     if(parsed&&typeof parsed==='object')e.salvage={
       failures:integer(parsed.failures)?parsed.failures:0,backoffUntil:integer(parsed.backoffUntil)?parsed.backoffUntil:0,
+      infraFailures:integer(parsed.infraFailures)?parsed.infraFailures:0,breakerUntil:integer(parsed.breakerUntil)?parsed.breakerUntil:0,
+      breakerPhase:['open','half-open'].includes(parsed.breakerPhase)?parsed.breakerPhase:'',
       trigger:typeof parsed.trigger==='string'&&/^[a-zA-Z0-9.-]{0,80}$/.test(parsed.trigger)?parsed.trigger:''};
+    if(e.salvage && ['forge-breaker-open','forge-breaker-half-open'].includes(e.salvage.trigger)) {
+      e.salvage.infraFailures=Math.max(e.salvage.infraFailures,e.salvage.failures);
+      e.salvage.breakerUntil=Math.max(e.salvage.breakerUntil,e.salvage.backoffUntil);
+      e.salvage.breakerPhase=e.salvage.trigger==='forge-breaker-open'?'open':'half-open';
+      e.salvage.trigger='';
+    }
     throw e;
   }
 }
@@ -70,10 +86,12 @@ async function transaction(root,action,host='forge') {
     return result;
   } finally {rmSync(pending,{force:true});releaseLockDir(root,key);}
 }
-export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',ping=pingForge}) {
+export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',ping=pingForge,recoveryProbe=false}) {
   try{return await transaction(root,async state=>{
     const now=clock();
-    if(now<state.backoffUntil)return {ok:false,reason:`backoff-${state.trigger}`};
+    if(recoveryProbe && state.breakerPhase!=='half-open')return {ok:false,reason:'forge-breaker-probe-not-claimed'};
+    if(!recoveryProbe && state.breakerPhase)return {ok:false,reason:'forge-breaker-open'};
+    if(!recoveryProbe && now<state.backoffUntil)return {ok:false,reason:`backoff-${state.trigger}`};
     const stale=()=>{
       const age=clock()-Date.parse(state.telemetry?.sampledAtET);
       return !Number.isFinite(age)||age < -60000||age>30000;
@@ -102,7 +120,11 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     else if(stale())trigger='telemetry-stale';
     else if(state.telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
     else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
-    if(trigger){state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};}
+    if(trigger){
+      if(isForgeInfraFailure({reason:trigger})) noteFailure(state,settings,clock());
+      state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;
+      return {ok:false,reason:trigger};
+    }
     return {ok:true};
   },host);}catch(error){
     if(error.message==='remote-health-busy')return {ok:false,reason:error.message};
@@ -111,6 +133,9 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
 }
 export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge'}) {
   return transaction(root,state=>{
+    // Preserve the legacy accounting independently of the additive infrastructure breaker.
+    if(isForgeInfraFailure(result)) noteFailure(state,settings,clock());
+    else if(!state.breakerPhase) state.infraFailures=0;
     if(result?.mode==='remote'&&Number.isInteger(result.code)&&result.code>=0&&result.code<=254){
       state.failures=0;state.backoffUntil=0;state.trigger='';return;
     }
@@ -127,4 +152,36 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
 export function peekRemoteTelemetry({root,host='forge'}) {
   const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
   try{return readState(join(root,key+'.json')).telemetry;}catch{return null;}
+}
+
+function noteFailure(state,settings,now) {
+  state.infraFailures=Math.min(Number.MAX_SAFE_INTEGER,state.infraFailures+1);
+  if(state.infraFailures >= (settings.backoffFailures ?? 3)) {
+    state.breakerPhase='open';state.breakerUntil=now+(settings.backoffMs ?? 600000);
+  }
+}
+
+/** Extend the existing backoff: atomically claim one half-open canary, outside the telemetry mutex.
+ * A five-minute lease covers the bounded two-minute canary, including cancellation and event recording.
+ * Other callers fall back locally; a crashed claimant can be retried after the lease expires. */
+export async function checkForgeBreaker({root,settings,host='forge',clock=Date.now,canary}) {
+  try {
+    const claim=await transaction(root,state=>{
+      // Old backoff alone is not proof of a consecutive infrastructure streak.
+      if(!state.breakerPhase)return {ok:true};
+      if(clock()<state.breakerUntil)return {ok:false,reason:'forge-breaker-open'};
+      state.breakerPhase='half-open';state.breakerUntil=clock()+300000;
+      return {lease:state.breakerUntil};
+    },host);
+    if(!claim.lease)return claim;
+    let event;
+    try {event=await canary();} catch {event={result:'fail'};}
+    return await transaction(root,state=>{
+      if(state.breakerPhase!=='half-open'||state.breakerUntil!==claim.lease)
+        return {ok:false,reason:'forge-breaker-open'};
+      if(event?.result==='pass') {state.infraFailures=0;state.breakerPhase='';state.breakerUntil=0;state.failures=0;state.backoffUntil=0;state.trigger='';state.lastReadAt=null;return {ok:true};}
+      state.breakerPhase='open';state.breakerUntil=clock()+(settings.backoffMs ?? 600000);
+      return {ok:false,reason:'forge-breaker-open'};
+    },host);
+  } catch {return {ok:false,reason:'remote-health-unreadable'};}
 }
