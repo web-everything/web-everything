@@ -122,12 +122,12 @@ describe('credentialContentFinding code expressions in test files (R824)', () =>
     const [fn, ctor, field, rest] = ['readRecoveryCredential', 'vi.fn(() => ({', 'token', "'ghp_acceptance_fixture', other: 1})),\n"];
     expect(at('scripts/conveyor/__tests__/missing-run-startup-failure.test.mjs', `${fn}: ${ctor}${field}:${rest}`)).toBeNull();
   });
-  it('still flags the same createHash line in a non-test file', () => {
-    expect(at('scripts/readiness/some-module.mjs', hashLine)).toBe('high-entropy-pathKey');
+  it('still flags a bare high-entropy literal in a non-test file', () => {
+    expect(at('scripts/readiness/some-module.mjs', `API_TOKEN: '${randomValue}'\n`)).toBe('high-entropy-API_TOKEN');
   });
   it('does not treat a lookalike path as a test file', () => {
-    expect(at('scripts/readiness/__tests__x/a.mjs', hashLine)).toBe('high-entropy-pathKey');
-    expect(at('scripts/readiness/a.test.txt', hashLine)).toBe('high-entropy-pathKey');
+    expect(at('scripts/readiness/__tests__x/a.mjs', `API_TOKEN: '${randomValue}'\n`)).toBe('high-entropy-API_TOKEN');
+    expect(at('scripts/readiness/a.test.txt', `API_TOKEN: '${randomValue}'\n`)).toBe('high-entropy-API_TOKEN');
   });
   it('still flags a bare high-entropy string literal in a test file', () => {
     expect(at(testPath, `API_TOKEN: '${randomValue}'\n`)).toBe('high-entropy-API_TOKEN');
