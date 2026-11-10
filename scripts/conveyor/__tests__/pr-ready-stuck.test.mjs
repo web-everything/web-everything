@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { beforeEach, describe, it, expect, vi } from 'vitest';
-import { runReadyStuck, isUnretryable, readReadyLabelTime, readMainCheckEvidence, checkDate } from '../pass-daemons/pr-ready-stuck.mjs';
+import { runReadyStuck, isUnretryable, readReadyLabelTime, readMainCheckEvidence, checkDate, readChecksOnly } from '../pass-daemons/pr-ready-stuck.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 import { runMergeWatch, resolveMergeWatchSettings } from '../pass-daemons/pr-merge-watch-pass.mjs';
 
@@ -24,6 +24,7 @@ function fixture(overrides = {}) {
       statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE', completedAt: date(25) }] },
     receipt: {}, config: { readyStuckMinutes: 120, selfHealStaleHours: 24 },
     readLabelTime: vi.fn(() => date(3)), readSkipReason: () => 'checks failed',
+    readRequiredChecks: vi.fn(() => ['test']),
     onlyChecksBlock: vi.fn(() => true), readMainChecks: vi.fn(() => [{ name: 'test', conclusion: 'SUCCESS' }]),
     refresh: vi.fn(() => ({ action: 'rebased' })), send: vi.fn(), save: vi.fn(), log: vi.fn(), ...overrides };
 }
@@ -469,4 +470,86 @@ describe('ready-stuck production refresh ref validation', () => {
       expect(refreshIo.rebaseDropManifest).not.toHaveBeenCalled();
       expect(f.log.mock.calls).toEqual([['pr-merge-watch: ready-stuck self-heal #17 skip']]);
     });
+});
+
+
+describe('missing required checks and checks-only rulesets', () => {
+  function missingFixture() {
+    const f = fixture({ readRequiredChecks: vi.fn(() => ['merge-gate']),
+      readMainChecks: vi.fn(() => [{ name: 'merge-gate', conclusion: 'SUCCESS' }]) });
+    f.pr.statusCheckRollup = [];
+    return f;
+  }
+  it('refreshes a missing merge-gate once after the alert', async () => {
+    const f = missingFixture(); await runReadyStuck(f); await runReadyStuck(f);
+    expect(f.refresh).toHaveBeenCalledTimes(1);
+  });
+  it('holds when the missing name is not green on main', async () => {
+    const f = missingFixture(); f.readMainChecks.mockReturnValue([{ name: 'other', conclusion: 'SUCCESS' }]);
+    await runReadyStuck(f); expect(f.refresh).not.toHaveBeenCalled();
+  });
+  it('holds and cools down an unreadable required-check read', async () => {
+    const f = missingFixture(); f.readRequiredChecks.mockImplementation(() => { throw Error('unreadable'); });
+    await runReadyStuck(f); await runReadyStuck(f);
+    expect(f.refresh).not.toHaveBeenCalled(); expect(f.readRequiredChecks).toHaveBeenCalledTimes(1);
+  });
+  function rulesFixture(types) {
+    const f = fixture(); f.pr.comments = []; f.pr.reviewDecision = 'APPROVED';
+    f.read = vi.fn(([, path]) => {
+      if (path.endsWith('/pulls/17')) return { head: { sha: f.pr.headRefOid, repo: { full_name: f.repo } },
+        base: { ref: 'main' }, mergeable: true, draft: false, state: 'open' };
+      if (path.includes('rulesets?')) return [{ id: 1, enforcement: 'active' }, { id: 2, enforcement: 'active' }];
+      if (path.endsWith('/rulesets/1')) return { rules: types.map(type => ({ type })) };
+      if (path.endsWith('/rulesets/2')) return { rules: [{ type: 'required_status_checks', parameters: {
+        required_status_checks: [{ context: 'merge-gate' }, { context: 'test' }] } }, { type: 'merge_queue' }] };
+      if (path.endsWith('/protection')) return { required_status_checks: { contexts: ['test'] } };
+      throw Error('unexpected read');
+    });
+    return f;
+  }
+  it('allows the two active checks/workflow rulesets', () => {
+    expect(readChecksOnly(rulesFixture(['deletion', 'non_fast_forward', 'workflows']))).toBe(true);
+  });
+  it('holds refresh for an unknown active rule type', async () => {
+    const f = rulesFixture(['unknown']); f.onlyChecksBlock = undefined;
+    await runReadyStuck(f); expect(f.refresh).not.toHaveBeenCalled();
+  });
+  it('unions branch and active ruleset required contexts', async () => {
+    const { readRequiredChecks } = await import('../pass-daemons/pr-ready-stuck.mjs');
+    expect(readRequiredChecks(rulesFixture(['workflows']))).toEqual(['test', 'merge-gate']);
+  });
+  it.each(['ruleset detail', 'required parameters', 'branch contexts'])(
+    'holds for unreadable %s in the production required-check reader', async kind => {
+      const { readRequiredChecks } = await import('../pass-daemons/pr-ready-stuck.mjs');
+      const f = rulesFixture(['workflows']); const original = f.read;
+      f.read = args => {
+        if (kind === 'ruleset detail' && args[1].endsWith('/rulesets/2')) throw Error('unreadable');
+        if (kind === 'required parameters' && args[1].endsWith('/rulesets/2')) return { rules: [{ type: 'required_status_checks' }] };
+        if (kind === 'branch contexts' && args[1].endsWith('/protection')) return { required_status_checks: {} };
+        return original(args);
+      };
+      expect(() => readRequiredChecks(f)).toThrow();
+    });
+  it('ignores disabled ruleset contexts', async () => {
+    const { readRequiredChecks } = await import('../pass-daemons/pr-ready-stuck.mjs');
+    const f = rulesFixture([]); const original = f.read;
+    f.read = args => args[1].includes('rulesets?') ? [{ enforcement: 'disabled' }] : original(args);
+    expect(readRequiredChecks(f)).toEqual(['test']);
+  });
+  it('keeps unfinished checks blocking even when a required name is missing', async () => {
+    const f = missingFixture(); f.pr.statusCheckRollup.push({ name: 'test', status: 'IN_PROGRESS' });
+    await runReadyStuck(f); expect(f.refresh).not.toHaveBeenCalled();
+    expect(f.readRequiredChecks).not.toHaveBeenCalled();
+  });
+  it('does not read missing checks before the alert threshold', async () => {
+    const f = missingFixture(); f.config.readyStuckMinutes = 240;
+    await runReadyStuck(f); expect(f.readRequiredChecks).not.toHaveBeenCalled();
+    expect(f.refresh).not.toHaveBeenCalled();
+  });
+  it('fails closed at the ruleset list cap with operator escalation', async () => {
+    const { readRequiredChecks } = await import('../pass-daemons/pr-ready-stuck.mjs');
+    const f = rulesFixture([]); f.read = () => Array.from({ length: 100 }, () => ({ enforcement: 'disabled' }));
+    expect(readChecksOnly(f)).toBe(false);
+    expect(() => readRequiredChecks(f)).toThrow(/operator/);
+  });
 });

@@ -34,6 +34,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
+import { informationalProvenance } from './carried-provenance.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
@@ -254,7 +255,11 @@ export function isKnownMachineBody(body, comment = undefined) {
   // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
   if (isTrustedMarkerAuthor(comment)) {
     if (text.startsWith(RED_TEAM_GATE_MARKER)) {
-      return isNonBlockingRedTeamGate(text);
+      if (isNonBlockingRedTeamGate(text)) return true;
+      const gate = parseRedTeamGateMarker(text);
+      // The provenance parser also accepts standalone records for the rebase path.
+      // Here only the combined carried envelope extends the strict gate shape.
+      return !!gate && !!parseVerdictCarriedMarker(text) && informationalProvenance(text, gate.rev, gate.pr);
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
       const parsed = parseRedTeamComment(text);

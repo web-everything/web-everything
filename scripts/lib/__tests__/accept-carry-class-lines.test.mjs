@@ -78,3 +78,24 @@ describe('review-verdict-carried envelope around a non-blocking advisory is a ma
     expect(isKnownMachineBody(envelope(blocking), trusted)).toBe(false);
   });
 });
+
+
+describe('gate-prefixed carried advisory after acceptance (PR 6584)', () => {
+  const sha = 'a'.repeat(40);
+  const body = (impact = 'degraded', rev = sha) => [
+    `<!-- we:red-team-gate pr=6584 rev=${sha} outcome=card-queued result=${'d'.repeat(16)} -->`,
+    `<!-- review-verdict-carried from=${OLD} to=${sha} patch-id=${'b'.repeat(40)} -->`,
+    'Review verdict carried across an identical contribution.',
+    `<!-- we:red-team-advisory pr=6584 rev=${rev} -->`,
+    '1. [**confirmed**] (degraded-impact, ' + impact + ') — Diagnostic detail missing',
+  ].join('\n');
+  const later = (text, author = trusted) => latestAcceptRecord([
+    { ...trusted, body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->` },
+    { ...author, body: text },
+  ]).laterVerdict;
+  it('keeps acceptance for a confirmed degraded finding', () => expect(later(body())).toBe(false));
+  it('holds for a confirmed broken finding', () => expect(later(body('broken'))).toBe(true));
+  it('holds for appended prose', () => expect(later(body() + '\nPlease hold this change.')).toBe(true));
+  it('holds for an untrusted author', () => expect(later(body(), { author: { login: 'mallory' } })).toBe(true));
+  it('holds for a mismatched advisory sha', () => expect(later(body('degraded', OLD))).toBe(true));
+});
