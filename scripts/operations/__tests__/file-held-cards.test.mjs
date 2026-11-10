@@ -290,6 +290,28 @@ it('a closed card with the same title does not suppress a fresh handoff', async 
   expect(fileItem.mock.calls[0][0].notDuplicateReason).toBe('9-old.md is closed and does not cover this fresh handoff');
 });
 
+const LONG = 'Rebuild the conveyor dispatch state after a runner restart while preserving every pending lane lease and review assignment across the entire machine';
+
+it('a long (truncated-title) card gets the closed-twin declaration too, in dry run and filing', async () => {
+  seed(`- [R3] 2026-11-10: ${LONG}`);
+  const title = composeFileItemInput({ text: LONG }).title;
+  expect(title.endsWith('…')).toBe(true);
+  writeFileSync(join(root, 'backlog', '9-old.md'), `---\nstatus: resolved\n---\n# ${title}\n`);
+  expect((await run({ dryRun: true })).planned).toHaveLength(1);
+  const result = await run();
+  expect(result.filed).toHaveLength(1);
+  expect(fileItem.mock.calls[0][0].notDuplicateReason).toBe('9-old.md is closed and does not cover this fresh handoff');
+});
+
+it('a truncated title with a live twin as well as a closed one is never declared not-duplicate', async () => {
+  seed(`- [R3] 2026-11-10: ${LONG}`);
+  const title = composeFileItemInput({ text: LONG }).title;
+  writeFileSync(join(root, 'backlog', '9-old.md'), `---\nstatus: resolved\n---\n# ${title}\n`);
+  writeFileSync(join(root, 'backlog', '8-live.md'), `---\nstatus: open\n---\n# ${title}\n`);
+  await run();
+  expect(fileItem.mock.calls[0][0]).not.toHaveProperty('notDuplicateReason');
+});
+
 it('a card with no closed twin carries no duplicate declaration, and the binding passes one through only when present', async () => {
   seed('- [R1] 2026-11-08: Fresh unrelated card');
   await run();

@@ -276,7 +276,9 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     }
     if (dryRun) { result.planned.push(summary); continue; }
     const row = { hash: card.hash, ...summary, card: null, filedAt: now() };
-    const closed = input.title.endsWith('…') ? undefined : closedTitles.get(titleKey(input.title));
+    // A truncated title gets the same closed-twin handling as a short one: a closed card carrying the identical
+    // generated title cannot cover a fresh handoff either. A live card with that title still blocks (never declared away).
+    const closed = titles.has(titleKey(input.title)) ? undefined : closedTitles.get(titleKey(input.title));
     if (closed) input.notDuplicateReason = safeLog(`${closed} is closed and does not cover this fresh handoff`);
     try {
       const response = await fileItem(input);
