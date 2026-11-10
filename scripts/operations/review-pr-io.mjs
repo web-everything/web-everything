@@ -803,7 +803,7 @@ const BODY_FILE_REFUSALS = Object.freeze([
   /--body-file=[^\r\n]+ is empty — pass the verdict write-up/,
   /--body-file must live under the repo root or a temp dir \(got /,
 ]);
-const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_REFUSALS.some(p => p.test(text));
+export const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_REFUSALS.some(p => p.test(text));
 
 const PRE_WRITE_REFUSALS = Object.freeze([
   ...BODY_FILE_REFUSALS,

@@ -20,6 +20,7 @@ import { judgeOutcome } from '../cli-adapter.mjs';
 import { rewindRunToStep } from '../engine.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation, reviewSeatOptionsForRun } from '../review-pr.mjs';
 import { runReviewLoopOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS } from '../review-loop-cli.mjs';
+import { isBodyFileRefusal } from '../review-pr-io.mjs';
 import {
   classifyReferralsByRound, findingIdentityTable, REFERRAL_DEMOTED_REASONS, referralFindingKey, normalizeFinding,
   mandatoryReferralReviewer, mandatoryReferralState, renderReferralRecord, openReferralHeads, buildOperatorRulingComment, REFERRAL_DROP_REASON,
@@ -1169,6 +1170,55 @@ describe('defaultFindResumableRun — the wiring from the PR thread to the hold 
   });
 });
 
+
+it('resumes a body-file-refused record in place without replaying the panel or applied effects, and bounds retries', async () => {
+  const { declaration, registry } = setup(input => {
+    const view = stubReader()(input);
+    return { ...view, body: '<!-- authored-by-actor: author -->',
+      detail: { ...view.detail, humanRequired: false, labels: ['review:pending'], reviewClass: 'agent' } };
+  });
+  const store = createMemoryRunStore(), seen = [], ruled = { value: true };
+  const judge = vi.fn(async () => judgeOutcome({ summary: 'clean', findings: [] }, {}));
+  const sinks = sinksWith({ seen, ruled });
+  sinks[REVIEW_EFFECTS.LABEL] = async () => { throw Error('--body-file=gone is unreadable (ENOENT)'); };
+  const args = { declaration, registry, argv, store, makeJudge: () => judge, sinks,
+    readAcceptancePr: () => ({ headRefOid: HEAD_1, body: '<!-- authored-by-actor: author -->', createdAt: '', comments: [] }),
+    advisorySettings: () => ({ value: { mode: 'off' } }),
+    mintRunId: () => 'review-pr-record-retry' };
+  await runReviewLoopOnce(args);
+  const saved = store.read('review-pr-record-retry');
+  expect(saved.pending).toMatchObject({ kind: 'effect', step: 'record' });
+  // Persisted pre-fix state: the body-file refusal is pending, with no unknown write attempt.
+  const label = saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL);
+  label.status = 'pending'; label.unknownAttempts = 0;
+  store.write(saved);
+  const findResumableRun = input => defaultFindResumableRun(input, {
+    readPr: () => ({ headRefOid: HEAD_1, comments: [] }),
+    readRuns: () => [reviewRunEvidence(store.read(saved.id))],
+  });
+  expect(findResumableRun({ repo: 'o/n', pr: 4361 })).toBe(saved.id);
+  const count = judge.mock.calls.length;
+  const retrySinks = sinksWith({ seen, ruled });
+  retrySinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = e => isBodyFileRefusal(e.error);
+  seen.length = 0;
+  const done = await runReviewLoopOnce({ ...args, sinks: retrySinks, findResumableRun,
+    mintRunId: () => { throw Error('new panel forbidden'); } });
+  expect(done.run.id).toBe(saved.id); expect(done.run.pending).toBeNull();
+  expect(done.run.recordEffectResumeAttempts).toBe(1);
+  expect(done.run.resumeOf).toBeUndefined();
+  expect(judge).toHaveBeenCalledTimes(count);
+  expect(seen.some(e => e.type === REVIEW_EFFECTS.LABEL)).toBe(true);
+  expect(seen.some(e => saved.effects.some(old => old.type === e.type && old.status === 'applied'))).toBe(false);
+  // A persisted retryable refusal with an exhausted budget stays held, with no new panel or effect attempt.
+  store.write({ ...saved, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
+  const effectCount = seen.length;
+  const refused = await runReviewLoopOnce({ ...args, findResumableRun });
+  expect(refused.stopped).toBe('refused');
+  expect(refused.lines.join(' ')).toContain('record effect resume attempts spent');
+  expect(seen).toHaveLength(effectCount);
+  expect(store.read(saved.id).recordEffectResumeAttempts).toBe(RESUME_MAX_ATTEMPTS);
+  expect(judge).toHaveBeenCalledTimes(count);
+});
 
 it('R746 resumes an effect-pending referral in place after the operator ruling, with no new panel', async () => {
   const { declaration, registry } = setup(input => {
