@@ -10,9 +10,13 @@ on:
         type: number
   schedule:
     - cron: '*/10 * * * *'
+# checks/statuses: the dry-run reads the required check (statusCheckRollup + REST check-runs);
+# without them every PR reads "required check missing" and no verdict can say enqueue.
 permissions:
   contents: read
   pull-requests: read
+  checks: read
+  statuses: read
 concurrency:
   group: drain-verdict
   cancel-in-progress: false

@@ -192,8 +192,15 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
     expect(checkouts(doc).length).toBeGreaterThan(0);
     expect(auditWorkflow(text)).toEqual({ ok: true, problems: [] });
   });
-  it.each(['contents', 'pull-requests', 'id-token'])('refuses top-level %s: write', permission => {
+  it.each(['contents', 'pull-requests', 'checks', 'statuses', 'id-token'])('refuses top-level %s: write', permission => {
     rejectedWorkflow(mutateWorkflow(doc => { doc.permissions = { ...doc.permissions, [permission]: 'write' }; }));
+  });
+  it('grants the token read access to checks and statuses (the required-check read needs both)', () => {
+    expect(yaml.safeLoad(workflowText()).permissions).toEqual(
+      { contents: 'read', 'pull-requests': 'read', checks: 'read', statuses: 'read' });
+  });
+  it.each(['checks', 'statuses'])('refuses a workflow that drops %s: read', permission => {
+    rejectedWorkflow(mutateWorkflow(doc => { delete doc.permissions[permission]; }));
   });
   it.each(['contents', 'pull-requests', 'id-token', 'checks', 'packages', 'statuses', 'issues', 'deployments'])
     ('refuses job-level %s: write', permission => {
@@ -380,6 +387,7 @@ describe('T5c: the spawned drain reads with the workflow token on a fresh runner
       readCache: () => null, writeCache: vi.fn(), writeStatus: vi.fn(),
       mint: vi.fn(async () => { throw new Error('mint must not run'); }),
       policy: { auth: 'app', personalExceptions: {}, source: { auth: 'default' } },
+      identity: { roles: {}, callerRoles: {}, anyConfigured: false },
       log: { log() {}, info() {}, warn() {}, error() {} } });
     return { result, installShim };
   };
@@ -408,9 +416,10 @@ describe('T5c: the spawned drain reads with the workflow token on a fresh runner
 
   it('every drain auth call in merge-ai-prs routes through the CI read-only exemption', () => {
     const src = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
-    const calls = src.match(/ensureFreshGithubAppEnv\(\{[^}]*\}\)/g) || [];
+    // Every call, whatever its argument shape (an options variable would bypass an object-literal match).
+    const calls = src.split('\n').filter(line => /ensureFreshGithubAppEnv\s*\(/.test(line) && !/^\s*(\/\/|\*)/.test(line));
     expect(calls.length).toBeGreaterThanOrEqual(2);
-    for (const call of calls) expect(call).toContain('daemon: !isCiReadonlyDryRun(process.env, process.argv)');
+    for (const call of calls) expect(call).toMatch(/ensureFreshGithubAppEnv\(\{[^}]*daemon: !isCiReadonlyDryRun\(process\.env, process\.argv\) \}\)/);
   });
 });
 

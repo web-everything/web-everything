@@ -64,7 +64,7 @@ const EXPECTED_WORKFLOW = Object.freeze({
   name: 'drain-verdict',
   on: { workflow_dispatch: { inputs: { pr: { description: 'PR number to classify', required: true, type: 'number' } } },
     schedule: [{ cron: '*/10 * * * *' }] },
-  permissions: { contents: 'read', 'pull-requests': 'read' },
+  permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read', statuses: 'read' },
   concurrency: { group: 'drain-verdict', 'cancel-in-progress': false },
   env: { GITHUB_TOKEN: '${{ github.token }}' },
   jobs: { classify: { 'runs-on': 'ubuntu-latest', 'timeout-minutes': 30, steps: [
@@ -85,8 +85,9 @@ export function auditWorkflow(yamlText) {
   let doc;
   try { doc = yaml.safeLoad(yamlText); } catch { return { ok: false, problems: [...problems, 'invalid YAML'] }; }
   if (!record(doc)) return { ok: false, problems: [...problems, 'missing workflow'] };
-  const permissions = value => exact(value, ['contents', 'pull-requests']) &&
-    value.contents === 'read' && value['pull-requests'] === 'read';
+  // Exactly these four scopes, each read: the dry-run must see PRs, code and the required check's runs/statuses.
+  const READ_SCOPES = ['contents', 'pull-requests', 'checks', 'statuses'];
+  const permissions = value => exact(value, READ_SCOPES) && READ_SCOPES.every(scope => value[scope] === 'read');
   if (!permissions(doc.permissions)) problems.push('expected explicit read-only permissions');
   if (!exact(doc.on, ['schedule', 'workflow_dispatch'])) problems.push('only schedule and dispatch triggers allowed');
   if (doc.name !== 'drain-verdict') problems.push('unexpected workflow name');
