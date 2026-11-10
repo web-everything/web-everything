@@ -79,6 +79,16 @@ describe('real guards launched from a trusted snapshot', () => {
       }).status).toBe(0);
     });
   }
+  it('measures verification of a cached snapshot containing the real scripts', () => {
+    const cwd = fixture.primary;
+    const result = fixture.run(cwd, 'scripts/guard-bash.mjs', {
+      tool_name: 'Bash', cwd, tool_input: { command: 'pwd' },
+    });
+    expect(result.status).toBe(0);
+    const timings = [...result.stderr.matchAll(/snapshot verification ([0-9.]+) ms/g)];
+    expect(timings).toHaveLength(1);
+    console.info(`Real scripts cached snapshot verification: ${timings[0][1]} ms`);
+  });
   it('overrides inherited roots and canonicalizes a nested symlink cwd', async () => {
     const { symlinkSync } = await import('node:fs');
     const nested = join(fixture.primary, 'nested'); mkdirSync(nested);

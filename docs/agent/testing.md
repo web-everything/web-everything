@@ -4126,7 +4126,22 @@ mutation enters handled-ID state. Run these and the affected lock/self-sync regr
 Snapshot code must resolve operated-checkout paths through `scripts/lib/hook-root.mjs`, not
 its cache location. The launcher sets `WE_HOOK_ROOT` to the real Git toplevel of its cwd;
 a cwd without a resolvable Git root denies even when a cached snapshot exists. Offline
-snapshot fallback still works inside a checkout. Keep direct-execution checks and snapshot
+snapshot fallback requires a verified manifest no older than 24h inside a checkout. Caches and
+`latest` pointers are scoped by SHA-256 of the real Git common directory; legacy global
+pointers are ignored. Each snapshot has a sibling `<sha>.manifest` with sorted file hashes
+and a root digest, and its tree is read-only. Every launch hashes the complete tree and
+reports verification milliseconds; invalid online caches are discarded and rebuilt from Git,
+while offline repairs require valid age evidence and preserve that original timestamp.
+Missing age evidence, expired snapshots and failed Git reconstruction deny. Snapshots must pass
+the launcher's root-helper compatibility probe before any guard runs. Keep direct-execution checks and snapshot
 resource imports tied to `import.meta.url`. Unpinned calls retain the script-parent root.
 `scripts/hooks/__tests__/hook-root.test.mjs` probes primary/lane protection, seeded daemon
 paths and lint scope through the real launcher using isolated Git snapshots under `TMPDIR`.
+
+Pinned-hook verification, repair, publication and guard execution hold one exclusive per-SHA
+lock using the shared atomic directory primitive. Pruning skips locked snapshots, including
+older revisions still needed for late imports. Contention waits on filesystem events for up
+to 5s, then denies with a retry/operator-inspection message. Locks have no automatic expiry:
+an abandoned lock requires confirming that no launcher or guard uses the snapshot before
+removing it. The named concurrent-launch tests cover cold publication, repair during a
+running guard, pruning overlap and delayed imports; abandoned-lock denial is also exercised.

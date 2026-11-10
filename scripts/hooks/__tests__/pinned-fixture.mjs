@@ -1,10 +1,21 @@
-import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, readdirSync, cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const source = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+
+/** Unlock only real directories, never dependency symlinks, for fixture cleanup. */
+export function removeFixture(path) {
+  function unlock(dir) {
+    if (!lstatSync(dir).isDirectory()) return;
+    chmodSync(dir, 0o700);
+    for (const name of readdirSync(dir)) unlock(join(dir, name));
+  }
+  unlock(path);
+  rmSync(path, { recursive: true, force: true });
+}
 
 /** Real Git snapshot containing the current guards, isolated from operator refs/cache. */
 export function pinnedFixture() {
@@ -40,6 +51,6 @@ export function pinnedFixture() {
         cwd, env, encoding: 'utf8', input: JSON.stringify(event), maxBuffer: 1024 * 1024,
       });
     },
-    cleanup() { rmSync(temp, { recursive: true, force: true }); },
+    cleanup() { removeFixture(temp); },
   };
 }
