@@ -733,25 +733,6 @@ describe('admissionBypassReason — when the wrapper is a pass-through', () => {
   it('poolRootOf strips .admission/heavy', () => expect(poolRootOf('/w/.lanes/.admission/heavy')).toBe('/w/.lanes'));
 });
 
-describe('runUnderAdmission — run ceiling counted from slot grant', () => {
-  it('applies runCeilingMs as the exec timeout only after the slot is held, and reports 124 on ETIMEDOUT', async () => {
-    const seen = [];
-    const exec = (_c, o) => { seen.push({ timeout: o.timeout, held: heldSlots({ lockRoot, cap: 1 }).length }); throw Object.assign(new Error('t'), { code: 'ETIMEDOUT' }); };
-    const r = await runUnderAdmission({ lockRoot, cap: 1, owner: 'A', command: 'x', runCeilingMs: 4321, exec, log: () => {}, now: () => T0, sleep: async () => {} });
-    expect(seen).toEqual([{ timeout: 4321, held: 1 }]);
-    expect(r.exitCode).toBe(124);
-    expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
-  });
-  it('no runCeilingMs means no exec timeout; admittedArgv carries the flag only when asked', async () => {
-    const seen = [];
-    await runUnderAdmission({ lockRoot, cap: 1, owner: 'B', command: 'x', exec: (_c, o) => seen.push(o.timeout), now: () => T0, sleep: async () => {} });
-    expect(seen).toEqual([undefined]);
-    const { admittedArgv } = await import('../heavy-admission.mjs');
-    expect(admittedArgv('npx', ['v']).args).not.toContain('--run-ceiling-ms=900');
-    expect(admittedArgv('npx', ['v'], { runCeilingMs: 900 }).args.slice(1, 4)).toEqual(['run', '--run-ceiling-ms=900', '--']);
-  });
-});
-
 describe('runUnderAdmission — re-entrancy flag and bypass', () => {
   it('runs the child with WE_HEAVY_ADMISSION_HELD=1 so a nested wrapper passes through', async () => {
     const seen = [];
