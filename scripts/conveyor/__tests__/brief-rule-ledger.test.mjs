@@ -10,11 +10,14 @@ import {
   readBriefs, validateLedger, weakestStatus,
 } from '../brief-rule-ledger.mjs';
 
+import { pinnedHookScript } from '../../lib/pinned-hook-command.mjs';
+
 const BRIEF = 'skills-src/conveyor/x-agent-brief.md';
 
 // Bounded to the registrations used here: an actual node invocation, with its script argument.
 // Comments, echo/prose and similarly named scripts cannot supply registration evidence.
 function invokes(command, script) {
+  if (pinnedHookScript(command) === script) return true;
   return String(command).split('\n').some((line) => {
     if (line.trimStart().startsWith('#')) return false;
     const groups = [[]];
@@ -56,6 +59,7 @@ describe('hook registration evidence (#4416)', () => {
     'guard-git-push': { kind: 'hook', ref: 'scripts/guard-git-push.mjs', registeredIn: '.githooks/pre-push' },
     other: { kind: 'gate', ref: 'scripts/no-registration.mjs' },
   } };
+  const pinned = "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/project.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'";
   const settings = [registration('node "scripts/project.mjs" --pre'), registration('node scripts/wrapper.mjs')];
   const read = (path) => {
     if (path !== '.githooks/pre-push') throw new Error('missing');
@@ -63,6 +67,18 @@ describe('hook registration evidence (#4416)', () => {
   };
   it('accepts project-only, wrapper-only, fragment refs and verified Git; ignores non-hooks', () => {
     expect(missingRegistrations(fixture, settings, read)).toEqual([]);
+  });
+  it('accepts the script argument after the pinned launcher', () => {
+    expect(missingRegistrations(fixture, [registration(pinned), settings[1]], read)).toEqual([]);
+  });
+  it.each([
+    `echo ${pinned}`,
+    pinned.replace('scripts/project.mjs;', 'scripts/not-project.mjs;'),
+    pinned.replace('run-pinned-guard.mjs', 'other-launcher.mjs'),
+    pinned.replace(' || exit 2', ''),
+  ])('rejects incomplete or unrelated pinned registration: %s', (command) => {
+    expect(missingRegistrations(fixture, [registration(command), settings[1]], read))
+      .toEqual(['project: no command registration for scripts/project.mjs']);
   });
   it.each([0, 1])('detects removal of sole settings registration %i', (index) => {
     const mutated = structuredClone(settings);
