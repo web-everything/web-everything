@@ -187,3 +187,14 @@ describe('operator-only findingClasses', () => {
     expect(resolveCascade({ standard: {}, envValues: { '': { findingClasses: policy } } }).value).toEqual({});
   });
 });
+
+it('cardNumbering reports independent source layers and ignores invalid env values', async () => {
+  const { resolveCardNumbering } = await import('../policy-cascade.mjs');
+  const logs = [];
+  const result = resolveCardNumbering({ tool: { mode: 'rename-before-enqueue' }, platform: { ledgerAuth: 'signed' },
+    env: { WE_CARD_NUMBERING_MODE: 'ledger-only', WE_CARD_LEDGER_AUTH: 'invalid', WE_POLICY_CASCADE_LOG: '1' }, log: l => logs.push(l) });
+  expect(result.value).toMatchObject({ mode: 'ledger-only', ledgerAuth: 'signed' });
+  expect(result.sources).toMatchObject({ mode: 'env', ledgerAuth: 'platform' });
+  expect(result.invalid).toEqual([expect.stringContaining('invalid')]);
+  expect(logs.join(' ')).toContain('ledgerAuth="signed" (platform)');
+});
