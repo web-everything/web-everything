@@ -546,6 +546,18 @@ export function redTeamResultRecordTimes(comments, pr, head, resultId) {
   });
 }
 
+/**
+ * Thread position (index into `comments`) of the newest trusted record holding a red-team result for this PR on ANY
+ * head, or -1. Read through the same record split as {@link readRedTeamDisposition}, so a result carried inside a
+ * verdict-carry comment counts at that carry comment. PURE.
+ */
+export function latestRedTeamResultPosition(comments, pr) {
+  return threadRecords(comments).reduce((latest, r) => {
+    const parsed = parseRedTeamComment(recordBody(r));
+    return parsed?.pr === Number(pr) && /^[0-9a-f]{40}$/.test(parsed.rev) ? Math.max(latest, r.at) : latest;
+  }, -1);
+}
+
 /** The newest trusted red-team result for this PR and head among the records, or null. PURE. */
 function latestResult(records, pr, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;

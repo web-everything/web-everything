@@ -13,7 +13,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
-import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
+import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -454,14 +454,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         });
         const parsed = parseRedTeamComment(comment?.body);
         const result = source && redTeamForHead(rawPr.comments, pr, source.sha);
-        // Late results on any revision also supersede the proposed source clear.
-        const latestResult = rawPr.comments.findLast(c => {
-          const parsed = parseRedTeamComment(c?.body);
-          return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);
-        });
+        // Late results on any revision also supersede the proposed source clear. Read them through the shared record
+        // split, so a result carried inside a verdict-carry comment is as late as a direct one.
+        const latestResultAt = latestRedTeamResultPosition(rawPr.comments, pr);
         if (restamp?.to === head && source?.sha === restamp.from
           && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
-          && latestResult === comment && result && result.findings.length === 0
+          && comment && latestResultAt === rawPr.comments.indexOf(comment) && result && result.findings.length === 0
           && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
           && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };

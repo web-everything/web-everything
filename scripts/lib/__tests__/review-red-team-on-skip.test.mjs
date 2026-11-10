@@ -1779,6 +1779,34 @@ describe('R100 recovery regressions', () => {
     expect(runGhSync).not.toHaveBeenCalled();
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
+  // A late result read through the shared record split: one carried inside a verdict-carry comment is as late as a
+  // direct one, so it supersedes the proposed source clear too (PR 6606 self-review, same class as the finding).
+  it.each([['after', 3], ['before', 2]])('refuses carry when a trusted CARRIED result on another revision arrives %s the live-head re-stamp', (_, at) => {
+    const o = carryOptions(), other = 'c'.repeat(40);
+    o.rawPrs[0].comments.splice(at, 0, trusted([
+      `<!-- review-verdict-carried from=${'e'.repeat(40)} to=${other} patch-id=${'f'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', redTeamMarker(pr, other),
+      '1. [**confirmed**] (edge-case, broken) `x.mjs:1` — carried break'].join('\n')));
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  // The writer's exact non-blocking carry (a clean advisory re-keyed to the carried-to head) is no acceptance hold, so
+  // only the late-result check sees it; it must read the same record split, like a direct clean late result.
+  it.each([['after', 3], ['before', 2]])('refuses carry when a trusted clean CARRIED result on another revision arrives %s the live-head re-stamp', (_, at) => {
+    const o = carryOptions(), other = 'c'.repeat(40), from = 'e'.repeat(40);
+    const advisory = renderRedTeamComment({ pr, rev: from, provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' })
+      .replace(redTeamMarker(pr, from), redTeamMarker(pr, other));
+    o.rawPrs[0].comments.splice(at, 0, trusted([
+      `<!-- review-verdict-carried from=${from} to=${other} patch-id=${'f'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', advisory].join('\n')));
+    expect(redTeamForHead(o.rawPrs[0].comments, pr, other)?.findings).toEqual([]);
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
   it.each(['untrusted', 'other-pr'])('refuses carry when a late %s result supersedes acceptance under latestAcceptRecord', kind => {
     const o = carryOptions();
     const late = trusted(`${redTeamMarker(kind === 'other-pr' ? pr + 1 : pr, 'c'.repeat(40))}\nRed team blocked`);
