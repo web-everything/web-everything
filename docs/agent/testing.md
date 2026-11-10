@@ -4120,3 +4120,13 @@ job/lock outcomes, including persisted request retention. `daemon-self-sync-muta
 requires failed/refused mutations to remain pending and retry on the next tick; only a completed
 mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.
+
+## Pinned-hook checkout roots
+
+Snapshot code must resolve operated-checkout paths through `scripts/lib/hook-root.mjs`, not
+its cache location. The launcher sets `WE_HOOK_ROOT` to the real Git toplevel of its cwd;
+a cwd without a resolvable Git root denies even when a cached snapshot exists. Offline
+snapshot fallback still works inside a checkout. Keep direct-execution checks and snapshot
+resource imports tied to `import.meta.url`. Unpinned calls retain the script-parent root.
+`scripts/hooks/__tests__/hook-root.test.mjs` probes primary/lane protection, seeded daemon
+paths and lint scope through the real launcher using isolated Git snapshots under `TMPDIR`.

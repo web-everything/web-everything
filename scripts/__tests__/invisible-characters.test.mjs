@@ -1,25 +1,24 @@
-import { describe, it, expect } from 'vitest';
+import { beforeAll, afterAll, describe, it, expect } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { pinnedFixture } from '../hooks/__tests__/pinned-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanInvisibleCharacters } from '../check-standards-rules.mjs';
 import { scanInvisibleSourceTree } from '../lib/invisible-source-scan.mjs';
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const settings = JSON.parse(readFileSync(join(root, '.claude/settings.json'), 'utf8'));
+const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const settings = JSON.parse(readFileSync(join(sourceRoot, '.claude/settings.json'), 'utf8'));
 const hook = settings.hooks.PreToolUse.find((block) => block.matcher === 'Edit|Write')
   .hooks.find((entry) => entry.command.includes('lint-invisible-characters.mjs'));
+let fixture, root;
+beforeAll(() => { fixture = pinnedFixture(); root = fixture.primary; }, 30_000);
+afterAll(() => fixture?.cleanup());
 function invoke(tool_name, tool_input) {
-  // Exercise the current guard's rules directly; snapshot selection has its own
-  // temporary-Git integration suite and must not use the operator's real cache.
   const target = hook.command.match(/node "\$launcher" (scripts\/lint-invisible-characters\.mjs); code=/)?.[1];
   expect(hook.command).toContain('scripts/hooks/run-pinned-guard.mjs');
   expect(target).toBe('scripts/lint-invisible-characters.mjs');
-  return spawnSync(process.execPath, [join(root, target)], {
-    cwd: root, encoding: 'utf8', input: JSON.stringify({ tool_name, tool_input, cwd: root }),
-  });
+  return fixture.run(root, target, { tool_name, tool_input, cwd: root });
 }
 
 describe('invisible source characters (#2866)', () => {
@@ -81,8 +80,8 @@ describe('invisible source characters (#2866)', () => {
   });
 
   it('has no existing corpus exceptions and the production gate emits the backstop findings as errors', () => {
-    expect(scanInvisibleSourceTree(root)).toEqual([]);
-    const gate = readFileSync(join(root, 'scripts/check-standards.mjs'), 'utf8');
+    expect(scanInvisibleSourceTree(sourceRoot)).toEqual([]);
+    const gate = readFileSync(join(sourceRoot, 'scripts/check-standards.mjs'), 'utf8');
     expect(gate).toContain('for (const finding of scanInvisibleSourceTree(ROOT)) err(finding.message, finding.descriptor)');
     expect(scanInvisibleCharacters([{ file: 'docs/example.md', content: '\ufeff' }])[0].message).toContain('U+FEFF');
   });

@@ -26,6 +26,7 @@ function git(cwd, args) {
 try {
   const [script, ...args] = process.argv.slice(2);
   if (!script || !/^scripts\/.+\.mjs$/.test(script) || script.split('/').includes('..')) throw new Error('expected a scripts/<guard>.mjs relative path');
+  const hookRoot = realpathSync(git(process.cwd(), ['rev-parse', '--show-toplevel']));
   let primary, sha;
   try {
     primary = dirname(git(process.cwd(), ['rev-parse', '--path-format=absolute', '--git-common-dir']));
@@ -70,7 +71,7 @@ try {
   const older = readdirSync(root).filter(name => shaPattern.test(name) && name !== sha)
     .sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs);
   for (const name of older.slice(2)) rmSync(join(root, name), { recursive: true, force: true });
-  const child = spawnSync(process.execPath, [target, ...args], { stdio: 'inherit', cwd: process.cwd(), env: process.env });
+  const child = spawnSync(process.execPath, [target, ...args], { stdio: 'inherit', cwd: process.cwd(), env: { ...process.env, WE_HOOK_ROOT: hookRoot } });
   if (child.error) throw child.error;
   process.exitCode = child.status ?? 2;
 } catch (error) {

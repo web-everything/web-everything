@@ -104,16 +104,17 @@ describe('pinned guard security boundary', () => {
     expect(readdirSync(f.cache).some(name => name.startsWith('.'))).toBe(false);
   });
 
-  it('falls back to latest when origin/main is unavailable, including outside any repository', () => {
+  it('falls back to latest when origin/main is unavailable, but refuses a cwd outside any repository', () => {
     const f = fixture();
     expect(f.run().status).toBe(0);
     f.git(f.primary, 'update-ref', '-d', 'refs/remotes/origin/main');
-    for (const cwd of [f.primary, f.outside]) {
+    for (const cwd of [f.primary]) {
       const result = f.run(cwd);
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout).marker).toBe('trusted');
       expect(result.stderr).toContain('origin/main unavailable; using latest snapshot');
     }
+    expect(f.run(f.outside)).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('denying') });
   });
 
   it('denies incomplete snapshots, escaping targets and unsafe latest pointers', () => {
@@ -126,19 +127,23 @@ describe('pinned guard security boundary', () => {
     expect(f.run(f.primary, 'scripts/../../outside.mjs').status).toBe(2);
     rmSync(join(f.cache, 'latest'));
     symlinkSync('../primary', join(f.cache, 'latest'));
-    const result = f.run(f.outside);
+    f.git(f.primary, 'update-ref', '-d', 'refs/remotes/origin/main');
+    const result = f.run();
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('invalid latest snapshot pointer');
   });
 
-  it('denies a dangling latest snapshot rather than using a working-tree guard', () => {
+  it('denies a dangling latest snapshot that cannot be reconstructed rather than using a working-tree guard', () => {
     const f = fixture();
     expect(f.run().status).toBe(0);
     rmSync(join(f.cache, f.sha), { recursive: true });
-    const result = f.run(f.outside);
+    rmSync(join(f.cache, 'latest'));
+    symlinkSync('0'.repeat(40), join(f.cache, 'latest'));
+    f.git(f.primary, 'update-ref', '-d', 'refs/remotes/origin/main');
+    const result = f.run();
     expect(result.status).toBe(2);
     expect(result.stdout).toBe('');
-    expect(result.stderr).toContain('latest snapshot is unavailable');
+    expect(result.stderr).toContain('cannot load trusted guard; denying');
   });
 
   it('fails closed on archive failure instead of running an older snapshot', () => {
