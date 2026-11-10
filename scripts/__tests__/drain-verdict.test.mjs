@@ -427,14 +427,17 @@ import { runBatch } from '../drain-classify-only.mjs';
 
 describe('T6: --batch owns the loop, the counting and the exit code', () => {
   const batchArgv = ['--batch', '--verdict-dir=verdicts'];
-  function batchIo({ prs = '7\n8\n', failPr = null, event = 'schedule', requested } = {}) {
+  const READY = [{ name: 'ready-to-merge' }];
+  // The plain open-PR listing as gh returns it: rows with number + labels (`prs` are labelled ready-to-merge).
+  const listing = (prs, extra = []) => JSON.stringify([...prs.map(number => ({ number, labels: READY })), ...extra]);
+  function batchIo({ prs = [7, 8], raw, failPr = null, event = 'schedule', requested } = {}) {
     const io = ioFor();
     io.env.GITHUB_EVENT_NAME = event;
     if (requested !== undefined) io.env.REQUESTED_PR = requested;
     io.mkdirSync = vi.fn();
     const inner = io.execFileSync;
     io.execFileSync = vi.fn((cmd, args, opts) => {
-      if (cmd === 'gh' && args[0] === 'pr') return prs;
+      if (cmd === 'gh' && args[0] === 'pr') return raw ?? listing(prs);
       if (cmd === process.execPath && failPr && args.includes(`--only=${failPr}`)) throw new Error('boom');
       if (cmd === process.execPath) {
         const n = args.find(a => a.startsWith('--only=')).slice(7);
@@ -457,19 +460,33 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
     expect(io.writeFileSync).toHaveBeenCalledTimes(1);
   });
   it('schedule: no labeled open PRs is a successful no-op', () => {
-    const io = batchIo({ prs: '' });
+    const io = batchIo({ prs: [], raw: listing([], [{ number: 5, labels: [{ name: 'review:pending' }] }]) });
     expect(runBatch(batchArgv, io)).toEqual({ written: 0, failed: 0 });
     expect(io.writeFileSync).not.toHaveBeenCalled();
     expect(io.mkdirSync).not.toHaveBeenCalled();
     expect(io.execFileSync).toHaveBeenCalledTimes(1);
   });
-  it('schedule: lists only ready-to-merge PRs with the existing bound', () => {
-    const io = batchIo();
-    runBatch(batchArgv, io);
+  it('schedule: lists open PRs plainly (never a search-backed label filter) and filters client-side', () => {
+    const io = batchIo({ raw: listing([7], [{ number: 5, labels: [] }, { number: 6, labels: ['ready-to-merge'] }]) });
+    expect(runBatch(batchArgv, io)).toMatchObject({ written: 2, failed: 0 });
     expect(io.execFileSync.mock.calls[0].slice(0, 2)).toEqual(['gh', [
-      'pr', 'list', '--repo', io.env.GITHUB_REPOSITORY, '--state', 'open',
-      '--label', 'ready-to-merge', '--limit', '10', '--json', 'number', '--jq', '.[].number',
+      'pr', 'list', '--repo', io.env.GITHUB_REPOSITORY, '--state', 'open', '--limit', '500', '--json', 'number,labels',
     ]]);
+    expect(io.writeFileSync.mock.calls.map(c => c[0])).toEqual(['verdicts/pr-7.json', 'verdicts/pr-6.json']);
+  });
+  it('schedule: classifies at most 10 labelled PRs per run', () => {
+    const io = batchIo({ prs: Array.from({ length: 12 }, (_, i) => i + 1) });
+    expect(runBatch(batchArgv, io)).toMatchObject({ written: 10, failed: 0 });
+  });
+  it.each([
+    ['a possibly-truncated listing (at the list limit)', () => listing(Array.from({ length: 500 }, (_, i) => i + 1))],
+    ['invalid JSON', () => 'not json'],
+    ['a non-array listing', () => '{"number":7}'],
+  ])('schedule: %s fails closed before any classification', (_name, raw) => {
+    const io = batchIo({ raw: raw() });
+    expect(runBatch(batchArgv, io)).toEqual({ written: 0, failed: 1 });
+    expect(io.writeFileSync).not.toHaveBeenCalled();
+    expect(io.execFileSync).toHaveBeenCalledTimes(1);
   });
   it('dispatch: absent requested PR remains a failure', () => {
     expect(runBatch(batchArgv, batchIo({ event: 'workflow_dispatch' }))).toEqual({ written: 0, failed: 1 });
@@ -481,7 +498,7 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
     expect(io.writeFileSync).not.toHaveBeenCalled();
   });
   it('all failing is a failure', () => {
-    const io = batchIo({ prs: '7\n', failPr: 7 });
+    const io = batchIo({ prs: [7], failPr: 7 });
     expect(runBatch(batchArgv, io)).toMatchObject({ written: 0, failed: 1 });
   });
   it('dispatch classifies only the requested PR', () => {
@@ -494,7 +511,7 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
     expect(runBatch(batchArgv, batchIo({ event: 'workflow_dispatch', requested }))).toMatchObject({ written: 0, failed: 1 });
   });
   it.each(['9; echo', '-1', 'x', '0'])('schedule ignores non-numeric PR list entry %j as a failure', bad => {
-    expect(runBatch(batchArgv, batchIo({ prs: `${bad}\n` }))).toMatchObject({ written: 0, failed: 1 });
+    expect(runBatch(batchArgv, batchIo({ prs: [bad] }))).toMatchObject({ written: 0, failed: 1 });
   });
   it('accepts a real runner step environment, as the workflow invokes it', () => {
     const io = batchIo(); Object.assign(io.env, RUNNER_STEP_ENV);

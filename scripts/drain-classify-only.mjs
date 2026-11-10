@@ -2,6 +2,10 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build, verify, forbiddenCredential } from './lib/drain-verdict.mjs';
+import { filterOpenPrsByLabel, OPEN_PR_LIST_LIMIT } from './lib/no-search-backed-pr-list.mjs';
+
+/** At most this many labelled PRs are classified per scheduled run (each spawns a full dry-run drain). */
+const BATCH_PR_CAP = 10;
 
 /** Only evidence exposed by the existing dry-run is asserted. */
 export function resultToVerdictInputs(result, ctx) {
@@ -118,11 +122,18 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   let prs;
   if (env.GITHUB_EVENT_NAME === 'workflow_dispatch') prs = [env.REQUESTED_PR ?? ''];
   else {
+    // List open PRs plainly and filter the label client-side: a label-filtered list is search-backed and
+    // exhausts the small search budget (#no-label-search). A possibly-truncated listing fails closed.
+    let listing;
     try {
-      prs = String((io.execFileSync || execFileSync)('gh', ['pr', 'list', '--repo', flags.repo || env.GITHUB_REPOSITORY,
-        '--state', 'open', '--label', 'ready-to-merge', '--limit', '10', '--json', 'number', '--jq', '.[].number'],
-      { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 60_000, env })).split('\n').filter(Boolean);
+      listing = JSON.parse(String((io.execFileSync || execFileSync)('gh', ['pr', 'list', '--repo', flags.repo || env.GITHUB_REPOSITORY,
+        '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', 'number,labels'],
+      { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 60_000, env })));
     } catch { return fail('open PR list unreadable'); }
+    if (!Array.isArray(listing)) return fail('open PR list unreadable');
+    const { prs: labelled, truncated } = filterOpenPrsByLabel(listing, 'ready-to-merge');
+    if (truncated) return fail('open PR list possibly truncated');
+    prs = labelled.slice(0, BATCH_PR_CAP).map(row => String(row?.number ?? ''));
   }
   if (!prs.length) return { written: 0, failed: 0 };
   (io.mkdirSync || mkdirSync)(flags['verdict-dir'], { recursive: true });
