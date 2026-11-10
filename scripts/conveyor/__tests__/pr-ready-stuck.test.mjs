@@ -357,7 +357,9 @@ describe('ready-stuck label-history reads', () => {
     expect(f.read.mock.calls.some(([a]) => a[1].includes('page=11'))).toBe(false);
     expect(f.send).not.toHaveBeenCalled(); // timing comes from observation, not label history
     expect(f.log).toHaveBeenCalledWith('pr-merge-watch: ready-stuck label history unavailable; using observed-since');
-    f.now += 121 * 60000; await runReadyStuck(f);
+    f.now += 30 * 60000; await runReadyStuck(f); // inside the cooldown: the failure is remembered
+    expect(f.read).toHaveBeenCalledTimes(10);
+    f.now += 91 * 60000; await runReadyStuck(f);
     expect(f.send).toHaveBeenCalledTimes(1);
   });
   it('readReadyLabelTime returns the latest ready-to-merge label and refuses unreadable pages', () => {
@@ -405,7 +407,58 @@ describe('ready-stuck production main-check evidence', () => {
   });
 });
 
+describe('ready-stuck refused-refresh evidence cooldown', () => {
+  it('a refused refresh re-reads its evidence at most once per cooldown, then retries', async () => {
+    const f = fixture({ onlyChecksBlock: vi.fn(() => false) });
+    await runReadyStuck(f); await runReadyStuck(f); await runReadyStuck(f);
+    expect(f.onlyChecksBlock).toHaveBeenCalledTimes(1);
+    f.now += 59 * 60000; await runReadyStuck(f);
+    expect(f.onlyChecksBlock).toHaveBeenCalledTimes(1);
+    f.now += 2 * 60000; await runReadyStuck(f);
+    expect(f.onlyChecksBlock).toHaveBeenCalledTimes(2);
+    f.onlyChecksBlock.mockReturnValue(true); f.now += 61 * 60000; await runReadyStuck(f);
+    expect(f.refresh).toHaveBeenCalledTimes(1);
+  });
+  it('an unreadable main-check refusal is remembered too', async () => {
+    const f = fixture({ readMainChecks: vi.fn(() => { throw Error('unknown'); }) });
+    await runReadyStuck(f); await runReadyStuck(f);
+    expect(f.readMainChecks).toHaveBeenCalledTimes(1);
+  });
+  it('production reads for a refused refresh are bounded across many ticks', async () => {
+    const { f, evidence } = (() => {
+      const f = fixture({ onlyChecksBlock: undefined }); f.pr.reviewDecision = 'APPROVED'; f.pr.comments = [];
+      const evidence = { pull: { head: { sha: f.pr.headRefOid, repo: { full_name: f.repo } }, base: { ref: 'main' },
+        mergeable: true, draft: false, state: 'open' }, rules: [{ enforcement: 'active' }] };
+      f.read = vi.fn(args => args[1].endsWith('/pulls/17') ? evidence.pull : evidence.rules);
+      return { f, evidence };
+    })();
+    expect(evidence.rules).toHaveLength(1);
+    for (let i = 0; i < 50; i++) { f.now += 60000; await runReadyStuck(f); }
+    expect(f.read.mock.calls.length).toBeLessThanOrEqual(2); // one attempt inside the 60-minute window
+  });
+  it('clears the remembered attempts when the label goes away', async () => {
+    const f = fixture({ onlyChecksBlock: vi.fn(() => false) }); await runReadyStuck(f);
+    expect(f.receipt.refreshTriedAt).toBe(now);
+    f.pr.labels = []; await runReadyStuck(f);
+    expect(f.receipt.refreshTriedAt).toBeUndefined();
+  });
+});
+
 describe('ready-stuck production refresh ref validation', () => {
+  it('accepts a lane branch with underscore, dot and dash and refuses non-lane branches', async () => {
+    for (const [name, expected] of [['lane/foo-bar_1.2', 'rebased'], ['feature/x', 'skip'], ['main', 'skip']]) {
+      refreshIo.gitRunner.mockReset().mockImplementation((_c, args) => {
+        const a = args.join(' ');
+        if (a.startsWith('fetch')) return { status: 0, stdout: '' };
+        return { status: 0, stdout: `${a === 'rev-parse origin/main' ? 'c'.repeat(40) : 'a'.repeat(40)}\n` };
+      });
+      refreshIo.rebaseDropManifest.mockReset().mockReturnValue({ action: 'rebased' });
+      const f = fixture({ refresh: undefined, readMainChecks: () => ({ sha: 'c'.repeat(40), checks: [{ name: 'test', conclusion: 'SUCCESS' }] }) });
+      f.pr.headRefName = name;
+      await runReadyStuck(f);
+      expect(f.log.mock.calls).toEqual([[`pr-merge-watch: ready-stuck self-heal #17 ${expected}`]]);
+    }
+  });
   it.each(['--upload-pack=touch x', '-x', 'a..b', 'has space', 'semi;colon', '', undefined])(
     'refuses refresh for headRefName %j without invoking git', async headRefName => {
       refreshIo.gitRunner.mockReset(); refreshIo.rebaseDropManifest.mockReset();

@@ -386,7 +386,9 @@ describe('merge-watch ready-stuck receipts and budget', () => {
     ['non-boolean readyStuckAlerted', { since: null, alerted: false, readyStuckAlerted: 'yes' }],
     ['non-boolean refreshed', { since: null, alerted: false, refreshed: 1 }],
     ['non-finite readyLabelAt', { since: null, alerted: false, readyLabelAt: 'soon' }],
-    ['future readyLabelAt', { since: null, alerted: false, readyLabelAt: Date.parse(at(10_000)) }],
+    ['non-finite readyLabelTriedAt', { since: null, alerted: false, readyLabelTriedAt: 'x' }],
+    ['future refreshTriedAt', { since: null, alerted: false, refreshTriedAt: Date.parse(at(10_000)) }],
+    ['future readyLabelAt',{ since: null, alerted: false, readyLabelAt: Date.parse(at(10_000)) }],
   ])('rejects %s as invalid saved evidence before any GitHub reads', async (_name, receipt) => {
     seed(receipt);
     expect((await tick(0)).incomplete).toBe(true);

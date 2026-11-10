@@ -20,7 +20,12 @@ const realDate = v => typeof v === 'string' && v !== GH_UNSTARTED_SENTINEL && Da
 export const checkDate = c => [c?.completedAt, c?.completed_at, c?.startedAt, c?.started_at, c?.createdAt]
   .find(realDate) ?? null;
 // Conservative ref-name shape for anything that reaches a git argv.
-const SAFE_REF = /^[A-Za-z0-9][\w./-]*$/;
+// Only conveyor lane branches are ever advanced by the self-heal.
+const SAFE_REF = /^lane\/[A-Za-z0-9][\w./-]*$/;
+// Retry window for evidence reads that failed or were refused (bounds shared-budget spend).
+export const RETRY_COOLDOWN_MS = 60 * 60000;
+const cooling = (at, now) => Number.isFinite(at) && now - at < RETRY_COOLDOWN_MS;
+const TIMER_KEYS = ['readyStuckSince', 'readyLabelAt', 'readyLabelTriedAt', 'refreshTriedAt'];
 
 export function readReadyLabelTime({ repo, pr, read }) {
   let latest = null;
@@ -94,8 +99,9 @@ export async function runReadyStuck({ repo, pr, receipt, now, config, read, send
   onlyChecksBlock = readChecksOnly, readMainChecks = readMainCheckEvidence,
   isUnretryable: unretryable = isUnretryable, refresh = refreshBranch } = {}) {
   if (pr.state !== 'OPEN' || pr.isDraft || !pr.labels.some(l => l.name === 'ready-to-merge')) {
-    if (receipt.readyStuckSince !== undefined || receipt.readyLabelAt !== undefined) {
-      delete receipt.readyStuckSince; delete receipt.readyLabelAt; save();
+    if (TIMER_KEYS.some(k => receipt[k] !== undefined)) {
+      for (const k of TIMER_KEYS) delete receipt[k];
+      save();
     }
     return;
   }
@@ -105,9 +111,11 @@ export async function runReadyStuck({ repo, pr, receipt, now, config, read, send
   // The label time only decides the alert. Once it has fired, spend no more GitHub calls
   // on label history; before that, read it once and keep it on the receipt.
   if (!receipt.readyStuckAlerted) {
-    if (!Number.isFinite(receipt.readyLabelAt)) {
+    // A failed or capped history read is remembered, so it is retried at most once per cooldown.
+    if (!Number.isFinite(receipt.readyLabelAt) && !cooling(receipt.readyLabelTriedAt, now)) {
       let labeled;
       try { labeled = await readLabelTime({ repo, pr, read }); } catch {
+        receipt.readyLabelTriedAt = now; save();
         log('pr-merge-watch: ready-stuck label history unavailable; using observed-since');
       }
       const labelTime = typeof labeled === 'number' ? labeled : Date.parse(labeled);
@@ -132,10 +140,13 @@ export async function runReadyStuck({ repo, pr, receipt, now, config, read, send
   // and only for finished checks: a queued or running check is not stale.
   if (!receipt.readyStuckAlerted || receipt.refreshed
     || !['BLOCKED', 'BEHIND'].includes(pr.mergeStateStatus) || !checks.length) return;
+  // Evidence reads for a refused refresh cost ~6 shared-budget calls; repeat them at most once per cooldown.
+  if (cooling(receipt.refreshTriedAt, now)) return;
   try {
     if (checks.some(unfinished)) return;
     if (!checks.every(c => checkName(c) && (unretryable(c) || (Number.isFinite(Date.parse(checkDate(c)))
       && now - Date.parse(checkDate(c)) > config.selfHealStaleHours * 3600000)))) return;
+    receipt.refreshTriedAt = now; save(); // before the first evidence read, so any refusal is remembered
     if (!await onlyChecksBlock({ repo, pr, read, now })) return;
     const main = await readMainChecks({ repo, pr, read });
     const green = Array.isArray(main) ? main : main?.checks;
