@@ -7,6 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
+import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -416,8 +417,15 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       // R850: a ruledWeakened exception is honoured only when this sha has a canonical WEAKENED audit record (the ruling
       // refers to a real audit), never on a handwritten ready record alone. Honoured, it proceeds in any mode.
-      const ownWeakened = [...auditRecords].reverse().find((r) => r?.verdict === 'WEAKENED' && String(r.head).toLowerCase() === String(input.sha).toLowerCase());
+      // Only a record findAudit accepts (valid time, current question, matching head) counts; the newest one decides.
+      const lcSha = String(input.sha).toLowerCase();
+      const ownWeakened = [...new Set(auditRecords.filter((r) => r && String(r.head).toLowerCase() === lcSha && r.base !== r.head).map((r) => r.base))]
+        .map((base) => findAudit(auditRecords, { head: input.sha, base, questionHash: QUESTION_HASH })).filter((r) => r?.verdict === 'WEAKENED')
+        .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
       if (out.gate.ruledWeakened) {
+        const ruled = out.gate.ruledWeakened.findings;
+        const undisclosed = ownWeakened ? (Array.isArray(ownWeakened.findings) ? ownWeakened.findings : []).filter((f) => !ruled.includes(f)) : [];
+        if (ownWeakened && undisclosed.length) return stop('no-canonical-audit', { detail: 'ruled-weakened-findings-mismatch', fallback: `The ruling ${out.gate.ruledWeakened.ruling} does not disclose every finding of the canonical WEAKENED audit for ${input.sha}; undisclosed: ${undisclosed.join(' | ')}. Get a ruling covering them.` });
         if (!ownWeakened || out.canonicalAudit.reason !== 'weakened') return stop('no-canonical-audit', { detail: 'ruled-weakened-without-canonical-record', fallback: `A ruledWeakened entry applies only when ${input.sha} has a canonical WEAKENED codex-audit record. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry.` });
         console.warn(`WARNING: ruled exception ${out.gate.ruledWeakened.ruling} rests on canonical WEAKENED audit record at ${ownWeakened.at}.`);
       } else

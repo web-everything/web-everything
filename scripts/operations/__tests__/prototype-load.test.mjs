@@ -356,6 +356,18 @@ describe('prototype-load ruled-WEAKENED admission', () => {
       }
     } finally { warning.mockRestore(); }
   });
+  it('R850: the canonical WEAKENED record must be valid (findAudit-accepted) and every finding disclosed by the ruling', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const bad = auditedFixture('refuse', { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, auditBaseInMain: TREE, audits: auditLines([auditRecord({ verdict: 'WEAKENED', at: 'not-a-date' })]) });
+      expect(await bad.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'ruled-weakened-without-canonical-record' });
+      const extra = auditedFixture('refuse', { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, auditBaseInMain: TREE, audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: [...findings, 'x.mjs:1 an undisclosed weakening'] })]) });
+      const out = await extra.run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'ruled-weakened-findings-mismatch' });
+      expect(out.fallback).toContain('undisclosed weakening');
+      expect(mutations(extra, 'add')).toHaveLength(0);
+    } finally { warning.mockRestore(); }
+  });
   it('R850: a ruled exception with a canonical WEAKENED record loads in the default (refuse) mode', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
