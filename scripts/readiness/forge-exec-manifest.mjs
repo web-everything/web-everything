@@ -171,7 +171,7 @@ function codeExpression(value,mode='legacy') {
     if(!closed)return false;
     code+=' ';
   }
-  if(mode==='fixture')return !code.split(/\s+/).some(opaqueToken);
+  if(mode==='fixture')return !code.split(/[\s,;:{}()[\]]+/).some(opaqueToken);
   if(mode==='source') {
     // Whole templates, or identifier/member call chains with non-opaque arguments.
     if((code.match(/[\w$]+/g)??[]).some(opaqueToken))return false;

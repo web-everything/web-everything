@@ -120,6 +120,9 @@ describe('credentialContentFinding narrow source exemptions', () => {
       expect(scan(`GITHUB_TOKEN: ${value}`, path)).not.toBeNull();
     }
   });
+  it('punctuation does not dilute a bare token in a test fixture', () => {
+    expect(scan('token: ' + token + ','.repeat(100), testPath)).not.toBeNull();
+  });
   it('still catches symmetric key blocks and bigint template literals', () => {
     const begin = '-----' + 'BEGIN OpenVPN Static key V1-----';
     expect(scan(`const k = \`${begin}\n${'0123456789abcdef'.repeat(2)}\n\`;`, scannerPath)).toBe('pem-header');
