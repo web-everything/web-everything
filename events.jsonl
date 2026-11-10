@@ -81,3 +81,5 @@
 {"type":"quarantine-removed","at":1794274947804,"actor":"red-main-safety-net","test":"scripts/readiness/__tests__/heavy-admission-remote-client.test.mjs","brokenSha":"7d2bf85aa30399987b4859fadeaa55857294a8d3","why":"main-green"}
 {"type":"quarantine-added","at":1794319740612,"actor":"operator","test":"scripts/lib/__tests__/identical-net-patch.test.mjs","brokenSha":"06c8c0b6383f252d9a30ed9bb15383688fc06b01","owner":"PR #6655","reason":"flake: module-level restamp memo collides when two fixtures mint the same head SHA within one clock second; merged range only touched a backlog card (R157)","addedAt":1794319740612,"expiresAt":1794406140612}
 {"type":"quarantine-fix-prs","at":1794319829833,"actor":"red-main-safety-net","fixPrs":[6655]}
+{"type":"quarantine-removed","at":1794321922261,"actor":"red-main-safety-net","test":"scripts/lib/__tests__/identical-net-patch.test.mjs","brokenSha":"06c8c0b6383f252d9a30ed9bb15383688fc06b01","why":"main-green"}
+{"type":"quarantine-fix-prs","at":1794321922261,"actor":"red-main-safety-net","fixPrs":[]}
