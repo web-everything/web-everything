@@ -10,10 +10,11 @@ import {readForgeTelemetry, pingForge} from './forge-telemetry.mjs';
 const freshState=()=>({v:1,lastReadAt:null,telemetry:null,failures:0,backoffUntil:0,trigger:''});
 const integer=v=>Number.isSafeInteger(v)&&v>=0;
 function readState(file) {
+  let parsed=null;
   try {
     const st=lstatSync(file);
     if(!st.isFile() || st.isSymbolicLink() || st.size>70000)throw new Error('invalid state size');
-    const s=JSON.parse(readFileSync(file,'utf8'));
+    const s=parsed=JSON.parse(readFileSync(file,'utf8'));
     if(!s || Object.keys(s).sort().join(',')!=='backoffUntil,failures,lastReadAt,telemetry,trigger,v' || s.v!==1
       || !(s.lastReadAt===null||integer(s.lastReadAt)) || !integer(s.failures) || !integer(s.backoffUntil)
       || typeof s.trigger!=='string' || !/^[a-zA-Z0-9.-]{0,80}$/.test(s.trigger))throw new Error('invalid state');
@@ -21,7 +22,13 @@ function readState(file) {
     return s;
   } catch(error){
     if(error.code==='ENOENT')return freshState();
-    const e=new Error('remote-health-unreadable');e.detail=String(error.message||error).slice(0,200);throw e;
+    const e=new Error('remote-health-unreadable');e.detail=String(error.message||error).slice(0,200);
+    // Circuit-breaker evidence survives only when each field is individually valid; telemetry and any
+    // lastGood* data are never carried over.
+    if(parsed&&typeof parsed==='object')e.salvage={
+      failures:integer(parsed.failures)?parsed.failures:0,backoffUntil:integer(parsed.backoffUntil)?parsed.backoffUntil:0,
+      trigger:typeof parsed.trigger==='string'&&/^[a-zA-Z0-9.-]{0,80}$/.test(parsed.trigger)?parsed.trigger:''};
+    throw e;
   }
 }
 // A malformed state file can never repair itself (the write path needs a readable state), so it is moved aside,
@@ -56,7 +63,7 @@ async function transaction(root,action,host='forge') {
       if(error.message!=='remote-health-unreadable')throw error;
       try{quarantine(root,key,file,error.detail);}
       catch(qe){const e=new Error('remote-health-unreadable');e.detail=`${error.detail}; quarantine failed: ${qe.message}`.slice(0,300);throw e;}
-      state=freshState();
+      state={...freshState(),...error.salvage};
     }
     const result=await action(state);
     writeFileSync(pending,JSON.stringify(state),{flag:'wx',mode:0o600});renameSync(pending,file);

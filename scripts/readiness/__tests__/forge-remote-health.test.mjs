@@ -31,6 +31,14 @@ describe('malformed Forge health state',()=>{
     expect(await check(root,sample({loadPerCore:5}))).toEqual({ok:false,reason:'maxLoadPerCore'});
     expect(invalid(root)).toHaveLength(1);
   });
+  it('carries valid failure and backoff evidence across quarantine, never old telemetry',async()=>{
+    vi.spyOn(console,'error').mockImplementation(()=>{});
+    const root=scratch(),read=vi.fn(async()=>sample());
+    writeFileSync(join(root,'health.json'),JSON.stringify({...legacy(),failures:2,backoffUntil:now+60000,trigger:'copy-failed'}));
+    expect(await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:read,ping:async()=>false})).toEqual({ok:false,reason:'backoff-copy-failed'});
+    expect(read).not.toHaveBeenCalled();
+    expect(invalid(root)).toHaveLength(1);
+  });
   it('keeps only the newest 3 quarantined files',async()=>{
     vi.spyOn(console,'error').mockImplementation(()=>{});
     const root=scratch();

@@ -530,6 +530,13 @@ describe('remote controls', () => {
       release?.({mode:'remote',code:0});await first;
     }
   });
+  it('keeps an active backoff when quarantining extra-key persisted evidence', async () => {
+    const f=fixture();mkdirSync(join(f.cwd,'remote'));
+    writeFileSync(join(f.cwd,'remote','health.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:Number.MAX_SAFE_INTEGER,trigger:'copy-failed',lastGoodAt:1}));
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('backoff-copy-failed'));
+  });
   it('quarantines corrupt persisted evidence and continues from a fresh read', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));
     writeFileSync(join(f.cwd,'remote','health.json'),'{}');
