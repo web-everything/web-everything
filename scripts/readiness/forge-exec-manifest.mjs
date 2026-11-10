@@ -106,6 +106,33 @@ const secretText=[
 ];
 export const credentialTextFinding=text=>textFinding(text);
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+// R824/R825: in test files only, a name:value whose value is a code expression
+// (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
+// strings are stripped first, so a literal that merely contains `(` still hits.
+// Known token patterns run before this on the whole text and always hit.
+function codeExpression(value) {
+  let code='';
+  for(let i=0;i<value.length;i++) {
+    const char=value[i];
+    // Comments can contain misleading quotes or calls. Without a full parser,
+    // refuse the exemption rather than interpreting their contents as code.
+    if(char==='/'&&/[/*]/.test(value[i+1]??''))return false;
+    if(!/["'`]/.test(char)) {code+=char;continue;}
+    const quote=char;
+    let closed=false;
+    for(i++;i<value.length;i++) {
+      if(value[i]===quote) {closed=true;break;}
+      // Escapes, interpolation and partial multiline strings need a parser to
+      // prove safe. Keep the original entropy rejection for these forms.
+      // A plain quoted literal beside a call is the ruled skip (R824/R825): a
+      // fixture like 'ghp_acceptance_fixture' must not trip the scan.
+      if(value[i]==='\\'||(quote==='`'&&value[i]==='$'&&value[i+1]==='{'))return false;
+    }
+    if(!closed)return false;
+    code+=' ';
+  }
+  return /=>|^\s*\(|[A-Za-z_$][\w$]*\s*\(/.test(code);
+}
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
@@ -146,6 +173,7 @@ export function credentialContentFinding(path,content) {
   if(text.includes('\0'))return 'unsupported-text-encoding';
   const raw=textFinding(text);
   if(raw)return raw;
+  const testSource=isTestFile(path);
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
   for(const match of text.matchAll(assignmentLine)) {
@@ -168,13 +196,13 @@ export function credentialContentFinding(path,content) {
       if(!continuation)return `unbounded-continuation-${field}`;
       if(credentialNamed) {
         for(const line of [...continuation,continuation.join('')]) {
-          if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${field}`;
+          if(line.length>=20&&entropy(line)>=3.5&&!(testSource&&codeExpression(line)))return `high-entropy-${field}`;
         }
       }
     }
     // A whole-value reference with no continuation line cannot hide a literal.
     if(reference&&!continuation.length)continue;
-    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value)))return `high-entropy-${field}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.
       if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
