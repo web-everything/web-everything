@@ -204,6 +204,15 @@ function isNonBlockingCarriedVerdict(text, comment) {
   return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, carried.fromSha.slice(0, 12));
 }
 
+// Resolve exactly the gate's live policy. Unknown policy requires a fresh review.
+function liveRedTeamAdvisoryPlan(parsed) {
+  try {
+    const setting = readConfirmedBreaks()?.value;
+    if (parsed.findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return null;
+    return planRedTeamActions(parsed, setting);
+  } catch { return null; }
+}
+
 /** Validate the rendered envelope and every finding line: the shared evidence parser skips malformed lines. */
 function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
   const parsed = parseRedTeamComment(text);
@@ -221,13 +230,8 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
     || lines[4] !== '') return false;
   if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.';
   if (lines.at(-2) !== '' || lines.at(-1) !== "A confirmed break is recorded as a miss for the accepting review and for the builder's model.") return false;
-  // Resolve exactly the gate's live policy: degraded (or any other class) can be configured for send-back.
-  // Unknown policy refuses the exemption; the existing later-verdict path requires a fresh review.
-  try {
-    const setting = readConfirmedBreaks()?.value;
-    if (findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return false;
-    if (planRedTeamActions(parsed, setting).sendBack.length) return false;
-  } catch { return false; }
+  const plan = liveRedTeamAdvisoryPlan(parsed);
+  if (!plan || plan.sendBack.length) return false;
   let count = 0;
   for (const line of lines.slice(5, -2)) {
     const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
@@ -259,7 +263,13 @@ export function isKnownMachineBody(body, comment = undefined) {
       const gate = parseRedTeamGateMarker(text);
       // The provenance parser also accepts standalone records for the rebase path.
       // Here only the combined carried envelope extends the strict gate shape.
-      return !!gate && !!parseVerdictCarriedMarker(text) && informationalProvenance(text, gate.rev, gate.pr);
+      if (!gate || !parseVerdictCarriedMarker(text) || !informationalProvenance(text, gate.rev, gate.pr)) return false;
+      const advisoryAt = text.indexOf(RED_TEAM_COMMENT_MARKER);
+      if (advisoryAt < 0) return true;
+      const parsed = parseRedTeamComment(text.slice(advisoryAt));
+      const plan = parsed && liveRedTeamAdvisoryPlan(parsed);
+      // A send-back owed under the live policy is a hold; a card is non-blocking (the gate already recorded card-queued).
+      return !!plan && !plan.sendBack.length;
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
       const parsed = parseRedTeamComment(text);

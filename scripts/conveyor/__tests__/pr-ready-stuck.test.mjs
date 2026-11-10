@@ -478,11 +478,25 @@ describe('missing required checks and checks-only rulesets', () => {
     const f = fixture({ readRequiredChecks: vi.fn(() => ['merge-gate']),
       readMainChecks: vi.fn(() => [{ name: 'merge-gate', conclusion: 'SUCCESS' }]) });
     f.pr.statusCheckRollup = [];
+    f.readLabelTime.mockReturnValue(date(25));
     return f;
   }
   it('refreshes a missing merge-gate once after the alert', async () => {
     const f = missingFixture(); await runReadyStuck(f); await runReadyStuck(f);
     expect(f.refresh).toHaveBeenCalledTimes(1);
+  });
+  it.each([3, 24])('does not refresh an absent required check after %sh with a 24h stale threshold', async hours => {
+    const f = missingFixture(); f.readLabelTime.mockReturnValue(date(hours));
+    await runReadyStuck(f);
+    expect(f.receipt.readyStuckAlerted).toBe(true);
+    expect(f.refresh).not.toHaveBeenCalled();
+  });
+  it('uses observed-since for missing-check staleness when label history is unavailable', async () => {
+    const f = missingFixture(); f.readLabelTime.mockImplementation(() => { throw Error('unreadable'); });
+    f.receipt = { readyStuckAlerted: true, readyStuckSince: now - 3 * 3600000 };
+    await runReadyStuck(f); expect(f.refresh).not.toHaveBeenCalled();
+    f.now += 22 * 3600000;
+    await runReadyStuck(f); expect(f.refresh).toHaveBeenCalledTimes(1);
   });
   it('holds when the missing name is not green on main', async () => {
     const f = missingFixture(); f.readMainChecks.mockReturnValue([{ name: 'other', conclusion: 'SUCCESS' }]);
@@ -493,13 +507,15 @@ describe('missing required checks and checks-only rulesets', () => {
     await runReadyStuck(f); await runReadyStuck(f);
     expect(f.refresh).not.toHaveBeenCalled(); expect(f.readRequiredChecks).toHaveBeenCalledTimes(1);
   });
+  const workflow = { path: '.github/workflows/ci.yml', ref: 'refs/heads/main', repository_id: 42 };
   function rulesFixture(types) {
     const f = fixture(); f.pr.comments = []; f.pr.reviewDecision = 'APPROVED';
     f.read = vi.fn(([, path]) => {
       if (path.endsWith('/pulls/17')) return { head: { sha: f.pr.headRefOid, repo: { full_name: f.repo } },
-        base: { ref: 'main' }, mergeable: true, draft: false, state: 'open' };
+        base: { ref: 'main', repo: { id: 42 } }, mergeable: true, draft: false, state: 'open' };
       if (path.includes('rulesets?')) return [{ id: 1, enforcement: 'active' }, { id: 2, enforcement: 'active' }];
-      if (path.endsWith('/rulesets/1')) return { rules: types.map(type => ({ type })) };
+      if (path.endsWith('/rulesets/1')) return { rules: types.map(type => type === 'workflows'
+        ? { type, parameters: { workflows: [{ ...workflow }] } } : { type }) };
       if (path.endsWith('/rulesets/2')) return { rules: [{ type: 'required_status_checks', parameters: {
         required_status_checks: [{ context: 'merge-gate' }, { context: 'test' }] } }, { type: 'merge_queue' }] };
       if (path.endsWith('/protection')) return { required_status_checks: { contexts: ['test'] } };
@@ -509,6 +525,31 @@ describe('missing required checks and checks-only rulesets', () => {
   }
   it('allows the two active checks/workflow rulesets', () => {
     expect(readChecksOnly(rulesFixture(['deletion', 'non_fast_forward', 'workflows']))).toBe(true);
+  });
+  it.each([
+    ['foreign repository', { ...workflow, repository_id: 99 }],
+    ['non-main ref', { ...workflow, ref: 'refs/heads/dev' }],
+    ['outside workflow directory', { ...workflow, path: 'ci.yml' }],
+    ['parent traversal', { ...workflow, path: '.github/workflows/../../ci.yml' }],
+    ['missing workflow path', { ref: workflow.ref, repository_id: 42 }],
+  ])('holds refresh for a workflow with %s', async (_name, entry) => {
+    const f = rulesFixture(['workflows']); const original = f.read;
+    f.read = args => args[1].endsWith('/rulesets/1')
+      ? { rules: [{ type: 'workflows', parameters: { workflows: [entry] } }] } : original(args);
+    f.onlyChecksBlock = undefined;
+    await runReadyStuck(f); expect(f.refresh).not.toHaveBeenCalled();
+  });
+  it.each([
+    { type: 'workflows' },
+    { type: 'workflows', parameters: { workflows: [null] } },
+    { type: 'required_status_checks' },
+    { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 42 }] } },
+    { type: 'required_status_checks', parameters: { required_status_checks: [{}] } },
+  ])('holds refresh for malformed rule parameters: %j', async rule => {
+    const f = rulesFixture([]); const original = f.read;
+    f.read = args => args[1].endsWith('/rulesets/1') ? { rules: [rule] } : original(args);
+    f.onlyChecksBlock = undefined;
+    await runReadyStuck(f); expect(f.refresh).not.toHaveBeenCalled();
   });
   it('holds refresh for an unknown active rule type', async () => {
     const f = rulesFixture(['unknown']); f.onlyChecksBlock = undefined;
@@ -542,7 +583,7 @@ describe('missing required checks and checks-only rulesets', () => {
     expect(f.readRequiredChecks).not.toHaveBeenCalled();
   });
   it('does not read missing checks before the alert threshold', async () => {
-    const f = missingFixture(); f.config.readyStuckMinutes = 240;
+    const f = missingFixture(); f.readLabelTime.mockReturnValue(date(3)); f.config.readyStuckMinutes = 240;
     await runReadyStuck(f); expect(f.readRequiredChecks).not.toHaveBeenCalled();
     expect(f.refresh).not.toHaveBeenCalled();
   });

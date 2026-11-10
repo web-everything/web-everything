@@ -51,6 +51,24 @@ async function drainSkip({ repo, pr }) {
 
 const CHECK_ONLY_RULES = new Set(['deletion', 'non_fast_forward', 'workflows', 'required_status_checks', 'merge_queue']);
 
+function checksOnlyRule(rule, repositoryId) {
+  if (!CHECK_ONLY_RULES.has(rule?.type)) return false;
+  if (rule.type === 'required_status_checks') {
+    const checks = rule.parameters?.required_status_checks;
+    return Array.isArray(checks) && checks.every(check => typeof check?.context === 'string' && check.context.trim());
+  }
+  if (rule.type === 'workflows') {
+    const workflows = rule.parameters?.workflows;
+    return Number.isSafeInteger(repositoryId) && repositoryId > 0 && Array.isArray(workflows)
+      && workflows.every(workflow => workflow?.repository_id === repositoryId && workflow.ref === 'refs/heads/main'
+        && typeof workflow.path === 'string' && workflow.path.startsWith('.github/workflows/')
+        && workflow.path.slice('.github/workflows/'.length).length > 0
+        && !workflow.path.split('/').some(part => !part || part === '.' || part === '..')
+        && !/[\\\x00-\x1f\x7f]/.test(workflow.path));
+  }
+  return true;
+}
+
 // No pagination guess: a full page or unknown detail keeps the alert actionable by the operator.
 function readActiveRules({ repo, read }) {
   const rows = read(['api', `repos/${repo}/rulesets?includes_parents=true&per_page=100`]);
@@ -96,7 +114,7 @@ export function readChecksOnly({ repo, pr, read, now }) {
     || pull.base?.ref !== 'main' || pull.mergeable !== true || pull.draft !== false
     || pull.state !== 'open' || humanReviewHold(pr, now).length) return false;
   try {
-    if (readActiveRules({ repo, read }).some(rule => !CHECK_ONLY_RULES.has(rule.type))) return false;
+    if (readActiveRules({ repo, read }).some(rule => !checksOnlyRule(rule, pull.base?.repo?.id))) return false;
   } catch { return false; }
   const protection = read(['api', `repos/${repo}/branches/main/protection`]);
   if (!protection?.required_status_checks || protection.restrictions
@@ -188,9 +206,11 @@ export async function runReadyStuck({ repo, pr, receipt, now, config, read, send
     const required = await requiredChecks({ repo, read });
     if (!Array.isArray(required) || required.some(name => typeof name !== 'string' || !name.trim())) return;
     const present = new Set(pr.statusCheckRollup.map(checkName));
-    // The delivered alert proves these absent runs have waited past readyStuckMinutes.
-    // They are finished evidence for this decision, never queued/running checks.
-    for (const name of new Set(required)) if (!present.has(name)) checks.push({ name, conclusion: 'MISSING' });
+    // Missing runs have no check date: use the label time, or the durable observation timer.
+    for (const name of new Set(required)) if (!present.has(name)) {
+      if (!(now - (receipt.readyLabelAt ?? receipt.readyStuckSince) > config.selfHealStaleHours * 3600000)) return;
+      checks.push({ name, conclusion: 'MISSING' });
+    }
     if (!checks.length) return;
     const main = await readMainChecks({ repo, pr, read });
     const green = Array.isArray(main) ? main : main?.checks;
