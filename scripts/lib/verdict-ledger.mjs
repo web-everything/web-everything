@@ -555,7 +555,12 @@ export const LABEL_INPUT_CHANGES = Object.freeze(['added', 'removed']);
 /** Card 5469 — a finding's status on one reviewed head: `raised` (it held the verdict), `tolerated` (reported, did
  *  not hold it), `fixed` (raised on an earlier head, not reported now, and the fix range changed code at it),
  *  `carded` (set aside as a card suggestion). Written only by the review role (`source: review-pr`). */
-export const FINDING_STATUS_VALUES = Object.freeze(['raised', 'tolerated', 'fixed', 'carded']);
+export const FINDING_STATUS_VALUES = Object.freeze(['raised', 'tolerated', 'fixed', 'carded', 'open', 'not-real']);
+/** R883 slice 1 — dispositions, written with `source: red-team` (a red-team finding that is still `open`, or ruled
+ *  `not-real`). Appended AFTER the old statuses so their positions never move. The round rules do not read them yet:
+ *  `foldFindingStatuses` skips them, so no decision changes. */
+export const FINDING_DISPOSITION_VALUES = Object.freeze(['open', 'not-real']);
+export const FINDING_SOURCE_RED_TEAM = 'red-team';
 /** Card 5469 — a stable finding id: `fi-` + 12 hex of sha256(repo, pr, path, symbol, defect class). Distinct from the
  *  #76a referral `f-` id, which also hashes the claim text and the first-seen head. */
 export const STABLE_FINDING_ID_PATTERN = /^fi-[0-9a-f]{12}$/;
