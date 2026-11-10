@@ -3,6 +3,11 @@ import { dirname, join } from 'node:path';
 import {
   createRedTeamDispatchQueue,
   defaultQueueFile,
+  RED_TEAM_QUEUE_MIN_CONCURRENT_CAP,
+  RED_TEAM_QUEUE_REVIEW_STARTS_CAP,
+  raiseReviewStartsPerTick,
+  loadRedTeamQueueFloor,
+  applyRedTeamQueueFloor,
   redTeamQueueAdmitCount,
   runWithRedTeamQueue,
 } from '../red-team-dispatch-queue.mjs';
@@ -77,6 +82,246 @@ function refused(pr, reason) {
     dispatched: [], notStarted: [{ prNumber: pr, reason }],
   };
 }
+
+describe('setting-driven red-team queue floor', () => {
+  const floorCapacity = count => ({ ...capacity(count), startsCeiling: Infinity });
+  const floor = { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 };
+  const file = join('queue-fixture', 'settings.json');
+  const settings = (minConcurrent = 2, minConcurrentIdlePct = 10) =>
+    JSON.stringify({ redTeam: { queue: { minConcurrent, minConcurrentIdlePct } } });
+  const load = (text, env = {}) => loadRedTeamQueueFloor({ env, file, readFile: () => text });
+
+  it.each([
+    ['missing redTeam', {}],
+    ['missing queue', { redTeam: {} }],
+    ['missing minimum', { redTeam: { queue: { minConcurrentIdlePct: 10 } } }],
+  ])('%s disables the floor without increasing capacity', (_name, configuration) => {
+    const configured = load(JSON.stringify(configuration));
+    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    const bound = floorCapacity(1);
+    const log = vi.fn();
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100, log });
+    expect(bound).toEqual(floorCapacity(1));
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing file threshold', {}],
+    ['empty environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: '' }],
+    ['blank environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: ' ' }],
+    ['nonfinite environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: 'Infinity' }],
+  ])('%s defaults to 10 while retaining the configured minimum', (_name, env) => {
+    const configured = load(JSON.stringify({ redTeam: { queue: { minConcurrent: 3 } } }), env);
+    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10, reviewStartsPerTick: 0 });
+    const bound = floorCapacity(1);
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 9 });
+    expect(bound.remainingStarts).toBe(1);
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 10 });
+    expect(bound).toEqual({ lanes: 1, startsCeiling: Infinity, remainingStarts: 3, budget: { left: 1 } });
+  });
+
+  it.each([
+    ['file', settings(99), {}, 4],
+    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 4],
+    ['invalid environment', settings(4), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: 'bad' }, 0],
+    ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
+  ])('%s minimum resolves with a hard cap of four and invalid overrides disable it', (_name, text, env, expected) => {
+    const configured = load(text, env);
+    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0 });
+    const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 10 } };
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100 });
+    expect(bound.remainingStarts).toBe(Math.max(1, expected));
+    expect(redTeamQueueAdmitCount(bound)).toBe(Math.max(1, expected));
+  });
+
+  it.each([
+    ['zero', 0, 0],
+    ['one', 1, 1],
+    ['unbounded', Infinity, 2],
+    ['absent', undefined, 0],
+    ['null', null, 0],
+    ['string', '2', 0],
+    ['NaN', NaN, 0],
+    ['negative', -1, 0],
+    ['negative infinity', -Infinity, 0],
+  ])('host ceiling %s bounds the floor at idle 100', (_name, startsCeiling, expected) => {
+    const bound = { lanes: 4, remainingStarts: 0, budget: { left: 4 } };
+    if (startsCeiling !== undefined) bound.startsCeiling = startsCeiling;
+    const before = structuredClone(bound);
+    const log = vi.fn();
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100, log });
+    expect(bound).toEqual({ ...before, remainingStarts: expected });
+    expect(redTeamQueueAdmitCount(bound)).toBe(expected);
+    expect(log).toHaveBeenCalledTimes(expected > 0 ? 1 : 0);
+  });
+
+  it('loads defaults 2/10 from the real shipped settings file with no environment overrides', () => {
+    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ ...floor, reviewStartsPerTick: 3 });
+    expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(4);
+  });
+
+  it('environment overrides win over both file settings', () => {
+    expect(load(settings(4, 80), {
+      WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '1',
+      WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: '20',
+    })).toEqual({ minConcurrent: 1, idlePct: 20, reviewStartsPerTick: 0 });
+  });
+
+  it.each([['file', 99, {}], ['environment', 2, { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }]])(
+    '%s oversized minimum clamps to 4 and admits at most 4 with ten lanes', async (_source, minimum, env) => {
+      const configured = load(settings(minimum), env);
+      expect(configured).toEqual({ minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 0 });
+      const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } };
+      applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
+      expect(redTeamQueueAdmitCount(bound)).toBe(4);
+      const f = fixture();
+      const run = vi.fn(started);
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5, 6]),
+        capacity: { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } },
+        floor: configured, readCpuIdlePct: () => 50, run, log: f.log });
+      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4]);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(4);
+      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(2);
+    },
+  );
+
+  it.each([[38, 2, 1], [10, 2, 1], [5, 1, 2]])(
+    'CPU idle %s yields %s admits and %s holds for three queued PRs', async (idle, admits, holds) => {
+      const bound = { lanes: 4, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 4 } };
+      const budget = bound.budget;
+      const log = vi.fn();
+      applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: idle, log });
+      expect(bound).toEqual({ lanes: 4, startsCeiling: Infinity, remainingStarts: admits, budget: { left: 4 } });
+      expect(bound.budget).toBe(budget);
+      expect(redTeamQueueAdmitCount(bound)).toBe(admits);
+      expect(log).toHaveBeenCalledTimes(idle >= 10 ? 1 : 0);
+      if (idle >= 10) expect(log.mock.calls[0].join(' ')).not.toMatch(/[\r\n]/);
+      const f = fixture();
+      const run = vi.fn(started);
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3]),
+        capacity: { lanes: 4, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 4 } },
+        floor, readCpuIdlePct: () => idle, run, log: f.log });
+      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3].slice(0, admits));
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(admits);
+      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(holds);
+    },
+  );
+
+  it.each([
+    ['string', settings('3'), {}],
+    ['negative', settings(-1), {}],
+    ['fractional', settings(1.5), {}],
+    ['null', settings(null), {}],
+    ['NaN JSON', '{"redTeam":{"queue":{"minConcurrent":NaN}}}', {}],
+    ['corrupt JSON', '{ truncated', {}],
+    ...['bad', '-1', '1.5', 'NaN', 'Infinity', ''].map(value =>
+      [`environment ${JSON.stringify(value)}`, settings(4), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: value }]),
+  ])('invalid minimum (%s) disables the floor instead of increasing computed capacity', (_name, text, env) => {
+    const configured = load(text, env);
+    expect(configured.minConcurrent).toBe(0);
+    const bound = { lanes: 4, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 4 } };
+    const before = structuredClone(bound);
+    const log = vi.fn();
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100, log });
+    expect(bound).toEqual(before);
+    expect(redTeamQueueAdmitCount(bound)).toBe(1);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each(['ENOENT', 'EACCES'])('%s settings file with no env override disables the floor', code => {
+    const configured = loadRedTeamQueueFloor({ env: {}, file, readFile: () => {
+      throw Object.assign(new Error('fixture file unavailable'), { code });
+    } });
+    expect(configured.minConcurrent).toBe(0);
+    const bound = floorCapacity(1);
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100, log: vi.fn() });
+    expect(bound).toEqual(floorCapacity(1));
+    expect(redTeamQueueAdmitCount(bound)).toBe(1);
+  });
+
+  it('zero minimum explicitly disables the floor in both file and environment', () => {
+    for (const configured of [load(settings(0)), load(settings(2), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '0' })]) {
+      expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+      const bound = floorCapacity(1);
+      applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
+      expect(bound).toEqual(floorCapacity(1));
+    }
+  });
+
+  it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j disables the floor', value => {
+    expect(load(settings(2, value))).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0 });
+  });
+
+  it.each([0, 100])('accepts idle threshold boundary %s', idlePct => {
+    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+    expect(load(settings(), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(idlePct) }))
+      .toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+  });
+
+  it.each([null, undefined, NaN, Infinity, -Infinity, '38', -1])(
+    'unreadable or insufficient CPU idle %j leaves capacity unchanged', cpuIdlePct => {
+      const bound = floorCapacity(1);
+      const log = vi.fn();
+      applyRedTeamQueueFloor(bound, { floor, cpuIdlePct, log });
+      expect(bound).toEqual(floorCapacity(1));
+      expect(log).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, null, NaN, '1'])('unreadable remainingStarts %j is never raised', remainingStarts => {
+    const bound = { lanes: 4, startsCeiling: Infinity, remainingStarts, budget: { left: 4 } };
+    const before = structuredClone(bound);
+    const log = vi.fn();
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 50, log });
+    expect(bound).toEqual(before);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('never lowers an existing higher value and logs only when raising', () => {
+    const bound = floorCapacity(3);
+    const log = vi.fn();
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 50, log });
+    expect(bound).toEqual(floorCapacity(3));
+    expect(log).not.toHaveBeenCalled();
+    bound.remainingStarts = 1;
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 50, log });
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 50, log });
+    expect(log).toHaveBeenCalledOnce();
+  });
+
+  it.each([[1, 4], [4, 1]])('floor preserves lanes=%s and budget.left=%s as independent bounds', async (lanes, left) => {
+    const bound = { lanes, startsCeiling: Infinity, remainingStarts: 0, budget: { left } };
+    const budget = bound.budget;
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 50, log: vi.fn() });
+    expect(bound).toEqual({ lanes, startsCeiling: Infinity, remainingStarts: 2, budget: { left } });
+    expect(bound.budget).toBe(budget);
+    expect(redTeamQueueAdmitCount(bound)).toBe(1);
+    const f = fixture();
+    const run = vi.fn(started);
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3]),
+      capacity: { lanes, startsCeiling: Infinity, remainingStarts: 0, budget: { left } },
+      floor, readCpuIdlePct: () => 50, run, log: f.log });
+    expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1]);
+  });
+
+  it.each(['both', 'floor only', 'reader only', 'neither'])(
+    'optional floor integration: %s preserves normalization and opt-in behavior', async mode => {
+      const f = fixture();
+      const run = vi.fn(started);
+      const readCpuIdlePct = vi.fn(() => 38);
+      const options = {};
+      if (mode === 'both' || mode === 'floor only') options.floor = floor;
+      if (mode === 'both' || mode === 'reader only') options.readCpuIdlePct = readCpuIdlePct;
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3]),
+        capacity: { lanes: 4.9, startsCeiling: Infinity, remainingStarts: 1.9, budget: { left: 4.9 } },
+        ...options, run, log: f.log });
+      const received = run.mock.calls[0][0];
+      expect(received.capacity).toEqual({ lanes: 4, startsCeiling: Infinity, remainingStarts: mode === 'both' ? 2 : 1, budget: { left: 4 } });
+      expect(received.plan.refusals).toHaveLength(mode === 'both' ? 2 : 1);
+    },
+  );
+});
 
 describe('FIFO red-team dispatch queue (R752/R785)', () => {
   it('FIFO order under a burst of N owed PRs with capacity 2 over multiple ticks', async () => {
@@ -596,5 +841,55 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       await block(f, 1);
       expect(numbers(f.open().admit(repo, 1))).toEqual([1, 2]);
     });
+  });
+});
+
+describe('red-team queue floor idle override', () => {
+  it('an invalid idle override keeps a valid stricter file threshold instead of loosening to 10', () => {
+    const text = JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 80 } } });
+    for (const bad of ['bad', '', ' ', 'Infinity', '-1', '101', '1.5']) {
+      expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: bad }, file: 'x', readFile: () => text }))
+        .toEqual({ minConcurrent: 2, idlePct: 80, reviewStartsPerTick: 0 });
+    }
+  });
+});
+
+
+describe('idle-only review start allowance', () => {
+  const floor = { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 3 };
+  it.each([[10, 3], [100, 3], [9, 2], [NaN, 2], [undefined, 2], ['10', 2]])(
+    'idle %s yields allowance %s', (cpuIdlePct, expected) => {
+      expect(raiseReviewStartsPerTick(2, { floor, cpuIdlePct })).toBe(expected);
+    });
+  it.each([Infinity, -Infinity, NaN, 0, -1, undefined, '2', 4])('preserves existing allowance %s', max => {
+    expect(raiseReviewStartsPerTick(max, { floor, cpuIdlePct: 100 })).toBe(max);
+  });
+  it('disabled floor never raises the allowance', () => {
+    expect(raiseReviewStartsPerTick(2, { floor: { ...floor, minConcurrent: 0 }, cpuIdlePct: 100 })).toBe(2);
+  });
+  it.each([undefined, null, '3', -1, 1.5, 99, 3])('loads file review starts %j with fail-closed integer bounds', value => {
+    const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: value } } });
+    const expected = Number.isInteger(value) && value >= 0 ? Math.min(value, 4) : 0;
+    expect(loadRedTeamQueueFloor({ env: {}, readFile }).reviewStartsPerTick).toBe(expected);
+    expect(RED_TEAM_QUEUE_REVIEW_STARTS_CAP).toBe(4);
+  });
+  it.each([['3', 3], ['99', 4], ['', 0], [' ', 0], ['bad', 0], ['Infinity', 0], ['1.5', 0], ['-1', 0]])(
+    'environment review starts %j overrides file with %s', (value, expected) => {
+      const log = vi.fn();
+      const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: 4 } } });
+      expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: value }, readFile, log }).reviewStartsPerTick).toBe(expected);
+      expect(log.mock.calls.flat().join(' ')).toContain('env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE');
+    });
+});
+
+describe('raiseReviewStartsPerTick guards', () => {
+  const f = { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 3 };
+  it('raises 2 to 3 only while idle, never from 1, never on impossible readings', () => {
+    expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 50 })).toBe(3);
+    expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 5 })).toBe(2);
+    expect(raiseReviewStartsPerTick(1, { floor: f, cpuIdlePct: 50 })).toBe(1);
+    expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 101 })).toBe(2);
+    expect(raiseReviewStartsPerTick(0, { floor: f, cpuIdlePct: 50 })).toBe(0);
+    expect(raiseReviewStartsPerTick(Infinity, { floor: f, cpuIdlePct: 50 })).toBe(Infinity);
   });
 });
