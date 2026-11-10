@@ -414,6 +414,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (freeText && out.canonicalAudit.ok && String(out.canonicalAudit.record?.head).toLowerCase() !== String(input.sha).toLowerCase()) {
         out.canonicalAudit = { mode, ok: false, reason: 'no-record' };
       }
+      // A hand-written ready record is a claim too: it never loads over this sha's own canonical WEAKENED record
+      // (only a ruled exception does), even in warn mode.
+      if (!out.canonicalAudit.ok && out.canonicalAudit.reason === 'weakened' && !freeText && !out.gate.ruledWeakened) {
+        const own = [...auditRecords].reverse().find((r) => r?.verdict === 'WEAKENED' && String(r.head).toLowerCase() === String(input.sha).toLowerCase());
+        if (own) return stop('no-canonical-audit', { detail: 'ready-record-contradicts-canonical-audit', fallback: `The ready record claims NOT WEAKENED but the latest canonical audit record for ${input.sha} (at ${own.at}, base ${own.base}) says WEAKENED. Fix the findings and re-audit, or get an operator ruling (ruledWeakened). Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}.` });
+      }
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (freeText) {

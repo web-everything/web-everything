@@ -386,11 +386,15 @@ describe('prototype-load canonical audit admission', () => {
     const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped).not.toHaveProperty('canonicalAuditMode');
   });
+  it.each(['warn', undefined])('a ready record never loads over its own sha\'s canonical WEAKENED record, even in mode %s (R848 2a)', async (mode) => {
+    const f = auditedFixture(mode, { audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]) });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', detail: 'ready-record-contradicts-canonical-audit' });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
   it.each([
     ['explicit warn', 'warn', [], 'no-record'],
     ['absent mode', undefined, [], 'no-record'],
-    ['weakened in warn', 'warn', [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
-    ['weakened with absent mode', undefined, [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
     ['unreadable in warn', 'warn', [], 'no-record', 'EACCES'],
     ['missing file with absent mode', undefined, [], 'no-record', 'ENOENT'],
   ])('%s proceeds with failed canonical evidence and a loud warning line', async (_, mode, records, reason, auditReadError) => {
@@ -876,13 +880,14 @@ describe('prototype-load', () => {
     const out = await f.run({ testsRun: 'test-1', audit: 'NOT WEAKENED' });
     expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', detail: 'free-text-audit-not-canonical', canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
     expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
-    expect(mutations(f, 'register')).toEqual([]);
+    expect(mutations(f, 'add')).toEqual([]);
   });
   it('refuses a free-text claim backed only by a fingerprint-carried record of another head', async () => {
     const OLDH = 'd'.repeat(40);
-    const f = auditedFixture('refuse', { ready: '', auditBaseInMain: TREE, fingerprint: () => 'fp1', audits: auditLines([auditRecord({ head: OLDH, fingerprint: 'fp1' })]) });
+    const f = auditedFixture('refuse', { ready: '', auditBaseInMain: TREE, fingerprint: () => 'e'.repeat(64), audits: auditLines([auditRecord({ head: OLDH, fingerprint: 'e'.repeat(64) })]) });
     const out = await f.run({ testsRun: 'test-1', audit: 'NOT WEAKENED' });
     expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'free-text-audit-not-canonical' });
+    expect(mutations(f, 'add')).toEqual([]);
   });
   it.each(['warn', 'refuse'])('refuses a free-text NOT WEAKENED claim that contradicts the latest canonical WEAKENED record, naming it (mode %s)', async (mode) => {
     const f = auditedFixture(mode, { ready: '', audits: auditLines([auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })]) });
@@ -2409,7 +2414,7 @@ describe('carried evidence precedence (R503 red team)', () => {
   it('round 3: warn mode keeps its existing behaviour for a live-head ready record and for a missing audit', async () => {
     const own = ready({ sha: SHA, fingerprint: undefined });
     const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
-    expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'weakened' } });
+    expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: false, detail: 'ready-record-contradicts-canonical-audit', canonicalAudit: { reason: 'weakened' } });
     expect(await auditedFixture('warn', { ready: auditLines([ready()]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'no-record' } });
   });
   it('round 3 self-review: a live-head WEAKENED audit that findAudit drops as malformed still blocks the carried pass', () => {
