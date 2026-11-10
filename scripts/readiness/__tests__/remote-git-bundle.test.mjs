@@ -323,3 +323,12 @@ it('R857 refuses an unclassifiable bundle path instead of downgrading unknown ev
     expect(warnings).toContainEqual({path:'.claude/note.txt',finding:'secret-assignment-password'});
   });
 });
+
+describe('credential directories and unsafe names block', () => {
+  it.each(['.ssh/config', '.gnupg/pubring.txt', '.aws/config', '.docker/config.json', '.kube/config', 'dir/.ssh/known_hosts',
+    'caf\u0435.txt', 'bad\u202Ename.txt', 'ctl\u0007name.txt'])(
+    'blocks %#: clean contents still block', async path => {
+      write(path, 'public'); commit('add file');
+      expect(await scan()).toMatchObject({finding:'excluded-path'});
+    });
+});

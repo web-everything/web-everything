@@ -8,7 +8,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { classifyManifestPath, credentialTextFinding, credentialBufferFinding, credentialContentFinding, credentialContentWarning, secretFileName } from './forge-exec-manifest.mjs';
+import { classifyManifestPath, credentialTextFinding, credentialBufferFinding, credentialContentFinding, credentialContentWarning, secretFileName, unsafeComponentName } from './forge-exec-manifest.mjs';
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
@@ -253,7 +253,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
     if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
     let policy;
     try { policy = classifyManifestPath(path); } catch { throw bundleError('bundle-credential-scan-failed'); }
-    if (policy.names.some(secretFileName)) return { path: label, finding: 'excluded-path' };
+    if (policy.names.some(secretFileName) || label.split('/').some(unsafeComponentName)) return { path: label, finding: 'excluded-path' };
     if (policy.excluded) excludedWarnings.push({ path: label, finding: 'excluded-path' });
     // A directory entry carries no blob: its name was scanned and classified above, its files are read under their own paths.
     if (newMode === '040000') continue;

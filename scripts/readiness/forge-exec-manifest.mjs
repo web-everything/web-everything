@@ -77,13 +77,15 @@ function normalizedComponent(part) {
     .replace(/\p{Cf}/gu, '').replace(/[. ]+$/u, '').toLowerCase();
 }
 // The caller supplies the normalized policy view of one path component.
-export const secretFileName = component => /^\.(?:env.*|netrc|npmrc)$/.test(component) || keyComponent.test(component) || credentialComponent.test(component);
+export const secretFileName = component => credentialDirectory(component) || /^\.(?:env.*|netrc|npmrc)$/.test(component) || keyComponent.test(component) || credentialComponent.test(component);
+export const unsafeComponentName = name => /\p{Cc}/u.test(name) || [...name].some(char => char.charCodeAt(0) > 127
+  && !/^(?:[a-z]\p{M}+|\p{Z})$/u.test(char.normalize('NFD')));
+// Credential stores: BLOCK in a bundle, never warn (R857 correction).
+export const credentialDirectory = component => /^\.(?:ssh|gnupg|aws|docker|kube)$/.test(component);
 function excludedComponent(name, leaf, allowCredential = false) {
   // Admit ordinary accented Latin names (e.g. é) but fail closed on remaining
   // non-ASCII forms: no incomplete hand-maintained confusable substitution map.
-  const unsafe = /\p{Cc}/u.test(name) || [...name].some(char => char.charCodeAt(0) > 127
-    && !/^(?:[a-z]\p{M}+|\p{Z})$/u.test(char.normalize('NFD')));
-  return unsafe || !name || /^\.(?:netrc|npmrc|env.*)$/.test(name)
+  return unsafeComponentName(name) || !name || /^\.(?:netrc|npmrc|env.*)$/.test(name)
     || (name.startsWith('.') && !safeDotDirectory.test(name) && !(leaf && safeDotFile.test(name)))
     || keyComponent.test(name) || (!allowCredential && credentialComponent.test(name));
 }
