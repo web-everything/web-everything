@@ -1,3 +1,4 @@
+import * as hostCapacity from '../../../scripts/lib/host-capacity.mjs';
 import { dispatchReview } from '../../../scripts/operations/review-dispatch.mjs';
 import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
 import { sweepAuthorStamps } from '../../../scripts/lib/author-stamp-restore.mjs';
@@ -1010,7 +1011,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     const admission = vi.fn(() => ({ admitted: true, reason: 'host load ok' }));
     expect(defaultReviewHostAdmission({ env, admission, loadPolicy: loadHostOverloadSettings }))
       .toEqual({ admitted: true, reason: 'host load ok', maxPerTick: 3 });
-    expect(admission).toHaveBeenCalledWith({ env, interactive: false,
+    expect(admission).toHaveBeenCalledWith({ env, interactive: false, capacityClass: 'review', capacityRead: expect.any(Function),
       policy: expect.objectContaining({ sources: expect.objectContaining({ 'host.maxReviewDispatchPerTick': 'env' }) }) });
     // A not-admitted host verdict flows through the tick: nothing dispatched, every review stays owed.
     const low = () => defaultReviewHostAdmission({ env, loadPolicy: loadHostOverloadSettings,
@@ -1039,6 +1040,9 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     // Hermetic: the real CPU-idle reading must not raise the per-tick cap in this wiring test.
     vi.stubEnv('WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE', '0');
     try {
+      let idle = 40; let mb = 4096;
+      const capacityRead = () => ({ idlePct: idle, memFreeGB: mb / 1024, source: 'fixture', loadAvg: 999, loadPerCore: 999 / 12 });
+      vi.spyOn(hostCapacity, 'readCapacity').mockImplementation(capacityRead);
       const seen = [];
       const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
       const effects = buildCliDaemonEffects({ owner: 'test', log: { error: () => {} }, reapSessions: () => null,
@@ -1047,13 +1051,12 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       await effects.tickOnce();
       expect(tick).toHaveBeenCalledTimes(1);
       expect(seen[0].hostAdmission()).toMatchObject({ admitted: true, maxPerTick: 2 });
-      vi.stubEnv('WE_TEST_HOST_LOAD1', '999');
+      idle = 5;
       await effects.tickOnce();
-      expect(seen[1].hostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('host load 999.00/') });
-      vi.stubEnv('WE_TEST_HOST_LOAD1', '0');
-      vi.stubEnv('WE_TEST_HOST_MEMORY_MB', '10');
-      expect(defaultReviewHostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('host memory headroom 10MB') });
-    } finally { vi.unstubAllEnvs(); }
+      expect(seen[1].hostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('idle=5%') });
+      idle = 40; mb = 10;
+      expect(defaultReviewHostAdmission({ capacityRead })).toMatchObject({ admitted: false, reason: expect.stringContaining('memory>=2048MB') });
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
   });
 
   it.each([[1, 3, 1], [3, 1, 1], [2, 2, 2]])('combines the host per-tick cap %i and live-review capacity %i across repos', (maxPerTick, left, expected) => {

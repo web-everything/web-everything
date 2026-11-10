@@ -4109,3 +4109,18 @@ job/lock outcomes, including persisted request retention. `daemon-self-sync-muta
 requires failed/refused mutations to remain pending and retry on the next tick; only a completed
 mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.
+
+
+## Host capacity admission
+
+`scripts/lib/host-capacity.mjs` owns the class CPU idle thresholds and the hard 2048 MB
+memory floor. Review admission and red-team floor raises use its windowed CPU reading;
+valid legacy red-team idle thresholds can tighten the shared review minimum, while invalid
+legacy thresholds disable the queue floor. Class admission also retains the host
+policy's memory floor and the shared pressure-aware memory reader. Load averages are
+shown for diagnosis only on wired callers. Inject history, clock, memory and exec functions
+in tests: absent/stale/short or unreadable sampler history holds; direct CPU sampling is disabled.
+Missing/unreadable settings and unknown/unreadable macOS memory pressure also hold until
+readable evidence on a subsequent tick. The stricter pressure requirement belongs to
+host-capacity; other shared memory-reader callers retain their existing fallback behavior.
+Run the scoped host-capacity, host-load and review-daemon tests via heavy-admission.
