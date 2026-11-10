@@ -118,6 +118,7 @@
  * gate would defeat the whole point of gating rebuilds in the first place).
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { daemonCloneRoots } from './daemon-clone-registry.mjs';
 import { gitRun, isCodePath } from './main-staleness.mjs';
@@ -756,6 +757,19 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
     && (j?.status === 'succeeded' || (j?.status === 'failed' && REBUILD_JOB_CRASHED_RE.test(String(j?.reason ?? '')))));
 }
 
+// Async context keeps concurrent/nested withSelfSync instances isolated, including after a tick ends.
+const safePointContext = new AsyncLocalStorage();
+export class SafePointRestart extends Error {
+  constructor(result) { super('safe-point-restart'); this.name = 'SafePointRestart'; this.result = result; }
+}
+export class SafePointAbort extends Error {
+  constructor(reason) { super(reason); this.name = 'SafePointAbort'; }
+}
+export async function safePoint(label) {
+  const context = safePointContext.getStore();
+  return context?.active ? context.handler(label) : { adopted: false };
+}
+
 /**
  * Single-owner clone coordination gates every rebuild path, refreshes the owner heartbeat each tick,
  * and consumes overlay rebuild requests only after movement or an up-to-date conclusion.
@@ -1164,11 +1178,11 @@ export function withSelfSync(effects, {
         } else if (r.reason === 'head-failed') {
           log.error?.(`daemon-self-sync: [POC mode: ${resolvedPocBranch}] NOT syncing (head-failed) — \`git symbolic-ref HEAD\` failed or timed out; retrying next tick`);
         }
-        return tick(...args);
+        return safePointContext.run({ active: false }, () => tick(...args));
       }
 
       // ---- VERSIONED path (card 89 S5) — rebuild builds a version and flips `current`; NO read/write lock ----
-      if (vctx) return versionedTick(args);
+      if (vctx) return safePointContext.run({ active: false }, () => versionedTick(args));
 
       // ---- DEFAULT (non-POC) path — full clone rebuild (#4044 Module E, see file header) ----
 
@@ -1176,7 +1190,7 @@ export function withSelfSync(effects, {
       await handleMutationDue();
 
       // Only count candidates already smoke-passed at tick entry, still based on this clone's HEAD.
-      // This is a tick-boundary policy: it never interrupts a running tick or changes the clone lock.
+      // This tick-boundary starvation policy is independent of explicit phase safe points below.
       const ready = readReady(root, env);
       const identity = ready && readHead(syncOpts()) === ready.prevHead
         ? JSON.stringify([ready.adopt?.finalSha, ready.passedAt, ready.prevHead]) : null;
@@ -1298,6 +1312,32 @@ export function withSelfSync(effects, {
           releaseRead(root, cloneLockOpts());
         };
 
+        const context = { active: !resolvedPocBranch, handler: async (label) => {
+          const say = (message) => log.error?.(`${new Date(now()).toISOString()} daemon-self-sync: safe-point ${label} ${message}`);
+          const ready = readReady(root, env);
+          if (!ready || ready.prevHead !== readHead(syncOpts())) {
+            say(`skipped (${ready ? 'other-base' : 'no-candidate'})`);
+            return { adopted: false };
+          }
+          releaseOnce();
+          const result = await rebuild({ adoptReadyOnly: true });
+          if (result?.moved && result.adopted) {
+            say(`adopted ${result.head}`);
+            const decision = restartGate(result.head, { minIntervalMs: swapMinIntervalMs });
+            // Movement ends this tick even when a restart is deferred: its modules belong to the old checkout.
+            if (!decision.restart) {
+              say(`skipped (restart-${decision.reason}; tick-ended)`);
+              throw new SafePointAbort(`restart-${decision.reason}`);
+            }
+            const restarted = await onRestart(result);
+            throw new SafePointRestart(restarted);
+          }
+          say(`skipped (${result?.reason ?? 'not-adopted'})`);
+          acquired = acquireRead(root, { ...cloneLockOpts(), readerKey });
+          if (!acquired.ok) throw new SafePointAbort(acquired.reason);
+          released = false;
+          return { adopted: false };
+        } };
         let tickResult;
         try {
           // 2b. x0m7a8x — under the read lock the checkout cannot be replaced, so this is the authoritative re-clone
@@ -1329,9 +1369,14 @@ export function withSelfSync(effects, {
           }
 
           // 4. Run the real tick under the read lock.
-          tickResult = await tick(...args);
+          tickResult = await safePointContext.run(context, () => tick(...args));
           markTickDone();
+        } catch (error) {
+          if (error instanceof SafePointRestart) return error.result ?? skippedTick('safe-point-restart');
+          if (error instanceof SafePointAbort) return skippedTick(`safe-point-abort: ${error.message}`);
+          throw error;
         } finally {
+          context.active = false;
           releaseOnce();
         }
 

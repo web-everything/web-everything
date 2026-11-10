@@ -9,11 +9,12 @@ import {
 import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
+import { readOverlayEventLog } from './prepare.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
-import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays, overlayGraduated } from './adopt.mjs';
+import { removeOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -337,7 +338,46 @@ async function resolveDispatchSmoke(opt, env) {
  * lease and returns `ready-recorded`. The daemon's next tick adopts the ready candidate through the existing
  * `prepareRebuild` ready path (no re-smoke, same match rules), so the swap stays at the daemon's own tick boundary.
  */
-export async function smokeAndAdopt({
+class OverlayRemoved extends Error {
+  constructor(refs) { super('rebuild-aborted-overlay-removed'); this.refs = refs; }
+}
+
+/** Missing/corrupt registry evidence refuses further smoke work; only proven graduation is exempt. */
+export function checkAppliedOverlays({ root, env, applied, git, now = Date.now }) {
+  const registry = readOverlayState(root, { env });
+  const registered = new Set(registry.overlays.map((o) => o.ref));
+  const events = readOverlayEventLog(root, env);
+  const refs = (applied || []).filter((a) => registry.corrupt || (!registered.has(a.ref) && !overlayGraduated({
+    ref: a.ref, sha: a.sha, build: verifyRev(git, 'origin/main'), registered: (r) => registered.has(r),
+    events, git, readyAt: new Date(now() + 1).toISOString(),
+  }))).map((a) => a.ref);
+  if (registry.corrupt || refs.length) throw new OverlayRemoved(refs);
+}
+
+export async function smokeAndAdopt(options) {
+  try { return await smokeAndAdoptInternal(options); }
+  catch (error) {
+    if (!(error instanceof OverlayRemoved)) throw error;
+    const { root, env, stEnv, log, lease, finalLockOpts, plan, prepAlerts = [], now } = options;
+    const detail = { refs: error.refs, target: plan.finalSha };
+    log.error?.(`daemon-rebuild: rebuild-aborted-overlay-removed ${JSON.stringify(detail)} — next tick plans a fresh build`);
+    try { appendOverlayEvent(root, { kind: 'rebuild-aborted-overlay-removed', ...detail }, { env }); } catch { /* log remains visible */ }
+    try {
+      const file = alertsFilePath(root, stEnv);
+      mkdirSync(dirname(file), { recursive: true });
+      appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind: 'rebuild-aborted-overlay-removed', detail })}\n`);
+    } catch { /* log remains visible */ }
+    await withWriteLock(root, () => {
+      const state = readRebuildState(root, stEnv);
+      releaseBuildLease(state, lease);
+      writeRebuildState(root, state, stEnv);
+    }, finalLockOpts);
+    return { moved: false, reason: 'rebuild-aborted-overlay-removed', refs: error.refs, plan,
+      alerts: [...prepAlerts, { kind: 'rebuild-aborted-overlay-removed', detail }] };
+  }
+}
+
+async function smokeAndAdoptInternal({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
   finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
 }) {
@@ -368,6 +408,8 @@ export async function smokeAndAdopt({
     } catch { /* best-effort audit trail only */ }
   };
   const git = makeGit({ run, cwd: root, env });
+  const checkOverlays = () => checkAppliedOverlays({ root, env, applied: plan.applied, git, now });
+  checkOverlays();
   const smokeEnv = candidateSmokeEnv({ root, env });
   // The per-clone state already isolates kinds (drain, review, etc.); include it in the proof as well.
   const cloneKind = posix.basename(root.replace(/\\/g, '/')) === 'code'
@@ -477,17 +519,23 @@ export async function smokeAndAdopt({
     let dispatch = null;
     const t0 = now();
     try {
-      const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
+      const child = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
+      const runChild = Object.assign(async (...args) => { checkOverlays(); return child(...args); }, {
+        deadline: child.deadline, failFast: child.failFast,
+      });
       smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild });
     } catch (e) {
       threw = e;
     }
     // xhiqxz3 — only after the ordinary smoke passed (a failing build is not adopted anyway).
-    if (!threw && smokeResult?.verdict === 'pass' && suspects.length) dispatch = await runDispatch(candidate.path, suspects);
+    try {
+      checkOverlays();
+      if (!threw && smokeResult?.verdict === 'pass' && suspects.length) dispatch = await runDispatch(candidate.path, suspects);
+    } finally {
+      removeCandidate({ root, path: candidate.path, run, env });
+    }
+    if (threw instanceof OverlayRemoved) throw threw;
     const ms = now() - t0;
-    removeCandidate({
-      root, path: candidate.path, run, env,
-    });
     // x5059uu — per-step timings on EVERY smoke (live 2026-10-09: smokes took 421 s and 1,002 s), so a slow step is
     // visible in the log before it crosses the smoke-slow line; the dispatch smoke counts as its own step.
     const checks = [
@@ -595,6 +643,7 @@ export async function smokeAndAdopt({
       const recorded = await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
       if (!recorded) throw new Error('adopted over a failed smoke: could not record it as unverified (write lock refused)');
     }
+    checkOverlays();
     writeReadyCandidate(root, {
       ...readyMeta,
       prevHead,

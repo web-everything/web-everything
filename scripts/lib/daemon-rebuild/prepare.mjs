@@ -521,118 +521,10 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'up-to-date', plan });
   }
 
-  // fix-rebuild-finalize — a candidate that already PASSED its smoke but could not be adopted (a reader was
-  // mid-tick when its finalize tried the lock) is adopted HERE, under the write lock this phase already holds,
-  // instead of being thrown away and re-smoked. Checked before the rejection/backoff short-circuits: a passed
-  // plain-main fallback answers exactly the inputs the reject-cache would otherwise stop at.
-  {
-    const ready = readReadyCandidate(root, stEnv);
-    if (ready) {
-      if (readyOnly) return mutationDue('ready-candidate-adopt');
-      // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
-      // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
-      const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
-      for (const d of plan.decisions) if (d.action === 'remove') registeredRefs.delete(d.ref);
-      const wantedRefs = new Set(mainOnly ? [] : registeredRefs);
-      for (const d of plan.decisions) {
-        if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
-      }
-      const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
-      let overlayEvents;
-      const readOverlayEvents = () => {
-        if (overlayEvents === undefined) {
-          overlayEvents = readOverlayEventLog(root, env);
-        }
-        return overlayEvents;
-      };
-      const m = matchReadyCandidate({
-        ready,
-        plan,
-        prevHead,
-        treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
-        stillWanted: (ref) => wantedRefs.has(ref),
-        verifyBuilt: (adopt) => readyBuildVerified({
-          git, adopt, mainTip: plan.mainSha, prevHead,
-          approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
-        }),
-        overlayTip: (ref) => verifyRev(git, `refs/remotes/origin/${ref}^{commit}`),
-        registered: (ref) => registeredRefs.has(ref),
-        allowFallback: !mainOnly, // a mainOnly rebuild never edits the overlay list, so never drops suspects
-        rejected: state.rejected,
-        nowMs: nowMs(),
-        maxAgeMs,
-        // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
-        // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
-        liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
-        carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
-        leftForMain: (a, build) => overlayGraduated({
-          readyAt: ready.at ?? ready.passedAt,
-          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
-        }),
-        contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
-        removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
-        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
-        forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
-      });
-      if (!m.adopt) {
-        // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
-        // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
-        // as head keeps its watch.
-        // …except an UNREADABLE watch: that may be a transient read failure, and dropping would throw the operator's build away while
-        // the abort (which cannot read the file either) leaves the watch behind. Not adopting is already the fail-closed part, so the
-        // record is kept and retried every tick; it is bounded by the ready record's own max age, which drops it as 'expired'.
-        if (m.reason === 'forced-watch-unreadable') {
-          alert('forced-watch-unreadable', { target: ready.adopt.finalSha, message: 'the forced build is NOT adopted while its rollback watch cannot be read; its ready record is kept and retried' });
-          return terminal({ moved: false, reason: 'forced-watch-unreadable', plan });
-        }
-        await dropReady(m.reason, prevHead);
-        reportDiscardedCandidate({
-          ready, match: m, alert,
-          needsYou: ({ kind, ...detail }) => {
-            try {
-              appendOverlayEvent(root, { kind: 'needs-you', need: kind, ...detail }, { env });
-            } catch { /* the alert remains visible when the event log is unwritable */ }
-            alert('ready-candidate-discarded-needs-you', detail);
-          },
-        });
-      } else {
-        const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
-        if (colliding.length > 0) {
-          await dropReady('untracked-collision');
-          alert('untracked-collision', { paths: colliding });
-          return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
-        }
-        alert('ready-candidate-adopted', {
-          target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
-          ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
-          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
-        });
-        writeState();
-        const fin = await finalizeRebuild({
-          root,
-          env,
-          log,
-          run,
-          stateOpts,
-          now,
-          plan: m.adopt,
-          prevHead,
-          lease: { token: ready.token ?? null },
-          onAdopted: m.dropRefs.length
-            ? ({ alert: finAlert }) => dropSuspectOverlays({
-              root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
-            })
-            : undefined,
-        });
-        const { alerts: finAlerts = [], ...finResult } = fin;
-        return {
-          terminal: true,
-          result: { ...finResult, ...(finResult.adopted ? { reason: 'ready-adopted', readyMatch: m.match } : {}) },
-          alerts: [...alertsList, ...finAlerts],
-        };
-      }
-    }
-  }
+  const readyResult = await adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, readyOnly,
+    mainOnly, overlaysBefore, plan, prevHead, state, unsafe, alert, terminal, dropReady, writeState, nowMs,
+    liveOverlaysOf, alertsList });
+  if (readyResult) return readyResult;
   // x5wbsbc — a BROKEN SMOKE HARNESS (every candidate, the last-good build included, fails the same checks) is
   // not re-smoked on every main move: it would cost up to three full smokes per move and every one would fail
   // the same way. Until its backoff expires the clone stays on its last-good build (and keeps dispatching —
@@ -755,4 +647,156 @@ export async function prepareRebuild({
   return {
     terminal: false, plan, prevHead, lease, overlays: overlaysBefore, alerts: alertsList,
   };
+}
+
+/** Shared ready adoption. Call only while holding the clone WRITE lock. */
+async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, readyOnly = false,
+  mainOnly, overlaysBefore, plan, prevHead, state, unsafe, alert, terminal, dropReady, writeState, nowMs,
+  liveOverlaysOf, alertsList, adoptReadyOnly = false }) {
+  const git = makeGit({ run, cwd: root, env });
+  const mutationDue = () => terminal({ moved: false, reason: 'readonly-job-mutation-due', mutation: 'ready-candidate-adopt' });
+  // fix-rebuild-finalize — a candidate that already PASSED its smoke but could not be adopted (a reader was
+  // mid-tick when its finalize tried the lock) is adopted HERE, under the write lock this phase already holds,
+  // instead of being thrown away and re-smoked. Checked before the rejection/backoff short-circuits: a passed
+  // plain-main fallback answers exactly the inputs the reject-cache would otherwise stop at.
+  {
+    const ready = readReadyCandidate(root, stEnv);
+    if (ready) {
+      if (readyOnly) return mutationDue('ready-candidate-adopt');
+      // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
+      // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
+      const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
+      for (const d of plan.decisions) if (d.action === 'remove') registeredRefs.delete(d.ref);
+      const wantedRefs = new Set(mainOnly ? [] : registeredRefs);
+      for (const d of plan.decisions) {
+        if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
+      }
+      const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
+      let overlayEvents;
+      const readOverlayEvents = () => {
+        if (overlayEvents === undefined) {
+          overlayEvents = readOverlayEventLog(root, env);
+        }
+        return overlayEvents;
+      };
+      const m = matchReadyCandidate({
+        ready,
+        plan,
+        prevHead,
+        requireVerified: adoptReadyOnly,
+        treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
+        stillWanted: (ref) => wantedRefs.has(ref) || (!mainOnly && (ready.adopt.applied || []).some((a) => a.ref === ref && overlayGraduated({
+          ref, sha: a.sha, build: ready.adopt.finalSha, registered: (r) => registeredRefs.has(r),
+          events: readOverlayEvents(), git, readyAt: ready.at ?? ready.passedAt,
+        }))),
+        verifyBuilt: (adopt) => readyBuildVerified({
+          git, adopt, mainTip: adoptReadyOnly ? verifyRev(git, 'origin/main') : plan.mainSha, prevHead,
+          approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
+        }),
+        overlayTip: (ref) => verifyRev(git, `refs/remotes/origin/${ref}^{commit}`),
+        registered: (ref) => registeredRefs.has(ref),
+        allowFallback: !mainOnly, // a mainOnly rebuild never edits the overlay list, so never drops suspects
+        rejected: state.rejected,
+        nowMs: nowMs(),
+        maxAgeMs,
+        // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
+        // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
+        liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
+        carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+        leftForMain: (a, build) => overlayGraduated({
+          readyAt: ready.at ?? ready.passedAt,
+          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
+        }),
+        contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
+        removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
+        forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
+      });
+      if (!m.adopt) {
+        // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
+        // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
+        // as head keeps its watch.
+        // …except an UNREADABLE watch: that may be a transient read failure, and dropping would throw the operator's build away while
+        // the abort (which cannot read the file either) leaves the watch behind. Not adopting is already the fail-closed part, so the
+        // record is kept and retried every tick; it is bounded by the ready record's own max age, which drops it as 'expired'.
+        if (m.reason === 'forced-watch-unreadable') {
+          alert('forced-watch-unreadable', { target: ready.adopt.finalSha, message: 'the forced build is NOT adopted while its rollback watch cannot be read; its ready record is kept and retried' });
+          return terminal({ moved: false, reason: 'forced-watch-unreadable', plan });
+        }
+        await dropReady(m.reason, prevHead);
+        reportDiscardedCandidate({
+          ready, match: m, alert,
+          needsYou: ({ kind, ...detail }) => {
+            try {
+              appendOverlayEvent(root, { kind: 'needs-you', need: kind, ...detail }, { env });
+            } catch { /* the alert remains visible when the event log is unwritable */ }
+            alert('ready-candidate-discarded-needs-you', detail);
+          },
+        });
+        if (adoptReadyOnly) return terminal({ moved: false, reason: m.reason, plan });
+      } else {
+        const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
+        if (colliding.length > 0) {
+          await dropReady('untracked-collision');
+          alert('untracked-collision', { paths: colliding });
+          return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
+        }
+        alert('ready-candidate-adopted', {
+          target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
+          ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
+          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
+        });
+        writeState();
+        const fin = await finalizeRebuild({
+          root,
+          env,
+          log,
+          run,
+          stateOpts,
+          now,
+          plan: m.adopt,
+          prevHead,
+          lease: { token: ready.token ?? null },
+          onAdopted: m.dropRefs.length
+            ? ({ alert: finAlert }) => dropSuspectOverlays({
+              root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
+            })
+            : undefined,
+        });
+        const { alerts: finAlerts = [], ...finResult } = fin;
+        return {
+          terminal: true,
+          result: { ...finResult, ...(finResult.adopted ? { reason: 'ready-adopted', readyMatch: m.match } : {}) },
+          alerts: [...alertsList, ...finAlerts],
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** Safe-point entry: no recovery, fetch, planning, lease claim or build launch. Caller holds WRITE. */
+export async function adoptReadyRebuild({ root, env, log, run, stateOpts, mainOnly, now }) {
+  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  const git = makeGit({ run, cwd: root, env });
+  const ready = readReadyCandidate(root, stEnv);
+  const prevHead = verifyRev(git, 'HEAD');
+  const terminal = (result) => ({ terminal: true, result, alerts: alertsList });
+  const alertsList = [];
+  const alert = (kind, detail) => { alertsList.push({ kind, detail }); log?.error?.(`daemon-rebuild: ${kind} ${JSON.stringify(detail)}`); };
+  if (!ready || !prevHead || ready.prevHead !== prevHead) return terminal({ moved: false, reason: !ready ? 'none' : 'other-base' });
+  // Re-read CURRENT registry here, under the write lock. Never trust a pre-lock snapshot (R854).
+  const registry = readOverlayState(root, { env });
+  if (registry.corrupt) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
+  const state = readRebuildState(root, stEnv);
+  if (state.quarantine || state.inProgress || state.unverified) return terminal({ moved: false, reason: 'quarantined' });
+  const unsafe = findUnsafeLocalState({ git, knownInputs: knownInputsOf(state) });
+  if (!unsafe.safe) return terminal({ moved: false, reason: unsafe.reason });
+  const plan = { ...ready.adopt, decisions: [] };
+  const result = await adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, mainOnly, now,
+    overlaysBefore: registry.overlays, plan, prevHead, state, unsafe, alert, terminal,
+    dropReady: (reason, keepSha = null) => dropReadyCandidate({ root, env: stEnv, keepSha, reason }),
+    writeState: () => writeRebuildState(root, state, stEnv), nowMs: now,
+    liveOverlaysOf: () => undefined, alertsList, adoptReadyOnly: true });
+  return result ?? terminal({ moved: false, reason: 'ready-not-adoptable' });
 }

@@ -102,12 +102,12 @@ import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defau
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
-import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
+import { forEachRepo, forEachRepoAtSafePoints } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 /** Per-owner App auth: this daemon fixes PRs in every org (live 2026-10-04: plateau-app calls failed with the
  *  web-everything token pinned). */
 export const FIX_DISPATCH_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
-import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
+import { withSelfSync, safePoint, SafePointRestart, SafePointAbort } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents } from '../../scripts/lib/pr-events.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
@@ -190,24 +190,27 @@ export const FIX_DISPATCH_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map(
  *   #4075/#3383; see `runReconcileFixDispatch`'s own `reconcileRefusalDetails` docblock for the full why).
  */
 export function runReconcileFixDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcileFixDispatch,
-  allowStandDownAutoProceed = resolveFixSettings().standDownAutoProceed, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, allowStandDownAutoProceed }));
-  const dispatched = [];
-  const refusals = [];
-  const reconcileRefusals = [];
-  for (const entry of perRepo) {
-    if (entry.error) {
-      refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: entry.error });
-      continue;
+  allowStandDownAutoProceed = resolveFixSettings().standDownAutoProceed, atSafePoints = false, ...tickOpts } = {}) {
+  const collected = (atSafePoints ? forEachRepoAtSafePoints : forEachRepo)(repos, (repo) => tick({ ...tickOpts, repo, allowStandDownAutoProceed }));
+  const aggregate = (perRepo) => {
+    const dispatched = [];
+    const refusals = [];
+    const reconcileRefusals = [];
+    for (const entry of perRepo) {
+      if (entry.error) {
+        refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: entry.error });
+        continue;
+      }
+      const { repo, result } = entry;
+      for (const d of (result.dispatched ?? [])) dispatched.push({ ...d, repo });
+      for (const r of (result.refusals ?? [])) refusals.push({ ...r, repo });
+      for (const r of (result.reconcileRefusalDetails ?? [])) reconcileRefusals.push({ ...r, repo });
     }
-    const { repo, result } = entry;
-    for (const d of (result.dispatched ?? [])) dispatched.push({ ...d, repo });
-    for (const r of (result.refusals ?? [])) refusals.push({ ...r, repo });
-    for (const r of (result.reconcileRefusalDetails ?? [])) reconcileRefusals.push({ ...r, repo });
-  }
-  return {
-    repos: perRepo, dispatched, refusals, reconcileRefusals,
+    return {
+      repos: perRepo, dispatched, refusals, reconcileRefusals,
+    };
   };
+  return atSafePoints ? collected.then(aggregate) : aggregate(collected);
 }
 
 /**
@@ -243,8 +246,10 @@ export async function runReconcileCiHealDispatchAllRepos({ repos = FIX_DISPATCH_
       const result = await tick({ ...tickOpts, repo });
       perRepo.push({ repo, result });
     } catch (e) {
+      if (e instanceof SafePointRestart || e instanceof SafePointAbort) throw e;
       perRepo.push({ repo, error: String((e && e.message) || e).split('\n')[0] });
     }
+    await safePoint(`ci-heal:${repo}`);
   }
   const dispatched = [];
   const refusals = [];
@@ -291,26 +296,29 @@ export async function runReconcileCiHealDispatchAllRepos({ repos = FIX_DISPATCH_
  *   refusals:Array<object>, reconcileRefusals:Array<object>}} same shape as
  *   {@link runReconcileCiHealDispatchAllRepos}'s own return, repo-tagged the same way.
  */
-export function runPromoteDraftDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcilePromoteDraftDispatch, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
-  const dispatched = [];
-  const refusals = [];
-  const reconcileRefusals = [];
-  for (const entry of perRepo) {
-    if (entry.error) {
-      // Prefixed so the whole-pass tick-failed line names THIS half (the fix half's own per-repo error line
-      // would otherwise read identically and hide that the promote half failed too).
-      refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: `promote-draft half: ${entry.error}` });
-      continue;
+export function runPromoteDraftDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcilePromoteDraftDispatch, atSafePoints = false, ...tickOpts } = {}) {
+  const collected = (atSafePoints ? forEachRepoAtSafePoints : forEachRepo)(repos, (repo) => tick({ ...tickOpts, repo }));
+  const aggregate = (perRepo) => {
+    const dispatched = [];
+    const refusals = [];
+    const reconcileRefusals = [];
+    for (const entry of perRepo) {
+      if (entry.error) {
+        // Prefixed so the whole-pass tick-failed line names THIS half (the fix half's own per-repo error line
+        // would otherwise read identically and hide that the promote half failed too).
+        refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: `promote-draft half: ${entry.error}` });
+        continue;
+      }
+      const { repo, result } = entry;
+      for (const d of (result.dispatched ?? [])) dispatched.push({ ...d, repo });
+      for (const r of (result.refusals ?? [])) refusals.push({ ...r, repo });
+      for (const r of (result.reconcileRefusalDetails ?? [])) reconcileRefusals.push({ ...r, repo });
     }
-    const { repo, result } = entry;
-    for (const d of (result.dispatched ?? [])) dispatched.push({ ...d, repo });
-    for (const r of (result.refusals ?? [])) refusals.push({ ...r, repo });
-    for (const r of (result.reconcileRefusalDetails ?? [])) reconcileRefusals.push({ ...r, repo });
-  }
-  return {
-    repos: perRepo, dispatched, refusals, reconcileRefusals,
+    return {
+      repos: perRepo, dispatched, refusals, reconcileRefusals,
+    };
   };
+  return atSafePoints ? collected.then(aggregate) : aggregate(collected);
 }
 
 /**
@@ -1207,11 +1215,13 @@ export async function runTickAllRepos({
     try { return await orphanGuardTick({ env: process.env, nowMs: now() }) ?? { rows: [] }; }
     catch (e) { return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] }; }
   });
-  const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
+  await safePoint('orphan-guard');
+  const fix = await timedAsync('fix', () => (authGate.paused ? pausedDispatchResult()
+    : runReconcileFixDispatchAllRepos({ atSafePoints: true, repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   planCache?.markTouched(fix);
+  await safePoint('fix');
   // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
   // The hooks cannot interrupt in-flight work or bound discovery/endFix/release IO.
   const stuckFixers = await timedAsync('stuck-fixers', async () => {
@@ -1242,6 +1252,7 @@ export async function runTickAllRepos({
       ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
   ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
   planCache?.markTouched(ciHeal);
+  await safePoint('ci-heal');
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
   planCache?.markTouched(hungCi);
@@ -1259,7 +1270,8 @@ export async function runTickAllRepos({
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
-  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
+  const promoteDraft = await timedAsync('promote-draft', () => runPromoteDraftDispatchAllRepos({ atSafePoints: true, repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
+  await safePoint('promote-draft');
   promoteDraft.budgetSkipped = budgets['promote-draft'].skipped;
   planCache?.markTouched(promoteDraft);
   // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus

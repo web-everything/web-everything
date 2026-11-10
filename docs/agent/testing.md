@@ -4109,3 +4109,17 @@ job/lock outcomes, including persisted request retention. `daemon-self-sync-muta
 requires failed/refused mutations to remain pending and retry on the next tick; only a completed
 mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.
+
+
+## Daemon phase safe points
+
+Use the exported `safePoint(label)` from `daemon-self-sync.mjs` only after a complete phase or repo
+has finished its dispatch and state writes. Parallel repo workers must all settle before yielding.
+The default tick installs an async-context handler while holding its read slot; POC and versioned ticks
+do not install one. Keep `SafePointRestart` and `SafePointAbort` out of best-effort error buckets:
+repo isolation must rethrow them to the self-sync wrapper. Safe-point adoption uses `adoptReadyOnly`
+with the finalize lock wait and re-reads the overlay registry under the write lock, without fetching,
+planning or starting a build. A successful adoption always ends the current tick: restart when the gate
+allows it, otherwise return a skipped tick without reacquiring the read slot or running the tick tail.
+An unsuccessful adoption reacquires the read slot before continuing; a refused read ends the tick. Pin these guarantees with injected lock/rebuild effects and the focused
+`daemon-self-sync-safepoint`, `daemon-safepoint-wiring` and `rebuild-abort-overlay-removed` tests.

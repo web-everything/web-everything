@@ -33,7 +33,7 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
  * @param {{ready:object|null, plan:object, prevHead:string, treeOf:(sha:string)=>string|null,
  *   stillWanted:(ref:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
  *   overlayTip?:(ref:string)=>string|null, registered?:(ref:string)=>boolean, allowFallback?:boolean,
- *   rejected?:object|null, nowMs:number, maxAgeMs:number, forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
+ *   rejected?:object|null, nowMs:number, maxAgeMs:number, requireVerified?:boolean, forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
  *   `registered`: still on the overlay list after this tick's own edits (defaults to `stillWanted`); `allowFallback: false`
  *   (a mainOnly rebuild) refuses any fallback; `forcedWatch` (R508): the state of the rollback watch a FORCED record needs
  *   (default `'missing'`, so a forced record is never adopted without proof of its watch).
@@ -42,7 +42,7 @@ export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
-  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing',
+  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', requireVerified = false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -77,6 +77,8 @@ export function matchReadyCandidate({
       ? { adopt: null, reason: 'fallback-inputs-moved' }
       : { adopt: ready.adopt, dropRefs, failed: ready.failed || '', match: 'fallback-main-moved' };
   }
+  if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+  if (requireVerified && !verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
   if (plan.finalSha === ready.adopt.finalSha) return { adopt: ready.adopt, dropRefs: [], match: 'exact' };
   const planTree = treeOf(plan.finalSha);
   if (planTree && ready.tree && planTree === ready.tree) {

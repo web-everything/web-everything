@@ -22,7 +22,7 @@ import {
 import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
-import { prepareRebuild } from './prepare.mjs';
+import { prepareRebuild, adoptReadyRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
@@ -86,7 +86,7 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
- *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
+ *   mainOnly?:boolean, admissionWaitMs?:number, adoptReadyOnly?:boolean, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
  * @returns {Promise<object>}
@@ -123,7 +123,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
  *  clone to the last-good build on a failed check or a crash loop. Never throws; the job process (readyOnly) skips it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
   const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false } = options;
-  if (!root || readyOnly) return;
+  if (!root || readyOnly || options.adoptReadyOnly) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
     await runForceWatchTick({
@@ -175,8 +175,19 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners,
+  asJob, admissionWaitMs, adoptReadyOnly = false, spawnerOwners = defaultSpawnerOwners,
 } = {}) {
+  if (adoptReadyOnly) {
+    // Same finalize wait setting as tick-start adoption, with no starvation escalation.
+    const waitMs = lockOpts.waitMs ?? (Number(env?.[FINALIZE_LOCK_WAIT_ENV]) > 0
+      ? Number(env[FINALIZE_LOCK_WAIT_ENV]) : DEFAULT_FINALIZE_LOCK_WAIT_MS);
+    const locked = await withWriteLock(root, () => adoptReadyRebuild({ root, env, log, run, stateOpts, mainOnly, now }), {
+      ...(env?.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {}),
+      ...lockOpts, now, waitMs, ...(sleep ? { sleep } : {}),
+    });
+    return locked.ok ? { ...locked.value.result, alerts: locked.value.alerts }
+      : { moved: false, reason: locked.reason };
+  }
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.

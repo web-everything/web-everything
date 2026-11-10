@@ -1,3 +1,4 @@
+import { safePoint, SafePointRestart, SafePointAbort } from './daemon-self-sync.mjs';
 /**
  * @file scripts/lib/for-each-repo.mjs
  * @description `forEachRepo` — the shared per-repo loop, extracted from
@@ -31,8 +32,23 @@ export function forEachRepo(repos, fn) {
     try {
       out.push({ repo, result: fn(repo) });
     } catch (e) {
+      if (e instanceof SafePointRestart || e instanceof SafePointAbort) throw e;
       out.push({ repo, error: String((e && e.message) || e).split('\n')[0] });
     }
+  }
+  return out;
+}
+
+/** Sequential: the previous repo's dispatch and writes have finished before yielding. */
+export async function forEachRepoAtSafePoints(repos, fn, label = 'repo') {
+  const out = [];
+  for (const repo of repos) {
+    try { out.push({ repo, result: await fn(repo) }); }
+    catch (error) {
+      if (error instanceof SafePointRestart || error instanceof SafePointAbort) throw error;
+      out.push({ repo, error: String(error?.message ?? error).split('\n')[0] });
+    }
+    await safePoint(`${label}:${repo}`);
   }
   return out;
 }

@@ -126,9 +126,9 @@ import { mintSessionSlug } from '../../scripts/conveyor/session-slug.mjs';
 import { freeLaneNumbers } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
-import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
+import { forEachRepo, forEachRepoAtSafePoints } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
-import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
+import { withSelfSync, safePoint, SafePointRestart, SafePointAbort } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents, makeDrainNudgeForward } from '../../scripts/lib/pr-events.mjs';
 import { makePoolExhaustionLogger } from '../../scripts/conveyor/pool-exhaustion.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
@@ -880,7 +880,7 @@ export function sharedHostBudget(hostAdmission) {
   };
 }
 
-export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
+export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, atSafePoints = false, ...tickOpts } = {}) {
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -893,68 +893,71 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
   // the per-tick cap is host-wide (never cap × repos).
   if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission);
-  const perRepo = forEachRepo(repos, (repo) => {
+  const collected = (atSafePoints ? forEachRepoAtSafePoints : forEachRepo)(repos, (repo) => {
     const started = Date.now();
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
     finally { perRepoMs[repo] = Date.now() - started; }
   });
-  const dispatched = [];
-  const failed = [];
-  const notStarted = [];
-  const pendingNotDispatched = [];
-  // #xvzwiew — a RECONCILE-PHASE failure (`runReviewTick` now catches it and returns `reconcileError` instead
-  // of throwing) reports through this SEPARATE bucket, never folded into `failed` as a bogus `prNumber: null`
-  // dispatch failure — no PR was ever identified for a repo whose reconcile crashed, so reporting it as if a
-  // specific review dispatch failed was always misleading. `entry.error` below (a whole-tick throw `tick`
-  // itself never caught — the genuinely-unexpected case) still reports through `failed`/`repos[].error`,
-  // unchanged: that safety net is orthogonal to this and stays in place.
-  const reconcileFailed = [];
-  // #x01u7az — the review-hold reconcile sweep runs INDEPENDENTLY of `reconcile`'s own plan inside
-  // `runReviewTick` (it populates both the normal AND the early-`reconcileError`-return shape), so it is
-  // aggregated here BEFORE the `reconcileError` continue below, never skipped alongside the dispatch/refusal
-  // data a failed reconcile genuinely has none of.
-  const holdReconcileRemoved = [];
-  const holdReconcileFailed = [];
-  let reviewsOwed = 0;
-  let refusals = 0;
-  let deferredForLanes = 0;
-  let deferredForCap = 0;
-  let deferredForCapReason = null;
-  let deferredForAuth = 0;
-  const liveProcessPrs = [];
-  const operatorHoldSnapshots = [];
-  for (const entry of perRepo) {
-    if (entry.error) {
-      failed.push({ prNumber: null, repo: entry.repo, error: entry.error });
-      continue;
+  const aggregate = (perRepo) => {
+    const dispatched = [];
+    const failed = [];
+    const notStarted = [];
+    const pendingNotDispatched = [];
+    // #xvzwiew — a RECONCILE-PHASE failure (`runReviewTick` now catches it and returns `reconcileError` instead
+    // of throwing) reports through this SEPARATE bucket, never folded into `failed` as a bogus `prNumber: null`
+    // dispatch failure — no PR was ever identified for a repo whose reconcile crashed, so reporting it as if a
+    // specific review dispatch failed was always misleading. `entry.error` below (a whole-tick throw `tick`
+    // itself never caught — the genuinely-unexpected case) still reports through `failed`/`repos[].error`,
+    // unchanged: that safety net is orthogonal to this and stays in place.
+    const reconcileFailed = [];
+    // #x01u7az — the review-hold reconcile sweep runs INDEPENDENTLY of `reconcile`'s own plan inside
+    // `runReviewTick` (it populates both the normal AND the early-`reconcileError`-return shape), so it is
+    // aggregated here BEFORE the `reconcileError` continue below, never skipped alongside the dispatch/refusal
+    // data a failed reconcile genuinely has none of.
+    const holdReconcileRemoved = [];
+    const holdReconcileFailed = [];
+    let reviewsOwed = 0;
+    let refusals = 0;
+    let deferredForLanes = 0;
+    let deferredForCap = 0;
+    let deferredForCapReason = null;
+    let deferredForAuth = 0;
+    const liveProcessPrs = [];
+    const operatorHoldSnapshots = [];
+    for (const entry of perRepo) {
+      if (entry.error) {
+        failed.push({ prNumber: null, repo: entry.repo, error: entry.error });
+        continue;
+      }
+      const { repo, result } = entry;
+      for (const h of (result?.holdReconcile ?? [])) holdReconcileRemoved.push({ ...h, repo });
+      if (result?.holdReconcileError) holdReconcileFailed.push({ repo, error: result.holdReconcileError });
+      if (result?.reconcileError) {
+        reconcileFailed.push({ repo, error: result.reconcileError });
+        continue; // no dispatch/refusal data — reconcile never produced a plan this tick
+      }
+      reviewsOwed += result.reviewsOwed;
+      refusals += result.refusals;
+      deferredForLanes += result.deferredForLanes ?? 0;
+      deferredForCap += result.deferredForCap ?? 0;
+      if (result.deferredForCapReason) deferredForCapReason = result.deferredForCapReason;
+      deferredForAuth += result.deferredForAuth ?? 0;
+      for (const d of result.dispatched) dispatched.push({ ...d, repo });
+      for (const k of (result.notStarted ?? [])) notStarted.push({ ...k, repo });
+      for (const p of (result.pendingNotDispatched ?? [])) pendingNotDispatched.push({ ...p, repo });
+      for (const f of result.failed) failed.push({ ...f, repo });
+      for (const prNumber of (result.liveProcessPrs ?? [])) liveProcessPrs.push({ repo, prNumber });
+      if (result.operatorHolds) operatorHoldSnapshots.push({ repo, ...result.operatorHolds });
     }
-    const { repo, result } = entry;
-    for (const h of (result?.holdReconcile ?? [])) holdReconcileRemoved.push({ ...h, repo });
-    if (result?.holdReconcileError) holdReconcileFailed.push({ repo, error: result.holdReconcileError });
-    if (result?.reconcileError) {
-      reconcileFailed.push({ repo, error: result.reconcileError });
-      continue; // no dispatch/refusal data — reconcile never produced a plan this tick
-    }
-    reviewsOwed += result.reviewsOwed;
-    refusals += result.refusals;
-    deferredForLanes += result.deferredForLanes ?? 0;
-    deferredForCap += result.deferredForCap ?? 0;
-    if (result.deferredForCapReason) deferredForCapReason = result.deferredForCapReason;
-    deferredForAuth += result.deferredForAuth ?? 0;
-    for (const d of result.dispatched) dispatched.push({ ...d, repo });
-    for (const k of (result.notStarted ?? [])) notStarted.push({ ...k, repo });
-    for (const p of (result.pendingNotDispatched ?? [])) pendingNotDispatched.push({ ...p, repo });
-    for (const f of result.failed) failed.push({ ...f, repo });
-    for (const prNumber of (result.liveProcessPrs ?? [])) liveProcessPrs.push({ repo, prNumber });
-    if (result.operatorHolds) operatorHoldSnapshots.push({ repo, ...result.operatorHolds });
-  }
-  return {
-    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap, deferredForCapReason,
-    deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
-    holdReconcile: holdReconcileRemoved, holdReconcileFailed,
-    operatorHoldSnapshots,
-    liveProcessPrs, // #3383 follow-up — see `runReviewTick`'s own field for the why; consumed by `buildCliDaemonEffects`
+    return {
+      repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap, deferredForCapReason,
+      deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
+      holdReconcile: holdReconcileRemoved, holdReconcileFailed,
+      operatorHoldSnapshots,
+      liveProcessPrs, // #3383 follow-up — see `runReviewTick`'s own field for the why; consumed by `buildCliDaemonEffects`
+    };
   };
+  return atSafePoints ? collected.then(aggregate) : aggregate(collected);
 }
 
 /**
@@ -1063,16 +1066,21 @@ export async function runConvertAdvisoryTickAllRepos({
   const perRepo = new Array(repos.length);
   const limit = Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8
     ? concurrency : resolveReviewTickSharing().repoConcurrency;
-  let next = 0;
-  const worker = async () => {
-    while (next < repos.length) {
-      const index = next++;
-      const repo = repos[index];
+  for (let start = 0; start < repos.length; start += limit) {
+    const batch = repos.slice(start, start + limit);
+    const settled = await Promise.allSettled(batch.map(async (repo, offset) => {
+      const index = start + offset;
       try { perRepo[index] = { repo, result: await tick({ ...tickOpts, repo }) }; }
-      catch (e) { perRepo[index] = { repo, error: String((e && e.message) || e).split('\n')[0] }; }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, repos.length) }, worker));
+      catch (e) {
+        if (e instanceof SafePointRestart || e instanceof SafePointAbort) throw e;
+        perRepo[index] = { repo, error: String(e?.message ?? e).split('\n')[0] };
+      }
+    }));
+    // Never unwind while another worker is still posting a result.
+    const failed = settled.find((r) => r.status === 'rejected');
+    if (failed) throw failed.reason;
+    await safePoint('convert-repos');
+  }
   let convertAdvisoriesOwed = 0;
   const posted = [];
   const skipped = [];
@@ -1695,7 +1703,7 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
   reviewTickOpts = cliReviewTickOpts,
-  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log, factCache }), ...opts }),
+  runReview = (opts) => runReviewTickAllRepos({ atSafePoints: true, tick, ...reviewTickOpts({ log, factCache }), ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).
@@ -1749,16 +1757,20 @@ export function buildCliDaemonEffects({
       try {
         sessionReap = reapSessions({ priorityNames });
       } catch (e) {
+        if (e instanceof SafePointRestart || e instanceof SafePointAbort) throw e;
         log.error(`review-daemon: session-reap failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
       phaseMs.reap = Date.now() - phaseStarted;
+      await safePoint('reap');
       phaseStarted = Date.now();
       const warm = await warmReviewFacts(REVIEW_DAEMON_REPOS); // once a tick: refresh the facts mirror from the Worker (not GitHub)
       log.error(`review-daemon: pr-facts ${warm.skipped ? `off (${warm.skipped})` : (warm.warmed ?? []).map((w) => `${w.repo.split('/')[1]}=${w.ok ? 'store' : `github (${w.reason})`}`).join(' ')}`);
       phaseMs.facts = Date.now() - phaseStarted;
+      await safePoint('facts');
       phaseStarted = Date.now();
       const result = await runReview({ plans, onPlan });
       phaseMs.review = Date.now() - phaseStarted;
+      await safePoint('review');
       // Refreshed for the NEXT tick's own reap call, above — always recomputed from THIS tick's fresh
       // discovery, never accumulated, so a PR that frees up (or a new one that blocks) is reflected within
       // one 120s cycle either way.
@@ -1772,6 +1784,7 @@ export function buildCliDaemonEffects({
         try {
           convertAdvisory = await runConvertAdvisories({ plans: sharing.reusePlan ? plans : null, concurrency: sharing.repoConcurrency });
         } catch (e) {
+        if (e instanceof SafePointRestart || e instanceof SafePointAbort) throw e;
           log.error(`review-daemon: convert-advisory tick failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
         }
       } else {
@@ -1779,14 +1792,17 @@ export function buildCliDaemonEffects({
       }
       // card x5f2daz — its OWN best-effort stage, same discipline as convert-advisory above.
       phaseMs.convert = Date.now() - phaseStarted;
+      await safePoint('convert');
       phaseStarted = Date.now();
       let prepReview = null;
       try {
         prepReview = await runPrepReview();
       } catch (e) {
+        if (e instanceof SafePointRestart || e instanceof SafePointAbort) throw e;
         log.error(`review-daemon: prep-review stage failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
       phaseMs.prep = Date.now() - phaseStarted;
+      await safePoint('prep');
       let cacheTiming = '';
       if (factCache) {
         const stats = factCache.stats();
