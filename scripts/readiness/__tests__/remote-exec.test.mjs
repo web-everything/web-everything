@@ -1126,6 +1126,7 @@ describe('runRemote', () => {
     expect(result.detail).toContain('[masked]');
     const short = remoteManifestAPI.forgeFailureTail('npm ERR! password=hunter2 and Authorization: Bearer abc123 x_token: s3cret; path /opt/forge/cache ok');
     expect(short).not.toMatch(/hunter2|abc123|s3cret/);
+    expect(remoteManifestAPI.forgeFailureTail('password="two words here" tail')).toBe('[masked] tail');
     expect(short).toContain('/opt/forge/cache');
     expect(log).toHaveBeenCalledWith('forge install failed: '+result.detail+'\n');
   });
