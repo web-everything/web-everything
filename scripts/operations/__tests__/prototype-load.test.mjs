@@ -401,6 +401,16 @@ describe('prototype-load ruled-WEAKENED admission', () => {
       expect(await f.run()).toMatchObject({ ok: false, detail: 'ruled-weakened-findings-mismatch' });
     } finally { warning.mockRestore(); }
   });
+  it('R850: a carried head\'s WEAKENED record without its own fingerprint is still disclosed-checked', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const FPX = 'e'.repeat(64), H = 'd'.repeat(40);
+      const f = auditedFixture('refuse', { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, auditBaseInMain: TREE, fingerprint: () => FPX, audits: auditLines([
+        auditRecord({ verdict: 'WEAKENED', findings }), auditRecord({ head: H, fingerprint: FPX }),
+        auditRecord({ verdict: 'WEAKENED', head: H, base: 'f'.repeat(40), at: '2026-10-25T12:00:00Z', findings: ['x.mjs:9 carried weakening'] })]) });
+      expect(await f.run()).toMatchObject({ ok: false, detail: 'ruled-weakened-findings-mismatch' });
+    } finally { warning.mockRestore(); }
+  });
   it('R850: a ruled exception with a canonical WEAKENED record loads in the default (refuse) mode', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {

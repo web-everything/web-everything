@@ -425,8 +425,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const ownWeakenedAll = ownBases.map((base) => findAudit(auditRecords, { head: input.sha, base, questionHash: QUESTION_HASH }))
         .filter((r) => r?.verdict === 'WEAKENED' && covers(r.base)).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
       // Conservative: EVERY WEAKENED record of this head (any base, any order, valid or not) must be disclosed by the ruling.
+      const carriedHeads = new Set(!ruledGate || !liveFp ? [] : auditRecords.filter((r) => r && r.fingerprint === liveFp).map((r) => String(r.head).toLowerCase()));
       const rawLatestWeak = !ruledGate ? [] : auditRecords.filter((r) => r && r.verdict === 'WEAKENED'
-        && (String(r.head).toLowerCase() === lcSha || (liveFp && r.fingerprint === liveFp)));
+        && (String(r.head).toLowerCase() === lcSha || carriedHeads.has(String(r.head).toLowerCase())));
       const ownWeakened = ownWeakenedAll[0];
       if (out.gate.ruledWeakened) {
         const ruled = out.gate.ruledWeakened.findings;
