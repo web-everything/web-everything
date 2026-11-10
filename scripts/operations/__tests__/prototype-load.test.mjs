@@ -2230,6 +2230,24 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
     }
   });
+  // R503 red team round 5: a successful exact-sha load names only its own sha, so no live fingerprint is computed;
+  // the readiness it appends must keep the stored fingerprint or the next rebase of the same code cannot carry.
+  it('an exact-sha load keeps the stored fingerprint so a later rebase still carries', async () => {
+    const stored = 'e'.repeat(64), rebased = '9'.repeat(40);
+    const ready = auditLines([{ ref: BASE.branch, sha: SHA, fingerprint: stored, tests: 'green', audit: 'NOT WEAKENED' }]);
+    const audits = auditLines([auditRecord({ fingerprint: stored })]);
+    const first = auditedFixture('refuse', { ready, audits, auditBaseInMain: TREE, fingerprint: () => stored });
+    expect(await first.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    expect(first.readyWrites.at(-1)).toMatchObject({ sha: SHA, fingerprint: stored });
+    const appended = first.readyWrites.map(({ path, ...record }) => record);
+    const second = auditedFixture('refuse', { sha: rebased, ready: ready + auditLines(appended), audits, auditBaseInMain: TREE, fingerprint: () => stored });
+    expect(await second.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    // Unreadable or different live code still refuses: the inherited fingerprint never loosens the carry.
+    for (const fingerprint of [() => '1'.repeat(64), () => null]) {
+      const other = auditedFixture('refuse', { sha: rebased, ready: ready + auditLines(appended), audits, auditBaseInMain: TREE, fingerprint });
+      expect(await other.run()).toMatchObject({ ok: false });
+    }
+  });
 });
 
 // R503 part 3 — ready records and ruledWeakened entries carry to the live tip when the net-diff fingerprint matches.
