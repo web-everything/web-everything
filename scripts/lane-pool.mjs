@@ -2747,7 +2747,7 @@ async function cmdAcquire(repo) {
           // there and retried on every acquire instead of being persistently quarantined.
           requireReadableLaneHistory(repo, pick);
           const work = acquireBlockingWork(repo, laneDir(repo, pick));
-          if (work.commits !== '') throw new Error(`lane-${pick} holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
+          if (work.commits !== '') throw new Error(`lane-${pick} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
           // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
@@ -2902,7 +2902,7 @@ async function cmdAcquire(repo) {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       if (!targetWasReserved) {
         const work = acquireBlockingWork(repo, dir);
-        if (work.commits !== '') throw new Error(`lane-${chosen} holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
+        if (work.commits !== '') throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
       }
       provisionClaimedLane(repo, chosen, targetWasReserved);
     } catch (e) {
