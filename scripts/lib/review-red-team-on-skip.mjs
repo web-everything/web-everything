@@ -850,12 +850,14 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 // settleRedTeamSkip reaches this only once it decided policy-clear and the head shows no result.
                 postComment: ({ repo, pr, body }) => {
                   // settleRedTeamSkip bounds its reason to 80 chars for the needs-you feed, which would cut a yield's
-                  // `detail` (the one fail-open case) out of the row. Keep the full publish failure for the row.
-                  try { publishPolicyClearCheck(pr, row.head); }
-                  catch (error) { publishFailure = safeErrorText(error); throw error; }
-                  return runGhSync([
-                    'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
-                  ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
+                  // `detail` (the one fail-open case) or a comment failure's cause out of the row. Keep the full
+                  // failure text for the row; the feed keeps its bound.
+                  try {
+                    publishPolicyClearCheck(pr, row.head);
+                    return runGhSync([
+                      'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+                    ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
+                  } catch (error) { publishFailure = safeErrorText(error); throw error; }
                 },
                 publishNeedsYou: publishAttention,
               } });
