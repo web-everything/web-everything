@@ -93,18 +93,24 @@ function releaseLock(lock, token, fsApi) {
  *  never stays in the ledger (the reader would otherwise drop or misread it), and report the failure. */
 function appendAll(fd, buf, fsApi) {
   let start;
+  let done = 0;
   try { start = fsApi.fstatSync(fd).size; } catch (e) { return { ok: false, error: `write failed: cannot stat ledger: ${e.message}` }; }
   try {
-    let off = 0;
-    while (off < buf.length) {
-      const n = fsApi.writeSync(fd, buf, off, buf.length - off);
-      if (!Number.isInteger(n) || n <= 0) throw new Error(`short write: ${off} of ${buf.length} bytes`);
-      off += n;
+    while (done < buf.length) {
+      const n = fsApi.writeSync(fd, buf, done, buf.length - done);
+      if (!Number.isInteger(n) || n <= 0) throw new Error(`short write: ${done} of ${buf.length} bytes`);
+      done += n;
     }
     return { ok: true };
   } catch (e) {
+    // Cut back only our own partial bytes. If anything else appended meanwhile (a hand edit, a writer that ignores the
+    // lock), truncating would destroy its data, so leave the file alone and say so.
     let cut = 'ledger cut back to its previous length';
-    try { fsApi.ftruncateSync(fd, start); } catch (t) { cut = `ledger NOT cut back: ${t.message}`; }
+    try {
+      const size = fsApi.fstatSync(fd).size;
+      if (size === start + done) fsApi.ftruncateSync(fd, start);
+      else cut = `ledger NOT cut back: another writer appended (expected ${start + done} bytes, found ${size}); a torn line may remain`;
+    } catch (t) { cut = `ledger NOT cut back: ${t.message}`; }
     return { ok: false, error: `write failed: ${e.message}; ${cut}` };
   }
 }
@@ -122,9 +128,12 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
   const built = buildReadyRecord(input);
   if (!built.ok) return built;
   const { ref, sha } = built.record;
-  const line = JSON.stringify(built.record);
-  const canon = (r) => JSON.stringify(Object.fromEntries(Object.entries(r).sort(([a], [b]) => (a < b ? -1 : 1))));
-  const want = canon(built.record);
+  // The adoption matrix drops any line without a valid ISO `at`, so every written record carries one. `at` is a
+  // write-time stamp, not part of the record's identity: the duplicate check ignores it.
+  const record = { ...built.record, at: new Date(now()).toISOString() };
+  const line = JSON.stringify(record);
+  const canon = ({ at: _at, ...r }) => JSON.stringify(Object.fromEntries(Object.entries(r).sort(([a], [b]) => (a < b ? -1 : 1))));
+  const want = canon(record);
   // Key order and sha case in a hand-written ledger line must not hide an identical record.
   const isDuplicate = (text) => { const prior = latestFor(text, ref, sha); return !!prior && canon({ ...prior, sha }) === want; };
   const duplicate = { ok: false, error: `duplicate: an identical latest record for ${ref}@${sha} already exists` };
@@ -150,7 +159,7 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
       const written = appendAll(fd, Buffer.from(`${prefix}${line}\n`), fsApi);
       if (!written.ok) return { ok: false, error: written.error };
     } finally { fsApi.closeSync(fd); }
-    return { ok: true, record: built.record, file };
+    return { ok: true, record, file };
   } finally {
     releaseLock(lock, token, fsApi);
   }

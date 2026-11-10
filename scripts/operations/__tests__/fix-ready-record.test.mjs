@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildReadyRecord, writeReadyRecord, readyRecordPath, adoptionReaderPath, parseArgs, main } from '../fix-ready-record.mjs';
 import { createAdoptionMatrixReader } from '../adoption-matrix-io.mjs';
+import { parseFixReadyLines } from '../adoption-matrix.mjs';
 import { jsonLines, readyEvidence } from '../prototype-load.mjs';
 
 const sha = 'b7bb8b2743e5c582d44e22e71a40f9e23ae07f6b';
@@ -84,6 +85,33 @@ describe('fix-ready-record', () => {
     const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
     expect(r.ok).toBe(true);
     expect(readFileSync(file, 'utf8')).toBe(`${JSON.stringify(r.record)}\n`);
+  });
+  it('does not cut the ledger back over bytes another writer appended meanwhile', () => {
+    const file = tmp();
+    writeFileSync(file, 'old\n');
+    const fsApi = {
+      ...fs,
+      writeSync: (fd, buf, off = 0) => {
+        fs.writeSync(fd, buf, off, 5); // our partial bytes
+        fs.writeSync(fd, 'FOREIGN\n'); // someone else appends before we fail
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      },
+    };
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/NOT cut back: another writer appended/);
+    expect(readFileSync(file, 'utf8')).toMatch(/FOREIGN\n$/);
+  });
+  it('writes an ISO `at` the adoption matrix accepts, and ignores `at` when spotting a duplicate', () => {
+    const file = tmp();
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => Date.parse('2026-11-10T13:00:00Z') });
+    expect(r.record.at).toBe('2026-11-10T13:00:00.000Z');
+    const incomplete = [];
+    expect(parseFixReadyLines(readFileSync(file, 'utf8'), { onIncomplete: (x) => incomplete.push(x) })).toEqual([{ ref, at: '2026-11-10T13:00:00.000Z', sha }]);
+    expect(incomplete).toEqual([]);
+    const dup = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => Date.parse('2026-11-10T14:00:00Z') });
+    expect(dup.error).toMatch(/duplicate/);
+    expect(readyEvidence(jsonLines(readFileSync(file, 'utf8')), { branch: ref, sha }, []).source).toBe('ready-record');
   });
   it('refuses and cuts the ledger back when a write fails part-way, leaving no torn line', () => {
     const file = tmp();
@@ -311,7 +339,7 @@ describe('fix-ready-record main()', () => {
     const { log } = quiet();
     const file = tmp();
     expect(main([`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'], { file })).toBe(0);
-    expect(jsonLines(readFileSync(file, 'utf8'))).toEqual([{ ref, sha, tests: 'green', audit: 'NOT WEAKENED' }]);
+    expect(jsonLines(readFileSync(file, 'utf8'))).toEqual([{ ref, sha, tests: 'green', audit: 'NOT WEAKENED', at: expect.any(String) }]);
     expect(log.mock.calls[0][0]).toMatch(/wrote lane\/example@/);
   });
   it('reads a WEAKENED record\'s disclosed findings from --auditDisclosed-file', () => {
@@ -320,7 +348,7 @@ describe('fix-ready-record main()', () => {
     const disclosed = tmp();
     writeFileSync(disclosed, JSON.stringify(findings));
     expect(main([`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=WEAKENED', '--auditRuling=R816', `--auditDisclosed-file=${disclosed}`], { file })).toBe(0);
-    expect(jsonLines(readFileSync(file, 'utf8'))[0]).toEqual({ ref, sha, tests: 'green', audit: 'WEAKENED', auditRuling: 'R816', auditDisclosed: findings });
+    expect(jsonLines(readFileSync(file, 'utf8'))[0]).toEqual({ ref, sha, tests: 'green', audit: 'WEAKENED', auditRuling: 'R816', auditDisclosed: findings, at: expect.any(String) });
   });
   it('exits 2 for a missing or malformed --auditDisclosed-file and writes nothing', () => {
     const { err } = quiet();

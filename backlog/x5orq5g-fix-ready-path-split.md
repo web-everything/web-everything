@@ -18,7 +18,8 @@ The fix-ready ledger has two readers with two path rules: prototype-load reads s
 - [A2] **Must** — with the shipped defaults, `readyRecordPath()` and the path the real `createAdoptionMatrixReader` asks for are the same file (test: "shipped defaults resolve to the very file the adoption matrix reads").
 - [A3] **Must** — `main()` refuses with exit 1, writes nothing and names both files when `WE_FIX_READY_PATH` or `fixReadyPath` points the adoption matrix at a different file (test: "main refuses (exit 1) when an override sends the adoption matrix to a different file").
 - [A4] **Must** — unreadable or malformed adoption-matrix settings fail closed with exit 2 and write nothing (test: "main fails closed (exit 2) when the adoption-matrix settings cannot be read").
-- [A5] **Must** — a write that is short, throws or makes no progress never leaves a torn line: the ledger is cut back to its previous length and the writer reports failure (tests: "finishes a short write…", "refuses and cuts the ledger back when a write fails part-way…").
+- [A5] **Must** — a write that is short, throws or makes no progress never leaves a torn line: the ledger is cut back to its previous length and the writer reports failure; if another writer appended meanwhile it is NOT cut back and the error says so (tests: "finishes a short write…", "refuses and cuts the ledger back when a write fails part-way…", "does not cut the ledger back over bytes another writer appended meanwhile").
+- [A6] **Must** — every written record carries an ISO `at`, because the adoption matrix drops a line without one as malformed; the duplicate check ignores `at` (test: "writes an ISO `at` the adoption matrix accepts…", which feeds the writer's output to the real `parseFixReadyLines`).
 
 ## Non-goals
 
@@ -30,12 +31,12 @@ The fix-ready ledger has two readers with two path rules: prototype-load reads s
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — n/a: the path comes from the operator's environment and settings files, not from record content; ref and sha validation is unchanged.
-2. **Truncated reads** — n/a: this item reads only small settings files; the ledger read is unchanged. The write side is covered by A5 (short write cut back).
-3. **Shared state files** — the ledger append stays under the existing lock; a failed write is truncated back while the lock is still held (A5).
+2. **Truncated reads** — the adoption matrix reader tails only the last 1 MiB of the ledger by its own design, so very old records fall out of its view; that is the reader's bound, not changed here. This item reads only small settings files; the ledger read is unchanged. The write side is covered by A5 (short write cut back).
+3. **Shared state files** — the ledger append stays under the existing lock; a failed write is truncated back while the lock is still held, but only if the file is exactly as this writer left it; a writer that ignores the lock (a hand edit) is never truncated over (A5).
 4. **Fail closed** — an unresolvable path or unreadable adoption-matrix settings refuse with exit 2; a path split refuses with exit 1 (A3, A4).
 5. **Identity scoping** — n/a: one operator ledger; no per-user or per-repo identity involved.
 6. **State over time** — settings and environment are read on each run, so a changed override is seen at once; no cached path.
-7. **Who wrote it** — n/a: the ledger is a local operator file; no trust marker is read or written here.
+7. **Who wrote it** — n/a: the ledger is a local operator file; no trust marker is read or written here. The record shape the reader accepts (`at`) is A6.
 
 ## Test plan
 
