@@ -89,7 +89,7 @@ describe('credentialContentFinding test-file code expression opaque tokens', () 
     ['adjacent quoted pieces', `f('${literal.slice(0, 12)}','${literal.slice(12)}')`],
     ['quoted pieces after a call', `f(a) + '${literal.slice(0, 12)}' + '${literal.slice(12)}'`],
     ['array join of pieces', `f(['${literal.slice(0, 12)}', '${literal.slice(12)}'].join(''))`],
-    ['zero-width split token', `f(${literal.slice(0, 12)}​${literal.slice(12)})`],
+    ['zero-width split token', `f(${literal.slice(0, 12)}\u200B${literal.slice(12)})`],
     ['piece hidden behind a call-like quoted fragment', `f('${literal.slice(0, 12)}(', '${literal.slice(12)}')`],
   ])('flags an opaque token in a test-file code expression: %s', (_name, value) => {
     expect(scan(`creds: ${value}\n`, testPath)).toBe('high-entropy-creds');
