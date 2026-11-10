@@ -27,7 +27,9 @@ import {
   listLedgerRepos, DEFAULT_VERDICT_LEDGER_READ_STORE, resolveLedgerReadStore, readLedgerEventsFromStore, foldRepoFromStore,
   EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
   buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
+  FINDING_STATUS_VALUES, FINDING_SOURCE_RED_TEAM,
 } from '../verdict-ledger.mjs';
+import { foldFindingStatuses, foldFindingDispositions, findingIdentity, bindingRoundDecision, reviewScope } from '../review-round-rules.mjs';
 import { registerLedgerStore } from '../verdict-ledger-store.mjs';
 import { createHash } from 'node:crypto';
 import { REVIEW_LABELS, normalizeContributionFingerprint, decideReviewGate } from '../review-escalation.mjs';
@@ -1887,5 +1889,71 @@ describe('appendVerdictBatch: one git push for many holding rows', () => {
     const out = appendVerdictBatch([mk('changes', 91), mk('changes', 92)], { ...opts(calls), store: 'git', warn: () => {} });
     expect(out).toHaveLength(2);
     expect(calls.map((c) => c.records.length)).toEqual([1, 1]);
+  });
+});
+
+// R883 slice 1 — ledger dispositions: `open` / `not-real`, `source: red-team`, stable red-team finding ids.
+describe('R883 finding dispositions', () => {
+  const SHA40 = 'a'.repeat(40);
+  const base = { repo: REPO, pr: 7, at: AT, source: FINDING_SOURCE_RED_TEAM, writer: 'h:1:w', declaredActor: 'op', session: 's1', channel: 'c' };
+  const fin = (o = {}) => ({ type: 'finding', headSha: SHA40, findingId: 'fi-0123456789ab', path: 'scripts/a.mjs', symbol: 'run', defectClass: 'fail-open', round: 1, ...o });
+
+  it('keeps the old statuses first and in order, then adds open and not-real', () => {
+    expect(FINDING_STATUS_VALUES.slice(0, 4)).toEqual(['raised', 'tolerated', 'fixed', 'carded']);
+    expect(FINDING_STATUS_VALUES).toEqual(expect.arrayContaining(['open', 'not-real']));
+    expect(FINDING_SOURCE_RED_TEAM).toBe('red-team');
+  });
+
+  it.each(['open', 'not-real'])('accepts a red-team %s finding row and round-trips it', (status) => {
+    const ev = buildLedgerEvent({ ...base, ...fin({ status }) });
+    expect(ev).toMatchObject({ status, source: 'red-team' });
+    const { ok, line } = serializeLedgerEvent(ev);
+    expect(ok).toBe(true);
+    expect(parseLedgerEvents(`${line}\n`)).toEqual([ev]);
+  });
+
+  it('still parses an old row (no new fields) and still rejects an unknown status', () => {
+    const old = buildLedgerEvent({ ...base, source: 'review-pr', ...fin({ status: 'raised' }) });
+    expect(parseLedgerEvents(`${serializeLedgerEvent(old).line}\n`)).toEqual([old]);
+    expect(() => buildLedgerEvent({ ...base, ...fin({ status: 'maybe' }) })).toThrow();
+  });
+
+  it('gives a red-team finding the same stable id on every head, and a different id on another PR', () => {
+    const f = { file: 'scripts/a.mjs', line: 10, summary: 'x', severity: 'major' };
+    const a = findingIdentity(f, { repo: REPO, pr: 7, symbol: 'run' });
+    const b = findingIdentity({ ...f, line: 40, summary: 'reworded' }, { repo: REPO, pr: 7, symbol: 'run' });
+    expect(a.findingId).toMatch(/^fi-[0-9a-f]{12}$/);
+    expect(b.findingId).toBe(a.findingId);
+    expect(findingIdentity(f, { repo: REPO, pr: 8, symbol: 'run' }).findingId).not.toBe(a.findingId);
+  });
+
+  const row = (o = {}) => ({ type: 'finding', pr: 7, headSha: 'p', findingId: 'fi-one', status: 'raised', round: 1, path: 'src/a.mjs', symbol: 'check', defectClass: 'fail-open', lines: [10], ...o });
+
+  it('pin: open / not-real / red-team rows change no decision input (foldFindingStatuses is unchanged)', () => {
+    const plain = [row(), row({ findingId: 'fi-two', status: 'tolerated' })];
+    const extra = [...plain,
+      row({ status: 'open', source: 'red-team', headSha: 'q' }), row({ status: 'not-real', source: 'red-team', headSha: 'r' }),
+      row({ findingId: 'fi-three', status: 'open', source: 'red-team' }), row({ findingId: 'fi-two', status: 'not-real' })];
+    expect(foldFindingStatuses(extra, { pr: 7, head: 'h' })).toEqual(foldFindingStatuses(plain, { pr: 7, head: 'h' }));
+  });
+
+  it('pin: the binding round decision is identical with or without the new rows', () => {
+    const scope = reviewScope({ priorHead: 'p', head: 'h', delta: { files: { 'src/a.mjs': [500] } } });
+    const finding = { file: 'src/a.mjs', line: 10, summary: 'x', severity: 'major' };
+    const identity = { findingId: 'fi-one', path: 'src/a.mjs', symbol: 'check', defectClass: 'fail-open' };
+    const rows = [row({ status: 'tolerated' })];
+    const withNew = [...rows, row({ status: 'open', source: 'red-team', headSha: 'q' }), row({ status: 'not-real', source: 'red-team', headSha: 'r' })];
+    const decide = (rs) => bindingRoundDecision({ finding, identity, prior: foldFindingStatuses(rs, { pr: 7, head: 'h' }).get('fi-one'), scope });
+    expect(decide(withNew)).toEqual(decide(rows));
+  });
+
+  it('foldFindingDispositions: latest open / not-real per id for the PR, ignoring other statuses, PRs and the current head', () => {
+    const rows = [row({ status: 'open', source: 'red-team' }), row({ status: 'raised' }),
+      row({ findingId: 'fi-two', status: 'open', source: 'red-team' }), row({ findingId: 'fi-two', status: 'not-real', source: 'red-team', headSha: 'q' }),
+      row({ findingId: 'fi-x', status: 'open', pr: 99 }), row({ findingId: 'fi-y', status: 'open', headSha: 'h' }), row({ findingId: 5, status: 'open' })];
+    const out = foldFindingDispositions(rows, { pr: 7, head: 'h' });
+    expect([...out.keys()].sort()).toEqual(['fi-one', 'fi-two']);
+    expect(out.get('fi-one').status).toBe('open');
+    expect(out.get('fi-two').status).toBe('not-real');
   });
 });
