@@ -7,7 +7,7 @@ import * as os from 'node:os';
 import { resourcePaths } from './resource-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sampleHost } from './host-sample.mjs';
-import { readHostMemoryHeadroomMb } from './host-load.mjs';
+import { readHostMemoryReading } from './host-load.mjs';
 
 export const CLASSES = Object.freeze(['blocker', 'review', 'smoke', 'build', 'background']);
 const DEFAULT_IDLE = Object.freeze({ blocker: 5, review: 10, smoke: 15, build: 15, background: 25 });
@@ -52,7 +52,7 @@ function readHistory({ root, env, readFile = readFileSync }) {
 
 /** Returns measured evidence or an explicit unknown; never substitutes load average for CPU. */
 export function readCapacity({ settings, env = process.env, root,
-  history = readHistory, readFile, sample = sampleHost, memory = readHostMemoryHeadroomMb,
+  history = readHistory, readFile, sample = sampleHost, memory = options => readHostMemoryReading(options).mb ?? NaN,
   now = Date.now, load = os.loadavg, cores = () => os.cpus().length } = {}) {
   let source = 'unknown'; let idlePct = null; let memFreeGB = null;
   let loadAvg = null; let loadPerCore = null;

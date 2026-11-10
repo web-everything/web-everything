@@ -15,7 +15,7 @@ import * as childProcess from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
-import { admit as admitCapacity } from './host-capacity.mjs';
+import { admit as admitCapacity, loadCapacitySettings } from './host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 
 // GC has no reason to reclaim even a stale lease. Unknown markers/IO refuse work too.
@@ -130,7 +130,12 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (capacityClass !== undefined) {
     try {
-      const verdict = capacityAdmission(capacityClass, { read: capacityRead, settings: capacitySettings, env, log });
+      policy ??= loadHostOverloadSettings({ env, log });
+      const min = policy.settings.host.minMemoryHeadroomMb ?? DEFAULT_MIN_MEMORY_HEADROOM_MB;
+      if (!Number.isFinite(min) || min <= 0) throw Error('invalid host memory threshold');
+      capacitySettings ??= loadCapacitySettings({ env, log });
+      const settings = { ...capacitySettings, minMemoryMb: Math.max(capacitySettings.minMemoryMb, min) };
+      const verdict = capacityAdmission(capacityClass, { read: capacityRead, settings, env, log });
       return { ...verdict, admitted: verdict.admit === true };
     } catch (error) { return { admitted: false, reason: `host-capacity hold class=${capacityClass} idle=unknown% (loadavg unknown display only): ${error.message}` }; }
   }

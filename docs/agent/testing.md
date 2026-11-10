@@ -4115,8 +4115,9 @@ mutation enters handled-ID state. Run these and the affected lock/self-sync regr
 
 `scripts/lib/host-capacity.mjs` owns the class CPU idle thresholds and the hard 2048 MB
 memory floor. Review admission and red-team floor raises use its windowed CPU reading;
-`red-team-queue.json` only controls concurrency/start counts. Legacy red-team idle settings
-are ignored; tighten review with `WE_HOST_CAPACITY_REVIEW_IDLE_PCT`. Load averages are
+valid legacy red-team idle thresholds can tighten the shared review minimum, while invalid
+legacy thresholds disable the queue floor. Class admission also retains the host
+policy's memory floor and the shared pressure-aware memory reader. Load averages are
 shown for diagnosis only on wired callers. Inject history, clock, memory and sample functions
 in tests: absent/stale/short history samples two uncached one-second intervals, while corrupt
 history or unreadable CPU/memory holds until readable evidence on a subsequent tick.

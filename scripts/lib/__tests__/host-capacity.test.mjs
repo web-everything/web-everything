@@ -1,8 +1,16 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { CLASSES, loadCapacitySettings, readCapacity, admit } from '../host-capacity.mjs';
 import { hostLoadAdmission } from '../host-load.mjs';
 import { defaultReviewHostAdmission } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { applyRedTeamQueueFloor, loadRedTeamQueueFloor, raiseReviewStartsPerTick } from '../red-team-dispatch-queue.mjs';
+
+const native = vi.hoisted(() => ({ exec: vi.fn() }));
+vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal(), execFileSync: native.exec }));
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+afterEach(() => {
+  Object.defineProperty(process, 'platform', platformDescriptor);
+  vi.restoreAllMocks();
+});
 
 const settings = loadCapacitySettings({ env: {} });
 const now = () => Date.parse('2026-11-10T12:00:00Z');
@@ -96,18 +104,39 @@ describe('review wiring and red-team floor', () => {
   it.each([[40, true], [5, false]])('load 79/12, idle %s => review admitted %s', (idle, admitted) => {
     const log = vi.fn();
     const result = defaultReviewHostAdmission({ env: {}, log, capacityRead: () => evidence(idle),
-      loadPolicy: () => ({ settings: { host: { maxReviewDispatchPerTick: 1, maxLoadPerCore: 0.1, minMemoryHeadroomMb: 999999 } } }) });
+      loadPolicy: () => ({ settings: { host: { maxReviewDispatchPerTick: 1, maxLoadPerCore: 0.1, minMemoryHeadroomMb: 2048 } } }) });
     expect(result.admitted).toBe(admitted);
     expect(result.maxPerTick).toBe(1);
     expect(result.reason).toContain('class=review');
     expect(result.reason).toContain('display only');
     if (admitted) expect(log).toHaveBeenCalledWith(expect.stringContaining('review-daemon: host-capacity admit class=review idle=40% mem=4GB source=resource-sampler'));
   });
-  it('wired host-load uses capacity memory authority and never legacy load/memory probes', () => {
+  it('wired host-load retains policy memory floors and never legacy load/memory probes', () => {
     const forbidden = () => { throw Error('legacy probe invoked'); };
     expect(hostLoadAdmission({ capacityClass: 'smoke', capacityRead: () => evidence(40),
       load: forbidden, memory: forbidden, capacity: forbidden, interactive: true }).admitted).toBe(true);
     expect(hostLoadAdmission({ capacityClass: 'review', capacityRead: () => evidence(40, 100), interactive: true }).admitted).toBe(false);
+  });
+  it.each([[8192, 2048], [2048, 6144]])('class admission retains policy %sMB and capacity %sMB memory floors', (min, capacityMin) => {
+    const result = hostLoadAdmission({ capacityClass: 'review', env: {},
+      policy: { settings: { host: { minMemoryHeadroomMb: min } } },
+      capacitySettings: { ...settings, minMemoryMb: capacityMin }, capacityRead: () => evidence(40, 4096) });
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain(`memory>=${Math.max(capacityMin, min)}MB`);
+  });
+  it.each(['2', '4'])('default capacity memory reader holds on macOS pressure %s', pressure => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    native.exec.mockReset().mockReturnValue(pressure);
+    const read = () => evidence(40, 4096, { memory: undefined });
+    expect(read().memFreeGB).toBe(0);
+    expect(admit('review', { settings, read }).admit).toBe(false);
+    expect(native.exec).toHaveBeenCalledWith('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], expect.any(Object));
+  });
+  it('default capacity memory reader holds on unreadable memory evidence', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    native.exec.mockReset().mockImplementation(() => { throw Error('unreadable memory'); });
+    const read = () => evidence(40, 4096, { memory: undefined });
+    expect(admit('review', { settings, read }).admit).toBe(false);
   });
   it('red-team floor and review starts use the shared stricter threshold and windowed idle', () => {
     const capacitySettings = loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '30' } });

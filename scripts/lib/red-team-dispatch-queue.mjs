@@ -23,8 +23,8 @@ const note = (log, message) => {
 export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
 export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
 
-/** Invalid or missing minimums disable the floor. CPU threshold is owned by host-capacity.
- * Legacy minConcurrentIdlePct / WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT are deliberately ignored. */
+/** Invalid minimums or legacy idle thresholds disable the floor. Valid legacy thresholds
+ * can tighten the shared host-capacity review threshold. */
 export function loadRedTeamQueueFloor({ env = process.env,
   file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-team-queue.json'), readFile = readFileSync,
   log = () => {}, capacitySettings = loadCapacitySettings({ env, log }) } = {}) {
@@ -32,16 +32,19 @@ export function loadRedTeamQueueFloor({ env = process.env,
   try { settings = JSON.parse(readFile(file, 'utf8'))?.redTeam?.queue; }
   catch { /* Unavailable settings never create extra capacity. */ }
   const minimumEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT;
+  const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
   const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
   const parseEnv = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const minimum = minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv);
+  const idle = idleEnv === undefined ? (settings?.minConcurrentIdlePct === undefined ? 10 : settings.minConcurrentIdlePct) : parseEnv(idleEnv);
+  const validIdle = Number.isInteger(idle) && idle >= 0 && idle <= 100;
   const floor = {
-    minConcurrent: Number.isInteger(minimum) && minimum >= 0 ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
-    idlePct: capacitySettings.idlePct.review,
+    minConcurrent: validIdle && Number.isInteger(minimum) && minimum >= 0 ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
+    idlePct: validIdle ? Math.max(idle, capacitySettings.idlePct.review) : capacitySettings.idlePct.review,
     reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
   };
-  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: host-capacity review), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
+  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: max(host-capacity review, ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}); invalid legacy threshold disables), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
   return floor;
 }
 
