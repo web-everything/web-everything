@@ -68,16 +68,30 @@ describe('credentialContentFinding whitespace-exemption boundaries', () => {
   });
 });
 
-// Ruled residual (R824/R825, card x5b2hyl): in a TEST file an unquoted contiguous value followed by a call or
-// arrow is read as a code expression, and so is a quoted literal beside a call. Pinned so that changing the
-// shape is a decision, not an accident. Non-test files keep the full rule.
-describe('credentialContentFinding test-file code expression residuals', () => {
+// R824/R825 test-file skip (card x5b2hyl): a code expression carrying a high-entropy token of its own is still a
+// secret, quoted or not, so the skip never covers it. Non-test files keep the full rule.
+describe('credentialContentFinding test-file code expression opaque tokens', () => {
   const testPath = 'scripts/lib/example.test.mjs';
   it.each([
     ['unquoted value then call', `${literal}(x)`],
     ['unquoted value then arrow', `${literal} => x`],
     ['quoted literal beside a call', `f('${literal}')`],
-  ])('pins the ruled test-file residual: %s', (_name, value) => {
+    ['double-quoted literal beside a call', `f("${literal}")`],
+    ['backtick literal beside a call', `f(\`${literal}\`)`],
+    ['quoted literal concatenated with a call', `'${literal}' + suffix()`],
+    ['unquoted token as an argument', `f(${literal}, 1)`],
+    ['quoted literal inside an arrow', `() => '${literal}'`],
+    ['whitespace-split quoted literal beside a call', `f('${literal.slice(0, 12)} ${literal.slice(12)}')`],
+  ])('flags an opaque token in a test-file code expression: %s', (_name, value) => {
+    expect(scan(`creds: ${value}\n`, testPath)).toBe('high-entropy-creds');
+    expect(scan(`creds:\n  ${value}\n`, testPath)).toBe('high-entropy-creds');
+  });
+
+  it.each([
+    ['fixture word beside a call', "f('ghp_acceptance_fixture')"],
+    ['long camelCase identifier call', 'readRecoveryCredentialFromStore(arg)'],
+    ['long identifier arrow', 'buildHeavyAdmissionRemoteClient => x'],
+  ])('still skips a word-like test-file code expression: %s', (_name, value) => {
     expect(scan(`creds: ${value}\n`, testPath)).toBeNull();
   });
 

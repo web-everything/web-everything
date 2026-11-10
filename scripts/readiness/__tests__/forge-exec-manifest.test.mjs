@@ -145,8 +145,13 @@ describe('credentialContentFinding code expressions in test files (R824)', () =>
     expect(at(testPath, `creds: ${value}\n`)).toBe('high-entropy-creds');
     expect(at(testPath, `creds:\n  ${value}\n`)).toBe('high-entropy-creds');
   });
-  it('ruled residual (R824/R825): a plain quoted literal beside a call is skipped in test files', () => {
-    expect(at(testPath, 'creds: "aB3dE5fG7hJ9kL2mN4pQ6rS8" + suffix()\n')).toBeNull();
+  it('flags a high-entropy argument inside a test-file credential call', () => {
+    expect(at(testPath, `creds: f('${randomValue}')\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, 'creds: "aB3dE5fG7hJ9kL2mN4pQ6rS8" + suffix()\n')).toBe('high-entropy-creds');
+  });
+  it('flags an unquoted high-entropy value beside a call or arrow in a test file', () => {
+    expect(at(testPath, `creds: ${randomValue}(x)\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, `creds: ${randomValue} => x\n`)).toBe('high-entropy-creds');
   });
   it('rejects a multiline template whose literal content resembles a call', () => {
     expect(at(testPath, `creds: \`${randomValue}abc(\n  \`,\n`)).toBe('high-entropy-creds');

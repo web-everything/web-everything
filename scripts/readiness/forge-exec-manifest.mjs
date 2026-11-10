@@ -110,6 +110,9 @@ const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??n
 // (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
 // strings are stripped first, so a literal that merely contains `(` still hits.
 // Known token patterns run before this on the whole text and always hit.
+// The skip never covers a value that carries a high-entropy token of its own (card x5b2hyl): a quoted literal
+// beside a call (`f('<random>')`) and an unquoted token beside a call or arrow (`<random>(x)`) both keep the
+// scan. Only short fixture words and identifiers (`'ghp_acceptance_fixture'`, `createHash`) are skipped.
 function codeExpression(value) {
   let code='';
   for(let i=0;i<value.length;i++) {
@@ -119,22 +122,32 @@ function codeExpression(value) {
     if(char==='/'&&/[/*]/.test(value[i+1]??''))return false;
     if(!/["'`]/.test(char)) {code+=char;continue;}
     const quote=char;
-    let closed=false;
+    let closed=false,inner='';
     for(i++;i<value.length;i++) {
       if(value[i]===quote) {closed=true;break;}
       // Escapes, interpolation and partial multiline strings need a parser to
       // prove safe. Keep the original entropy rejection for these forms.
-      // A plain quoted literal beside a call is the ruled skip (R824/R825): a
-      // fixture like 'ghp_acceptance_fixture' must not trip the scan.
       if(value[i]==='\\'||(quote==='`'&&value[i]==='$'&&value[i+1]==='{'))return false;
+      inner+=value[i];
     }
     if(!closed)return false;
+    // A quoted literal that is opaque once whitespace is removed is a secret, whatever it sits beside.
+    if(opaqueLiteral(inner.replace(/\s/g,'')))return false;
     code+=' ';
   }
+  // An unquoted opaque token (split at punctuation, so a chained secret piece still counts) keeps the scan.
+  if(code.split(/[^\w$+/=-]+/).some(opaqueLiteral))return false;
   // Only an arrow or a call to a real identifier is a code expression. A bare paren, or a keyword before a
   // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
   return /=>|[A-Za-z_$][\w$]*\s*\(/.test(code.replace(nonCallKeyword,' '));
 }
+// A token inside a test-file code expression counts as a secret when it is long and either digit-bearing or
+// very high entropy. Word-like fixtures and long camelCase identifiers (digit-free, entropy under ~4.1) pass.
+const opaqueLiteral=token=>{
+  if(token.length<20)return false;
+  const bits=entropy(token);
+  return bits>=3.5&&(bits>=4.3||(token.match(/\d/g)??[]).length>=3);
+};
 const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|case|in|of|instanceof|if|while|for|switch|catch|with|else|do|new|async|function|class|import|super|this|default|let|const|var|extends|as|satisfies|static|get|set)(?![\w$])/g;
 const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 function entropy(text) {
