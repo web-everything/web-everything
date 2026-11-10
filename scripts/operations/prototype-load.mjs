@@ -18,14 +18,37 @@ const lowerSha = (sha) => (typeof sha === 'string' ? sha.toLowerCase() : sha);
 export function jsonLines(text) {
   return String(text).split(/\r?\n/).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
 }
+/** A bounded, complete check-run page; latest `test` run on this SHA decides. */
+/** The `test` gate must come from the GitHub Actions app (id 15368), never a same-named check from another integration. */
+export const TEST_CHECK_APP_ID = 15368;
+export function testCheckEvidence(data, sha) {
+  if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
+    || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count) return null;
+  const runs = data.check_runs.filter((r) => r?.name === 'test' && r.head_sha === sha && r.app?.id === TEST_CHECK_APP_ID);
+  if (!runs.length || runs.some((r) => !Number.isSafeInteger(r.id) || !Number.isSafeInteger(r.check_suite?.id))) return null;
+  // Latest run per check suite (a rerun supersedes only its own suite); another workflow's success never hides a failure.
+  const bySuite = new Map();
+  for (const r of runs) if (!bySuite.has(r.check_suite.id) || r.id > bySuite.get(r.check_suite.id).id) bySuite.set(r.check_suite.id, r);
+  const latests = [...bySuite.values()];
+  const latest = latests.find((r) => r.status !== 'completed' || r.conclusion !== 'success') ?? latests.sort((x, y) => y.id - x.id)[0];
+  return { sha: latest.head_sha, name: latest.name, status: latest.status, conclusion: latest.conclusion, id: latest.id, appId: latest.app.id, suiteIds: [...bySuite.keys()].sort((a, b) => a - b) };
+}
+/** Every suite behind the `test` evidence must belong to a workflow run of the expected workflow file on this exact sha.
+ *  Unreadable, truncated or foreign evidence is false (fail closed). */
+export const TEST_WORKFLOW_PATH = '.github/workflows/ci.yml';
+export function testWorkflowBound(evidence, runsData, sha, path = TEST_WORKFLOW_PATH) {
+  if (!evidence || !Array.isArray(evidence.suiteIds) || !evidence.suiteIds.length || typeof path !== 'string' || !path) return false;
+  if (!Number.isInteger(runsData?.total_count) || !Array.isArray(runsData.workflow_runs) || runsData.workflow_runs.length !== runsData.total_count || runsData.total_count > 100) return false;
+  return evidence.suiteIds.every((id) => runsData.workflow_runs.some((r) => r?.check_suite_id === id && r.head_sha === sha
+    && typeof r.path === 'string' && r.path.split('@')[0] === path));
+}
 /** A WEAKENED fix-ready record loads ONLY as a ruled exception (operator R396): the record must carry
  *  `auditRuling` and a non-empty `auditDisclosed`, AND the settings allowlist `ruledWeakened` must hold an entry whose
  *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
  *  never claim it. Never a blanket bypass. */
 const RULING = /^R\d+(?:\+R\d+)*$/;
 export function readyEvidence(records, input, ruledWeakened = [], liveFpSource = null) {
-  if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
-  // The live fingerprint may be passed lazily (a function): the arguments path above never pays for the git read.
+  // Arguments are labels only; readiness comes from persisted evidence.
   const liveFp = typeof liveFpSource === 'function' ? liveFpSource() : liveFpSource;
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
@@ -66,6 +89,19 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
   if ([...latest].some(([sha, i]) => sha !== live && i > pick && !hasFp(list[i].fingerprint) && !judge(list[i]))) return null;
   return judge(list[pick]);
 }
+/** True when a stored ready record for this branch speaks about THIS head's code: it names the live sha (any case),
+ * carries the live net-diff fingerprint, or is too malformed to classify (fail closed). A record for other code never
+ * counts, so an iterated branch is not stranded by its own earlier load. Pair with readyEvidence: refuse only when
+ * readyEvidence is null AND a record speaks for this head. */
+export function readyRecordSpeaksFor(records, input, liveFp = null) {
+  const live = lowerSha(input.sha);
+  // An unreadable live fingerprint (failed fetch/read) cannot prove a record is about other code, so a record that
+  // stores a readable fingerprint still speaks: a transient git failure must not clear negative evidence.
+  const liveUnknown = !carriesAcross(liveFp, liveFp);
+  return (Array.isArray(records) ? records : []).some((r) => r && typeof r === 'object' && r.ref === input.branch
+    && (!validSha(r.sha) || lowerSha(r.sha) === live || carriesAcross(r.fingerprint, liveFp)
+      || (liveUnknown && carriesAcross(r.fingerprint, r.fingerprint))));
+}
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
@@ -102,8 +138,19 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // Ask covers() once per base: a flaky second answer must never let the pass loop disagree with this check.
   const coverMemo = new Map();
   const covered = (base) => { if (!coverMemo.has(base)) coverMemo.set(base, !!covers(base)); return coverMemo.get(base); };
-  // An own WEAKENED stops here, before covers() can touch git (refuse mode promises to stop before git).
-  if (own.some((d) => d.record.verdict === 'WEAKENED')) return { ok: false, reason: 'weakened' };
+  const ruled = (record) => {
+    const gate = auditOptions.ruledWeakened;
+    return gate?.ruledWeakened && record.questionHash === QUESTION_HASH
+      // The ruled audit is the gate record's own (exact sha), or the carried audit of the same net diff: readiness
+      // appended by an earlier carry names the NEW sha, and must keep binding to the audit it was carried from.
+      && (record.head === lowerSha(gate.record.sha)
+        || (carriesAcross(record.fingerprint, liveFp) && carriesAcross(gate.record.fingerprint, liveFp)))
+      && Array.isArray(record.findings)
+      && JSON.stringify(record.findings) === JSON.stringify(gate.ruledWeakened.findings)
+      && covered(record.base);
+  };
+  // Unruled own WEAKENED stops before git; a matching ruling still needs canonical base coverage.
+  if (own.some((d) => d.record.verdict === 'WEAKENED' && !ruled(d.record))) return { ok: false, reason: 'weakened' };
   // Round 3: a live-head WEAKENED that findAudit cannot use (contradictory findings, unparsable time) must not vanish
   // and leave the live head looking unaudited, which would let a carried pass decide. Only a foreign question is ignored.
   // The same holds for a PRIOR-question WEAKENED still inside its accepted window (round 5): it is a real negative
@@ -128,7 +175,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
     && !carried.some((d) => d.record.head === r.head && d.base === r.base)
     && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
-  const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED');
+  const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED' && !ruled(d.record));
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
     if (carriedWeak.some((d) => !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
@@ -191,7 +238,7 @@ export function refusal(records, ref, since, alerts = false) {
     && (alerts ? /reject|drop|refus|conflict/i.test(JSON.stringify(r)) : /removed|dropped/.test(r.kind || r.event || r.type || '')));
 }
 export function prototypeLoadOperation() {
-  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms', 'ruling', 'quote'].map((key) => [key, { type: 'string', required: false, default: '' }]));
+  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms', 'ruling', 'quote', 'remove', 'reason'].map((key) => [key, { type: 'string', required: false, default: '' }]));
   input['dry-run'] = { type: 'boolean', required: false, default: false };
   // R310: retire-only run — drop registrations proved merged, in main, or superseded, and load nothing.
   input.retire = { type: 'boolean', required: false, default: false };
