@@ -101,10 +101,18 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  *   `{ok:false, reason:'policy-clear yielded to a concurrent round'}`; the caller posts no comment and retries.
  *   A failed re-read does the same with an in_progress run (fail closed). A later retry over its own orphan yield,
  *   with no round run behind it, posts the success again, so a yield never strands a head.
- * No lock and no sleep. Residual (disclosed on #6535): a round's FINAL run landing between the re-read and the
- * superseding post is masked by the mirror. A retry corrects it, but once that round has posted its result comment
- * the on-skip row stops retrying, so the head can stay held until an operator republishes. It fails closed (never a
- * false success). PR-A #6606's per-identity publish lock, shared by every writer, closes this window.
+ * No lock and no sleep. Residuals (disclosed on #6535; PR-A #6606's per-identity publish lock, shared by every
+ * writer, closes each of them):
+ * - FAIL-OPEN window (bounded by the next on-skip pass): between the success POST and a landed superseding run, the
+ *   success is the newest run over a round run it did not see. If the supersede POST fails, or the process dies
+ *   between the POST and the re-read, merge-gate reads a success until the next pass corrects it (the pre-post
+ *   correction above). The same holds when a round run created just before the success is missing from both reads
+ *   (read lag). This writer does NOT promise "never a false success"; it promises the success never stays newest
+ *   past a pass that can read the head.
+ * - Fail-closed: a round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
+ *   A retry corrects it, but once that round has posted its result comment the on-skip row stops retrying, so the
+ *   head can stay held until an operator republishes. Likewise, near the 100-run bound a post can push the head
+ *   past it; every later read then refuses, so an orphan yield stays until an operator inspects the history.
  */
 export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round';
 export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
