@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs, { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildReadyRecord, writeReadyRecord, readyRecordPath, parseArgs, main } from '../fix-ready-record.mjs';
+import { buildReadyRecord, writeReadyRecord, readyRecordPath, adoptionReaderPath, parseArgs, main } from '../fix-ready-record.mjs';
+import { createAdoptionMatrixReader } from '../adoption-matrix-io.mjs';
 import { jsonLines, readyEvidence } from '../prototype-load.mjs';
 
 const sha = 'b7bb8b2743e5c582d44e22e71a40f9e23ae07f6b';
@@ -69,9 +70,37 @@ describe('fix-ready-record', () => {
     const file = tmp();
     const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
     expect(r.ok).toBe(true);
-    expect(writes).toEqual([`${JSON.stringify(r.record)}\n`]);
+    expect(writes.map(String)).toEqual([`${JSON.stringify(r.record)}\n`]);
     expect(opens).toContain('a');
-    expect(readFileSync(file, 'utf8')).toBe(writes[0]);
+    expect(readFileSync(file, 'utf8')).toBe(String(writes[0]));
+  });
+  it('finishes a short write: keeps writing until the whole record is on disk', () => {
+    const file = tmp();
+    const fsApi = {
+      ...fs,
+      // a filesystem that accepts at most 7 bytes per call
+      writeSync: (fd, buf, off = 0, len = buf.length - off) => fs.writeSync(fd, buf, off, Math.min(7, len)),
+    };
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
+    expect(r.ok).toBe(true);
+    expect(readFileSync(file, 'utf8')).toBe(`${JSON.stringify(r.record)}\n`);
+  });
+  it('refuses and cuts the ledger back when a write fails part-way, leaving no torn line', () => {
+    const file = tmp();
+    writeFileSync(file, `${JSON.stringify({ ref: 'lane/old', sha, tests: 'green', audit: 'NOT WEAKENED' })}\n`);
+    const before = readFileSync(file, 'utf8');
+    for (const second of [() => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); }, () => 0]) {
+      let calls = 0;
+      const fsApi = {
+        ...fs,
+        writeSync: (fd, buf, off = 0, len = buf.length - off) => (calls++ === 0 ? fs.writeSync(fd, buf, off, 5) : second()),
+      };
+      const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/write failed|short write/);
+      expect(readFileSync(file, 'utf8')).toBe(before);
+      expect(existsSync(`${file}.lock`)).toBe(false);
+    }
   });
   it('keeps both records parseable when the existing file has no trailing newline', () => {
     const file = tmp();
@@ -217,6 +246,65 @@ describe('fix-ready-record main()', () => {
   const quiet = () => ({
     log: vi.spyOn(console, 'log').mockImplementation(() => {}),
     err: vi.spyOn(console, 'error').mockImplementation(() => {}),
+  });
+
+  describe('writer and adoption-matrix reader agree on the ledger path', () => {
+    const quietReader = (env, settings = { fixReadyPath: null }) => {
+      const asked = [];
+      const reader = createAdoptionMatrixReader({
+        env, home: '/h', settings, readText: (p) => { asked.push(p); return ''; },
+        run: () => null, exec: () => '', readdir: () => [], isDirectory: () => false,
+      });
+      try { reader({}); } catch { /* clone discovery is irrelevant here: only the path asked for matters */ }
+      return asked[0];
+    };
+    it('shipped defaults resolve to the very file the adoption matrix reads', () => {
+      const env = { HOME: '/h' };
+      expect(readyRecordPath({ env })).toBe(quietReader(env));
+      expect(adoptionReaderPath({ env, home: '/h' })).toBe(quietReader(env));
+    });
+    it.each([
+      ['WE_FIX_READY_PATH', { HOME: '/h', WE_FIX_READY_PATH: '/o/env.jsonl' }, { fixReadyPath: null }, '/o/env.jsonl'],
+      ['~ in WE_FIX_READY_PATH', { HOME: '/h', WE_FIX_READY_PATH: '~/o/env.jsonl' }, { fixReadyPath: null }, '/h/o/env.jsonl'],
+      ['fixReadyPath setting', { HOME: '/h' }, { fixReadyPath: '/o/set.jsonl' }, '/o/set.jsonl'],
+      ['env beats setting', { HOME: '/h', WE_FIX_READY_PATH: '/o/env.jsonl' }, { fixReadyPath: '/o/set.jsonl' }, '/o/env.jsonl'],
+    ])('adoptionReaderPath follows the reader for %s', (_n, env, settings, want) => {
+      expect(quietReader(env, settings)).toBe(want);
+      expect(adoptionReaderPath({ env, home: '/h', settings })).toBe(want);
+    });
+    it('main refuses (exit 1) when an override sends the adoption matrix to a different file, and writes nothing', () => {
+      const { err } = quiet();
+      const dir = mkdtempSync(join(tmpdir(), 'fix-ready-p-'));
+      const settingsFile = join(dir, 'p.json');
+      writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'ledger.jsonl') }));
+      const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'];
+      const env = { HOME: dir, WE_FIX_READY_PATH: join(dir, 'elsewhere.jsonl') };
+      expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+      expect(err.mock.calls[0][0]).toMatch(/adoption matrix reads .*elsewhere\.jsonl/);
+      expect(main(argv, { env: { HOME: dir }, settingsFile, adoptionSettings: { fixReadyPath: join(dir, 'set.jsonl') } })).toBe(1);
+      expect(existsSync(join(dir, 'ledger.jsonl'))).toBe(false);
+      expect(existsSync(join(dir, 'elsewhere.jsonl'))).toBe(false);
+    });
+    it('main writes when the override names the same file the writer uses', () => {
+      quiet();
+      const dir = mkdtempSync(join(tmpdir(), 'fix-ready-p-'));
+      const settingsFile = join(dir, 'p.json');
+      const ledger = join(dir, 'ledger.jsonl');
+      writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: ledger }));
+      const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'];
+      expect(main(argv, { env: { HOME: dir, WE_FIX_READY_PATH: ledger }, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(0);
+      expect(jsonLines(readFileSync(ledger, 'utf8'))).toHaveLength(1);
+    });
+    it('main fails closed (exit 2) when the adoption-matrix settings cannot be read', () => {
+      const { err } = quiet();
+      const dir = mkdtempSync(join(tmpdir(), 'fix-ready-p-'));
+      const settingsFile = join(dir, 'p.json');
+      writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'ledger.jsonl') }));
+      const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'];
+      expect(main(argv, { env: { HOME: dir }, settingsFile, adoptionSettingsFile: join(dir, 'missing.json') })).toBe(2);
+      expect(err.mock.calls[0][0]).toMatch(/adoption-matrix settings/);
+      expect(existsSync(join(dir, 'ledger.jsonl'))).toBe(false);
+    });
   });
 
   it('maps --audit=NOT-WEAKENED to a NOT WEAKENED record and exits 0', () => {

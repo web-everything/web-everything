@@ -2,13 +2,14 @@
 // Writes ONE fix-ready record for prototype-load. The shape is exactly what readyEvidence() in prototype-load.mjs reads:
 // NOT WEAKENED needs ref + 40-hex sha + tests green; WEAKENED additionally needs auditRuling (R<n>) and a non-empty
 // auditDisclosed array of non-empty strings. A record identical to the latest one for that ref+sha is refused; a different
-// one supersedes it (the reader lets the latest record per sha win). The append is one write under a lock file.
+// one supersedes it (the reader lets the latest record per sha win). The append is written until complete under a lock file, and cut back if it fails part-way.
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validSha, jsonLines } from './prototype-load.mjs';
+import { loadAdoptionMatrixSettingsFile } from '../lib/adoption-matrix-settings.mjs';
 
 const RULING = /^R\d+(?:\+R\d+)*$/;
 const here = dirname(fileURLToPath(import.meta.url));
@@ -18,6 +19,15 @@ export function readyRecordPath({ env = process.env, settingsFile = join(here, '
   const p = JSON.parse(fs.readFileSync(settingsFile, 'utf8')).readyRecordPath;
   if (typeof p !== 'string' || !p) throw new Error('prototype-load settings have no readyRecordPath');
   return p.startsWith('~/') ? join(env.HOME || homedir(), p.slice(2)) : p;
+}
+
+/** The file the adoption matrix reads fix-ready records from (adoption-matrix-io.mjs): WE_FIX_READY_PATH, then the
+ *  adoption-matrix `fixReadyPath` setting, then the shipped default; `~/` expanded against home. A test pins this to
+ *  the real reader, so a drift in either one fails loudly. `settings` (parsed) or `settingsFile` may be injected. */
+export function adoptionReaderPath({ env = process.env, home = env.HOME || homedir(), settings, settingsFile } = {}) {
+  const config = settings ?? loadAdoptionMatrixSettingsFile(settingsFile);
+  const p = env.WE_FIX_READY_PATH || config.fixReadyPath || join(home, 'workspace', '.operations', 'coordination', 'fix-ready.jsonl');
+  return p.startsWith('~/') ? join(home, p.slice(2)) : p;
 }
 
 /** Pure: returns {ok:true, record} or {ok:false, error}. */
@@ -78,6 +88,27 @@ function releaseLock(lock, token, fsApi) {
   try { if (String(fsApi.readFileSync(lock, 'utf8')) === token) fsApi.unlinkSync(lock); } catch { /* best effort: a stale lock expires */ }
 }
 
+/** Writes every byte of `buf` to an append handle. writeSync may accept fewer bytes than asked, so loop on its return
+ *  value. If a write throws or makes no progress, cut the file back to its length before this append so a torn line
+ *  never stays in the ledger (the reader would otherwise drop or misread it), and report the failure. */
+function appendAll(fd, buf, fsApi) {
+  let start;
+  try { start = fsApi.fstatSync(fd).size; } catch (e) { return { ok: false, error: `write failed: cannot stat ledger: ${e.message}` }; }
+  try {
+    let off = 0;
+    while (off < buf.length) {
+      const n = fsApi.writeSync(fd, buf, off, buf.length - off);
+      if (!Number.isInteger(n) || n <= 0) throw new Error(`short write: ${off} of ${buf.length} bytes`);
+      off += n;
+    }
+    return { ok: true };
+  } catch (e) {
+    let cut = 'ledger cut back to its previous length';
+    try { fsApi.ftruncateSync(fd, start); } catch (t) { cut = `ledger NOT cut back: ${t.message}`; }
+    return { ok: false, error: `write failed: ${e.message}; ${cut}` };
+  }
+}
+
 /** The latest record for ref+sha (the reader's "latest per sha wins" rule), or undefined. */
 function latestFor(text, ref, sha) {
   // Match lines exactly as the reader does: a string, valid sha. A hand-edited line the reader ignores must not count.
@@ -115,7 +146,10 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
     // A hand-edited ledger may lack a final newline; without this the new record would fuse onto the last line.
     const prefix = locked.text && !locked.text.endsWith('\n') ? '\n' : '';
     const fd = fsApi.openSync(file, 'a');
-    try { fsApi.writeSync(fd, `${prefix}${line}\n`); } finally { fsApi.closeSync(fd); }
+    try {
+      const written = appendAll(fd, Buffer.from(`${prefix}${line}\n`), fsApi);
+      if (!written.ok) return { ok: false, error: written.error };
+    } finally { fsApi.closeSync(fd); }
     return { ok: true, record: built.record, file };
   } finally {
     releaseLock(lock, token, fsApi);
@@ -136,7 +170,21 @@ export function main(argv = process.argv.slice(2), deps = {}) {
     catch (e) { console.error(`fix-ready-record: cannot read auditDisclosed-file: ${e.message}`); return 2; }
   }
   const audit = a.audit === 'NOT-WEAKENED' ? 'NOT WEAKENED' : a.audit;
-  const out = writeReadyRecord({ ref: a.ref, sha: a.sha, tests: a.tests, audit, auditRuling: a.auditRuling, auditDisclosed }, deps);
+  // The default ledger must be the file the adoption matrix reads; otherwise the record is written where nothing looks.
+  let file = deps.file;
+  if (file === undefined) {
+    const env = deps.env ?? process.env;
+    let readerPath;
+    try {
+      file = readyRecordPath({ env, ...(deps.settingsFile ? { settingsFile: deps.settingsFile } : {}) });
+      readerPath = adoptionReaderPath({ env, settings: deps.adoptionSettings, settingsFile: deps.adoptionSettingsFile });
+    } catch (e) { console.error(`fix-ready-record: cannot resolve the ledger path / adoption-matrix settings: ${e.message}`); return 2; }
+    if (readerPath !== file) {
+      console.error(`fix-ready-record: refused: the adoption matrix reads ${readerPath} (WE_FIX_READY_PATH / fixReadyPath) but this writer would append to ${file} (readyRecordPath); make them the same file`);
+      return 1;
+    }
+  }
+  const out = writeReadyRecord({ ref: a.ref, sha: a.sha, tests: a.tests, audit, auditRuling: a.auditRuling, auditDisclosed }, { ...deps, file });
   if (!out.ok) { console.error(`fix-ready-record: refused: ${out.error}`); return 1; }
   console.log(`fix-ready-record: wrote ${out.record.ref}@${out.record.sha} (${out.record.audit}) to ${out.file}`);
   return 0;
