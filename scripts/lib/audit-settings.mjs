@@ -108,7 +108,7 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/gh-throttle.json', 'scripts/settings/red-main-hold.json', 'scripts/settings/prototype-load.json',
   // The legacy dispatch settings file as a glob: this module never reads it, and settings-files.test.mjs counts a quoted
   // literal of its full name as a direct reader.
-  'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
+  'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/settings/fix-pass-budget.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
   'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json',
@@ -215,7 +215,7 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/health-responder.mjs', 'scripts/conveyor/land-overlap-yield.mjs',
   'scripts/conveyor/main-ci-red-io.mjs', 'scripts/conveyor/needs-you-feed-job.mjs',
   'scripts/conveyor/nightly-coroner-job.mjs', 'scripts/conveyor/pr-stall-digest.mjs',
-  'scripts/conveyor/pr-stall-sweep.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs',
+  'scripts/conveyor/pr-stall-reset.mjs', 'scripts/conveyor/pr-stall-sweep.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs',
   'scripts/conveyor/resolve-runner-checkout.mjs', 'scripts/conveyor/resource-sampler-daemon.mjs',
   'scripts/conveyor/session-watchdog.mjs', 'scripts/conveyor/soak/breaks/lease-reaper-borrowed-fixer-pid-invisible.mjs',
   'scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.mjs', 'scripts/conveyor/stand-down-auto-proceed-io.mjs',
