@@ -1126,6 +1126,7 @@ describe('runRemote', () => {
     expect(result.detail).toContain('[masked]');
     const short = remoteManifestAPI.forgeFailureTail('npm ERR! password=hunter2 and Authorization: Bearer abc123 x_token: s3cret\n\npath /opt/forge/cache ok');
     expect(short).not.toMatch(/hunter2|abc123|s3cret/);
+    expect(remoteManifestAPI.forgeFailureTail('token=\rshortSecret123\rnext')).toBe('[masked] next');
     expect(remoteManifestAPI.forgeFailureTail('token=\nshortSecret123\nnext')).toBe('[masked] next');
     expect(remoteManifestAPI.forgeFailureTail('password="two words here" tail\n\nnext')).toBe('[masked] next');
     expect(short).toContain('/opt/forge/cache');
