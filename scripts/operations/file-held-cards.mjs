@@ -196,14 +196,18 @@ export async function fileInCheckout(input, run = runOperationCli) {
   // The shared argv builder expects scope, but unscoped cards must omit that flag.
   // size is never set for a held card; an omitted one must reach file-item as absent, not as the string 'undefined'.
   return fileItemForPrevention({ ...input, scope: input.scope ?? '', size: input.size ?? '' }, {
-    run: args => run({ ...args, argv: args.argv.filter(arg => arg !== '--scope=' && arg !== '--size=') }),
+    // file-item's own duplicate search includes closed cards; a closed twin the caller already vetted is declared
+    // through file-item's own --notDuplicateReason, so preflight and filing agree.
+    run: args => run({ ...args, argv: [...args.argv.filter(arg => arg !== '--scope=' && arg !== '--size='),
+      ...(input.notDuplicateReason ? [`--notDuplicateReason=${input.notDuplicateReason}`] : [])] }),
   });
 }
 
 async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md'),
   dryRun = false, select, since, max = 10, deps = {} } = {}) {
   validateOptions({ max, since, select });
-  const { root = REPO_ROOT, fileItem = fileInCheckout, log = console.log, now = () => new Date().toISOString() } = deps;
+  const { root = REPO_ROOT, fileItem = fileInCheckout, log = console.log, now = () => new Date().toISOString(),
+    appendFile = appendFileSync } = deps;
   source = resolve(expandHome(source));
   // The ledger path is fixed beside the source; it is not an input.
   let ledger = resolve(join(dirname(source), 'cards-filed.jsonl'));
@@ -225,13 +229,14 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   }
   const cards = selectUnfiled(parseCards(readFileSync(source, 'utf8')), ledgerRows, { select, since, max: Infinity });
   const titles = new Map();
+  const closedTitles = new Map(); // finished cards: never a duplicate here, but file-item's own search still sees them
   for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
     const content = readFileSync(join(root, 'backlog', name), 'utf8');
     // The title is the first heading AFTER the front matter: a `# comment` line inside it is not a title.
     const title = content.slice(frontMatterEnd(content)).match(/^#\s+(.+)$/m)?.[1];
     if (!title) continue; // legacy untitled cards cannot be title-matched; they never block a run
     // A finished card does not cover a fresh handoff: only live cards suppress a same-titled line.
-    if (isFinishedCard(content)) continue;
+    if (isFinishedCard(content)) { closedTitles.set(titleKey(title), name); continue; }
     titles.set(titleKey(title), name);
   }
   const result = { planned: [], filed: [], duplicates: [], refused: [], failed: [] };
@@ -260,42 +265,50 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
       log(safeLog(`refused ${card.tag}: remove secrets and use explicit WE path prefixes before retrying`));
       continue;
     }
-    if (dryRun) { result.planned.push(summary); continue; }
-    const row = { hash: card.hash, ...summary, card: null, filedAt: now() };
     // A truncated title is not a full identity: two distinct cards can share its first 110 chars.
     const duplicate = input.title.endsWith('…') ? undefined : titles.get(titleKey(input.title));
     if (duplicate) {
       // Never ledgered: the twin may close later, and then this handoff must be filed on a re-run.
+      // A dry run reports it too, so the plan never lists a card the real run would skip.
       result.duplicates.push({ ...summary, card: duplicate });
       log(safeLog(`duplicate ${card.tag}: ${input.title}`));
       continue;
-    } else {
-      try {
-        const response = await fileItem(input);
-        const { parseFiledPayload } = await import('./review-loop-cli.mjs');
-        const payload = parseFiledPayload(response?.lines);
-        if (response?.code !== 0 || !payload.verdict?.num || !payload.verdict?.rel) {
-          // Do not echo file-item output: it can contain the rejected secret itself.
-          throw new Error('file-item refused or returned incomplete filing evidence; inspect its run before retrying');
-        }
-        row.card = payload.verdict.num;
-        if (payload.pr != null) row.pr = payload.pr;
-      } catch {
-        result.failed.push(summary);
-        log(safeLog(`failed ${card.tag}: file-item did not file this card; inspect its run before retrying`));
-        continue;
-      }
-      result.filed.push(row);
-      titles.set(titleKey(input.title), row.card);
-      log(safeLog(`filed ${card.tag}: ${input.title}`));
     }
+    if (dryRun) { result.planned.push(summary); continue; }
+    const row = { hash: card.hash, ...summary, card: null, filedAt: now() };
+    // A truncated title gets the same closed-twin handling as a short one: a closed card carrying the identical
+    // generated title cannot cover a fresh handoff either. A live card with that title still blocks (never declared away).
+    const closed = titles.has(titleKey(input.title)) ? undefined : closedTitles.get(titleKey(input.title));
+    if (closed) input.notDuplicateReason = safeLog(`${closed} is closed and does not cover this fresh handoff`);
+    try {
+      const response = await fileItem(input);
+      const { parseFiledPayload } = await import('./review-loop-cli.mjs');
+      const payload = parseFiledPayload(response?.lines);
+      if (response?.code !== 0 || !payload.verdict?.num || !payload.verdict?.rel) {
+        // Do not echo file-item output: it can contain the rejected secret itself.
+        throw new Error('file-item refused or returned incomplete filing evidence; inspect its run before retrying');
+      }
+      row.card = payload.verdict.num;
+      if (payload.pr != null) row.pr = payload.pr;
+    } catch {
+      result.failed.push(summary);
+      log(safeLog(`failed ${card.tag}: file-item did not file this card; inspect its run before retrying`));
+      continue;
+    }
+    result.filed.push(row);
+    titles.set(titleKey(input.title), row.card);
+    log(safeLog(`filed ${card.tag}: ${input.title}`));
     // A ledger failure stops the batch: continuing could silently lose successful filing evidence.
     let separator = '';
     try {
       const existing = readFileSync(ledger, 'utf8');
       if (existing && !existing.endsWith('\n')) separator = '\n';
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    appendFileSync(ledger, `${separator}${JSON.stringify(row)}\n`);
+    try { appendFile(ledger, `${separator}${JSON.stringify(row)}\n`); } catch (error) {
+      // The card is already filed: name every filed-but-unledgered number so the operator can add the rows.
+      const filed = result.filed.map(filedRow => `${filedRow.card} (${filedRow.tag})`).join(', ');
+      throw new Error(safeLog(`ledger append failed (${error.code ?? error.message}); filed but not ledgered: ${filed}`), { cause: error });
+    }
   }
   return result;
 }
@@ -309,16 +322,50 @@ export async function runFileHeldCards(options = {}) {
   // One lock by canonical ledger path (exists from the first run, even before the ledger does), held through select, filing and append.
   const ids = [createHash('sha256').update(canonical).digest('hex').slice(0, 24)];
   const held = [];
-  const release = () => { for (const lock of held) { try { unlinkSync(lock); } catch { /* already gone */ } } };
+  // Release only a lock that still names this process, so a lock reclaimed and retaken by another run survives.
+  const release = () => { for (const lock of held) {
+    try { if (readFileSync(lock, 'utf8').trim() === String(process.pid)) unlinkSync(lock); } catch { /* already gone */ }
+  } };
   for (const id of ids) {
     const lock = join(tmpdir(), `file-held-cards-${id}.lock`);
-    try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); held.push(lock); } catch (error) {
-      release();
-      if (error.code === 'EEXIST') throw new Error('another file-held-cards run holds the ledger lock; retry when it finishes');
-      throw error;
-    }
+    try { acquireLock(lock); held.push(lock); } catch (error) { release(); throw error; }
   }
   try { return await runFileHeldCardsLocked(options); } finally { release(); }
+}
+
+// Only "no such process" proves a dead owner; EPERM and any invalid-pid error stay live (fail closed).
+const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
+
+/** Take the lock file; a lock whose recorded owner is a dead process is reclaimed once. An unreadable or
+ *  unparseable owner counts as live (fail closed), and the refusal names the file so an operator can clear it. */
+function acquireLock(lock) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { writeFileSync(lock, String(process.pid), { flag: 'wx' }); return; } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    let text;
+    try { text = readFileSync(lock, 'utf8').trim(); } catch (error) {
+      if (error.code === 'ENOENT') continue; // released between our create and read: try again
+      throw error;
+    }
+    const owner = /^\d+$/.test(text) ? Number(text) : NaN;
+    if (!Number.isSafeInteger(owner) || owner < 1 || pidAlive(owner)) {
+      throw new Error(`another file-held-cards run holds the ledger lock (${lock}${Number.isSafeInteger(owner) ? `, pid ${owner}` : ''}); retry when it finishes, or delete that file if no such run is alive`);
+    }
+    // Dead owner: only one reclaimer at a time (an exclusive guard file), and the lock is re-read under the guard,
+    // so a fresh lock another run just created is never removed. The lock itself is never renamed or moved.
+    const guard = `${lock}.reclaim`;
+    try { writeFileSync(guard, String(process.pid), { flag: 'wx' }); } catch (error) {
+      if (error.code === 'EEXIST') throw new Error(`another file-held-cards run is reclaiming the ledger lock (${guard}); retry when it finishes, or delete that file if no such run is alive`);
+      throw error;
+    }
+    try {
+      let again = null;
+      try { again = readFileSync(lock, 'utf8').trim(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (again === text) unlinkSync(lock);
+    } finally { try { unlinkSync(guard); } catch { /* already gone */ } }
+  }
+  throw new Error(`could not take the ledger lock (${lock}); retry when other file-held-cards runs finish`);
 }
 
 export function fileHeldCardsOperation() {
@@ -343,10 +390,14 @@ export function createFileHeldCardsSinks(deps) {
   return { [BATCH_EFFECT]: async input => {
     const result = await runFileHeldCards({ ...input, source: input.source || undefined,
       dryRun: input['dry-run'], deps: { ...deps, log: () => {} } });
-    // A failed or refused card must fail the run itself (CLI exit and HTTP status alike), not only the CLI finisher.
-    if (result.failed.length || result.refused.length) {
+    // A failed or refused card must fail a real run itself (CLI exit and HTTP status alike), not only the CLI
+    // finisher. The message carries the filed card numbers: the thrown error is all that reaches the operator.
+    // A dry run files nothing; its plan, refusals and duplicates ARE the product, so it returns them (the
+    // finisher still exits non-zero on a refusal).
+    if (!input['dry-run'] && (result.failed.length || result.refused.length)) {
       const tags = [...result.failed, ...result.refused].map(card => card.tag).join(', ');
-      throw new Error(safeLog(`file-held-cards: ${result.failed.length} failed and ${result.refused.length} refused card(s) (${tags}); ${result.filed.length} filed`));
+      const filed = result.filed.map(row => `${row.card} (${row.tag})`).join(', ');
+      throw new Error(safeLog(`file-held-cards: ${result.failed.length} failed and ${result.refused.length} refused card(s) (${tags}); ${result.filed.length} filed${filed ? `: ${filed}` : ''}`));
     }
     return result;
   } };
@@ -356,7 +407,8 @@ export function finishFileHeldCards(outcome, json = false) {
   const result = outcome.run?.effects?.find(entry => entry.type === BATCH_EFFECT)?.result;
   if (!result) return outcome;
   const lines = json ? [JSON.stringify(result)] : Object.entries(result).flatMap(([status, cards]) => cards.map(card =>
-    safeLog(`${status} ${card.tag} ${card.date}: ${card.title} [${card.scope || 'unscoped'}]`)));
+    // A refused card carries no title on purpose (it may hold the secret that got it refused).
+    safeLog(`${status} ${card.tag} ${card.date}: ${card.title ?? '(withheld)'} [${card.scope || 'unscoped'}]`)));
   // A file-item failure must not look like success to automated callers.
   return { ...outcome, lines, ...(result.failed?.length || result.refused?.length ? { code: 1 } : {}) };
 }
