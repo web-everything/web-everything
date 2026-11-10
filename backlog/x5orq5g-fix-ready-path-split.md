@@ -21,7 +21,7 @@ The fix-ready ledger has two readers with two path rules: prototype-load reads s
 - [A5] **Must** — a write that is short, throws or makes no progress never leaves a torn line: the ledger is cut back to its previous length and the writer reports failure (tests: "finishes a short write…", "refuses and cuts the ledger back when a write fails part-way…").
 - [A6] **Must** — the cut-back never deletes bytes another writer appended (test: "does not cut back bytes another writer appended…"), and a record over 64 KiB is refused because the adoption matrix reader keeps only the last 1 MiB of the ledger (test: "refuses a record too large…").
 
-- [A7] **Must** — every record the writer appends carries a parseable ISO `at`, so the adoption matrix reader (`parseFixReadyLines`) accepts it instead of dropping it as "fix-ready log malformed"; `at` is ignored when deciding a duplicate, and an unusable clock refuses with nothing written (tests: "stamps every written record with a parseable `at`…", "ignores `at` when deciding a duplicate…", "refuses to write when the clock returns no usable time…").
+- [A7] **Must** — every record the writer appends carries a parseable ISO `at`, so the adoption matrix reader (`parseFixReadyLines`) accepts it instead of dropping it as "fix-ready log malformed"; `at` is ignored when deciding a duplicate, and an unusable clock (NaN or out of range) refuses with nothing written, and `at` is never below the ref's latest `at` already in the ledger, so the reader keeps the newer record (tests: "stamps every written record with a parseable `at`…", "ignores `at` when deciding a duplicate…", "refuses to write when the clock returns no usable time…", "never stamps a ref below its latest `at`…").
 
 ## Non-goals
 

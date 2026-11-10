@@ -131,10 +131,11 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
   const { ref, sha } = built.record;
   // The adoption matrix reader (parseFixReadyLines) drops any line without a parseable `at`, so every record carries
   // the write time. `at` is not part of the record's identity: it is left out of the duplicate comparison below.
-  const stamp = now();
-  if (!Number.isFinite(stamp)) return { ok: false, error: 'cannot stamp the record: the clock returned no time' };
-  const record = { ...built.record, at: new Date(stamp).toISOString() };
-  const line = JSON.stringify(record);
+  // A clock value `Date` cannot represent (NaN, or finite but out of range) would throw in toISOString: refuse it first.
+  const clockMs = new Date(now()).getTime();
+  if (!Number.isFinite(clockMs)) return { ok: false, error: 'cannot stamp the record: the clock returned no usable time' };
+  // The final `at` is chosen under the lock (stampUnderLock); this provisional line only sizes the record.
+  const line = JSON.stringify({ ...built.record, at: new Date(clockMs).toISOString() });
   // The adoption matrix reads only the last 1 MiB of the ledger; a record near that size would be written, reported as
   // success, then cut by the reader's tail slice. Refuse it instead.
   if (Buffer.byteLength(line) > MAX_RECORD_BYTES) return { ok: false, error: `record is ${Buffer.byteLength(line)} bytes; the limit is ${MAX_RECORD_BYTES} (the reader keeps only the last 1 MiB of the ledger)` };
@@ -165,9 +166,14 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
     if (isDuplicate(locked.text)) return duplicate;
     // A hand-edited ledger may lack a final newline; without this the new record would fuse onto the last line.
     const prefix = locked.text && !locked.text.endsWith('\n') ? '\n' : '';
+    // The reader keeps, per ref, the line with the greatest `at` (a tie goes to the later line). Stamp under the lock
+    // and never go below the ref's latest `at` already in the ledger, so a clock step back, skew between machines or
+    // two writers racing cannot make this newer record lose to an older one.
+    const priorAt = Math.max(-Infinity, ...jsonLines(locked.text).filter((r) => r && r.ref === ref && typeof r.at === 'string').map((r) => Date.parse(r.at)).filter(Number.isFinite));
+    const record = { ...built.record, at: new Date(Math.max(clockMs, priorAt)).toISOString() };
     const fd = fsApi.openSync(file, 'a');
     try {
-      const written = appendAll(fd, Buffer.from(`${prefix}${line}\n`), fsApi);
+      const written = appendAll(fd, Buffer.from(`${prefix}${JSON.stringify(record)}\n`), fsApi);
       if (!written.ok) return { ok: false, error: written.error };
     } finally { fsApi.closeSync(fd); }
     return { ok: true, record, file };

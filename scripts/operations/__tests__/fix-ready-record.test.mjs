@@ -273,12 +273,30 @@ describe('fix-ready-record', () => {
     expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => 1_800_000_000_000 }).error).toMatch(/duplicate/);
     expect(jsonLines(readFileSync(file, 'utf8'))).toHaveLength(1);
   });
-  it('refuses to write when the clock returns no usable time, and writes nothing', () => {
+  it.each([[NaN], [undefined], [1e20], [-1e20]])('refuses to write when the clock returns no usable time (%s), and writes nothing', (bad) => {
     const file = tmp();
-    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => NaN });
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => bad });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/clock/);
     expect(existsSync(file)).toBe(false);
+  });
+  it('never stamps a ref below its latest `at` in the ledger, so the reader keeps the newer record (clock stepped back)', () => {
+    const file = tmp();
+    const later = '2026-11-10T12:00:00.000Z';
+    writeFileSync(file, `${JSON.stringify({ ref, sha: 'a'.repeat(40), tests: 'green', audit: 'NOT WEAKENED', at: later })}\n`);
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => Date.parse(later) - 3_600_000 });
+    expect(r.ok).toBe(true);
+    expect(r.record.at).toBe(later);
+    expect(parseFixReadyLines(readFileSync(file, 'utf8'))).toEqual([{ ref, at: later, sha }]);
+    // a different ref is unaffected by this ref's `at`
+    const other = writeReadyRecord({ ...base, ref: 'lane/other', audit: 'NOT WEAKENED' }, { file, now: () => Date.parse(later) - 3_600_000 });
+    expect(other.record.at).toBe('2026-11-10T11:00:00.000Z');
+  });
+  it('uses the clock when it is ahead of the ledger, and ignores unparseable `at` values in old lines', () => {
+    const file = tmp();
+    writeFileSync(file, `${JSON.stringify({ ref, sha: 'a'.repeat(40), tests: 'green', audit: 'NOT WEAKENED', at: 'not-a-date' })}\n`);
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => Date.parse('2026-11-10T13:00:00.000Z') });
+    expect(r.record.at).toBe('2026-11-10T13:00:00.000Z');
   });
   it('passes a NOT WEAKENED record through the reader as ready-record', () => {
     const r = buildReadyRecord({ ...base, audit: 'NOT WEAKENED' });
