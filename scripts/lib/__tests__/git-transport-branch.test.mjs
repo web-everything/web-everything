@@ -511,3 +511,30 @@ describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', 
     expect(fetches(m.calls)).toBe(1);
   });
 });
+
+it('signedTransportVerifiesBeforePush: signature failure never pushes', () => {
+  const s = stub();
+  expect(() => stage(s, { sign: { keyPath: 'key', verify: () => { throw new Error('invalid signature'); } } })).toThrow(/signature/);
+  expect(s.calls.some(c => c.args?.[0] === 'push')).toBe(false);
+});
+it('signed transport signs, verifies, then pushes; unsigned path stays unchanged', () => {
+  const s = stub(); let verified = false;
+  stage(s, { sign: { keyPath: 'key', verify: () => { verified = true; expect(s.calls.some(c => c.args?.[0] === 'push')).toBe(false); } } });
+  expect(verified).toBe(true);
+  expect(s.calls.find(c => c.args?.includes('commit')).args).toContain('-S');
+});
+
+it('ignoresAmbientSignerTrust: explicit signers and empty keyring; verifies reported fingerprint', async () => {
+  const { verifySignedTransportCommit } = await import('../git-transport-branch.mjs');
+  const seen = [];
+  const run = (args, opts) => {
+    seen.push({ args, opts });
+    return 'Good "git" signature with ED25519 key SHA256:trusted';
+  };
+  const allowedSigners = [{ key: 'ssh-ed25519 AAAA', fingerprint: 'SHA256:trusted' }];
+  expect(verifySignedTransportCommit({ run, cwd: 'fixture', commit: 'a'.repeat(40), allowedSigners })).toBe('SHA256:trusted');
+  expect(seen[0].args).toContain('gpg.format=ssh');
+  expect(seen[0].args.some(a => a.startsWith('gpg.ssh.allowedSignersFile='))).toBe(true);
+  expect(seen[0].opts.env.GNUPGHOME).toBeTruthy();
+  expect(() => verifySignedTransportCommit({ run: () => 'Good signature SHA256:ambient', cwd: 'fixture', commit: 'a'.repeat(40), allowedSigners })).toThrow(/signer|signature/);
+});

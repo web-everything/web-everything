@@ -324,3 +324,8 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(stderr).toMatch(reconcile ? /FAILED open-PR listing/ : /dequeue sweep.*retried next pass/);
   });
 });
+
+it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
+  const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
+  expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
+});
