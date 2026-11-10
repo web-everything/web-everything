@@ -86,6 +86,56 @@ describe('credentialContentFinding test-file code expression residuals', () => {
   });
 });
 
+describe('credentialContentFinding narrow source exemptions', () => {
+  const testPath = 'scripts/lib/example.test.mjs';
+  const scannerPath = 'scripts/readiness/forge-exec-manifest.mjs';
+  const token = 'AbC9dE2fG5hJ8kL1mN4p'.repeat(2);
+  const pem = ['-----' + 'BEGIN PRIVATE' + ' KEY-----', Buffer.from(token).toString('base64'), '-----' + 'END PRIVATE' + ' KEY-----'].join('\n');
+
+  it.each([
+    "  GITHUB_TOKEN: 'secret-token-marker', ANTHROPIC_API_KEY: 'secret-key-marker',",
+    "  GITHUB_TOKEN: 'github', SERVICE_TOKEN: 'token', SERVICE_SECRET: 'secret', SERVICE_KEY: 'key', NODE_API_KEY: 'key' };",
+  ])('allows short object fixture values in test files: %s', line => {
+    expect(scan(line, testPath)).toBeNull();
+    expect(scan(line)).not.toBeNull();
+  });
+  it('allows a source hash call chain', () => {
+    expect(scan("WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(token).digest('hex'),")).toBeNull();
+  });
+  it('allows a source template with short static and quoted parts', () => {
+    expect(scan("readerKey = `reader:${basename(String(entries?.[0] || 'daemon'))}`, ")).toBeNull();
+  });
+  it('exempts pattern text only at the scanner path', () => {
+    const pattern = '/' + '-----' + 'BEGIN/';
+    expect(scan(pattern, scannerPath)).toBeNull();
+    expect(scan(pattern)).toBe('pem-header');
+    expect(scan(pattern, 'other/' + scannerPath)).toBe('pem-header');
+    expect(scan(readFileSync(new URL('../forge-exec-manifest.mjs', import.meta.url)), scannerPath)).toBeNull();
+  });
+  it.each([testPath, 'scripts/lib/example.mjs'])('still catches real literal tokens in %s', path => {
+    expect(token).toHaveLength(40);
+    for (const value of [token, `'${token}'`, `f('${token}')`, `\`reader:${token}\``, `\`reader:\${f('${token}')}\``, `\`\${/${token}/.source}\``]) {
+      // The existing test-file call residual is pinned separately above.
+      if (path === testPath && value.startsWith('f(')) continue;
+      expect(scan(`GITHUB_TOKEN: ${value}`, path)).not.toBeNull();
+    }
+  });
+  it.each(['ordinary.txt', scannerPath])('still catches a real PEM block in %s', path => {
+    expect(scan(pem, path)).toBe('pem-header');
+  });
+  it.each(['x.mjs', testPath, scannerPath])('keeps known token patterns everywhere in %s', path => {
+    for (const value of ['gh' + 'p_' + token, 'AK' + 'IA' + '0123456789ABCDEF', 's' + 'k-' + token, 'PRIVATE' + ' KEY']) {
+      expect(scan(value, path)).not.toBeNull();
+    }
+  });
+  it.each([
+    "'short' /* comment */ suffix()", "'short' // suffix()", "'unclosed suffix()", "'escaped\\'value' + suffix()",
+  ])('refuses unsafe quote handling: %s', value => {
+    expect(scan(`GITHUB_TOKEN: ${value}`, testPath)).not.toBeNull();
+    expect(scan(`GITHUB_TOKEN: ${value}`)).not.toBeNull();
+  });
+});
+
 // A test file that spells out a credential marker contiguously fails the very scan it exercises, so Forge
 // refuses it and falls back to the local host. Scan each of these files as Forge would.
 describe('forge scan test files pass their own scan', () => {

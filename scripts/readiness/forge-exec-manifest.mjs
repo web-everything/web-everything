@@ -105,13 +105,27 @@ const secretText=[
   [/xox[bp]-[A-Za-z0-9-]{8,}/,'slack-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
-const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+const textFinding=(text,patternSource=false)=>secretText.find(([pattern,rule])=>{
+  if(patternSource&&rule==='pem-header')return false;
+  // Ignore only the scanner's regex spelling; standalone key markers still hit.
+  const candidate=patternSource&&rule==='private-key'?text.replaceAll('/PRIVATE KEY/i',''):text;
+  return pattern.test(candidate);
+})?.[1]??null;
 // R824/R825: in test files only, a name:value whose value is a code expression
 // (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
 // strings are stripped first, so a literal that merely contains `(` still hits.
 // Known token patterns run before this on the whole text and always hit.
-function codeExpression(value) {
+function codeExpression(value,mode='legacy') {
   let code='';
+  const safeSpan=span=>!opaqueToken(span.replace(/\s/g,''));
+  // Read plain quotes conservatively; escapes and partial strings need a parser.
+  const quoteEnd=start=>{
+    for(let end=start+1;end<value.length;end++) {
+      if(value[end]==='\\')return -1;
+      if(value[end]===value[start])return mode==='legacy'||safeSpan(value.slice(start+1,end))?end:-1;
+    }
+    return -1;
+  };
   for(let i=0;i<value.length;i++) {
     const char=value[i];
     // Comments can contain misleading quotes or calls. Without a full parser,
@@ -119,17 +133,47 @@ function codeExpression(value) {
     if(char==='/'&&/[/*]/.test(value[i+1]??''))return false;
     if(!/["'`]/.test(char)) {code+=char;continue;}
     const quote=char;
+    if(quote!=='`') {
+      i=quoteEnd(i);
+      if(i<0)return false;
+      code+=' ';
+      continue;
+    }
     let closed=false;
+    let staticStart=i+1;
     for(i++;i<value.length;i++) {
-      if(value[i]===quote) {closed=true;break;}
+      if(value[i]===quote) {
+        if(mode!=='legacy'&&!safeSpan(value.slice(staticStart,i)))return false;
+        closed=true;break;
+      }
       // Escapes, interpolation and partial multiline strings need a parser to
       // prove safe. Keep the original entropy rejection for these forms.
       // A plain quoted literal beside a call is the ruled skip (R824/R825): a
       // fixture like 'ghp_acceptance_fixture' must not trip the scan.
-      if(value[i]==='\\'||(quote==='`'&&value[i]==='$'&&value[i+1]==='{'))return false;
+      if(value[i]==='\\')return false;
+      if(value[i]==='$'&&value[i+1]==='{') {
+        if(mode!=='source'||!safeSpan(value.slice(staticStart,i)))return false;
+        let depth=1;
+        for(i+=2;i<value.length;i++) {
+          // Slash syntax could be a regex literal carrying a credential; do not parse it here.
+          if(value[i]==='\\'||value[i]==='`'||value[i]==='/')return false;
+          if(/["']/.test(value[i])) {i=quoteEnd(i);if(i<0)return false;continue;}
+          if(value[i]==='{')depth++;
+          if(value[i]==='}'&&!--depth)break;
+        }
+        if(depth)return false;
+        staticStart=i+1;
+      }
     }
     if(!closed)return false;
     code+=' ';
+  }
+  if(mode==='fixture')return !code.split(/\s+/).some(opaqueToken);
+  if(mode==='source') {
+    // Whole templates, or identifier/member call chains with non-opaque arguments.
+    if((code.match(/[A-Za-z_$][\w$]*/g)??[]).some(opaqueToken))return false;
+    return /^\s*`/.test(value)?/^\s*[,;]?\s*$/.test(code)
+      :/^\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\([\w$\s.,()[\]?|]*\)(?:\.[A-Za-z_$][\w$]*\s*\([\w$\s.,()[\]?|]*\))*\s*[,;]?\s*$/.test(code);
   }
   return /=>|^\s*\(|[A-Za-z_$][\w$]*\s*\(/.test(code);
 }
@@ -167,12 +211,14 @@ function continuationLines(text,from,indent) {
 export function credentialContentFinding(path,content) {
   // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
   // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
-  const leaf=classifyManifestPath(path).names.at(-1);
+  const names=classifyManifestPath(path).names,leaf=names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
-  const raw=textFinding(text);
+  const patternSource=names.join('/')==='scripts/readiness/forge-exec-manifest.mjs'
+    &&!/^-----BEGIN [A-Z ]+-----\r?\n(?:[A-Za-z0-9+/]+={0,2})\r?$/m.test(text);
+  const raw=textFinding(text,patternSource);
   if(raw)return raw;
   const testSource=isTestFile(path);
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
@@ -203,6 +249,10 @@ export function credentialContentFinding(path,content) {
     }
     // A whole-value reference with no continuation line cannot hide a literal.
     if(reference&&!continuation.length)continue;
+    // These exemptions prove every quoted span safe, unlike the legacy test call residual.
+    // Continuation scalars retain their existing rejection above.
+    if(!continuation.length&&((testSource&&codeExpression(value,'fixture'))
+      ||(!testSource&&/\.(?:mjs|js|ts)$/.test(leaf)&&codeExpression(value,'source'))))continue;
     // An unquoted value with internal whitespace is a code expression or a sentence, never one opaque secret
     // (`keys: [index], at: r.at });`). Contiguous and quoted values, and continuation lines above, keep the full rule.
     // Only source and prose files qualify (never YAML/INI, where `${{ 'literal' }}` is a real leak shape), and a quote
