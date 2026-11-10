@@ -144,6 +144,25 @@ describe('window and source selection', () => {
     }
     expect(evidence(40, 4096, { history: undefined, root: '/fixture', readFile: () => [row(20, 60), row(30, 30), row(40)].map(JSON.stringify).join('\n') })).toMatchObject({ idlePct: 30, source: 'resource-sampler' });
   });
+  it('ignores invalid rows older than the window and decides from in-window rows', () => {
+    const old = (age, extra) => ({ ...row(50, age), ...extra });
+    const rows = [old(9000, { cpu: { idlePct: null } }), old(8000, { sampledAt: 'garbage' }), old(7000, { cpu: {} }), row(40, 60), row(40, 30), row(40)];
+    expect(evidence(40, 4096, { history: () => rows })).toMatchObject({ idlePct: 40, source: 'resource-sampler' });
+    expect(admit('review', { settings, read: () => evidence(40, 4096, { history: () => rows }) }).admit).toBe(true);
+  });
+  it('reads a real file with an old null-idle line and admits from the window', () => {
+    const lines = [JSON.stringify({ ...row(0, 9000), cpu: { idlePct: null } }), '{bad', ...[row(40, 60), row(40, 30), row(40)].map(r => JSON.stringify(r))].join('\n');
+    expect(evidence(40, 4096, { history: undefined, root: '/fixture', readFile: () => lines })).toMatchObject({ idlePct: 40, source: 'resource-sampler' });
+  });
+  it.each([
+    ['null idle', { cpu: { idlePct: null } }], ['out-of-range idle', { cpu: { idlePct: 101 } }],
+    ['future sample', { sampledAt: new Date(now() + 5000).toISOString() }],
+  ])('an invalid in-window row (%s) still holds', (_n, bad) => {
+    const rows = [row(40, 60), { ...row(40, 30), ...bad }, row(40)];
+    const read = () => evidence(40, 4096, { history: () => rows });
+    expect(read()).toMatchObject({ error: expect.any(String), idlePct: null });
+    expect(admit('review', { settings, read }).admit).toBe(false);
+  });
   it('unreadable display probes cannot veto valid capacity', () => {
     expect(evidence(40, 4096, { load: () => { throw Error('display unavailable'); } }).error).toBeUndefined();
   });
