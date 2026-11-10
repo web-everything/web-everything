@@ -185,6 +185,12 @@ describe('the hold lifts only when the posted comment shows the SAME whole body'
 });
 
 describe('the sealed status reader fails closed', () => {
+  it('reads the very file the drain evidence writer writes (path parity, with and without the runs-dir override)', () => {
+    const loopPayload = { findings: { read: { netBasis: { rev: head } } } };
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'ran' }, { env: process.env });
+    expect(JSON.parse(readFileSync(sealedStatusPath({ repo, pr: 42, head }, process.env), 'utf8'))).toMatchObject({ repo, pr: 42, head, result: 'ran' });
+    expect(sealedStatusPath({ repo, pr: 42, head }, {})).toBe(sealedStatusPath({ repo, pr: 42, head }, { [SHARED_RUNS_DIR_ENV]: '' }));
+  });
   it('nothing sealed, a missing file and bad identity inputs hold nothing or fail closed', () => {
     expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toBeNull();
     expect(readSealedStatus({ repo: null, pr: 42, head })).toBeNull();

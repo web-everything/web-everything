@@ -55,6 +55,10 @@ const stage = (root) => {
     copyFileSync(join(dirname(LEAF), '../conveyor', f), join(root, 'conveyor', f));
   }
   copyFileSync(join(dirname(LEAF), 'secret-scrub.mjs'), join(root, 'lib/secret-scrub.mjs'));
+  // PR #6622 — red-team-gate.mjs reads the sealed stored evidence through this leaf, which resolves the runs dir via
+  // `../operations/coordination-root.mjs` — stage both, or the staged copy fails to import and `main()` never runs.
+  copyFileSync(join(dirname(LEAF), 'red-team-sealed-status.mjs'), join(root, 'lib/red-team-sealed-status.mjs'));
+  copyFileSync(join(dirname(LEAF), '../operations/coordination-root.mjs'), join(root, 'operations/coordination-root.mjs'));
   // #4077 continuation — `health-watch-core.mjs` now imports `./health-smells-notify-list.mjs` (the ONE
   // declared place for the notify-in-shadow list; a plain data file, no further leaf needs staging) — stage
   // it too, or the staged copy fails to import and `main()` silently never runs (same failure mode as every

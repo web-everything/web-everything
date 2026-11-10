@@ -6,11 +6,18 @@
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { sharedRunsDir } from '../operations/run-store.mjs';
+import { resolve } from 'node:path';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+
+// Mirrors run-store's `sharedRunsDir` without its import graph (this leaf rides inside the gate, which staged partial
+// copies of the operator queue must import); a test pins the path to the drain evidence writer's.
+const SHARED_RUNS_DIR_ENV = 'WE_SHARED_RUNS_DIR';
+const runsDir = env => env?.[SHARED_RUNS_DIR_ENV]?.trim() ? resolve(env[SHARED_RUNS_DIR_ENV].trim())
+  : join(dirname(resolveCoordinationRoot({ env })), 'runs');
 
 /** The status file the publisher and the drain evidence writer share (same grammar as drain-red-team-evidence). */
 export const sealedStatusPath = ({ repo, pr, head }, env = process.env) =>
-  join(dirname(sharedRunsDir(env)), 'red-team-status', `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+  join(dirname(runsDir(env)), 'red-team-status', `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
 /**
  * PURE: a stored status object as the hold decision's `sealed` input, or null when it holds nothing.
