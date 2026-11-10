@@ -1,0 +1,50 @@
+{
+  "_comment": "New entries need review. SHA-256 pins the exact offending physical line, without CR/LF; no raw secrets.",
+  "entries": [
+    {
+      "path": "scripts/readiness/__tests__/remote-exec.test.mjs",
+      "rule": "high-entropy-GITHUB_TOKEN",
+      "sha256": "7f8190daf5a13c26eda199606813f3e49181c2010be7d84dd57d4f8ce619803d"
+    },
+    {
+      "path": "scripts/readiness/__tests__/remote-exec.test.mjs",
+      "rule": "high-entropy-SECRET",
+      "sha256": "fd6df0227edadbef0810f235ed83704ca9dd651f537344ba73f76abd09c9e784"
+    },
+    {
+      "path": "scripts/readiness/__tests__/remote-exec.test.mjs",
+      "rule": "high-entropy-CREDENTIAL",
+      "sha256": "352dd654dc1e8ec1e4d84cc7ec968122d1cbbfae4fd74b10b8ed5cabb04c857e"
+    },
+    {
+      "path": "scripts/operations/__tests__/prototype-load.test.mjs",
+      "rule": "high-entropy-GITHUB_TOKEN",
+      "sha256": "3b1f0434f362976e1a7a7671e59f4bb3f1284ae78ed6b7b25ab8cc923372b30d"
+    },
+    {
+      "path": "scripts/conveyor/ci-red-recovery-watch.mjs",
+      "rule": "high-entropy-WE_GH_AUTH_TOKEN_HASH",
+      "sha256": "99d82b9b874457bffa0cf2d83895fc015294c37b0de978a11f9eabb74dced85f"
+    },
+    {
+      "path": "scripts/conveyor/ci-red-recovery-watch.mjs",
+      "rule": "secret-assignment-token",
+      "sha256": "0c4b5829ca8d96e16f457bc6fa01644c5ec07beb1c49d3bb40544ed0c7ab181b"
+    },
+    {
+      "path": "scripts/lib/daemon-self-sync.mjs",
+      "rule": "high-entropy-readerKey",
+      "sha256": "4a862c1d001cff9c0fb3b5be4d2a9a0e79d7d2300ef6ac1cfb53281a37d4321e"
+    },
+    {
+      "path": "scripts/readiness/forge-exec-manifest.mjs",
+      "rule": "pem-header",
+      "sha256": "b24a85770c0a40f8e6f78de9f5a6c331809e67892c00e388d301c7908e3eb2b3"
+    },
+    {
+      "path": "scripts/readiness/forge-exec-manifest.mjs",
+      "rule": "private-key",
+      "sha256": "b24a85770c0a40f8e6f78de9f5a6c331809e67892c00e388d301c7908e3eb2b3"
+    }
+  ]
+}

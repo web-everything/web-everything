@@ -1,6 +1,25 @@
 import {createHash} from 'node:crypto';
+import {readFileSync} from 'node:fs';
 const LIMIT=4*1024*1024;
 const sha=value=>createHash('sha256').update(value).digest('hex');
+// Load once. Missing or malformed review evidence permits no skips.
+const scanAllowlist=(()=>{
+  try {
+    const data=JSON.parse(readFileSync(new URL('./forge-scan-allowlist.json',import.meta.url),'utf8'));
+    if(!Array.isArray(data.entries)||!data.entries.every(entry=>entry
+      &&typeof entry.path==='string'&&typeof entry.rule==='string'
+      &&typeof entry.sha256==='string'&&/^[a-f0-9]{64}$/.test(entry.sha256)))return [];
+    return data.entries;
+  } catch {return [];}
+})();
+let scanHasBom=false; // a leading BOM is stripped by decoding, so a listed line cannot be trusted
+const allowedScanHit=(path,rule,span)=>!scanHasBom&&scanAllowlist.some(entry=>entry.rule===rule
+  &&Buffer.from(entry.path).equals(path)&&entry.sha256===sha(span));
+// Pin the complete physical line, excluding its CR/LF separator, including whitespace.
+function scanLine(text,index) {
+  const start=Math.max(text.lastIndexOf('\n',index-1),text.lastIndexOf('\r',index-1))+1;
+  return text.slice(start).split(/[\r\n]/,1)[0];
+}
 // Paths remain bytes throughout inventory, transport, hashing and verification.
 export function pathParts(path) {
   if (!Buffer.isBuffer(path) || !path.length || path[0] === 47 || path.some(b => b === 0 || b === 10 || b === 13))
@@ -106,6 +125,34 @@ const secretText=[
 ];
 export const credentialTextFinding=text=>textFinding(text);
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+// R824/R825: in test files only, a name:value whose value is a code expression
+// (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
+// strings are stripped first, so a literal that merely contains `(` still hits.
+// Known token patterns run before this on the whole text and always hit.
+function codeExpression(value) {
+  let code='';
+  for(let i=0;i<value.length;i++) {
+    const char=value[i];
+    // Comments can contain misleading quotes or calls. Without a full parser,
+    // refuse the exemption rather than interpreting their contents as code.
+    if(char==='/'&&/[/*]/.test(value[i+1]??''))return false;
+    if(!/["'`]/.test(char)) {code+=char;continue;}
+    const quote=char;
+    let closed=false;
+    for(i++;i<value.length;i++) {
+      if(value[i]===quote) {closed=true;break;}
+      // Escapes, interpolation and partial multiline strings need a parser to
+      // prove safe. Keep the original entropy rejection for these forms.
+      // A plain quoted literal beside a call is the ruled skip (R824/R825): a
+      // fixture like 'ghp_acceptance_fixture' must not trip the scan.
+      if(value[i]==='\\'||(quote==='`'&&value[i]==='$'&&value[i+1]==='{'))return false;
+    }
+    if(!closed)return false;
+    code+=' ';
+  }
+  return /=>|^\s*\(|[A-Za-z_$][\w$]*\s*\(/.test(code);
+}
+const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
@@ -137,6 +184,7 @@ function continuationLines(text,from,indent) {
 // excluded, so a run that needs it falls back to the Mac. Returns the first
 // finding or null when clean.
 export function credentialContentFinding(path,content) {
+  scanHasBom=content.length>=3&&content[0]===0xEF&&content[1]===0xBB&&content[2]===0xBF;
   // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
   // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
   const leaf=classifyManifestPath(path).names.at(-1);
@@ -144,8 +192,12 @@ export function credentialContentFinding(path,content) {
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
-  const raw=textFinding(text);
-  if(raw)return raw;
+  for(const [pattern,rule] of secretText) {
+    for(const match of text.matchAll(new RegExp(pattern.source,pattern.flags+'g'))) {
+      if(!allowedScanHit(path,rule,scanLine(text,match.index)))return rule;
+    }
+  }
+  const testSource=isTestFile(path);
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
   for(const match of text.matchAll(assignmentLine)) {
@@ -168,16 +220,33 @@ export function credentialContentFinding(path,content) {
       if(!continuation)return `unbounded-continuation-${field}`;
       if(credentialNamed) {
         for(const line of [...continuation,continuation.join('')]) {
-          if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${field}`;
+          if(line.length>=20&&entropy(line)>=3.5&&!(testSource&&codeExpression(line)))return `high-entropy-${field}`;
         }
       }
     }
     // A whole-value reference with no continuation line cannot hide a literal.
     if(reference&&!continuation.length)continue;
-    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    // An unquoted value with internal whitespace is a code expression or a sentence, never one opaque secret
+    // (`keys: [index], at: r.at });`). Contiguous and quoted values, and continuation lines above, keep the full rule.
+    // Only source and prose files qualify (never YAML/INI, where `${{ 'literal' }}` is a real leak shape), and a quote
+    // anywhere in the value keeps it scanned (apostrophes and, as code spans, backticks are allowed in .md prose only;
+    // in source a backtick opens a template literal). A value that carries any single opaque token
+    // (`<secret> # prod`, `<secret> (rotated)`, a backticked secret in prose) is a secret with a tail, not prose.
+    // Quoted/backticked spans also keep the scan when their content is opaque after removing whitespace;
+    // word boundaries around the quotes prevent prose apostrophes from forming spans.
+    // Boundaries pinned in forge-scan-code-expression.test.mjs (whitespace-exemption boundaries).
+    const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
+      &&!(leaf.endsWith('.md')?/["]/:/["'`]/).test(trimmed)&&!trimmed.split(/\s+/).some(opaqueToken)
+      &&![...trimmed.matchAll(/(?<![\w])(['`])(.+?)\1(?![\w])/g)].some(([, ,span])=>opaqueToken(span.replace(/\s/g,'')));
+    const span=scanLine(text,match.index+(/^[\r\n\u0085\u2028\u2029]/.test(match[0])?1:0));
+    if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value))) {
+      if(allowedScanHit(path,`high-entropy-${field}`,span))continue;
+      return `high-entropy-${field}`;
+    }
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.
-      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
+      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal)
+        &&!allowedScanHit(path,`secret-assignment-${field}`,span))return `secret-assignment-${field}`;
     }
   }
   return null;
