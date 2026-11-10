@@ -15,6 +15,7 @@ import {
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
 import { redTeamGateMarker } from '../red-team-gate.mjs';
+import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import * as redTeamGate from '../red-team-gate.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -1237,6 +1238,28 @@ describe('red-team machine-body boundary (#5828)', () => {
     const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
     expect(record.laterVerdict).toBe(true);
     expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
+
+  it.each([['degraded=send-back', true], ['degraded=card', false], ['degraded=advisory', false]])(
+    'follows live policy for combined carried provenance: %s', (policy, hold) => {
+    vi.stubEnv('WE_RED_TEAM_CONFIRMED_BREAKS', policy);
+    const body = `${gate('card-queued')}\n${buildVerdictCarriedMarker({ fromSha: OLD, toSha: NEW, patchId: 'a'.repeat(40) })}\nReview verdict carried across an identical contribution.\n${advisory([finding])}`;
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(record.laterVerdict).toBe(hold);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe(hold ? 'none' : 'carry');
+  });
+
+  it.each([
+    ['finding index 99', body => body.replace(/^1\./m, '99.'), true],
+    ['bare gate and carry markers', body => body.slice(0, body.indexOf('\nReview verdict')), true],
+    ['missing advisory', body => body.slice(0, body.indexOf('\n' + advisory([finding]).split('\n')[0])), true],
+    ['gate without card-queued outcome', body => body.replaceAll('card-queued', 'no-send-back'), true],
+    ['mismatched carry target', body => body.replace(`to=${NEW}`, `to=${OLD}`), true],
+    ['PR 6584 complete single degraded finding', body => body, false],
+  ])('combined envelope: %s', (_name, transform, hold) => {
+    vi.stubEnv('WE_RED_TEAM_CONFIRMED_BREAKS', 'degraded=card');
+    const body = `${gate('card-queued')}\n${buildVerdictCarriedMarker({ fromSha: OLD, toSha: NEW, patchId: 'a'.repeat(40) })}\nReview verdict carried across an identical contribution.\n${advisory([finding]).replace(`Head \`${NEW.slice(0, 12)}\``, `Head \`${OLD.slice(0, 12)}\``)}`;
+    expect(laterRecord(transform(body), { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(hold);
   });
 
   it('uses the shared settings policy when a confirmed degraded advisory is configured for send-back', () => {
