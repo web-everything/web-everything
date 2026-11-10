@@ -135,6 +135,12 @@ describe('credentialContentFinding narrow source exemptions', () => {
       expect(scan(`token: "${pad}${token}${pad}"`, testPath)).not.toBeNull();
     }
   });
+  it('hex token between homogeneous padding is still caught (test and source)', () => {
+    const hex = 'aabbccddeeff00112233445566778899';
+    const pad = 'A'.repeat(128);
+    expect(scan(`token: "${pad}${hex}${pad}"`, testPath)).not.toBeNull();
+    expect(scan(`token: String('${pad}${hex}${pad}')`, 'scripts/readiness/x.mjs')).not.toBeNull();
+  });
   it('padded quoted token in a test fixture is still caught', () => {
     const pad = '!'.repeat(64);
     expect(scan(`token: "${pad}${token}${pad}"`, testPath)).not.toBeNull();
