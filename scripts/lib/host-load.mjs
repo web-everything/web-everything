@@ -15,6 +15,7 @@ import * as childProcess from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
+import { admit as admitCapacity } from './host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 
 // GC has no reason to reclaim even a stale lease. Unknown markers/IO refuse work too.
@@ -124,9 +125,15 @@ export function readHostMemoryHeadroomMb(options = {}) {
   return readMemoryReading(options).mb ?? NaN;
 }
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
-  capacity = collectHostCapacity,
+  capacity = collectHostCapacity, capacityClass, capacityAdmission = admitCapacity, capacityRead, capacitySettings,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
+  if (capacityClass !== undefined) {
+    try {
+      const verdict = capacityAdmission(capacityClass, { read: capacityRead, settings: capacitySettings, env, log });
+      return { ...verdict, admitted: verdict.admit === true };
+    } catch (error) { return { admitted: false, reason: `host-capacity hold class=${capacityClass} idle=unknown% (loadavg unknown display only): ${error.message}` }; }
+  }
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
   try {

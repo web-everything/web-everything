@@ -163,7 +163,7 @@ describe('setting-driven red-team queue floor', () => {
   it('environment overrides win over both file settings', () => {
     expect(load(settings(4, 80), {
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '1',
-      WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: '20',
+      WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '20',
     })).toEqual({ minConcurrent: 1, idlePct: 20, reviewStartsPerTick: 0 });
   });
 
@@ -248,15 +248,15 @@ describe('setting-driven red-team queue floor', () => {
     }
   });
 
-  it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j disables the floor', value => {
-    expect(load(settings(2, value))).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
-    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0 });
+  it.each(['bad', -1, 101, 1.5, null])('legacy invalid idle threshold %j is ignored; shared review threshold wins', value => {
+    expect(load(settings(2, value))).toEqual({ minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 });
   });
 
-  it.each([0, 100])('accepts idle threshold boundary %s', idlePct => {
-    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+  it.each([0, 100])('ignores legacy idle threshold boundary %s', idlePct => {
+    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 });
     expect(load(settings(), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(idlePct) }))
-      .toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+      .toEqual({ minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 });
   });
 
   it.each([null, undefined, NaN, Infinity, -Infinity, '38', -1])(
@@ -845,11 +845,11 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
 });
 
 describe('red-team queue floor idle override', () => {
-  it('an invalid idle override keeps a valid stricter file threshold instead of loosening to 10', () => {
+  it('legacy idle overrides and thresholds are replaced by host-capacity review settings', () => {
     const text = JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 80 } } });
     for (const bad of ['bad', '', ' ', 'Infinity', '-1', '101', '1.5']) {
       expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: bad }, file: 'x', readFile: () => text }))
-        .toEqual({ minConcurrent: 2, idlePct: 80, reviewStartsPerTick: 0 });
+        .toEqual({ minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 });
     }
   });
 });

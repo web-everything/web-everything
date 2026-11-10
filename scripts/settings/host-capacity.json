@@ -1,0 +1,8 @@
+{
+  "hostCapacity": {
+    "windowSec": 90,
+    "maxFreshSec": 90,
+    "minMemoryMb": 2048,
+    "idlePct": { "blocker": 5, "review": 10, "smoke": 15, "build": 15, "background": 25 }
+  }
+}

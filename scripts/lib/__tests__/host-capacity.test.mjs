@@ -1,0 +1,125 @@
+import { describe, it, expect, vi } from 'vitest';
+import { CLASSES, loadCapacitySettings, readCapacity, admit } from '../host-capacity.mjs';
+import { hostLoadAdmission } from '../host-load.mjs';
+import { defaultReviewHostAdmission } from '../../../skills-src/conveyor/review-daemon.mjs';
+import { applyRedTeamQueueFloor, loadRedTeamQueueFloor, raiseReviewStartsPerTick } from '../red-team-dispatch-queue.mjs';
+
+const settings = loadCapacitySettings({ env: {} });
+const now = () => Date.parse('2026-11-10T12:00:00Z');
+const row = (idle, age = 0) => ({ sampledAt: new Date(now() - age * 1000).toISOString(), cpu: { idlePct: idle } });
+const evidence = (idle = 40, mem = 4096, extra = {}) => readCapacity({ settings, env: {}, now,
+  history: () => [row(idle, 60), row(idle)], memory: () => mem, load: () => [79], cores: () => 12,
+  sample: () => { throw Error('unexpected direct sample'); }, ...extra });
+const decide = (cls, idle, mem) => admit(cls, { settings, read: () => evidence(idle, mem) });
+
+describe('class capacity floors', () => {
+  for (const cls of CLASSES) {
+    it.each([-0.1, 0, 0.1])(`${cls} at threshold offset %s`, offset => {
+      expect(decide(cls, settings.idlePct[cls] + offset).admit).toBe(offset >= 0);
+    });
+  }
+  it('high load average is display only', () => {
+    const decision = decide('review', 40);
+    expect(decision.admit).toBe(true);
+    expect(decision.reason).toContain('loadavg 79');
+    expect(decision.reason).toContain('display only');
+  });
+  it.each(CLASSES)('%s enforces the hard memory floor', cls => {
+    expect(decide(cls, 100, 2047).admit).toBe(false);
+    expect(decide(cls, 100, 2048).admit).toBe(true);
+  });
+  it('unknown class holds without reading the host', () => {
+    const read = vi.fn();
+    expect(admit('typo', { settings, read }).admit).toBe(false);
+    expect(read).not.toHaveBeenCalled();
+  });
+  it.each([NaN, Infinity, null, undefined, '40', -1, 101])('invalid CPU %s holds', idlePct => {
+    expect(admit('review', { settings, read: () => ({ idlePct, memFreeGB: 4 }) }).admit).toBe(false);
+  });
+  it.each([NaN, Infinity, null, -1, '4096'])('invalid memory %s holds', mem => {
+    expect(decide('review', 40, mem).admit).toBe(false);
+  });
+  it('thrown memory read holds', () => {
+    expect(admit('review', { settings, read: () => evidence(40, 4096, { memory: () => { throw Error('denied'); } }) }).admit).toBe(false);
+  });
+});
+
+describe('window and source selection', () => {
+  it('averages the window so a last-sample spike cannot admit', () => {
+    const read = () => evidence(40, 4096, { history: () => [row(100, 100), row(0, 80), row(0, 40), row(25)] });
+    expect(read().idlePct).toBeCloseTo(25 / 3);
+    expect(admit('review', { settings, read }).admit).toBe(false);
+  });
+  it.each([[], [row(40)], [row(40, 100), row(40, 120)]].map(rows => ({ rows })))('missing/short/stale telemetry falls back to two uncached direct intervals: $rows', ({ rows }) => {
+    const sample = vi.fn().mockReturnValueOnce({ ok: true, idlePct: 20 }).mockReturnValueOnce({ ok: true, idlePct: 40 });
+    expect(evidence(40, 4096, { history: () => rows, sample })).toMatchObject({ idlePct: 30, source: 'direct' });
+    expect(sample).toHaveBeenCalledTimes(2);
+    expect(sample).toHaveBeenCalledWith({ ttlMs: 0 });
+  });
+  it.each([() => [row(NaN)], () => [{ sampledAt: 'bad', cpu: { idlePct: 40 } }], () => null,
+    () => { throw Error('corrupt history'); }])('misread sampler holds without direct fallback', history => {
+    const sample = vi.fn();
+    const read = () => evidence(40, 4096, { history, sample });
+    expect(admit('review', { settings, read }).admit).toBe(false);
+    expect(sample).not.toHaveBeenCalled();
+  });
+  it.each([{ ok: false, idlePct: 40 }, { ok: true, idlePct: NaN }, { ok: true, idlePct: 101 }])('misread direct sample holds', result => {
+    expect(admit('review', { settings, read: () => evidence(40, 4096, { history: () => [], sample: () => result }) }).admit).toBe(false);
+  });
+  it('parses actual sampler history rows and holds malformed JSON/IO', () => {
+    for (const readFile of [() => '{bad', () => { throw Error('denied'); }]) {
+      const read = () => evidence(40, 4096, { history: undefined, root: '/fixture', readFile });
+      expect(admit('review', { settings, read }).admit).toBe(false);
+    }
+    expect(evidence(40, 4096, { history: undefined, root: '/fixture', readFile: () => [row(20, 60), row(40)].map(JSON.stringify).join('\n') })).toMatchObject({ idlePct: 30, source: 'resource-sampler' });
+  });
+  it('unreadable display probes cannot veto valid capacity', () => {
+    expect(evidence(40, 4096, { load: () => { throw Error('display unavailable'); } }).error).toBeUndefined();
+  });
+});
+
+describe('settings', () => {
+  it.each(['', ' ', 'bad', 'NaN', 'Infinity', '-1', '101', '0', '5'])('invalid/looser review override %j never loosens', value => {
+    expect(loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: value } }).idlePct.review).toBe(10);
+  });
+  it('file and environment can tighten; malformed file uses standard', () => {
+    const readFile = () => JSON.stringify({ hostCapacity: { idlePct: { review: 30 }, minMemoryMb: 1, windowSec: 120 } });
+    expect(loadCapacitySettings({ readFile, env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '20' } })).toMatchObject({ idlePct: { review: 30 }, minMemoryMb: 2048, windowSec: 120 });
+    const log = vi.fn();
+    expect(loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '35' }, log }).idlePct.review).toBe(35);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('env WE_HOST_CAPACITY_REVIEW_IDLE_PCT'));
+    expect(loadCapacitySettings({ env: {}, readFile: () => '{' }).idlePct.review).toBe(10);
+  });
+});
+
+describe('review wiring and red-team floor', () => {
+  it.each([[40, true], [5, false]])('load 79/12, idle %s => review admitted %s', (idle, admitted) => {
+    const log = vi.fn();
+    const result = defaultReviewHostAdmission({ env: {}, log, capacityRead: () => evidence(idle),
+      loadPolicy: () => ({ settings: { host: { maxReviewDispatchPerTick: 1, maxLoadPerCore: 0.1, minMemoryHeadroomMb: 999999 } } }) });
+    expect(result.admitted).toBe(admitted);
+    expect(result.maxPerTick).toBe(1);
+    expect(result.reason).toContain('class=review');
+    expect(result.reason).toContain('display only');
+    if (admitted) expect(log).toHaveBeenCalledWith(expect.stringContaining('review-daemon: host-capacity admit class=review idle=40% mem=4GB source=resource-sampler'));
+  });
+  it('wired host-load uses capacity memory authority and never legacy load/memory probes', () => {
+    const forbidden = () => { throw Error('legacy probe invoked'); };
+    expect(hostLoadAdmission({ capacityClass: 'smoke', capacityRead: () => evidence(40),
+      load: forbidden, memory: forbidden, capacity: forbidden, interactive: true }).admitted).toBe(true);
+    expect(hostLoadAdmission({ capacityClass: 'review', capacityRead: () => evidence(40, 100), interactive: true }).admitted).toBe(false);
+  });
+  it('red-team floor and review starts use the shared stricter threshold and windowed idle', () => {
+    const capacitySettings = loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '30' } });
+    const floor = loadRedTeamQueueFloor({ capacitySettings, env: {}, readFile: () => JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 0, reviewStartsPerTickWhileIdle: 3 } } }) });
+    expect(floor.idlePct).toBe(30);
+    const capacity = { remainingStarts: 1, startsCeiling: 3 };
+    const cpuIdlePct = evidence(40, 4096, { history: () => [row(0, 60), row(40)] }).idlePct;
+    applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct });
+    expect(capacity.remainingStarts).toBe(1);
+    expect(raiseReviewStartsPerTick(2, { floor, cpuIdlePct })).toBe(2);
+    applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct: 30 });
+    expect(capacity.remainingStarts).toBe(2);
+    expect(raiseReviewStartsPerTick(2, { floor, cpuIdlePct: 30 })).toBe(3);
+  });
+});
