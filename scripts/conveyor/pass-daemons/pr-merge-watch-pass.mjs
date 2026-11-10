@@ -87,6 +87,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
         || Object.entries(p.heads).some(([h, r]) => !sha(h) || !object(r) || typeof r.alerted !== 'boolean'
           || ['readyStuckAlerted', 'refreshed'].some(k => r[k] !== undefined && typeof r[k] !== 'boolean')
           || (r.readyStuckSince !== undefined && (!Number.isFinite(r.readyStuckSince) || r.readyStuckSince > stamp))
+          || (r.readyLabelAt !== undefined && (!Number.isFinite(r.readyLabelAt) || r.readyLabelAt > stamp))
           || (r.signals !== undefined && (!object(r.signals) || Object.entries(r.signals).some(([k, v]) => !/^(progress|ci:\d+|loop:[a-f0-9]{64})$/.test(k) || v !== true)))
           || !(r.since === null || (Number.isFinite(r.since) && r.since <= stamp))))) throw Error('invalid saved evidence');
       const save = () => atomicJson(file, state);

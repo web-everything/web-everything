@@ -3,13 +3,24 @@
  * refresh; unavailable label history instead starts a durable observation timer.
  */
 import { humanReviewHold } from '../../operations/pr-sweep-core.mjs';
+import { GH_UNSTARTED_SENTINEL } from '../ci-queue-watch.mjs';
 
 export const isUnretryable = check => check?.rerunError?.status === 403
   && /cannot be retried/i.test(check.rerunError.message ?? '');
 const conclusion = c => String(c?.conclusion || c?.state || c?.status || 'UNKNOWN').toUpperCase();
 const successful = c => ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(conclusion(c));
 const checkName = c => c?.name ?? c?.context;
-const checkDate = c => c?.completedAt || c?.completed_at || c?.startedAt || c?.started_at || c?.createdAt || null;
+// A queued or running check is not stale: it has no result to retry. GitHub reports the
+// unfinished-run time as the year-1 sentinel, so treat that (and any implausible date)
+// as absent and fall through to the next field.
+const UNFINISHED = new Set(['QUEUED', 'IN_PROGRESS', 'PENDING', 'WAITING', 'REQUESTED', 'EXPECTED']);
+const unfinished = c => UNFINISHED.has(conclusion(c))
+  || (typeof c?.status === 'string' && c.status.toUpperCase() !== 'COMPLETED');
+const realDate = v => typeof v === 'string' && v !== GH_UNSTARTED_SENTINEL && Date.parse(v) > Date.UTC(2000, 0, 1);
+export const checkDate = c => [c?.completedAt, c?.completed_at, c?.startedAt, c?.started_at, c?.createdAt]
+  .find(realDate) ?? null;
+// Conservative ref-name shape for anything that reaches a git argv.
+const SAFE_REF = /^[A-Za-z0-9][\w./-]*$/;
 
 export function readReadyLabelTime({ repo, pr, read }) {
   let latest = null;
@@ -38,6 +49,8 @@ async function drainSkip({ repo, pr }) {
  * The existing refresh helper independently enforces live fix claims/scope jumps.
  */
 export function readChecksOnly({ repo, pr, read, now }) {
+  // Comment-derived holds (red-team send-back, open fix claim) need comments; fail closed without them.
+  if (!Array.isArray(pr.comments)) return false;
   const pull = read(['api', `repos/${repo}/pulls/${pr.number}`]);
   if (pull?.head?.sha !== pr.headRefOid || pull.head.repo?.full_name !== repo
     || pull.base?.ref !== 'main' || pull.mergeable !== true || pull.draft !== false
@@ -68,7 +81,7 @@ async function refreshBranch({ repo, pr, mainSha }) {
   const { repoProfile } = await import('../../lib/repo-profile.mjs');
   const { rebaseDropManifest, gitRunner } = await import('../../lib/rebase-drop-manifest.mjs');
   const cwd = repoProfile(repo)?.checkoutPath;
-  if (!cwd || !mainSha || !pr.headRefName) return { action: 'skip' };
+  if (!cwd || !mainSha || !SAFE_REF.test(pr.headRefName ?? '') || pr.headRefName.includes('..')) return { action: 'skip' };
   // Pin both merge inputs to the evidence. Never merge a newer unexamined head.
   if (gitRunner('git', ['fetch', 'origin', 'main', pr.headRefName], { cwd }).status !== 0) return { action: 'error' };
   const oid = ref => gitRunner('git', ['rev-parse', ref], { cwd }).stdout?.trim();
@@ -81,31 +94,46 @@ export async function runReadyStuck({ repo, pr, receipt, now, config, read, send
   onlyChecksBlock = readChecksOnly, readMainChecks = readMainCheckEvidence,
   isUnretryable: unretryable = isUnretryable, refresh = refreshBranch } = {}) {
   if (pr.state !== 'OPEN' || pr.isDraft || !pr.labels.some(l => l.name === 'ready-to-merge')) {
-    if (receipt.readyStuckSince !== undefined) { delete receipt.readyStuckSince; save(); }
+    if (receipt.readyStuckSince !== undefined || receipt.readyLabelAt !== undefined) {
+      delete receipt.readyStuckSince; delete receipt.readyLabelAt; save();
+    }
     return;
   }
   receipt.readyStuckSince ??= now;
   save();
-  let labeled;
-  try { labeled = await readLabelTime({ repo, pr, read }); } catch { /* observed-since fallback */ }
-  const time = typeof labeled === 'number' ? labeled : Date.parse(labeled);
-  const since = Number.isFinite(time) && time <= now ? time : receipt.readyStuckSince;
-  const minutes = (now - since) / 60000;
   const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.filter(c => !successful(c)) : [];
-  if (!receipt.readyStuckAlerted && minutes > config.readyStuckMinutes) {
-    let skipReason = null;
-    try { skipReason = await readSkipReason({ repo, pr }); } catch { /* diagnostic only */ }
-    const result = await send({ kind: 'ready-stuck', repo, pr: pr.number, detail: {
-      minutes, head: pr.headRefOid, threshold: config.readyStuckMinutes, needsYou: true,
-      cause: { skipReason, nonSuccessChecks: checks.map(c => ({ name: checkName(c) ?? null,
-        conclusion: conclusion(c), date: checkDate(c) })), mergeStateStatus: pr.mergeStateStatus },
-    } });
-    if (result === false) throw Error('ready-stuck delivery failed');
-    receipt.readyStuckAlerted = true;
-    save();
+  // The label time only decides the alert. Once it has fired, spend no more GitHub calls
+  // on label history; before that, read it once and keep it on the receipt.
+  if (!receipt.readyStuckAlerted) {
+    if (!Number.isFinite(receipt.readyLabelAt)) {
+      let labeled;
+      try { labeled = await readLabelTime({ repo, pr, read }); } catch {
+        log('pr-merge-watch: ready-stuck label history unavailable; using observed-since');
+      }
+      const labelTime = typeof labeled === 'number' ? labeled : Date.parse(labeled);
+      if (Number.isFinite(labelTime) && labelTime <= now) { receipt.readyLabelAt = labelTime; save(); }
+    }
+    const since = Number.isFinite(receipt.readyLabelAt) ? receipt.readyLabelAt : receipt.readyStuckSince;
+    const minutes = (now - since) / 60000;
+    if (minutes > config.readyStuckMinutes) {
+      let skipReason = null;
+      try { skipReason = await readSkipReason({ repo, pr }); } catch { /* diagnostic only */ }
+      const result = await send({ kind: 'ready-stuck', repo, pr: pr.number, detail: {
+        minutes, head: pr.headRefOid, threshold: config.readyStuckMinutes, needsYou: true,
+        cause: { skipReason, nonSuccessChecks: checks.map(c => ({ name: checkName(c) ?? null,
+          conclusion: conclusion(c), date: checkDate(c) })), mergeStateStatus: pr.mergeStateStatus },
+      } });
+      if (result === false) throw Error('ready-stuck delivery failed');
+      receipt.readyStuckAlerted = true;
+      save();
+    }
   }
-  if (receipt.refreshed || !['BLOCKED', 'BEHIND'].includes(pr.mergeStateStatus) || !checks.length) return;
+  // Refresh only after the ready-stuck threshold has passed (the delivered alert is the proof),
+  // and only for finished checks: a queued or running check is not stale.
+  if (!receipt.readyStuckAlerted || receipt.refreshed
+    || !['BLOCKED', 'BEHIND'].includes(pr.mergeStateStatus) || !checks.length) return;
   try {
+    if (checks.some(unfinished)) return;
     if (!checks.every(c => checkName(c) && (unretryable(c) || (Number.isFinite(Date.parse(checkDate(c)))
       && now - Date.parse(checkDate(c)) > config.selfHealStaleHours * 3600000)))) return;
     if (!await onlyChecksBlock({ repo, pr, read, now })) return;
