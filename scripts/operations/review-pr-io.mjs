@@ -954,7 +954,9 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
 export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
-  runStore = createFileRunStore(sharedRunsDir(env)),
+  // The SAME store the executor and `run.mjs --resume` use (`resolveRunsDir()`, where `OPERATION_RUNS_DIR` wins);
+  // reading `sharedRunsDir` here would miss every run a daemon job child or a test wrote under that override.
+  runStore = createFileRunStore(),
   referralJudge = judgeSpawn,
   sameGapJudge,
   publishGate = readReviewCiGate,
