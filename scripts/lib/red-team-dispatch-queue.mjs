@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
 
@@ -16,6 +17,60 @@ const note = (log, message) => {
   try { log(`review-daemon: red-team queue ${message}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')); }
   catch { /* Diagnostics must not interrupt recovery. */ }
 };
+
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
+export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
+
+/** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
+export function loadRedTeamQueueFloor({ env = process.env,
+  file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-team-queue.json'), readFile = readFileSync,
+  log = () => {} } = {}) {
+  let settings;
+  try { settings = JSON.parse(readFile(file, 'utf8'))?.redTeam?.queue; }
+  catch { /* Unavailable settings never create extra capacity. */ }
+  const minimumEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT;
+  const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
+  const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
+  const parseEnv = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+  const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
+  const minimum = minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv);
+  const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
+  // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
+  const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
+  const floor = {
+    // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
+    minConcurrent: (idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
+      ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
+    idlePct: validIdle(idle) ? idle : 10,
+    reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
+  };
+  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
+  return floor;
+}
+
+/** Idle capacity may raise a finite admitted allowance; disabled/unknown evidence never raises it. */
+export function raiseReviewStartsPerTick(maxPerTick, { floor, cpuIdlePct } = {}) {
+  if (!Number.isFinite(maxPerTick) || maxPerTick < 2
+    || !(floor?.minConcurrent > 0)
+    || !Number.isFinite(cpuIdlePct) || cpuIdlePct > 100 || !(cpuIdlePct >= floor.idlePct)
+    || !Number.isInteger(floor.reviewStartsPerTick) || floor.reviewStartsPerTick < 0) return maxPerTick;
+  // One extra start at most, and never past the configured cap; a configured limit of 1 stays 1.
+  return Math.max(maxPerTick, Math.min(maxPerTick + 1, floor.reviewStartsPerTick));
+}
+
+/** Raise the per-tick start allowance only within the caller's host ceiling; other bounds stay independent. */
+export function applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log = () => {} } = {}) {
+  if (!capacity || !Number.isFinite(capacity.remainingStarts)
+    || typeof capacity.startsCeiling !== 'number' || !(capacity.startsCeiling >= 0)
+    || !Number.isInteger(floor?.minConcurrent) || floor.minConcurrent <= 0
+    || !Number.isInteger(floor.idlePct) || floor.idlePct < 0 || floor.idlePct > 100
+    || !Number.isFinite(cpuIdlePct) || cpuIdlePct < floor.idlePct || cpuIdlePct > 100) return;
+  const minimum = Math.min(floor.minConcurrent, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP, capacity.startsCeiling);
+  if (capacity.remainingStarts >= minimum) return;
+  const before = capacity.remainingStarts;
+  capacity.remainingStarts = minimum;
+  note(log, `floor raises remainingStarts ${before} -> ${minimum}: CPU idle ${cpuIdlePct}% >= ${floor.idlePct}%`);
+}
 
 export function defaultQueueFile(env = process.env, home = homedir()) {
   return env.WE_RED_TEAM_QUEUE_FILE || join(home, 'workspace', '.operations', 'red-team-dispatch-queue.json');
@@ -203,7 +258,8 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.remainingStarts == null || (typeof capacity.remainingStarts === 'number' && !Number.isNaN(capacity.remainingStarts)))
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
-export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {}, ...rest }) {
+export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
+  floor, readCpuIdlePct, ...rest }) {
   const candidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
@@ -211,6 +267,11 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     if (isRealHead(head)) candidates.push({ pr: Number(row.prNumber), head });
   }
   const capacity = normalizeCapacity(rawCapacity);
+  if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
+    let cpuIdlePct;
+    try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
+    applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log });
+  }
   const transaction = transactions.get(queue)?.();
   try {
     queue.sync(repo, candidates);

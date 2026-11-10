@@ -1036,6 +1036,8 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     // The default runReview of buildCliDaemonEffects runs with those opts, and the host check it hands every repo's
     // tick is the real one (real host-load + memory readers; the Vitest host seams stand in for the machine).
     vi.stubEnv('WE_REVIEW_FACTS', '0');
+    // Hermetic: the real CPU-idle reading must not raise the per-tick cap in this wiring test.
+    vi.stubEnv('WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE', '0');
     try {
       const seen = [];
       const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
@@ -2769,3 +2771,29 @@ describe('operator-hold snapshots (card 5653)', () => {
     expect(skipped.some((l) => l.includes('operator-holds'))).toBe(false);
   });
 });
+
+
+it.each(['idle', 'low', 'denied', 'floor throws', 'sample throws', 'infinite'])(
+  'defaultReviewHostAdmission idle raise: %s', async mode => {
+    const { defaultReviewHostAdmission } = await import('../review-daemon.mjs');
+    const maxPerTick = mode === 'infinite' ? Infinity : 2;
+    const loadFloor = vi.fn(() => {
+      if (mode === 'floor throws') throw Error('unreadable');
+      return { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 3 };
+    });
+    const readCpuIdlePct = vi.fn(() => {
+      if (mode === 'sample throws') throw Error('unreadable');
+      return mode === 'low' ? 9 : 10;
+    });
+    const log = vi.fn();
+    const result = defaultReviewHostAdmission({ loadFloor, readCpuIdlePct, log,
+      loadPolicy: () => ({ settings: { host: { maxReviewDispatchPerTick: maxPerTick } } }),
+      admission: () => ({ admitted: mode !== 'denied', reason: 'verdict' }),
+    });
+    expect(result).toEqual({ admitted: mode !== 'denied', reason: 'verdict', maxPerTick: mode === 'idle' ? 3 : maxPerTick });
+    expect(log).toHaveBeenCalledTimes(mode === 'idle' ? 1 : 0);
+    if (mode === 'denied') {
+      expect(loadFloor).not.toHaveBeenCalled();
+      expect(readCpuIdlePct).not.toHaveBeenCalled();
+    }
+  });
