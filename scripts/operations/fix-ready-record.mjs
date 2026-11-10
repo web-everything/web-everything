@@ -69,4 +69,4 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   return 0;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) process.exit(main());
+if (process.argv[1] === fileURLToPath(import.meta.url)) process.exitCode = main();
