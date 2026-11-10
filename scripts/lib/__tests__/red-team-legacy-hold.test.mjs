@@ -16,6 +16,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { writeStore, resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
 import { SHARED_RUNS_DIR_ENV } from '../../operations/run-store.mjs';
+import { gateReadyItems, itemsFromReport } from '../../operations/needs-you-feed.mjs';
 
 const head = 'a'.repeat(40);
 const repo = 'o/n';
@@ -258,6 +259,19 @@ describe('(e) every disposition caller reports the hold', () => {
     expect(redTeamRulingNeeded(prFor(comments))).toMatchObject({ head, findings: [expect.objectContaining({ index: 0 })] });
     expect(redTeamEnqueueHold({ comments, pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/confirmed a break/);
     expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: [], comments, evidence: {} }).add).toBe('red-team:blocked');
+  });
+  it('the needs-you feed (gateReadyItems) never offers the sealed head for approval: it reports the owed break', async () => {
+    seal();
+    // The live PR read the feed makes, in gh's own shapes: the view, then the paged comment thread.
+    const gh = async (_f, args) => args[0] === 'api'
+      ? JSON.stringify([[{ user: { login: 'web-everything' }, body: clearComment.body, created_at: clearComment.createdAt }]])
+      : JSON.stringify({ headRefOid: head, labels: [] });
+    const report = { ready: [{ repo, number: 42, title: 't' }] };
+    const { kept, held } = await gateReadyItems(itemsFromReport(report), report, { gh, log: () => {}, fixClaimLive: () => false });
+    expect(held).toEqual([]);
+    // The report's other derived rows pass through untouched; the approval row itself becomes the owed break.
+    expect(kept.filter(i => i.pr === 42 && ['needs-you', 'confirmed-break-owed-send-back'].includes(i.kind)))
+      .toEqual([expect.objectContaining({ head, kind: 'confirmed-break-owed-send-back' })]);
   });
   it.each([
     'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/red-team-status-labels.mjs',
