@@ -1382,7 +1382,8 @@ export function restackStackedPr(d, {
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
  *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
- *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps only ruleset-only candidates across SHAs.
+ *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps plain-absent ruleset candidates across SHAs;
+ *   startup-failure admission counts only current-head attempts.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepMissingRunRecovery({
@@ -1463,7 +1464,6 @@ export function sweepMissingRunRecovery({
     const comments = readComments(c.prNumber, { repo });
     return {
       ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch }),
-      recoveryAttemptsForPr: countMissingRunComments(comments, null, { defaultBranch }),
       // Bound checks discovered only by the ruleset expansion across pushes. Classic/declared candidates
       // retain their existing per-SHA budget, including all-absent heads and restacks.
       triggerAttemptsForPr: classicCandidateNumbers.has(c.prNumber)
@@ -1477,6 +1477,9 @@ export function sweepMissingRunRecovery({
   const candidateByPr = new Map(candidates.map(c => [c.prNumber, c]));
   plan.dispatch = plan.dispatch.filter(d => {
     if (classicCandidateNumbers.has(d.prNumber)) return true;
+    // Startup failures get the current head's budget, already bounded by the planner.
+    // Keep the cross-head cap for the original plain-absent ruleset candidates.
+    if (!legacyCandidateNumbers.has(d.prNumber)) return true;
     const attempts = attemptsByPr.get(d.prNumber) ?? 0;
     if (attempts < maxRetriesPerPr) return true;
     plan.refusals.push({ ...d, kind: 'missing-run-pr-cap-exhausted', attempts,
@@ -1505,7 +1508,7 @@ export function sweepMissingRunRecovery({
             }),
             claimed: held === null ? false : true,
             token: credential?.token, env: credential?.env,
-            attemptsForSha: c?.triggerAttemptsForSha, attemptsForPr: c?.recoveryAttemptsForPr,
+            attemptsForSha: c?.triggerAttemptsForSha, attemptsForPr: c?.triggerAttemptsForSha,
             maxRetriesPerSha, maxRetriesPerPr,
           });
         } catch {

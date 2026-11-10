@@ -26,6 +26,36 @@ const candidates = value => buildMissingRunCandidates([value], {
 });
 
 describe('required ruleset context startup failures use missing-run push recovery', () => {
+  it.each([0, 1, 2])('uses the current-head budget with two old-head comments and %s current-head attempts', attempts => {
+    const value = pr();
+    const comments = ['old-head-1', 'old-head-2', ...Array(attempts).fill(HEAD)].map(headSha => ({
+      viewerDidAuthor: true, body: buildMissingRunComment({ headSha }),
+    }));
+    const trigger = vi.fn(() => ({ ok: true, action: 'pull-request-push' }));
+    const postComment = vi.fn();
+    const result = sweepMissingRunRecovery({
+      repo: REPO, apply: true, mainRuns: [], now: Date.parse('2026-11-09T12:00:00Z'),
+      readOpenPrs: () => [value], readRequiredContexts: () => CLASSIC, readAttributedRequiredChecks: () => REQUIRED,
+      readRecoveryPr: () => value,
+      readRecoveryEvidence: () => ({ requiredContexts: REQUIRED, rollup: value.statusCheckRollup, workflowRuns: value.workflowRuns }),
+      readRecoveryCredential: () => ({ token: 'ghp_fixture', env: {} }), checkClaim: () => null,
+      readPush: () => null, readHeadCommittedAt: () => '2026-11-08T00:00:00Z', readComments: () => comments,
+      maxRetriesPerSha: 2, maxRetriesPerPr: 2, trigger, postComment, clearLabel: vi.fn(),
+    });
+    if (attempts < 2) {
+      expect(result.dispatch).toEqual([expect.objectContaining({ headSha: HEAD, attempts, kind: 'trigger-ci' })]);
+      expect(result.refusals).toEqual([]);
+      expect(result.applied).toEqual([expect.objectContaining({ ok: true })]);
+      expect(trigger).toHaveBeenCalledTimes(1);
+      expect(postComment).toHaveBeenCalledTimes(1);
+    } else {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'missing-run-cap-exhausted', attempts: 2 })]);
+      expect(trigger).not.toHaveBeenCalled();
+      expect(postComment).not.toHaveBeenCalled();
+    }
+  });
+
   it.each([1, 2])('startup_failure-only context counts as absent (%s rollup rows)', count => {
     const value = pr(Array.from({ length: count }, () => done('merge-gate', 'STARTUP_FAILURE')));
     expect(isStalledPartialRollup(value.statusCheckRollup, REQUIRED)).toBe(true);
