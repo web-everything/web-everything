@@ -48,7 +48,7 @@ describe('mechanical clearance', () => {
   fail('doc must be text', 'schema', f => f.content = '{"_doc":1}');
   for (const value of ['-1', 'NaN', '"1"', '3601']) fail(`invalid seconds ${value}`, 'schema', f => f.content = `{"unit":{"${testPath}":${value}},"soak":{"${testPath}":1}}`);
   for (const key of ['README.md', '../a.test.ts', '/a.test.ts', 'a\\b.test.ts', 'missing.test.ts']) {
-    fail(`invalid or missing test ${key}`, 'keys', f => f.content = JSON.stringify({ unit: { [key]: 1 }, soak: { [testPath]: 1 } }));
+    fail(`invalid or missing test ${key}`, 'keys', f => f.content = JSON.stringify({ unit: { [testPath]: 1, [key]: 1 }, soak: { [testPath]: 1 } }));
   }
   fail('empty document refuses', 'schema', f => f.content = '{}');
   for (const group of ['unit', 'soak']) {
