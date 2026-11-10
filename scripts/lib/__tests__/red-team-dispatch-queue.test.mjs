@@ -8,7 +8,6 @@ import {
   raiseReviewStartsPerTick,
   loadRedTeamQueueFloor,
   applyRedTeamQueueFloor,
-  raiseReviewStartsPerTick,
   redTeamQueueAdmitCount,
   runWithRedTeamQueue,
 } from '../red-team-dispatch-queue.mjs';
