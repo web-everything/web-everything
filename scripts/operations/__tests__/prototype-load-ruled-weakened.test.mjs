@@ -84,9 +84,19 @@ describe('ruledWeakened union of platform and tool layers', () => {
     expect(merged.map((e) => [e.ref, e.layer])).toEqual([[REF, 'tool'], ['lane/other', 'platform']]);
     expect(readyEvidence([record()], input, merged)).toMatchObject({ ruledWeakened: { layer: 'tool' } });
   });
+  it('accepts combined rulings (R475+R485, three-way) from the platform layer exactly as the tool layer does', () => {
+    for (const ruling of ['R475+R485', 'R384+R396', 'R464+R468+R474']) {
+      const e = entry({ ruling });
+      const fromPlatform = mergeRuledWeakened([e], []);
+      expect(fromPlatform).toHaveLength(1);
+      expect(fromPlatform[0]).toMatchObject({ ruling, layer: 'platform' });
+      expect(readyEvidence([record({ auditRuling: ruling })], input, fromPlatform)).toMatchObject({ ruledWeakened: { ruling, layer: 'platform' } });
+      expect(readyEvidence([record({ auditRuling: ruling })], input, mergeRuledWeakened([], [e]))).toMatchObject({ ruledWeakened: { ruling, layer: 'tool' } });
+    }
+  });
   it('ignores malformed platform entries with a warning', () => {
     const warnings = [];
-    const bad = [entry({ sha: 'abc' }), entry({ ruling: 'R1+R2' }), entry({ findings: [] }), entry({ ref: '' }), null, 'x'];
+    const bad = [entry({ sha: 'abc' }), entry({ ruling: 'R1+' }), entry({ ruling: 'R1++R2' }), entry({ ruling: 'R1 R2' }), entry({ ruling: 'r1' }), entry({ findings: [] }), entry({ ref: '' }), null, 'x'];
     expect(mergeRuledWeakened(bad, [], (m) => warnings.push(m))).toEqual([]);
     expect(warnings).toHaveLength(bad.length);
     expect(readyEvidence([record()], input, mergeRuledWeakened(bad, []))).toBeNull();
