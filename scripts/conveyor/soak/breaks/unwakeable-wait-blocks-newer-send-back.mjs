@@ -11,7 +11,7 @@ export default {
   id: 'unwakeable-wait-blocks-newer-send-back',
   title: 'a stale unwakeable fix wait with a dead session stayed owed and blocked a newer review:changes send-back',
   card: 'PR #6595 (fix daemon, proven 2026-11-10 10:36 ET)',
-  fixedBy: { sha: 'HEAD', where: 'lane/retire-unwakeable-wait', paths: [LOOP] },
+  fixedBy: { sha: '9bb8d330d8', where: 'lane/retire-unwakeable-wait', paths: [LOOP] },
   fixPresent(root) {
     const source = readFileSync(join(root, LOOP), 'utf8');
     return source.includes('shouldRetireUnwakeable') && source.includes('retired unwakeable wait');
