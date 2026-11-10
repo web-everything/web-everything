@@ -4123,3 +4123,9 @@ and admission for fix/build/review owners, retaining the live/unknown admission 
 that fresh owners and unknown evidence cannot trigger takeover. The feed-tail regression uses
 more than 2 MiB and spies on the actual read to pin offset, requested length, returned bytes, and
 exclusion of the partial leading record.
+
+Live-owner review recovery must use `runReconcilePass` admission with the complete comment
+thread before the manual single-PR launcher. Re-arm comments, rather than the displayed round
+label, carry the durable attempt budget. Preserve `expectedHead` through the mode dispatcher
+so the job also refuses a head changed after the manual precheck. Unknown build-claim metadata
+blocks ownership classification; lease expiry alone never proves that its owner is gone.

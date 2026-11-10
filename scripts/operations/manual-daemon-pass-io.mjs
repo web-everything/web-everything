@@ -38,7 +38,8 @@ export function readManualDaemonStatus({ exec = execFileSync, env = process.env 
 export async function dispatchManualPass(input, { env, load = () => import('./review-job.mjs'), readHead } = {}) {
   const { dispatchReviewByMode, dispatchReviewJob, createReviewJobIo } = await load();
   // The daemon leaves root to the shared dispatcher's module checkout default.
-  const options = { pr: input.pr, repo: input.repo, env };
+  const options = { pr: input.pr, repo: input.repo, env,
+    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }) };
   // A red-team restart names the mode the job's queued admission will re-plan; anything else would be refused there.
   if (input.redTeamMode !== undefined && !['fresh', 'resume'].includes(input.redTeamMode)) {
     throw new Error('manual-daemon-pass: invalid redTeamMode; operator must inspect before retrying');

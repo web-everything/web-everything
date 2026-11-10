@@ -153,10 +153,25 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
     const { laneRefItemNum } = await import('./lease-reaper.mjs');
     const item = laneRefItemNum(pr.headRefName);
     if (item) {
-      const { listBuildDispatchClaims, buildDispatchClaimRoot } = await import('./build-dispatch-claim.mjs');
+      const { buildDispatchClaimRoot } = await import('./build-dispatch-claim.mjs');
       const { parseBuildSessionName } = await import('./build-supervision.mjs');
-      for (const entry of listBuildDispatchClaims({ lockRoot: buildDispatchClaimRoot(resolveCoordinationRoot({ env, home })) })
-        .filter(c => c.meta.repo === repoKey && String(c.meta.num) === String(item))) {
+      const { parseLockEntry } = await import('../readiness/file-locks.mjs');
+      const lockRoot = buildDispatchClaimRoot(resolveCoordinationRoot({ env, home }));
+      let names;
+      try { names = readdirSync(lockRoot); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; names = []; }
+      if (names.length > 512) throw Error('build claim inventory oversized; operator must inspect full inventory');
+      for (const name of names) {
+        // Unknown metadata cannot prove a claim belongs to another scope. Include expired claims:
+        // a clock proves neither that the build ended nor that its owner died.
+        let entry;
+        try { entry = parseLockEntry(optional(join(lockRoot, name, 'lock.json'), '')); }
+        catch { throw Error('build claim unreadable; operator must inspect claim inventory'); }
+        if (!entry?.meta?.repo || !entry.meta.num || entry.meta.kind !== 'build'
+          || !Number.isFinite(Date.parse(entry.heartbeatAt)))
+          throw Error('build claim metadata incomplete; operator must inspect claim inventory');
+        if (entry.meta.repo !== repoKey || (String(entry.meta.num) !== String(item)
+          && !entry.meta.scope?.map(String).includes(String(item)))) continue;
         const session = agents.find(a => parseBuildSessionName(a.name)?.num === String(item)
           && ([repoKey, pr.repo].includes(a.repo) || (a.repo == null && repoKey === 'we'))
           && !['done', 'stopped', 'failed'].includes(a.state));
@@ -220,8 +235,15 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
     appendDecision(record) { appendFileSync(join(dir, `${record.ts.slice(0, 7)}.jsonl`), `${JSON.stringify(record)}\n`); },
     readSweepHistory: () => sweep.readAuditHistory(sweep.stallSweepDir(env)),
     listPRs() {
-      const prs = readGh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(config.maxPrs + 1), '--json',
+      const read = () => readGh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(config.maxPrs + 1), '--json',
         'number,headRefOid,headRefName,baseRefName,isDraft,labels,mergeable,mergeStateStatus,statusCheckRollup,createdAt,updatedAt,author,files']);
+      let prs;
+      try { prs = read(); }
+      catch (e) {
+        if (e.code !== 'ETIMEDOUT') throw e;
+        try { prs = read(); }
+        catch (retry) { throw Error(`PR list unavailable after one timeout retry (${retry.code ?? retry.message}); operator must inspect inventory before retrying`); }
+      }
       if (!Array.isArray(prs) || prs.some(p => !Array.isArray(p.labels) || !Array.isArray(p.statusCheckRollup)
         || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? ''))) throw Error('PR facts incomplete');
       return prs.map(p => ({ ...p, repo }));
@@ -278,12 +300,36 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
           reason: 'fix daemon planner refused or did not prove a dispatch' };
       }
       if (action.action === 'refresh-check') {
-        const { createStaleBaseGate } = await import('./stale-base-refresh.mjs');
-        const result = await (adapters.staleBaseGate ?? createStaleBaseGate({ env }))({ planned: { pr: pr.number }, repo: repoKey, root });
+        const { createStaleBaseGate, readStaleBaseFacts } = await import('./stale-base-refresh.mjs');
+        const { readCompletePrComments } = await import('./pr-comments-complete.mjs');
+        let comments;
+        try { comments = readCompletePrComments(pr.number, { repo: pr.repo, gh: readGh }); }
+        catch { return { ok: false, reason: 'complete PR comments unavailable; operator must inspect full thread before refreshing base' }; }
+        const result = await (adapters.staleBaseGate ?? createStaleBaseGate({ env,
+          readFacts: options => readStaleBaseFacts({ ...options, readComments: () => comments,
+            exec: (cmd, args, opts) => cmd === 'gh' ? readGhText(args) : execFileSync(cmd, args, opts) }),
+        }))({ planned: { pr: pr.number }, repo: repoKey, root });
         return { ok: result?.held === true && result.reason === 'stale-base refresh first: refreshed onto main, CI re-runs before any fixer',
           reason: result?.reason ?? 'stale-base gate did not refresh; operator must inspect missing/stuck check' };
       }
       const { dispatchManualPass } = await import('../operations/manual-daemon-pass-io.mjs');
+      if (action.action === 'review-dispatch') {
+        try {
+          const { readCompletePrComments } = await import('./pr-comments-complete.mjs');
+          const { runReconcilePass } = await import('./reconcile-pass.mjs');
+          const comments = readCompletePrComments(pr.number, { repo: pr.repo, gh: readGh });
+          agents = await readAgents();
+          if (!Array.isArray(agents)) throw Error('review ownership unavailable');
+          const plan = await (adapters.reconcileReview ?? runReconcilePass)({ repo: pr.repo, env, now,
+            readPrs: () => [{ ...pr, comments }], readAgents: () => agents,
+          });
+          if (!Array.isArray(plan?.dispatch) || !Array.isArray(plan?.refusals)
+            || !plan.dispatch.some(d => d.kind === 'review' && Number(d.prNumber) === pr.number))
+            return { ok: false, reason: `review reconcile held: ${plan?.refusals?.map(r => r.kind).join(', ') || 'no proven review admission'}; operator must inspect durable rounds and stand-downs` };
+        } catch {
+          return { ok: false, reason: 'review admission unavailable; operator must inspect complete thread, durable rounds and stand-downs before retrying' };
+        }
+      }
       let redTeamMode;
       if (action.action === 'red-team-dispatch') {
         const { readRedTeamStatus, readRecoveryWitness } = await import('../lib/drain-red-team-evidence.mjs');
@@ -300,7 +346,7 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
         redTeamMode = plan.mode;
       }
       const result = await (adapters.dispatchManualPass ?? dispatchManualPass)({ daemon: action.action === 'review-dispatch' ? 'review' : 'red-team',
-        repo: pr.repo, pr: pr.number, expectedHead: pr.headRefOid, ...(redTeamMode ? { redTeamMode } : {}) }, { env });
+        repo: pr.repo, pr: pr.number, expectedHead: pr.headRefOid, ...(redTeamMode ? { redTeamMode } : {}) }, { env, readHead: () => readGh(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'headRefOid']).headRefOid });
       return { ok: !result?.error && !result?.skipped && result?.ok !== false
         && (result?.launched === true || (Number.isSafeInteger(result?.jobPid) && result.jobPid > 0)
           || (action.action === 'review-dispatch' && typeof result?.agentId === 'string' && result.agentId.length > 0)),

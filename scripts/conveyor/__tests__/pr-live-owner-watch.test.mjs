@@ -1,6 +1,6 @@
 /** @file R863 ownership, safety, durable budgets, smells and health cadence regressions. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, readSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, readSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch } from '../pr-live-owner-watch.mjs';
@@ -296,7 +296,8 @@ describe('portable feed IO and settings', () => {
   });
   it('real review adapter forwards expectedHead to the injected manual dispatcher', async () => {
     const dispatchManualPass = vi.fn(() => ({ mode: 'session', agentId: 'review-agent' }));
-    const { io } = await localIo({ dispatchManualPass });
+    const { io } = await localIo({ dispatchManualPass, readGhText: commentGh(), readAgents: () => [],
+      reconcileReview: () => ({ dispatch: [{ kind: 'review', prNumber: 863 }], refusals: [] }) });
     expect((await io.execute({ pr: pr(), action: 'review-dispatch' })).ok).toBe(true);
     expect(dispatchManualPass.mock.calls[0][0]).toEqual({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: pr().headRefOid });
   });
@@ -380,10 +381,126 @@ describe('portable feed IO and settings', () => {
     expect(reconcileFixDispatch).not.toHaveBeenCalled();
     if (failure === 'page cap') expect(readGhText).toHaveBeenCalledTimes(10);
   });
+
+  async function reviewAdapters(overrides = {}) {
+    const { planReconcile, resolveRoundCap } = await import('../reconcile-core.mjs');
+    const { durableCountsFrom } = await import('../reconcile-pass.mjs');
+    return { readAgents: () => [], readGhText: commentGh(), dispatchManualPass: vi.fn(),
+      reconcileReview: options => {
+        const prs = options.readPrs();
+        return planReconcile({ prs, repo: 'we', now: NOW, agents: options.readAgents(),
+          roundCap: resolveRoundCap(options.env), durableCounts: durableCountsFrom(prs) });
+      }, ...overrides };
+  }
+  it.each(['cap-exhausted', 'stood-down', 'unavailable', 'incomplete plan'])
+  ('review adapter holds shared durable admission refusal: %s', async kind => {
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    const { REARM_COMMENT_MARKER } = await import('../rearm-review.mjs');
+    const comments = kind === 'cap-exhausted' ? Array.from({ length: 6 }, (_, i) => comment(i, REARM_COMMENT_MARKER)) : kind === 'stood-down' ? [comment(1, buildStandDownComment({
+      actor: 'conveyor fix agent', reason: 'needs-judgment', head: pr().headRefOid,
+    }))] : [];
+    const adapters = await reviewAdapters({ readGhText: commentGh(comments) });
+    if (kind === 'unavailable') adapters.reconcileReview = () => { throw Error('unreadable attempts'); };
+    if (kind === 'incomplete plan') adapters.reconcileReview = () => ({});
+    const { io } = await localIo(adapters);
+    const result = await io.execute({ pr: pr({ labels: [{ name: 'review:pending' }] }), action: 'review-dispatch' });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain(kind === 'unavailable' ? 'admission unavailable' : kind === 'incomplete plan' ? 'no proven review admission' : kind);
+    expect(result.reason).toContain('operator must inspect');
+    expect(adapters.dispatchManualPass).not.toHaveBeenCalled();
+  });
+  it('review rechecks live head after reconcile and records the expected head on a refused intent', async () => {
+    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
+    let liveHead = pr().headRefOid;
+    const dispatchReviewByMode = vi.fn(), readGhText = commentGh();
+    const adapters = await reviewAdapters({
+      readGhText: args => args[0] === 'pr' ? JSON.stringify({ headRefOid: liveHead }) : readGhText(args),
+      reconcileReview: () => { liveHead = 'b'.repeat(40); return { dispatch: [{ kind: 'review', prNumber: 863 }], refusals: [] }; },
+      dispatchManualPass: (input, opts) => dispatchManualPass(input, { ...opts, load: async () => ({ dispatchReviewByMode }) }),
+    });
+    const { io } = await localIo(adapters);
+    const h = harness([pr({ labels: ['review:pending'] })], { execute: io.execute });
+    const result = await h.run();
+    expect(result.held).toContainEqual({ pr: 863, reason: expect.stringContaining('PR head changed') });
+    expect(h.history).toEqual([expect.objectContaining({ phase: 'intent', head: pr().headRefOid })]);
+    expect(dispatchReviewByMode).not.toHaveBeenCalled();
+  });
+  it('manual review dispatch forwards expectedHead and checks it immediately before mode dispatch', async () => {
+    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
+    const order = [], dispatchReviewByMode = vi.fn(options => { order.push('dispatch'); return options; });
+    const result = await dispatchManualPass({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: pr().headRefOid }, {
+      load: async () => ({ dispatchReviewByMode }), readHead: () => { order.push('head'); return pr().headRefOid; },
+    });
+    expect(order).toEqual(['head', 'dispatch']);
+    expect(result.expectedHead).toBe(pr().headRefOid);
+  });
+  it('review mode refuses a later head change after the manual precheck', async () => {
+    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
+    const { dispatchReviewByMode } = await import('../../operations/review-job.mjs');
+    let head = pr().headRefOid;
+    const spawnJob = vi.fn();
+    const result = await dispatchManualPass({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: head }, {
+      readHead: () => head,
+      load: async () => ({ dispatchReviewByMode: options => dispatchReviewByMode({ ...options, mode: 'job',
+        stackCheck: () => { head = 'b'.repeat(40); return { base: null }; },
+        io: { liveHead: () => head }, spawnJob,
+      }) }),
+    });
+    expect(result).toMatchObject({ refused: true, outcome: 'refused-head-moved' });
+    expect(spawnJob).not.toHaveBeenCalled();
+  });
+  it.each(['malformed', 'missing', 'unreadable', 'expired', 'oversized inventory'])
+  ('build ownership holds instead of skipping %s claims', async kind => {
+    const p = pr({ headRefName: 'lane/863-fixture', labels: ['status:fixing'] });
+    const { io, dir } = await localIo({ readAgents: () => [], readRedTeamStatus: () => null,
+      readLedgerSnapshot: () => ({ status: 'ok', rows: [] }), readRequiredChecks: () => ({ source: 'live', checks: [] }) });
+    const { buildDispatchClaimRoot, buildDispatchResource } = await import('../build-dispatch-claim.mjs');
+    const { lockDirFor } = await import('../../readiness/file-locks.mjs');
+    const lockRoot = buildDispatchClaimRoot(join(dir, 'coordination'));
+    const claimDir = lockDirFor(lockRoot, buildDispatchResource({ repo: 'we', num: '863' }));
+    mkdirSync(claimDir, { recursive: true });
+    const path = join(claimDir, 'lock.json');
+    if (kind === 'malformed') writeFileSync(path, '{');
+    if (kind === 'unreadable') mkdirSync(path);
+    if (kind === 'expired') writeFileSync(path, JSON.stringify({ owner: 'fixture', heartbeatAt: ago(1000),
+      meta: { repo: 'we', num: '863', kind: 'build' } }));
+    if (kind === 'oversized inventory') for (let i = 0; i < 512; i++) mkdirSync(join(lockRoot, `unknown-${i}`));
+    const h = harness([p], { readEvidence: io.readEvidence });
+    const result = await h.run();
+    expect(result.held).toContainEqual({ pr: 863, reason: expect.stringContaining('evidence-unavailable') });
+    expect(h.io.execute).not.toHaveBeenCalled();
+    if (kind !== 'expired') await expect(io.readEvidence(p, [p])).rejects.toThrow(/claim/);
+    else expect(await io.readEvidence(p, [p])).toMatchObject({ liveClaim: true, claims: [{ alive: null, kind: 'build' }] });
+  });
+  it.each(['count mismatch', 'page cap'])('stale-base gate holds incomplete comments: %s', async kind => {
+    const staleBaseGate = vi.fn();
+    const { io } = await localIo({ staleBaseGate, readGhText: kind === 'page cap'
+      ? commentGh(Array.from({ length: 1000 }, (_, i) => comment(i))) : commentGh([comment(1)], 2) });
+    expect(await io.execute({ pr: pr(), action: 'refresh-check' })).toMatchObject({ ok: false,
+      reason: expect.stringContaining('operator must inspect full thread') });
+    expect(staleBaseGate).not.toHaveBeenCalled();
+  });
+  it('PR list retries ETIMEDOUT once and recovers without losing the inventory', async () => {
+    const readGhText = vi.fn().mockImplementationOnce(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); })
+      .mockReturnValueOnce(JSON.stringify([pr()]));
+    const { io } = await localIo({ readGhText });
+    expect(io.listPRs()).toEqual([pr()]);
+    expect(readGhText).toHaveBeenCalledTimes(2);
+  });
+  it('PR list holds after one failed timeout retry with an inventory inspection fallback', async () => {
+    const readGhText = vi.fn(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); });
+    const { io } = await localIo({ readGhText });
+    const h = harness([], { listPRs: io.listPRs });
+    const result = await h.run();
+    expect(result.considered).toBe(0);
+    expect(result.held).toContainEqual({ reason: expect.stringMatching(/PR list unavailable after one timeout retry.*ETIMEDOUT.*operator must inspect inventory/) });
+    expect(readGhText).toHaveBeenCalledTimes(2); expect(h.io.execute).not.toHaveBeenCalled();
+  });
+
   it('stale-base gate and optional validator use injected existing entry points', async () => {
     const staleBaseGate = vi.fn(() => ({ held: true, reason: 'stale-base refresh first: refreshed onto main, CI re-runs before any fixer' }));
     const validateDataRefresh = vi.fn(() => ({ ok: true }));
-    const { io } = await localIo({ staleBaseGate, validateDataRefresh });
+    const { io } = await localIo({ staleBaseGate, validateDataRefresh, readGhText: commentGh() });
     expect((await io.execute({ pr: pr(), action: 'refresh-check' })).ok).toBe(true);
     expect(staleBaseGate.mock.calls[0][0]).toMatchObject({ repo: 'we', planned: { pr: 863 } });
     expect((await io.execute({ pr: pr(), action: 'validate-data-refresh' })).ok).toBe(true);
