@@ -3904,10 +3904,15 @@ clearing as a false-positive proof of detector completeness.
 ## Shard split-retry evidence
 
 `verify-shard-run` retries incomplete inventory once in at most two halves to surface
-failures. The retry never yields PASS: the first TIMEOUT, NOT-RUN, or FAIL half
+failures. The first TIMEOUT, NOT-RUN, or FAIL half
 keeps its status (TIMEOUT/NOT-RUN exit 124). Otherwise, observed failure evidence
-makes the shard FAIL (exit 1). Every other retry
-outcome is UNSETTLED (exit 75), including all halves passing. Retry output and
+makes the shard FAIL (exit 1). The shard settles PASS (exit 0) only when every half
+passes with exit 0, no signal, and complete inventory; the halves together cover
+exactly the shard's files; and every assertion in every reported retry file is
+`passed`, with no observed failure, infrastructure exit, or load deferral.
+Missing assertions and pending/skipped/todo assertions keep it UNSETTLED,
+as do missing or oversized half reports, load deferral, or an unresolved exit 75.
+Every other retry outcome is UNSETTLED (exit 75). Retry output and
 failure details remain visible, and each shard contributes one final result.
 Admission forwards child exit codes, so exit 75 cannot prove the command never ran;
 nonzero exits other than 75 are failure evidence even without inventory, and
