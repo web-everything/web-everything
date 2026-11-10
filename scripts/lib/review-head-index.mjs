@@ -252,7 +252,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
  * Is a review owed for this PR head? Pure. `seed` (from seedFromReviewComments) stands in for a missing record. `index` is the result of readHeadIndex.
  * owed:null + held:true means unknown (fail closed): hold the PR, do not treat it as nothing-owed.
  */
-const ACCEPT_HEAD = /^✅ review — accepted\r?\n/, CHANGES_HEAD = /^(?:🔁 )?(?:human )?review — changes requested\r?\n/;
+const ACCEPT_HEAD = /^✅ review — accepted(?:\r?\n|$)/, CHANGES_HEAD = /^(?:🔁 )?(?:human )?review — changes requested(?:\r?\n|$)/;
 // Any other trusted daemon/operator control comment (re-arm, stand-down, escalation, hold, pause, load-flake, supersede, or an
 // unknown future hold): a symbol/emoji-led first line naming one of those. A later one withdraws an earlier accept.
 // The first non-empty line (BOM / zero-width / leading markdown emphasis stripped) is tested for the keywords; a wider net only
@@ -299,10 +299,10 @@ export function seedFromReviewComments(comments) {
     // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
     if (f && !(f[1][0] === '`' && f[2].includes('`'))) { open = { ch: f[1][0], len: f[1].length }; continue; }
     if (/^\s*>/.test(line)) continue;
-    // HTML blockquotes quote like Markdown ones: a marker inside one (depth > 0) is quoted text, and the tag lines themselves never carry a marker.
+    // HTML blockquotes and raw-text/code containers (pre, code, script, style, textarea) quote like Markdown ones: a marker inside one (depth > 0) is quoted text, and the tag lines themselves never carry a marker.
     // Tags are counted in order, case-insensitively, several per line; a stray closer never goes below 0, an unclosed opener quotes the rest.
     let tagLine = false;
-    for (const t of line.matchAll(/<(\/?)blockquote(?=[\s/>]|$)/gi)) { tagLine = true; depth = t[1] ? Math.max(0, depth - 1) : depth + 1; }
+    for (const t of line.matchAll(/<(\/?)(?:blockquote|pre|code|script|style|textarea)(?=[\s/>]|$)/gi)) { tagLine = true; depth = t[1] ? Math.max(0, depth - 1) : depth + 1; }
     if (tagLine || depth > 0) continue;
     const m = MARKER_LINE.exec(line);
     if (m) found = m[1];

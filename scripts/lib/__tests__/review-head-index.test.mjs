@@ -476,6 +476,34 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(readFileSync(log, 'utf8')).toBe(logBefore);
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);
   });
+  it('pre-index PR: a one-line changes-requested comment with no trailing newline withdraws an earlier accept', () => {
+    const A = '1'.repeat(40);
+    const accept = { viewerDidAuthor: true, body: `✅ review — accepted\n\n<!-- reviewed-sha: ${A} -->\n` };
+    const idx = readHeadIndex({ dir });
+    for (const body of ['review — changes requested', '🔁 review — changes requested', 'human review — changes requested\r\n', 'review — changes requested\n']) {
+      const seed = seedFromReviewComments([accept, { viewerDidAuthor: true, body }]);
+      expect(seed, body).toBeNull();
+      expect(headReviewOwed({ index: idx, repo: 'o/r', pr: 5, head: A, seed }).owed, body).toBe(true);
+    }
+    expect(seedFromReviewComments([accept])?.lastReviewedHead).toBe(A);
+  });
+  it('pre-index PR: a reviewed-sha marker inside pre/code/script/style/textarea is example text and never replaces the reviewed head', () => {
+    const [A, B] = ['1'.repeat(40), '2'.repeat(40)];
+    const mk = body => [{ viewerDidAuthor: true, body }];
+    const m = s => `<!-- reviewed-sha: ${s} -->`;
+    const head = `✅ review — accepted\n\n${m(A)}\n`;
+    const idx = readHeadIndex({ dir });
+    for (const tag of ['pre', 'code', 'PRE', 'script', 'style', 'textarea']) {
+      const seed = seedFromReviewComments(mk(`${head}<${tag}>\n${m(B)}\n</${tag}>\n`));
+      expect(seed?.lastReviewedHead, tag).toBe(A);
+      expect(headReviewOwed({ index: idx, repo: 'o/r', pr: 5, head: B, seed }).owed, tag).toBe(true);
+    }
+    expect(seedFromReviewComments(mk(`${head}<pre>${m(B)}</pre>\n`))?.lastReviewedHead).toBe(A);
+    expect(seedFromReviewComments(mk(`${head}<code>${m(B)}</code>\n`))?.lastReviewedHead).toBe(A);
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n<pre>\n${m(B)}\n</pre>\n`))).toBeNull();
+    // a tag that merely starts with the name is not a container
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n<prefix>\n${m(A)}\n`))?.lastReviewedHead).toBe(A);
+  });
   it('pre-index PR: a reviewed-sha marker inside an HTML blockquote is quoted text and never seeds the head', () => {
     const [A, B] = ['1'.repeat(40), '2'.repeat(40)];
     const mk = body => [{ viewerDidAuthor: true, body }];
