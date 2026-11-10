@@ -35,7 +35,7 @@ import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import {
-  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, classifyStaleOwed, classifyUnwakeableWait, awaitPassRunner, releaseOnCompletion,
+  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, classifyStaleOwed, classifyUnwakeableWait, shouldRetireUnwakeable, awaitPassRunner, releaseOnCompletion,
 } from './fixer-slot-rules.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -138,15 +138,32 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     const live = io.listRecords().find((e) => e.key === row.key)?.record;
     if (reason && now && beforeA.has(row.key) && isDeepStrictEqual(beforeA.get(row.key), now) && isDeepStrictEqual(live, now)) unwakeable.set(row.key, reason);
   }
+  const retired = new Set();
+  for (const [key, reason] of unwakeable) {
+    const record = allOwed.find(e => e.key === key).record;
+    try {
+      const sessionLive = await io.sessionLive?.(record);
+      const newerVerdict = await io.newerVerdictSince?.(record.repo, record.pr, record.requestedAt);
+      if (!shouldRetireUnwakeable({ reason, sessionLive, newerVerdict })) continue;
+      const current = io.listRecords().find(e => e.key === key)?.record;
+      if (!current?.pendingResume?.kind || !isDeepStrictEqual(current, record)) continue;
+      if (typeof io.clearStoredRecordIf !== 'function' || (await io.clearStoredRecordIf(key, record))?.cleared !== true) continue;
+      cleared.push(key);
+      retired.add(key);
+      unwakeable.delete(key);
+      log(`await-verify: retired unwakeable wait ${key} (pr #${record.pr}): newer review:changes verdict, session not live`);
+    } catch { /* Unknown evidence or failed cleanup retains the wait for operator recovery. */ }
+  }
   const excluded = [];
   for (const { key, record } of allOwed) {
+    if (retired.has(key)) continue;
     const reason = stale.has(key) ? 'stale' : prFacts.get(key)?.open === false ? 'closed-pr' : unwakeable.get(key);
     if (!reason) continue;
     excluded.push({ key, reason });
     log(`await-verify: excluded from fix-slot admission ${key} (pr #${record.pr}): ${reason}`);
   }
   // Exclusion itself never clears the retained repair inventory.
-  const skipped = new Set(excluded.map(({ key }) => key));
+  const skipped = new Set([...retired, ...excluded.map(({ key }) => key)]);
   const records = allRecords.filter(({ key }) => !skipped.has(key));
   const owedFix = allOwed.filter(({ key }) => !skipped.has(key));
   const owedKeys = new Set(owedFix.map(({ key }) => key));
@@ -174,6 +191,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const pushedA = (r) => (r.result && r.result !== 'resume-paused' ? `${r.result}; ` : '');
   const rows = (a.rows ?? []).filter((r) => !skipped.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
   for (const { key, record } of allOwed) {
+    if (retired.has(key)) continue;
     if (unwakeable.get(key) === 'resume-exhausted') {
       rows.push({ key, pr: record.pr, who: record.who, action: 'resume', reason: 'resume-exhausted-excluded',
         result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)' });
