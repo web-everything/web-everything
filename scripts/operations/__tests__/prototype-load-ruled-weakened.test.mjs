@@ -41,17 +41,21 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
   it('NOT WEAKENED records are unchanged', () => {
     expect(readyEvidence([{ ref: REF, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' }], input, [])).toMatchObject({ source: 'ready-record' });
   });
-  it('ships exactly the nineteen ruled entries with pinned refs, full shas and rulings', () => {
+  it('ships exactly the twenty-four ruled entries with pinned refs, full shas and rulings', () => {
     const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped.ruledWeakened.map(({ ref, sha, ruling }) => [ref, sha, ruling])
       .sort(([a], [b]) => a.localeCompare(b))).toEqual([
       ['lane/author-lookup-defer', 'f62437a87d2831fdb56be1ec3d8387243b5e2f57', 'R521'],
+      ['lane/bound-session-stale', '95d22a251a5389eb5b703b66cc705cb569743f8f', 'R810+R794'],
       ['lane/cheap-pr-list-retry', '393b3f42378fc25dd729b4d17c930dd7fb89a56c', 'R517'],
+      ['lane/ci-heal-reset', '1e3b7159e4f9d463087b412c7a885621c97ecb8e', 'R815'],
       ['lane/dispatch-scope-multi', '2fe6208f8409668f0a74a637c5b53ac46f5031cf', 'R396'],
+      ['lane/drain-freeze-priority', 'cbcec6ed1c53f31ba7586a8b99be954e87911dda', 'R813'],
       ['lane/drain-rest-reader-r557', 'cc8ac117222de6f7146f7a059f55df0fe00aa587', 'R563'],
       ['lane/forge-slot-reconciler-r475', '0cbd4303bc0a961fdafda162bec407af8b8709dc', 'R475+R485'],
       ['lane/freeze-read-retry-lkg', 'f8564fc77a42e3c5a326fc17e38c3873f66696b3', 'R432'],
       ['lane/fresh-plan-read', '83be0f19530ef10b5634c1ce9b8f69074e620e7a', 'R521'],
+      ['lane/merge-gate-retrigger-wip2', '2003ae3eaf94c3995fec985331527f9d58b26358', 'R813'],
       ['lane/mq-removed-event-hold', '9730180d08259a7def9e8c4590ac9b7697515c65', 'R443'],
       ['lane/mq-same-head-merge-conflict', '94eb862d0f5595cb6d322c09d5945bbdcf92bfa9', 'R466+R484'],
       ['lane/mq-same-head-merge-conflict', '1c2c1cacd9ae0d3bc55324817a705e9a50e38b2c', 'R594'],
@@ -63,6 +67,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/redteam-dispatch-queue', 'f86f066e17bd0eeb3a8c2f945d4d4f6236d30c75', 'R786'],
       ['lane/redteam-foreign-host', 'df6f584666eecef95c6a0b2c72d393cd8e54dd6d', 'R757'],
       ['lane/redteam-pending-on-accept-m1', '166689d13b300960fbf2f458ff3ba18f560b097a', 'R796'],
+      ['lane/redteam-ran-verdict', 'e9cce536ad8cfebb3b343b52ee58de387d9b3a78', 'R813'],
       ['lane/review-early-start', 'bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2', 'R464+R468+R474'],
       ['lane/runs-scan-bound-aff4', 'aff4a567812cd837234ceeadd0cd7d8a0f658fdb', 'R545'],
       ['lane/stall-sweep-live', 'c305b4d9990be329d41d4577cf193ef729282899', 'R803+R804'],
