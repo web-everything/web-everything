@@ -39,6 +39,10 @@ export async function dispatchManualPass(input, { env, load = () => import('./re
   const { dispatchReviewByMode, dispatchReviewJob, createReviewJobIo } = await load();
   // The daemon leaves root to the shared dispatcher's module checkout default.
   const options = { pr: input.pr, repo: input.repo, env };
+  // A red-team restart names the mode the job's queued admission will re-plan; anything else would be refused there.
+  if (input.redTeamMode !== undefined && !['fresh', 'resume'].includes(input.redTeamMode)) {
+    throw new Error('manual-daemon-pass: invalid redTeamMode; operator must inspect before retrying');
+  }
   if (input.expectedHead !== undefined) {
     if (typeof input.expectedHead !== 'string' || !/^[a-f0-9]{40}$/i.test(input.expectedHead)) {
       throw new Error('manual-daemon-pass: invalid expectedHead; operator must inspect before retrying');
@@ -58,7 +62,8 @@ export async function dispatchManualPass(input, { env, load = () => import('./re
     }
   }
   return input.daemon === 'red-team' ? dispatchReviewJob({ ...options, redTeamOnly: true,
-    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }) }) : dispatchReviewByMode(options);
+    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }),
+    ...(input.redTeamMode === undefined ? {} : { redTeamMode: input.redTeamMode }) }) : dispatchReviewByMode(options);
 }
 
 export function createManualDaemonPassSinks({

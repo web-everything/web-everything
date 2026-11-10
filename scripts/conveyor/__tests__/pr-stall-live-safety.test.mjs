@@ -143,6 +143,7 @@ function options(dir, patch = {}) {
       host: 'fixture-host', pidNamespace: 'fixture-ns', pid: 12345, pidStart: 'original-owner', startedAt: OLD }),
     probe: { host: 'fixture-host', namespace: 'fixture-ns', isAlive: () => false, readPidStart: () => 'original-owner' },
     abandonStaleRun: vi.fn(() => ({ ok: true })),
+    planRestartRecovery: vi.fn(() => ({ mode: 'fresh', abandon: false })),
     dispatchRestart: vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 })), ...patch };
 }
 
@@ -283,6 +284,32 @@ async function abandonRefusalStops(run, refusal = { ok: false }) {
     .toEqual([[11, 'intent'], [11, 'error']]);
   expect(records(input.dir).find(r => r.phase === 'error').error).toMatch(/abandon.*operator/);
 }
+// Queued admission re-plans the abandoned run and refuses any other mode: a completed seat must restart as resume.
+async function recoveryModeDispatched(run) {
+  const events = [];
+  const input = options(fixture(), {
+    abandonStaleRun: vi.fn(() => { events.push('abandon'); return { ok: true }; }),
+    planRestartRecovery: vi.fn(key => { events.push(['plan', key]); return { mode: 'resume', abandon: false }; }),
+    dispatchRestart: vi.fn(async args => { events.push(['dispatch', args.redTeamMode]); return { status: 'dispatched', jobPid: 24680 }; }),
+  });
+  await run(input);
+  expect(events).toEqual(['abandon', ['plan', { repo: REPO, pr: 11, head: HEAD, env: {} }], ['dispatch', 'resume']]);
+  expect(records(input.dir).map(r => r.phase)).toEqual(['pass', 'intent', 'did']);
+}
+// A plan admission would refuse (still abandonable, skip, unknown mode, unreadable) stops before any spawn.
+async function inadmissibleRecoveryStops(run, plan = { mode: 'skip', why: 'prior pass cannot restart' }) {
+  const input = options(fixture(), {
+    read: () => ({ now: NOW, prs: [pr(11), pr(12)], liveJobs: [], unreadable: [], stalledAfterMinutes: 45 }),
+    planRestartRecovery: vi.fn(() => { if (plan instanceof Error) throw plan; return plan; }),
+  });
+  const out = await run(input);
+  expect(input.planRestartRecovery).toHaveBeenCalledTimes(1);
+  expect(input.dispatchRestart).not.toHaveBeenCalled();
+  expect(out.incomplete).toBe(true);
+  expect(records(input.dir).filter(r => r.action === 'restart-red-team').map(r => [r.pr, r.phase]))
+    .toEqual([[11, 'intent'], [11, 'error']]);
+  expect(records(input.dir).find(r => r.phase === 'error').error).toMatch(/recovery not admissible.*operator/);
+}
 async function stopAfterError(run) {
   const input = options(fixture(), {
     read: () => ({ now: NOW, prs: [pr(11), pr(12)], liveJobs: [], unreadable: [], stalledAfterMinutes: 45 }),
@@ -319,6 +346,12 @@ const guarantees = [
     'const abandoned = await abandonStaleRun({ repo: i.repo, pr: i.pr, head: i.head, env });', 'const abandoned = { ok: true };'],
   ['a refused abandonment stops the pass without dispatch', run => abandonRefusalStops(run),
     "if (abandoned?.ok !== true) throw new Error('stale red-team abandonment refused; operator must inspect');", ''],
+  ['the restart dispatches the mode the post-abandonment recovery plan names', recoveryModeDispatched,
+    'redTeamMode = recovery.mode;', "redTeamMode = 'fresh';"],
+  ['an inadmissible post-abandonment recovery plan stops the pass without dispatch', run => inadmissibleRecoveryStops(run),
+    "if (recovery?.abandon !== false || !['fresh', 'resume'].includes(recovery?.mode)) {", 'if (false) {'],
+  ['a still-abandonable recovery plan stops the pass without dispatch', run => inadmissibleRecoveryStops(run, { mode: 'fresh', abandon: true }),
+    "if (recovery?.abandon !== false || !['fresh', 'resume'].includes(recovery?.mode)) {", 'if (false) {'],
   ['standard shadow default never executes', shadowDefault,
     "i.action === 'restart-red-team' && cfg.actionModes?.['restart-red-team'] === 'on'", "i.action === 'restart-red-team'"],
 ];
@@ -333,6 +366,11 @@ describe('live restart execution guarantees', () => {
     // The same contract assertion must fail when its guard is removed.
     await expect(verify(mutant.runStallSweep)).rejects.toThrow();
   });
+  it.each([[new Error('witness unreadable')], [undefined], [{ mode: 'retry', abandon: false }]])(
+    'an unreadable or unknown post-abandonment recovery plan (%s) stops the pass without dispatch', async plan => {
+      const control = await loadCopy();
+      await inadmissibleRecoveryStops(control.runStallSweep, plan);
+    });
 
   it.each(['off', 'shadow', 'on'])('explicit tool actionModes=%s overrides the standard shadow default with provenance', async mode => {
     const settings = resolveStallSweepSettings({ env: {}, log: () => {}, read: path => JSON.stringify({ prStallSweep:

@@ -16,7 +16,7 @@ import { homedir, hostname } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { dispatchManualPass } from '../operations/manual-daemon-pass-io.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
-import { readRedTeamStatus as defaultReadRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { readRedTeamStatus as defaultReadRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace, pidStartTime } from '../lib/pid-alive.mjs';
 import { foreignStaleOwnerDead } from '../lib/red-team-foreign-host-stale.mjs';
 import { readConfirmedBreaks } from '../lib/red-team-gate.mjs';
@@ -183,7 +183,12 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   readStatusAt = ({ repo, pr, head, env }) => statSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`)).mtimeMs,
   probe, judge = judgeRound, dir, log = console.error, force = false, dispatchRestart = dispatchManualPass,
   // Loaded lazily so importers of the sweep keep a light module closure.
-  abandonStaleRun = async key => (await import('../lib/review-red-team-on-skip.mjs')).abandonStaleRedTeamRun(key) } = {}) {
+  abandonStaleRun = async key => (await import('../lib/review-red-team-on-skip.mjs')).abandonStaleRedTeamRun(key),
+  // The same read-only re-plan the job's queued admission makes after abandonment (same witness, probe and deadline).
+  planRestartRecovery = async key => {
+    const { planRedTeamRecovery, recoveryProbe, staleRunDeadlineMs } = await import('../lib/review-red-team-on-skip.mjs');
+    return planRedTeamRecovery(readRecoveryWitness(key), { now: Date.now(), probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(key.env), env: key.env });
+  } } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
   const cfg = s.value;
   // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
@@ -413,7 +418,19 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       } catch (e) {
         throw new Error(/abandonment refused/.test(msg(e)) ? msg(e) : `stale red-team abandonment refused (${msg(e)}); operator must inspect`);
       }
-      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead });
+      // Admission then re-plans the abandoned run and refuses any mode but its own (a completed seat resumes), so the
+      // restart dispatches the mode that plan names. A plan admission would refuse stops the pass before any spawn.
+      let redTeamMode;
+      try {
+        const recovery = await planRestartRecovery({ repo: i.repo, pr: i.pr, head: i.head, env });
+        if (recovery?.abandon !== false || !['fresh', 'resume'].includes(recovery?.mode)) {
+          throw new Error(typeof recovery?.why === 'string' && recovery.why ? recovery.why : `mode ${String(recovery?.mode)}`);
+        }
+        redTeamMode = recovery.mode;
+      } catch (e) {
+        throw new Error(`stale red-team recovery not admissible after abandonment (${msg(e)}); operator must inspect`);
+      }
+      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead, redTeamMode });
       if (result?.error || result?.skipped || result?.ok === false) throw new Error(`restart refused: ${msg(result.error ?? result.skipped ?? 'unsuccessful dispatch')}`);
       if (result?.jobPid === null || result?.launched === false || !(result?.launched === true
         || (Number.isSafeInteger(result?.jobPid) && result.jobPid > 0))) {
