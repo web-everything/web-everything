@@ -5,6 +5,8 @@ import {join} from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
+// Hermetic: the reachability ping must never touch the real Forge. These cases exercise the no-retry path.
+vi.mock('../forge-telemetry.mjs',async importOriginal=>({...await importOriginal(),pingForge:async()=>false}));
 import * as runner from '../forge-exec-run.mjs';
 import {isAllowedCommand, verifyReceipt, runRemote} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, formatAdmissionPolicy, runWithRemoteDecision, heldSlots} from '../heavy-admission.mjs';
