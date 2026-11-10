@@ -19,6 +19,7 @@ const note = (log, message) => {
 };
 
 export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
+export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
 
 /** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
 export function loadRedTeamQueueFloor({ env = process.env,
@@ -29,7 +30,9 @@ export function loadRedTeamQueueFloor({ env = process.env,
   catch { /* Unavailable settings never create extra capacity. */ }
   const minimumEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT;
   const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
+  const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
   const parseEnv = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+  const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const minimum = minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv);
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
@@ -37,9 +40,19 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const floor = {
     minConcurrent: Number.isInteger(minimum) && minimum >= 0 ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
     idlePct: validIdle(idle) ? idle : 10,
+    reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
   };
-  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'})`);
+  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
   return floor;
+}
+
+/** Idle capacity may raise a finite admitted allowance; disabled/unknown evidence never raises it. */
+export function raiseReviewStartsPerTick(maxPerTick, { floor, cpuIdlePct } = {}) {
+  if (!Number.isFinite(maxPerTick) || maxPerTick < 1
+    || !(floor?.minConcurrent > 0)
+    || !Number.isFinite(cpuIdlePct) || !(cpuIdlePct >= floor.idlePct)
+    || !Number.isInteger(floor.reviewStartsPerTick) || floor.reviewStartsPerTick < 0) return maxPerTick;
+  return Math.max(maxPerTick, floor.reviewStartsPerTick);
 }
 
 /** Raise the per-tick start allowance only within the caller's host ceiling; other bounds stay independent. */

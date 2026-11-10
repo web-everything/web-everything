@@ -4,6 +4,8 @@ import {
   createRedTeamDispatchQueue,
   defaultQueueFile,
   RED_TEAM_QUEUE_MIN_CONCURRENT_CAP,
+  RED_TEAM_QUEUE_REVIEW_STARTS_CAP,
+  raiseReviewStartsPerTick,
   loadRedTeamQueueFloor,
   applyRedTeamQueueFloor,
   redTeamQueueAdmitCount,
@@ -83,7 +85,7 @@ function refused(pr, reason) {
 
 describe('setting-driven red-team queue floor', () => {
   const floorCapacity = count => ({ ...capacity(count), startsCeiling: Infinity });
-  const floor = { minConcurrent: 2, idlePct: 10 };
+  const floor = { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 };
   const file = join('queue-fixture', 'settings.json');
   const settings = (minConcurrent = 2, minConcurrentIdlePct = 10) =>
     JSON.stringify({ redTeam: { queue: { minConcurrent, minConcurrentIdlePct } } });
@@ -95,7 +97,7 @@ describe('setting-driven red-team queue floor', () => {
     ['missing minimum', { redTeam: { queue: { minConcurrentIdlePct: 10 } } }],
   ])('%s disables the floor without increasing capacity', (_name, configuration) => {
     const configured = load(JSON.stringify(configuration));
-    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10 });
+    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
     const bound = floorCapacity(1);
     const log = vi.fn();
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100, log });
@@ -110,7 +112,7 @@ describe('setting-driven red-team queue floor', () => {
     ['nonfinite environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: 'Infinity' }],
   ])('%s defaults to 10 while retaining the configured minimum', (_name, env) => {
     const configured = load(JSON.stringify({ redTeam: { queue: { minConcurrent: 3 } } }), env);
-    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10 });
+    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10, reviewStartsPerTick: 0 });
     const bound = floorCapacity(1);
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 9 });
     expect(bound.remainingStarts).toBe(1);
@@ -125,7 +127,7 @@ describe('setting-driven red-team queue floor', () => {
     ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
   ])('%s minimum resolves with a hard cap of four and invalid overrides disable it', (_name, text, env, expected) => {
     const configured = load(text, env);
-    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10 });
+    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0 });
     const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 10 } };
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100 });
     expect(bound.remainingStarts).toBe(Math.max(1, expected));
@@ -154,7 +156,7 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it('loads defaults 2/10 from the real shipped settings file with no environment overrides', () => {
-    expect(loadRedTeamQueueFloor({ env: {} })).toEqual(floor);
+    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ ...floor, reviewStartsPerTick: 3 });
     expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(4);
   });
 
@@ -162,13 +164,13 @@ describe('setting-driven red-team queue floor', () => {
     expect(load(settings(4, 80), {
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '1',
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: '20',
-    })).toEqual({ minConcurrent: 1, idlePct: 20 });
+    })).toEqual({ minConcurrent: 1, idlePct: 20, reviewStartsPerTick: 0 });
   });
 
   it.each([['file', 99, {}], ['environment', 2, { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }]])(
     '%s oversized minimum clamps to 4 and admits at most 4 with ten lanes', async (_source, minimum, env) => {
       const configured = load(settings(minimum), env);
-      expect(configured).toEqual({ minConcurrent: 4, idlePct: 10 });
+      expect(configured).toEqual({ minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 0 });
       const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } };
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
       expect(redTeamQueueAdmitCount(bound)).toBe(4);
@@ -239,7 +241,7 @@ describe('setting-driven red-team queue floor', () => {
 
   it('zero minimum explicitly disables the floor in both file and environment', () => {
     for (const configured of [load(settings(0)), load(settings(2), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '0' })]) {
-      expect(configured).toEqual({ minConcurrent: 0, idlePct: 10 });
+      expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
       const bound = floorCapacity(1);
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
       expect(bound).toEqual(floorCapacity(1));
@@ -248,13 +250,13 @@ describe('setting-driven red-team queue floor', () => {
 
   it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j alone falls back to 10', value => {
     expect(load(settings(2, value))).toEqual(floor);
-    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0 });
+    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0 });
   });
 
   it.each([0, 100])('accepts idle threshold boundary %s', idlePct => {
-    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct });
+    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
     expect(load(settings(), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(idlePct) }))
-      .toEqual({ minConcurrent: 2, idlePct });
+      .toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
   });
 
   it.each([null, undefined, NaN, Infinity, -Infinity, '38', -1])(
@@ -847,7 +849,35 @@ describe('red-team queue floor idle override', () => {
     const text = JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 80 } } });
     for (const bad of ['bad', '', ' ', 'Infinity', '-1', '101', '1.5']) {
       expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: bad }, file: 'x', readFile: () => text }))
-        .toEqual({ minConcurrent: 2, idlePct: 80 });
+        .toEqual({ minConcurrent: 2, idlePct: 80, reviewStartsPerTick: 0 });
     }
   });
+});
+
+
+describe('idle-only review start allowance', () => {
+  const floor = { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 3 };
+  it.each([[10, 3], [100, 3], [9, 2], [NaN, 2], [undefined, 2], ['10', 2]])(
+    'idle %s yields allowance %s', (cpuIdlePct, expected) => {
+      expect(raiseReviewStartsPerTick(2, { floor, cpuIdlePct })).toBe(expected);
+    });
+  it.each([Infinity, -Infinity, NaN, 0, -1, undefined, '2', 4])('preserves existing allowance %s', max => {
+    expect(raiseReviewStartsPerTick(max, { floor, cpuIdlePct: 100 })).toBe(max);
+  });
+  it('disabled floor never raises the allowance', () => {
+    expect(raiseReviewStartsPerTick(2, { floor: { ...floor, minConcurrent: 0 }, cpuIdlePct: 100 })).toBe(2);
+  });
+  it.each([undefined, null, '3', -1, 1.5, 99, 3])('loads file review starts %j with fail-closed integer bounds', value => {
+    const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: value } } });
+    const expected = Number.isInteger(value) && value >= 0 ? Math.min(value, 4) : 0;
+    expect(loadRedTeamQueueFloor({ env: {}, readFile }).reviewStartsPerTick).toBe(expected);
+    expect(RED_TEAM_QUEUE_REVIEW_STARTS_CAP).toBe(4);
+  });
+  it.each([['3', 3], ['99', 4], ['', 0], [' ', 0], ['bad', 0], ['Infinity', 0], ['1.5', 0], ['-1', 0]])(
+    'environment review starts %j overrides file with %s', (value, expected) => {
+      const log = vi.fn();
+      const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: 4 } } });
+      expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: value }, readFile, log }).reviewStartsPerTick).toBe(expected);
+      expect(log.mock.calls.flat().join(' ')).toContain('env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE');
+    });
 });

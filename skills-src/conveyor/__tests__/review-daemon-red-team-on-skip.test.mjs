@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.mjs';
-import { cliReviewTickOpts, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
+import { cliReviewTickOpts, defaultReviewHostAdmission, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
 import * as reviewJob from '../../../scripts/operations/review-job.mjs';
 import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.mjs';
 import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
@@ -336,7 +336,8 @@ it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves
 it.each([
   ['host denied', false, 2, 0, 0],
   ['maxPerTick 1 exhausted by ordinary review', true, 1, 1, 0],
-  ['maxPerTick 2 with recovery reserve', true, 2, 0, 2],
+  ['maxPerTick 2 always reserves ordinary start', true, 2, 1, 1],
+  ['maxPerTick 3 with recovery reserve', true, 3, 1, 2],
 ])('production queue floor at idle 100 respects %s', (_name, admitted, maxPerTick, ordinaryStarts, recoveryStarts) => {
   const { options } = recoveryTickFixture({ ordinary: true });
   const { plan, rawPrs } = owedPrs(options.repo, [6101, 6102, 6103]);
@@ -421,4 +422,29 @@ it('a confirmed ordinary non-start leaves the host allowance available to recove
   expect(recoveryDispatch).toHaveBeenCalledTimes(1);
   expect(out.redTeamOnSkip.dispatched).toHaveLength(1);
   expect(take.mock.calls).toEqual([[1]]);
+});
+
+
+it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery reviews and one ordinary review', (idlePct, recoveryStarts) => {
+  const { options } = recoveryTickFixture({ ordinary: true });
+  const { plan, rawPrs } = owedPrs(options.repo, [6201, 6202, 6203]);
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE', '3');
+  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct });
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const out = runReviewTick({ ...options, redTeamOnSkip: production.redTeamOnSkip,
+      readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6204 }] }),
+      liveReviewBudget: { left: 5 }, hostAdmission: () => defaultReviewHostAdmission({
+        loadPolicy: () => ({ settings: { host: { maxReviewDispatchPerTick: 2 } } }),
+        admission: () => ({ admitted: true }), log: vi.fn(),
+      }),
+    });
+    expect(options.dispatch).toHaveBeenCalledOnce();
+    expect(out.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(recoveryStarts);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(recoveryStarts);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
