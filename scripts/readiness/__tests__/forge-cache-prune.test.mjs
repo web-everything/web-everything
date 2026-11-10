@@ -707,3 +707,72 @@ describe('readLiveEvidence', () => {
     expect((await readLiveEvidence({receipts: join(tmp, 'missing')})).complete).toBe(false);
   });
 });
+
+describe('forge-setup.sh installs the cache-retention timer and service (replacing cron cache pruning)', () => {
+  const sectionOf = (setup, name, tag) => {
+    const match = setup.match(new RegExp(`cat > /etc/systemd/system/${name.replace('.', '\\.')} <<'${tag}'\\n([\\s\\S]*?)\\n${tag}\\n`));
+    expect(match, `${name} heredoc present`).not.toBeNull();
+    return match[1];
+  };
+  const unitLines = text => text.split('\n').filter(line => line && !line.startsWith('#'));
+  let setup;
+  beforeEach(async () => { setup = await fs.readFile(new URL('../forge-setup.sh', import.meta.url), 'utf8'); });
+
+  it('service is a root oneshot running the fixed installed pruner with --apply at idle priority and explicit settings', () => {
+    const service = unitLines(sectionOf(setup, 'forge-cache-prune.service', 'CACHE_SERVICE'));
+    expect(service).toEqual([
+      '[Unit]',
+      'Description=Prune expired Forge dependency cache profiles',
+      'After=local-fs.target',
+      '[Service]',
+      'Type=oneshot',
+      'User=root',
+      'Environment=FORGE_CACHE_MAX_AGE_HOURS=12',
+      'Environment=FORGE_CACHE_MAX_BYTES=214748364800',
+      'Environment=FORGE_CACHE_HIGH_WATER_PCT=80',
+      'ExecStart=/usr/bin/env node /usr/local/libexec/forge-cache-prune.mjs --apply',
+      'Nice=19',
+      'IOSchedulingClass=idle',
+    ]);
+  });
+
+  it('the Environment= values installed by setup are exactly accepted by the pruner settings resolver', () => {
+    const service = sectionOf(setup, 'forge-cache-prune.service', 'CACHE_SERVICE');
+    const env = Object.fromEntries([...service.matchAll(/^Environment=(\w+)=(.*)$/gm)].map(m => [m[1], m[2]]));
+    expect(Object.keys(env).sort()).toEqual(Object.keys(validEnv).sort());
+    vi.stubEnv('FORGE_CACHE_MAX_AGE_HOURS', env.FORGE_CACHE_MAX_AGE_HOURS);
+    vi.stubEnv('FORGE_CACHE_MAX_BYTES', env.FORGE_CACHE_MAX_BYTES);
+    vi.stubEnv('FORGE_CACHE_HIGH_WATER_PCT', env.FORGE_CACHE_HIGH_WATER_PCT);
+    expect(() => resolveSettings()).not.toThrow();
+  });
+
+  it('timer fires 2min after boot then every 15min, is not persistent, and activates the service', () => {
+    const timer = unitLines(sectionOf(setup, 'forge-cache-prune.timer', 'CACHE_TIMER'));
+    expect(timer).toEqual([
+      '[Unit]',
+      'Description=Check Forge cache retention every 15 minutes',
+      '[Timer]',
+      'OnBootSec=2min',
+      'OnUnitActiveSec=15min',
+      'AccuracySec=1min',
+      'Persistent=false',
+      'Unit=forge-cache-prune.service',
+      '[Install]',
+      'WantedBy=timers.target',
+    ]);
+  });
+
+  it('reloads systemd then enables the timer, and bundles the pruner into /usr/local/libexec', () => {
+    const timerHeredoc = setup.indexOf("CACHE_TIMER\nsystemctl daemon-reload\nsystemctl enable --now forge-cache-prune.timer\n");
+    expect(timerHeredoc).toBeGreaterThan(setup.indexOf("<<'CACHE_SERVICE'"));
+    expect(setup).toContain('"forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs"}');
+    expect(setup).toContain('for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs"]:');
+  });
+
+  it('the cron job no longer owns cache retention', () => {
+    const cron = setup.match(/<<'PRUNE'\n([\s\S]*?)\nPRUNE\n/)[1];
+    expect(cron).not.toContain('/srv/forge-cache');
+    expect(cron).not.toContain('1209600');
+    expect(cron).not.toContain('forge-cache-prune');
+  });
+});
