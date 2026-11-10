@@ -3,6 +3,8 @@
  * No background sampler or cache is created here. Every IO boundary is injectable.
  */
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import * as os from 'node:os';
 import { resourcePaths } from './resource-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -16,9 +18,19 @@ const numericEnv = n => typeof n === 'string' && n.trim() !== '' ? Number(n) : N
 
 /** Settings can tighten standard floors; invalid values retain the preceding safe value. */
 export function loadCapacitySettings({ env = process.env, readFile = readFileSync,
-  file = new URL('../settings/host-capacity.json', import.meta.url), log = () => {} } = {}) {
+  file = resolve(dirname(fileURLToPath(import.meta.url)), '../settings/host-capacity.json'), log = () => {} } = {}) {
   let data;
-  try { data = JSON.parse(readFile(file, 'utf8')).hostCapacity; } catch { /* standard fallback */ }
+  try {
+    const parsed = JSON.parse(readFile(file, 'utf8'));
+    const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    if (!isObject(parsed) || !isObject(parsed.hostCapacity)
+      || ('idlePct' in parsed.hostCapacity && !isObject(parsed.hostCapacity.idlePct))) {
+      throw Error('invalid settings shape');
+    }
+    data = parsed.hostCapacity;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw Error('host-capacity settings unreadable', { cause: error });
+  }
   const sources = {};
   const setting = (key, fallback) => {
     const n = data?.[key];
@@ -73,10 +85,11 @@ export function readCapacity({ settings, env = process.env, root,
       const time = Date.parse(row?.sampledAt);
       const idle = row?.cpu?.idlePct;
       if (!Number.isFinite(time) || time > at || !validIdle(idle)) throw Error('invalid sampler reading');
-      return { time, idle };
+      return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
     });
-    const newest = parsed.reduce((latest, row) => Math.max(latest, row.time), -Infinity);
-    const window = parsed.filter(row => row.time >= at - settings.windowSec * 1000);
+    const window = parsed.filter(row => row.time >= at - settings.windowSec * 1000
+      && Number.isFinite(row.freshUntil) && at <= row.freshUntil);
+    const newest = window.reduce((latest, row) => Math.max(latest, row.time), -Infinity);
     if (at - newest <= settings.maxFreshSec * 1000 && window.length >= 2) {
       source = 'resource-sampler';
       idlePct = window.reduce((sum, row) => sum + row.idle, 0) / window.length;

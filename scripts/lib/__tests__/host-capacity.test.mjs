@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { CLASSES, loadCapacitySettings, readCapacity, admit } from '../host-capacity.mjs';
 import { hostLoadAdmission } from '../host-load.mjs';
@@ -10,11 +12,19 @@ const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 afterEach(() => {
   Object.defineProperty(process, 'platform', platformDescriptor);
   vi.restoreAllMocks();
+  syncBuiltinESMExports();
 });
+
+const mockSettingsFile = read => {
+  const original = fs.readFileSync;
+  vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) =>
+    String(file).endsWith('/settings/host-capacity.json') ? read() : original(file, ...args));
+  syncBuiltinESMExports();
+};
 
 const settings = loadCapacitySettings({ env: {} });
 const now = () => Date.parse('2026-11-10T12:00:00Z');
-const row = (idle, age = 0) => ({ sampledAt: new Date(now() - age * 1000).toISOString(), cpu: { idlePct: idle } });
+const row = (idle, age = 0) => ({ sampledAt: new Date(now() - age * 1000).toISOString(), freshUntil: new Date(now() + 30000).toISOString(), cpu: { idlePct: idle } });
 const evidence = (idle = 40, mem = 4096, extra = {}) => readCapacity({ settings, env: {}, now,
   history: () => [row(idle, 60), row(idle)], memory: () => mem, load: () => [79], cores: () => 12,
   sample: () => { throw Error('unexpected direct sample'); }, ...extra });
@@ -64,6 +74,33 @@ describe('window and source selection', () => {
     expect(sample).toHaveBeenCalledTimes(2);
     expect(sample).toHaveBeenCalledWith({ ttlMs: 0 });
   });
+  it.each(['expired', 'missing', 'invalid'])('sampler %s freshUntil falls back and cannot admit on expired telemetry', state => {
+    const rows = [row(100, 10), row(100)];
+    for (const entry of rows) {
+      if (state === 'missing') delete entry.freshUntil;
+      else entry.freshUntil = state === 'expired' ? new Date(now() - 1).toISOString() : 'bad';
+    }
+    const sample = vi.fn(() => ({ ok: true, idlePct: 0 }));
+    const read = () => evidence(100, 4096, { history: () => rows, sample });
+    expect(admit('review', { settings, read })).toMatchObject({ admit: false, source: 'direct' });
+    expect(sample).toHaveBeenCalledTimes(2);
+  });
+  it('excludes expired rows even when the latest row is fresh', () => {
+    const expired = { ...row(100, 10), freshUntil: new Date(now() - 1).toISOString() };
+    expect(evidence(40, 4096, { history: () => [expired, row(0, 5), row(0)] }))
+      .toMatchObject({ idlePct: 0, source: 'resource-sampler' });
+  });
+  it('accepts freshUntil exactly now but keeps maxFreshSec as an upper bound', () => {
+    const rows = [row(40, 20), row(40, 10)].map(entry => ({ ...entry, freshUntil: new Date(now()).toISOString() }));
+    expect(evidence(40, 4096, { history: () => rows })).toMatchObject({ source: 'resource-sampler' });
+    const sample = vi.fn(() => ({ ok: true, idlePct: 0 }));
+    expect(evidence(40, 4096, { settings: { ...settings, maxFreshSec: 5 }, history: () => rows, sample }))
+      .toMatchObject({ source: 'direct', idlePct: 0 });
+    expect(sample).toHaveBeenCalledTimes(2);
+    const expiredLatest = { ...row(100), freshUntil: new Date(now() - 1).toISOString() };
+    expect(evidence(40, 4096, { settings: { ...settings, maxFreshSec: 5 },
+      history: () => [...rows, expiredLatest], sample })).toMatchObject({ source: 'direct', idlePct: 0 });
+  });
   it.each([() => [row(NaN)], () => [{ sampledAt: 'bad', cpu: { idlePct: 40 } }], () => null,
     () => { throw Error('corrupt history'); }])('misread sampler holds without direct fallback', history => {
     const sample = vi.fn();
@@ -90,13 +127,43 @@ describe('settings', () => {
   it.each(['', ' ', 'bad', 'NaN', 'Infinity', '-1', '101', '0', '5'])('invalid/looser review override %j never loosens', value => {
     expect(loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: value } }).idlePct.review).toBe(10);
   });
-  it('file and environment can tighten; malformed file uses standard', () => {
+  it('file and environment can tighten', () => {
     const readFile = () => JSON.stringify({ hostCapacity: { idlePct: { review: 30 }, minMemoryMb: 1, windowSec: 120 } });
     expect(loadCapacitySettings({ readFile, env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '20' } })).toMatchObject({ idlePct: { review: 30 }, minMemoryMb: 2048, windowSec: 120 });
     const log = vi.fn();
     expect(loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '35' }, log }).idlePct.review).toBe(35);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('env WE_HOST_CAPACITY_REVIEW_IDLE_PCT'));
-    expect(loadCapacitySettings({ env: {}, readFile: () => '{' }).idlePct.review).toBe(10);
+  });
+});
+
+describe('settings evidence failures', () => {
+  it.each(['{', 'null', '[]', '{}', '{"hostCapacity":null}', '{"hostCapacity":[]}',
+    '{"hostCapacity":"bad"}', '{"hostCapacity":{"idlePct":[]}}'])('malformed settings %s hold before reading capacity', text => {
+    const readFile = () => text;
+    expect(() => loadCapacitySettings({ env: {}, readFile })).toThrow('settings unreadable');
+    mockSettingsFile(readFile);
+    const read = vi.fn(() => ({ idlePct: 100, memFreeGB: 8 }));
+    expect(admit('review', { env: {}, read })).toMatchObject({ admit: false, reason: expect.stringContaining('settings unreadable') });
+    expect(read).not.toHaveBeenCalled();
+  });
+  it('unreadable settings hold; missing settings use defaults', () => {
+    const denied = () => { throw Object.assign(Error('denied'), { code: 'EACCES' }); };
+    expect(() => loadCapacitySettings({ env: {}, readFile: denied })).toThrow('settings unreadable');
+    mockSettingsFile(denied);
+    expect(admit('review', { env: {}, read: () => ({ idlePct: 100, memFreeGB: 8 }) }))
+      .toMatchObject({ admit: false, reason: expect.stringContaining('settings unreadable') });
+    const missing = () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); };
+    expect(loadCapacitySettings({ env: {}, readFile: missing })).toMatchObject({ idlePct: { review: 10 }, minMemoryMb: 2048 });
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+    mockSettingsFile(missing);
+    expect(admit('review', { env: {}, read: () => ({ idlePct: 100, memFreeGB: 8 }) }).admit).toBe(true);
+  });
+  it('invalid individual settings preserve stricter floors', () => {
+    const readFile = () => JSON.stringify({ hostCapacity: { minMemoryMb: 'bad', windowSec: -1,
+      idlePct: { review: 'bad', build: 30 } } });
+    expect(loadCapacitySettings({ env: { WE_HOST_CAPACITY_BUILD_IDLE_PCT: 'bad' }, readFile }))
+      .toMatchObject({ minMemoryMb: 2048, windowSec: 90, idlePct: { review: 10, build: 30 } });
   });
 });
 
