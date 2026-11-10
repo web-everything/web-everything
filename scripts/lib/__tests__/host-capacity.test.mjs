@@ -73,22 +73,25 @@ describe('window and source selection', () => {
       reason: expect.stringContaining('hold until readable evidence on next tick') });
     expect(sample).not.toHaveBeenCalled();
   });
-  it.each(['expired', 'missing', 'invalid'])('sampler %s freshUntil holds without direct sampling', state => {
+  it.each(['expired', 'missing', 'invalid'])('newest sampler %s freshUntil holds without direct sampling', state => {
     const rows = [row(100, 10), row(100)];
-    for (const entry of rows) {
-      if (state === 'missing') delete entry.freshUntil;
-      else entry.freshUntil = state === 'expired' ? new Date(now() - 1).toISOString() : 'bad';
-    }
+    if (state === 'missing') delete rows[1].freshUntil;
+    else rows[1].freshUntil = state === 'expired' ? new Date(now() - 1).toISOString() : 'bad';
     const sample = vi.fn(() => ({ ok: true, idlePct: 100 }));
     const read = () => evidence(100, 4096, { history: () => rows, sample });
     expect(read().error).toEqual(expect.any(String));
     expect(admit('review', { settings, read }).admit).toBe(false);
     expect(sample).not.toHaveBeenCalled();
   });
-  it('excludes expired rows even when the latest row is fresh', () => {
-    const expired = { ...row(100, 10), freshUntil: new Date(now() - 1).toISOString() };
-    expect(evidence(40, 4096, { history: () => [expired, row(0, 5), row(0)] }))
-      .toMatchObject({ idlePct: 0, source: 'resource-sampler' });
+  it('holds review on the full window despite expired busy rows and fresh idle rows', () => {
+    const reviewSettings = { ...settings, idlePct: { ...settings.idlePct, review: 40 } };
+    const rows = [80, 60, 40, 20].map(age => ({
+      ...row(5, age), freshUntil: new Date(now() - 1).toISOString(),
+    }));
+    rows.push(row(90, 5), row(90));
+    const read = () => evidence(40, 4096, { settings: reviewSettings, history: () => rows });
+    expect(read()).toMatchObject({ idlePct: 200 / 6, source: 'resource-sampler' });
+    expect(admit('review', { settings: reviewSettings, read }).admit).toBe(false);
   });
   it('accepts freshUntil exactly now but keeps maxFreshSec as an upper bound', () => {
     const rows = [row(40, 20), row(40, 10)].map(entry => ({ ...entry, freshUntil: new Date(now()).toISOString() }));

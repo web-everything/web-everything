@@ -116,10 +116,10 @@ export function readCapacity({ settings, env = process.env, root,
       if (!Number.isFinite(time) || time > at || !validIdle(idle)) throw Error('invalid sampler reading');
       return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
     });
-    const window = parsed.filter(row => row.time >= at - settings.windowSec * 1000
-      && Number.isFinite(row.freshUntil) && at <= row.freshUntil);
-    const newest = window.reduce((latest, row) => Math.max(latest, row.time), -Infinity);
-    if (window.length < 2 || at - newest > settings.maxFreshSec * 1000) {
+    const window = parsed.filter(row => row.time >= at - settings.windowSec * 1000);
+    const newest = window.reduce((latest, row) => !latest || row.time > latest.time ? row : latest, null);
+    if (window.length < 2 || !Number.isFinite(newest.freshUntil) || at > newest.freshUntil
+      || at - newest.time > settings.maxFreshSec * 1000) {
       throw Error('missing, stale or short sampler history');
     }
     source = 'resource-sampler';
