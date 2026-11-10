@@ -183,7 +183,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // Landed on main since: the daemon world capsule writer (an exclusive `wx` create).
   'scripts/lib/daemon-rebuild/world-capsule.mjs',
   // Landed on main since: the daemons page renderer (an exclusive create).
-  'scripts/operations/daemons-render-io.mjs']);
+  'scripts/operations/daemons-render-io.mjs',
+  // Landed on main since (PR #6381, CI run 42791408190): the held-card filer (an exclusive create and a lock file name).
+  'scripts/operations/file-held-cards.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
