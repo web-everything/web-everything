@@ -461,6 +461,11 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
       expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('clear failed') });
       expect(runGhSync).not.toHaveBeenCalled();
       expect(failed.syncLabels).not.toHaveBeenCalled();
+      // A yield whose superseding post failed (the one fail-open case) names that detail in the row, never hides it.
+      const yielded = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-3'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: false, reason: 'policy-clear yielded to a concurrent round', detail: 'superseding in_progress not posted (HTTP 503)' })) });
+      expect(runRedTeamOnSkip(yielded).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('superseding in_progress not posted (HTTP 503)') });
+      expect(runGhSync).not.toHaveBeenCalled();
     } finally {
       runGhSync.mockReset();
       rmSync(dir, { recursive: true, force: true });

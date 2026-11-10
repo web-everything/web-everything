@@ -755,6 +755,9 @@ describe('red-team check run contract', () => {
       } });
       expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round',
         detail: expect.stringContaining('superseding in_progress not posted') });
+      // The disclosed fail-open window (self-review M1): until the next pass, the unverified success is newest and
+      // merge-gate reads it as clear over the unfinished round. Pinned so the residual stays visible, not hidden.
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }).ok).toBe(true);
       // GitHub is back: the retry sees its own unverified success over the round and yields (finding A).
       const retry = liveGh({ initial: fake.runs });
       expect(publish(retry.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
