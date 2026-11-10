@@ -71,7 +71,7 @@ const EXPECTED_WORKFLOW = Object.freeze({
     { uses: ACTIONS[0], with: { ref: 'main', 'persist-credentials': false } },
     { name: 'Install dependencies', run: 'npm ci --ignore-scripts --no-audit --no-fund' },
     { name: 'Classify', env: { REQUESTED_PR: '${{ inputs.pr }}' }, run: 'node scripts/drain-classify-only.mjs --batch --verdict-dir=verdicts' },
-    { uses: ACTIONS[1], if: 'always()', with: { name: 'drain-verdicts', path: 'verdicts/*.json', 'retention-days': 1, 'if-no-files-found': 'error' } },
+    { uses: ACTIONS[1], if: 'always()', with: { name: 'drain-verdicts', path: 'verdicts/*.json', 'retention-days': 1, 'if-no-files-found': 'ignore' } },
   ] } },
 });
 
@@ -114,7 +114,7 @@ export function auditWorkflow(yamlText) {
       for (const key of Object.keys(record(value.with) ? value.with : {})) {
         if (!allowed.includes(key) || /token|key|secret/i.test(key.replace(/^persist-credentials$/, ''))) problems.push('action input not allowed');
       }
-      if (/^actions\/upload-artifact@/.test(value.uses) && value.with?.['if-no-files-found'] !== 'error') problems.push('artifact upload must error on no files');
+      if (/^actions\/upload-artifact@/.test(value.uses) && value.with?.['if-no-files-found'] !== 'ignore') problems.push('artifact upload must ignore no files');
       if (/^actions\/checkout@/.test(value.uses) &&
           (!exact(value.with, ['ref', 'persist-credentials']) || value.with.ref !== 'main' ||
            value.with['persist-credentials'] !== false)) problems.push('unsafe checkout');

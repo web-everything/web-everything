@@ -208,7 +208,7 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
     ['github-script with BOT_PAT token', doc => { jobs(doc)[0].steps.push({ uses: 'actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea', with: { 'github-token': '${{ vars.BOT_PAT }}' } }); }],
     ['upload-artifact with token-like input', doc => { for (const step of jobs(doc)[0].steps) if (/upload-artifact/.test(step.uses ?? '')) step.with['api-key'] = 'x'; }],
     ['upload-artifact tolerates empty uploads', doc => { for (const step of jobs(doc)[0].steps) if (/upload-artifact/.test(step.uses ?? '')) step.with['if-no-files-found'] = 'warn'; }],
-    ['upload-artifact ignore', doc => { for (const step of jobs(doc)[0].steps) if (/upload-artifact/.test(step.uses ?? '')) step.with['if-no-files-found'] = 'ignore'; }],
+    ['upload-artifact error on empty schedule', doc => { for (const step of jobs(doc)[0].steps) if (/upload-artifact/.test(step.uses ?? '')) step.with['if-no-files-found'] = 'error'; }],
     ['continue-on-error on job', doc => { jobs(doc)[0]['continue-on-error'] = true; }],
     ['continue-on-error on classify step', doc => { for (const step of jobs(doc)[0].steps) if (step.run?.includes('drain-classify-only')) step['continue-on-error'] = true; }],
     ['continue-on-error expression', doc => { jobs(doc)[0]['continue-on-error'] = '${{ true }}'; }],
@@ -390,8 +390,29 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
     expect(out).toMatchObject({ written: 1, failed: 1 });
     expect(io.writeFileSync).toHaveBeenCalledTimes(1);
   });
-  it('zero verdicts (no open PRs) is a failure', () => {
-    expect(runBatch(batchArgv, batchIo({ prs: '' }))).toMatchObject({ written: 0, failed: 1 });
+  it('schedule: no labeled open PRs is a successful no-op', () => {
+    const io = batchIo({ prs: '' });
+    expect(runBatch(batchArgv, io)).toEqual({ written: 0, failed: 0 });
+    expect(io.writeFileSync).not.toHaveBeenCalled();
+    expect(io.mkdirSync).not.toHaveBeenCalled();
+    expect(io.execFileSync).toHaveBeenCalledTimes(1);
+  });
+  it('schedule: lists only ready-to-merge PRs with the existing bound', () => {
+    const io = batchIo();
+    runBatch(batchArgv, io);
+    expect(io.execFileSync.mock.calls[0].slice(0, 2)).toEqual(['gh', [
+      'pr', 'list', '--repo', io.env.GITHUB_REPOSITORY, '--state', 'open',
+      '--label', 'ready-to-merge', '--limit', '10', '--json', 'number', '--jq', '.[].number',
+    ]]);
+  });
+  it('dispatch: absent requested PR remains a failure', () => {
+    expect(runBatch(batchArgv, batchIo({ event: 'workflow_dispatch' }))).toEqual({ written: 0, failed: 1 });
+  });
+  it('schedule: unreadable PR list remains a failure', () => {
+    const io = batchIo();
+    io.execFileSync.mockImplementation(() => { throw new Error('unreadable'); });
+    expect(runBatch(batchArgv, io)).toEqual({ written: 0, failed: 1 });
+    expect(io.writeFileSync).not.toHaveBeenCalled();
   });
   it('all failing is a failure', () => {
     const io = batchIo({ prs: '7\n', failPr: 7 });
@@ -427,6 +448,10 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
 describe('T6b: workflow pins the exact command', () => {
   const CMD = 'node scripts/drain-classify-only.mjs --batch --verdict-dir=verdicts';
   const classify = doc => jobs(doc)[0].steps.find(st => /drain-classify-only/.test(st.run ?? ''));
+  it('real workflow ignores missing artifacts for an empty scheduled batch', () => {
+    const upload = jobs(yaml.safeLoad(workflowText()))[0].steps.find(st => /upload-artifact/.test(st.uses ?? ''));
+    expect(upload.with['if-no-files-found']).toBe('ignore');
+  });
   it('real workflow runs exactly the batch command', () => {
     expect(classify(yaml.safeLoad(workflowText())).run.trim()).toBe(CMD);
   });

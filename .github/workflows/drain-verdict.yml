@@ -39,4 +39,4 @@ jobs:
           name: drain-verdicts
           path: verdicts/*.json
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore

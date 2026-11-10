@@ -99,7 +99,7 @@ export function runCli(argv = process.argv.slice(2), io = {}) {
   return verdict;
 }
 
-/** Owns the loop, the counting and the exit code: any failure, or zero verdicts, is a failure. */
+/** Owns the loop, counting and exit code: failures fail; an empty scheduled list is a no-op. */
 export function runBatch(argv = process.argv.slice(2), io = {}) {
   const flags = Object.create(null);
   for (const arg of argv) {
@@ -120,11 +120,11 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   else {
     try {
       prs = String((io.execFileSync || execFileSync)('gh', ['pr', 'list', '--repo', flags.repo || env.GITHUB_REPOSITORY,
-        '--state', 'open', '--limit', '10', '--json', 'number', '--jq', '.[].number'],
+        '--state', 'open', '--label', 'ready-to-merge', '--limit', '10', '--json', 'number', '--jq', '.[].number'],
       { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 60_000, env })).split('\n').filter(Boolean);
     } catch { return fail('open PR list unreadable'); }
   }
-  if (!prs.length) return fail('no PRs to classify');
+  if (!prs.length) return { written: 0, failed: 0 };
   (io.mkdirSync || mkdirSync)(flags['verdict-dir'], { recursive: true });
   let written = 0, failed = 0;
   for (const pr of prs) {
