@@ -8,7 +8,7 @@ import * as reviewJob from '../../../scripts/operations/review-job.mjs';
 import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.mjs';
 import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
-import * as hostSample from '../../../scripts/lib/host-sample.mjs';
+import * as hostCapacity from '../../../scripts/lib/host-capacity.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
 
@@ -22,7 +22,7 @@ beforeEach(() => {
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '2');
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT', '10');
-  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
+  vi.spyOn(hostCapacity, 'readCapacity').mockReturnValue({ idlePct: 0 });
 });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
@@ -311,9 +311,9 @@ it('a throwing host check blocks recovery-only starts', () => {
   expect(recoveryDispatch).not.toHaveBeenCalled();
 });
 
-it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
+it.each([38, 'throws'])('CLI queue uses the shared windowed CPU reading (%s) and preserves lane/budget bounds', idle => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
-  vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
+  vi.spyOn(hostCapacity, 'readCapacity').mockImplementation(() => {
     if (idle === 'throws') throw new Error('sample unavailable');
     return { idlePct: idle };
   });
@@ -326,7 +326,7 @@ it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves
     cliReviewTickOpts({ log: { error: vi.fn() } }).redTeamOnSkip({
       repo: 'fixture/cpu-floor', plan: { refusals: [] }, rawPrs: [], capacity,
     });
-    expect(hostSample.sampleHost).toHaveBeenCalledOnce();
+    expect(hostCapacity.readCapacity).toHaveBeenCalledOnce();
     expect(recovery.mock.calls[0][0].capacity).toBe(capacity);
     expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 'throws' ? 1 : 2, budget: { left: 3 } });
     expect(capacity.budget).toBe(budget);
@@ -343,7 +343,7 @@ it.each([
   const { plan, rawPrs } = owedPrs(options.repo, [6101, 6102, 6103]);
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
-  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 100 });
+  vi.spyOn(hostCapacity, 'readCapacity').mockReturnValue({ idlePct: 100 });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   const take = vi.fn();
   try {
@@ -353,7 +353,7 @@ it.each([
       reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6104 }] }),
       liveReviewBudget: { left: 5 }, hostAdmission: () => ({ admitted, maxPerTick, take }),
     });
-    expect(hostSample.sampleHost).toHaveBeenCalledOnce();
+    expect(hostCapacity.readCapacity).toHaveBeenCalledOnce();
     expect(options.dispatch).toHaveBeenCalledTimes(ordinaryStarts);
     expect(out.dispatched).toHaveLength(ordinaryStarts);
     expect(dispatch).toHaveBeenCalledTimes(recoveryStarts);
@@ -367,7 +367,7 @@ it('production queue floor at idle 100 cannot replenish the shared host allowanc
   const { plan, rawPrs } = owedPrs(options.repo, [6111, 6112, 6113]);
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
-  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 100 });
+  vi.spyOn(hostCapacity, 'readCapacity').mockReturnValue({ idlePct: 100 });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   const check = vi.fn(() => ({ admitted: true, maxPerTick: 1 }));
   const hostAdmission = sharedHostBudget(check);
@@ -384,7 +384,7 @@ it('production queue floor at idle 100 cannot replenish the shared host allowanc
     expect(dispatch).toHaveBeenCalledOnce();
     expect(check).toHaveBeenCalledOnce();
     expect(hostAdmission().maxPerTick).toBe(0);
-    expect(hostSample.sampleHost).toHaveBeenCalledTimes(2);
+    expect(hostCapacity.readCapacity).toHaveBeenCalledTimes(2);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
 
@@ -431,7 +431,7 @@ it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery r
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
   vi.stubEnv('WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE', '3');
-  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct });
+  vi.spyOn(hostCapacity, 'readCapacity').mockReturnValue({ idlePct });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   try {
     const production = cliReviewTickOpts({ log: { error: vi.fn() } });
@@ -439,7 +439,7 @@ it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery r
       readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6204 }] }),
       liveReviewBudget: { left: 5 }, hostAdmission: () => defaultReviewHostAdmission({
         loadPolicy: () => ({ settings: { host: { maxReviewDispatchPerTick: 2 } } }),
-        admission: () => ({ admitted: true }), log: vi.fn(),
+        admission: () => ({ admitted: true, idlePct }), log: vi.fn(),
       }),
     });
     expect(options.dispatch).toHaveBeenCalledOnce();

@@ -32,11 +32,17 @@ export function parseMemoryFree(text) {
 
 const run = (cmd, args, timeout) => execFileSync(cmd, args, { encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] });
 
-/** Uncached read. `exec(cmd,args)` is injectable for tests. */
-export function readHostSample({ exec = (c, a) => run(c, a, 8000), platform = process.platform } = {}) {
+/** Uncached read. Opt in to rejecting incomplete top intervals; `exec(cmd,args)` is injectable. */
+export function readHostSample({ exec = (c, a) => run(c, a, 8000), platform = process.platform,
+  requireTwoIntervals = false } = {}) {
   let idlePct = null; let memFreePct = null;
   if (platform === 'darwin') {
-    try { idlePct = parseTopIdle(exec('top', ['-l', '2', '-n', '0', '-s', '1'])); } catch { /* sample failed */ }
+    try {
+      const top = exec('top', ['-l', '2', '-n', '0', '-s', '1']);
+      if (!requireTwoIntervals || String(top ?? '').split('\n').filter(line => /CPU usage:/.test(line)).length >= 2) {
+        idlePct = parseTopIdle(top);
+      }
+    } catch { /* sample failed */ }
     try { memFreePct = parseMemoryFree(exec('memory_pressure', [])); } catch { /* memory unreadable: second check skipped */ }
   }
   return { ok: idlePct !== null, idlePct, memFreePct };

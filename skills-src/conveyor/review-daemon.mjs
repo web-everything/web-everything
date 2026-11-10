@@ -93,7 +93,7 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
 import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
-import { sampleHost } from '../../scripts/lib/host-sample.mjs';
+import { readCapacity } from '../../scripts/lib/host-capacity.mjs';
 import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
@@ -391,7 +391,7 @@ export function runReviewTick({
   // verify-admission (2026-10-20) — host-level admission for new review sessions: `() => {admitted, reason,
   // maxPerTick?}`. Not admitted ⇒ nothing is dispatched this tick (every review stays owed: queued, never dropped);
   // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
-  // the real daemon wires {@link defaultReviewHostAdmission} (host load + memory headroom, cascade-sourced).
+  // the real daemon wires {@link defaultReviewHostAdmission} (windowed CPU idle + hard memory floor).
   hostAdmission = () => ({ admitted: true, reason: 'not checked', maxPerTick: Infinity }),
   // EMERGENCY 2026-10-20 — `{left:number}` shared by every repo of one daemon tick (see
   // {@link liveReviewRoundBudget}); `null` (the default) never caps, so pure-function callers are unchanged.
@@ -1250,15 +1250,18 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
  *  dispatch cap, all from the host-overload cascade (sources logged by the loader). Fails closed: an unreadable
  *  policy or host reading admits nothing, so owed reviews wait for the next tick. */
 export function defaultReviewHostAdmission({ env = process.env, admission = hostLoadAdmission, loadPolicy = loadHostOverloadSettings,
-  loadFloor = loadRedTeamQueueFloor, readCpuIdlePct = () => sampleHost().idlePct, log = console.error } = {}) {
+  loadFloor = loadRedTeamQueueFloor, readCpuIdlePct, capacityRead = readCapacity, log = console.error } = {}) {
   let policy;
   try { policy = loadPolicy({ env }); } catch (e) { return { admitted: false, reason: `host policy unreadable: ${String(e?.message ?? e).split('\n')[0]}` }; }
-  const verdict = admission({ policy, env, interactive: false });
+  const verdict = admission({ policy, env, interactive: false, capacityClass: 'review', capacityRead });
+  if (verdict.admitted && verdict.source) {
+    try { log(`review-daemon: ${verdict.reason}`); } catch { /* diagnostic only */ }
+  }
   let maxPerTick = policy.settings.host.maxReviewDispatchPerTick;
   if (verdict.admitted) {
     try {
       const floor = loadFloor({ env });
-      const cpuIdlePct = readCpuIdlePct();
+      const cpuIdlePct = readCpuIdlePct ? readCpuIdlePct() : verdict.idlePct;
       const raised = raiseReviewStartsPerTick(maxPerTick, { floor, cpuIdlePct });
       if (raised > maxPerTick) {
         try { log(`review-daemon: CPU idle ${cpuIdlePct}% >= ${floor.idlePct}% raises maxPerTick ${maxPerTick} -> ${raised}`); }
@@ -1310,7 +1313,10 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         catch { redTeamQueueFloor = null; }
       }
       return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
-        floor: redTeamQueueFloor, readCpuIdlePct: () => sampleHost().idlePct });
+        floor: redTeamQueueFloor, readCpuIdlePct: () => {
+          const reading = readCapacity();
+          return reading.error ? null : reading.idlePct;
+        } });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,

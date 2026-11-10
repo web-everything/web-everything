@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
 
+import { loadCapacitySettings } from './host-capacity.mjs';
+
 const transactions = new WeakMap();
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // still probed every tick, but it must not occupy one of the capacity-bound admissions.
@@ -21,10 +23,11 @@ const note = (log, message) => {
 export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
 export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
 
-/** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
+/** Invalid minimums or legacy idle thresholds disable the floor. Valid legacy thresholds
+ * can tighten the shared host-capacity review threshold. */
 export function loadRedTeamQueueFloor({ env = process.env,
   file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-team-queue.json'), readFile = readFileSync,
-  log = () => {} } = {}) {
+  log = () => {}, capacitySettings = loadCapacitySettings({ env, log }) } = {}) {
   let settings;
   try { settings = JSON.parse(readFile(file, 'utf8'))?.redTeam?.queue; }
   catch { /* Unavailable settings never create extra capacity. */ }
@@ -34,17 +37,14 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const parseEnv = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const minimum = minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv);
-  const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
-  // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
-  const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
+  const idle = idleEnv === undefined ? (settings?.minConcurrentIdlePct === undefined ? 10 : settings.minConcurrentIdlePct) : parseEnv(idleEnv);
+  const validIdle = Number.isInteger(idle) && idle >= 0 && idle <= 100;
   const floor = {
-    // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
-    minConcurrent: (idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
-      ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
-    idlePct: validIdle(idle) ? idle : 10,
+    minConcurrent: validIdle && Number.isInteger(minimum) && minimum >= 0 ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
+    idlePct: validIdle ? Math.max(idle, capacitySettings.idlePct.review) : capacitySettings.idlePct.review,
     reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
   };
-  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
+  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: max(host-capacity review, ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}); invalid legacy threshold disables), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
   return floor;
 }
 
@@ -63,7 +63,7 @@ export function applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log = () =
   if (!capacity || !Number.isFinite(capacity.remainingStarts)
     || typeof capacity.startsCeiling !== 'number' || !(capacity.startsCeiling >= 0)
     || !Number.isInteger(floor?.minConcurrent) || floor.minConcurrent <= 0
-    || !Number.isInteger(floor.idlePct) || floor.idlePct < 0 || floor.idlePct > 100
+    || !Number.isFinite(floor.idlePct) || floor.idlePct < 0 || floor.idlePct > 100
     || !Number.isFinite(cpuIdlePct) || cpuIdlePct < floor.idlePct || cpuIdlePct > 100) return;
   const minimum = Math.min(floor.minConcurrent, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP, capacity.startsCeiling);
   if (capacity.remainingStarts >= minimum) return;
