@@ -16,6 +16,19 @@ const STRICT_PATHS = [...GUARD_FLOOR, '**'];
 const STRICT = { verdictMode: 'shadow', preExistingMode: 'block', releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0, requireOnMain: true, requirePayBy: true };
 
 describe('audit settings (R528)', () => {
+  it.each(['raceBlockPaths', 'guardFloorPaths'])('strict path grammar rejects malformed %s at settings load', key => {
+    for (const pattern of ['custom/a+b.mjs', '---a/scripts/x.mjs']) {
+      for (const layer of ['file', 'platform', 'env']) {
+        expect(() => resolveAuditSettings({
+          fileRead: file(full(layer === 'file' ? { [key]: [pattern] } : {})),
+          platform: layer === 'platform' ? { [key]: [pattern] } : null,
+          env: layer === 'env' ? { [AUDIT_SETTINGS_ENV[key]]: JSON.stringify([pattern]) } : {},
+          log: () => {},
+        }), `${layer}: ${pattern}`).toThrow(/malformed protected pattern/);
+      }
+    }
+  });
+
   it('reads today\'s choices from the checked-in file in the running checkout', () => {
     expect(AUDIT_SETTINGS_PATH).toMatch(/scripts\/settings\/codex-audit\.json$/);
     const r = resolveAuditSettings({ platform: null, env: {}, log: () => {} });

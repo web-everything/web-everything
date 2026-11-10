@@ -6,6 +6,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { assertProtectedPatterns } from './audit-path.mjs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { cascadePolicy, LEGACY_PLATFORM_PREFERENCES_PATHS, operatorPreferencesPath, PLATFORM_PREFERENCES_ENV, PLATFORM_PREFERENCES_PATH,
   readPlatformPreferences } from './policy-cascade.mjs';
@@ -85,6 +86,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  'scripts/settings/daemon-tasks.json',
+  'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
   'scripts/settings/red-team.json', 'scripts/settings/github-auth.json', 'scripts/settings/human-review-surfaces.json',
   'scripts/settings/direction-aware-human.json', 'scripts/settings/review-no-verdict-retry.json', 'scripts/settings/referral-hold-auto-resolve.json',
   'scripts/settings/gh-throttle.json', 'scripts/settings/red-main-hold.json', 'scripts/settings/prototype-load.json',
@@ -170,6 +173,7 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  'scripts/lib/card-number-ledger.mjs',
   'scripts/lib/mq-failure-ledger.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.
@@ -240,6 +244,7 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',
   // Claims and mutexes are locks too (PR #6381 red team: the fix dispatch claim store).
   'scripts/**/*claim*', 'scripts/*claim*', 'scripts/**/*mutex*', 'scripts/*mutex*', ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS,
+  'scripts/operations/daemons-render-io.mjs', 'scripts/readiness/forge-cache-prune.mjs',
   // Hold-scan modules the source-scan floor test found missing (PR #6381 judge).
   'scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.mjs', 'scripts/lib/archive-closed-review-runs.mjs',
   'scripts/lib/reap-dead-review-runs.mjs', 'scripts/lib/run-abandoned.mjs', 'scripts/lib/build-queue-cache.mjs',
@@ -282,6 +287,13 @@ const DEFAULTS = Object.freeze({ verdictMode: 'model', preExistingMode: 'block',
   requireOnMain: true, requirePayBy: true });
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+// Preserve strictest recovery for unreadable settings; a well-shaped list with a malformed
+// path is a configuration error that must stop the whole load before verdict computation.
+class MalformedProtectedPatterns extends Error {}
+function assertConfiguredPatterns(patterns) {
+  try { assertProtectedPatterns(patterns); }
+  catch (cause) { throw new MalformedProtectedPatterns(cause.message, { cause }); }
+}
 const validPaths = v => Array.isArray(v) && v.length <= 256 && v.every(p => typeof p === 'string' && p.trim().length > 0 && p.length <= 512);
 // The same record shape findAudit reads (scripts/operations/codex-audit.mjs resolvePriorQuestionHashes): one
 // {hash, acceptUntil} object per prior question hash, the hash 64 lowercase hex characters. Two readers of one
@@ -420,7 +432,7 @@ function tightenToChain(over, chain) {
 
 /**
  * Resolve the audit settings. `fileRead`/`path`/`platform`/`platformRead` are test seams; production passes none.
- * Never throws: anything the resolution itself cannot survive (a value a parser cannot convert, an environment
+ * Malformed protected patterns throw and abort the load. Other resolution failures (a value a parser cannot convert, an environment
  * object that throws on read) resolves EVERY setting to its strictest option, with a warning (PR #6381 red team).
  * @returns {{value: object, sources: Record<string,string>, warnings: string[]}}
  */
@@ -428,6 +440,7 @@ export function resolveAuditSettings(options = {}) {
   // Shared with the resolution, so warnings it logged before a throw stay in the returned list (log and list agree).
   const warnings = [];
   try { return resolveUnguarded(options ?? {}, warnings); } catch (err) {
+    if (err instanceof MalformedProtectedPatterns) throw err;
     let reason = 'unknown error';
     try { if (typeof err?.message === 'string') reason = err.message.slice(0, 200); } catch { /* keep the generic reason */ }
     const warning = `audit settings could not be resolved (${reason}); every setting resolves to its strictest option`;
@@ -548,6 +561,7 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
     let strictest = unreadable || !cascade || platBad;
     const own = layer => (isObj(layer) ? layer[key] : undefined);
     const layerLists = [...chainFiles.map(own), own(chainPlat), own(plat), own(tool)].filter(l => l !== undefined);
+    for (const patterns of layerLists) if (validPaths(patterns)) assertConfiguredPatterns(patterns);
     let platList = []; let list = [];
     if (!layerLists.every(validPaths) || malformed(key, validPaths)) { warn(`audit setting ${key} invalid; every path protected`); strictest = true; }
     else {
@@ -558,10 +572,11 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
     const raw = env?.[AUDIT_SETTINGS_ENV[key]];
     if (raw !== undefined) {
       let p; try { p = JSON.parse(raw); } catch { p = undefined; }
-      if (validPaths(p)) envList = p;
+      if (validPaths(p)) { assertConfiguredPatterns(p); envList = p; }
       else { warn(`env ${AUDIT_SETTINGS_ENV[key]} invalid; every path protected`); strictest = true; }
     }
     value[key] = Object.freeze([...new Set([...(strictest ? STRICTEST_PATHS : GUARD_FLOOR), ...list, ...envList])]);
+    assertConfiguredPatterns(value[key]);
     sources[key] = strictest ? 'strictest' : envList.length ? 'env' : list.length > platList.length ? 'file' : platList.length ? 'platform' : 'built-in';
   }
   // Prior question hashes only widen what is ACCEPTED, so only the trusted file may set them: no env route, and the

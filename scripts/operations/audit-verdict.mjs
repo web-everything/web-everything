@@ -5,6 +5,7 @@
  */
 const RELEASE_STAGES = Object.freeze(['prerelease', 'prod']);
 import { GUARD_FLOOR, resolveAuditSettings } from '../lib/audit-settings.mjs';
+import { canonicalPaths, anchorsOf, assertProtectedPatterns } from '../lib/audit-path.mjs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 
@@ -137,151 +138,19 @@ function payByTime(due) {
   const t = Date.UTC(y, mo - 1, d); const day = new Date(t);
   return day.getUTCFullYear() === y && day.getUTCMonth() === mo - 1 && day.getUTCDate() === d ? t : NaN;
 }
-/** Longest reported path matched against globs; a longer one cannot be established and fails closed (bounds glob cost). */
-const MAX_PATH = 512;
 /** Most globs one CALLER list may carry (the trusted lists are bounded by audit-settings: the floor plus 256 per layer). */
 const MAX_GLOBS = GUARD_FLOOR.length + 512;
-/** Most candidate forms one reported path may yield; more cannot be matched at bounded cost and fail closed. */
-const MAX_CANDIDATES = 32;
 /**
- * The one fold a reported path and a protected pattern both go through (PR #6381 referral: the two sides dropped
- * different characters): compatibility form (NFKC); invisible, control, format, line and paragraph separator
+ * Legacy cleanup for caller-supplied patterns; configured settings are validated before this fold.
+ * Compatibility form (NFKC); invisible, control, format, line and paragraph separator
  * characters and the blank Braille pattern dropped; the dash, slash and dot lookalikes NFKC keeps (U+2011, U+2212,
  * U+2215, U+3002, ...) read as `-`, `/` and `.`. Written as escapes: a raw invisible in source is refused by check:standards.
  */
-const foldPathText = (s, gap = '') => s.normalize('NFKC')
-  .replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{2800}]/gu, gap)
+const foldPathText = s => s.normalize('NFKC')
+  .replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{2800}]/gu, '')
   .replace(/[\p{Pd}\u{2212}\u{2043}]/gu, '-')
   .replace(/[\u{2215}\u{2044}\u{2216}\u{29f5}\u{29f8}\u{29f9}]/gu, '/')
   .replace(/[\u{b7}\u{589}\u{6d4}\u{2027}\u{2219}\u{22c5}\u{2e31}\u{2e33}\u{3002}\u{30fb}]/gu, '.');
-/**
- * Every repo-relative POSIX form a reported path may name, or null when it cannot be established (callers fail closed).
- * A model reading a diff or a trace wraps the file in text the floor globs never match: quotes or backticks, a diff
- * header or side prefix (`+++ b/`, `a/`, `i/`), a folder above the repo, a line suffix (`:42`, `:42-50`, `#L42`,
- * `(line 42)`, `@sha`), trailing punctuation, compatibility-form or invisible characters (PR #6381 self-review).
- * Listing those shapes always misses the next one, so the shape is not listed: every run of path characters in the
- * report (raw and NFKC-folded) is a token and a candidate, and so is every trailing run of the token's folders that
- * starts at an ANCHOR, the first folder a protected glob names (`scripts`, `.claude`). Anchoring keeps a glob's
- * meaning (`*` still names only a top-level file: `x/y` never yields `y`). A path is protected when ANY candidate
- * matches, so a candidate only ever protects more. The raw report must still normalize.
- */
-function pathCandidates(file, anchors = new Set()) {
-  if (typeof file !== 'string' || file.length > MAX_PATH) return null;
-  const raw = pathCandidate(file);
-  if (raw === null) return null;
-  const out = new Set([raw]);
-  // PR #6381 self-review: a model may escape a character inside a name (markdown `review\-x.mjs`, `%2B`, `&#43;`), so the
-  // report is also read with those ASCII escapes decoded. Like every other form, it only adds candidates.
-  for (const text of new Set([file, unescapeAscii(file)])) if (!addCandidates(text, anchors, out)) return null;
-  return [...out];
-}
-/**
- * ASCII-only decoding of the escapes a model writes inside a name: `%XX`, numeric HTML entities, a markdown `\` escape,
- * and a shell-escaped space (`custom/a\ b.mjs`; fix-6381 self-review: the `\` was read as `/` and the space was lost).
- */
-const unescapeAscii = s => s
-  .replace(/%([0-7][0-9A-Fa-f])/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-  .replace(/&#(?:[xX]([0-9A-Fa-f]{1,2})|(\d{1,3}));/g, (m, h, d) => {
-    const n = h ? parseInt(h, 16) : Number(d);
-    return n < 0x80 ? String.fromCharCode(n) : m;
-  })
-  .replace(/\\([ !-/:-@[-`{-~])/g, '$1');
-/** Adds every candidate `file` yields to `out`; false when the report cannot be established (callers fail closed). */
-function addCandidates(file, anchors, out) {
-  // PR #6381 referral (block): a character that NFKC keeps split the folded token, so an explicitly named module
-  // matched no glob. Listing such characters always misses the next one (a format character, then a lookalike dash,
-  // then a combining mark), so the fold maps the separators a path uses and then REFUSES what is left: a token that
-  // still holds a non-ASCII letter, number, mark or symbol next to a path character cannot be established, and the
-  // path fails closed (protected). Every tracked file name is ASCII, so no real path is refused. A second form also
-  // drops whitespace, which renders as a gap inside a name. Each form only adds candidates; the raw report stays one.
-  // A run is what sits between whitespace. Punctuation and symbols at its edges are prose (a curly-quoted or bracketed
-  // path, a trailing ideographic full stop); what is left is the run's core. A core that still mixes a non-ASCII
-  // character with an ASCII letter refuses the report, wherever the character sits and whatever it looks like (a
-  // bracket inside a name, a box-drawing slash in place of every `/`). Non-ASCII prose (no ASCII letter) still passes.
-  const folded = foldPathText(file);
-  const cores = folded.split(/\s+/u).map(run => run.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, ''));
-  if (cores.some(core => /[^\x00-\x7f]/.test(core) && /[A-Za-z]/.test(core))) return false;
-  // Forms: the raw report, the fold, the fold without whitespace, and the fold keeping only path characters, so any
-  // splitter inside a name (a gap, a bracket, `,`, `!`, `:`, a symbol stripped above as an edge) joins it up again.
-  const joined = folded.replace(/\s/gu, '');
-  const tokens = [];
-  for (const form of new Set([file, folded, joined, folded.replace(/[^\p{L}\p{N}\p{M}_.\-/\\]/gu, '')])) {
-    tokens.push(...(form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []));
-  }
-  // PR #6381 judge: the token regex splits on any ASCII character it does not list (`+`, `@`, `~`, `%`, `=`, `,`), so a
-  // legal name such as custom/a+b.mjs never matched once quoted, line-suffixed or diff-prefixed. Adding characters to
-  // the regex always misses the next one, so the cores are tokens too: only their edges were trimmed, so every
-  // interior character stays. Wrapping prose may still sit inside a core (`"a+b.mjs":12`, `[x](a+b.mjs)`, `a+b.mjs?x=1`,
-  // two names joined by `,`), and no list of those characters is complete either, so each whitespace run is cut at
-  // EVERY punctuation or symbol that is not a path character, and every span between two cuts that reads as a path (a
-  // letter and a `/`, `\` or `.`) is a token; a span of prose (`render(`, `label,`) only spends the candidate bound. The run is cut untrimmed, so a name that itself starts or ends with such a character (`+a.mjs`, `a.mjs+`)
-  // keeps it in some span. The runs are taken from a second fold too, where a dropped invisible or line separator is a
-  // gap rather than nothing, so prose it glued onto a name is cut off. The whitespace-joined form is a token as it
-  // stands, never cut. More candidates still fail closed.
-  // PR #6381 fix-6381 self-review: every span becoming a candidate made a report with no spaces and a few marks
-  // (`src/a.ts:12:4,src/b.ts:13:5,...`) pass the candidate bound and fail closed into recheck although nothing in it
-  // is protected. A span can only matter where it starts at a glob's first folder (or top-level name), so a span is a
-  // candidate only from an anchored segment on; when some glob starts with a wildcard (no anchor) every span still is.
-  // A span is also taken with its edges trimmed (a markdown `_name_`), and with its trailing dots kept (`custom/a.`).
-  // A protected pattern that itself holds whitespace (`custom/a b.mjs`) can only be named across a gap, so then the
-  // whole report is one run as well: more cuts, and so fail-closed sooner, only when such a pattern exists.
-  const edges = s => s.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
-  tokens.push(...cores, edges(joined));
-  const gapped = foldPathText(file, ' ');
-  const runs = [...folded.split(/\s+/u), ...gapped.split(/\s+/u), ...(anchors.spaced ? [folded.trim(), gapped.trim()] : [])];
-  const spans = [];
-  for (const run of new Set(runs)) {
-    const cuts = [-1];
-    for (let i = 0; i < run.length; i++) if (/[^\p{L}\p{N}\p{M}_.\-/\\]/u.test(run[i])) cuts.push(i);
-    // Spans grow with the square of the cuts: a run with more cuts than the candidate bound fails closed (protected).
-    if (cuts.length > MAX_CANDIDATES + 1) return false;
-    cuts.push(run.length);
-    for (let a = 0; a < cuts.length - 1; a++) {
-      for (let b = a + 1; b < cuts.length; b++) {
-        const span = run.slice(cuts[a] + 1, cuts[b]);
-        if (/[./\\]/.test(span) && /\p{L}/u.test(span)) spans.push(span, edges(span));
-      }
-    }
-  }
-  const sources = [...tokens.map(t => [t, true]), ...spans.map(s => [s, anchors.open === true])];
-  for (const [token, whole] of sources) {
-    if (token === '') continue;
-    const slashed = token.replace(/\\/g, '/');
-    for (const form of new Set([slashed, slashed.replace(/\.+$/, '')])) {
-      const segs = form.split('/').filter(s => s !== '' && s !== '.');
-      for (let i = 0; i < segs.length; i++) {
-        if ((i > 0 || !whole) && !anchors.has(segs[i].toLowerCase())) continue;
-        const c = pathCandidate(segs.slice(i).join('/'));
-        if (c !== null) out.add(c);
-        if (out.size > MAX_CANDIDATES) return false;
-      }
-    }
-  }
-  return true;
-}
-/**
- * The literal first folder of each glob (`scripts` of `scripts/**\/x`); a glob that starts with a wildcard names none
- * and marks the set `open` (every span is then a candidate). `spaced` marks a glob holding whitespace.
- */
-const anchorsOf = patterns => Object.assign(
-  new Set(patterns.map(p => p.toLowerCase().split('/')[0]).filter(s => s !== '' && !s.includes('*'))),
-  { open: patterns.some(p => { const first = p.split('/')[0]; return first === '' || first.includes('*'); }),
-    spaced: patterns.some(p => /\s/u.test(p)) });
-function pathCandidate(file) {
-  if (/[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
-  let path = file.replace(/\\/g, '/');
-  if (path.startsWith('/')) {
-    if (!path.startsWith(REPO_ROOT.replace(/\\/g, '/'))) return null;
-    path = path.slice(REPO_ROOT.length);
-  }
-  const parts = [];
-  for (const seg of path.split('/')) {
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') { if (!parts.length) return null; parts.pop(); continue; }
-    parts.push(seg);
-  }
-  return parts.length ? parts.join('/') : null;
-}
 // Case-insensitive: the checkout may sit on a case-insensitive file system, where `Scripts/Guard-Bash.mjs` IS the guard.
 // Folding both sides only ever protects more paths. The candidates are computed once per path, not once per glob.
 // A pattern is cleaned up the way a path candidate is (PR #6381 self-review), else `./custom/**`, `/custom/**`,
@@ -301,16 +170,18 @@ const cleanPattern = p => {
   if (!segs.length) return '**';
   return `${segs.join('/')}${s.endsWith('/') ? '/' : ''}`.toLowerCase();
 };
-const matchesSome = (file, patterns) => {
+export const matchesSome = (file, patterns) => {
   const clean = patterns.map(cleanPattern);
-  const c = pathCandidates(file, anchorsOf(clean))?.map(x => x.toLowerCase());
-  return c === undefined || clean.some(p => c.some(x => matchesPath(x, p)));
+  const c = canonicalPaths(file, anchorsOf(clean));
+  return c === null || clean.some(p => c.some(x => matchesPath(x.toLowerCase(), p)));
 };
 
 export function computeVerdict(findings, options = {}) {
   // Settings come from the trusted running checkout (strictest on any failure), never from the candidate or the
   // caller. There is deliberately no settings argument: tests mock the resolver module instead.
   const trusted = resolveAuditSettings().value;
+  assertProtectedPatterns(trusted.raceBlockPaths);
+  assertProtectedPatterns(trusted.guardFloorPaths);
   // A caller may only TIGHTEN the trusted settings: a stricter stage, more protected paths. It can never relax them.
   const { rulings = [], relationProofs = [], base, head } = options;
   const stageOption = options.releaseStage ?? trusted.releaseStage;

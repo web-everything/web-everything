@@ -4,8 +4,8 @@
     "verdict": { "mode": "model" },
     "preExisting": { "mode": "block", "baseRecheckMax": 3 },
     "releaseStage": "prerelease",
-    "raceBlockPaths": [],
-    "guardFloorPaths": ["scripts/guard-*", "scripts/**/guard-*", "scripts/lib/lane-lease.mjs", ".claude/settings.json"],
+    "raceBlockPaths": ["scripts/operations/daemons-render-io.mjs", "scripts/readiness/forge-cache-prune.mjs", "scripts/settings/card-ledger-legacy-identities.json", "scripts/settings/card-ledger-trust.json", "scripts/settings/card-numbering.json", "scripts/lib/card-number-ledger.mjs", "scripts/settings/daemon-tasks.json"],
+    "guardFloorPaths": ["scripts/guard-*", "scripts/**/guard-*", "scripts/lib/lane-lease.mjs", ".claude/settings.json", "scripts/operations/daemons-render-io.mjs", "scripts/readiness/forge-cache-prune.mjs", "scripts/settings/card-ledger-legacy-identities.json", "scripts/settings/card-ledger-trust.json", "scripts/settings/card-numbering.json", "scripts/lib/card-number-ledger.mjs", "scripts/settings/daemon-tasks.json"],
     "priorQuestionHashes": [],
     "recheck": { "max": 1 },
     "cards": { "requireOnMain": true, "requirePayBy": true }

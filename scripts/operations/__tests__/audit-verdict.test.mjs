@@ -6,6 +6,7 @@ import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { GUARD_FLOOR, LOCK_API, LOCK_HOLDERS, LOCK_PRIMITIVES, LOCK_USERS, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
 import { findingFingerprint, proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
+import { assertProtectedPatterns, validateProtectedPattern } from '../../lib/audit-path.mjs';
 
 // R473 stage 1 deliberately supplies tests only. Stage 2 supplies the implementation;
 // this suite must stay RED until then. Do not stub the verdict engine or skip cases
@@ -56,6 +57,29 @@ const scope = f => Object.fromEntries(['file', 'line', 'invariant', 'trigger', '
 const cases = JSON.parse(readFileSync(new NodeURL('./fixtures/weakened-15-cases.json', import.meta.url), 'utf8'));
 
 describe('R473 pure classified verdict', () => {
+  it.each(['custom/a+b.mjs', '"custom/a+b.mjs"', 'custom/a+b.mjs:12', '+++ b/custom/a+b.mjs',
+    ...['@', '~', '%', '=', ','].map(ch => `custom/a${ch}b.mjs`)])(
+    'strict path grammar protects unparseable report %j under custom/**', async file => {
+      const result = await compute([finding({ class: 'E2', file })], options(), trustedLayer({ guardFloorPaths: ['custom/**'] }));
+      expect(result.verdict).toBe('WEAKENED');
+      expect(result.recheck).toEqual([expect.objectContaining({ id: 'f1', class: 'X2' })]);
+      expect(result.blocks).toEqual([]);
+      expect(result.ships).toEqual([]);
+    });
+  it('strict path grammar still ships an unrelated custom-free path', async () => {
+    const result = await compute([finding({ class: 'E2', file: 'docs/ab.md' })], options(), trustedLayer({ guardFloorPaths: ['custom/**'] }));
+    expect(result.verdict).toBe('NOT WEAKENED');
+    expect(ids(result.ships)).toEqual(['f1']);
+    expect(result.blocks).toEqual([]);
+  });
+  it('strict path grammar wiring makes matchesSome return true for an unparseable report', async () => {
+    const { matchesSome } = await import(verdictModule);
+    expect(matchesSome).toBeTypeOf('function');
+    expect(matchesSome('custom/a+b.mjs', ['custom/**'])).toBe(true);
+    expect(matchesSome('unparseable@report', [])).toBe(true);
+    expect(matchesSome('docs/ab.md', ['custom/**'])).toBe(false);
+  });
+
   it('requires the stage-2 computeVerdict export before behavioral contracts can run', async () => {
     await loadComputeVerdict();
   });
@@ -222,6 +246,10 @@ describe('R473 pure classified verdict', () => {
     trigger: 'A reads the record; B writes it; A writes over it', consequence: 'B\'s write is lost', interleaving });
   it('a D3 finding on custom/writers/save.mjs with raceBlockPaths [custom/**/] is WEAKENED (PR #6381 judge)', async () => {
     for (const pattern of ['custom/**/', 'custom/*/', 'custom/**//', 'custom/']) {
+      if (!validateProtectedPattern(pattern)) {
+        await expect(compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }))).rejects.toThrow(/malformed protected pattern/);
+        continue;
+      }
       const result = await compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }));
       expect(result.verdict, pattern).toBe('WEAKENED');
       expect(result.ships, pattern).toEqual([]);
@@ -235,26 +263,29 @@ describe('R473 pure classified verdict', () => {
   });
   // The same class (PR #6381 self-review): a pattern is cleaned up the way a path candidate is, so a leading ./ or /,
   // a backslash, a doubled slash or surrounding whitespace never makes a protected pattern match nothing.
-  it('a protected pattern written with ./, /, \\, // or whitespace still protects its paths (PR #6381 self-review)', async () => {
+  it('a configured pattern written with ./, /, \\, // or whitespace refuses settings load', async () => {
     // Invisible characters are built from code points: a raw one in source is refused by check:standards.
     const ZW = String.fromCodePoint(0x200b);
     for (const pattern of ['./custom/**', '/custom/**', 'custom\\**', 'custom//**', 'custom/** ', ' custom/**', './custom/', './/custom/**/', 'custom\\',
       'custom/./**', 'custom/**/.', 'x/../custom/**', `custom${ZW}/**`, `${String.fromCodePoint(0xff43)}ustom/**`,
       `cus${String.fromCodePoint(0x7f)}tom/**`, `custom/${String.fromCodePoint(0xad)}**/`, `custom/** ${ZW}`, `${ZW} custom/**`, ` ${ZW} custom/** ${ZW} `]) {
-      const race = await compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }));
-      expect(race.verdict, pattern).toBe('WEAKENED');
-      const guard = await compute([finding({ class: 'E2', file: 'custom/writers/save.mjs' })], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] }));
-      expect(guard.verdict, pattern).toBe('WEAKENED');
-      expect((await compute([d3('other/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }))).verdict, pattern).toBe('NOT WEAKENED');
+      for (const key of ['raceBlockPaths', 'guardFloorPaths']) {
+        await expect(compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ [key]: [pattern] })))
+          .rejects.toThrow(/malformed protected pattern/);
+      }
     }
     // A pattern naming the repo root (`./`, `/`), or one climbing above it (`../custom/**`), protects every path.
     for (const pattern of ['./', '/', '../custom/**', 'custom/../../x']) {
-      expect((await compute([d3('other/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }))).verdict, pattern).toBe('WEAKENED');
+      await expect(compute([d3('other/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }))).rejects.toThrow(/malformed protected pattern/);
     }
   });
   it('an E2 finding with guardFloorPaths [custom/**/] is WEAKENED (PR #6381 judge)', async () => {
     for (const pattern of ['custom/**/', 'custom/*/', 'custom/**//']) {
       const f = finding({ class: 'E2', file: 'custom/writers/save.mjs' });
+      if (!validateProtectedPattern(pattern)) {
+        await expect(compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] }))).rejects.toThrow(/malformed protected pattern/);
+        continue;
+      }
       const result = await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] }));
       expect(result.verdict, pattern).toBe('WEAKENED');
       expect(ids(result.blocks), pattern).toContain('f1');
@@ -263,12 +294,22 @@ describe('R473 pure classified verdict', () => {
     expect((await compute([finding({ class: 'E2', file: 'other/x.mjs' })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/**/'] }))).verdict)
       .toBe('NOT WEAKENED');
   });
-  // PR #6381 judge (red-team 1b07722449ffc6d7): the path-character token regex has no `+` (nor `@ ~ % = ,`), so a legal
-  // ASCII name like custom/a+b.mjs was split at the `+` once quoted, line-suffixed or diff-prefixed, and no candidate
-  // equalled the protected glob. The whitespace-run cores (edges trimmed, interior kept) are now candidates too.
-  describe('a protected name holding ASCII punctuation the token regex splits on (PR #6381 judge)', () => {
+  // R787 redesign: punctuation remains in the FILE report, but configured patterns use the strict grammar.
+  // An unparseable report is protected even when no configured glob names its apparent path.
+  describe('strict grammar protects punctuation reports (PR #6381 judge, R787 redesign)', () => {
     const PLUS = 'custom/a+b.mjs'; const MIXED = 'custom/x@y~z%w=v,u.mjs'; const QUOTED = "custom/it's!&$.mjs";
-    const GUARDED = [PLUS, MIXED, QUOTED];
+    const GUARDED = ['custom/**'];
+    const expectProtected = result => {
+      expect(result.verdict).toBe('WEAKENED');
+      expect(ids([...result.blocks, ...result.recheck])).toEqual(['f1']);
+      expect(result.ships).toEqual([]);
+      expect(result.cards).toEqual([]);
+    };
+    it('punctuation patterns themselves throw at load', () => {
+      for (const pattern of [PLUS, MIXED, QUOTED]) {
+        expect(() => assertProtectedPatterns([pattern])).toThrow(/malformed protected pattern/);
+      }
+    });
     const wrapped = name => [name, `"${name}"`, `${name}:12`, `+++ b/${name}`, `--- a/${name}`, `\`${name}\``, `${name}:42:7`, `${name}#L42`,
       `${name} (line 42)`, `${name}@ec32b86`, `a/${name}`, `see (${name})`, `${name}, line 4`, `${name}:12:`, `custom\\${name.slice(7)}`,
       // Self-review of the cores fix: a wrapper closed before a line suffix, a markdown link, a query or other annotation
@@ -279,26 +320,17 @@ describe('R473 pure classified verdict', () => {
       // fix-6381 self-review: markdown emphasis keeps `_` (a path character) on a span's edges.
       `_${name}_:12`, `_${name}_`, `**${name}**`,
       ...[0x2028, 0x2029, 0x85, 0x200b, 0xad, 0x2060].map(cp => `${name}${String.fromCodePoint(cp)}more`)];
-    it.each([...wrapped(PLUS), ...wrapped(MIXED), ...wrapped(QUOTED)])('%j is WEAKENED under guardFloorPaths naming it', async file => {
+    it.each([...wrapped(PLUS), ...wrapped(MIXED), ...wrapped(QUOTED)])('%j is WEAKENED under custom/**', async file => {
       const f = finding({ class: 'E2', file });
-      const layered = await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }));
-      expect(layered.verdict).toBe('WEAKENED');
-      expect(layered.ships).toEqual([]);
-      // A block, never the candidate-bound recheck: the name is MATCHED in every wrapper (fix-6381 self-review: the
-      // MIXED and QUOTED forms used to pass this only because their spans overflowed the bound).
-      expect(ids(layered.blocks)).toContain('f1');
-      expect((await compute([f], options('prerelease', { guardFloorPaths: GUARDED }))).verdict).toBe('WEAKENED');
+      expectProtected(await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED })));
+      expectProtected(await compute([f], options('prerelease', { guardFloorPaths: GUARDED })));
     });
-    // The same wrapped reports under a glob that does not name them ship: protection comes from a match, not from
-    // the candidate bound failing closed.
-    it.each([...wrapped(PLUS), ...wrapped(MIXED), ...wrapped(QUOTED)])('%j ships when no glob names it', async file => {
-      expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/zzz.mjs'] }))).verdict)
-        .toBe('NOT WEAKENED');
+    it.each([...wrapped(PLUS), ...wrapped(MIXED), ...wrapped(QUOTED)])('%j is protected even when no glob names it', async file => {
+      expectProtected(await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/zzz.mjs'] })));
     });
     it.each(['custom/a.mjs', 'custom/b.mjs', 'custom/x@y.mjs', 'custom/it.mjs', ...wrapped('custom/ab.mjs')])(
-      'an unrelated path %j still ships (the cores never over-block)', async file => {
-        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
-          .toBe('NOT WEAKENED');
+      'a custom path reported as %j remains protected', async file => {
+        expectProtected(await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED })));
       });
     // Second self-review: a protected name that itself starts or ends with punctuation lost that character to the edge
     // trim once wrapped, and an escaped character inside a name (markdown `\-`, `%2B`, `&#43;`) split it.
@@ -313,7 +345,9 @@ describe('R473 pure classified verdict', () => {
         'custom/a\\ b.mjs', 'custom/a\\ b.mjs:12', '"custom/a\\ b.mjs"']],
       ['custom/a.', ['"custom/a."', 'custom/a.:12', '`custom/a.`']]])('a protected %j stays WEAKENED in every wrapper', async (guard, files) => {
       for (const file of files) {
-        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: [guard] }))).verdict, file).toBe('WEAKENED');
+        // Root-level punctuation names use a valid catch-all; custom and hidden custom folders use valid globs.
+        const pattern = guard.startsWith('custom/') ? 'custom/**' : guard.startsWith('.custom/') ? '.custom/**' : '*';
+        expectProtected(await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] })));
       }
     });
     it.each(['scripts/lib/review\\-independence.mjs', 'scripts/lib/review%2Dindependence.mjs', 'scripts/lib/review&#45;independence.mjs',
@@ -330,19 +364,28 @@ describe('R473 pure classified verdict', () => {
       'src/components/merge-button.ts:12', 'a/b/c-d-e-f-g.test.mjs:10:5', 'src/x.ts (lines 12-14, 20-22, 30-31)',
       // fix-6381 self-review: with no spaces, every span of a run was a candidate and these passed the bound.
       'src/a.ts:12:4,src/b.ts:13:5,src/c.ts:14:6', '(src/x.ts:12,src/y.ts:13,src/z.ts:14)', 'src/x.ts:12,src/y.ts:13,src/z.ts:14,src/w.ts:15'])(
-      'an ordinary unprotected report %j still ships', async file => {
+      'an ordinary report %j follows the strict grammar', async file => {
         for (const guardFloorPaths of [GUARDED, []]) {
-          expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths }))).verdict, String(guardFloorPaths))
-            .toBe('NOT WEAKENED');
+          const result = await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths }));
+          // R787: prose and multi-path reports are unparseable; these two clean path:line forms still ship.
+          if (['src/components/merge-button.ts:12', 'a/b/c-d-e-f-g.test.mjs:10:5'].includes(file)) {
+            expect(result.verdict).toBe('NOT WEAKENED');
+            expect(ids(result.ships)).toEqual(['f1']);
+            expect(result.blocks).toEqual([]);
+            expect(result.recheck).toEqual([]);
+          } else expectProtected(result);
         }
       });
-    // A glob holding a space makes the whole report one run (more cuts); a short ordinary report is still judged.
-    it.each(['src/a.ts:12', 'src/x.ts (lines 12-14)'])('%j still ships under a glob holding a space', async file => {
-      expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/a b.mjs'] }))).verdict)
-        .toBe('NOT WEAKENED');
+    it.each(['src/a.ts:12', 'src/x.ts (lines 12-14)'])('%j is judged under a valid custom glob', async file => {
+      const result = await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }));
+      if (file === 'src/a.ts:12') {
+        expect(result.verdict).toBe('NOT WEAKENED');
+        expect(ids(result.ships)).toEqual(['f1']);
+        expect(result.blocks).toEqual([]);
+        expect(result.recheck).toEqual([]);
+      } else expectProtected(result);
     });
-    // The spans between cuts grow with the square of the cuts, so a core cut more often than the candidate bound allows
-    // fails closed (protected, an operator-visible block), at bounded cost; one just under it is still judged.
+    // R787: punctuation and prose fail closed at bounded cost, regardless of the old candidate-cut count.
     it('a core with more cuts than the candidate bound fails closed at bounded cost', async () => {
       const started = Date.now();
       for (const file of [`other/${'a+'.repeat(40)}.mjs`, `other/${'+'.repeat(500)}x`, `other/x${'?'.repeat(400)}.mjs`]) {
@@ -350,15 +393,13 @@ describe('R473 pure classified verdict', () => {
         expect(r.verdict, file.slice(0, 20)).toBe('WEAKENED');
         expect(r.ships).toEqual([]);
       }
-      // Just under the cut bound in two runs: judged (nothing protected), at bounded cost.
+      // Even under the old cut bound, this prose report is unparseable and protected (R787).
       const worst = `src/${'a.b:'.repeat(8)} ${'c/d:'.repeat(8)}`;
-      expect((await compute([finding({ class: 'E2', file: worst })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
-        .toBe('NOT WEAKENED');
+      expectProtected(await compute([finding({ class: 'E2', file: worst })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED })));
       expect(Date.now() - started).toBeLessThan(5000);
     });
-    it.each(['other/a+b+c.mjs', 'other/x.mjs?plain=1#L4-L9'])('a report %j with a few cuts is still judged and ships', async file => {
-        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
-          .toBe('NOT WEAKENED');
+    it.each(['other/a+b+c.mjs', 'other/x.mjs?plain=1#L4-L9'])('an unparseable report %j with a few cuts remains protected (R787)', async file => {
+        expectProtected(await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED })));
       });
   });
   // PR #6381 judge: WE_PLATFORM_PREFERENCES_FILE replaced the whole platform chain, so a race path the default chain
@@ -608,7 +649,9 @@ describe('R473 pure classified verdict', () => {
       ['ab', 'a***b', true], ['a/b', 'a*b', false], ['a.b', 'a.b', true], ['axb', 'a.b', false], ['ab', 'a?b', false],
       ['a?b', 'a?b', true], ['a[x]', 'a[x]', true], ['ax', 'a[x]', false], ['a+', 'a+', true], ['aa', 'a+', false],
       ['x', '*', true], ['x/y', '*', false], ['x/y', '**', true], ['xZ', '**Z', true], ['x/Z', '*Z', false]]) {
-      expect(await isProtected(file, pattern), `${file} ~ ${pattern}`).toBe(want);
+      if (!validateProtectedPattern(pattern)) {
+        await expect(isProtected(file, pattern), `${file} ~ ${pattern}`).rejects.toThrow(/malformed protected pattern/);
+      } else expect(await isProtected(file, pattern), `${file} ~ ${pattern}`).toBe(want);
     }
   });
 
@@ -1074,14 +1117,25 @@ describe('R473 structured concurrency evidence', () => {
       expect((await compute([finding({ class: 'E2', file: `${'x/'.repeat(200)}output.mjs` })], options())).verdict).toBe('NOT WEAKENED');
     });
     it.each(['a/scripts/output.mjs', 'scripts/output.mjs:12', 'scripts/output.mjs#L12', 'scripts/output.mjs ', '`scripts/output.mjs`',
-      '+++ b/scripts/output.mjs', 'src/components/merge-button.ts',
-      // Quotes, brackets and a dash between words stay prose: they never refuse an unprotected report.
+      '+++ b/scripts/output.mjs', 'src/components/merge-button.ts'])(
+      'a clean unprotected path reported as %j still ships as debt', async file => {
+        const result = await compute([finding({ class: 'E2', file })], options());
+        expect(result.verdict).toBe('NOT WEAKENED');
+        expect(ids(result.ships)).toEqual(['f1']);
+        expect(result.blocks).toEqual([]);
+        expect(result.recheck).toEqual([]);
+      });
+    // R787 redesign: non-ASCII wrappers, prose and arrows are unparseable => PROTECTED.
+    it.each([
       `${String.fromCodePoint(0x2018)}scripts/output.mjs${String.fromCodePoint(0x2019)}`, `${String.fromCodePoint(0x201c)}scripts/output.mjs${String.fromCodePoint(0x201d)}`,
       `scripts/output.mjs ${String.fromCodePoint(0x2014)} line 12`, `scripts/output.mjs${String.fromCodePoint(0x2013)}12`, `${String.fromCodePoint(0x300c)}scripts/output.mjs${String.fromCodePoint(0x300d)}`,
       `scripts/output.mjs${String.fromCodePoint(0x3002)}`, `scripts/output.mjs ${String.fromCodePoint(0x7b2c)}42${String.fromCodePoint(0x884c)}`,
       `scripts/output.mjs ${String.fromCodePoint(0x2192)} scripts/other.mjs`])(
-      'an unprotected file reported as %j still ships as debt (the stripped forms add protection, never remove a path)', async file => {
-        expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('NOT WEAKENED');
+      'an unparseable report %j is WEAKENED and cannot ship', async file => {
+        const result = await compute([finding({ class: 'E2', file })], options());
+        neverShips(result);
+        expect(result.recheck).toEqual([expect.objectContaining({ id: 'f1', class: 'X2' })]);
+        expect(result.cards).toEqual([]);
       });
   });
 
