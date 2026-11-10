@@ -12,7 +12,8 @@ const scanAllowlist=(()=>{
     return data.entries;
   } catch {return [];}
 })();
-const allowedScanHit=(path,rule,span)=>scanAllowlist.some(entry=>entry.rule===rule
+let scanHasBom=false; // a leading BOM is stripped by decoding, so a listed line cannot be trusted
+const allowedScanHit=(path,rule,span)=>!scanHasBom&&scanAllowlist.some(entry=>entry.rule===rule
   &&Buffer.from(entry.path).equals(path)&&entry.sha256===sha(span));
 // Pin the complete physical line, excluding its CR/LF separator, including whitespace.
 function scanLine(text,index) {
@@ -183,6 +184,7 @@ function continuationLines(text,from,indent) {
 // excluded, so a run that needs it falls back to the Mac. Returns the first
 // finding or null when clean.
 export function credentialContentFinding(path,content) {
+  scanHasBom=content.length>=3&&content[0]===0xEF&&content[1]===0xBB&&content[2]===0xBF;
   // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
   // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
   const leaf=classifyManifestPath(path).names.at(-1);
@@ -218,8 +220,7 @@ export function credentialContentFinding(path,content) {
       if(!continuation)return `unbounded-continuation-${field}`;
       if(credentialNamed) {
         for(const line of [...continuation,continuation.join('')]) {
-          if(line.length>=20&&entropy(line)>=3.5&&!(testSource&&codeExpression(line))
-            &&!allowedScanHit(path,`high-entropy-${field}`,line))return `high-entropy-${field}`;
+          if(line.length>=20&&entropy(line)>=3.5&&!(testSource&&codeExpression(line)))return `high-entropy-${field}`;
         }
       }
     }

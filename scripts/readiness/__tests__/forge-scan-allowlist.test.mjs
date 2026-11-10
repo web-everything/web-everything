@@ -34,6 +34,10 @@ describe('reviewed Forge scan allowlist', () => {
     expect(scan(path, content.replace(span, changed))).not.toBeNull();
   });
 
+  it.each(cases)('catches $rule at $path when a UTF-8 BOM is prepended', ({ path, content }) => {
+    expect(credentialContentFinding(Buffer.from(path), Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(content)]))).not.toBeNull();
+  });
+
   it.each(cases)('catches the same $rule span at another path ($path)', ({ path, span }) => {
     expect(scan(`unlisted/${path}`, span)).not.toBeNull();
   });
