@@ -186,7 +186,7 @@ function isNonBlockingRedTeamGate(text) {
  * The carry writer's envelope (review-job.mjs): the carried marker, its fixed sentence, then optionally a non-blocking
  * advisory re-bound to the carried-to head (its "Head" label keeps the carried-from head). Anything else is a possible hold.
  */
-function isNonBlockingCarriedVerdict(text, comment) {
+function isNonBlockingCarriedVerdict(text, comment, shownHead = null) {
   if (comment === undefined || !isTrustedMarkerAuthor(comment)) return false;
   const carried = parseVerdictCarriedMarker(text);
   if (!carried) return false;
@@ -200,7 +200,17 @@ function isNonBlockingCarriedVerdict(text, comment) {
   if (!rest.startsWith('\n') || !rest.trimStart().startsWith(RED_TEAM_COMMENT_MARKER)) return false;
   rest = rest.trim();
   const parsed = parseRedTeamComment(rest);
-  return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, carried.fromSha.slice(0, 12));
+  return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, shownHead ?? carried.fromSha.slice(0, 12));
+}
+
+// Resolve exactly the gate's live policy. Unknown policy requires a fresh review.
+function liveRedTeamAdvisoryPlan(parsed) {
+  try {
+    // A missing policy retains defaults; an unreadable policy cannot prove this advisory is non-blocking.
+    const setting = readConfirmedBreaks({ strict: true })?.value;
+    if (parsed.findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return null;
+    return planRedTeamActions(parsed, setting);
+  } catch { return null; }
 }
 
 /** Validate the rendered envelope and every finding line: the shared evidence parser skips malformed lines. */
@@ -220,13 +230,8 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
     || lines[4] !== '') return false;
   if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.';
   if (lines.at(-2) !== '' || lines.at(-1) !== "A confirmed break is recorded as a miss for the accepting review and for the builder's model.") return false;
-  // Resolve exactly the gate's live policy: degraded (or any other class) can be configured for send-back.
-  // Unknown policy refuses the exemption; the existing later-verdict path requires a fresh review.
-  try {
-    const setting = readConfirmedBreaks()?.value;
-    if (findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return false;
-    if (planRedTeamActions(parsed, setting).sendBack.length) return false;
-  } catch { return false; }
+  const plan = liveRedTeamAdvisoryPlan(parsed);
+  if (!plan || plan.sendBack.length) return false;
   let count = 0;
   for (const line of lines.slice(5, -2)) {
     const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
@@ -254,7 +259,24 @@ export function isKnownMachineBody(body, comment = undefined) {
   // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
   if (isTrustedMarkerAuthor(comment)) {
     if (text.startsWith(RED_TEAM_GATE_MARKER)) {
-      return isNonBlockingRedTeamGate(text);
+      if (isNonBlockingRedTeamGate(text)) return true;
+      const gate = parseRedTeamGateMarker(text);
+      // The provenance parser also accepts standalone records for the rebase path.
+      // Here only the combined carried envelope extends the strict gate shape.
+      const carried = parseVerdictCarriedMarker(text);
+      if (!gate || gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || !carried || carried.toSha !== gate.rev) return false;
+      // The gate part (a bare marker line, or the strict full gate comment) then the strict carried envelope.
+      const cut = text.indexOf(buildVerdictCarriedMarker(carried));
+      if (cut < 0) return false;
+      const gatePart = text.slice(0, cut).trim();
+      const bare = redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds, gate.classCards);
+      if (gatePart !== bare && !isNonBlockingRedTeamGate(gatePart)) return false;
+      const envelope = text.slice(cut);
+      if (!envelope.includes(RED_TEAM_COMMENT_MARKER)) return false;
+      // Both producer shapes retain the strict finding sequence/completeness checks:
+      // the original displayed head, or the advisory rendered for the current head.
+      return isNonBlockingCarriedVerdict(envelope, comment)
+        || isNonBlockingCarriedVerdict(envelope, comment, gate.rev.slice(0, 12));
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
       const parsed = parseRedTeamComment(text);
