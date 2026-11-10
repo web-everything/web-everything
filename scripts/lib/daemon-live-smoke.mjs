@@ -397,8 +397,12 @@ const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?
 // listing, a config scrub). Live 2026-11-01: the detail showed "lane-33: reclaiming 127 … safe to drop" for an
 // acquire that actually failed on a lane-hold + busy pool, so the busy-pool classifier never saw "no free lane".
 export const lanePoolFailureLine = (e) => {
-  const reason = String(e?.stderr ?? '').split(/\r?\n/).filter((l) => l.startsWith('✗ ')).pop();
-  return reason && Number.isInteger(e?.status) ? `exited ${e.status}: ${reason.slice(2)}` : firstLine(e);
+  const lines = String(e?.stderr ?? '').split(/\r?\n/);
+  const reason = lines.filter(l => /UNPUSHED_WORK|^✗ /.test(l)).pop();
+  if (!reason) return firstLine(e);
+  const clean = reason.replace(/^✗ /, '').trim().replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+  const bounded = clean.length > 1000 ? `${clean.slice(0, 1000)}… (truncated)` : clean;
+  return Number.isInteger(e?.status) ? `exited ${e.status}: ${bounded}` : bounded;
 };
 
 async function checkLaneAcquireRelease(ctx) {
@@ -417,7 +421,7 @@ async function checkLaneAcquireRelease(ctx) {
     // #4139 — see {@link checkLanePoolList}'s own comment just above: `env` must reach every lane-pool child
     // this gate spawns, never just some of them, or an isolated caller's pool override is only PARTLY honored.
     const acquire = () => runChild('node', [
-      'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`,
+      'scripts/lane-pool.mjs', 'acquire', '--require-releasable', '--purpose=smoke', `--session=${sessionSlug}`,
       `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--json',
     ], {
       cwd: root, timeoutMs: acquireCapMs, env,
@@ -458,10 +462,18 @@ async function checkLaneAcquireRelease(ctx) {
     });
     return { ok: true, detail: `acquired + released lane-${laneNum}`, lane: laneNum };
   } catch (e) {
+    // Retry only the ordinary, guarded release; work appearing after admission must stay protected.
+    let cleanedUp = false;
+    try {
+      await runChild('node', ['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${sessionSlug}`], {
+        cwd: root, timeoutMs: budgets.laneReleaseMs, env,
+      });
+      cleanedUp = true;
+    } catch { /* no destructive override; the short lease TTL remains the backstop */ }
     // A stuck release still leaves a REAL lease held against the live pool — surfacing it as a gate failure
     // (never swallowed) is deliberate: a leaked smoke lease is exactly the kind of thing that should block
     // adopting the code that caused it, not just get logged and forgotten.
-    return { ok: false, detail: `acquired lane-${laneNum} but release failed (lease leaked — needs a hand release): ${firstLine(e)}`, lane: laneNum, ...childFailureDiagnostics(e) };
+    return { ok: false, detail: `acquired lane-${laneNum} but release failed (${cleanedUp ? 'session cleanup succeeded' : 'lease may remain — needs a hand release'}): ${lanePoolFailureLine(e)}`, lane: laneNum, ...childFailureDiagnostics(e) };
   }
 }
 
