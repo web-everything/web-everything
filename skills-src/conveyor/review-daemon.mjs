@@ -1931,12 +1931,13 @@ async function main() {
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged): a relevant PR event ends the sleep
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
-  // Keep the inner healthy-feed sleep within the outer local-wake polling slice.
-  const { stoppedReason } = await runDaemonLoop(
-    withReviewWake(withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
-      root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
-    }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()], healthyIntervalMs: 5_000 })),
-  );
+  // The local promotion wake only applies when the PR-event waker is off: with WE_PR_EVENTS on, that waker owns the sleep
+  // (a ready_for_review event wakes review itself), and stacking both would reset its minimum-gap timer.
+  const baseEffects = withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+    root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
+  });
+  const eventEffects = withPrEvents(baseEffects, { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] });
+  const { stoppedReason } = await runDaemonLoop(eventEffects === baseEffects ? withReviewWake(baseEffects) : eventEffects);
   if (!stopping) {
     console.error(`review-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });
