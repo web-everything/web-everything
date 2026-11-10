@@ -258,6 +258,8 @@ describe('remote client override', () => {
   });
 
   it('removing the clientPath setting leaves unrelated admission state untouched', async () => {
+    // Real provenance IO must not race its optional 100ms storage deadline on busy CI; timeout behaviour is covered by the stalled-provenance tests.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
     const platform = { cap: 3, fastSlots: 2, priority: { mode: 'off' },
       remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 2.5 } };
@@ -301,6 +303,8 @@ describe('remote client override', () => {
   });
 
   it('emits a remote-client-override event for distinct raw paths that sanitize identically with the same sha', async () => {
+    // Real provenance IO must not race its optional 100ms storage deadline on busy CI; timeout behaviour is covered by the stalled-provenance tests.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
     const firstPath = join(f.root, 'caf\u00e9', 'remote-exec.mjs');
     const secondPath = join(f.root, 'caf\u00e8', 'remote-exec.mjs');
@@ -328,6 +332,8 @@ describe('remote client override', () => {
   });
 
   it('emits fresh provenance for legacy state without pathKey even when path and sha match', async () => {
+    // Real provenance IO must not race its optional 100ms storage deadline on busy CI; timeout behaviour is covered by the stalled-provenance tests.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
     mkdirSync(dirname(f.state), { recursive: true });
