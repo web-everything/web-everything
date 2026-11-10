@@ -262,6 +262,12 @@ it('A4: every job CLI flag is named', () => {
   for (const [, flag] of source.matchAll(/flag\('([^']+)'\)/g)) expect(tests).toContain(`--${flag}`);
 });
 
+it('A4b: --expected-head is forwarded to the spawned job and parsed back as a flag', () => {
+  const source = readFileSync(new URL('../review-job.mjs', import.meta.url), 'utf8');
+  expect(source).toContain('`--expected-head=${expectedHead}`');
+  expect(source).toContain("flag('expected-head')");
+});
+
 it.each([false, true])('C: production payload preserves carry conflict unless an exact-head panel exists (exact=%s)', exact => {
   const f = fixture();
   expect(() => resumeRedTeamCarry({ repo, pr, head, loopPayload: { ...payload(), carriedFrom: 'b'.repeat(40) } }, {

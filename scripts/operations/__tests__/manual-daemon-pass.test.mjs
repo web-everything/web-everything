@@ -44,6 +44,68 @@ describe('manual-daemon-pass arguments', () => {
 });
 
 describe('manual-daemon-pass admission and audit', () => {
+  it.each(['review', 'red-team'])('refuses %s dispatch when the live head differs from expectedHead', async daemon => {
+    const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn();
+    const readHead = vi.fn(async () => 'b'.repeat(40));
+    await expect(dispatchManualPass({ ...input, daemon, expectedHead: sha }, {
+      readHead, load: async () => ({ dispatchReviewByMode, dispatchReviewJob }),
+    })).rejects.toThrow(/head.*changed/i);
+    expect(readHead).toHaveBeenCalledWith({ repo: input.repo, pr: input.pr });
+    expect(dispatchReviewByMode).not.toHaveBeenCalled();
+    expect(dispatchReviewJob).not.toHaveBeenCalled();
+  });
+  it.each(['review', 'red-team'])('dispatches %s only after reading a matching expectedHead through review-job IO', async daemon => {
+    const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn();
+    const liveHead = vi.fn(() => sha);
+    const createReviewJobIo = vi.fn(() => ({ liveHead }));
+    const env = {};
+    await dispatchManualPass({ ...input, daemon, expectedHead: sha }, {
+      env, load: async () => ({ dispatchReviewByMode, dispatchReviewJob, createReviewJobIo }),
+    });
+    const selected = daemon === 'red-team' ? dispatchReviewJob : dispatchReviewByMode;
+    expect(createReviewJobIo).toHaveBeenCalledWith({ env });
+    expect(liveHead).toHaveBeenCalledWith({ repo: input.repo, pr: input.pr });
+    expect(liveHead.mock.invocationCallOrder[0]).toBeLessThan(selected.mock.invocationCallOrder[0]);
+    expect(selected).toHaveBeenCalledTimes(1);
+    expect(selected).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env,
+      ...(daemon === 'red-team' ? { redTeamOnly: true, expectedHead: sha } : {}) });
+    expect(daemon === 'red-team' ? dispatchReviewByMode : dispatchReviewJob).not.toHaveBeenCalled();
+  });
+  it.each(['throws', undefined, null, '', 'not-a-head', 'a'.repeat(39), 'g'.repeat(40)])(
+    'refuses red-team dispatch when live head evidence is unreadable: %s', async head => {
+      const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn();
+      await expect(dispatchManualPass({ ...input, daemon: 'red-team', expectedHead: sha }, {
+        readHead: async () => { if (head === 'throws') throw new Error('read failed'); return head; },
+        load: async () => ({ dispatchReviewByMode, dispatchReviewJob }),
+      })).rejects.toThrow(/head.*unreadable/i);
+      expect(dispatchReviewByMode).not.toHaveBeenCalled();
+      expect(dispatchReviewJob).not.toHaveBeenCalled();
+    });
+  it.each(['fresh', 'resume'])('forwards red-team redTeamMode=%s to the job dispatch', async redTeamMode => {
+    const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn();
+    const env = {};
+    await dispatchManualPass({ ...input, daemon: 'red-team', expectedHead: sha, redTeamMode }, {
+      env, readHead: async () => sha, load: async () => ({ dispatchReviewByMode, dispatchReviewJob }),
+    });
+    expect(dispatchReviewJob).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env, redTeamOnly: true, expectedHead: sha, redTeamMode });
+  });
+  it.each([null, '', 'retry', 7])('refuses an unknown redTeamMode %s without reading or dispatching', async redTeamMode => {
+    const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn(), readHead = vi.fn();
+    await expect(dispatchManualPass({ ...input, daemon: 'red-team', expectedHead: sha, redTeamMode }, {
+      readHead, load: async () => ({ dispatchReviewByMode, dispatchReviewJob }),
+    })).rejects.toThrow(/invalid redTeamMode/);
+    expect(readHead).not.toHaveBeenCalled();
+    expect(dispatchReviewJob).not.toHaveBeenCalled();
+  });
+  it.each([null, '', 7, 'a'.repeat(41), 'g'.repeat(40)])('refuses malformed expectedHead %s without reading or dispatching', async expectedHead => {
+    const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn(), readHead = vi.fn();
+    await expect(dispatchManualPass({ ...input, daemon: 'red-team', expectedHead }, {
+      readHead, load: async () => ({ dispatchReviewByMode, dispatchReviewJob }),
+    })).rejects.toThrow(/invalid expectedHead/);
+    expect(readHead).not.toHaveBeenCalled();
+    expect(dispatchReviewByMode).not.toHaveBeenCalled();
+    expect(dispatchReviewJob).not.toHaveBeenCalled();
+  });
   it('reads the real current checkout HEAD and appends its event through the real filesystem', async () => {
     await withRealRepo(async ({ root, tmp, head }) => {
       const path = join(tmp, 'handoff', 'daemon-events.jsonl');

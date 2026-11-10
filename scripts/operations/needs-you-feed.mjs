@@ -15,7 +15,7 @@ import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
-import { resolveStallSweepSettings } from '../conveyor/pr-stall-sweep.mjs';
+import { resolveStallSweepSettings } from '../conveyor/pr-stall-settings.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 
