@@ -2292,7 +2292,7 @@ function scrubClaimedLaneConfig(dir, reason) {
   return removed.length ? undefined : dietConfig;
 }
 
-function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructiveStep = () => {} } = {}) {
+function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructiveStep = () => {}, beforeReset = () => {} } = {}) {
   const dir = laneDir(repo, chosen);
   const dietConfig = scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
@@ -2377,6 +2377,9 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     // auto-pick restores the claim and moves to the next lane; `--force` does not override it.
     const held = laneHoldRefuses(dir, 'reset', { unpushed: before.unpushed ?? undefined });
     if (held) throw Object.assign(new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`), { laneHoldRefusal: true });
+    // Acquire's all-branches/HEAD/stash unpushed-work guard runs here, AFTER the #2924 fresh-fetch re-verify and
+    // the hold rule, so those older refusals keep their own wording and fetch evidence; THROWS like them.
+    beforeReset();
     acquireResetSnapshots.set(chosen, before);
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
     beforeDestructiveStep();
@@ -2746,8 +2749,6 @@ async function cmdAcquire(repo) {
           // Probe before --no-reset's safety check too: otherwise unreadable history is merely refused
           // there and retried on every acquire instead of being persistently quarantined.
           requireReadableLaneHistory(repo, pick);
-          const work = acquireBlockingWork(repo, laneDir(repo, pick));
-          if (work.commits !== '') throw new Error(`lane-${pick} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
           // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
@@ -2758,7 +2759,7 @@ async function cmdAcquire(repo) {
             const doa = effectiveDirtyOrAhead(laneDir(repo, pick), repo.branch, noResetRemoteShas);
             if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
           }
-          provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
+          provisionClaimedLane(repo, pick, false, { beforeReset: () => assertNoUnpushedLaneWork(repo, pick) }); // auto-pick never targets a reserved lane
           chosen = pick;
           break;
         } catch (e) {
@@ -2900,11 +2901,7 @@ async function cmdAcquire(repo) {
   if (flags.lane !== undefined) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
-      if (!targetWasReserved) {
-        const work = acquireBlockingWork(repo, dir);
-        if (work.commits !== '') throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
-      }
-      provisionClaimedLane(repo, chosen, targetWasReserved);
+      provisionClaimedLane(repo, chosen, targetWasReserved, { beforeReset: () => assertNoUnpushedLaneWork(repo, chosen) });
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
       fail(e && e.message ? e.message : String(e));
@@ -3199,6 +3196,14 @@ function acquireBlockingWork(repo, dir) {
   }
   const left = work.commits.split('\n').filter(sha => sha && real.has(sha));
   return { ...work, commits: left.join('\n') };
+}
+
+/** Acquire's pre-reset refusal: all-branches/HEAD/stash tips must be provably on origin (or patch-equivalent).
+ *  `--force` is the documented operator override, exactly as for the #2924 containment re-verify. */
+function assertNoUnpushedLaneWork(repo, chosen) {
+  if (flags.force) return;
+  const work = acquireBlockingWork(repo, laneDir(repo, chosen));
+  if (work.commits !== '') throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually (or --force to discard)`);
 }
 
 /** Park abandoned commits on the canonical remote before recycling a free lane. An exclusive lease spans
@@ -5451,7 +5456,10 @@ async function recoverRepoPool(repo, lanes = classifyLaneNames(readdirSync(repo.
   return result;
 }
 async function cmdGc(repo) {
-  const salvage = async () => { try { return await salvageUnpushed(repo, { dryRun: !!flags['dry-run'] }); } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
+  // A lane whose salvage is refused is KEPT and logged + journaled loud (salvageUnpushed), and the gc recovery
+  // below still handles it by its own preservation path — so a per-lane refusal must not flip gc's exit status
+  // (gc exited 0 before salvage joined it). A thrown error (bad flags) still fails the run.
+  const salvage = async () => { try { const prior = process.exitCode; const ok = await salvageUnpushed(repo, { dryRun: !!flags['dry-run'] }); process.exitCode = prior; return ok; } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
   const heal = () => { try { healSiblings(repo); } catch (e) { log(`heal-siblings skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); } };
   const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
   const recover = async () => {
