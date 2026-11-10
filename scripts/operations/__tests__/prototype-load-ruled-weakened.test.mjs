@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { readyEvidence } from '../prototype-load.mjs';
+import { readyEvidence, mergeRuledWeakened } from '../prototype-load.mjs';
 
 const REF = 'lane/example-fix';
 const SHA = 'a'.repeat(40);
@@ -69,5 +69,29 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/verify-forge-route', '2b6ac7d67b5e4fc1b7137c6d7e59d202eb45a41b', 'R396'],
     ]);
     for (const e of shipped.ruledWeakened) { expect(e.sha).toMatch(/^[a-f0-9]{40}$/); expect(e.findings.length).toBeGreaterThan(0); }
+  });
+});
+
+describe('ruledWeakened union of platform and tool layers', () => {
+  it('takes platform-only entries and lets a matching record load, naming the layer', () => {
+    const merged = mergeRuledWeakened([entry()], []);
+    expect(merged).toHaveLength(1);
+    expect(readyEvidence([record()], input, merged)).toMatchObject({ ruledWeakened: { ruling: 'R396', layer: 'platform' } });
+  });
+  it('keeps tool entries and unions both, de-duplicated by ref+sha+ruling (tool wins)', () => {
+    const other = entry({ ref: 'lane/other', ruling: 'R7' });
+    const merged = mergeRuledWeakened([entry(), other], [entry()]);
+    expect(merged.map((e) => [e.ref, e.layer])).toEqual([[REF, 'tool'], ['lane/other', 'platform']]);
+    expect(readyEvidence([record()], input, merged)).toMatchObject({ ruledWeakened: { layer: 'tool' } });
+  });
+  it('ignores malformed platform entries with a warning', () => {
+    const warnings = [];
+    const bad = [entry({ sha: 'abc' }), entry({ ruling: 'R1+R2' }), entry({ findings: [] }), entry({ ref: '' }), null, 'x'];
+    expect(mergeRuledWeakened(bad, [], (m) => warnings.push(m))).toEqual([]);
+    expect(warnings).toHaveLength(bad.length);
+    expect(readyEvidence([record()], input, mergeRuledWeakened(bad, []))).toBeNull();
+  });
+  it('tolerates non-array layers', () => {
+    expect(mergeRuledWeakened(undefined, 'x')).toEqual([]);
   });
 });
