@@ -86,6 +86,9 @@ beforeAll(() => {
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/lane/seed'], referenceDir);
   git(['update-ref', 'refs/heads/trunk', 'refs/heads/lane/seed'], originDir);
+  // The pool's primary checkout (a sibling of the reference): `release --pool=waitms` proves lane work against that
+  // primary's canonical origin and refuses when it cannot resolve one.
+  git(['clone', '--quiet', '--branch=trunk', originDir, join(fixtureRoot, 'waitms')]);
   sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
 });
 
@@ -109,6 +112,8 @@ const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, 
 function scheduleRelease(delayMs) {
   const sleepSec = (delayMs / 1000).toFixed(3);
   spawn('sh', ['-c', `sleep ${sleepSec} && node "${SCRIPT}" release --pool=waitms --lane=1 --session=holder`], {
+    // From the reference checkout, so --pool=waitms resolves its sibling primary (and so its canonical origin).
+    cwd: referenceDir,
     env: withGhStub({ ...process.env, LANE_POOL_NO_RECOVER: '1', LANE_POOL_ROOT: poolRoot }),
     stdio: 'ignore',
     detached: true,
