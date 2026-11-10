@@ -271,6 +271,12 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
       );
     }
     if (entry.status === 'pending' && !entry.idempotent) {
+      const sink = lookup(entry.type);
+      if (typeof sink.provablyNotApplied === 'function' && sink.provablyNotApplied(entry) === true) {
+        run = withEntry(run, entry.key, { ...entry, status: 'failed' });
+        store.write(run);
+        continue;
+      }
       throw new Error(
         `operations: effect ${entry.key} (${entry.type}) was attempted and its outcome is UNKNOWN — it is not declared ` +
         'idempotent, so replaying it could double-apply. Refusing. Resolve it by hand (mark the entry `applied` or ' +
