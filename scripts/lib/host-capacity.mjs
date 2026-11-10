@@ -110,16 +110,16 @@ export function readCapacity({ settings, env = process.env, root,
     if (!Number.isFinite(at)) throw Error('invalid clock');
     const rows = history({ root, env, readFile });
     if (!Array.isArray(rows)) throw Error('invalid sampler history');
-    // Filter to the window FIRST (unparsable timestamps cannot be placed, so they are dropped);
-    // only rows inside the window are validated. An invalid in-window row still holds admission.
+    // Filter to the window FIRST; only rows inside it are validated. History is chronological, so a row whose
+    // time cannot be placed is outside the window only if it precedes the first in-window row; otherwise it holds.
     const since = at - settings.windowSec * 1000;
-    const parsed = rows.map(row => ({ row, time: Date.parse(row?.sampledAt) }))
-      .filter(({ time }) => Number.isFinite(time) && time >= since || time > at)
-      .map(({ row, time }) => {
-        const idle = row?.cpu?.idlePct;
-        if (time > at || !validIdle(idle)) throw Error('invalid sampler reading');
-        return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
-      });
+    const timed = rows.map(row => ({ row, time: Date.parse(row?.sampledAt) }));
+    const first = timed.findIndex(({ time }) => Number.isFinite(time) && time >= since);
+    const parsed = first < 0 ? [] : timed.slice(first).map(({ row, time }) => {
+      const idle = row?.cpu?.idlePct;
+      if (!Number.isFinite(time) || time > at || !validIdle(idle)) throw Error('invalid sampler reading');
+      return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
+    });
     const window = parsed;
     const newest = window.at(-1);
     if (window.length < 3
