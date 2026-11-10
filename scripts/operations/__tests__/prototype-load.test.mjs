@@ -2788,7 +2788,7 @@ describe('refuse-only safety properties P1–P9', () => {
       const f = auditedFixture('refuse', { ready: auditLines([weak]), settings: { ruledWeakened: [ruled] },
         audits: auditLines([{ ...canonicalWeak, findings }]), auditBaseInMain: TREE });
       const out = await f.run();
-      expect(out.gate.ruledWeakened).toEqual({ ruling: 'R787', findings: weak.auditDisclosed });
+      expect(out.gate.ruledWeakened).toEqual({ ruling: 'R787', findings: weak.auditDisclosed, layer: 'tool' });
       expect(out.ok).toBe(findings[0] === 'guard removed');
       if (!out.ok) { expect(out.stopReason).toBe('no-canonical-audit'); expect(mutations(f, 'add')).toHaveLength(0); }
     }

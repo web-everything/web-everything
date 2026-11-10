@@ -226,3 +226,21 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
 
 /** Test seam: forget what was logged. @test-only-export-ok */
 export function resetCascadeLogForTest() { logged.clear(); }
+
+/** Card naming policy (#6121). Shadow keeps the current rename path authoritative. */
+export function resolveCardNumbering({ env = process.env, readFile = readFileSync, tool, platform, log } = {}) {
+  if (tool === undefined) {
+    try { tool = JSON.parse(readFile(join(HERE, '../settings/card-numbering.json'), 'utf8'))?.backlog?.cardNumbering; }
+    catch { tool = {}; }
+  }
+  return cascadePolicy('backlog.cardNumbering', tool, {
+    standard: { mode: 'rename-after-land', ledgerAuth: 'none', shadow: true, readMaxBytes: 8 * 1024 * 1024, historyBudget: 256 },
+    platform, env, log,
+    envValues: { mode: env.WE_CARD_NUMBERING_MODE, ledgerAuth: env.WE_CARD_LEDGER_AUTH,
+      shadow: env.WE_CARD_LEDGER_SHADOW === undefined ? undefined : ({ true: true, false: false, '1': true, '0': false })[env.WE_CARD_LEDGER_SHADOW] ?? env.WE_CARD_LEDGER_SHADOW },
+    valid: { mode: v => ['rename-before-enqueue', 'rename-after-land', 'ledger-only'].includes(v),
+      ledgerAuth: v => ['none', 'signed'].includes(v), shadow: v => typeof v === 'boolean',
+      readMaxBytes: v => Number.isSafeInteger(v) && v > 0 && v <= 64 * 1024 * 1024,
+      historyBudget: v => Number.isSafeInteger(v) && v > 0 && v <= 4096 },
+  });
+}

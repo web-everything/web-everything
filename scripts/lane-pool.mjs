@@ -77,7 +77,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync, openSync, closeSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
@@ -717,6 +717,74 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
 function ensureRepoSiblings(repo, opts = {}) {
   if (!PORT_BANDS[repo.name]) return; // not the WE pool → no unconditional sibling dependency
   for (const name of SIBLING_REPO_NAMES) ensureOneSibling(repo, name, opts);
+}
+
+// ── heal-siblings (R817) — Forge's remote-exec needs ../frontierui next to every lane ───────────────────
+// Self-heal for the constellation siblings, run by the `gc` tick (and by hand: `heal-siblings [--dry-run]`).
+// It acts ONLY on: (1) a pool-root sibling that is ABSENT or a DANGLING symlink → the existing
+// ensureRepoSiblings/ensureOneSibling path recreates a real clone; (2) a DANGLING symlink at
+// <primary sibling>/<name> (e.g. ~/workspace/frontierui/frontierui) → removed (symlink only; rmSync on a
+// symlink never follows it). A live symlink, a real dir/file, a dirty clone and an untracked `.claude/` are
+// never touched. A lock file bounds concurrent/slow runs: a held, non-stale lock means "skip this tick".
+const HEAL_LOCK_STALE_MS = 15 * 60 * 1000;
+
+function lstatOrNull(p) {
+  try { return lstatSync(p); } catch { return null; }
+}
+
+function planSiblingHeal(repo) {
+  const plan = { removeDangling: [], recreate: [] };
+  for (const name of SIBLING_REPO_NAMES) {
+    const link = join(primarySiblingPath(repo, name), name);
+    const l = lstatOrNull(link);
+    if (l && l.isSymbolicLink() && !existsSync(link)) plan.removeDangling.push(link);
+    const dest = join(repo.poolDir, name);
+    const d = lstatOrNull(dest);
+    if (!d || (d.isSymbolicLink() && !existsSync(dest))) plan.recreate.push(name);
+  }
+  return plan;
+}
+
+function takeHealLock(repo) {
+  const lock = join(repo.poolDir, '.heal-siblings.lock');
+  const st = lstatOrNull(lock);
+  if (st && Date.now() - st.mtimeMs > HEAL_LOCK_STALE_MS) rmSync(lock, { force: true });
+  try {
+    closeSync(openSync(lock, 'wx'));
+    return lock;
+  } catch {
+    return null;
+  }
+}
+
+function healSiblings(repo, { dryRun = false } = {}) {
+  if (!PORT_BANDS[repo.name]) return { skipped: 'not-we-pool' };
+  const plan = planSiblingHeal(repo);
+  if (!plan.removeDangling.length && !plan.recreate.length) return { plan, changed: false };
+  log(`heal-siblings${dryRun ? ' (dry run)' : ''}: remove dangling symlink(s) [${plan.removeDangling.join(', ') || 'none'}]; recreate pool sibling(s) [${plan.recreate.map((n) => join(repo.poolDir, n)).join(', ') || 'none'}]`);
+  if (dryRun) return { plan, changed: false, dryRun: true };
+  mkdirSync(repo.poolDir, { recursive: true });
+  const lock = takeHealLock(repo);
+  if (!lock) {
+    log('heal-siblings: another heal is in flight (lock held) — skipping this pass');
+    return { plan, changed: false, skipped: 'lock-held' };
+  }
+  try {
+    for (const link of plan.removeDangling) {
+      const now = lstatOrNull(link);
+      if (!now || !now.isSymbolicLink() || existsSync(link)) continue; // changed since planning → leave it
+      rmSync(link, { force: true });
+      log(`heal-siblings: removed dangling symlink ${link}`);
+    }
+    for (const name of plan.recreate) ensureOneSibling(repo, name);
+  } finally {
+    try { unlinkSync(lock); } catch { /* already gone */ }
+  }
+  return { plan, changed: true };
+}
+
+function cmdHealSiblings(repo) {
+  healSiblings(repo, { dryRun: !!flags['dry-run'] });
 }
 
 // ── lane-ports registry (#2139) — item → lane page-port mapping for the main-checkout proxy ─────────
@@ -1478,6 +1546,85 @@ function refreshLane(repo, n, { force = false } = {}) {
  * @param {number} n
  * @param {{leasedOnly?: boolean}} [opts]
  */
+// History quarantine is metadata only: never move/delete the clone, and never gate release/reap on it.
+const historyQuarantinePath = (repo, n) => join(repo.poolDir, '.quarantine-state', `lane-${n}.json`);
+function historyQuarantine(repo, n) {
+  const file = historyQuarantinePath(repo, n);
+  try {
+    const record = JSON.parse(readFileSync(file, 'utf8'));
+    if (typeof record.reason !== 'string' || !record.reason) throw new Error('missing reason');
+    return record;
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    return { reason: 'history quarantine record unreadable; inspect it manually' };
+  }
+}
+
+// Fail-closed: any read error other than ENOENT (EACCES, ENOTDIR, bad JSON) still counts as quarantined.
+const isHistoryQuarantined = (repo, n) => historyQuarantine(repo, n) !== null;
+
+// Use release's honest-history environment and traversal, but no remote proof/fetch: this is readability,
+// not a pushed-work verdict. All local branch/stash tips are walked (without exclusions), so an origin
+// tip cannot hide a missing ancestor. git() bounds time/output; hitting either bound fails closed too.
+function probeLaneHistory(dir) {
+  // GIT_SHALLOW_FILE=/dev/null: a .git/shallow boundary must not mask a missing ancestor (a shallow lane fails closed here).
+  const read = (args, opts = {}) => git(args, dir, { ...opts, env: { ...releaseEvidenceEnv(args), GIT_SHALLOW_FILE: '/dev/null' } });
+  read(['rev-list', '--max-count=200', 'HEAD']);
+  // One for-each-ref covers branches AND the stash (acquire's auto-pick pays this probe per picked lane, and
+  // the spawn-count ceilings in lane-pool-ahead-provably-pushed-single-spawn / lane-pool-acquire-free-list
+  // bound it). HEAD itself is fed to the batch check by name, so an unborn/unresolvable HEAD reads as
+  // "HEAD missing" (not a commit) and fails closed without a separate rev-parse spawn.
+  const refs = read(['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads/', 'refs/stash'])
+    .split('\n').filter(Boolean).map(line => line.split(' '));
+  const stash = refs.filter(([, name]) => name === 'refs/stash').map(([sha]) => sha);
+  const reflog = stash.length ? read(['reflog', 'show', '--format=%H', 'refs/stash', '--']) : '';
+  const tips = ['HEAD', ...refs.map(([sha]) => sha), ...reflog.split('\n')].filter(Boolean);
+  const input = tips.map(sha => `${sha}\n`).join('');
+  const opts = { stdio: ['pipe', 'pipe', 'pipe'], input };
+  const present = read(['cat-file', '--batch-check=%(objectname) %(objecttype)'], opts).split('\n');
+  if (present.length !== tips.length || !present.every(line => / commit$/.test(line))) {
+    throw new Error('local history tip missing or not a commit');
+  }
+  read(['rev-list', '--ignore-missing', '--stdin'], opts);
+}
+
+function requireReadableLaneHistory(repo, n, { allowRepair = !flags['no-reset'] } = {}) {
+  const dir = laneDir(repo, n);
+  let firstError;
+  // Exactly one retry, including timeouts/output-limit errors. Preserve the initial diagnostic.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { probeLaneHistory(dir); return; } catch (e) {
+      firstError ??= msgOf(e).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 2000);
+    }
+    if (attempt === 0) {
+      const sha = tryGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
+      const evidence = {
+        lane: n, at: new Date().toISOString(), firstError,
+        head: tryGit(['symbolic-ref', '-q', 'HEAD'], dir) || 'HEAD', sha,
+        refs: tryGit(['for-each-ref', '--format=%(objectname) %(refname)'], dir),
+      };
+      // Keep evidence outside the clone (it may be re-cloned), separate from the active quarantine.
+      // Flush BEFORE any repair; a failed evidence write refuses acquisition without healing anything.
+      mkdirSync(join(repo.poolDir, '.quarantine-state'), { recursive: true });
+      writeFileSync(historyQuarantinePath(repo, n).replace(/\.json$/, '.evidence.jsonl'),
+        JSON.stringify(evidence) + '\n', { flag: 'a', flush: true });
+      if (allowRepair) {
+        healLaneRefs(dir, { log });
+        // A missing HEAD object already used the corrupt-clone recovery path before this gate.
+        // A present tip with missing ancestors must instead fail the second honest-history probe.
+        if (sha && tryGit(['cat-file', '-e', `${sha}^{commit}`], dir) === null) {
+          recloneLane(repo, n, `HEAD ${sha} missing or not a commit; ${firstError}`);
+        }
+      }
+    }
+  }
+  const file = historyQuarantinePath(repo, n);
+  const reason = `history unreadable after two probes: ${firstError}`;
+  mkdirSync(join(repo.poolDir, '.quarantine-state'), { recursive: true });
+  writeFileSync(file, JSON.stringify({ lane: n, reason, at: new Date().toISOString(), firstError }) + '\n');
+  throw new Error(`lane-${n} QUARANTINED: ${reason}; inspect/repair history (or probe limits), then remove ${file} manually`);
+}
+
 function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, path: dir, exists: false };
@@ -1486,6 +1633,12 @@ function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
   // #2275 — surface the hold so a picker can filter (and a human sees who owns a lane). `leased` is only
   // true for a LIVE lease; a stale marker reads as free (reclaimable), matching acquire's own logic.
   const leased = lease ? !isLeaseStale(lease, Date.now(), ttlMsFromFlags()) : false;
+  const quarantine = historyQuarantine(repo, n);
+  if (quarantine) return {
+    lane: n, path: dir, exists: true, deps: depsReady(dir), lease: lease || null, leased,
+    ...(readError ? { readError } : {}), status: 'QUARANTINED', reason: quarantine.reason,
+    recovery: `Inspect/repair history (or probe limits), then remove ${historyQuarantinePath(repo, n)} manually`,
+  };
   if (leasedOnly && !leased) {
     return {
       lane: n,
@@ -1552,6 +1705,8 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, exists: false };
   const lease = readLease(dir);
+  // A history-quarantined lane is never acquirable (acquire would refuse it), so it must not be advertised either.
+  if (isHistoryQuarantined(repo, n)) return { lane: n, exists: false, quarantined: true };
   if (leaseDisqualifiesAcquire(lease, nowMs, ttlMs)) return { lane: n, exists: true, lease, dirtyOrAhead: null };
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
@@ -2328,6 +2483,8 @@ async function cmdAcquire(repo) {
     const n = Number(flags.lane);
     const dir = laneDir(repo, n);
     if (!existsSync(dir)) fail(`lane-${n} does not exist (${dir})`);
+    const quarantine = historyQuarantine(repo, n);
+    if (quarantine) fail(`lane-${n} QUARANTINED: ${quarantine.reason}; inspect/repair history (or probe limits), then remove ${historyQuarantinePath(repo, n)} manually`);
     // #2350 — a RESERVED lane is off-limits to an ordinary acquire, INCLUDING the OWNING session's own plain
     // re-acquire. Without this pre-claim guard, `tryClaimLane`'s `leaseOwnedBy` self-refresh would rewrite the
     // marker as an ordinary (non-reserved) lease and then the reset path below would `reset --hard` the lane —
@@ -2568,7 +2725,7 @@ async function cmdAcquire(repo) {
       }
       const pickable = candidateDirs
         .map((d) => Number(basename(d).slice(5)))
-        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane)
+        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
         .sort((a, b) => a - b);
       for (const pick of pickable) {
         const claimed = tryClaimLane(laneDir(repo, pick), session, Date.now(), ttlMs);
@@ -2583,6 +2740,9 @@ async function cmdAcquire(repo) {
         // blip, the #2924 re-verify, a bad `--base`, an npm hiccup) — none of which are reasons to give up on
         // every OTHER candidate this pool might still offer.
         try {
+          // Probe before --no-reset's safety check too: otherwise unreadable history is merely refused
+          // there and retried on every acquire instead of being persistently quarantined.
+          requireReadableLaneHistory(repo, pick);
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
           // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
@@ -2734,6 +2894,7 @@ async function cmdAcquire(repo) {
   // would silently re-run `fetchOriginPruneWithRetry`/`checkout -B`/`ensureDeps` a second time for no reason.
   if (flags.lane !== undefined) {
     try {
+      requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       provisionClaimedLane(repo, chosen, targetWasReserved);
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
@@ -3446,6 +3607,11 @@ function printStatus(repo) {
   }
   log(`pool "${repo.name}" @ ${repo.poolDir} (integration branch: origin/${repo.branch})${leasedOnly ? ' — leased-only (git-probed rows below only)' : ''}`);
   for (const r of rows) {
+    if (r.status === 'QUARANTINED') {
+      log(`  lane-${r.lane}: QUARANTINED · ${r.reason}${r.leased ? ` · ${describeLease(r.lease)}` : ''}`);
+      log(`    ${r.recovery}`);
+      continue;
+    }
     if (leasedOnly && !r.leased) {
       log(`  lane-${r.lane}: (unleased — skipped, --leased-only) · deps ${r.deps}`);
       continue;
@@ -4009,9 +4175,9 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
         if (limit !== null && out.length >= limit) break; // #xn432dz --limit: stop once N are found
       }
     }
-    return out.map((n) => laneDir(repo, n));
+    return out.filter((n) => !isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n));
   } catch (e) {
-    if (e && e.partialScan) return out.map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
+    if (e && e.partialScan) return out.filter((n) => !isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
     throw e;
   } finally {
     scanDeadlineMs = null;
@@ -4036,7 +4202,13 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
 // holder's scan actually finished or the lock's OWN (far larger) staleness grace elapsed — 3.4x its wait in the
 // worst observed case. `null` (the default, e.g. `list --acquirable`'s own direct callers) reproduces the
 // prior behavior exactly: no caller-side bound, only the scan/lock's own.
-function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
+// A quarantine record can land after a list was cached, so every answer (cache hit or fresh) is re-filtered.
+function acquirableListCached(repo, opts) {
+  const paths = acquirableListCachedRaw(repo, opts); // may wait on a scan lock: snapshot records AFTER it returns
+  const quarantined = new Set(existingLanes(repo).filter((n) => isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)));
+  return quarantined.size ? paths.filter((p) => !quarantined.has(p)) : paths;
+}
+function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
   const hit = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
   if (hit) return slice(hit);
@@ -5160,6 +5332,7 @@ async function recoverRepoPool(repo, lanes = classifyLaneNames(readdirSync(repo.
   return result;
 }
 async function cmdGc(repo) {
+  const heal = () => { try { healSiblings(repo); } catch (e) { log(`heal-siblings skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); } };
   const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
   const recover = async () => {
     if (!recoveryEnabled()) return;
@@ -5169,11 +5342,12 @@ async function cmdGc(repo) {
     }
     try { await recoverRepoPool(repo); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   };
-  if (!flags.watch) { const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
+  if (!flags.watch) { heal(); const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
   const tick = async () => {
     let interval = 60000; // unreadable policy refuses the pass, then retries policy later
     try {
       interval = loadHostOverloadSettings({ log }).settings.lanes.gc.schedule;
+      heal();
       const result = pass();
       if (result.ran) await recover();
     } catch (e) { log(`gc skipped: ${e.message}`); }
@@ -5188,6 +5362,7 @@ async function cmdGc(repo) {
 const COMMANDS = {
   // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
   gc: cmdGc,
+  'heal-siblings': cmdHealSiblings,
   provision: cmdProvision,
   refresh: cmdRefresh,
   status: printStatus,
@@ -5207,11 +5382,12 @@ const COMMANDS = {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
-    'usage: lane-pool.mjs <gc|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
+    'usage: lane-pool.mjs <gc|heal-siblings|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
       '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
+      '  # heal-siblings [--dry-run] (R817): recreate an absent/dangling pool-root frontierui/plateau-app clone and remove only a dangling symlink at <primary>/<name>; gc calls it each pass\n' +
       '  # gc/acquire auto-recover backed-up lanes; disable with LANE_POOL_AUTO_RECOVER=0 or LANE_POOL_NO_RECOVER=1\n' +
       '  # status --leased-only (#4345): skip git for every unleased lane, keep the full probe only for leased ones\n' +
       '  # acquire (auto-pick, no --lane): on a full pool, grows it by up to --growth-max-new=N new lanes (default 4, env ' +

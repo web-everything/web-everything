@@ -114,7 +114,7 @@ describe('admission import boundary', () => {
     let now = Date.parse('2026-01-01T12:00:00.000Z');
     // The bundled client refuses this command before any external IO. Do not replace its loader with a mock.
     expect(await createRemoteExec({ policy })({ argv: ['not-an-allowed-heavy-command'], clock: () => now++ })).toEqual({
-      mode: 'not-started', terminated: true, reason: 'command-not-allowed',
+      mode: 'not-started', terminated: true, reason: 'command-not-allowed', detail: 'other',
       timings: [{ stage: 'total', startedAtET: '2026-01-01T07:00:00.000-05:00', ms: 1 }],
     });
   });

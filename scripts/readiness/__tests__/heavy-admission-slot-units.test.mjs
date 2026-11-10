@@ -277,3 +277,13 @@ describe('R324 elastic remote slot units',()=>{
     expect(()=>elasticRunLimits(limits('12G','garbage'),1,2)).toThrow('Slot units exceed parent memory limit'); // unreadable ceiling fails closed
   });
 });
+
+describe('non-elastic kinds never need telemetry (remote-slot-unreadable race)',()=>{
+  const policy=resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',maxConcurrent:4}}});
+  it.each(['files','selected','build','other','verify'])('%s runs on one unit when telemetry was just rewritten as null',kind=>{
+    expect(resolveRemoteSlotUnits({policy,kind,telemetry:null})).toEqual({units:1,source:'default'});
+  });
+  it('an elastic kind still refuses unreadable telemetry',()=>{
+    expect(()=>resolveRemoteSlotUnits({policy,kind:'FULL',telemetry:null})).toThrow('Unreadable run count');
+  });
+});

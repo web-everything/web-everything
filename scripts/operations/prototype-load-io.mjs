@@ -21,7 +21,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -207,7 +207,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}) => layer;
   const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
     platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
-  const config = policy.value;
+  // ruledWeakened is the union of platform and tool layers (arrays are cascade leaves, so the tool layer would replace it).
+  const config = { ...policy.value, ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, (m) => console.warn(m)) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
   // Preserve a stricter caller policy without forwarding overrides that could weaken file policy.
@@ -471,7 +472,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         { ruledWeakened: out.gate }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
-      if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED. Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
+      if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildMissingRunCandidates, buildMissingRunComment, isStalledPartialRollup } from '../main-red-recovery.mjs';
-import { sweepMissingRunRecovery, triggerCiForPr } from '../ci-red-recovery-watch.mjs';
+import { defaultReadHeadRuns, sweepMissingRunRecovery, triggerCiForPr } from '../ci-red-recovery-watch.mjs';
 
 vi.mock('../../lib/gh-throttle.mjs', async original => ({
   ...await original(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected live IO'); }),
@@ -26,6 +26,99 @@ const candidates = value => buildMissingRunCandidates([value], {
 });
 
 describe('required ruleset context startup failures use missing-run push recovery', () => {
+  it.each([
+    ['startup_failure dispatches', [run()], true],
+    ['plain-absent stays refused', [], false],
+    ['unreadable runs stay refused', null, false],
+    ['startup_failure stays per-SHA capped', [run()], false, 2],
+  ])('reads head runs when the PR-wide cap is exhausted: %s', (_, runs, allowed, currentAttempts = 0) => {
+    // Match the open-PR listing: no merge-gate row or workflowRuns field.
+    const value = pr([]);
+    delete value.workflowRuns;
+    const readHeadRuns = vi.fn(() => runs);
+    const trigger = vi.fn(() => ({ ok: true }));
+    const result = sweepMissingRunRecovery({
+      repo: REPO, apply: true, mainRuns: [], now: Date.parse('2026-11-09T12:00:00Z'),
+      readOpenPrs: () => [value], readRequiredContexts: () => CLASSIC, readAttributedRequiredChecks: () => REQUIRED,
+      readHeadRuns, readPush: () => null, readHeadCommittedAt: () => '2026-11-08T00:00:00Z',
+      readComments: () => ['old-head-1', 'old-head-2', ...Array(currentAttempts).fill(HEAD)].map(headSha => ({
+        viewerDidAuthor: true, body: buildMissingRunComment({ headSha }),
+      })),
+      maxRetriesPerSha: 2, maxRetriesPerPr: 2, trigger, postComment: vi.fn(), clearLabel: vi.fn(),
+    });
+    if (currentAttempts === 2) {
+      expect(readHeadRuns).not.toHaveBeenCalled();
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'missing-run-cap-exhausted', attempts: 2 })]);
+      expect(trigger).not.toHaveBeenCalled();
+      return;
+    }
+    expect(readHeadRuns).toHaveBeenCalledTimes(1);
+    expect(readHeadRuns).toHaveBeenCalledWith({ repo: REPO, headSha: HEAD });
+    if (allowed) {
+      expect(result.dispatch).toEqual([expect.objectContaining({ headSha: HEAD, attempts: 0 })]);
+      expect(result.refusals).toEqual([]);
+      expect(trigger).toHaveBeenCalledTimes(1);
+    } else {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'missing-run-pr-cap-exhausted', attempts: 2,
+        why: expect.stringContaining('needs human/ci-heal inspection') })]);
+      expect(trigger).not.toHaveBeenCalled();
+    }
+  });
+
+  it('reads complete head runs with one bounded GitHub call', () => {
+    const runs = [run()];
+    const exec = vi.fn(() => JSON.stringify({ total_count: 1, workflow_runs: runs }));
+    expect(defaultReadHeadRuns({ repo: REPO, headSha: HEAD, exec })).toEqual(runs);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledWith('gh', ['api', `repos/${REPO}/actions/runs?head_sha=${HEAD}&per_page=100`],
+      expect.objectContaining({ maxBuffer: 4 * 1024 * 1024, timeout: expect.any(Number), killSignal: 'SIGKILL' }));
+    expect(defaultReadHeadRuns({ repo: REPO, headSha: HEAD,
+      exec: () => JSON.stringify({ total_count: 0, workflow_runs: [] }) })).toEqual([]);
+  });
+
+  it.each([
+    ['read error', () => { throw new Error('unreadable'); }],
+    ['invalid JSON', () => '{'],
+    ['missing count', () => JSON.stringify({ workflow_runs: [run()] })],
+    ['incomplete page', () => JSON.stringify({ total_count: 2, workflow_runs: [run()] })],
+    ['full page', () => JSON.stringify({ total_count: 100, workflow_runs: Array(100).fill(run()) })],
+    ['oversized result', () => JSON.stringify({ total_count: 101, workflow_runs: Array(100).fill(run()) })],
+  ])('head-run reader fails closed on %s', (_, exec) => {
+    expect(defaultReadHeadRuns({ repo: REPO, headSha: HEAD, exec })).toBeNull();
+  });
+
+  it.each([0, 1, 2])('uses the current-head budget with two old-head comments and %s current-head attempts', attempts => {
+    const value = pr();
+    const comments = ['old-head-1', 'old-head-2', ...Array(attempts).fill(HEAD)].map(headSha => ({
+      viewerDidAuthor: true, body: buildMissingRunComment({ headSha }),
+    }));
+    const trigger = vi.fn(() => ({ ok: true, action: 'pull-request-push' }));
+    const postComment = vi.fn();
+    const result = sweepMissingRunRecovery({
+      repo: REPO, apply: true, mainRuns: [], now: Date.parse('2026-11-09T12:00:00Z'),
+      readOpenPrs: () => [value], readRequiredContexts: () => CLASSIC, readAttributedRequiredChecks: () => REQUIRED,
+      readRecoveryPr: () => value,
+      readRecoveryEvidence: () => ({ requiredContexts: REQUIRED, rollup: value.statusCheckRollup, workflowRuns: value.workflowRuns }),
+      readRecoveryCredential: () => ({ token: 'ghp_fixture', env: {} }), checkClaim: () => null,
+      readPush: () => null, readHeadCommittedAt: () => '2026-11-08T00:00:00Z', readComments: () => comments,
+      maxRetriesPerSha: 2, maxRetriesPerPr: 2, trigger, postComment, clearLabel: vi.fn(),
+    });
+    if (attempts < 2) {
+      expect(result.dispatch).toEqual([expect.objectContaining({ headSha: HEAD, attempts, kind: 'trigger-ci' })]);
+      expect(result.refusals).toEqual([]);
+      expect(result.applied).toEqual([expect.objectContaining({ ok: true })]);
+      expect(trigger).toHaveBeenCalledTimes(1);
+      expect(postComment).toHaveBeenCalledTimes(1);
+    } else {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'missing-run-cap-exhausted', attempts: 2 })]);
+      expect(trigger).not.toHaveBeenCalled();
+      expect(postComment).not.toHaveBeenCalled();
+    }
+  });
+
   it.each([1, 2])('startup_failure-only context counts as absent (%s rollup rows)', count => {
     const value = pr(Array.from({ length: count }, () => done('merge-gate', 'STARTUP_FAILURE')));
     expect(isStalledPartialRollup(value.statusCheckRollup, REQUIRED)).toBe(true);

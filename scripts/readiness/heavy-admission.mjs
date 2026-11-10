@@ -708,6 +708,8 @@ export function createRemoteExec({
       (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
   }),
   notice = remoteClientNotice, runOverride = null,
+  // Best-effort persistence deadline; injectable so a loaded host (CI coverage shard) cannot race the audit write in tests.
+  provenanceBudgetMs = 100,
 } = {}) {
   return async (options) => {
     const scope = runOverride != null ? 'run' : 'host';
@@ -742,7 +744,7 @@ export function createRemoteExec({
         }
         if (scope === 'run') { // per-run: never touches the shared host provenance state
           await boundedClientProvenance(() => appendEvent({ kind: 'remote-client-override',
-            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), 100);
+            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), provenanceBudgetMs);
           return;
         }
         await boundedClientProvenance(async (signal) => {
@@ -777,7 +779,7 @@ export function createRemoteExec({
             if (signal.aborted) return;
             await provenanceFs.writeFile(file, JSON.stringify({ ...pair, pathKey }) + '\n', { encoding: 'utf8', signal });
           }
-        }, 100);
+        }, provenanceBudgetMs);
       })().catch(() => {}).finally(() => pendingClientProvenance.delete(provenance));
       pendingClientProvenance.add(provenance);
     }
@@ -794,6 +796,8 @@ export function appendVerifyRemoteReport(env, result) {
 /** R324: old Forge runners omit limits; their operator setting is the bounded fallback. */
 export function resolveRemoteSlotUnits({policy, kind, telemetry, priority = false}) {
   const r = policy.settings.remote;
+  // Only elastic kinds read telemetry; a concurrent health refresh that cached a failed read must not strand the rest.
+  if (!['FULL', 'soak', 'standards'].includes(kind)) return {units: 1, source: 'default'};
   if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0) throw new Error('Unreadable run count');
   // An explicitly unreadable limits report must never turn into the legacy setting fallback.
   let auto = r.autoSlotUnits, source = 'setting';

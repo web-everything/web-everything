@@ -643,6 +643,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
       siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
     } catch (error) {
+      if(typeof error.path==='string'){const rel=relative(resolve(cwd,'../frontierui'),Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path);if(rel&&!rel.startsWith('..'))error.siblingPath=rel;}
       error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file'].includes(error.code) ? error.code : 'sibling-inventory-failed';
       throw error;
     }
@@ -1085,6 +1086,28 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
+
+const DETAIL_MAX=200, DETAIL_PATH=/^[A-Za-z0-9._@+\-\/]+$/, DETAIL_FINDING=/^[A-Za-z0-9_-]+$/, TOKENISH=/[A-Za-z0-9]{32,}/;
+const DETAIL_BINARIES=new Set(['npm','npx','node','git','vitest','tsc','sh','bash','rsync','ssh','curl','python','python3']);
+function safePathDetail(path){
+  if(typeof path!=='string'||!path||path.length>DETAIL_MAX||!DETAIL_PATH.test(path)||path.startsWith('/')||path.split('/').some(seg=>seg===''||seg==='..')||TOKENISH.test(path))return undefined;
+  return path;
+}
+/** Safe fallback detail: repo-relative path (+ finding name) or a fixed binary name only; never content or a matched value. */
+export function safeFallbackDetail(kind,raw){
+  let out;
+  if(kind==='bundle-credential-hit'){
+    const at=typeof raw==='string'?raw.lastIndexOf(': '):-1;
+    const path=at>0?safePathDetail(raw.slice(0,at)):undefined, finding=at>0?raw.slice(at+2):'';
+    if(path&&DETAIL_FINDING.test(finding)&&finding.length<=60&&!TOKENISH.test(finding))out=`${path}: ${finding}`;
+  }else if(kind==='sibling-inventory-failed')out=safePathDetail(raw);
+  else if(kind==='command-not-allowed'){
+    const first=Array.isArray(raw)&&typeof raw[0]==='string'?raw[0]:'';
+    return DETAIL_BINARIES.has(first)?first:'other';
+  }
+  return out&&out.length<=DETAIL_MAX?out:'unavailable';
+}
+
 /** R807: fail closed. A scan that throws is treated as git-needing, so the run needs an affirmed bundle or falls back local. */
 export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit}){
   try{return route({argv,cwd}).local===true;}catch{return true;}
@@ -1094,7 +1117,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   argv = normalizeRemoteArgv(argv);
-  if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
+  if (!isAllowedCommand(argv)) return fallback('command-not-allowed',safeFallbackDetail('command-not-allowed',argv));
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
   const bundleTransport=resolveTransport(transport)==='git-bundle';
@@ -1248,7 +1271,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       let useBundle=bundleTransport&&needsGit&&runnerSupportsBundle(preparation.capabilities);
       // R559: bundle mode needs a recently fetched public main on the mirror and a credential-clean range. Either
       // failure falls back: check:standards keeps the rsync/GitHub-fetch path, a git-spawning test stays local.
-      let bundleRefusal;
+      let bundleRefusal,bundleDetail;
       if(useBundle&&mainFreshness(preparation.capabilities,bundleMainMaxAgeMs)!=='fresh')bundleRefusal='bundle-main-stale';
       if(useBundle&&!bundleRefusal){
         const planDone=begin('git-bundle-plan');
@@ -1256,12 +1279,13 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         try{bundlePlan=await planBundle({cwd,head:logicalHead,runnerBase:preparation.capabilities.gitBundleBase,exec,directory:bundleDirectory});}
         catch(error){
           bundleRefusal=['bundle-credential-hit','bundle-credential-scan-too-large'].includes(error.code)?error.code:'git-bundle-failed';
+          bundleDetail=bundleRefusal==='bundle-credential-hit'?safeFallbackDetail(bundleRefusal,error.detail):undefined;
           log(`bundle: refused (${bundleRefusal}${error.detail?': '+error.detail:''}); falling back\n`);
         }
         planDone({shipMode:bundlePlan?.mode??'refused'});
       }
       if(bundleRefusal){useBundle=false;bundlePlan=undefined;}
-      if(testNeedsGit&&!useBundle)return {mode:'not-started',terminated:true,reason:bundleRefusal??'forge-runner-too-old'};
+      if(testNeedsGit&&!useBundle)return {mode:'not-started',terminated:true,reason:bundleRefusal??'forge-runner-too-old',...(bundleDetail?{detail:bundleDetail}:{})};
       // forge-exec-run.mjs is separately installed by forge-setup.sh. Redeploy
       // that fixed wrapper before siblings can run; old runners stay local.
       if (manifest.siblings && preparation.capabilities?.siblings !== 1)
@@ -1314,7 +1338,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
         return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
       }
-      if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
+      if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code,detail:safeFallbackDetail(error.code,error.siblingPath)};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
