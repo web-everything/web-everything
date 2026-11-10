@@ -2130,6 +2130,18 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     };
   };
 
+  it('runs the orphan-round guard before fix so a capped orphan is not re-dispatched first', async () => {
+    const f = productionFixture();
+    const order = [];
+    vi.spyOn(stuckReclaim, 'runFixerStuckReclaimPass').mockResolvedValue({ rows: [] });
+    const result = await realRunTickAllRepos({ ...f.options,
+      orphanGuardTick: async () => { order.push('orphan'); return { rows: [{ decision: 'escalate', reason: 'cap' }] }; },
+      fixTick: undefined });
+    expect(order).toEqual(['orphan']);
+    expect(result.stuckFixers.rows.some(r => r.kind === 'orphan-fix-round')).toBe(true);
+    expect(Object.keys(result.phaseMs).indexOf('orphan-guard')).toBeLessThan(Object.keys(result.phaseMs).indexOf('fix'));
+  });
+
   it('wires stuck reclaim hooks to stop before further writes and skip orphan work after budget exhaustion', async () => {
     const f = productionFixture();
     let time = 0;
@@ -2142,7 +2154,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       time = 1001;
       // The real reclaim pass catches this throw as stop-failed and leaves claims untouched.
       expect(() => options.stopSession(stopOptions)).toThrow('budget exhausted; retry next tick');
-      expect(await options.orphanPass({})).toEqual({ rows: [] });
+      expect(options.orphanPass).toBeNull();
       return { rows: [] };
     });
     const result = await realRunTickAllRepos({ ...f.options, now: () => time,

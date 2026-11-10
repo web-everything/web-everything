@@ -1019,6 +1019,8 @@ export async function runTickAllRepos({
   now = Date.now,
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
+  // Off under a test run unless injected (the real pass reads GitHub).
+  orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
@@ -1199,6 +1201,12 @@ export async function runTickAllRepos({
     };
     return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile, ...reuseOptions(step, tick) });
   };
+  // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
+  const orphanGuard = await timedAsync('orphan-guard', async () => {
+    if (stuckFixerTick || !realTick || !orphanGuardTick) return { rows: [] };
+    try { return await orphanGuardTick({ env: process.env, nowMs: now() }) ?? { rows: [] }; }
+    catch (e) { return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] }; }
+  });
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
@@ -1219,9 +1227,13 @@ export async function runTickAllRepos({
         if (overBudget()) throw new Error('stuck-fixers pass budget exhausted; retry next tick');
         return stopSession(options);
       },
-      orphanPass: options => overBudget() ? { rows: [] } : runOrphanFixRoundPass(options),
+      orphanPass: null, // ran before fix (orphan-guard phase)
     });
   });
+  if (orphanGuard.rows?.length && Array.isArray(stuckFixers?.rows)) {
+    stuckFixers.orphanRounds = orphanGuard;
+    for (const r of orphanGuard.rows) stuckFixers.rows.push({ ...r, kind: 'orphan-fix-round' });
+  }
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
