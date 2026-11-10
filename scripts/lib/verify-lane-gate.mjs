@@ -659,7 +659,7 @@ export function laneRelevantChangeSince({ recordSha, headSha, base = 'origin/mai
     // `headSha` that is not (or is no longer) this checkout's actual current HEAD (e.g. an explicit `--sha=`).
     const mergeBase = String(runGit(['merge-base', base, sha])).trim() || null;
     if (!mergeBase) return null;
-    return lines(runGit(['diff', '--name-only', mergeBase, sha, '--']));
+    return lines(runGit(['diff', '--name-only', '--no-renames', mergeBase, sha, '--']));
   };
   try {
     // The trailing `--` separates the two revisions from a pathspec (there is none) so a validly-hex-shaped but
@@ -669,7 +669,7 @@ export function laneRelevantChangeSince({ recordSha, headSha, base = 'origin/mai
     // NOT an ancestor of headSha is refused (`--is-ancestor` exits 1 -> runGit throws -> null).
     runGit(['merge-base', '--is-ancestor', recordSha, headSha]);
     const changedSinceRecord = lines(runGit(['diff', '--name-only', '--no-renames', recordSha, headSha, '--']))
-      .filter((f) => !(isCardPath(f) || isDocsPath(f)));
+      .filter((f) => !isCarriedDocPath(f));
     if (changedSinceRecord.length === 0) return [];
     // The UNION of "relevant at record time" and "relevant at headSha" — see the header doc above for why
     // `headSha` alone misses a lane-side revert of its own already-verified work.
@@ -929,4 +929,9 @@ export function formatVerifyPhases(phases) {
   ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`),
   ...(phases.settingsSource ? [`settingsSource=${JSON.stringify(phases.settingsSource)}`] : []),
   ...Object.entries(phases.admissionPhases ?? {}).map(([name, phase]) => `${name}Wait=${phase.waitedMs}(${phase.lane})`)].join(' ');
+}
+
+/** A path whose change carries no code: a `.md` under backlog/ (card) or docs/ ONLY — never a root `README.md`. */
+function isCarriedDocPath(f) {
+  return (isCardPath(f) || isDocsPath(f)) && /^(?:backlog|docs)\/.+\.md$/.test(f);
 }

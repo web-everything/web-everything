@@ -189,6 +189,19 @@ describe('resolveFinishGuardVerdict — a green marker carries over docs-only co
     commit('docs script');
     expect(verdict().ok).toBe(false);
   });
+  it('REFUSES a root README.md (only backlog/ or docs/ .md counts)', () => {
+    setup();
+    writeAndAdd('README.md', 'x\n');
+    commit('root md');
+    expect(verdict().ok).toBe(false);
+  });
+  it('REFUSES code renamed to a docs .md name', () => {
+    setup();
+    writeAndAdd('docs/a.md', 'lane edit\n'); // identical content: git sees a rename
+    execFileSync('git', ['rm', '-q', 'scripts/a.mjs'], { cwd: dir });
+    commit('rename code to md');
+    expect(verdict().ok).toBe(false);
+  });
   it('REFUSES a marker on a non-ancestor commit', () => {
     setup();
     execFileSync('git', ['checkout', '-q', '--orphan', 'other'], { cwd: dir });
