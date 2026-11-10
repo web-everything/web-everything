@@ -10,6 +10,7 @@ import { basename } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
+import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
@@ -282,10 +283,16 @@ async function rebuildCloneInternal({
 
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
   try {
-    return await smokeAndAdopt({
-      root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
-    });
+    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep });
+    try {
+      return await smokeAndAdopt({
+        root, env, stEnv, log, run, runSmoke,
+        stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
+        finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+      });
+    } finally {
+      await slot.release();
+    }
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.
     try {
