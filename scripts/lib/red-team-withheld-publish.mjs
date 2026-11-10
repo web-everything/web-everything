@@ -131,7 +131,15 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
         // A readable row must show the SAME confirmed breaks as the posted comment (not just as many), or the gate would clear a guess.
         const live = redTeamForHead(comments, pr, head);
         conflict = !live || !sameConfirmedBreaks(live, recovered);
-        if (!conflict) return { status: 'skipped' };
+        if (!conflict) {
+          // The posted comment now agrees with the stored evidence: lift a hold an earlier pass recorded.
+          if (status.legacyHoldPublished) {
+            const { legacyHoldPublished: _lifted, ...rest } = status;
+            status = rest;
+            writeStatus(status);
+          }
+          return { status: 'skipped' };
+        }
       }
     } catch { return failedAttempt(); }
     // Outside the try: a failing alert write must not be counted as a publish attempt.
@@ -154,7 +162,8 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       if (postComment) postComment({ repo, pr, body });
       else provider.postComment(repo, pr, body);
     } catch { return failedAttempt(); }
-    writeStatus({ ...status, publishedAt: now(), result: { ...result, comment: 'posted' } });
+    const { legacyHoldPublished: _posted, ...kept } = status;
+    writeStatus({ ...kept, publishedAt: now(), result: { ...result, comment: 'posted' } });
     return { status: 'posted' };
   });
 }

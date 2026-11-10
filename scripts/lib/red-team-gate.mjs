@@ -677,8 +677,11 @@ function gateActionLines(body) {
  * re-keyed); the newer head's own records win. Human operator blocks retain gateRecordsFor's binding, including
  * legacy records and carries. Operator card actions never carry: only a direct record on the live head releases
  * its named result. With anyState off, legacy card/advisory records keep their existing binding.
+ * `legacyHold`: the stored legacy red-team status says its evidence conflicts with the posted comment (card x1b8hlo).
+ * The thread cannot show that conflict, so the caller passes it in and it counts as one held finding (index 0, which
+ * no real finding uses); the result is never read as clear while it stands.
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings, legacyHold = false } = {}) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const result = latestResult(records, pr, live)?.parsed ?? null;
@@ -790,7 +793,15 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (effectiveAction === 'held') held.push(f);
     if (effectiveAction === 'send-back') sendBack.push(f);
   }
+  if (legacyHold === true) held.push({ index: 0, confirmed: true, category: 'legacy-conflict', file: null, line: null,
+    summary: 'Legacy red-team evidence conflicts with the posted comment; operator review required.', legacyHold: true });
   return { result, sendBack, held, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };
+}
+
+/** Does this stored red-team status carry an unresolved legacy conflict hold? Only an unposted bare `ran` result counts. */
+export function legacyConflictHold(status, head) {
+  return status?.legacyHoldPublished === true && status.status === 'finished' && status.result === 'ran'
+    && (status.head === undefined || String(status.head).toLowerCase() === String(head ?? '').toLowerCase());
 }
 
 /**
