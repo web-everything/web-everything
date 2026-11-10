@@ -214,10 +214,20 @@ function addCandidates(file, anchors, out) {
   // letter and a `/`, `\` or `.`) is a token; a span of prose (`render(`, `label,`) only spends the candidate bound. The run is cut untrimmed, so a name that itself starts or ends with such a character (`+a.mjs`, `a.mjs+`)
   // keeps it in some span. The runs are taken from a second fold too, where a dropped invisible or line separator is a
   // gap rather than nothing, so prose it glued onto a name is cut off. The whitespace-joined form is a token as it
-  // stands, never cut: cutting a whole report would pair every two marks in it. More candidates still fail closed.
+  // stands, never cut. More candidates still fail closed.
+  // PR #6381 fix-6381 self-review: every span becoming a candidate made a report with no spaces and a few marks
+  // (`src/a.ts:12:4,src/b.ts:13:5,...`) pass the candidate bound and fail closed into recheck although nothing in it
+  // is protected. A span can only matter where it starts at a glob's first folder (or top-level name), so a span is a
+  // candidate only from an anchored segment on; when some glob starts with a wildcard (no anchor) every span still is.
+  // A span is also taken with its edges trimmed (a markdown `_name_`), and with its trailing dots kept (`custom/a.`).
+  // A protected pattern that itself holds whitespace (`custom/a b.mjs`) can only be named across a gap, so then the
+  // whole report is one run as well: more cuts, and so fail-closed sooner, only when such a pattern exists.
   const edges = s => s.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
   tokens.push(...cores, edges(joined));
-  for (const run of new Set([...folded.split(/\s+/u), ...foldPathText(file, ' ').split(/\s+/u)])) {
+  const gapped = foldPathText(file, ' ');
+  const runs = [...folded.split(/\s+/u), ...gapped.split(/\s+/u), ...(anchors.spaced ? [folded.trim(), gapped.trim()] : [])];
+  const spans = [];
+  for (const run of new Set(runs)) {
     const cuts = [-1];
     for (let i = 0; i < run.length; i++) if (/[^\p{L}\p{N}\p{M}_.\-/\\]/u.test(run[i])) cuts.push(i);
     // Spans grow with the square of the cuts: a run with more cuts than the candidate bound fails closed (protected).
@@ -226,24 +236,34 @@ function addCandidates(file, anchors, out) {
     for (let a = 0; a < cuts.length - 1; a++) {
       for (let b = a + 1; b < cuts.length; b++) {
         const span = run.slice(cuts[a] + 1, cuts[b]);
-        if (/[./\\]/.test(span) && /\p{L}/u.test(span)) tokens.push(span);
+        if (/[./\\]/.test(span) && /\p{L}/u.test(span)) spans.push(span, edges(span));
       }
     }
   }
-  for (const token of tokens) {
+  const sources = [...tokens.map(t => [t, true]), ...spans.map(s => [s, anchors.open === true])];
+  for (const [token, whole] of sources) {
     if (token === '') continue;
-    const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
-    for (let i = 0; i < segs.length; i++) {
-      if (i > 0 && !anchors.has(segs[i].toLowerCase())) continue;
-      const c = pathCandidate(segs.slice(i).join('/'));
-      if (c !== null) out.add(c);
-      if (out.size > MAX_CANDIDATES) return false;
+    const slashed = token.replace(/\\/g, '/');
+    for (const form of new Set([slashed, slashed.replace(/\.+$/, '')])) {
+      const segs = form.split('/').filter(s => s !== '' && s !== '.');
+      for (let i = 0; i < segs.length; i++) {
+        if ((i > 0 || !whole) && !anchors.has(segs[i].toLowerCase())) continue;
+        const c = pathCandidate(segs.slice(i).join('/'));
+        if (c !== null) out.add(c);
+        if (out.size > MAX_CANDIDATES) return false;
+      }
     }
   }
   return true;
 }
-/** The literal first folder of each glob (`scripts` of `scripts/**\/x`); a glob that starts with a wildcard names none. */
-const anchorsOf = patterns => new Set(patterns.map(p => p.toLowerCase().split('/')[0]).filter(s => s !== '' && !s.includes('*')));
+/**
+ * The literal first folder of each glob (`scripts` of `scripts/**\/x`); a glob that starts with a wildcard names none
+ * and marks the set `open` (every span is then a candidate). `spaced` marks a glob holding whitespace.
+ */
+const anchorsOf = patterns => Object.assign(
+  new Set(patterns.map(p => p.toLowerCase().split('/')[0]).filter(s => s !== '' && !s.includes('*'))),
+  { open: patterns.some(p => { const first = p.split('/')[0]; return first === '' || first.includes('*'); }),
+    spaced: patterns.some(p => /\s/u.test(p)) });
 function pathCandidate(file) {
   if (/[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
   let path = file.replace(/\\/g, '/');

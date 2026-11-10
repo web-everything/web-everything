@@ -276,16 +276,24 @@ describe('R473 pure classified verdict', () => {
       `\`${name}\`:12`, `"${name}":12`, `'${name}':12`, `<${name}>:12`, `(${name}):12`, `{${name}}:12`, `*${name}*:12`,
       `[${name}](link)`, `[x](${name})`, `[${name}](https://example.test/a/b)`, `${name}?plain=1`, `${name}?plain=1#L4`,
       `${name}~1`, `${name}|12`, `${name}!12`, `${name}%3A12`, `${name},custom/c.mjs`, `custom/c.mjs,${name}`,
+      // fix-6381 self-review: markdown emphasis keeps `_` (a path character) on a span's edges.
+      `_${name}_:12`, `_${name}_`, `**${name}**`,
       ...[0x2028, 0x2029, 0x85, 0x200b, 0xad, 0x2060].map(cp => `${name}${String.fromCodePoint(cp)}more`)];
     it.each([...wrapped(PLUS), ...wrapped(MIXED), ...wrapped(QUOTED)])('%j is WEAKENED under guardFloorPaths naming it', async file => {
       const f = finding({ class: 'E2', file });
       const layered = await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }));
       expect(layered.verdict).toBe('WEAKENED');
       expect(layered.ships).toEqual([]);
-      // A report cut so often that its runs pass the candidate bound fails closed into recheck (X2, human adjudication)
-      // instead of a block: still protected, never shipped. Every PLUS form stays within the bound.
-      expect([...ids(layered.blocks), ...(file.includes(PLUS) ? [] : ids(layered.recheck))]).toContain('f1');
+      // A block, never the candidate-bound recheck: the name is MATCHED in every wrapper (fix-6381 self-review: the
+      // MIXED and QUOTED forms used to pass this only because their spans overflowed the bound).
+      expect(ids(layered.blocks)).toContain('f1');
       expect((await compute([f], options('prerelease', { guardFloorPaths: GUARDED }))).verdict).toBe('WEAKENED');
+    });
+    // The same wrapped reports under a glob that does not name them ship: protection comes from a match, not from
+    // the candidate bound failing closed.
+    it.each([...wrapped(PLUS), ...wrapped(MIXED), ...wrapped(QUOTED)])('%j ships when no glob names it', async file => {
+      expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/zzz.mjs'] }))).verdict)
+        .toBe('NOT WEAKENED');
     });
     it.each(['custom/a.mjs', 'custom/b.mjs', 'custom/x@y.mjs', 'custom/it.mjs', ...wrapped('custom/ab.mjs')])(
       'an unrelated path %j still ships (the cores never over-block)', async file => {
@@ -298,7 +306,11 @@ describe('R473 pure classified verdict', () => {
       ['.custom/a+b.mjs', ['.custom/a+b.mjs:12', '".custom/a+b.mjs"']], ['+a.mjs', ['+a.mjs:12', '"+a.mjs"']], ['_a+b.mjs', ['_a+b.mjs:12']],
       ['custom/a+b.mjs_', ['"custom/a+b.mjs_":3']],
       ['custom/a+b.mjs', ['custom/a\\+b.mjs', 'custom/a%2Bb.mjs', 'custom/a%2bb.mjs:12', 'custom/a&#43;b.mjs', 'custom/a&#x2B;b.mjs', '"custom/a&#43;b.mjs":12']],
-      ['custom/a_b.mjs', ['custom/a\\_b.mjs']]])('a protected %j stays WEAKENED in every wrapper', async (guard, files) => {
+      ['custom/a_b.mjs', ['custom/a\\_b.mjs']],
+      // fix-6381 self-review: `_` emphasis, a name holding a space, a name ending in a dot.
+      ['custom/ab.mjs', ['_custom/ab.mjs_:12', '_custom/ab.mjs_', '*custom/ab.mjs*:12']],
+      ['custom/a b.mjs', ['"custom/a b.mjs"', 'custom/a b.mjs:12', '+++ b/custom/a b.mjs', 'custom/a%20b.mjs', 'see `custom/a b.mjs` here']],
+      ['custom/a.', ['"custom/a."', 'custom/a.:12', '`custom/a.`']]])('a protected %j stays WEAKENED in every wrapper', async (guard, files) => {
       for (const file of files) {
         expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: [guard] }))).verdict, file).toBe('WEAKENED');
       }
@@ -314,11 +326,20 @@ describe('R473 pure classified verdict', () => {
     it.each(['src/a.ts:12:4, src/b.ts:13:5, src/c.ts:14:6',
       'src/lib/format.ts (the function formatDate, called from render(), returns the wrong value when the label is empty, see line 12, col 4)',
       'In src/lib/format.ts, the helper (formatLabel) drops the label; it is called by renderRow, renderCell, and renderHeader.',
-      'src/components/merge-button.ts:12', 'a/b/c-d-e-f-g.test.mjs:10:5', 'src/x.ts (lines 12-14, 20-22, 30-31)'])(
+      'src/components/merge-button.ts:12', 'a/b/c-d-e-f-g.test.mjs:10:5', 'src/x.ts (lines 12-14, 20-22, 30-31)',
+      // fix-6381 self-review: with no spaces, every span of a run was a candidate and these passed the bound.
+      'src/a.ts:12:4,src/b.ts:13:5,src/c.ts:14:6', '(src/x.ts:12,src/y.ts:13,src/z.ts:14)', 'src/x.ts:12,src/y.ts:13,src/z.ts:14,src/w.ts:15'])(
       'an ordinary unprotected report %j still ships', async file => {
-        expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
-          .toBe('NOT WEAKENED');
+        for (const guardFloorPaths of [GUARDED, []]) {
+          expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths }))).verdict, String(guardFloorPaths))
+            .toBe('NOT WEAKENED');
+        }
       });
+    // A glob holding a space makes the whole report one run (more cuts); a short ordinary report is still judged.
+    it.each(['src/a.ts:12', 'src/x.ts (lines 12-14)'])('%j still ships under a glob holding a space', async file => {
+      expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/a b.mjs'] }))).verdict)
+        .toBe('NOT WEAKENED');
+    });
     // The spans between cuts grow with the square of the cuts, so a core cut more often than the candidate bound allows
     // fails closed (protected, an operator-visible block), at bounded cost; one just under it is still judged.
     it('a core with more cuts than the candidate bound fails closed at bounded cost', async () => {
@@ -328,6 +349,10 @@ describe('R473 pure classified verdict', () => {
         expect(r.verdict, file.slice(0, 20)).toBe('WEAKENED');
         expect(r.ships).toEqual([]);
       }
+      // Just under the cut bound in two runs: judged (nothing protected), at bounded cost.
+      const worst = `src/${'a.b:'.repeat(8)} ${'c/d:'.repeat(8)}`;
+      expect((await compute([finding({ class: 'E2', file: worst })], options('prerelease'), trustedLayer({ guardFloorPaths: GUARDED }))).verdict)
+        .toBe('NOT WEAKENED');
       expect(Date.now() - started).toBeLessThan(5000);
     });
     it.each(['other/a+b+c.mjs', 'other/x.mjs?plain=1#L4-L9'])('a report %j with a few cuts is still judged and ships', async file => {
