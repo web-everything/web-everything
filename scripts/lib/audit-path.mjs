@@ -50,6 +50,8 @@ export function anchorsOf(patterns) {
  */
 export function canonicalPaths(file, anchors) {
   if (!(anchors instanceof Set)) throw new TypeError('canonicalPaths: anchors must be a Set (anchorsOf(patterns), or new Set() for none)');
+  // An anchor is compared with one path segment, so `scripts/lib`, `*` or '' could never match and would silently switch the protection off.
+  for (const a of anchors) if (typeof a !== 'string' || !/^[A-Za-z0-9._-]+$/.test(a)) throw new TypeError('canonicalPaths: each anchor must be a single folder name (no "/", "*" or empty), got ' + JSON.stringify(a));
   if (typeof file !== 'string' || file.length > MAX_AUDIT_PATH) return null;
   const text = file.replace(/^ +| +$/g, '');
   // A leading `word:` reads as a URL scheme (`file:x`, or a top-level `x.mjs:42`): refused, as the old matcher did.

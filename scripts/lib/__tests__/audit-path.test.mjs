@@ -193,6 +193,8 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     expect(() => canonicalPathsOf('repo/scripts/guard-bash.mjs')).toThrow(TypeError);
     // Even a hostile report is refused for the missing anchors first, never answered unprotected.
     expect(() => canonicalPathsOf(null)).toThrow(TypeError);
+    // A hand-built anchor that can never equal one path segment would switch the protection off silently: refused.
+    for (const a of ['scripts/lib', '*', '', 'a b', 7, null]) expect(() => canonicalPathsOf('repo/scripts/x.mjs', new Set([a])), String(a)).toThrow(TypeError);
   });
   it('a caller that passes only the patterns keeps a nested protected path protected (anchorsOf)', () => {
     const anchors = anchorsOf(PATTERNS);
@@ -289,7 +291,8 @@ describe('P2 bounded to real patterns: every tracked path under every past wrapp
       }
     }
     // The guarantee is every tracked path, not a sample: the visited set must be exactly the tracked set.
-    expect(visited.size).toBe(new Set(files).size);
-    expect([...visited].sort()).toEqual([...new Set(files)].sort());
+    // Compared with a fresh read, so a loop that stopped early (or a list that changed under it) fails here.
+    const again = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 1 << 28 }).split('\0').filter(Boolean);
+    expect([...visited].sort()).toEqual([...new Set(again)].sort());
   }, 300_000);
 });
