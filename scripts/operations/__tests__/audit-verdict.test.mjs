@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { GUARD_FLOOR, LOCK_API, LOCK_HOLDERS, LOCK_PRIMITIVES, LOCK_USERS, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
+import { AUDITOR_FLOOR, GUARD_FLOOR, LOCK_API, LOCK_HOLDERS, LOCK_PRIMITIVES, LOCK_USERS, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
 import { findingFingerprint, proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
 import { assertProtectedPatterns, validateProtectedPattern } from '../../lib/audit-path.mjs';
 
@@ -972,6 +972,8 @@ describe('R473 structured concurrency evidence', () => {
       'scripts/lib/permission-change.mjs', 'scripts/lib/pr-merge-gate.mjs', '.github/workflows/merge-gate.yml', '.github/workflows/review-gate.yml',
       'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit.mjs', 'scripts/operations/codex-audit-io.mjs',
       'scripts/lib/audit-settings.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
+      // PR #6381 judge: the auditor's own imports. audit-path.mjs classifies every protected path for the verdict engine.
+      'scripts/lib/audit-path.mjs', 'scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
       // Review authorization (PR #6381 red team): who may clear, accept or carry a verdict, and which markers are trusted.
       'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
       'scripts/operations/build-pr-authorship.mjs', 'scripts/lib/human-clearance-carry.mjs', 'scripts/conveyor/human-clearance-carry-cli.mjs',
@@ -1038,6 +1040,25 @@ describe('R473 structured concurrency evidence', () => {
     it.each([...new Set(directImports)].sort())(
       'every direct import of the review authorization family is on the floor: E2 in %s never ships (PR #6381 red team)', async file => {
         neverShips(await compute([finding({ class: 'E2', file })], options()));
+      });
+    // PR #6381 judge: the auditor delegates protected-path classification to audit-path.mjs, which the floor missed. The
+    // auditor's roots are AUDITOR_FLOOR itself, expanded to the tracked modules each entry matches, and every module a
+    // root imports directly must be on the floor (the same one-level scan as the review authorization family).
+    const AUDITOR_ROOTS = [...new Set(AUDITOR_FLOOR.flatMap(entry => execFileSync('git', ['ls-files', '-z', '--', `:(glob)${entry}`],
+      { cwd: repoRoot, encoding: 'utf8', maxBuffer: 4 << 20 }).split('\0')))]
+      .filter(p => /\.m?js$/.test(p) && !/\.test\.m?js$/.test(p) && !p.includes('/__tests__/')).sort();
+    const auditorImports = [...new Set(AUDITOR_ROOTS.flatMap(root => [...readFileSync(`${repoRoot}${root}`, 'utf8')
+      .matchAll(/\bfrom\s*['"](\.\.?\/[^'"\r\n]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"\r\n]+)['"]\s*\)/g)]
+      .map(m => fileURLToPath(new NodeURL(m[1] ?? m[2], new NodeURL(root, `file://${repoRoot}`))).slice(repoRoot.length))))].sort();
+    it('the auditor scan is live: its roots cover the verdict engine and its imports include the path classifier', () => {
+      expect(AUDITOR_ROOTS).toEqual(expect.arrayContaining(['scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit.mjs',
+        'scripts/operations/codex-audit-io.mjs', 'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs']));
+      expect(auditorImports).toEqual(expect.arrayContaining(['scripts/lib/audit-path.mjs', 'scripts/lib/net-diff-fingerprint.mjs']));
+      expect(auditorImports.filter(p => !existsSync(`${repoRoot}${p}`))).toEqual([]);
+    });
+    it.each([...new Set([...AUDITOR_ROOTS, ...auditorImports])].sort())(
+      'every auditor module and its direct imports are on the floor: E2 in %s never ships (PR #6381 judge)', async file => {
+        for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
       });
     // PR #6381 self-review: a floor module decides with the JSON file it reads (red-team-gate.mjs reads red-team.json),
     // so weakening that file weakens the module. Every floor module is read from the source, and each tracked scripts/

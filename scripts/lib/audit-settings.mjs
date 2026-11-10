@@ -43,6 +43,15 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
   'scripts/lib/approved-human-surface-hold.mjs', 'scripts/settings/approved-human-surface-hold.json', 'scripts/lib/pr-state/holds/verdict.mjs',
   // `**/` needs at least one folder here, so each `scripts/**/` entry above has a twin for a file directly in scripts/.
   'scripts/*human-clearance-carry*', 'scripts/accept-carry-*', 'scripts/*verdict-carry*', 'scripts/*clear-human*']);
+/**
+ * The auditor itself: weakening it weakens every later audit. Like REVIEW_AUTH_FLOOR, a test reads every module these
+ * entries match and pins each module it imports DIRECTLY onto the floor (PR #6381 judge: audit-verdict.mjs delegates
+ * protected-path classification to audit-path.mjs, which was missing).
+ */
+export const AUDITOR_FLOOR = Object.freeze(['scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*',
+  'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
+/** Modules the auditor imports directly that no other floor entry names (the source-scan test pins each import). */
+const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs']);
 /** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
 const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/lib/github-app-identity.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
@@ -267,9 +276,8 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   ...REVIEW_AUTH_FLOOR, ...REVIEW_AUTH_IMPORTS, ...FLOOR_SETTINGS,
   // The review settings file: carryAcrossRebase and unattendedAcceptRequiresCleanReferrals decide carries and accepts.
   'scripts/settings/review.json',
-  // The auditor itself: weakening it weakens every later audit.
-  'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
-  'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json'])]);
+  // The auditor itself and the modules it imports directly (see AUDITOR_FLOOR).
+  ...AUDITOR_FLOOR, ...AUDITOR_IMPORTS])]);
 /** What an invalid or unreadable path list resolves to: the floor plus every path (`**` matches any path). */
 const STRICTEST_PATHS = Object.freeze([...GUARD_FLOOR, '**']);
 
