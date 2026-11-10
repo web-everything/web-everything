@@ -25,13 +25,43 @@
  *   - `intervalMs`: how often {@link ../pass-daemon.mjs} re-runs this pass after each run completes.
  */
 
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { defineJobKind, kindRegistry } from '../../scripts/lib/daemon-jobs.mjs';
 
-/** Every mechanical pass ran at this same cadence as one of `runner.mjs`'s own `makeCliMechanicalPasses`
- *  steps — unchanged here, since #3873 wires the SAME passes onto standalone daemons, not a redesign of how
- *  often they run. */
+/** Fallback cadence for mechanical passes; only the allowlisted watchers accept settings overrides. */
 const DEFAULT_PASS_INTERVAL_MS = 120_000;
+const MIN_PASS_INTERVAL_MS = 60_000;
+const MAX_PASS_INTERVAL_MS = 1_800_000;
+const WATCHER_PASSES = new Set([
+  'advisory-label-sweep', 'parked-pr-conflict-watch', 'parked-pr-progress-watch',
+  'lane-pool-health-watch', 'ci-queue-watch', 'stuck-pr-watch',
+]);
+
+/** Read once at manifest load. Missing, unreadable or invalid JSON retains the default cadence. */
+export function loadPassIntervalSettings(file = resolve(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/pass-intervals.json')) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/** Resolve watcher cadence with code-owned bounds and provenance; critical-path passes ignore settings.
+ * @returns {{ intervalMs: number, source: 'settings' | 'default' | 'clamped' }}
+ */
+export function passIntervalMs(passName, settings) {
+  const value = settings?.passIntervals?.intervalsMs?.[passName];
+  if (!WATCHER_PASSES.has(passName) || !Number.isFinite(value)) {
+    return { intervalMs: DEFAULT_PASS_INTERVAL_MS, source: 'default' };
+  }
+  const intervalMs = Math.min(MAX_PASS_INTERVAL_MS, Math.max(MIN_PASS_INTERVAL_MS, value));
+  return { intervalMs, source: intervalMs === value ? 'settings' : 'clamped' };
+}
+
+const PASS_INTERVAL_SETTINGS = loadPassIntervalSettings();
 
 /** PR #3881/#3932 — the load-flake re-verify pass. Each run is a cheap loadavg read unless the host is quiet,
  *  so 5 minutes is plenty; `WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS` overrides it (read once, at manifest load). */
@@ -57,8 +87,9 @@ export function loadFlakeReverifyIntervalMs(env = process.env) {
  */
 function perRepoEntries(passName, script, args, extra = {}) {
   const out = {};
+  const { intervalMs } = passIntervalMs(passName, PASS_INTERVAL_SETTINGS);
   for (const [key, { slug }] of Object.entries(CONSTELLATION_REPOS)) {
-    out[`${passName}-${key}`] = { script, args: [...args, `--repo=${slug}`], intervalMs: DEFAULT_PASS_INTERVAL_MS, ...extra };
+    out[`${passName}-${key}`] = { script, args: [...args, `--repo=${slug}`], intervalMs, ...extra };
   }
   return out;
 }

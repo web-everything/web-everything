@@ -1,0 +1,1 @@
+{"passIntervals":{"intervalsMs":{"advisory-label-sweep":300000,"parked-pr-conflict-watch":300000,"parked-pr-progress-watch":300000,"lane-pool-health-watch":300000,"ci-queue-watch":240000,"stuck-pr-watch":300000}}}

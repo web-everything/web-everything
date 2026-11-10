@@ -9,14 +9,91 @@
 import { describe, it, expect } from 'vitest';
 import {
   DAEMON_MANIFEST, isSafeManifestScriptPath, assertValidManifestEntry, resolveManifestEntry,
+  passIntervalMs, loadPassIntervalSettings,
 } from '../daemon-manifest.mjs';
 import { defaultLaunchNames } from '../supervisor-launcher.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+describe('watcher pass interval settings', () => {
+  const settingsFor = (passName, value) => ({ passIntervals: { intervalsMs: { [passName]: value } } });
+
+  it.each([
+    ['advisory-label-sweep', 300_000],
+    ['parked-pr-conflict-watch', 300_000],
+    ['parked-pr-progress-watch', 300_000],
+    ['lane-pool-health-watch', 300_000],
+    ['ci-queue-watch', 240_000],
+    ['stuck-pr-watch', 300_000],
+  ])('applies the shipped %s override to every repository', (passName, intervalMs) => {
+    expect(passIntervalMs(passName, loadPassIntervalSettings())).toEqual({ intervalMs, source: 'settings' });
+    for (const key of Object.keys(CONSTELLATION_REPOS)) {
+      expect(DAEMON_MANIFEST[`${passName}-${key}`].intervalMs).toBe(intervalMs);
+    }
+  });
+
+  it.each([-1, 0, 59_999])('clamps a low override of %s to the hard minimum', (value) => {
+    expect(passIntervalMs('ci-queue-watch', settingsFor('ci-queue-watch', value)))
+      .toEqual({ intervalMs: 60_000, source: 'clamped' });
+  });
+
+  it.each([1_800_001, Number.MAX_VALUE])('clamps a high override of %s to the hard maximum', (value) => {
+    expect(passIntervalMs('ci-queue-watch', settingsFor('ci-queue-watch', value)))
+      .toEqual({ intervalMs: 1_800_000, source: 'clamped' });
+  });
+
+  it.each([60_000, 1_800_000])('accepts the exact bound %s with settings provenance', (intervalMs) => {
+    expect(passIntervalMs('ci-queue-watch', settingsFor('ci-queue-watch', intervalMs)))
+      .toEqual({ intervalMs, source: 'settings' });
+  });
+
+  it.each([
+    'ci-red-recovery-watch', 'lease-reaper', 'drain', 'review-dispatch', 'fix-dispatch',
+    'red-team', 'merge-orphan-sweep', 'branch-drift', 'unknown-watch', 'ci-queue-watch-we',
+  ])('ignores overrides for non-allowlisted pass %s', (passName) => {
+    expect(passIntervalMs(passName, settingsFor(passName, 900_000)))
+      .toEqual({ intervalMs: 120_000, source: 'default' });
+  });
+
+  it('keeps the critical CI recovery entries at the default interval', () => {
+    for (const key of Object.keys(CONSTELLATION_REPOS)) {
+      expect(DAEMON_MANIFEST[`ci-red-recovery-watch-${key}`].intervalMs).toBe(120_000);
+    }
+  });
+
+  it.each([undefined, null, {}, { passIntervals: null }, { passIntervals: { intervalsMs: {} } }])(
+    'falls back to 120000 for incomplete settings %j', (settings) => {
+      expect(passIntervalMs('ci-queue-watch', settings)).toEqual({ intervalMs: 120_000, source: 'default' });
+    },
+  );
+
+  it.each(['300000', null, true, {}, [], NaN, Infinity, -Infinity])(
+    'falls back to 120000 for an invalid interval %j', (value) => {
+      expect(passIntervalMs('ci-queue-watch', settingsFor('ci-queue-watch', value)))
+        .toEqual({ intervalMs: 120_000, source: 'default' });
+    },
+  );
+
+  it.each([
+    ['missing', undefined], ['invalid JSON', '{broken'], ['invalid shape', 'null'],
+    ['invalid interval', '{"passIntervals":{"intervalsMs":{"ci-queue-watch":"bad"}}}'],
+  ])('falls back to 120000 for a %s settings file', (_name, contents) => {
+    const dir = mkdtempSync(join(tmpdir(), 'pass-intervals-'));
+    try {
+      const file = join(dir, 'pass-intervals.json');
+      if (contents !== undefined) writeFileSync(file, contents);
+      expect(passIntervalMs('ci-queue-watch', loadPassIntervalSettings(file)))
+        .toEqual({ intervalMs: 120_000, source: 'default' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
   const REPO_KEYS = Object.keys(CONSTELLATION_REPOS);
