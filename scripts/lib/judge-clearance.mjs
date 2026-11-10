@@ -26,16 +26,15 @@ export function deriveRecordBinding({ record, pr, baseShaIsAncestor } = {}) {
 }
 
 /** Shared by clearance and arbitration. Missing path evidence retains the human hold. */
-export function protectedPathsTouched({ changedPaths, decisionCardResolves = [], addedLines = [] } = {}) {
+export function protectedPathsTouched({ changedPaths, decisionCardResolves, addedLines = [] } = {}) {
   if (!Array.isArray(changedPaths) || changedPaths.truncated === true
     || changedPaths.some(path => typeof path !== 'string' || !path || path.includes('..') || path.startsWith('/'))) {
     return { touched: true, paths: [], detail: 'changed-paths-incomplete' };
   }
+  if (!Array.isArray(decisionCardResolves)) return { touched: true, paths: [], detail: 'ratification-evidence-missing' };
   const paths = changedPaths.filter(path => [...JUDGE_PROTECTED, ...RATIFICATION_PROTECTED].some(re => re.test(path)));
   if (paths.length) return { touched: true, paths, detail: paths };
-  if (!Array.isArray(decisionCardResolves) || !Array.isArray(addedLines)) {
-    return { touched: true, paths: [], detail: 'changed-paths-incomplete' };
-  }
+  if (!Array.isArray(addedLines)) return { touched: true, paths: [], detail: 'changed-paths-incomplete' };
   if (decisionCardResolves.length) return { touched: true, paths: [...decisionCardResolves], detail: 'decision-card-resolved' };
   const rulings = addedLines.filter(({ path, line }) => /\.md$/i.test(path)
     && RULING_MARKERS.some(marker => line.startsWith(marker))).map(({ path }) => path);
@@ -56,12 +55,11 @@ export function decideJudgeClearance(input) {
     const { pr } = input;
     const labels = labelNames(pr.labels);
     if (!labels.includes('review:human')) return refuse('not-human-gated');
-    // Supplied GitHub author identities, never marker text, establish authorship.
-    // The contract also accepts GitHub's reserved workflow principal: its workflow
-    // definitions are protected, just like the shared automation's trust machinery.
+    // GitHub author identity establishes trust; the reserved workflow principal's definitions are protected.
     const trusted = new Set(trustedAdvisoryComments(pr.comments));
-    const advisory = latestAdvisory((Array.isArray(pr.comments) ? pr.comments : []).filter(comment =>
-      trusted.has(comment) || JUDGE_WORKFLOW_LOGINS.includes(comment?.author?.login ?? comment?.user?.login)));
+    const advisoryComments = (Array.isArray(pr.comments) ? pr.comments : []).filter(comment =>
+      trusted.has(comment) || JUDGE_WORKFLOW_LOGINS.includes(comment?.author?.login ?? comment?.user?.login));
+    const advisory = latestAdvisory(advisoryComments);
     if (!labels.includes('advisory:accepted') || labels.includes('review:changes')
       || labels.includes('review:pending') || input.ciGreen !== true
       || advisory?.outcome !== 'accept' || !advisoryCoversHead(advisory, pr.headRefOid)
@@ -76,6 +74,7 @@ export function decideJudgeClearance(input) {
       if (SECRET_PATTERNS.some(([re]) => new RegExp(re.source, re.flags).test(line))
         || (line.match(/[A-Za-z0-9_-]+/g) ?? []).some(isHighEntropyToken)) return refuse('secret-in-diff', path);
     }
+    if (!parseClearerActorId([advisoryComments[advisory.index]])) return refuse('independence-unknown', 'reviewer-identity-unknown');
     if (!Array.isArray(input.dispatchRecords) || input.dispatchRecords.length !== 1) return refuse('independence-unknown');
     const record = input.dispatchRecords[0];
     const derived = deriveRecordBinding({ record, pr, baseShaIsAncestor: input.recordBinding?.baseShaIsAncestor });

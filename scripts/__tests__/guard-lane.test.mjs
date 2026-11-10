@@ -553,6 +553,11 @@ describe('#5062 trusted judge inputs are read-only to lane agents', () => {
       expect(result.status, target).toBe(0);
     }
   });
+  it('fails closed when malformed path evidence throws inside the trusted-input check', () => {
+    const result = invoke('Write', { unreadable: true });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toMatch(/trusted judge.*unavailable|trusted judge.*unknown/i);
+  });
   it('the hook protects the shared exported path list', async () => {
     const { JUDGE_SWITCHES_PATH, JUDGE_VERDICTS_DIR, JUDGE_DISPATCH_DIR, JUDGE_TRUSTED_PATHS } = await import(/* @vite-ignore */ judgeModule);
     const expected = await targets();

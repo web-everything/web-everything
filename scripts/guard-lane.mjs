@@ -81,7 +81,7 @@
  * very guard, or an emergency hotfix the user directs). The escape is loud by being explicit.
  *
  * Protocol: reads the PreToolUse event JSON on stdin, denies via exit code 2 + a stderr message (mirrors
- * scripts/backlog-guard.mjs). Fail-OPEN on any internal error — a guard bug must never wedge the agent.
+ * scripts/backlog-guard.mjs). Fail-CLOSED on internal errors: unknown evidence cannot authorize a write.
  */
 import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
@@ -267,7 +267,7 @@ if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fi
         if (msg) { process.stderr.write('guard-lane: ' + msg + '\n'); process.exit(2); }
       }
     }
-  } catch { /* fail-OPEN: a guard fault must never wedge the agent */ }
+  } catch { process.stderr.write('guard-lane: Trusted judge input protection unavailable; use the operator ceremony.\n'); process.exit(2); }
   process.exit(0);
 }
 

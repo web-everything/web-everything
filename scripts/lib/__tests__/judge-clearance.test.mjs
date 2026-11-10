@@ -51,6 +51,30 @@ function trustedClean() {
   return input;
 }
 
+describe('#5062 audit unknown independence and ratification evidence', () => {
+  it.each(['missing stamp', 'stamp on another comment', 'stamp on an untrusted advisory'])(
+    'refuses reviewer-identity-unknown for the accepted advisory: %s', problem => {
+      const input = clean();
+      expect(decideJudgeClearance(input).allowed).toBe(true);
+      input.pr.comments[0].body = input.pr.comments[0].body.replace(buildClearerActorMarker('reviewer-session'), '');
+      if (problem === 'stamp on another comment') input.pr.comments.push({
+        author: { login: 'github-actions[bot]' }, body: buildClearerActorMarker('other-reviewer'),
+      });
+      if (problem === 'stamp on an untrusted advisory') input.pr.comments.push({
+        ...input.pr.comments[0], author: { login: 'outside-untrusted-account' },
+        body: input.pr.comments[0].body + buildClearerActorMarker('other-reviewer'),
+      });
+      refuses(input, 'independence-unknown', 'reviewer-identity-unknown');
+    });
+  it.each([undefined, null, {}, 'backlog/9001-decision.md'])(
+    'refuses unknown ratification evidence instead of treating it as empty: %j', decisionCardResolves => {
+      const input = { ...clean(), decisionCardResolves };
+      if (decisionCardResolves === undefined) delete input.decisionCardResolves;
+      refuses(input, 'protected-list', 'ratification-evidence-missing');
+      expect(protectedPathsTouched(input)).toEqual({ touched: true, paths: [], detail: 'ratification-evidence-missing' });
+    });
+});
+
 describe('#5062 trusted-evidence refusal coverage', () => {
   const modulePath = resolve(dirname(fileURLToPath(import.meta.url)), '../judge-clearance.mjs');
   const moduleUrl = pathToFileURL(modulePath);
