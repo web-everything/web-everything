@@ -1244,10 +1244,30 @@ export function appendVerdict(record, opts = {}) {
 export function appendVerdictBatch(records, opts = {}) {
   const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
   const results = [];
-  const deferred = []; // { index, record, board }
+  let deferred = []; // { index, record, board }
+  const gitSeam = opts.gitAppend ? { appendRows: opts.gitAppend } : undefined;
+  // Flush the deferred holding rows in ONE push; on a miss flag every one (home rows stay, so each hold stands).
+  const flush = () => {
+    const groups = new Map();
+    for (const d of deferred) {
+      const k = `${d.board}\0${d.record.repo}`;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(d);
+    }
+    deferred = [];
+    for (const group of groups.values()) {
+      const r = appendGitRowsSync(group.map((d) => d.record), { board: group[0].board, repo: group[0].record.repo }, gitSeam);
+      if (r.ok) continue;
+      loud(`verdict-ledger: GIT WRITE MISS (batch of ${group.length}) for ${group[0].record.repo}: ${r.error} — holds still apply; ledger-write-miss`);
+      for (const d of group) {
+        results[d.index] = { ...results[d.index], ledgerWriteMiss: true, git: { status: 'miss', error: r.error } };
+      }
+    }
+  };
   for (const record of records ?? []) {
     const plan = verdictWritePlan(record, opts);
     const index = results.length;
+    let homed = false;
     let step = plan.next();
     while (!step.done) {
       const op = step.value;
@@ -1255,11 +1275,15 @@ export function appendVerdictBatch(records, opts = {}) {
       if (op.name === 'home') {
         try { result = (opts.homeAppend ?? appendVerdictHome)(op.record); }
         catch (e) { result = homeWriteFailure(e); }
+        homed = result?.ok === true;
       } else if (op.name === 'git') {
-        if (!op.board) result = noBoardWriteMiss();
-        else if (!eventClears(op.record)) { deferred.push({ index, record: op.record, board: op.board }); result = { ok: true }; }
-        else result = appendGitRowsSync([op.record], { board: op.board, repo: op.record.repo },
-          opts.gitAppend ? { appendRows: opts.gitAppend } : undefined);
+        // Defer only a HOLDING row whose home row already exists (dual): a git-only row has no home fallback to
+        // fall back on, and a CLEARING row must stay git-first. Both first flush what is queued, so git order = call order.
+        if (op.board && homed && !eventClears(op.record)) { deferred.push({ index, record: op.record, board: op.board }); result = { ok: true }; }
+        else {
+          flush();
+          result = op.board ? appendGitRowsSync([op.record], { board: op.board, repo: op.record.repo }, gitSeam) : noBoardWriteMiss();
+        }
       } else {
         result = { ok: false, appended: 0, error: `plugged store ${op.name} is async; use appendVerdictAsync` };
       }
@@ -1267,20 +1291,7 @@ export function appendVerdictBatch(records, opts = {}) {
     }
     results.push(step.value);
   }
-  // One flush per (board, repo): the transport branch is per repo.
-  const groups = new Map();
-  for (const d of deferred) {
-    const k = `${d.board}\0${d.record.repo}`;
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(d);
-  }
-  for (const group of groups.values()) {
-    const flush = appendGitRowsSync(group.map((d) => d.record), { board: group[0].board, repo: group[0].record.repo },
-      opts.gitAppend ? { appendRows: opts.gitAppend } : undefined);
-    if (flush.ok) continue;
-    loud(`verdict-ledger: GIT WRITE MISS (batch of ${group.length}) for ${group[0].record.repo}: ${flush.error} — holds still apply; ledger-write-miss`);
-    for (const d of group) results[d.index] = { ...results[d.index], ledgerWriteMiss: true };
-  }
+  flush();
   return results;
 }
 
