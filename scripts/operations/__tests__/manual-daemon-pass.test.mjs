@@ -81,6 +81,23 @@ describe('manual-daemon-pass admission and audit', () => {
       expect(dispatchReviewByMode).not.toHaveBeenCalled();
       expect(dispatchReviewJob).not.toHaveBeenCalled();
     });
+  it.each(['fresh', 'resume'])('forwards the recovery-planned red-team mode %s to the red-team job', async redTeamMode => {
+    const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn();
+    const env = {};
+    await dispatchManualPass({ ...input, daemon: 'red-team', expectedHead: sha, redTeamMode }, {
+      env, readHead: async () => sha, load: async () => ({ dispatchReviewByMode, dispatchReviewJob }),
+    });
+    expect(dispatchReviewJob).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env, redTeamOnly: true, expectedHead: sha, redTeamMode });
+  });
+  it.each([['red-team', 'skip'], ['red-team', ''], ['red-team', 'RESUME'], ['review', 'fresh']])(
+    'refuses %s dispatch with redTeamMode %j', async (daemon, redTeamMode) => {
+      const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn();
+      await expect(dispatchManualPass({ ...input, daemon, expectedHead: sha, redTeamMode }, {
+        readHead: async () => sha, load: async () => ({ dispatchReviewByMode, dispatchReviewJob }),
+      })).rejects.toThrow(/invalid redTeamMode/);
+      expect(dispatchReviewByMode).not.toHaveBeenCalled();
+      expect(dispatchReviewJob).not.toHaveBeenCalled();
+    });
   it.each([null, '', 7, 'a'.repeat(41), 'g'.repeat(40)])('refuses malformed expectedHead %s without reading or dispatching', async expectedHead => {
     const dispatchReviewByMode = vi.fn(), dispatchReviewJob = vi.fn(), readHead = vi.fn();
     await expect(dispatchManualPass({ ...input, daemon: 'red-team', expectedHead }, {

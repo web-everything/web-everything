@@ -16,13 +16,16 @@ import { runPrSweepJob } from '../pr-sweep-job.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
 import { sidecarsOf, replay, runOnce, unacknowledged } from '../../operations/needs-you-feed.mjs';
 import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
-import { abandonStaleRedTeamRun } from '../../lib/review-red-team-on-skip.mjs';
+import { abandonStaleRedTeamRun, planRedTeamRecovery } from '../../lib/review-red-team-on-skip.mjs';
+import { readRecoveryWitness } from '../../lib/drain-red-team-evidence.mjs';
 
 // Keep the future default live-dispatch path hermetic as well as the injected seam.
 vi.mock('../../operations/manual-daemon-pass-io.mjs', () => ({ dispatchManualPass: vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 })) }));
 // The default abandonment seam is the shared stale-run abandonment; keep it hermetic but observable.
 vi.mock('../../lib/review-red-team-on-skip.mjs', async importOriginal => ({ ...await importOriginal(),
-  abandonStaleRedTeamRun: vi.fn(() => ({ ok: true })) }));
+  abandonStaleRedTeamRun: vi.fn(() => ({ ok: true })), planRedTeamRecovery: vi.fn(() => ({ mode: 'fresh', abandon: false })) }));
+vi.mock('../../lib/drain-red-team-evidence.mjs', async importOriginal => ({ ...await importOriginal(),
+  readRecoveryWitness: vi.fn(() => ({ ok: true, fixture: 'witness' })) }));
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -891,6 +894,8 @@ describe('R804 restart-only live acceptance', () => {
   afterEach(() => {
     vi.restoreAllMocks(); vi.mocked(dispatchManualPass).mockClear();
     vi.mocked(abandonStaleRedTeamRun).mockClear().mockImplementation(() => ({ ok: true }));
+    vi.mocked(planRedTeamRecovery).mockClear().mockImplementation(() => ({ mode: 'fresh', abandon: false }));
+    vi.mocked(readRecoveryWitness).mockClear().mockImplementation(() => ({ ok: true, fixture: 'witness' }));
   });
 
   it.each([
@@ -1077,10 +1082,16 @@ describe('R804 restart-only live acceptance', () => {
       readRedTeamStatus: () => ({ ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old }),
       probe: { host: owner.host, namespace: owner.pidNamespace, isAlive: () => false, readPidStart: () => owner.pidStart } });
     expect(dispatchManualPass).toHaveBeenCalledTimes(1);
-    expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD });
-    // The default seam abandons the dead owner's run through the shared recovery helper first, as recovery does.
+    expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String),
+      expectedHead: HEAD, redTeamMode: 'fresh' });
+    // The default seams abandon the dead owner's run through the shared recovery helper first, as recovery does, then
+    // dispatch the mode the shared recovery plan names for exactly that witness.
     expect(abandonStaleRedTeamRun).toHaveBeenCalledWith({ repo: REPO, pr: 11, head: HEAD, env: {} });
+    expect(readRecoveryWitness).toHaveBeenCalledWith({ repo: REPO, pr: 11, head: HEAD, env: {} });
+    expect(planRedTeamRecovery).toHaveBeenCalledWith({ ok: true, fixture: 'witness' }, expect.objectContaining({ env: {} }));
     expect(vi.mocked(abandonStaleRedTeamRun).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(planRedTeamRecovery).mock.invocationCallOrder.at(-1));
+    expect(vi.mocked(planRedTeamRecovery).mock.invocationCallOrder.at(-1))
       .toBeLessThan(vi.mocked(dispatchManualPass).mock.invocationCallOrder[0]);
   });
   it.each([true, null])('R804 ownerAlive=%s cannot dispatch a restart', async alive => {

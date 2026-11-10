@@ -183,7 +183,15 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   readStatusAt = ({ repo, pr, head, env }) => statSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`)).mtimeMs,
   probe, judge = judgeRound, dir, log = console.error, force = false, dispatchRestart = dispatchManualPass,
   // Loaded lazily so importers of the sweep keep a light module closure.
-  abandonStaleRun = async key => (await import('../lib/review-red-team-on-skip.mjs')).abandonStaleRedTeamRun(key) } = {}) {
+  abandonStaleRun = async key => (await import('../lib/review-red-team-on-skip.mjs')).abandonStaleRedTeamRun(key),
+  // The shared recovery plan the red-team job's queued admission recomputes: it names the mode (fresh or resume) and
+  // proves a bound abandonment whose rewrite reset the record's silence clock.
+  recoveryPlan = async key => {
+    const [recovery, { readRecoveryWitness }] = await Promise.all([
+      import('../lib/review-red-team-on-skip.mjs'), import('../lib/drain-red-team-evidence.mjs')]);
+    return recovery.planRedTeamRecovery(readRecoveryWitness(key), { now: Date.now(), probe: recovery.recoveryProbe(),
+      deadlineMs: recovery.staleRunDeadlineMs(key.env), env: key.env });
+  } } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
   const cfg = s.value;
   // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
@@ -264,6 +272,13 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
           if (alive !== null && alive !== undefined
             && foreignStaleOwnerDead(status, { host: local.host, namespace: local.namespace, statusAt, now, env,
               isAlive: () => alive, readPidStart: local.readPidStart })) ownerAlive = false;
+          // An earlier restart's abandonment rewrote this record and reset its silence clock. The shared recovery
+          // planner proves a bound abandonment (marker binds this writer and evidence, and the local pid probe holds);
+          // anything it does not admit stays unknown.
+          if (ownerAlive !== false && status.staleAbandoned && sameTable) {
+            const plan = await recoveryPlan({ repo: row.repo, pr: row.number, head, env });
+            if (plan?.abandon === false && ['fresh', 'resume'].includes(plan?.mode)) ownerAlive = false;
+          }
         }
       }
     // Probe failure leaves ownership unknown; preserve classification and shadow records.
@@ -408,7 +423,13 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       // abandon-then-dispatch order the shared stale recovery uses. A refusal spends nothing more and stops the pass.
       const abandoned = await abandonStaleRun({ repo: i.repo, pr: i.pr, head: i.head, env });
       if (abandoned?.ok !== true) throw new Error('stale red-team abandonment refused; operator must inspect');
-      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead });
+      // Dispatch exactly the mode admission will accept: a dead writer with a completed seat resumes, never restarts fresh.
+      const plan = await recoveryPlan({ repo: i.repo, pr: i.pr, head: i.head, env });
+      const redTeamMode = plan?.mode;
+      if (plan?.abandon !== false || !['fresh', 'resume'].includes(redTeamMode)) {
+        throw new Error(`stale red-team recovery not admissible (${msg(plan?.why ?? 'no plan').slice(0, 120)}); operator must inspect`);
+      }
+      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead, redTeamMode });
       if (result?.error || result?.skipped || result?.ok === false) throw new Error(`restart refused: ${msg(result.error ?? result.skipped ?? 'unsuccessful dispatch')}`);
       if (result?.jobPid === null || result?.launched === false || !(result?.launched === true
         || (Number.isSafeInteger(result?.jobPid) && result.jobPid > 0))) {

@@ -57,8 +57,13 @@ export async function dispatchManualPass(input, { env, load = () => import('./re
       throw new Error('manual-daemon-pass: PR head changed; operator must inspect before retrying');
     }
   }
+  // A recovered dead writer is admitted only in the mode its recovery plan names (fresh or resume).
+  if (input.redTeamMode !== undefined && (input.daemon !== 'red-team' || !['fresh', 'resume'].includes(input.redTeamMode))) {
+    throw new Error('manual-daemon-pass: invalid redTeamMode; operator must inspect before retrying');
+  }
   return input.daemon === 'red-team' ? dispatchReviewJob({ ...options, redTeamOnly: true,
-    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }) }) : dispatchReviewByMode(options);
+    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }),
+    ...(input.redTeamMode === undefined ? {} : { redTeamMode: input.redTeamMode }) }) : dispatchReviewByMode(options);
 }
 
 export function createManualDaemonPassSinks({

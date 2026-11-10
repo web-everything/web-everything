@@ -143,6 +143,7 @@ function options(dir, patch = {}) {
       host: 'fixture-host', pidNamespace: 'fixture-ns', pid: 12345, pidStart: 'original-owner', startedAt: OLD }),
     probe: { host: 'fixture-host', namespace: 'fixture-ns', isAlive: () => false, readPidStart: () => 'original-owner' },
     abandonStaleRun: vi.fn(() => ({ ok: true })),
+    recoveryPlan: vi.fn(() => ({ mode: 'fresh', abandon: false })),
     dispatchRestart: vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 })), ...patch };
 }
 
@@ -283,6 +284,32 @@ async function abandonRefusalStops(run, refusal = { ok: false }) {
     .toEqual([[11, 'intent'], [11, 'error']]);
   expect(records(input.dir).find(r => r.phase === 'error').error).toMatch(/abandon.*operator/);
 }
+// Admission recomputes the shared recovery plan and refuses any other mode: a writer with a completed seat resumes.
+async function resumeModeForwarded(run) {
+  const input = options(fixture(), { recoveryPlan: vi.fn(() => ({ mode: 'resume', abandon: false })) });
+  await run(input);
+  expect(input.recoveryPlan).toHaveBeenCalledWith({ repo: REPO, pr: 11, head: HEAD, env: {} });
+  expect(input.dispatchRestart).toHaveBeenCalledWith(expect.objectContaining({ daemon: 'red-team', expectedHead: HEAD, redTeamMode: 'resume' }));
+}
+async function inadmissiblePlanStops(run, plan = { mode: 'skip', why: 'owner live' }) {
+  const input = options(fixture(), { recoveryPlan: vi.fn(() => plan) });
+  const out = await run(input);
+  expect(input.abandonStaleRun).toHaveBeenCalledTimes(1);
+  expect(input.dispatchRestart).not.toHaveBeenCalled();
+  expect(out.incomplete).toBe(true);
+  expect(records(input.dir).find(r => r.phase === 'error').error).toMatch(/recovery not admissible.*operator/);
+}
+// A renamed-host record that an earlier restart abandoned has a fresh mtime; the bound abandonment is still proof.
+async function boundAbandonmentProvesDead(run, plan = { mode: 'fresh', abandon: false }) {
+  const input = options(fixture(), {
+    readRedTeamStatus: ({ pr: number }) => ({ repo: REPO, pr: number, head: HEAD, status: 'running', host: 'host-before-rename',
+      pidNamespace: 'fixture-ns', pid: 12345, pidStart: 'original-owner', startedAt: OLD, staleAbandoned: { at: OLD } }),
+    readStatusAt: () => NOW - 60_000,
+    recoveryPlan: vi.fn(() => plan),
+  });
+  await run(input);
+  return input;
+}
 async function stopAfterError(run) {
   const input = options(fixture(), {
     read: () => ({ now: NOW, prs: [pr(11), pr(12)], liveJobs: [], unreadable: [], stalledAfterMinutes: 45 }),
@@ -319,6 +346,14 @@ const guarantees = [
     'const abandoned = await abandonStaleRun({ repo: i.repo, pr: i.pr, head: i.head, env });', 'const abandoned = { ok: true };'],
   ['a refused abandonment stops the pass without dispatch', run => abandonRefusalStops(run),
     "if (abandoned?.ok !== true) throw new Error('stale red-team abandonment refused; operator must inspect');", ''],
+  ['the recovery-planned resume mode is dispatched', resumeModeForwarded,
+    'expectedHead: i.expectedHead, redTeamMode });', 'expectedHead: i.expectedHead });'],
+  ['an inadmissible recovery plan stops the pass without dispatch', run => inadmissiblePlanStops(run),
+    "if (plan?.abandon !== false || !['fresh', 'resume'].includes(redTeamMode)) {", 'if (false) {'],
+  ['a bound abandonment on a renamed host still proves the owner dead', async run => {
+    const input = await boundAbandonmentProvesDead(run);
+    expect(input.dispatchRestart).toHaveBeenCalledTimes(1);
+  }, "if (plan?.abandon === false && ['fresh', 'resume'].includes(plan?.mode)) ownerAlive = false;", ''],
   ['standard shadow default never executes', shadowDefault,
     "i.action === 'restart-red-team' && cfg.actionModes?.['restart-red-team'] === 'on'", "i.action === 'restart-red-team'"],
 ];
@@ -359,6 +394,18 @@ describe('live restart execution guarantees', () => {
   it.each([['a throw', new Error('status claim busy')], ['no result', undefined], ['a non-true ok', { ok: 'yes' }]])(
     'an abandonment that returns %s stops the pass without dispatch', async (_name, refusal) => {
       await abandonRefusalStops(runStallSweep, refusal);
+    });
+
+  it.each([['abandon still owed', { mode: 'fresh', abandon: true }], ['no plan', undefined], ['an unknown mode', { mode: 'other', abandon: false }]])(
+    'a recovery plan with %s stops the pass without dispatch', async (_name, plan) => {
+      await inadmissiblePlanStops(runStallSweep, plan);
+    });
+
+  it.each([['skip', { mode: 'skip', why: 'abandonment witness changed' }], ['abandon owed', { mode: 'fresh', abandon: true }]])(
+    'a renamed-host abandonment the shared planner does not admit (%s) never dispatches', async (_name, plan) => {
+      const input = await boundAbandonmentProvesDead(runStallSweep, plan);
+      expect(input.abandonStaleRun).not.toHaveBeenCalled();
+      expect(input.dispatchRestart).not.toHaveBeenCalled();
     });
 
   it('global off overrides the explicit live action', async () => {
