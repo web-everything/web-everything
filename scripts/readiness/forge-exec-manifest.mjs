@@ -174,7 +174,13 @@ export function credentialContentFinding(path,content) {
     }
     // A whole-value reference with no continuation line cannot hide a literal.
     if(reference&&!continuation.length)continue;
-    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    // An unquoted value with internal whitespace is a code expression or a sentence, never one opaque secret
+    // (`keys: [index], at: r.at });`). Contiguous and quoted values, and continuation lines above, keep the full rule.
+    // Only source and prose files qualify (never YAML/INI, where `${{ 'literal' }}` is a real leak shape), and a quote
+    // anywhere in the value keeps it scanned (apostrophes are allowed in .md prose only).
+    const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
+      &&!(leaf.endsWith('.md')?/["]/:/["']/).test(trimmed);
+    if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.
       if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
