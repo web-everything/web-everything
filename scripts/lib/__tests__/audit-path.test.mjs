@@ -4,10 +4,11 @@ import { canonicalPaths as canonicalPathsOf, anchorsOf, validateProtectedPattern
 import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern, oracleMatchesPath } from './fixtures/audit-path-old-oracle.mjs';
 
 const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'review-x.mjs', 'docs/', 'guard-*.mjs'];
-// R813(c): P2 is bounded to REAL patterns. The settings load refuses the REFUSED_JUNK subset below (a leading '-' or a '+');
-// the other JUNK shapes are well-formed patterns the validator accepts, so only the P2 rows (not the load) cover them.
+// R813(c): P2 is bounded to REAL patterns. The settings load refuses the REFUSED_JUNK shapes below (a trailing '-', a
+// leading '-' or a '+'); they are listed by hand, and the validator test asserts each one is refused. The other JUNK
+// shapes are well-formed patterns the validator accepts, so only the P2 rows (not the load) cover them.
 const JUNK = ['scripts/x.mjs42', 'scripts/x.mjs-', 'custom/x.mjs42', 'scripts/guard-bash.mjs4', '4-9', 'L3-L9', '1', 'L42', '42-50', '---a/scripts/x.mjs', 'custom/a+b.mjs'];
-const REFUSED_JUNK = JUNK.filter(x => /^-|\+/.test(x));
+const REFUSED_JUNK = ['scripts/x.mjs-', '---a/scripts/x.mjs', 'custom/a+b.mjs'];
 // The anchors argument is required by the module; the tests that mean "no anchors" say so here, once.
 const NO_ANCHORS = new Set();
 const canonicalPaths = (file, anchors = NO_ANCHORS) => canonicalPathsOf(file, anchors);
@@ -194,7 +195,7 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     // Even a hostile report is refused for the missing anchors first, never answered unprotected.
     expect(() => canonicalPathsOf(null)).toThrow(TypeError);
     // A hand-built anchor that can never equal one path segment would switch the protection off silently: refused.
-    for (const a of ['scripts/lib', '*', '', 'a b', 7, null]) expect(() => canonicalPathsOf('repo/scripts/x.mjs', new Set([a])), String(a)).toThrow(TypeError);
+    for (const a of ['scripts/lib', '*', '', 'a b', '.', '..', 7, null]) expect(() => canonicalPathsOf('repo/scripts/x.mjs', new Set([a])), String(a)).toThrow(TypeError);
   });
   it('a caller that passes only the patterns keeps a nested protected path protected (anchorsOf)', () => {
     const anchors = anchorsOf(PATTERNS);
@@ -274,6 +275,7 @@ describe('P2 bounded to real patterns: every tracked path under every past wrapp
     const files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 1 << 28 }).split('\0').filter(Boolean);
     expect(files.length).toBeGreaterThan(100);
     const visited = new Set();
+    let compared = 0;
     const wrappers = [x => x, x => '"' + x + '"', x => "'" + x + "'", x => '\u0060' + x + '\u0060', x => '+++ b/' + x, x => '--- a/' + x, x => x + ':42', x => x + ':4-9', x => x + ':1:2', x => x + '#L42', x => x + '#L3-L9', x => 'repo/' + x, x => ' ' + x + ' ', x => x + '.', x => '-' + x, x => './' + x, x => '"' + x + '":42', x => 'i/' + x];
     for (const f of files) {
       visited.add(f);
@@ -285,11 +287,15 @@ describe('P2 bounded to real patterns: every tracked path under every past wrapp
       for (const w of wrappers) {
         const input = w(f);
         if (!oracleMatchesSome(input, pats)) continue;
+        compared++;
         const c = canonicalPaths(input, anchors);
         const ok = c === null || lower(c).some(x => clean.some(p => oracleMatchesPath(x, p)));
         expect(ok, input).toBe(true);
       }
     }
+    // A wrapper the oracle does not protect is skipped, so a dead oracle or an empty wrapper list would pass vacuously:
+    // the plain wrapper alone is protected for every file, so at least one comparison per tracked path must have run.
+    expect(compared).toBeGreaterThanOrEqual(files.length);
     // The guarantee is every tracked path, not a sample: the visited set must be exactly the tracked set.
     // Compared with a fresh read, so a loop that stopped early (or a list that changed under it) fails here.
     const again = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 1 << 28 }).split('\0').filter(Boolean);

@@ -45,13 +45,15 @@ export function anchorsOf(patterns) {
  * casing cannot switch the protection off. A missing or non-Set `anchors` throws: leaving it out would silently drop
  * the folder-above-the-repo protection (`repo/scripts/x.mjs` would match no `scripts/**` glob), so it is not a default.
  *
+ * The candidates keep the report's casing; a caller matching case-insensitively lower-cases them (and its patterns) itself.
+ *
  * A PATH that ends in punctuation (`.` `-` `_` `/`) or holds a `..` segment is refused: no tracked name does either, and
  * the old matcher's trimmed and joined readings of such a name are not worth chasing one by one.
  */
 export function canonicalPaths(file, anchors) {
   if (!(anchors instanceof Set)) throw new TypeError('canonicalPaths: anchors must be a Set (anchorsOf(patterns), or new Set() for none)');
   // An anchor is compared with one path segment, so `scripts/lib`, `*` or '' could never match and would silently switch the protection off.
-  for (const a of anchors) if (typeof a !== 'string' || !/^[A-Za-z0-9._-]+$/.test(a)) throw new TypeError('canonicalPaths: each anchor must be a single folder name (no "/", "*" or empty), got ' + JSON.stringify(a));
+  for (const a of anchors) if (typeof a !== 'string' || a === '.' || a === '..' || !/^[A-Za-z0-9._-]+$/.test(a)) throw new TypeError('canonicalPaths: each anchor must be a single folder name (no "/", "*" or empty), got ' + JSON.stringify(a));
   if (typeof file !== 'string' || file.length > MAX_AUDIT_PATH) return null;
   const text = file.replace(/^ +| +$/g, '');
   // A leading `word:` reads as a URL scheme (`file:x`, or a top-level `x.mjs:42`): refused, as the old matcher did.
