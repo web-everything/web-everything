@@ -1272,6 +1272,36 @@ describe('red-team machine-body boundary (#5828)', () => {
   });
 
   it.each([
+    ['malformed JSON', '{"redTeam":{"confirmedBreaks":{"degraded":"send-back"', true],
+    ['unreadable directory', undefined, true],
+    ['absent file', undefined, false],
+    ['readable card policy', JSON.stringify({ redTeam: { confirmedBreaks: { degraded: 'card' } } }), false],
+    ['readable send-back policy', JSON.stringify({ redTeam: { confirmedBreaks: { degraded: 'send-back' } } }), true],
+  ])('holds carry for unreadable policy, preserving readable/absent behavior: %s', (kind, contents, hold) => {
+    const dir = mkdtempSync(join(tmpdir(), 'acf-policy-'));
+    const path = kind === 'unreadable directory' ? dir : join(dir, 'red-team.json');
+    const readPolicy = redTeamGate.readConfirmedBreaks;
+    try {
+      if (contents !== undefined) writeFileSync(path, contents);
+      // Other callers retain the historical forgiving reader behavior.
+      if (kind === 'malformed JSON' || kind === 'unreadable directory') {
+        expect(readPolicy({ path, env: {} }).value.degraded).toBe('card');
+      }
+      vi.spyOn(redTeamGate, 'readConfirmedBreaks').mockImplementation(options => readPolicy({ ...options, path }));
+      const metadata = { author: { login: 'web-everything[bot]' } };
+      const combined = `${gate('card-queued')}\n${buildVerdictCarriedMarker({ fromSha: OLD, toSha: NEW, patchId: 'a'.repeat(40) })}\nReview verdict carried across an identical contribution.\n${advisory([finding])}`;
+      for (const body of [advisory([finding]), combined]) {
+        expect(isKnownMachineBody(body, metadata)).toBe(!hold);
+        const record = laterRecord(body, metadata);
+        expect(record.laterVerdict).toBe(hold);
+        expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe(hold ? 'none' : 'carry');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
     ['throws', () => { throw new Error('policy unavailable'); }],
     ['missing', () => undefined],
     ['incomplete', () => ({ value: {} })],

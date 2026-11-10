@@ -206,7 +206,8 @@ function isNonBlockingCarriedVerdict(text, comment, shownHead = null) {
 // Resolve exactly the gate's live policy. Unknown policy requires a fresh review.
 function liveRedTeamAdvisoryPlan(parsed) {
   try {
-    const setting = readConfirmedBreaks()?.value;
+    // A missing policy retains defaults; an unreadable policy cannot prove this advisory is non-blocking.
+    const setting = readConfirmedBreaks({ strict: true })?.value;
     if (parsed.findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return null;
     return planRedTeamActions(parsed, setting);
   } catch { return null; }
