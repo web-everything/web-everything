@@ -406,8 +406,13 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       record({ ...i, ts, phase: 'intent', mode: cfg.mode });
       // The job's queued admission refuses a dead owner's still-running status unless it was abandoned first, the same
       // abandon-then-dispatch order the shared stale recovery uses. A refusal spends nothing more and stops the pass.
+      // A throw (for example a busy status claim) is the same refusal: name it as an abandonment refusal, not a bare cause.
+      try {
       const abandoned = await abandonStaleRun({ repo: i.repo, pr: i.pr, head: i.head, env });
       if (abandoned?.ok !== true) throw new Error('stale red-team abandonment refused; operator must inspect');
+      } catch (e) {
+        throw new Error(/abandonment refused/.test(msg(e)) ? msg(e) : `stale red-team abandonment refused (${msg(e)}); operator must inspect`);
+      }
       const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead });
       if (result?.error || result?.skipped || result?.ok === false) throw new Error(`restart refused: ${msg(result.error ?? result.skipped ?? 'unsuccessful dispatch')}`);
       if (result?.jobPid === null || result?.launched === false || !(result?.launched === true
