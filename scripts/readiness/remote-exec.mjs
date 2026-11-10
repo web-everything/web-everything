@@ -1408,15 +1408,23 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
   } catch {return false;}
 }
 
-/** R817: bounded (500 chars), control-free tail of the Forge run stderr, safe to print and attach. Fail closed: any
- * secret-like keyword or token shape withholds the whole tail rather than trusting line-based masking. */
+/** R817: what the Forge run stderr says, as a fixed vocabulary only. Nothing from stderr is copied through, so a
+ * credential can never reach the returned detail or the gate log (heuristic redaction of free text kept leaking).
+ * Output is the de-duplicated, ordered signals found: node/npm error codes (E...) and known install-failure phrases. */
+const FORGE_FAILURE_SIGNALS=[
+  [/\bE(?:[A-Z0-9]{3,12})\b/g,match=>match], // ENOSPC, EACCES, ETIMEDOUT, EAI_AGAIN, ELOCKVERIFY ...
+  [/npm ci validation failed/i,()=>'npm ci validation failed'],[/npm ci failed/i,()=>'npm ci failed'],
+  [/install[- ]cache/i,()=>'install-cache'],[/\block(?:ed| file)?\b/i,()=>'lock'],[/missing: .* from lock file/i,()=>'lockfile out of sync'],
+  [/no space left on device/i,()=>'no space left on device'],[/permission denied/i,()=>'permission denied'],
+  [/timed? ?out/i,()=>'timed out'],[/network|getaddrinfo|ECONN/i,()=>'network'],
+];
 export function forgeFailureTail(stderr) {
-  const raw=String(stderr??'');
-  const text=raw.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu,' ').replace(/\s+/g,' ').trim();
-  const probe=raw.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\s]+/gu,'');// keywords split by controls/whitespace still match
-  const mixedRun=(text.match(/[A-Za-z0-9+/_=-]{32,}/g)??[]).some(run=>/[a-z]/.test(run)&&/[A-Z]/.test(run)&&/\d/.test(run));
-  if(/auth|cookie|\/\/[^\s/]*@|[?&][a-z_]*(?:key|sig|code)=|token|secret|passw|pwd|api[_-]?key|access[_-]?key|credential|bearer|basic\s|private[_ -]?key|\b(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{4,}|[A-Za-z0-9+_=-]{24,}/i.test(text)||mixedRun||/auth|cookie|passw|token|secret|credential|bearer|privatekey/i.test(probe)) return '[withheld: secret-like content]';
-  return text.slice(-500);
+  const text=String(stderr??'').slice(-20000),found=[];
+  for(const [pattern,label] of FORGE_FAILURE_SIGNALS) {
+    const global=pattern.global?pattern:new RegExp(pattern.source,pattern.flags+'g');
+    for(const match of text.matchAll(global)) {const value=label(match[0]);if(!found.includes(value))found.push(value);}
+  }
+  return (found.join('; ')||'unclassified (stderr not copied)').slice(0,500);
 }
 
 /** R817: the launcher's sentinel codes (install 97, supervisor 254) under the SAME integrity checks as a test receipt; only the phase allow-list widens. */

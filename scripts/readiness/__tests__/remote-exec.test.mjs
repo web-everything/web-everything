@@ -1109,23 +1109,23 @@ describe('runRemote', () => {
   it.each([['install',97,'forge-install-failed'],['supervisor',254,'forge-supervisor-failed']])(
     'R817: a verified %s-phase code-%i receipt is not-started (%s), never unconfirmed', async (phase, code, reason) => {
       const f = fixture({runCode:code, receipt:(_n, value) => JSON.stringify({...value, phase, code})});
-      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason,detail:''});
+      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason,detail:'unclassified (stderr not copied)'});
     });
 
-  it('R817: the failure detail is a bounded, control-free stderr tail that withholds anything secret-like, and is logged', async () => {
-    const stderr = 'x '.repeat(1000)+'\u001b[31mnpm ci failed\u0007 at /opt/forge/cache';
+  it('R817: the failure detail is a fixed-vocabulary classification, never raw stderr, and is logged', async () => {
+    const secrets = ['password=hunter2','Authorization: Bearer abc','ghp_'+'A1b2C3d4'.repeat(3),'https://user:pw@registry.example/x','pass\u200bword=x','tok-en: s3cret','Cookie: a=b'];
+    const stderr = '\u001b[31mnpm ci failed\u0007 ENOSPC: no space left on device, install-cache lock held\n'+secrets.join('\n')+'\n'+'x'.repeat(5000);
     const f = fixture({runCode:97, receipt:(_n, value) => JSON.stringify({...value, phase:'install', code:97})});
     const original = f.exec; const log = vi.fn();
     f.exec = vi.fn(async call => { const r = await original(call); return isRun(call) ? {...r, stderr} : r; });
     const result = await runRemote({...f, log});
     expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-install-failed'});
     expect(result.detail.length).toBeLessThanOrEqual(500);
-    expect(result.detail).toContain('npm ci failed at /opt/forge/cache'.replace('failed at','failed '+'at'));
-    expect(result.detail).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(result.detail).toBe('ENOSPC; npm ci failed; install-cache; lock; no space left on device');
+    for (const secret of secrets) { expect(result.detail).not.toContain(secret.slice(0, 8)); }
     expect(log).toHaveBeenCalledWith('forge install failed: '+result.detail+'\n');
-    expect(remoteManifestAPI.forgeFailureTail('a\u200bb\u202ec\u2028d\u0085e')).toBe('a b c d e');
-    for (const secret of ['password=hunter2','Authorization: Bearer abc','token=\n\nshortSecret123','token=\rshortSecret123','password="a\nb\nc\nSECRET"','ghp_'+'A1b2C3d4'.repeat(3),'aB3/dE5+fG7hJ9kL1mN3pQ5rS7tU9vW1xYz','-----BEGIN PRIVATE KEY-----','pass\u200bword=x','to\nken=y','fetch https://user:pw@registry.example/x','Cookie: a=b','GET /p?sig=abc','abcdefghijklmnopqrstuvwx'])
-      expect(remoteManifestAPI.forgeFailureTail('npm ERR! '+secret+'\nmore')).toBe('[withheld: secret-like content]');
+    expect(remoteManifestAPI.forgeFailureTail('weird unknown text '.repeat(500))).toBe('unclassified (stderr not copied)');
+    expect(remoteManifestAPI.forgeFailureTail(undefined)).toBe('unclassified (stderr not copied)');
   });
 
   it.each([
@@ -2035,7 +2035,7 @@ describe('receipt field binding', () => {
       baseline = {...v};
       return JSON.stringify({...v,phase:'install'});
     }})))
-      .toEqual({mode:'not-started',terminated:true,reason:'forge-install-failed',detail:''});
+      .toEqual({mode:'not-started',terminated:true,reason:'forge-install-failed',detail:'unclassified (stderr not copied)'});
     expectValidReceipt(baseline);
   });
 });
