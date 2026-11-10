@@ -8,7 +8,7 @@ import { LIVE_OWNER_DEFAULTS, processLive } from './pr-live-owner-watch.mjs';
 import { handoffHome } from '../lib/handoff-path.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
-import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { acquireLiveOwnerWatchLock } from './pr-live-owner-lock.mjs';
 
@@ -64,7 +64,7 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
   const overlays = await import('../lib/daemon-overlays.mjs');
   const adoption = await import('../lib/overlay-adoption.mjs');
   const clones = await import('../lib/daemon-clone-registry.mjs');
-  const repo = env.GH_REPO || 'web-everything/web-everything';
+  const repo = env.GH_REPO || CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
   const repoKey = repoKeyForSlug(repo);
   if (!repoKey) throw Error('unregistered repo; operator inspection required');
   const dir = env.WE_LIVE_OWNER_WATCH_DIR || join(home, 'workspace', '.operations', 'pr-live-owner-watch');

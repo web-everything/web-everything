@@ -119,8 +119,11 @@ import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
-import { probeLiveOwnerWatch } from './pr-live-owner-watch.mjs';
-export { probeLiveOwnerWatch };
+// Keep the watchdog's IO behind its probe boundary, outside the lane-action helper inventory.
+export async function probeLiveOwnerWatch(options) {
+  const { probeLiveOwnerWatch: probe } = await import('./pr-live-owner-watch.mjs');
+  return probe(options);
+}
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
 import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, publishCoronerFailure, coronerNightDue } from './nightly-coroner-job.mjs';
