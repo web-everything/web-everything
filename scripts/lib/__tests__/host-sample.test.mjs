@@ -5,6 +5,12 @@ import { join } from 'node:path';
 import { parseTopIdle, parseMemoryFree, readHostSample, sampleHost } from '../host-sample.mjs';
 
 describe('host sample', () => {
+  it('single CPU line remains valid unless two intervals are required', () => {
+    const options = { platform: 'darwin', exec: command => command === 'top'
+      ? 'CPU usage: 1% user, 1% sys, 98% idle\n' : '' };
+    expect(readHostSample(options)).toMatchObject({ ok: true, idlePct: 98 });
+    expect(readHostSample({ ...options, requireTwoIntervals: true })).toMatchObject({ ok: false, idlePct: null });
+  });
   it('parses the last top CPU line and memory_pressure', () => {
     expect(parseTopIdle('CPU usage: 1% user, 1% sys, 98.0% idle\nCPU usage: 41.2% user, 42.0% sys, 16.8% idle \n')).toBe(16.8);
     expect(parseTopIdle('garbage')).toBeNull();

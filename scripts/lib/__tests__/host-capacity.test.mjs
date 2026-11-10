@@ -8,6 +8,10 @@ import { applyRedTeamQueueFloor, loadRedTeamQueueFloor, raiseReviewStartsPerTick
 
 const native = vi.hoisted(() => ({ exec: vi.fn() }));
 vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal(), execFileSync: native.exec }));
+vi.mock('../host-sample.mjs', async importOriginal => {
+  const original = await importOriginal();
+  return { ...original, readHostSample: options => original.readHostSample({ ...options, exec: native.exec }) };
+});
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 afterEach(() => {
   Object.defineProperty(process, 'platform', platformDescriptor);
@@ -63,6 +67,17 @@ describe('class capacity floors', () => {
 });
 
 describe('window and source selection', () => {
+  it.each([0, 1, 2])('default direct sampling requires two top CPU lines (received %s)', count => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    native.exec.mockReset().mockImplementation(command => command === 'top'
+      ? 'CPU usage: 1% user, 1% sys, 98% idle\n'.repeat(count)
+      : 'System-wide memory free percentage: 86%');
+    const read = () => evidence(40, 4096, { history: () => [], sample: undefined });
+    const reading = read();
+    if (count < 2) expect(reading.error).toBe('invalid direct CPU sample');
+    else expect(reading).toMatchObject({ idlePct: 98, source: 'direct', memFreeGB: 4 });
+    expect(admit('review', { settings, read }).admit).toBe(count >= 2);
+  });
   it('averages the window so a last-sample spike cannot admit', () => {
     const read = () => evidence(40, 4096, { history: () => [row(100, 100), row(0, 80), row(0, 40), row(25)] });
     expect(read().idlePct).toBeCloseTo(25 / 3);
@@ -154,11 +169,36 @@ describe('settings evidence failures', () => {
     expect(loadCapacitySettings({ env: {}, readFile: missing })).toMatchObject({ idlePct: { review: 10 }, minMemoryMb: 2048 });
     expect(admit('review', { env: {}, readFile: missing, read: () => ({ idlePct: 100, memFreeGB: 8 }) }).admit).toBe(true);
   });
-  it('invalid individual settings preserve stricter floors', () => {
+  it('invalid individual settings hold despite stricter floors', () => {
     const readFile = () => JSON.stringify({ hostCapacity: { minMemoryMb: 'bad', windowSec: -1,
       idlePct: { review: 'bad', build: 30 } } });
-    expect(loadCapacitySettings({ env: { WE_HOST_CAPACITY_BUILD_IDLE_PCT: 'bad' }, readFile }))
-      .toMatchObject({ minMemoryMb: 2048, windowSec: 90, idlePct: { review: 10, build: 30 } });
+    expect(() => loadCapacitySettings({ env: { WE_HOST_CAPACITY_BUILD_IDLE_PCT: 'bad' }, readFile }))
+      .toThrow('host-capacity settings unreadable');
+    expect(admit('review', { env: {}, readFile, read: () => ({ idlePct: 100, memFreeGB: 8 }) }).admit).toBe(false);
+  });
+  it.each(['windowSec', 'maxFreshSec', 'minMemoryMb'].flatMap(key =>
+    [0, -1, null, '90', true, [], {}, 1e309].map(value => ({ key, value }))))('invalid $key=$value holds before reading capacity', ({ key, value }) => {
+    const readFile = () => `{"hostCapacity":{${JSON.stringify(key)}:${value === Infinity ? '1e309' : JSON.stringify(value)}}}`;
+    expect(() => loadCapacitySettings({ env: {}, readFile })).toThrow('host-capacity settings unreadable');
+    const read = vi.fn();
+    expect(admit('review', { env: {}, readFile, read })).toMatchObject({ admit: false,
+      reason: expect.stringContaining('host-capacity settings unreadable') });
+    expect(read).not.toHaveBeenCalled();
+  });
+  it.each(CLASSES.flatMap(cls => [-1, 101, null, '30', true, [], {}, 1e309].map(value => ({ cls, value }))))('invalid idlePct.$cls=$value holds', ({ cls, value }) => {
+    const readFile = () => `{"hostCapacity":{"idlePct":{${JSON.stringify(cls)}:${value === Infinity ? '1e309' : JSON.stringify(value)}}}}`;
+    expect(() => loadCapacitySettings({ env: {}, readFile })).toThrow('host-capacity settings unreadable');
+    expect(admit('review', { env: {}, readFile, read: () => ({ idlePct: 100, memFreeGB: 8 }) }).admit).toBe(false);
+  });
+  it('absent keys use defaults and unknown idle classes are ignored', () => {
+    const readFile = () => JSON.stringify({ hostCapacity: { idlePct: { typo: 'bad' } } });
+    expect(loadCapacitySettings({ env: {}, readFile })).toMatchObject({ windowSec: 90, maxFreshSec: 90,
+      minMemoryMb: 2048, idlePct: { blocker: 5, review: 10, smoke: 15, build: 15, background: 25 } });
+  });
+  it.each([0, 100])('valid idle boundary %s and invalid env preserve the configured floor', value => {
+    const readFile = () => JSON.stringify({ hostCapacity: { idlePct: { review: value } } });
+    expect(loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: 'bad' }, readFile }).idlePct.review)
+      .toBe(Math.max(10, value));
   });
 });
 

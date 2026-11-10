@@ -8,7 +8,7 @@ import { dirname, resolve } from 'node:path';
 import * as os from 'node:os';
 import { resourcePaths } from './resource-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { sampleHost } from './host-sample.mjs';
+import { sampleHost, readHostSample } from './host-sample.mjs';
 import { readHostMemoryReading } from './host-load.mjs';
 
 export const CLASSES = Object.freeze(['blocker', 'review', 'smoke', 'build', 'background']);
@@ -16,7 +16,7 @@ const DEFAULT_IDLE = Object.freeze({ blocker: 5, review: 10, smoke: 15, build: 1
 const validIdle = n => Number.isFinite(n) && n >= 0 && n <= 100;
 const numericEnv = n => typeof n === 'string' && n.trim() !== '' ? Number(n) : NaN;
 
-/** Settings can tighten standard floors; invalid values retain the preceding safe value. */
+/** Settings can tighten standard floors; invalid file values hold, invalid env overrides are ignored. */
 export function loadCapacitySettings({ env = process.env, readFile = readFileSync,
   file = resolve(dirname(fileURLToPath(import.meta.url)), '../settings/host-capacity.json'), log = () => {} } = {}) {
   let data;
@@ -28,6 +28,16 @@ export function loadCapacitySettings({ env = process.env, readFile = readFileSyn
       throw Error('invalid settings shape');
     }
     data = parsed.hostCapacity;
+    for (const key of ['windowSec', 'maxFreshSec', 'minMemoryMb']) {
+      if (Object.hasOwn(data, key) && (!Number.isFinite(data[key]) || data[key] <= 0)) {
+        throw Error(`invalid ${key}`);
+      }
+    }
+    for (const cls of CLASSES) {
+      if (data.idlePct && Object.hasOwn(data.idlePct, cls) && !validIdle(data.idlePct[cls])) {
+        throw Error(`invalid idlePct.${cls}`);
+      }
+    }
   } catch (error) {
     if (error.code !== 'ENOENT') throw Error('host-capacity settings unreadable', { cause: error });
   }
@@ -64,7 +74,9 @@ function readHistory({ root, env, readFile = readFileSync }) {
 
 /** Returns measured evidence or an explicit unknown; never substitutes load average for CPU. */
 export function readCapacity({ settings, env = process.env, root,
-  history = readHistory, readFile, sample = sampleHost, memory = options => readHostMemoryReading(options).mb ?? NaN,
+  history = readHistory, readFile,
+  sample = options => sampleHost({ ...options, read: () => readHostSample({ requireTwoIntervals: true }) }),
+  memory = options => readHostMemoryReading(options).mb ?? NaN,
   now = Date.now, load = os.loadavg, cores = () => os.cpus().length } = {}) {
   let source = 'unknown'; let idlePct = null; let memFreeGB = null;
   let loadAvg = null; let loadPerCore = null;
