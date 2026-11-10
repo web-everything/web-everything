@@ -29,7 +29,7 @@ const expectShipped=async path=>{
   expect(names(manifest.excluded)).not.toContain(path);
 };
 const assertPolicy=(path,content,reason)=>{
-  const bytes=Buffer.from(content),blocked=secretText.some(([,rule])=>rule===reason);
+  const bytes=Buffer.from(content),blocked=!/^(?:high-entropy|secret-assignment)-/.test(reason);
   expect(credentialContentFinding(Buffer.from(path),bytes)).toBe(blocked?reason:null);
   if(!blocked)expect(credentialContentWarning(Buffer.from(path),bytes)).toBe(reason);
   return blocked;
@@ -79,7 +79,7 @@ describe('credential-name rule (R321)',()=>{
       expect(source,path).toBeDefined();expect(alias,path).toMatchObject({sha256:source.sha256,tracked:false,sourcePath:Buffer.from(path)});
     }
   },30000);
-  it('admits the generic corpus, blocks the Rust fine-grained PAT sample, and retains the missing-test fallback',async()=>{
+  it('admits readable generic evidence, blocks token samples, and retains the missing-test fallback',async()=>{
     const repo=fileURLToPath(new URL('../../../',import.meta.url));
     const inventory=await exec({file:'git',args:['ls-files','-z'],cwd:repo});
     expect(inventory.code).toBe(0);
@@ -91,7 +91,7 @@ describe('credential-name rule (R321)',()=>{
       const bytes=await fs.readFile(join(repo,p));
       if(credentialContentFinding(Buffer.from(p),bytes))refused.push(p);
     }
-    expect(refused).toEqual(['scripts/rust-scan/src/secret_scrub.rs']);
+    expect(refused).toEqual(['scripts/__tests__/secret-scrub.test.mjs','scripts/rust-scan/src/secret_scrub.rs']);
     // The fallback itself stays covered by a synthetic refused test file, header assembled at run time.
     const refusedTest='scripts/__tests__/token-sample.test.mjs';
     await write(refusedTest,`// ${'-----'+'BEGIN PRIVATE KEY-----'}\n`);
@@ -256,13 +256,13 @@ describe('content secret scan',()=>{
     'admits an explicit non-JSON placeholder: %s',value=>{
       expect(credentialContentFinding(Buffer.from('credentials.txt'),Buffer.from('password='+value))).toBe(null);
     });
-  it('warns and ships credentials.json containing invalid UTF-8 password bytes',async()=>{
+  it('rejects credentials.json containing invalid UTF-8 password bytes',async()=>{
     const bytes=Buffer.concat([Buffer.from('{"password":"'),Buffer.from(Array.from({length:24},(_,i)=>0xff-i)),Buffer.from('"}')]);
     await write('credentials.json',bytes);await git(['add','.']);await commit();
-    await expectShipped('credentials.json');
-    expect(credentialContentWarning(Buffer.from('credentials.json'),bytes)).toBe('unsupported-text-encoding');
-    expect(designTokenSecretFinding(bytes)).toBeNull();
-    expect(()=>manifestEntry(Buffer.from('credentials.json'),bytes,false,true)).not.toThrow();
+    await expectExcluded('credentials.json');
+    expect(credentialContentWarning(Buffer.from('credentials.json'),bytes)).toBeNull();
+    expect(designTokenSecretFinding(bytes)).toBe('unsupported-text-encoding');
+    expect(()=>manifestEntry(Buffer.from('credentials.json'),bytes,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
   });
   it.each([
     ['PEM','-----'+'BEGIN PRIVATE KEY-----','pem-header'],
@@ -285,9 +285,9 @@ describe('content secret scan',()=>{
   it.each([
     ['UTF-16LE',Buffer.from('password: q8Zr2LmX9vT4pW7kJ1nB5cY3','utf16le')],
     ['invalid UTF-8',Buffer.from([0xff,0xfe,0x61])],
-  ])('warns on unsupported %s text encoding',(_label,bytes)=>{
-    expect(credentialContentFinding(Buffer.from('credentials.txt'),bytes)).toBeNull();
-    expect(credentialContentWarning(Buffer.from('credentials.txt'),bytes)).toBe('unsupported-text-encoding');
+  ])('blocks unsupported %s text encoding',(_label,bytes)=>{
+    expect(credentialContentFinding(Buffer.from('credentials.txt'),bytes)).toBe('unsupported-text-encoding');
+    expect(credentialContentWarning(Buffer.from('credentials.txt'),bytes)).toBeNull();
   });
   it('does not mistake task- or disk-prefixed prose for an sk token',()=>{
     for(const value of ['task-abcdefghijklmnopqrstuvwxyz','disk-abcdefghijklmnopqrstuvwxyz'])expect(credentialContentFinding(Buffer.from('token.md'),Buffer.from(value))).toBe(null);
@@ -335,22 +335,22 @@ describe('content secret scan',()=>{
 
 describe('R857 exact credential formats',()=>{
   const cases=[
-    ['pem-header','-----'+'BEGIN RSA PRIVATE KEY-----','Discuss a private key; -----'+'BEGIN CERTIFICATE-----'],
-    ['github-token','ghp_'+'a'.repeat(36),'ghp_'+'a'.repeat(35)],
+    ['pem-header','-----'+'BEGIN RSA PRIVATE KEY-----','ordinary public documentation'],
+    ['github-token','ghp_'+'a'.repeat(20),'ghp_'+'a'.repeat(19)],
     ['github-token','github_pat_'+'a1_'.repeat(8),'github_pat_'+'a'.repeat(21)],
     ['aws-access-key','AKIA'+'A'.repeat(16),'AKIA'+'A'.repeat(15)],
-    ['aws-access-key','ASIA'+'A'.repeat(16),'ASIA'+'A'.repeat(17)],
-    ['sk-token','sk-'+'a'.repeat(32),'sk-'+'css-class-name'],
-    ['sk-token','sk-ant-'+'a'.repeat(20),'sk-ant-'+'css-name'],
-    ['slack-token','xoxb-'+'a'.repeat(10),'xoxb-'+'a'.repeat(9)],
+    ['aws-access-key','ASIA'+'A'.repeat(16),'ASIA'+'A'.repeat(15)],
+    ['sk-token','sk-'+'a'.repeat(16),'sk-'+'css-class-name'],
+    ['sk-token','sk-ant-'+'a'.repeat(20),'sk-ant-short'],
+    ['slack-token','xoxb-'+'a'.repeat(8),'xoxb-'+'a'.repeat(7)],
     ['google-api-key','AIza'+'a'.repeat(35),'AIza'+'a'.repeat(34)],
     ['npm-token','npm_'+'a'.repeat(36),'npm_'+'a'.repeat(35)],
   ];
   it.each(cases)('blocks exact %s, and rejects its near miss %#',(rule,positive,negative)=>{
     const pattern=secretText.find(([,name])=>name===rule)[0];
     expect(pattern.test(positive)).toBe(true);
-    for(const prefix of ['_', '-'])expect(credentialTextFinding(prefix+positive)).toBe(rule);
-    if(rule!=='pem-header')expect(credentialTextFinding('a'+positive)).toBeNull();
+    for(const prefix of ['_', '-'])expect(credentialTextFinding(prefix+positive)).toBe(rule==='sk-token'&&prefix==='_'?null:rule);
+    if(rule!=='sk-token')expect(credentialTextFinding('a'+positive)).toBe(rule);
     expect(pattern.test(negative)).toBe(false);
     expect(credentialTextFinding(negative)).toBeNull();
     for(const path of ['credentials.txt','tokens.json']) {
@@ -359,21 +359,21 @@ describe('R857 exact credential formats',()=>{
     }
   });
   it.each('pousr'.split(''))('blocks GitHub prefix gh%s at the exact minimum',kind=>{
-    expect(credentialTextFinding(`gh${kind}_`+'a'.repeat(36))).toBe('github-token');
+    expect(credentialTextFinding(`gh${kind}_`+'a'.repeat(20))).toBe('github-token');
   });
   it.each('abprs'.split(''))('blocks Slack prefix xox%s at the exact minimum',kind=>{
-    expect(credentialTextFinding(`xox${kind}-`+'a'.repeat(9)+'1')).toBe('slack-token');
+    expect(credentialTextFinding(`xox${kind}-`+'a'.repeat(7)+'1')).toBe('slack-token');
   });
   it.each(['-----'+'BEGIN PRIVATE KEY BLOCK-----','-----'+'BEGIN OPENSSH PRIVATE KEY-----'])(
     'blocks private-key header variant %#',value=>expect(credentialTextFinding(value)).toBe('pem-header'));
   it.each(['private key','PRIVATE KEY','-----'+'BEGIN','prefix'+githubToken])(
-    'admits prose and tokens preceded by an alphanumeric prefix %#',value=>expect(credentialTextFinding(value)).toBeNull());
+    'blocks private-key markers and prefixed tokens %#',value=>expect(credentialTextFinding(value)).toBe(value.startsWith('-----')?'pem-header':value.startsWith('prefix')?'github-token':'private-key'));
   it.each(['.env','.env.local','.netrc','.npmrc','x.pem','id_rsa','x.key','x.p12','x.pfx','x.jks','x.keystore',
     '.ＥＮＶ.local. ','X.PEM ','id_\u200brsa'])(
     'recognizes normalized secret-file component %s',name=>{
       expect(secretFileName(classifyManifestPath(Buffer.from(name)).names[0])).toBe(true);
     });
-  it.each(['.claude','.private','credentials','token.md','keynote.md','x.pem.md','env.txt'])(
+  it.each(['.claude','.private','keynote.md','x.pem.md','env.txt'])(
     'does not treat generic component %s as a secret filename',name=>expect(secretFileName(name)).toBe(false));
   it('finds a decoded format after an earlier generic JSON warning, including duplicate fields',()=>{
     const escaped=[...githubToken].map(c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0')).join('');
@@ -381,9 +381,9 @@ describe('R857 exact credential formats',()=>{
     expect(credentialContentWarning(Buffer.from('token.json'),content)).toBe('high-entropy-password');
     expect(credentialContentFinding(Buffer.from('token.json'),content)).toBe('github-token');
   });
-  it.each(['{"value":','"public"'])('warns without blocking invalid/non-object JSON %#',content=>{
-    expect(credentialContentFinding(Buffer.from('token.json'),Buffer.from(content))).toBeNull();
-    expect(credentialContentWarning(Buffer.from('token.json'),Buffer.from(content))).toBe(content.endsWith(':')?'unparseable-json':'non-object-json');
+  it.each(['{"value":','"public"'])('blocks invalid/non-object JSON %#',content=>{
+    expect(credentialContentFinding(Buffer.from('token.json'),Buffer.from(content))).toBe(content.endsWith(':')?'unparseable-json':'non-object-json');
+    expect(credentialContentWarning(Buffer.from('token.json'),Buffer.from(content))).toBeNull();
   });
   it('blocks ASCII formats even inside unsupported encodings',()=>{
     const content=Buffer.concat([Buffer.from([0xff,0]),Buffer.from(githubToken)]);

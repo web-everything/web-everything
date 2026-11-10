@@ -228,6 +228,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
     const hit = await flushCommits(); if (hit) return hit;
   }
   const tokens = splitNul(bytes(log.stdout));
+  const excludedWarnings = [];
   const blobs = new Map(); // sha -> Map(path key -> {label, path}): the policy scan is path-dependent, so EVERY path adding a blob is scanned
   let pathCount = 0;
   for (let i = 0; i < tokens.length; i++) {
@@ -253,7 +254,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
     let policy;
     try { policy = classifyManifestPath(path); } catch { throw bundleError('bundle-credential-scan-failed'); }
     if (policy.names.some(secretFileName)) return { path: label, finding: 'excluded-path' };
-    if (policy.excluded) warnings.push({ path: label, finding: 'excluded-path' });
+    if (policy.excluded) excludedWarnings.push({ path: label, finding: 'excluded-path' });
     // A directory entry carries no blob: its name was scanned and classified above, its files are read under their own paths.
     if (newMode === '040000') continue;
     const paths = blobs.get(newSha) ?? new Map();
@@ -263,7 +264,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
     if (blobs.size > maxBlobs || pathCount > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
   }
   const shas = [...blobs.keys()];
-  if (!shas.length) return null;
+  if (!shas.length) { warnings.push(...excludedWarnings); return null; }
   const check = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], shas.join('\n') + '\n');
   if (check.code !== 0) throw bundleError('bundle-credential-scan-failed');
   const sizes = new Map(); let total = 0;
@@ -304,7 +305,9 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
     if (batchBytes + sizes.get(sha) > SCAN_BATCH_BYTES) { const hit = await flush(); if (hit) return hit; }
     batch.push(sha); batchBytes += sizes.get(sha);
   }
-  return flush();
+  const hit = await flush();
+  if (!hit) warnings.push(...excludedWarnings);
+  return hit;
 }
 
 /** R559: 'fresh' only when the runner reported the mirror's main age and it is within the bound. */

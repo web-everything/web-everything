@@ -1017,11 +1017,15 @@ describe('warm-base tick',()=>{
     return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs,runs:join(root,'slots'),receipts:join(root,'receipts')}};
   }
   it('warmTick excludes flagged public files with secret-like content and matches full/delta inventories',async()=>{
-    const token='ghp_'+'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8';
+    const token='ghp_'+'A1b2C3d4E5f6G7h8I9j0K';
     const refused={
       'token-patterns.mjs':`const sample = "${token}";`,
       'credentials.yaml':`password: ${token}`,
-      'token-utf16.txt':Buffer.from(`password: ${token}`,'utf16le'),
+      'token-utf16.txt':Buffer.from('public contents','utf16le'),
+      'token-invalid.json':'{',
+      'token-array.json':'[]',
+      'token-nul.txt':'public\0',
+      'token-invalid-utf8.txt':Buffer.from([255]),
     };
     for(const [path,bytes] of Object.entries(refused))await fs.writeFile(join(repo,path),bytes);
     const generic='password: q8Zr2LmX9vT4pW7kJ1nB5cY3';

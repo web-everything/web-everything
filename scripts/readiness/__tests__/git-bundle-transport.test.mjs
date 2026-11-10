@@ -237,11 +237,11 @@ describe('R593 credential scan over the whole bundled range (R559)', () => {
     const head = await commit(lane, { 'notes.md': 'clean\n' }, 'scrub');
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'notes.md', finding: 'github-token' });
   });
-  it('warns on a credential-named path', async () => {
+  it('blocks a credential-named path', async () => {
     const head = await commit(lane, { 'credentials.txt': 'x\n' }, 'cred');
     const warnings=[];
-    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, warnings })).toBeNull();
-    expect(warnings).toContainEqual({path:'credentials.txt',finding:'excluded-path'});
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, warnings })).toEqual({path:'credentials.txt',finding:'excluded-path'});
+    expect(warnings).toEqual([]);
   });
   const tokenName = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
   it('flags a token in a FILE NAME (tree entry) even when the content is clean', async () => {
@@ -353,12 +353,12 @@ describe('R593 content scanner parity with the rsync path (R559)', () => {
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, warnings })).toBeNull();
     expect(warnings).toContainEqual({path:'config.ini',finding:'secret-assignment-password'});
   });
-  it('warns on a binary historical blob', async () => {
+  it('blocks a binary historical blob', async () => {
     await fs.writeFile(join(lane, 'blob.bin'), Buffer.from([0xff, 0xfe, 0x00, 0x80]));
     git(lane, 'add', '--', 'blob.bin'); git(lane, ...ident, 'commit', '-q', '-m', 'bin');
     const warnings=[];
-    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec, warnings })).toBeNull();
-    expect(warnings).toContainEqual({path:'blob.bin',finding:'unsupported-text-encoding'});
+    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec, warnings })).toEqual({path:'blob.bin',finding:'unsupported-text-encoding'});
+    expect(warnings).toEqual([]);
   });
 });
 
@@ -565,7 +565,7 @@ describe('R857 advisory bundle credential policy',()=>{
     ['cloneKey.json',JSON.stringify({cloneKey:'q8Zr2LmX9vT4pW7kJ1nB5cY3'}),'high-entropy-cloneKey'],
     ['config.txt','GIT_CONFIG_KEY_0=q8Zr2LmX9vT4pW7kJ1nB5cY3','high-entropy-GIT_CONFIG_KEY_0'],
     ['notes.md','key: q8Zr2LmX9vT4pW7kJ1nB5cY3','high-entropy-key'],
-    ['.claude/notes.md','ordinary private key documentation','excluded-path'],
+    ['.claude/notes.md','ordinary documentation','excluded-path'],
     ['.other/notes.md','ordinary notes','excluded-path'],
   ])('plans a Forge bundle for %s with a warning',async(path,content,finding)=>{
     await fs.mkdir(join(lane,path,'..'),{recursive:true});

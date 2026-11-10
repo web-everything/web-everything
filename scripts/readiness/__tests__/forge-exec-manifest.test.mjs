@@ -101,9 +101,11 @@ describe('credentialContentFinding GitHub Actions references', () => {
     expect(scan(content)).not.toBeNull();
   });
 
-  it('warns on a continuation longer than the scan bound instead of passing it', () => {
+  it('blocks a continuation longer than the scan bound for local fallback', () => {
     const lines = Array.from({ length: 300 }, () => '  x').join('\n');
-    expect(scan(`private-key: \${{ secrets.X }}\n${lines}\n`)).toBe('unbounded-continuation-private-key');
+    const content=Buffer.from(`private-key: \${{ secrets.X }}\n${lines}\n`);
+    expect(credentialContentFinding(path,content)).toBe('unbounded-continuation-private-key');
+    expect(credentialContentWarning(path,content)).toBeNull();
   });
 
   it('warns on a literal continuation led by a non-breaking space after a reference', () => {

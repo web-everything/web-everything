@@ -77,7 +77,7 @@ function normalizedComponent(part) {
     .replace(/\p{Cf}/gu, '').replace(/[. ]+$/u, '').toLowerCase();
 }
 // The caller supplies the normalized policy view of one path component.
-export const secretFileName = component => /^\.(?:env.*|netrc|npmrc)$/.test(component) || keyComponent.test(component);
+export const secretFileName = component => /^\.(?:env.*|netrc|npmrc)$/.test(component) || keyComponent.test(component) || credentialComponent.test(component);
 function excludedComponent(name, leaf, allowCredential = false) {
   // Admit ordinary accented Latin names (e.g. é) but fail closed on remaining
   // non-ASCII forms: no incomplete hand-maintained confusable substitution map.
@@ -102,13 +102,14 @@ function excludedComponent(name, leaf, allowCredential = false) {
 // unsafe for other reasons (key files, dotfiles, .env, non-ASCII) never qualify.
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 export const secretText=[
-  [/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/,'pem-header'],
-  [/(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b/,'github-token'],
-  [/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}\b/,'aws-access-key'],
-  [/(?<![A-Za-z0-9])(?:sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{32,})/,'sk-token'],
-  [/(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}/,'slack-token'],
-  [/(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}\b/,'google-api-key'],
-  [/(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}\b/,'npm-token'],
+  [/-----BEGIN/,'pem-header'],
+  [/PRIVATE KEY/i,'private-key'],
+  [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
+  [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
+  [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
+  [/xox[abprs]-[A-Za-z0-9-]{8,}/,'slack-token'],
+  [/AIza[0-9A-Za-z_-]{35}/,'google-api-key'],
+  [/npm_[A-Za-z0-9]{36}/,'npm-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
@@ -136,7 +137,7 @@ const physicalTail=/[^\r\n]*/y;
 const continuationRe=new RegExp(`[${lineBreaks}]([\\t ]*)([^${lineBreaks}]*)`,'y');
 const maxContinuationLines=256;
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
-// line that is not. Returns null when more than maxContinuationLines remain (caller warns).
+// line that is not. Returns null when more than maxContinuationLines remain (caller blocks).
 function continuationLines(text,from,indent) {
   const lines=[];
   continuationRe.lastIndex=from;
@@ -147,13 +148,18 @@ function continuationLines(text,from,indent) {
   }
   return lines;
 }
-// R857: only exact credential formats block. Generic evidence is advisory.
+// Credential formats and unreadable evidence block. Readable generic evidence is advisory.
 export function credentialContentFinding(path,content) {
-  // An encoding warning must never hide a credential in another decoded view.
+  // Unreadable bytes must never hide a credential in another decoded view.
   const raw=credentialBufferFinding(content);
   if(raw)return raw;
+  let text;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
+  if(text.includes('\0'))return 'unsupported-text-encoding';
   const leaf=classifyManifestPath(path).names.at(-1);
-  return /\.json$/.test(leaf)?designTokenSecretFinding(content):null;
+  if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
+  const finding=assignmentFinding(text);
+  return finding?.startsWith('unbounded-continuation-')?finding:null;
 }
 // Field names are diagnostic data too; never echo a credential-bearing or unbounded name.
 const findingField=field=>textFinding(field)||field.length>80?`field-sha256-${sha(field).slice(0,12)}`:field;
@@ -161,8 +167,12 @@ export function credentialContentWarning(path,content) {
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content,{warnings:true});
   let text;
-  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
-  if(text.includes('\0'))return 'unsupported-text-encoding';
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return null;}
+  if(text.includes('\0'))return null;
+  const finding=assignmentFinding(text);
+  return /^(?:high-entropy|secret-assignment)-/.test(finding??'')?finding:null;
+}
+function assignmentFinding(text) {
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This advisory heuristic is not a parser for arbitrary formats.
   for(const match of text.matchAll(assignmentLine)) {
@@ -202,21 +212,21 @@ export function credentialContentWarning(path,content) {
 // Scan decoded JSON literals as well as raw text; duplicate keys remain visible.
 export function designTokenSecretFinding(content,{warnings=false}={}) {
   let text;
-  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return warnings?'unsupported-text-encoding':textFinding(content.toString('latin1'));}
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return warnings?null:credentialBufferFinding(content)??'unsupported-text-encoding';}
   if(!warnings) {
     const raw=textFinding(text);
     if(raw)return raw;
-    // Inspect even a non-object or malformed document before issuing its warning.
+    // Inspect decoded literals too, including duplicate fields and malformed documents.
     for(const [literal] of text.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
       let value;try {value=JSON.parse(literal);} catch {continue;}
       const decoded=textFinding(value);if(decoded)return decoded;
     }
-    return null;
   }
-  if(text.includes('\0'))return 'unsupported-text-encoding';
+  if(text.includes('\0'))return warnings?null:'unsupported-text-encoding';
   let json;
-  try {json=JSON.parse(text);} catch {return 'unparseable-json';}
-  if(!json||typeof json!=='object'||Array.isArray(json))return 'non-object-json';
+  try {json=JSON.parse(text);} catch {return warnings?null:'unparseable-json';}
+  if(!json||typeof json!=='object'||Array.isArray(json))return warnings?null:'non-object-json';
+  if(!warnings)return null;
   // Scan every string literal in the raw bytes, decoded, in order. JSON.parse
   // keeps only the last duplicate property, so its object view is never used.
   // A secret-named field taints every string nested under it (arrays, objects).

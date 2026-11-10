@@ -308,10 +308,10 @@ it('R857 refuses an unclassifiable bundle path instead of downgrading unknown ev
     ['data.json', '{', 'unparseable-json'],
     ['data.json', '[]', 'non-object-json'],
     ['note.txt', Buffer.from([255]), 'unsupported-text-encoding'],
-    ['note.txt', 'public\0', 'unsupported-text-encoding'],
+    ['note.txt', Buffer.from('public\0'), 'unsupported-text-encoding'],
     ['.claude/note.txt', Buffer.from([255]), 'unsupported-text-encoding'],
     ['.claude/note.txt', '-----'+'BEGIN', 'pem-header'],
-  ])('blocks unsafe content in %s (%s)', async (path, content, finding) => {
+  ])('blocks unsafe content case %#', async (path, content, finding) => {
     write(path, content); commit('add content');
     expect(await scan()).toEqual({path,finding});
   });
