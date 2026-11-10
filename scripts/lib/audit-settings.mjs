@@ -103,7 +103,11 @@ const FLOOR_SETTINGS = Object.freeze([
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
   // Read by card-dedupe.mjs and citation-check.mjs.
-  'scripts/settings/card-dedupe.json', 'scripts/conveyor/flows/build-dispatch.flow.json']);
+  'scripts/settings/card-dedupe.json', 'scripts/conveyor/flows/build-dispatch.flow.json',
+  // Read by card-number-ledger.mjs (landed on main since).
+  'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
+  // Read by a floor module (landed on main since).
+  'scripts/settings/daemon-tasks.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
  * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
@@ -159,7 +163,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.mjs', 'scripts/lib/archive-closed-review-runs.mjs',
   'scripts/lib/reap-dead-review-runs.mjs', 'scripts/lib/run-abandoned.mjs',
   // Landed on main since: the daemon world capsule writer (an exclusive `wx` create).
-  'scripts/lib/daemon-rebuild/world-capsule.mjs']);
+  'scripts/lib/daemon-rebuild/world-capsule.mjs',
+  // Landed on main since: the daemons page renderer (an exclusive create).
+  'scripts/operations/daemons-render-io.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
@@ -193,11 +199,10 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/resolve-runner-checkout.mjs', 'scripts/conveyor/resource-sampler-daemon.mjs',
   'scripts/conveyor/session-watchdog.mjs', 'scripts/conveyor/soak/breaks/lease-reaper-borrowed-fixer-pid-invisible.mjs',
   'scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.mjs', 'scripts/conveyor/stand-down-auto-proceed-io.mjs',
-  'scripts/held-cards-io.mjs', 'scripts/lane-drain.mjs', 'scripts/lib/card-group.mjs',
+  'scripts/held-cards-io.mjs', 'scripts/lane-drain.mjs', 'scripts/lib/card-group.mjs', 'scripts/lib/card-number-ledger.mjs',
   'scripts/lib/daemon-clone-lock.mjs', 'scripts/lib/daemon-item-tasks.mjs', 'scripts/lib/daemon-jobs-runtime.mjs',
   'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
   'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
-  'scripts/lib/daemon-self-sync.mjs',
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
   'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/pr-limit.mjs', 'scripts/lib/pr-snapshot.mjs',
