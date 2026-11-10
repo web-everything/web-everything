@@ -1382,6 +1382,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(reply.phase==='install' && result.code===97)return {mode:'unconfirmed',reason:'ambiguous-result',infraFailure:'install-failed'};
       if (argv[2] === 'check:standards') {
         observeStandards(result.stdout ?? '', 'stdout');
         observeStandards(result.stderr ?? '', 'stderr');
@@ -1421,7 +1422,7 @@ export function verifyReceipt(text, expected, code) {
         && Number.isSafeInteger(receipt.resources.slotCpus)&&receipt.resources.slotCpus>=1))
       && (!Object.hasOwn(receipt,'timings') || (!!receipt.timings && Object.keys(receipt.timings).sort().join(',')==='installMs,runMs' && [receipt.timings.installMs,receipt.timings.runMs].every(ms=>Number.isSafeInteger(ms)&&ms>=0)))
       && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)
-      && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
+      && (receipt.phase==='test' || (receipt.phase==='install' && code===97)) && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
   } catch {return false;}
 }
 

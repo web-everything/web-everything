@@ -4109,3 +4109,35 @@ job/lock outcomes, including persisted request retention. `daemon-self-sync-muta
 requires failed/refused mutations to remain pending and retry on the next tick; only a completed
 mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.
+
+### Forge enforcement
+
+`heavyAdmission.remote.backoffFailures` (3) and `backoffMs` (600000, ten minutes)
+now control the existing infrastructure breaker as well as telemetry backoff. They resolve
+through the existing standard → platform → tool → environment policy rules (host-shared
+settings reject per-process overrides outside private pools); `formatAdmissionPolicy` logs
+values and sources. Unreachable, missing executable, SSH/transport, timeout, copy and
+installation failures count. Ordinary test exits, bundle credential refusals and
+command-not-allowed never count. A late completion cannot close an already open breaker.
+Persisted older infra backoffs with a threshold failure count migrate to open, preserving
+their deadline. After the deadline one mutex-claimed canary runs; other callers fall back
+locally with `forge-breaker-open`. A passing canary closes it; a failed canary reopens it.
+The five-minute half-open lease permits recovery if the claimant dies.
+
+Run `node scripts/readiness/forge-canary.mjs --json --trigger=on-demand` for the fixed,
+credential-free node:test fixture through Forge's existing exec/receipt path. Other triggers
+are `breaker-half-open`, `forge-setup`, and `overlay-adopt`. Setup invokes it non-fatally.
+The runner command contract allows only that exact node command, never arbitrary node code.
+Events append to `forge-canary.jsonl` in the admission lock root. A failed recent canary,
+sustained infra fallback window, or low heavy-minute share raises `forge-down`, including
+in shadow mode, and prints `FORGE-DOWN <summary>` in watch output. Missing/corrupt evidence
+also alerts as UNKNOWN with an instruction to restore the histories; it never reports healthy.
+The probe uses bounded existing JSONL tail reads; a truncated tail without window coverage
+alerts as incomplete. `remote.forgeDownMinutes` (15, positive minutes ≤1440),
+`remote.forgeDownShare` (0.3, >0 and ≤1), and `remote.forgeDownMinRuns` (5, integer 1–100000)
+use the same policy cascade and provenance. Heavy-minute share reads local completion durations
+from `durations.jsonl`, since fallback rows contain no duration. Its window is fixed at 60 minutes.
+
+Outage evidence includes `forge-breaker-open` fallback rows: they extend an infrastructure
+outage even when no runs complete. Keep this probe-specific classification separate from
+execution failures that increment the breaker; a refusal is not another failed execution.
