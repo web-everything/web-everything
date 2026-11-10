@@ -309,7 +309,8 @@ describe('R473 pure classified verdict', () => {
       ['custom/a_b.mjs', ['custom/a\\_b.mjs']],
       // fix-6381 self-review: `_` emphasis, a name holding a space, a name ending in a dot.
       ['custom/ab.mjs', ['_custom/ab.mjs_:12', '_custom/ab.mjs_', '*custom/ab.mjs*:12']],
-      ['custom/a b.mjs', ['"custom/a b.mjs"', 'custom/a b.mjs:12', '+++ b/custom/a b.mjs', 'custom/a%20b.mjs', 'see `custom/a b.mjs` here']],
+      ['custom/a b.mjs', ['"custom/a b.mjs"', 'custom/a b.mjs:12', '+++ b/custom/a b.mjs', 'custom/a%20b.mjs', 'see `custom/a b.mjs` here',
+        'custom/a\\ b.mjs', 'custom/a\\ b.mjs:12', '"custom/a\\ b.mjs"']],
       ['custom/a.', ['"custom/a."', 'custom/a.:12', '`custom/a.`']]])('a protected %j stays WEAKENED in every wrapper', async (guard, files) => {
       for (const file of files) {
         expect((await compute([finding({ class: 'E2', file })], options('prerelease'), trustedLayer({ guardFloorPaths: [guard] }))).verdict, file).toBe('WEAKENED');

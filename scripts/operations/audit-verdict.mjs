@@ -175,14 +175,17 @@ function pathCandidates(file, anchors = new Set()) {
   for (const text of new Set([file, unescapeAscii(file)])) if (!addCandidates(text, anchors, out)) return null;
   return [...out];
 }
-/** ASCII-only decoding of the escapes a model writes inside a name: `%XX`, numeric HTML entities, a markdown `\` escape. */
+/**
+ * ASCII-only decoding of the escapes a model writes inside a name: `%XX`, numeric HTML entities, a markdown `\` escape,
+ * and a shell-escaped space (`custom/a\ b.mjs`; fix-6381 self-review: the `\` was read as `/` and the space was lost).
+ */
 const unescapeAscii = s => s
   .replace(/%([0-7][0-9A-Fa-f])/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
   .replace(/&#(?:[xX]([0-9A-Fa-f]{1,2})|(\d{1,3}));/g, (m, h, d) => {
     const n = h ? parseInt(h, 16) : Number(d);
     return n < 0x80 ? String.fromCharCode(n) : m;
   })
-  .replace(/\\([!-/:-@[-`{-~])/g, '$1');
+  .replace(/\\([ !-/:-@[-`{-~])/g, '$1');
 /** Adds every candidate `file` yields to `out`; false when the report cannot be established (callers fail closed). */
 function addCandidates(file, anchors, out) {
   // PR #6381 referral (block): a character that NFKC keeps split the folded token, so an explicitly named module
