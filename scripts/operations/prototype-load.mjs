@@ -139,7 +139,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   if (list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
     // An unparsable time cannot place the record outside its window, so it is judged by the hash's own expiry alone
     // (fail closed, matching a current-question record, which blocks whatever its time).
-    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(r.at)) ? r.at : undefined }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
+    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(text(r.at))) ? r.at : undefined }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
   // Round 6: a carried head's PRIOR-question WEAKENED that findAudit would accept on its own can be hidden by an unusable
   // current-question record for the same head+base (findAudit lets even an unusable current record block the prior
   // fallback, which is right for a PASS but fail-open for a NEGATIVE verdict). Such a record keeps vetoing, judged by
@@ -152,8 +152,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
   const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
-    const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
-    if (carriedWeak.some((d) => !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
+    const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(text(d.record.at))));
+    if (carriedWeak.some((d) => !(Date.parse(text(d.record.at)) < ownAt))) return { ok: false, reason: 'weakened' };
   }
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
@@ -163,7 +163,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     // eligibility dropped it (no or differing fingerprint): judge against ALL records, fail closed.
     if (record.questionHash !== QUESTION_HASH
       && list.some((r) => r?.head === record.head && r.base === base && r.questionHash === QUESTION_HASH)) continue;
-    if (covered(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
+    if (covered(base) && (!pass || Date.parse(text(record.at)) >= Date.parse(text(pass.at)))) pass = record;
   }
   return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };
 }

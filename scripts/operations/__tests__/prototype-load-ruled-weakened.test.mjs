@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { readyEvidence, mergeRuledWeakened } from '../prototype-load.mjs';
+import { readyEvidence, mergeRuledWeakened, refusal } from '../prototype-load.mjs';
 
 const REF = 'lane/example-fix';
 const SHA = 'a'.repeat(40);
@@ -125,6 +125,13 @@ describe('ruledWeakened union of platform and tool layers', () => {
       expect(() => readyEvidence([record({ audit: v })], input, [entry()])).not.toThrow();
       expect(readyEvidence([record({ audit: v })], input, [entry()])).toBeNull();
     }
+  });
+  it('refusal ignores hostile non-string at/kind/event/type without throwing', () => {
+    const hostile = JSON.parse('{"toString":null}');
+    const rows = [{ ref: REF, at: hostile, kind: 'removed' }, { ref: REF, at: '2026-01-02T00:00:00Z', kind: hostile, event: hostile, type: ['removed'] }];
+    expect(() => refusal(rows, REF, 0)).not.toThrow();
+    expect(refusal(rows, REF, 0)).toBeUndefined();
+    expect(refusal([{ ref: REF, at: '2026-01-02T00:00:00Z', kind: hostile, event: 'dropped' }], REF, 0)).toBeDefined();
   });
   it('tolerates non-array layers', () => {
     expect(mergeRuledWeakened(undefined, 'x')).toEqual([]);
