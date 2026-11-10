@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/readiness/__tests__/heavy-admission-remote-client.test.mjs",
-      "brokenSha": "7d2bf85aa30399987b4859fadeaa55857294a8d3",
-      "owner": "lane/main-fix-remote-client-override",
-      "reason": "wall-clock race: 100ms provenance deadline on loaded CI shard; not a #6618 regression",
-      "addedAt": 1794275101573,
-      "expiresAt": 1794361501573
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
