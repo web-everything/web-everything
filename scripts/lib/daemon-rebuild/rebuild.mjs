@@ -193,7 +193,17 @@ async function rebuildCloneInternal({
   // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
-  if (vctx) return versionedRebuild({ ctx: vctx, log });
+  if (vctx) {
+    // Versioned builds take no clone lease to renew while queued, but their live smoke
+    // shares the same host capacity and deadline as an unversioned candidate.
+    const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
+    try {
+      if (!slot.acquired) return { moved: false, reason: 'smoke-queue-timeout' };
+      return await versionedRebuild({ ctx: vctx, log });
+    } finally {
+      await slot.release();
+    }
+  }
   // daemonRebuild.skipUnrelated (default on): `skipCheck` is injectable; else built from the daemon's `entries`.
   // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
   // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.

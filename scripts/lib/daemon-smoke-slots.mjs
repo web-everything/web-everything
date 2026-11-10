@@ -20,7 +20,13 @@ const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-s
 
 function setting(env, log, key, envKey, fallback, ceiling = Infinity) {
   let tool;
-  try { tool = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'))?.[key]; } catch { /* default */ }
+  try { tool = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'))?.[key]; }
+  catch {
+    if (key === 'smokeMaxConcurrent') {
+      log.error?.('daemon-live-smoke: smokeMaxConcurrent=1 (settings read/parse failure) — inspect daemon-rebuild-settings.json before retrying');
+      return 1;
+    }
+  }
   const raw = env[envKey];
   const override = raw === undefined ? undefined : /^\d+$/.test(raw) ? Number(raw) : NaN;
   // Invalid layers are ignored independently: env → configured settings → default.

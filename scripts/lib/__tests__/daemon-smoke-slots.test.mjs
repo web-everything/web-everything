@@ -15,6 +15,7 @@ import * as smoke from '../daemon-rebuild/smoke.mjs';
 import * as rebuildState from '../daemon-rebuild/state.mjs';
 import * as leases from '../daemon-rebuild/lease.mjs';
 import * as adoptions from '../overlay-adoption.mjs';
+import * as versionRuntime from '../daemon-version-runtime.mjs';
 
 const settings = { value: undefined };
 
@@ -46,6 +47,63 @@ async function wake() {
 }
 
 describe('daemon smoke slots', () => {
+  it.each(['unreadable', 'unparseable'])('fails closed to cap 1 when bundled settings are %s', async failure => {
+    const read = fs.readFileSync.getMockImplementation();
+    fs.readFileSync.mockImplementation((path, ...args) => {
+      if (!String(path).endsWith('/daemon-rebuild-settings.json')) return read(path, ...args);
+      if (failure === 'unreadable') throw new Error('settings read denied');
+      return '{';
+    });
+    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '2' };
+    const holder = await acquire(11, { env });
+    let time = 0;
+    const next = await acquire(12, { env: { ...env, WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1' },
+      now: () => time, sleep: async ms => { time += ms; } });
+    expect(next.acquired).toBe(false);
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('smokeMaxConcurrent=1 (settings read/parse failure)'));
+    await holder.release();
+  });
+
+  it.each([false, true])('versioned rebuild holds the host slot and releases on completion (throws=%s)', async throws => {
+    vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
+    const result = { moved: false, reason: 'smoke-failed' };
+    const versions = { clone: stateDir };
+    const versioned = vi.spyOn(versionRuntime, 'versionedRebuild').mockImplementation(async ({ ctx }) => {
+      expect(ctx).toBe(versions);
+      expect(state().holders.map(e => e.pid)).toEqual([process.pid]);
+      if (throws) throw new Error('versioned smoke failure');
+      return result;
+    });
+    const rebuilding = rebuildClone({ root: stateDir, versions, asJob: false, readyOnly: true,
+      env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir }, log, emitEvent: vi.fn() });
+    if (throws) await expect(rebuilding).rejects.toThrow('versioned smoke failure');
+    else expect(await rebuilding).toBe(result);
+    expect(versioned).toHaveBeenCalledTimes(1);
+    expect(state().holders).toEqual([]);
+    expect(state().waiters).toEqual([]);
+  });
+
+  it('versioned rebuild times out without building, then retries after host capacity is released', async () => {
+    settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 3001 };
+    const holder = await acquire(process.pid);
+    vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
+    const versioned = vi.spyOn(versionRuntime, 'versionedRebuild').mockResolvedValue({ moved: true });
+    let time = 0;
+    const options = { root: stateDir, versions: { clone: stateDir }, asJob: false, readyOnly: true,
+      env: {}, stateOpts: { env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir } }, log, emitEvent: vi.fn(),
+      now: () => time, sleep: async ms => { time += ms; } };
+    expect(await rebuildClone(options)).toEqual({ moved: false, reason: 'smoke-queue-timeout' });
+    expect(time).toBe(3001);
+    expect(versioned).not.toHaveBeenCalled();
+    expect(state().holders.map(e => e.pid)).toEqual([process.pid]);
+    expect(state().waiters).toEqual([]);
+    await holder.release();
+    expect(await rebuildClone(options)).toEqual({ moved: true });
+    expect(versioned).toHaveBeenCalledTimes(1);
+    expect(state().holders).toEqual([]);
+  });
+
   it('awaits onWait on every occupied poll, including when queue position is unchanged', async () => {
     settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 5000 };
     const holder = await acquire(11);
