@@ -1826,7 +1826,7 @@ it('wires each review sweep and disk probe into tick and publishes distinct open
   const ps = join(dir, 'ps.txt'); writeFileSync(ps, '');
   const flags = { 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
     'self-sync-dir': join(dir, 'sync'), 'ps-fixture': ps, 'tmp-sweep-root': dir,
-    'no-gh': true, 'no-diagnose': true };
+    'no-gh': true, 'no-forge-feed': true, 'no-diagnose': true };
   sweepReviewTmp.mockClear(); probeDiskSpace.mockClear();
   sweepReviewTmp.mockReturnValue({ directories: 0, files: 0, bytesFreed: 0, busy: 0, errors: 0 });
   probeDiskSpace.mockReturnValue({ freeGb: 9 });
