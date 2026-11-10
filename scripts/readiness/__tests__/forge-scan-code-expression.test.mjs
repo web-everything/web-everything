@@ -49,6 +49,9 @@ describe('credentialContentFinding whitespace-exemption boundaries', () => {
     ['backtick in markdown', 'notes.md', ':', `say \`${literal} with spaces\``],
     ['double quote in markdown', 'notes.md', ':', `say "${literal}" now`],
     ['single-quoted literal in markdown', 'notes.md', ':', `say '${literal}' now`],
+    ['single-quoted spaced credential in markdown', 'notes.md', ':', "'aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY'"],
+    ['backticked spaced credential in markdown', 'notes.md', ':', '`aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY`'],
+    ['spaced credential embedded in markdown prose', 'notes.md', ':', "use 'aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY' here"],
   ])('flags: %s', (_name, path, sep, value) => {
     expect(scan(`signing_key${sep} ${value}\n`, path)).toBe(flagged);
   });
@@ -56,6 +59,7 @@ describe('credentialContentFinding whitespace-exemption boundaries', () => {
   it.each([
     ['source expression', 'x.mjs', 'keys: [index], at: r.at, action });'],
     ['markdown prose with an apostrophe', 'notes.md', "key: it's a short note about the config surface"],
+    ['short markdown code span', 'notes.md', 'key: `foo bar`'],
     // The original Forge fallback line; it comes from a markdown file, where backticks are code spans.
     ['markdown prose with code spans (the original fallback line)', 'notes.md', 'key=value` config surface (`codex exec --help`, or grep the installed binary)'],
     ['markdown prose with code spans', 'notes.md', 'key: see `codex exec --help` or grep the installed binary for it'],
