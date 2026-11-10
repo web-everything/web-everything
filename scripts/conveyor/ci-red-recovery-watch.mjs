@@ -62,7 +62,7 @@ import { dirname, join, resolve } from 'node:path';
 import { linkSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
@@ -72,7 +72,9 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   realRequiredFailures, retryOutcome, wrongSpentStandDowns, buildResolvedSpentComment,
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
-import { pushMissingRunCommit } from './missing-run-push.mjs';
+import { ownerInstallationToken, pushMissingRunCommit } from './missing-run-push.mjs';
+import { recoveryPreflight } from './recovery-preflight.mjs';
+import { installationForOwner, ownerOfSlug } from '../lib/github-app-installations.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -89,7 +91,7 @@ import {
   classifyCiFailureAttribution, countRebaseOntoMainComments, buildRebaseOntoMainComment,
   DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   DEFAULT_REQUIRED_CONTEXTS, DEFAULT_MISSING_RUN_THRESHOLD_MS, DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA,
-  buildMissingRunCandidates, planMissingRunRecoveries, countMissingRunComments, buildMissingRunComment,
+  buildMissingRunCandidates, isStartupFailure, planMissingRunRecoveries, countMissingRunComments, buildMissingRunComment,
   DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, failingRequiredCheckForAttribution, isAnyRequiredCheckFailed,
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
   mainLatestGreenShaForCheck, isMainGreenFixOwed, classifyMainDefect, classifierNeedsComments, isMainLatestCheckGreen, isMainFixedSignatureOwed,
@@ -1151,6 +1153,70 @@ export function triggerCiForPr(d, options = {}) {
   return pushMissingRunCommit(d, options);
 }
 
+/** Read current PR eligibility independently of the shared listing. Unknowns
+ * remain unknown so the pure admission gate refuses them. */
+export function defaultReadRecoveryPr(d, { repo, exec = execFileSyncThrottled } = {}) {
+  try {
+    return JSON.parse(exec('gh', ['pr', 'view', String(d.prNumber), '--repo', repo,
+      '--json', 'state,baseRefName,isCrossRepository,mergeable,headRefOid,headRefName'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }));
+  } catch { return null; }
+}
+
+/** Use the same owner-bound credential provenance as the writer. A missing
+ * environment credential gets one bounded auth read, never a guessed identity. */
+export function defaultReadRecoveryCredential({ repo, exec = execFileSyncThrottled,
+  env = process.env, readCache, now = Date.now() } = {}) {
+  try {
+    const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
+    const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh',
+      ['auth', 'token', '--hostname', 'github.com'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024,
+        timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', env,
+      })).trim();
+    return { token, env: ownerToken ? { ...env,
+      WE_GH_AUTH_INSTALLATION: String(installationForOwner(ownerOfSlug(repo), env)),
+      WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(token).digest('hex'),
+    } : env };
+  } catch { return { token: null, env }; }
+}
+
+/** One bounded head read; incomplete evidence keeps the cap and human/ci-heal fallback. */
+export function defaultReadHeadRuns({ repo, headSha, exec = execFileSyncThrottled } = {}) {
+  try {
+    const runs = JSON.parse(exec('gh', ['api',
+      `repos/${repoSlug(repo)}/actions/runs?head_sha=${headSha}&per_page=100`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }));
+    if (!Number.isSafeInteger(runs.total_count) || runs.total_count < 0 || runs.total_count >= 100
+      || !Array.isArray(runs.workflow_runs) || runs.workflow_runs.length !== runs.total_count) return null;
+    return runs.workflow_runs;
+  } catch { return null; }
+}
+
+/** Two bounded reads per admitted push candidate, with no pagination or guessed
+ * empty result. A full page may be truncated: hand off to human/ci-heal instead.
+ */
+export function defaultReadRecoveryEvidence(d, {
+  repo, requiredContexts, exec = execFileSyncThrottled,
+} = {}) {
+  try {
+    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
+    const live = JSON.parse(exec('gh', ['pr', 'view', String(d.prNumber), '--repo', repo,
+      '--json', 'headRefOid,statusCheckRollup'], opts));
+    const runs = JSON.parse(exec('gh', ['api',
+      `repos/${repo}/actions/runs?head_sha=${d.headSha}&per_page=100`], opts));
+    if (live.headRefOid !== d.headSha || !Array.isArray(live.statusCheckRollup)
+      || !Number.isSafeInteger(runs.total_count) || runs.total_count < 0 || runs.total_count >= 100
+      || !Array.isArray(runs.workflow_runs) || runs.workflow_runs.length !== runs.total_count) return null;
+    return { requiredContexts, rollup: live.statusCheckRollup, workflowRuns: runs.workflow_runs };
+  } catch { return null; }
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultPostMissingRunComment — post the durable marker comment
  * ({@link buildMissingRunComment}) after EVERY missing-run trigger attempt, success or failure — mirrors
@@ -1328,9 +1394,10 @@ export function restackStackedPr(d, {
  * shape and injectability exactly — every reader/writer is injectable so the whole sweep is exercisable with no
  * network and no credential.
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
- *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
+ *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function, readHeadRuns?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
- *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps only ruleset-only candidates across SHAs.
+ *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps plain-absent ruleset candidates across SHAs;
+ *   startup-failure admission counts only current-head attempts.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepMissingRunRecovery({
@@ -1342,6 +1409,9 @@ export function sweepMissingRunRecovery({
   readAttributedRequiredChecks = readRequiredContexts === defaultReadRequiredContexts
     ? defaultReadAttributedRequiredChecks : readRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
+  readRecoveryEvidence = defaultReadRecoveryEvidence, readHeadRuns = defaultReadHeadRuns,
+  readRecoveryPr = defaultReadRecoveryPr, readRecoveryCredential = defaultReadRecoveryCredential,
+  checkClaim = pushRefusal,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
@@ -1369,6 +1439,26 @@ export function sweepMissingRunRecovery({
   const classicCandidateNumbers = new Set(buildMissingRunCandidates(prs, {
     requiredContexts: requiredContexts ?? null, stalledPartialContexts,
   }).map(c => c.prNumber));
+  // Isolate the startup-failure expansion against the SAME required context set,
+  // including ruleset checks. Plain-absent #5060 candidates keep their call path.
+  // Treat startup failures as reported for classification only, including
+  // workflow-only evidence; admission still reads the unmodified live evidence.
+  const legacyCandidateNumbers = new Set();
+  for (const pr of Array.isArray(prs) ? prs : []) {
+    const legacyPr = {
+      ...pr,
+      workflowRuns: Array.isArray(pr?.workflowRuns)
+        ? pr.workflowRuns.map(run => isStartupFailure(run) ? { ...run, conclusion: 'success' } : run)
+        : pr?.workflowRuns,
+      statusCheckRollup: Array.isArray(pr?.statusCheckRollup)
+        ? pr.statusCheckRollup.map(row => isStartupFailure(row) ? { ...row, conclusion: 'FAILURE' } : row)
+        : pr?.statusCheckRollup,
+    };
+    for (const c of buildMissingRunCandidates([legacyPr], {
+      requiredContexts: requiredContexts ?? null,
+      stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
+    })) legacyCandidateNumbers.add(c.prNumber);
+  }
   const rawCandidates = (Array.isArray(prs) ? prs : []).flatMap(pr => buildMissingRunCandidates([pr], {
     requiredContexts: requiredContexts ?? null,
     stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
@@ -1398,10 +1488,20 @@ export function sweepMissingRunRecovery({
     candidates, now, thresholdMs, maxRetriesPerSha,
   });
   const attemptsByPr = new Map(candidates.map(c => [c.prNumber, c.triggerAttemptsForPr]));
+  const candidateByPr = new Map(candidates.map(c => [c.prNumber, c]));
   plan.dispatch = plan.dispatch.filter(d => {
     if (classicCandidateNumbers.has(d.prNumber)) return true;
+    // Startup failures get the current head's budget, already bounded by the planner.
+    // Keep the cross-head cap for the original plain-absent ruleset candidates.
+    if (!legacyCandidateNumbers.has(d.prNumber)) return true;
     const attempts = attemptsByPr.get(d.prNumber) ?? 0;
     if (attempts < maxRetriesPerPr) return true;
+    // Open-PR listings omit workflow runs. Check only otherwise capped heads for
+    // startup failures; the planner has already enforced the per-SHA cap.
+    try {
+      const runs = readHeadRuns({ repo: repoSlug(repo), headSha: d.headSha });
+      if (Array.isArray(runs) && runs.some(isStartupFailure)) return true;
+    } catch { /* Unknown evidence keeps the refusal and its operator fallback. */ }
     plan.refusals.push({ ...d, kind: 'missing-run-pr-cap-exhausted', attempts,
       why: `PR #${d.prNumber} already had ${attempts} missing-run trigger attempt(s) across all head SHAs (cap ${maxRetriesPerPr}) — needs human/ci-heal inspection` });
     return false;
@@ -1413,6 +1513,34 @@ export function sweepMissingRunRecovery({
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;
+      if (!legacyCandidateNumbers.has(d.prNumber)) {
+        const c = candidateByPr.get(d.prNumber);
+        let admission;
+        try {
+          const slug = repoSlug(repo);
+          const pr = readRecoveryPr(d, { repo: slug });
+          const held = checkClaim({ repo: slug, branch: d.headRefName });
+          const credential = readRecoveryCredential({ repo: slug, now });
+          admission = recoveryPreflight({
+            repo: slug, head: d.headSha, headRefName: d.headRefName, defaultBranch, pr,
+            recoveryEvidence: readRecoveryEvidence(d, {
+              repo: slug, requiredContexts: defaultBasePartialContexts,
+            }),
+            claimed: held === null ? false : true,
+            token: credential?.token, env: credential?.env,
+            attemptsForSha: c?.triggerAttemptsForSha, attemptsForPr: c?.triggerAttemptsForSha,
+            maxRetriesPerSha, maxRetriesPerPr,
+          });
+        } catch {
+          admission = { allow: false, reason: 'recovery preflight inputs unreadable; needs human/operator or ci-heal inspection' };
+        }
+        if (!admission.allow) {
+          plan.refusals.push({ ...d, kind: 'missing-run-preflight-refused', why: admission.reason });
+          applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
+            ok: false, action: 'pull-request-push', deferred: true, labelCleared: false, error: admission.reason });
+          continue;
+        }
+      }
       const result = stacked
         ? restack(d, { prs, repo, defaultBranch, readIsCrossRepository, root: resolveLanePoolRepoPath(repo) ?? REPO_ROOT })
         : trigger(d, { repo: repoSlug(repo), defaultBranch });

@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { keepAliveScript, spawnKeepAlive } from '../test-keepalive.mjs';
 
 import {
-  JOB_ATTEMPT_ENV, JOB_ID_ENV, createJobStore, enqueueJob, hostName, launchJob, localHostAliases, probeHandle, readProcStart,
+  JOB_ATTEMPT_ENV, JOB_ID_ENV, confirmHandleAbsent, createJobStore, enqueueJob, hostName, launchJob, localHostAliases, probeHandle, readProcStart,
   reapDeadGroup, reattachTick, runJob, selfHandle, stopHandle,
 } from '../daemon-jobs-runtime.mjs';
 import { defineJobKind, kindRegistry, markClaimed, markLaunching, markSucceeded } from '../daemon-jobs.mjs';
@@ -225,6 +225,84 @@ describe('reattachTick', () => {
     return store.update(id, (r) => markClaimed(r, { at: heartbeatAt, handle: HANDLE, host: 'h', pid: 99, procStart: 'x' }));
   };
   const noLaunch = () => null;
+
+  it.each([
+    ['pid gone', 'h', null, 0, false, 1, 'dead', 'requeue', 'queued'],
+    ['procStart mismatch', 'h', 'new-start', 0, false, 1, 'dead', 'requeue', 'queued'],
+    ['live owner', 'h', 'x', 0, false, 1, 'live', null, 'running'],
+    ['stale foreign owner', 'Mac', null, 1001, false, 1, 'dead', 'requeue', 'queued'],
+    ['exhausted stale foreign owner', 'Mac', null, 1001, false, 3, 'dead', 'fail', 'failed'],
+    ['fresh foreign owner', 'Mac', null, 1000, false, 1, 'foreign', null, 'running'],
+    ['sleeping foreign owner', 'Mac', null, 1001, true, 1, 'foreign', null, 'running'],
+  ])('%s preserves recovery and process-group safety', async (_name, host, start, age, slept, attempts, state, action, status) => {
+    const now = Date.now();
+    claimed('owner', { heartbeatAt: new Date(now - age).toISOString(), attempts });
+    const handle = formatJobHandle({ host, pid: 99, procStart: 'x' });
+    store.update('owner', r => ({ ...r, job: { ...r.job, handle, host } }));
+    const readStart = vi.fn(() => start);
+    const reapGroup = vi.fn(() => false), stop = vi.fn();
+    const confirmForeignGone = vi.fn(() => true); // read-only confirmation seam
+    const out = await reattachTick({ store, kinds, maxConcurrent: 1, launch: noLaunch,
+      observation: { now, slept, gapMs: 0 }, foreignStaleMs: 1000, reapGroup, stop, confirmForeignGone,
+      probe: h => probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['h']), readStart }) });
+    expect(store.read('owner').job.status).toBe(status);
+    if (action) expect(out.actions).toEqual([expect.objectContaining({ id: 'owner', state, action })]);
+    else expect(out.actions).toEqual([]);
+    expect(stop).not.toHaveBeenCalled();
+    if (host === 'Mac') {
+      expect(readStart).not.toHaveBeenCalled();
+      expect(reapGroup).not.toHaveBeenCalled();
+    }
+    // Recovering a stale foreign owner requires the read-only absence confirmation exactly once.
+    expect(confirmForeignGone).toHaveBeenCalledTimes(state === 'dead' && host === 'Mac' ? 1 : 0);
+  });
+
+  it.each([
+    ['stale foreign non-task owner, absence unconfirmed', 'pending'],
+    ['stale foreign non-task owner, confirmation throws', 'throws'],
+  ])('%s keeps its slot and is not relaunched', async (_n, how) => {
+    const now = Date.now();
+    claimed('owner', { heartbeatAt: new Date(now - 2000).toISOString() });
+    store.update('owner', r => ({ ...r, job: { ...r.job, handle: formatJobHandle({ host: 'Mac', pid: 99, procStart: 'x' }), host: 'Mac' } }));
+    const confirmForeignGone = vi.fn(() => { if (how === 'throws') throw new Error('ps unavailable'); return false; });
+    const reapGroup = vi.fn(), stop = vi.fn(), launch = vi.fn();
+    const out = await reattachTick({ store, kinds, maxConcurrent: 1, launch, observation: { now, slept: false, gapMs: 0 },
+      foreignStaleMs: 1000, reapGroup, stop, confirmForeignGone,
+      probe: h => probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['h']), readStart: vi.fn() }) });
+    expect(confirmForeignGone).toHaveBeenCalledTimes(1);
+    expect(store.read('owner').job.status).toBe('running');
+    expect(out.actions).toContainEqual(expect.objectContaining({ id: 'owner', action: 'stop-failed' }));
+    expect(launch).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+    expect(reapGroup).not.toHaveBeenCalled();
+  });
+
+  it('a stale foreign non-task owner that refreshes its heartbeat during confirmation is not requeued', async () => {
+    const now = Date.now();
+    claimed('owner', { heartbeatAt: new Date(now - 2000).toISOString() });
+    store.update('owner', r => ({ ...r, job: { ...r.job, handle: formatJobHandle({ host: 'Mac', pid: 99, procStart: 'x' }), host: 'Mac' } }));
+    const confirmForeignGone = vi.fn(() => {
+      store.update('owner', r => ({ ...r, job: { ...r.job, heartbeatAt: new Date(now).toISOString() } }));
+      return true; // absence "confirmed", but the owner beat in the meantime: the in-lock re-check must win
+    });
+    const out = await reattachTick({ store, kinds, maxConcurrent: 1, launch: noLaunch, observation: { now, slept: false, gapMs: 0 },
+      foreignStaleMs: 1000, reapGroup: vi.fn(), stop: vi.fn(), confirmForeignGone,
+      probe: h => probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['h']), readStart: vi.fn() }) });
+    expect(confirmForeignGone).toHaveBeenCalledTimes(1);
+    expect(store.read('owner').job.status).toBe('running');
+    expect(out.actions).toEqual([]);
+  });
+
+  it('propagates a non-task probe error without recovering or releasing the slot', async () => {
+    claimed('uncertain');
+    const reapGroup = vi.fn(), stop = vi.fn(), launch = vi.fn();
+    await expect(reattachTick({ store, kinds, maxConcurrent: 1, reapGroup, stop, launch,
+      probe: () => { throw new Error('probe unavailable'); } })).rejects.toThrow('probe unavailable');
+    expect(store.read('uncertain').job.status).toBe('running');
+    expect(reapGroup).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  });
 
   it('leaves a live job alone, requeues a dead one keeping its checkpoint', async () => {
     claimed('live');
@@ -659,6 +737,170 @@ function runningTask(item, launchedAt, now) {
   return store.update(task.id, r => markClaimed(markLaunching(r, { at: new Date(launchedAt).toISOString() }),
     { ...taskOwner, at: new Date(now).toISOString() }));
 }
+
+it.each([
+  ['stale', 1001, false, false, false, false, 'queued', 'requeue'],
+  ['exhausted stale', 1001, false, true, false, false, 'failed', 'fail'],
+  ['expired stale', 1001, false, false, true, false, 'queued', 'requeue'],
+  ['saved-result stale', 1001, false, false, false, true, 'succeeded', null],
+  ['saved-result expired stale', 1001, false, false, true, true, 'succeeded', null],
+  ['fresh', 1000, false, false, false, false, 'running', 'stop-failed'],
+  ['sleeping stale', 1001, true, false, false, false, 'running', 'stop-failed'],
+  ['unknown stale', 1001, false, false, false, false, 'running', 'stop-failed'],
+])('%s foreign TASK owner preserves recovery and process safety', async (mode, age, slept, exhausted, expired, saved, status, action) => {
+  const now = Date.now();
+  const owner = runningTask(950, now - (expired ? 2000 : 0), now - age);
+  const handle = formatJobHandle({ host: 'Mac', pid: 123, procStart: 'start' });
+  store.update(owner.id, r => {
+    r.job.handle = handle;
+    r.job.host = 'Mac';
+    if (exhausted) r.job.task.failureCount = r.job.maxAttempts - 1;
+    if (saved) r.job.task.execution = { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 },
+    } } };
+    return r;
+  });
+  const waiting = queuedTask(951);
+  const readStart = vi.fn(), reapGroup = vi.fn(), stop = vi.fn(), releaseTaskClaim = vi.fn(), launch = vi.fn();
+  const confirmForeignGone = vi.fn(() => true); // read-only confirmation seam; the kill path (reapGroup) is never used
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept, gapMs: 0 },
+    foreignStaleMs: 1000, reapGroup, stop, releaseTaskClaim, launch, confirmForeignGone,
+    probe: h => {
+      if (mode === 'unknown stale') throw Error('probe unavailable');
+      return probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['MacBook-Pro']), readStart });
+    } });
+  expect(store.read(owner.id).job.status).toBe(status);
+  expect(readStart).not.toHaveBeenCalled();
+  expect(reapGroup).not.toHaveBeenCalled();
+  expect(stop).not.toHaveBeenCalled();
+  // Recovery of a stale foreign owner now requires the read-only absence confirmation exactly once.
+  expect(confirmForeignGone).toHaveBeenCalledTimes(status === 'running' ? 0 : 1);
+  if (action) expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id,
+    state: status === 'running' ? mode === 'unknown stale' ? 'dead' : 'foreign' : 'dead', action }));
+  else expect(out.actions).toEqual([]);
+  if (status === 'running') {
+    expect(store.read(owner.id).job.task.failureCount).toBe(0);
+    expect(releaseTaskClaim).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  } else {
+    expect(releaseTaskClaim).toHaveBeenCalledTimes(1);
+    expect(releaseTaskClaim.mock.calls[0][0].id).toBe(owner.id);
+    expect(store.read(owner.id).job.task.failureCount).toBe(saved ? 0 : exhausted ? owner.job.maxAttempts : 1);
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch.mock.calls[0][0].id).toBe(waiting.id);
+  }
+});
+
+it('a stale foreign TASK owner whose pid is still alive keeps its claim and slot', async () => {
+  // Host renamed, so the handle reads as foreign; the subprocess is this very test process, alive with its recorded start.
+  const now = Date.now();
+  const owner = runningTask(970, now - 31 * 60_000, now - 31 * 60_000);
+  const procStart = readProcStart(process.pid);
+  store.update(owner.id, r => {
+    r.job.handle = formatJobHandle({ host: 'OldMac', pid: process.pid, procStart });
+    r.job.host = 'OldMac';
+    return r;
+  });
+  const waiting = queuedTask(971);
+  const releaseTaskClaim = vi.fn(), reapGroup = vi.fn(), stop = vi.fn(), launch = vi.fn();
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false, gapMs: 0 },
+    reapGroup, stop, releaseTaskClaim, launch,
+    probe: h => probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['MacBook-Pro']) }) });
+  expect(store.read(owner.id).job.status).toBe('running');
+  expect(store.read(waiting.id).job.status).toBe('queued');
+  expect(releaseTaskClaim).not.toHaveBeenCalled();
+  expect(launch).not.toHaveBeenCalled();
+  expect(stop).not.toHaveBeenCalled();
+  expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id, action: 'stop-failed' }));
+});
+
+it.each([
+  ['stale, no saved result', false, 'pending'],
+  ['stale, saved result', true, 'pending'],
+  ['stale, no saved result, confirmation throws', false, 'throws'],
+  ['stale, saved result, confirmation throws', true, 'throws'],
+])('%s foreign TASK owner is retained when absence is not confirmed (%s)', async (_n, saved, how) => {
+  const now = Date.now();
+  const owner = runningTask(980, now, now - 2000);
+  store.update(owner.id, r => {
+    r.job.handle = formatJobHandle({ host: 'Mac', pid: 123, procStart: 'start' });
+    r.job.host = 'Mac';
+    if (saved) r.job.task.execution = { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 },
+    } } };
+    return r;
+  });
+  queuedTask(981);
+  const confirmForeignGone = vi.fn(() => { if (how === 'throws') throw new Error('ps unavailable'); return false; });
+  const releaseTaskClaim = vi.fn(), launch = vi.fn(), stop = vi.fn(), reapGroup = vi.fn();
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false, gapMs: 0 }, foreignStaleMs: 1000,
+    reapGroup, stop, releaseTaskClaim, launch, confirmForeignGone,
+    probe: h => probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['MacBook-Pro']), readStart: vi.fn() }) });
+  expect(confirmForeignGone).toHaveBeenCalledTimes(1);
+  expect(store.read(owner.id).job.status).toBe('running');
+  expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id, action: 'stop-failed' }));
+  expect(releaseTaskClaim).not.toHaveBeenCalled();
+  expect(launch).not.toHaveBeenCalled();
+  expect(stop).not.toHaveBeenCalled();
+  expect(reapGroup).not.toHaveBeenCalled();
+});
+
+it('a stale foreign TASK owner with a saved result that refreshes its heartbeat during confirmation keeps its claim', async () => {
+  const now = Date.now();
+  const owner = runningTask(990, now, now - 2000);
+  store.update(owner.id, r => {
+    r.job.handle = formatJobHandle({ host: 'Mac', pid: 123, procStart: 'start' });
+    r.job.host = 'Mac';
+    r.job.task.execution = { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 },
+    } } };
+    return r;
+  });
+  const releaseTaskClaim = vi.fn();
+  const confirmForeignGone = vi.fn(() => {
+    store.update(owner.id, r => { r.job.heartbeatAt = new Date(now).toISOString(); return r; });
+    return true;
+  });
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false, gapMs: 0 }, foreignStaleMs: 1000,
+    reapGroup: vi.fn(), stop: vi.fn(), releaseTaskClaim, launch: vi.fn(), confirmForeignGone,
+    probe: h => probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['MacBook-Pro']), readStart: vi.fn() }) });
+  expect(confirmForeignGone).toHaveBeenCalledTimes(1);
+  expect(store.read(owner.id).job.status).toBe('running');
+  expect(releaseTaskClaim).not.toHaveBeenCalled();
+});
+
+describe('confirmHandleAbsent', () => {
+  const handle = formatJobHandle({ host: 'Old', pid: 4242, procStart: 'S' });
+  const esrch = () => { throw Object.assign(new Error('x'), { code: 'ESRCH' }); };
+  it.each([
+    ['pid and group gone', () => null, esrch, true],
+    ['pid present with a differently formatted start (TZ drift), group gone', () => 'other', esrch, false],
+    ['recorded process still alive', () => 'S', esrch, false],
+    ['group still has a member', () => null, () => true, false],
+    ['group check denied (EPERM)', () => null, () => { throw Object.assign(new Error('x'), { code: 'EPERM' }); }, false],
+    ['ps unreadable', () => { throw new Error('ps'); }, esrch, false],
+  ])('%s', (_n, readStart, kill, expected) => {
+    const sent = [];
+    expect(confirmHandleAbsent(handle, { readStart, kill: (pid, sig) => { sent.push(sig); return kill(); } })).toBe(expected);
+    expect(sent.every(sig => sig === 0)).toBe(true); // never a real signal
+  });
+  it('refuses an unparseable handle', () => expect(confirmHandleAbsent('junk')).toBe(false));
+});
+
+it('a foreign TASK owner that refreshes its heartbeat after classification keeps its claim', async () => {
+  const now = Date.now();
+  const owner = runningTask(960, now, now - 2000);
+  store.update(owner.id, r => { r.job.handle = formatJobHandle({ host: 'Mac', pid: 123, procStart: 'start' }); r.job.host = 'Mac'; return r; });
+  const releaseTaskClaim = vi.fn(), reapGroup = vi.fn(), stop = vi.fn();
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false, gapMs: 0 }, foreignStaleMs: 1000,
+    reapGroup, stop, releaseTaskClaim, launch: vi.fn(),
+    probe: h => {
+      store.update(owner.id, r => { r.job.heartbeatAt = new Date(now).toISOString(); return r; });
+      return probeHandle(h, { host: 'MacBook-Pro.local', aliases: new Set(['MacBook-Pro']), readStart: vi.fn() });
+    } });
+  expect(store.read(owner.id).job.status).toBe('running');
+  expect(releaseTaskClaim).not.toHaveBeenCalled();
+});
 
 it('task deadlines coexist with legacy absolute deadlines', async () => {
   const now = Date.now();

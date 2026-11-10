@@ -36,7 +36,10 @@ function fixture(source = success) {
   const lockRoot = join(root, 'pool', '.admission', 'heavy');
   const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', clientPath } } });
   const seams = { policy, lockRoot, laneRoots: [], readSha: vi.fn(() => 'abc123'),
-    log: vi.fn(), appendEvent: vi.fn(async () => true), notice: { logged: false } };
+    log: vi.fn(), appendEvent: vi.fn(async () => true), notice: { logged: false },
+    // Real-IO provenance must not race the production 100ms deadline on a loaded coverage shard;
+    // the deadline tests below pass the production budget explicitly.
+    provenanceBudgetMs: 5000 };
   // Keep admission health/slot state separate from the provenance IO under test.
   // The default-executor wiring test below exercises their shared production root.
   const admission = { lockRoot: join(root, 'admission', 'heavy'), readTelemetry: healthyRead };
@@ -258,6 +261,8 @@ describe('remote client override', () => {
   });
 
   it('removing the clientPath setting leaves unrelated admission state untouched', async () => {
+    // Real provenance IO must not race its optional 100ms storage deadline on busy CI; timeout behaviour is covered by the stalled-provenance tests.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
     const platform = { cap: 3, fastSlots: 2, priority: { mode: 'off' },
       remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 2.5 } };
@@ -301,6 +306,8 @@ describe('remote client override', () => {
   });
 
   it('emits a remote-client-override event for distinct raw paths that sanitize identically with the same sha', async () => {
+    // Real provenance IO must not race its optional 100ms storage deadline on busy CI; timeout behaviour is covered by the stalled-provenance tests.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
     const firstPath = join(f.root, 'caf\u00e9', 'remote-exec.mjs');
     const secondPath = join(f.root, 'caf\u00e8', 'remote-exec.mjs');
@@ -328,6 +335,8 @@ describe('remote client override', () => {
   });
 
   it('emits fresh provenance for legacy state without pathKey even when path and sha match', async () => {
+    // Real provenance IO must not race its optional 100ms storage deadline on busy CI; timeout behaviour is covered by the stalled-provenance tests.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
     mkdirSync(dirname(f.state), { recursive: true });
@@ -839,7 +848,7 @@ describe('remote client override', () => {
     let result;
     const pending = runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env: {},
       ...f.admission, policy: f.policy, timeoutMs: 1000, loadPerCore: () => 0, log: f.seams.log,
-      remoteExec: createRemoteExec({ ...f.seams, provenanceFs, ...extra,
+      remoteExec: createRemoteExec({ ...f.seams, provenanceFs, ...extra, provenanceBudgetMs: 100,
         importClient: async () => ({ runRemote }) }),
     }).then((value) => { result = value; return value; });
     await vi.advanceTimersByTimeAsync(0);
@@ -894,7 +903,7 @@ describe('remote client override', () => {
       let release;
       const stalled = vi.fn(() => new Promise((resolve) => { release = resolve; }));
       const provenanceFs = mockProvenanceFs();
-      const extra = { provenanceFs };
+      const extra = { provenanceFs, provenanceBudgetMs: 100 };
       if (operation in provenanceFs) provenanceFs[operation] = stalled;
       else extra[operation] = stalled;
       const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));

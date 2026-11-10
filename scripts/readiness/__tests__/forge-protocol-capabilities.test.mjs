@@ -10,6 +10,19 @@ import {resolveAdmissionPolicy, resolveRemoteSlotUnits} from '../heavy-admission
 const io=vi.hoisted(()=>({open:vi.fn(),readdir:vi.fn(),writeFile:vi.fn(),rename:vi.fn(),rm:vi.fn(),lstat:vi.fn(),mkdir:vi.fn()}));
 vi.mock('node:fs/promises',async original=>({...await original(),...io}));
 vi.mock('../forge-exec-limits.mjs',async original=>({...await original(),readLimits:vi.fn()}));
+// Production prepare refuses every run unless nft table inet forge_exec_egress exists (R595 S1). CI hosts have no
+// such table, so answer ONLY that one probe as present; every other spawn still reaches the real child_process.
+vi.mock('node:child_process',async original=>{
+  const actual=await original();
+  const {EventEmitter}=await import('node:events');
+  return {...actual,spawn:(file,...rest)=>{
+    if(file!=='/usr/sbin/nft')return actual.spawn(file,...rest);
+    const child=new EventEmitter();
+    child.stdout=new EventEmitter();child.stderr=new EventEmitter();child.kill=()=>{};
+    queueMicrotask(()=>child.emit('close',0));
+    return child;
+  }};
+});
 // The production base document: R518 publishes activeRunIds when two listings agree (the mocked listing is empty and stable).
 // Opt-in fields such as `limits` must never appear in it.
 const legacyTelemetry=['activeRunIds','activeRuns','cores','loadPerCore','memFreePct','recent','sampledAtET'];

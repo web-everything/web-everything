@@ -54,6 +54,7 @@ import { CLOSE_ITEMS_OP } from '../close-items.mjs';
 import { REOPEN_ITEMS_OP } from '../reopen-items.mjs';
 import { SCAFFOLD_OP } from '../scaffold.mjs';
 import { FILE_ITEM_OP } from '../file-item.mjs';
+import { FILE_HELD_CARDS_OP } from '../file-held-cards.mjs';
 import { CLEAR_STUCK_SESSION_OP } from '../clear-stuck-session.mjs';
 import { DOCKET_REFRESH_OP } from '../docket-refresh.mjs';
 import { PERF_SNAPSHOT_OP } from '../perf-snapshot.mjs';
@@ -418,7 +419,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // #4979 — `record-referral-ruling`'s `write` step posts a PR comment, so it is NOT read-only; listed here for
     // map coverage. The gh reads and the post live in `record-referral-ruling-io.mjs`.
     'extend-rounds': 'extend-rounds.mjs',
-    ...Object.fromEntries(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim'].map(name => [name, 'operator-controls.mjs'])),
+    ...Object.fromEntries(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset'].map(name => [name, 'operator-controls.mjs'])),
     [RECORD_REFERRAL_RULING_OP]: 'record-referral-ruling.mjs',
     // Card 334 — `land-human-only`'s `write` step labels, enqueues and comments, so it is NOT read-only; listed for map
     // coverage. Every gh call lives in `land-human-only-io.mjs`.
@@ -534,6 +535,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // reaches nothing that can act — both effects' sinks live in `file-item-io.mjs`, which reuses
     // `scaffold-io.mjs`'s own guarded write sink and adds only a `queue-store.mjs` sink beside it.
     [FILE_ITEM_OP]: 'file-item.mjs',
+    // `file-held-cards` files cards through `file-item` and appends a ledger: effects, NOT read-only; map coverage only.
+    [FILE_HELD_CARDS_OP]: 'file-held-cards.mjs',
     // #3690/#xd9xwtn — READ-ONLY and genuinely so: both steps are `compute`, the declaring module imports
     // only `registry.mjs` and `step-kinds.mjs`, and the `readStore()` call lives in
     // `graduation-progress-report-io.mjs` behind the injected `readScorecards` reader.

@@ -17,6 +17,10 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('tells dispatchers every Agent brief needs a Slot line with all four forms', () => {
+    expect(renderWorkerBrief(params)).toContain('Every build Agent brief (the ones the prep gate covers) needs a `Slot:` line: `Slot: plan:<item>`, `Slot: blocker:<what it unblocks>`, `Slot: operator:<quoted placement>`, or `Slot: waived — <reason>`.');
+  });
+
   it.each([
     ['Alice1', 'alice1'],
     ['abcdEFGhiJKlmnop', 'AbcDeFgHIjKLmnop'],
@@ -221,6 +225,7 @@ describe('renderWorkerBrief', () => {
       'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=full',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
+      'committed and its PR opened BEFORE you release the lane', '~/.claude/lane-salvage',
       `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,
       defaultProof, 'report it as PENDING', 'exact command', '10\nminutes',
       '`pkill`, `killall`', 'operator\'s dev server', 'No `--force`', 'no `--no-verify`',
@@ -244,6 +249,35 @@ describe('renderWorkerBrief', () => {
 
   it('tells the worker to stop and report when open-pr is refused by the PR limit, never to self-allow (xfaz7ho)', () => {
     expect(renderWorkerBrief(params)).toContain('If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.');
+  });
+
+  it('lists every daemon with what it runs when an edge clone is given', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep)');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)');
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that. Does not accept prototype loads (unsupported) [prototype load UNSUPPORTED]');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)\n');
+  });
+
+  it('warns instead of confirming when the edge clone matches a daemon that cannot adopt prototype loads', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('WARNING: --edge-clone /ws/wev-merge-daemon matches daemon key merge-watch, which cannot adopt prototype loads');
+    expect(brief).not.toContain('matches daemon key merge-watch.');
+  });
+
+  it('confirms a supported daemon match without a warning', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-control' });
+    expect(brief).toContain('--edge-clone /ws/wev-control matches daemon key control.');
+    expect(brief).not.toContain('WARNING: --edge-clone');
+  });
+
+  it('warns when the edge clone matches no daemon clone', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
+    expect(brief).toContain('WARNING: --edge-clone /tmp/edge matches no daemon clone');
+  });
+
+  it('omits the daemon list without an edge clone', () => {
+    expect(renderWorkerBrief({ ...params })).not.toContain('merge-queue drain (drain-queue-safety');
   });
 
   it('includes the optional edge section as the last numbered rule', () => {

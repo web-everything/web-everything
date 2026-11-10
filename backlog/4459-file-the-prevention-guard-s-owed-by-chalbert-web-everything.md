@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-07"
-preparedAgainstSha: "5b2bbedb1108b15ccecded45a09a1df93c93a345"
+preparedDate: "2026-11-09"
+preparedAgainstSha: "3e0f0948836da9a2240c23631c7d3aedc38c84f4"
 tags: []
 ---
 
@@ -41,6 +41,8 @@ All named tests below are to be added or strengthened in `we:scripts/operations/
 - **Callers/defaults:** repository search found the CLI wrapper at `we:scripts/operations/sweep-orphan-backlog-cards.mjs:594-624` and the parser-only import at `we:scripts/backlog/__tests__/task-agreement.test.mjs:21`. The latter does not call the sweep and needs no migration. The live default remains non-dry-run; only executions with survivors gain the mandatory PR read. Existing scripted acquisition-first fixtures at `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:426-493` must prepend explicit complete no-match responses rather than relaxing assertions.
 - **Sizing:** old size 3, retained size 3. Expected changed lines: approximately 80 in `we:scripts/operations/sweep-orphan-backlog-cards.mjs` (guards and adapter), 220 in `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs` (boundary matrix, caller and real Git fixture), and 15 in `we:docs/agent/testing.md` (two conventions). The existing injected orchestration harness at `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:371-383` avoids a new test plane. This is a story, so no estimatedLoc is added.
 - 2026-11-07 re-stamp against `5b2bbedb`: the sweep source and its test are unchanged since `fa7d3c168` (only unrelated `we:docs/agent/testing.md` lane-deps/verify paragraphs landed); the loop still falls through to commit and acquisition still lacks a PR read, so the design above stands.
+- 2026-11-08 re-stamp against `9bce6d7f`: sweep source and test unchanged since `5b2bbedb` (only an unrelated `we:docs/agent/testing.md` referral-review section landed); premise, scope and design stand.
+- 2026-11-09 re-stamp against `3e0f0948`: sweep source and test have no commits since `9bce6d7f`; the exhaustion fall-through (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:474-507`) and acquisition without a PR read (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:441-452`) are unchanged. Premise, scope, design and executable Acceptance stand.
 - Preparation used source and test inspection only; implementation, red/green execution and stamps remain for the runner/build stages.
 
 ## Design

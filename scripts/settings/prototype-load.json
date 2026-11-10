@@ -1,35 +1,50 @@
 {
   "daemons": {
     "review": {
-      "label": "com.we.review-daemon"
+      "label": "com.we.review-daemon",
+      "runs": "review daemon (PR reviews, lease-reaper, lane-pool health, parked-PR conflict watch)"
     },
     "fix": {
-      "label": "com.we.fix-dispatch-daemon"
+      "label": "com.we.fix-dispatch-daemon",
+      "runs": "fix-dispatch daemon (fixers for red or blocked PRs)"
     },
     "build": {
-      "label": "com.we.build-dispatch-daemon"
+      "label": "com.we.build-dispatch-daemon",
+      "runs": "build-dispatch daemon (builders for ready backlog items)"
     },
     "verify": {
-      "label": "com.we.verify-daemon"
+      "label": "com.we.verify-daemon",
+      "runs": "verify daemon (PR verification runs)"
     },
     "health-watch": {
-      "label": "com.we.health-watch"
+      "label": "com.we.health-watch",
+      "runs": "health-watch (daemon and queue smell detection)"
     },
     "lease-reaper": {
-      "label": "com.we.lease-reaper"
+      "label": "com.we.lease-reaper",
+      "runs": "lease-reaper (expires stale lane and scope leases)"
     },
     "pass-readers": {
       "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
-      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code."
+      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code.",
+      "runs": "reader pass daemons (ci-red-recovery-watch and the other read-only passes)"
     },
     "control": {
       "label": "com.we.control",
-      "clone": "wev-control"
+      "clone": "wev-control",
+      "runs": "control daemon (operator control surface)"
     },
     "drain": {
       "label": "com.plateau.drain-daemon",
       "clone": ".lanes/we-drain-daemon/code",
-      "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs."
+      "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs.",
+      "runs": "merge-queue drain (drain-queue-safety, enqueue)"
+    },
+    "merge-watch": {
+      "label": "com.we.conveyor-pass-daemon.merge-orphan-sweep",
+      "clone": "wev-merge-daemon",
+      "unsupported": "its merge-orphan-sweep pass runs self-sync main-only (mainOnly=true), which excludes registered overlays, so a prototype loaded here would stay pending forever. Land the change through a normal PR instead.",
+      "runs": "merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that. Does not accept prototype loads (unsupported)"
     }
   },
   "daemonAliases": {
@@ -199,6 +214,103 @@
         "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:343 — Cached main-red evidence bypasses retesting for six hours by default, delaying detection of changed environmental failures even when commit SHAs remain unchanged.",
         "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:276 — Missing, unreadable, or invalid rerun configuration falls back to allowing one rerun, enabling the weaker publication policy instead of retaining the original fail-closed behavior.",
         "scripts/conveyor/__tests__/prep-review.test.mjs:301 — Raises this test’s timeout to 30 seconds; the same relaxation at line 659 allows slower or stalled behavior to escape the previous timeout guard."
+      ]
+    },
+    {
+      "ref": "lane/redteam-foreign-host",
+      "sha": "df6f584666eecef95c6a0b2c72d393cd8e54dd6d",
+      "ruling": "R757",
+      "findings": [
+        "scripts/lib/drain-red-team-evidence.mjs:541 — Replaces the foreign-host fail-closed hold with an age-based local PID check. Different machines can both have null PID namespaces; an absent or mismatched local PID cannot prove the remote writer stopped. After 30 minutes (configurable down to 10), a live remote review can lose its in-flight/queued protection, allowing review-job.mjs:387 to admit a replacement writer and overwrite its status."
+      ]
+    },
+    {
+        "ref": "lane/redteam-dispatch-queue",
+        "sha": "f86f066e17bd0eeb3a8c2f945d4d4f6236d30c75",
+        "ruling": "R786",
+        "findings": [
+            "scripts/lib/review-red-team-on-skip.mjs:791 — Pre-existing limitation relied on by scripts/lib/red-team-dispatch-queue.mjs:171: worker-free `carry` publishes policy-clear without revalidating live holds or complete formal reviews. A read-only probe selected `carry` with zero live-state or complete-review reads despite readers configured to report a hold; a hold arriving after the snapshot can therefore be bypassed."
+        ]
+    },
+    {
+        "ref": "lane/rebuild-adopt-chase",
+        "sha": "a7200c7282fd29ac9c792bb4fad48bd65a94110e",
+        "ruling": "R790",
+        "findings": [
+            "scripts/lib/daemon-rebuild/adopt.mjs:132 — The legacy allowlist bypasses tip binding and recorded `contentInMain`/`cleanMerges` evidence for the specified event, allowing superseded adoption previously refused. Direct probes confirmed acceptance with both a missing and a mismatched tip; candidate tree, driver, and time checks remain."
+        ]
+    },
+    {
+        "ref": "lane/redteam-pending-on-accept-m1",
+        "sha": "166689d13b300960fbf2f458ff3ba18f560b097a",
+        "ruling": "R796",
+        "findings": [
+            "scripts/lib/drain-merge-strategy.mjs:432 — Check-run mode skips live evidence and disposition validation. An older successful check can authorize enqueue despite a later confirmed-break comment, operator block, or revoked deferral when blocking labels are absent.",
+            "scripts/merge-gate-check.mjs:194 — Publication holds do not prevent stale-success admission: after the check read, a writer can publish a newer pending check and clear its publication hold before the status read. An injected read-only probe returned success while the latest check was in progress."
+        ]
+    },
+    {
+      "ref": "lane/stall-sweep-live",
+      "sha": "c305b4d9990be329d41d4577cf193ef729282899",
+      "ruling": "R803+R804",
+      "findings": [
+        "scripts/settings/pr-stall-sweep.json:10 — Enables live restarts under global `mode: \"shadow\"`; shadow no longer guarantees zero dispatches. (R804: per-action live with global shadow is the ruled change)",
+        "scripts/conveyor/pr-stall-sweep.mjs:342 — Treats a missing PID namespace as matching locally. A stale record from another machine can therefore be declared dead by a local PID probe. (R803: ruled single-host exception inherited from #6603)",
+        "scripts/conveyor/pr-stall-sweep.mjs:152 — Operator resets discard earlier restart spend from lifetime caps, spacing, and idempotency checks. (R804: the recorded operator reset is the ruled action)"
+      ]
+    },
+    {
+      "ref": "lane/drain-freeze-priority",
+      "sha": "cbcec6ed1c53f31ba7586a8b99be954e87911dda",
+      "ruling": "R813",
+      "findings": [
+        "scripts/lib/gh-throttle.mjs:2012 — Raises the configured concurrency ceiling from cap to cap + 1 for reserved freeze reads, allowing execution when the original gate would throttle. The passthrough path repeats this override at line 2288."
+      ]
+    },
+    {
+      "ref": "lane/bound-session-stale",
+      "sha": "95d22a251a5389eb5b703b66cc705cb569743f8f",
+      "ruling": "R810+R794",
+      "findings": [
+        "scripts/conveyor/hung-session.mjs:444 — Replaces the absolute pending-tool-call veto with an age-and-idle override, allowing unfinished calls to be classified as finished without observing completion.",
+        "scripts/conveyor/reconcile-core.mjs:1167 — Already-hung rows skip the new fresh-status check. The preceding hung detector releases pending calls at the same grace threshold, so even a fresh busy/waiting status cannot enforce the claimed protection.",
+        "scripts/conveyor/soak/breaks/idle-row-dangling-call-holds-pr.mjs:57 — fixPresent runs the same scenario as the test; a behavioral regression returns false and selects it.fails in defineBreakTest, allowing the regression to pass as an expected failure."
+]
+    },
+    {
+      "ref": "lane/merge-gate-retrigger-wip2",
+      "sha": "2003ae3eaf94c3995fec985331527f9d58b26358",
+      "ruling": "R813",
+      "findings": [
+        "scripts/conveyor/ci-red-recovery-watch.mjs:1493 \u2014 Legacy candidates skip preflight entirely. A completed required failure plus another absent context still qualifies, bypassing live evidence validation and, for classic candidates, the PR-wide retry cap.",
+        "scripts/conveyor/missing-run-push.mjs:73 \u2014 Writer admission is optional, and the production trigger at ci-red-recovery-watch.mjs:1525 supplies none of its enabling inputs. Writer tests explicitly inject those inputs, so they cannot detect production bypassing evidence and cap checks.",
+        "scripts/conveyor/fix-claim-store.mjs:92 \u2014 The claim reader treats directory-read errors as no claims and skips unreadable or corrupt entries. Both new admission and existing writer checks therefore accept an unreadable claim store as unclaimed, despite their fail-closed assertions."
+      ]
+    },
+    {
+      "ref": "lane/redteam-ran-verdict",
+      "sha": "e9cce536ad8cfebb3b343b52ee58de387d9b3a78",
+      "ruling": "R813",
+      "findings": [
+        "scripts/lib/red-team-withheld-publish.mjs:103 \u2014 Legacy recovery relies on marker-only deduplication without comparing the posted comment against recovered findings. Reproduced: a seat row containing one confirmed break plus an existing trusted \u201cno break found\u201d comment returns `skipped`, writes nothing, raises no alert, and leaves the gate seeing zero findings. Conflicting evidence silently bypasses the hold."
+      ]
+    },
+    {
+      "ref": "lane/ci-heal-reset",
+      "sha": "1e3b7159e4f9d463087b412c7a885621c97ecb8e",
+      "ruling": "R815",
+      "findings": [
+        "scripts/operations/operator-controls-io.mjs:150 — The new operation resets exhausted resumeFailures to zero, bypassing the existing three-failure stop and permitting additional resume attempts on the same head.",
+        "scripts/operations/operator-controls.mjs:108 — The advertised two-reset limit relies solely on record.operatorResets. The existing re-mark path (scripts/conveyor/await-verify.mjs:404) preserves resumeFailures but drops operatorResets, allowing repeated same-head re-marks to replenish the reset budget indefinitely."
+]
+    },
+    {
+      "ref": "lane/redteam-capacity-floor",
+      "sha": "b7bb8b2743e5c582d44e22e71a40f9e23ae07f6b",
+      "ruling": "R816",
+      "findings": [
+        "skills-src/conveyor/review-daemon.mjs:1262 — Overrides host.maxReviewDispatchPerTick: defaults raise 2 to 3 at CPU idle >= 10% (operator-ruled R816/R818 B; one start stays reserved for ordinary reviews).",
+        "scripts/lib/red-team-dispatch-queue.mjs:71 — The floor raises remainingStarts (including 0) up to a host-supplied ceiling (operator-ruled R816: min 2 concurrent red-team runs while CPU idle >= 10%)."
       ]
     }
   ]

@@ -1711,6 +1711,9 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
+  "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
   "scripts/conveyor/soak/breaks/stall-sweep-informational-refusal.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/overlay-main-sync-unrunnable-selection.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,

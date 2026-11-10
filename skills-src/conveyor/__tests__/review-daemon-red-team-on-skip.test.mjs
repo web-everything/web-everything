@@ -1,10 +1,167 @@
-import { it, expect, vi } from 'vitest';
+import { it, expect, vi, afterAll, beforeEach } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.mjs';
-import { cliReviewTickOpts, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
+import { cliReviewTickOpts, defaultReviewHostAdmission, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
 import * as reviewJob from '../../../scripts/operations/review-job.mjs';
 import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.mjs';
+import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
+import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
+import * as hostSample from '../../../scripts/lib/host-sample.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
+
+// cliReviewTickOpts keeps a module-level queue bound to the first file it sees, so every test in this
+// file shares one temp queue file (never the operator's real one) and the directory is removed at the end.
+const QUEUE_DIR = mkdtempSync(join(tmpdir(), 'we-rtq-test-'));
+const QUEUE_FILE = join(QUEUE_DIR, 'queue.json');
+afterAll(() => rmSync(QUEUE_DIR, { recursive: true, force: true }));
+// A developer's exported WE_RED_TEAM_DISPATCH_QUEUE=off must not flip the tests that expect the queue.
+beforeEach(() => {
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '2');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT', '10');
+  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
+});
+const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
+
+/** Mocks evidence for N owed PRs (heads derived per PR) and returns the owed plan/rawPrs. */
+function owedPrs(repo, prs) {
+  const head = pr => String(pr).padStart(40, '0');
+  vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(({ rawPrs }) => ({ rawPrs }));
+  vi.spyOn(redTeamEvidence, 'readDrainRedTeamEvidence').mockImplementation(({ head: rev }) => ({
+    recorded: false, loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev } } } },
+  }));
+  vi.spyOn(redTeamEvidence, 'readRedTeamStatus').mockReturnValue(null);
+  vi.spyOn(redTeamEvidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
+  return {
+    plan: { refusals: prs.map(prNumber => ({ kind: 'already-reviewed-head', prNumber, headSha: head(prNumber) })) },
+    rawPrs: prs.map(number => ({ number, headRefOid: head(number), labels: [], comments: [] })),
+  };
+}
+
+it('CLI routes red-team recovery through the FIFO queue: capacity 1 dispatches only the head of 3 owed PRs', () => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [6001, 6002, 6003]);
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
+  const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
+      capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
+    expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6001]);
+    expect(recovery.mock.calls[0][0].rawPrs.map(pr => pr.number)).toEqual([6001]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith({ pr: 6001, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(result.dispatched).toEqual([{ prNumber: 6001, jobPid: 42, mode: 'fresh' }]);
+    // The two held-out PRs stay queued, in FIFO order, in the persisted file.
+    expect(JSON.parse(readQueueFile()).map(entry => entry.pr)).toEqual([6002, 6003]);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it.each(['off', 'OFF', ' off ', '0', 'false', 'no'])('CLI bypasses the dispatch queue when WE_RED_TEAM_DISPATCH_QUEUE=%j', value => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [6011, 6012, 6013]);
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', value);
+  const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
+  const lines = [];
+  const queueBefore = readQueueFile();
+  try {
+    const production = cliReviewTickOpts({ log: { error: line => lines.push(line) } });
+    production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
+      capacity: { lanes: 3, budget: { left: 3 }, remainingStarts: 3, take: vi.fn() }, paused: false });
+    // Direct runner: the full unfiltered plan and PRs, no queue filtering, no queue file IO.
+    expect(recovery).toHaveBeenCalledTimes(1);
+    expect(recovery.mock.calls[0][0].plan).toBe(plan);
+    expect(recovery.mock.calls[0][0].rawPrs.map(pr => pr.number)).toEqual([6011, 6012, 6013]);
+    expect(dispatch.mock.calls.map(call => call[0].pr)).toEqual([6011, 6012, 6013]);
+    expect(readQueueFile()).toBe(queueBefore);
+    expect(lines.some(line => line.includes('red-team queue') && line.includes('off') && line.includes('WE_RED_TEAM_DISPATCH_QUEUE'))).toBe(true);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it('CLI keeps the queue on and logs when WE_RED_TEAM_DISPATCH_QUEUE is unrecognised', () => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [6031, 6032]);
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'maybe');
+  const lines = [];
+  try {
+    const production = cliReviewTickOpts({ log: { error: line => lines.push(line) } });
+    production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
+      capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
+    expect(dispatch.mock.calls.map(call => call[0].pr)).toEqual([6031]);
+    expect(lines.some(line => line.includes('unrecognised WE_RED_TEAM_DISPATCH_QUEUE'))).toBe(true);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it('CLI exhausted capacity passes every owed PR to the real runner without spending retry state', () => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [6021, 6022]);
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
+  const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
+  const lastDispatch = new Map();
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch,
+      capacity: { lanes: 0, budget: { left: 0 }, remainingStarts: 0, take: vi.fn() }, paused: false });
+    expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6021, 6022]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(lastDispatch.size).toBe(0);
+    expect(result.dispatched).toEqual([]);
+    expect(result.rows.filter(row => row.why === 'no review capacity left').map(row => row.prNumber)).toEqual([6021, 6022]);
+    // Queue attempts are untouched too: "no review capacity left" is not a failed attempt.
+    expect(JSON.parse(readQueueFile()).map(entry => [entry.pr, entry.attempts])).toEqual([[6021, 0], [6022, 0]]);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it('CLI label repair exception preserves original PRs and still dispatches red-team recovery', () => {
+  const repo = 'web-everything/web-everything', head = 'e'.repeat(40), pr = 5762;
+  const rawPrs = [{ number: pr, headRefOid: head, labels: [], comments: [] }];
+  const plan = { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] };
+  const before = structuredClone(rawPrs);
+  const sync = vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(() => {
+    throw new Error('injected label repair exception');
+  });
+  const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
+  vi.spyOn(redTeamEvidence, 'readDrainRedTeamEvidence').mockReturnValue({
+    recorded: false, loopPayload: {
+      verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
+    },
+  });
+  vi.spyOn(redTeamEvidence, 'readRedTeamStatus').mockReturnValue(null);
+  vi.spyOn(redTeamEvidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
+      capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(sync).toHaveBeenCalledWith({ repo, refusals: plan.refusals, rawPrs, log: expect.any(Function) });
+    expect(recovery).toHaveBeenCalledTimes(1);
+    expect(recovery.mock.calls[0][0].rawPrs).toBe(rawPrs);
+    expect(sync.mock.invocationCallOrder[0]).toBeLessThan(recovery.mock.invocationCallOrder[0]);
+    expect(rawPrs).toEqual(before);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(result.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
 
 it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head in %s mode', mode => {
   const repo = 'web-everything/web-everything', head = (mode === 'fresh' ? 'c' : 'd').repeat(40), pr = 5762;
@@ -18,6 +175,7 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
   const witness = vi.spyOn(redTeamEvidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   try {
     const production = cliReviewTickOpts({ log: { error: vi.fn() } });
     const take = vi.fn();
@@ -76,7 +234,7 @@ it('already-reviewed heads get one recovery hook with remaining capacity; null a
   const out = runReviewTick(options);
   expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
   expect(redTeamOnSkip).toHaveBeenCalledWith({ repo, plan, rawPrs,
-    capacity: { lanes: 3, budget: liveReviewBudget, remainingStarts: Infinity, take: expect.any(Function) }, paused: false });
+    capacity: { lanes: 3, budget: liveReviewBudget, remainingStarts: Infinity, startsCeiling: Infinity, take: expect.any(Function) }, paused: false });
   expect(out.redTeamOnSkip).toBe(result);
   expect(tagStatus.mock.calls.at(-1)[0].agents).toBeUndefined();
   expect(runReviewTick({ ...options, redTeamOnSkip: null })).not.toHaveProperty('redTeamOnSkip');
@@ -153,6 +311,83 @@ it('a throwing host check blocks recovery-only starts', () => {
   expect(recoveryDispatch).not.toHaveBeenCalled();
 });
 
+it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
+    if (idle === 'throws') throw new Error('sample unavailable');
+    return { idlePct: idle };
+  });
+  vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(o => ({ rawPrs: o.rawPrs }));
+  const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip')
+    .mockReturnValue({ rows: [], dispatched: [], notStarted: [] });
+  const capacity = { lanes: 4, startsCeiling: 3, remainingStarts: 1, budget: { left: 3 } };
+  const budget = capacity.budget;
+  try {
+    cliReviewTickOpts({ log: { error: vi.fn() } }).redTeamOnSkip({
+      repo: 'fixture/cpu-floor', plan: { refusals: [] }, rawPrs: [], capacity,
+    });
+    expect(hostSample.sampleHost).toHaveBeenCalledOnce();
+    expect(recovery.mock.calls[0][0].capacity).toBe(capacity);
+    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 'throws' ? 1 : 2, budget: { left: 3 } });
+    expect(capacity.budget).toBe(budget);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it.each([
+  ['host denied', false, 2, 0, 0],
+  ['maxPerTick 1 exhausted by ordinary review', true, 1, 1, 0],
+  ['maxPerTick 2 always reserves ordinary start', true, 2, 1, 1],
+  ['maxPerTick 3 with recovery reserve', true, 3, 1, 2],
+])('production queue floor at idle 100 respects %s', (_name, admitted, maxPerTick, ordinaryStarts, recoveryStarts) => {
+  const { options } = recoveryTickFixture({ ordinary: true });
+  const { plan, rawPrs } = owedPrs(options.repo, [6101, 6102, 6103]);
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 100 });
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  const take = vi.fn();
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const out = runReviewTick({ ...options, redTeamOnSkip: production.redTeamOnSkip,
+      readPrs: () => rawPrs,
+      reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6104 }] }),
+      liveReviewBudget: { left: 5 }, hostAdmission: () => ({ admitted, maxPerTick, take }),
+    });
+    expect(hostSample.sampleHost).toHaveBeenCalledOnce();
+    expect(options.dispatch).toHaveBeenCalledTimes(ordinaryStarts);
+    expect(out.dispatched).toHaveLength(ordinaryStarts);
+    expect(dispatch).toHaveBeenCalledTimes(recoveryStarts);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(recoveryStarts);
+    expect(take.mock.calls).toEqual(Array.from({ length: ordinaryStarts + recoveryStarts }, () => [1]));
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it('production queue floor at idle 100 cannot replenish the shared host allowance across repos', () => {
+  const { options } = recoveryTickFixture();
+  const { plan, rawPrs } = owedPrs(options.repo, [6111, 6112, 6113]);
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 100 });
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  const check = vi.fn(() => ({ admitted: true, maxPerTick: 1 }));
+  const hostAdmission = sharedHostBudget(check);
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const tickOptions = { ...options, redTeamOnSkip: production.redTeamOnSkip,
+      readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [] }),
+      liveReviewBudget: { left: 5 }, hostAdmission,
+    };
+    const first = runReviewTick(tickOptions);
+    const second = runReviewTick({ ...tickOptions, repo: 'web-everything/frontierui' });
+    expect(first.redTeamOnSkip.dispatched).toHaveLength(1);
+    expect(second.redTeamOnSkip.dispatched).toEqual([]);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(check).toHaveBeenCalledOnce();
+    expect(hostAdmission().maxPerTick).toBe(0);
+    expect(hostSample.sampleHost).toHaveBeenCalledTimes(2);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
 it('ordinary and recovery starts share maxPerTick=1', () => {
   const { options, recoveryDispatch } = recoveryTickFixture({ ordinary: true });
   const take = vi.fn();
@@ -187,4 +422,29 @@ it('a confirmed ordinary non-start leaves the host allowance available to recove
   expect(recoveryDispatch).toHaveBeenCalledTimes(1);
   expect(out.redTeamOnSkip.dispatched).toHaveLength(1);
   expect(take.mock.calls).toEqual([[1]]);
+});
+
+
+it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery reviews and one ordinary review', (idlePct, recoveryStarts) => {
+  const { options } = recoveryTickFixture({ ordinary: true });
+  const { plan, rawPrs } = owedPrs(options.repo, [6201, 6202, 6203]);
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE', '3');
+  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct });
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const out = runReviewTick({ ...options, redTeamOnSkip: production.redTeamOnSkip,
+      readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6204 }] }),
+      liveReviewBudget: { left: 5 }, hostAdmission: () => defaultReviewHostAdmission({
+        loadPolicy: () => ({ settings: { host: { maxReviewDispatchPerTick: 2 } } }),
+        admission: () => ({ admitted: true }), log: vi.fn(),
+      }),
+    });
+    expect(options.dispatch).toHaveBeenCalledOnce();
+    expect(out.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(recoveryStarts);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(recoveryStarts);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });

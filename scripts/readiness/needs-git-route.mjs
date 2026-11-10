@@ -63,7 +63,8 @@ export function routeNeedsGit({ argv, cwd = process.cwd(), readFile, declared = 
   const hits = [];
   for (const file of testFilterArgs(argv)) {
     if (declared.includes(file)) { hits.push(file); continue; }
-    try { if (sourceNeedsGit(read(file), { helpers })) hits.push(file); } catch { /* unresolved: stay remote */ }
+    // R807: fail closed. An unreadable file, a directory, a glob or an out-of-root path cannot be proven git-free, so it routes local.
+    try { if (sourceNeedsGit(read(file), { helpers })) hits.push(file); } catch (e) { if (e?.code !== 'ENOENT' || /[*?[\]{}]/.test(file)) hits.push(file); } // a plain absent name stays remote (substring filter; documented gap)
   }
   return hits.length ? { local: true, reason: NEEDS_GIT_REASON, files: hits } : { local: false };
 }

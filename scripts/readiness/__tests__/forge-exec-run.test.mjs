@@ -613,6 +613,166 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     expect(result.status,result.stderr).toBe(0);
     expect(await readFile(status,'utf8')).toBe('3');
   });
+  it.each(['wall limit', 'orphan sweep', 'normal exit'].flatMap(mode => [[mode, false], [mode, true]]))('supervisor enforces %s with cancel configured=%s', async (mode, withCancel) => {
+    const status=join(root,'bounded-supervisor-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
+from unittest.mock import patch
+source, root, status, mode, with_cancel = sys.argv[1:]
+now, waits = 0, 0
+killed, swept = [], []
+entries = {
+    101: (b'S', 100), 102: (b'S', 101),
+    201: (b'S', 100), 202: (b'S', 201),
+    203: (b'Z', 100), 204: (b'Z', 201),
+    301: (b'S', 999),
+}
+def listproc(path):
+    assert path == '/proc'
+    if now >= 4: entries[205] = (b'S', 100)
+    return [*(str(pid) for pid in entries), 'self', '9999']
+def proc_open(path, *args, **kwargs):
+    pid = int(path.split('/')[2])
+    if pid not in entries: raise FileNotFoundError(path)
+    state, ppid = entries[pid]
+    return io.BytesIO(str(pid).encode() + b' (name ) with delimiters) ' + state + b' ' + str(ppid).encode() + b' 0 0\n')
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def wait(timeout=None):
+    global now, waits
+    waits += 1
+    if mode == 'normal exit': return 7
+    assert timeout == (0.1 if with_cancel == 'true' else 2), ('unbounded wait', timeout)
+    assert waits <= 3, 'supervisor did not enforce its bound'
+    if mode == 'orphan sweep' and waits == 3:
+        swept.extend(killed)
+        assert set(swept) == {201, 202}, swept
+        return 9
+    now += 2
+    raise subprocess.TimeoutExpired('fixture', timeout)
+def reap(*args):
+    assert {101, 102}.issubset(killed), killed
+    assert 301 not in killed, killed
+    raise ChildProcessError()
+writer = dict(guard=os.path.join(root, 'bounded-writer'), reservation=os.path.join(root, 'bounded-reservation.json'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer,
+           wallMs=3000 if mode == 'wall limit' else 10000, orphanGraceMs=3000)
+if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
+     patch.object(builtins, 'open', side_effect=proc_open), patch.object(os, 'kill', side_effect=kill), \
+     patch.object(os, 'waitpid', side_effect=reap), patch.object(time, 'monotonic', side_effect=lambda: now):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.pid = 101
+    worker.return_value.wait.side_effect = wait
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+if mode == 'orphan sweep': assert set(swept) == {201, 202}, swept
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,mode,String(withCancel)],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':mode==='orphan sweep'?'9':'7');
+    if(mode==='wall limit') expect(result.stderr).toMatch(/wall.*limit/i);
+  });
+  it.each([
+    ['wall limit diagnostic', 'wall limit', 'false', []],
+    ['wall limit diagnostic with cancel configured', 'wall limit', 'true', []],
+    ['task-pressure diagnostic', 'normal exit', 'false', ['usage']],
+    ['wall limit diagnostic, full undrained pipe', 'wall limit', 'false', ['full']],
+    ['wall limit diagnostic with cancel configured, full undrained pipe', 'wall limit', 'true', ['full']],
+    ['task-pressure diagnostic, full undrained pipe', 'normal exit', 'false', ['usage', 'full']],
+  ])('broken or stalled stderr pipe never aborts or blocks cleanup or status publication: %s', async (_name, mode, withCancel, extra) => {
+    const status=join(root,'closed-stderr-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
+from unittest.mock import patch
+source, root, status, mode, with_cancel, *extra = sys.argv[1:]
+now, killed, reaped = 0, [], []
+def listproc(path):
+    return ['101']
+def proc_open(path, *args, **kwargs):
+    if path == '/proc/101/stat': return io.BytesIO(b'101 (name) S 100 0 0\n')
+    raise FileNotFoundError(path)
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def wait(timeout=None):
+    global now
+    if mode == 'normal exit': return 7
+    now += 2
+    raise subprocess.TimeoutExpired('fixture', timeout)
+def reap(*args):
+    reaped.append(True)
+    raise ChildProcessError()
+writer = dict(guard=os.path.join(root, 'closed-writer'), reservation=os.path.join(root, 'closed-reservation.json'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer, wallMs=3000, orphanGraceMs=3000)
+if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
+if 'usage' in extra: cfg['usage'] = os.path.join(root, 'closed-usage')
+rd, wr = os.pipe()
+if 'full' in extra:
+    # Keep the read end open but never drain it: fill the pipe so any blocking
+    # diagnostic write stalls, then restore blocking mode like an inherited pipe.
+    import fcntl
+    flags = fcntl.fcntl(wr, fcntl.F_GETFL)
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True: os.write(wr, b'x' * 4096)
+    except BlockingIOError: pass
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags)
+else:
+    os.close(rd)
+sys.stderr = os.fdopen(wr, 'w', buffering=1)
+real_open = builtins.open
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
+     patch.object(builtins, 'open', side_effect=lambda path, *a, **k: proc_open(path) if str(path).startswith('/proc/') or str(path).startswith('/sys/') else real_open(path, *a, **k)), \
+     patch.object(os, 'kill', side_effect=kill), patch.object(os, 'waitpid', side_effect=reap), \
+     patch.object(time, 'monotonic', side_effect=lambda: now):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.pid = 101
+    worker.return_value.wait.side_effect = wait
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+`;
+    // The probe's own failures must stay readable, so the broken pipe is only
+    // installed on the supervisor's sys.stderr; exit status and files are the proof.
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,mode,withCancel,...extra],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':'7');
+  });
+  it.each(['closed', 'full'])('supervisor crash traceback never blocks exit on a %s stderr pipe', pipeState => {
+    // An uncaught supervisor error (here: the subreaper is unavailable) prints a
+    // traceback; on a full undrained pipe that blocking write used to hang the
+    // supervisor, holding its writer lock, instead of exiting non-zero.
+    const probe=String.raw`import ctypes, fcntl, json, os, sys
+from unittest.mock import patch
+source, state = sys.argv[1:]
+rd, wr = os.pipe()
+if state == 'full':
+    flags = fcntl.fcntl(wr, fcntl.F_GETFL)
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True: os.write(wr, b'x' * 4096)
+    except BlockingIOError: pass
+    fcntl.fcntl(wr, fcntl.F_SETFL, flags)
+else:
+    os.close(rd)
+os.dup2(wr, 2)
+sys.stderr = os.fdopen(2, 'w', buffering=1, closefd=False)
+with patch.object(ctypes, 'CDLL') as libc:
+    libc.return_value.prctl.return_value = -1
+    sys.argv = ['supervisor', json.dumps({})]
+    exec(source)
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,pipeState],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+  });
 });
 
 describe('setup and pruning contract', () => {
@@ -637,7 +797,7 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 3
+    assert chown.call_count == 4
     assert chown.call_args.args[1:] == (0, 0)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
@@ -646,7 +806,7 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(installed.status,installed.stderr).toBe(0);
     const names=await readdir(join(local,'libexec'));
-    expect(names.sort()).toEqual(['forge-exec-limits.mjs','forge-exec-run.mjs','forge-warm-base.mjs']);
+    expect(names.sort()).toEqual(['forge-cache-prune.mjs','forge-exec-limits.mjs','forge-exec-run.mjs','forge-warm-base.mjs']);
     const entry=join(local,'libexec','forge-exec-run.mjs');
     expect((await stat(entry)).mode & 0o777).toBe(0o755);
     // Disable newer Node's syntax detection to retain the Node 22.1 default.
@@ -669,6 +829,12 @@ with patch.object(os, 'open', side_effect=local_open), \
       env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
     expect(warmResult.status,warmResult.stderr).toBe(1);
     expect(warmResult.stderr).toBe('forge-warm-base: No arguments accepted\n');
+    const pruner=join(local,'libexec','forge-cache-prune.mjs');
+    expect((await stat(pruner)).mode & 0o777).toBe(0o755);
+    const pruneResult=spawnSync(pruner,['--unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
+    expect(pruneResult.status,pruneResult.stderr).toBe(1);
+    expect(pruneResult.stderr).toContain('Unknown argument: --unexpected');
     expect(setup).toContain('User=ops');
     // The worker and ops share dependency archives through ordinary 0644/0755
     // files. A service-wide 0077 mask makes a cold worker install unreadable to ops.
@@ -685,7 +851,7 @@ with patch.object(os, 'open', side_effect=local_open), \
     const client=await readFile(new URL('../remote-exec.mjs',import.meta.url),'utf8');
     expect(client).toContain('/usr/local/libexec/forge-exec-run.mjs ${command}');
   });
-  it('installs a root-owned fixed wrapper, makes the old cache inert, and prunes only expired state', async () => {
+  it('installs a root-owned fixed wrapper, makes the old cache inert, and the cron prunes only expired execution state, never the cache', async () => {
     const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
     expect(setup).toContain('os.fchown(fd, 0, 0)');
     expect(setup).toContain('os.fchmod(fd, 0o755)');
@@ -694,7 +860,8 @@ with patch.object(os, 'open', side_effect=local_open), \
     expect(setup).toContain('("forge-cache", 0, ops.pw_gid, 0o770)');
     const prune=setup.match(/<<'PRUNE'\n([\s\S]*?)\nPRUNE/)[1];
     expect(prune).toContain('86400');
-    expect(prune).toContain('1209600');
+    expect(prune).not.toContain('1209600');
+    expect(prune).not.toContain('/srv/forge-cache');
     const expired=new Date(Date.now()-16*24*60*60*1000);
     const oldRun=join(root,'runs','r-expired'), oldReceipt=join(root,'receipts','expired.receipt');
     const oldCache=join(root,'cache','expired'), newCache=join(root,'cache','fresh');
@@ -714,13 +881,15 @@ with patch.object(os, 'open', side_effect=local_open), \
     await rm(active,{recursive:true});
     const inactive=spawnSync('bash',['-c',local],{encoding:'utf8'});
     expect(inactive.status,inactive.stderr).toBe(0);
-    for(const path of [oldRun,oldReceipt,oldCache]) await expect(stat(path)).rejects.toThrow();
+    for(const path of [oldRun,oldReceipt]) await expect(stat(path)).rejects.toThrow();
+    // Cache retention belongs to forge-cache-prune; the cron never deletes cache entries.
+    expect((await stat(oldCache)).isDirectory()).toBe(true);
     expect((await stat(newCache)).isDirectory()).toBe(true);
     expect((await stat(work)).isDirectory()).toBe(true);
     await expect(stat(active)).rejects.toThrow();
   });
   it.each(['empty historical reservation','malformed metadata','unreadable metadata','non-object metadata','missing run identity','invalid run identity'])(
-    'preserves expired execution evidence and caches with %s',async fault=>{
+    'preserves expired execution evidence with %s and never touches caches',async fault=>{
       const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
       const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
       const active=join(root,'receipts/worker-active'),reservation=join(active,'reservation.json');
@@ -752,7 +921,7 @@ os.open=metadata_open
       const harness=(fault==='unreadable metadata'?denied:'')+local;
       const result=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
       expect(result.status,result.stderr).toBe(0);
-      expect(result.stderr).toContain('preserving expired receipts');expect(result.stderr).toContain('preserving expired cache entries');
+      expect(result.stderr).toContain('preserving expired receipts');expect(result.stderr).not.toContain('cache');
       expect((await stat(active)).isDirectory()).toBe(true);
       for(const [path,content] of evidence)expect(await readFile(path,'utf8')).toBe(content);
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
@@ -762,10 +931,10 @@ os.open=metadata_open
       const released=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
       expect(released.status,released.stderr).toBe(0);
       for(const [path] of evidence)await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
-      await expect(stat(cache)).rejects.toMatchObject({code:'ENOENT'});
+      expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
     });
-  it.each(['held','old with live UID','abandoned without live UID','abandoned with zombie UID','historical without writer protocol','held without cache evidence'])(
-    'prunes unrelated expired telemetry, receipts and caches with reservation %s',async mode=>{
+  it.each(['held','old with live UID','abandoned without live UID','abandoned with zombie UID','historical without writer protocol'])(
+    'prunes unrelated expired telemetry and receipts, leaving caches alone, with reservation %s',async mode=>{
       const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
       const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
       const run='r-'+ 'a'.repeat(32),other='r-'+ 'b'.repeat(32),lock='c'.repeat(64);
@@ -779,7 +948,7 @@ os.open=metadata_open
       await writeFile(join(reservation,'reservation.json'),JSON.stringify({run,slot:'forge-exec-1',...(mode==='historical without writer protocol'?{}:{writerGuard:1})}));
       const running=join(root,'receipts',run+'.running'),telemetry=join(root,'receipts',run+'.telemetry');
       const unrelatedReceipt=join(root,'receipts',other+'.receipt'),unrelatedTelemetry=join(root,'receipts',other+'.telemetry');
-      await writeFile(running,JSON.stringify({run,...(mode==='held without cache evidence'?{}:{lock})}));await writeFile(telemetry,'active');
+      await writeFile(running,JSON.stringify({run,lock}));await writeFile(telemetry,'active');
       await writeFile(unrelatedReceipt,'expired');await writeFile(unrelatedTelemetry,'expired');
       const recent=join(root,'receipts/recent.receipt');await writeFile(recent,'recent');
       const writer=join(root,'receipts/.worker-active-1.writer');await writeFile(writer,'',{mode:0o600});
@@ -787,7 +956,7 @@ os.open=metadata_open
       const expired=new Date(Date.now()-16*86400000);
       await utimes(writer,expired,expired);
       for(const path of [join(slot,run),join(idle,other),running,telemetry,unrelatedReceipt,unrelatedTelemetry,join(root,'cache',lock),join(root,'cache/unrelated')])await utimes(path,expired,expired);
-      if(!['held','held without cache evidence'].includes(mode))await utimes(reservation,expired,expired);
+      if(mode!=='held')await utimes(reservation,expired,expired);
       const local=body.replaceAll('/srv/forge-exec',join(root,'runs')).replaceAll('/srv/forge-receipts',join(root,'receipts'))
         .replaceAll('/srv/forge-cache',join(root,'cache')).replaceAll('/proc',proc);
       const harness=`import pwd, types, os\npwd.getpwnam=lambda _:types.SimpleNamespace(pw_uid=os.getuid())\n${local}`;
@@ -795,10 +964,9 @@ os.open=metadata_open
       expect(result.status,result.stderr).toBe(0);
       expect((await stat(writer)).ino).toBe(writerInode);
       for(const path of [join(idle,other),unrelatedReceipt,unrelatedTelemetry])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
-      if(mode==='held without cache evidence')expect((await stat(join(root,'cache/unrelated'))).isDirectory()).toBe(true);
-      else await expect(stat(join(root,'cache/unrelated'))).rejects.toMatchObject({code:'ENOENT'});
-      for(const path of [recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
-      const protectedPaths=[reservation,join(slot,run),running,telemetry,join(root,'cache',lock)];
+      // Cache retention is owned by forge-cache-prune: every cache entry survives the cron.
+      for(const path of [join(root,'cache/unrelated'),join(root,'cache',lock),recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
+      const protectedPaths=[reservation,join(slot,run),running,telemetry];
       if(mode.startsWith('abandoned')){
         expect(result.stderr).toContain('abandoned reservation worker-active-1; UID has no live processes');
         for(const path of protectedPaths){
@@ -806,9 +974,7 @@ os.open=metadata_open
           else await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
         }
       }else{
-        if(mode==='held without cache evidence'){
-          expect(result.stderr).toContain('preserving expired cache entries');expect(result.stderr).not.toContain('preserving expired receipts');
-        }else expect(result.stderr).toBe('');
+        expect(result.stderr).toBe('');
         for(const path of protectedPaths)expect(await stat(path)).toBeDefined();
       }
     });

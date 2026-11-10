@@ -117,7 +117,7 @@ import {
   // PR #2793 review — the per-PR evidence the green-check path now also requires (see `isMainGreenFixOwed`).
   mainLatestGreenShaForCheck,
 } from './main-red-recovery.mjs';
-import { readHungInfo, resolveHungThresholdMs, readClaudeAuthExpiredInfo, readIdleFinishedInfo, resolveIdleFinishedThresholdMs } from './hung-session.mjs';
+import { readHungInfo, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER, readClaudeAuthExpiredInfo, readIdleFinishedInfo, resolveIdleFinishedThresholdMs } from './hung-session.mjs';
 import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 // #4263 — the pure escalation reader (no fs/network of its own) reconcile-core.mjs already imports; re-scanning
 // comments HERE with the SAME function, never a re-derived copy, is what lets this enrich step find exactly the
@@ -505,6 +505,23 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   return Array.isArray(rows) ? enrich(rows) : rows;
 }
 
+/** UNCACHED `claude agents --json` status for one row's sessionId, or null when unreadable/absent (fail closed). */
+export function freshAgentStatus(row, exec = execFileSync) {
+  try {
+    const rows = JSON.parse(String(exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' }) || '[]'));
+    const hit = Array.isArray(rows) ? rows.find((r) => r?.sessionId && r.sessionId === row?.sessionId) : null;
+    return hit && typeof hit.status === 'string' ? hit.status : null;
+  } catch { return null; }
+}
+
+/** The reconcile-only idle-finished reader: opts in to the idle-row override with the full 3x hung pending-call grace
+ *  and an UNCACHED status read (R810); the session reaper never passes these opts. */
+export function makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec = execFileSync } = {}) {
+  return (a, n, t) => readIdleFinishedInfo(a, n, t, {
+    trustIdleRow: true, pendingGraceMs: hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER, freshStatusFor: (row) => freshAgentStatus(row, exec),
+  });
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#defaultReadAgents — the live-session listing. A THIN DELEGATION to
  * `defaultListAgents` (`we:scripts/operations/dispatch-lane-io.mjs`), not a second builder of the same argv: one
@@ -537,7 +554,7 @@ export function defaultReadAgents({
   exec = execFileSync, env = process.env, completionFor = tryReadCompletion,
   hungInfoFor = readHungInfo, now = Date.now(), hungThresholdMs = resolveHungThresholdMs(env),
   authExpiredInfoFor = readClaudeAuthExpiredInfo,
-  idleFinishedInfoFor = readIdleFinishedInfo, idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
+  idleFinishedInfoFor = makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec }), idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
   bgIsolationStallInfoFor = readBgIsolationStallInfo,
   listJobs = undefined,
 } = {}) {
@@ -2059,8 +2076,9 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     // inventory" and the PR could never be classified eligible for the re-run that does not spend heal budget.
     // PR #4651 (2026-10-09): judge only the run GitHub's branch protection judges (newest check suite per name), so a
     // cancelled run already superseded by a newer suite is never re-run, and a newest-suite cancel always is.
-    const failed = authoritativeCheckRuns(checks).filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion))
-      .filter((c) => !isDerivedTimeoutCheck(c, checks));
+    const redChecks = authoritativeCheckRuns(checks).filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion));
+    const reviewHoldOnly = redChecks.every((c) => c.name === 'review-gate');
+    const failed = redChecks.filter((c) => !isDerivedTimeoutCheck(c, checks));
     const jobs = failed.map((c) => {
       const match = resolveCheckOrigin(c, { repo, api });
       const job = api(`repos/${repo}/actions/jobs/${match[3]}`);
@@ -2085,6 +2103,11 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     }
     if (infraClass.kind === 'mixed') return { eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' };
     // Refuse incomplete/mixed inventories before the more expensive immutable source reads.
+    // Nothing left after dropping derived checks (review-gate red BY DESIGN under a review hold, or a superseded
+    // cancelled suite) is not an unreadable inventory: say so, or reconcile files an operator ruling-needed event
+    // ("incomplete failure inventory ... rerun spent") for a PR whose CI is green (live 2026-11-09, #6612/#6621).
+    // Only when review-gate is the SOLE red check; any other empty-jobs case (e.g. a superseded shard hiding a red aggregate) stays an incomplete inventory.
+    if (!jobs.length && reviewHoldOnly) throw new Error('no-primary-failed-checks');
     if (!jobs.length || jobs.some((j) => !parseTimeoutFailures(j.log).complete)) throw new Error('incomplete-failure-inventory');
     const tree = api(`repos/${repo}/git/trees/${head}?recursive=1`);
     if (tree.truncated) throw new Error('truncated-source-tree');
