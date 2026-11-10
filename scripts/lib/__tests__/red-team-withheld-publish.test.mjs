@@ -98,6 +98,51 @@ describe('legacy bare-string red-team publication', () => {
     expect(io.writeStatus).not.toHaveBeenCalled();
     expect(io.publishNeedsYou).not.toHaveBeenCalled();
   });
+  const posted = (text = '### Post-accept red team — no break found', login = 'web-everything') =>
+    [{ author: { login }, body: `${redTeamMarker(42, head)}\n${text}` }];
+  const changesRow = () => seatRow({ foldedVerdict: 'changes', confirmedMissCount: 1, findings: [confirmedFinding] });
+  const confirmedLine = '1. [**confirmed**] (correctness, impact?) `scripts/x.mjs:12` — Confirmed boundary check bypass';
+  it('holds and alerts when a posted comment drops a recovered confirmed break', () => {
+    const io = harness(legacy(), { readSeatRow: changesRow, listComments: () => posted() });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'red-team-legacy-ran-unreadable', repo: 'o/n', pr: 42, head }));
+    expect(io.status.needsYouPublished).toBe(true);
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+  });
+  it('holds when the posted comment shows a confirmed break the recovered row does not have', () => {
+    const io = harness(legacy(), { readSeatRow: () => seatRow(), listComments: () => posted(confirmedLine) });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(io.postComment).not.toHaveBeenCalled();
+  });
+  it('skips quietly when a posted comment agrees with the recovered confirmed breaks', () => {
+    const io = harness(legacy(), { readSeatRow: changesRow, listComments: () => posted(confirmedLine) });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(io.writeStatus).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['seat row missing', () => null],
+    ['seat reader throws', () => { throw Error('seat unreadable'); }],
+    ['seat row from another head', () => seatRow({ rev: 'b'.repeat(40) })],
+  ])('an already-posted legacy ran with an unreadable row raises no conflict alert: %s', (_name, readSeatRow) => {
+    const io = harness(legacy(), { readSeatRow, listComments: () => posted() });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(io.writeStatus).not.toHaveBeenCalled();
+  });
+  it('a forged marker from an untrusted author neither skips nor validates', () => {
+    const io = harness(legacy(), { readSeatRow: changesRow, listComments: () => posted('', 'attacker') });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'posted' });
+    expect(io.postComment).toHaveBeenCalledTimes(1);
+    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+  });
 });
 
 describe('stored red-team publication', () => {
@@ -203,7 +248,14 @@ describe('legacy recovery never publishes an unparseable break', () => {
     const row = { rev: head, foldedVerdict: 'changes', confirmedMissCount: 1, provider: 'p', model: 'm', callId: 'c',
       findings: [{ summary: 's', file: ' ', category: 'correctness', confirmedByRecheck: true }] };
     const io = harness({ repo: 'o/n', pr: 42, head, status: 'finished', result: 'ran' }, { readSeatRow: () => row });
-    expect(publishStoredRedTeamResult(io).status).not.toBe('posted');
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'retry' });
+    expect(io.status.publishAttempts).toBe(1);
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'failed' });
+    expect(io.status).toMatchObject({ publishAttempts: 2, needsYouPublished: true });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'failed' });
     expect(io.postComment).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'red-team-publish-failed', repo: 'o/n', pr: 42, head }));
   });
 });

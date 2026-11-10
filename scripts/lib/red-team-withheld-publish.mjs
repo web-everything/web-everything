@@ -64,21 +64,20 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     };
     const legacy = status.result === 'ran';
     let result = status.result;
-    if (legacy) {
-      try {
-        const row = readSeatRow({ repo, pr, head });
-        if (!row || row.rev !== head || !Array.isArray(row.findings)
-          || !['accept', 'changes', 'needs-human'].includes(row.foldedVerdict)
-          || !Number.isInteger(row.confirmedMissCount) || row.confirmedMissCount < 0
-          || row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck === true).length
-          || (row.foldedVerdict !== 'accept' && row.confirmedMissCount === 0)) {
-          throw Error('invalid legacy red-team evidence');
-        }
-        result = { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
-          callId: row.callId, foldedVerdict: row.foldedVerdict, confirmedMissCount: row.confirmedMissCount,
-          findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true })) };
-      } catch { return holdLegacy(); }
-    }
+    // Throws unless the exact-head seat row is complete and self-consistent.
+    const recoverLegacy = () => {
+      const row = readSeatRow({ repo, pr, head });
+      if (!row || row.rev !== head || !Array.isArray(row.findings)
+        || !['accept', 'changes', 'needs-human'].includes(row.foldedVerdict)
+        || !Number.isInteger(row.confirmedMissCount) || row.confirmedMissCount < 0
+        || row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck === true).length
+        || (row.foldedVerdict !== 'accept' && row.confirmedMissCount === 0)) {
+        throw Error('invalid legacy red-team evidence');
+      }
+      return { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
+        callId: row.callId, foldedVerdict: row.foldedVerdict, confirmedMissCount: row.confirmedMissCount,
+        findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true })) };
+    };
     const escalate = () => {
       if (!status.needsYouPublished) {
         publishNeedsYou({ kind: 'red-team-publish-failed', pr, repo, head,
@@ -97,13 +96,26 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       return status.publishAttempts >= 2 ? escalate() : { status: 'retry' };
     };
     const provider = (!listComments || !postComment) ? createGhProvider() : null;
+    let conflict = false;
     try {
       const comments = listComments ? listComments() : provider.readComments(repo, pr);
       if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
       if (redTeamCommentPosted(comments, pr, head)) {
-        return { status: 'skipped' };
+        if (!legacy) return { status: 'skipped' };
+        // The posted comment stays authoritative: an unreadable row cannot contradict it, so no alert.
+        let recovered;
+        try { recovered = recoverLegacy(); } catch { return { status: 'skipped' }; }
+        // A readable row must agree with the posted comment on confirmed breaks, or the gate would clear a guess.
+        const live = redTeamForHead(comments, pr, head);
+        conflict = !live || live.findings.filter(f => f.confirmed).length !== recovered.confirmedMissCount;
+        if (!conflict) return { status: 'skipped' };
       }
     } catch { return failedAttempt(); }
+    // Outside the try: a failing alert write must not be counted as a publish attempt.
+    if (conflict) return holdLegacy();
+    if (legacy) {
+      try { result = recoverLegacy(); } catch { return holdLegacy(); }
+    }
     if (status.publishAttempts >= 2) return escalate();
     try {
       if (!Array.isArray(result.findings)) throw Error('red-team findings unreadable');
