@@ -1413,7 +1413,7 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
 export function forgeFailureTail(stderr) {
   const text=String(stderr??'').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g,' ').replace(/\s+/g,' ').trim();
   const mixedRun=(text.match(/[A-Za-z0-9+/_=-]{32,}/g)??[]).some(run=>/[a-z]/.test(run)&&/[A-Z]/.test(run)&&/\d/.test(run));
-  if(/auth|token|secret|passw|pwd|api[_-]?key|access[_-]?key|credential|bearer|basic\s|private[_ -]?key|\b(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{4,}|[A-Za-z0-9+_=-]{32,}/i.test(text)||mixedRun) return '[withheld: secret-like content]';
+  if(/auth|token|secret|passw|pwd|api[_-]?key|access[_-]?key|credential|bearer|basic\s|private[_ -]?key|\b(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{4,}|[A-Za-z0-9+_=-]{24,}/i.test(text)||mixedRun) return '[withheld: secret-like content]';
   return text.slice(-500);
 }
 
