@@ -406,6 +406,21 @@ describe('fix-ready-record main()', () => {
         expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(0);
         expect(jsonLines(readFileSync(join(dir, 'sub', 'l.jsonl'), 'utf8'))).toHaveLength(1);
       });
+      it('refuses `link/..` when the link points at a nested directory: `..` leaves the link target, not the link parent', () => {
+        const { dir, settingsFile, ledger } = setup();
+        const { err } = quiet();
+        mkdirSync(join(dir, 'sub', 'deep'));
+        symlinkSync(join(dir, 'sub', 'deep'), join(dir, 'link'));
+        // The kernel opens `<dir>/sub/ledger.jsonl` for this name; the writer's ledger is `<dir>/ledger.jsonl`.
+        const env = { HOME: dir, WE_FIX_READY_PATH: `${dir}/link/../ledger.jsonl` };
+        expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+        expect(err.mock.calls[0][0]).toMatch(/refused/);
+        expect(existsSync(ledger)).toBe(false);
+        // ...and accepts it when the writer really names the file the kernel reaches.
+        writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'sub', 'ledger.jsonl') }));
+        expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(0);
+        expect(jsonLines(readFileSync(join(dir, 'sub', 'ledger.jsonl'), 'utf8'))).toHaveLength(1);
+      });
       it('still refuses two different files whose names merely look alike', () => {
         const { dir, settingsFile } = setup();
         const { err } = quiet();

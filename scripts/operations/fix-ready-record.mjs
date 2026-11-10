@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, parse, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validSha, jsonLines } from './prototype-load.mjs';
 import { loadAdoptionMatrixSettingsFile } from '../lib/adoption-matrix-settings.mjs';
@@ -32,19 +32,22 @@ export function adoptionReaderPath({ env = process.env, home = env.HOME || homed
 }
 
 /** The canonical spelling of a ledger path, so two names for one file compare equal: made absolute (against the working
- *  directory, as both readers do), `.`/`..` collapsed, and symlinks resolved. A ledger that does not exist yet is
- *  resolved through its deepest existing ancestor directory. */
+ *  directory, as both readers do), then walked one component at a time the way the kernel does: each existing
+ *  component is resolved through its symlinks, and `..` steps out of the directory resolved so far (so `link/..` leaves
+ *  the symlink's TARGET, not the link's parent; `path.resolve` would wrongly collapse it textually). Components that do
+ *  not exist yet (a ledger not written yet) are appended as written. */
 export function canonicalPath(p, fsApi = fs) {
-  let rest = '';
-  let cur = resolve(p);
-  for (;;) {
-    try { return join(fsApi.realpathSync(cur), rest); } catch {
-      const up = dirname(cur);
-      if (up === cur) return resolve(p);
-      rest = rest ? join(basename(cur), rest) : basename(cur);
-      cur = up;
-    }
+  const abs = isAbsolute(p) ? p : `${process.cwd()}${sep}${p}`;
+  let cur = parse(abs).root;
+  let exists = true;
+  for (const part of abs.slice(cur.length).split(sep)) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') { cur = dirname(cur); continue; }
+    const next = join(cur, part);
+    if (exists) { try { cur = fsApi.realpathSync(next); continue; } catch { exists = false; } }
+    cur = next;
   }
+  return cur;
 }
 
 /** Pure: returns {ok:true, record} or {ok:false, error}. */
