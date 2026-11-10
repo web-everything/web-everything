@@ -504,6 +504,24 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     // a tag that merely starts with the name is not a container
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n<prefix>\n${m(A)}\n`))?.lastReviewedHead).toBe(A);
   });
+  it('pre-index PR: a mismatched closing tag never closes another container, so a quoted marker cannot suppress review', () => {
+    const [A, B] = ['1'.repeat(40), '2'.repeat(40)];
+    const mk = body => [{ viewerDidAuthor: true, body }];
+    const m = s => `<!-- reviewed-sha: ${s} -->`;
+    const head = `✅ review — accepted\n\n${m(A)}\n`;
+    const idx = readHeadIndex({ dir });
+    // red-team input: </code> inside an open <pre> must not close it
+    const seed = seedFromReviewComments(mk(`${head}<pre>\n</code>\n${m(B)}\n</pre>\n`));
+    expect(seed?.lastReviewedHead).toBe(A);
+    expect(headReviewOwed({ index: idx, repo: 'o/r', pr: 5, head: B, seed }).owed).toBe(true);
+    for (const [o, c] of [['pre', 'blockquote'], ['blockquote', 'pre'], ['script', 'style'], ['textarea', 'code']]) {
+      expect(seedFromReviewComments(mk(`${head}<${o}>\n</${c}>\n${m(B)}\n</${o}>\n`))?.lastReviewedHead, `${o}/${c}`).toBe(A);
+    }
+    // closing the outer element after an unmatched closer still ends the quote
+    expect(seedFromReviewComments(mk(`${head}<pre>\n</code>\n</pre>\n${m(B)}\n`))?.lastReviewedHead).toBe(B);
+    // a nested pair closes in order
+    expect(seedFromReviewComments(mk(`${head}<pre><code>\nx\n</code></pre>\n${m(B)}\n`))?.lastReviewedHead).toBe(B);
+  });
   it('pre-index PR: a reviewed-sha marker inside an HTML blockquote is quoted text and never seeds the head', () => {
     const [A, B] = ['1'.repeat(40), '2'.repeat(40)];
     const mk = body => [{ viewerDidAuthor: true, body }];
