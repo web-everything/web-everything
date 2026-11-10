@@ -186,8 +186,8 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     validateControlInput(p.op, p.input);
     if (p.input.preview || p.action === 'noop') return { action: 'noop', why: 'preview or nothing to do' };
     const before = await readContext(p.op, p.input), existing = await getRecords(p, before);
-    if (p.op === 'ci-heal-reset') planOperatorControl(p.op, before, p.input);
     if (p.records.every(r => existing.some(old => old.key === r.key))) return { action: 'noop', why: 'operator action key already recorded' };
+    if (p.op === 'ci-heal-reset') planOperatorControl(p.op, before, p.input);
     if (controlFingerprint(p.op, before, p.input) !== p.fingerprint) throw new Error('state changed since operator plan; re-run');
     const validated = planOperatorControl(p.op, { ...before, now: p.record.at }, p.input);
     if (validated.body !== p.body || JSON.stringify(validated.records) !== JSON.stringify(p.records) || validated.action !== 'apply') throw new Error('operator plan no longer valid');

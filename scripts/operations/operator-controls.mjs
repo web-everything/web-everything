@@ -98,10 +98,15 @@ export function planOperatorControl(name, read, input) {
     const full = sha => typeof sha === 'string' && /^[a-f\d]{40}$(?![\s\S])/i.test(sha);
     const matches = sha => full(sha) && sha.toLowerCase().startsWith(input.head.toLowerCase());
     const liveHead = String(read.head ?? '').toLowerCase();
-    if (!matches(read.head)) throw new Error('head moved: state changed since the exhausted record');
+    const lower = sha => String(sha ?? '').toLowerCase();
+    if (!full(read.head)) throw new Error('head moved: state changed since the exhausted record');
     if (!Array.isArray(read.awaitVerify)) throw new Error('await-verify records unavailable');
     const rows = read.awaitVerify.filter(({ record }) => record.repo === input.repo && record.pr === input.pr);
-    const matching = rows.filter(({ record }) => matches(record.sha) && String(record.sha).toLowerCase() === liveHead);
+    // An unpushed repair: the record names the withheld repair sha while the remote still holds the head it was based on
+    // (previousCi.headSha, pinned by the harness). Only that recorded pair is accepted; any other head move still refuses.
+    const unpushedRepair = record => full(record.sha) && lower(record.previousCi?.headSha) === liveHead && lower(record.sha) !== liveHead
+      && !(record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha));
+    const matching = rows.filter(({ record }) => (lower(record.sha) === liveHead && matches(read.head)) || (unpushedRepair(record) && (matches(read.head) || matches(record.sha))));
     if (rows.length && !matching.length) throw new Error('head moved: state changed since the exhausted record');
     resets = matching.filter(({ record }) => previousCiFailurePending(record) && Number.isSafeInteger(record.resumeFailures) && record.resumeFailures >= AWAIT_VERIFY_LIMITS.maxResumeFailures);
     if (matching.some(({ record }) => record.operatorResets !== undefined && !(Number.isSafeInteger(record.operatorResets) && record.operatorResets >= 0))) throw new Error('invalid operatorResets counter; escalate');

@@ -109,4 +109,35 @@ describe('ci-heal-reset', () => {
       expect(writeRecord).not.toHaveBeenCalled();
     }
   });
+  it('recovers an unpushed repair: record sha is the withheld repair, remote still holds its pinned base', async () => {
+    const repair = otherHead, rows = () => [row('target', { sha: repair, previousCi: { headSha: head, ready: { ciFailures: ['test'] } } })];
+    for (const value of [head, repair]) {
+      const f = fixture(rows());
+      await f.sink(f.plan({ ...input, head: value }));
+      expect(f.stored()[0].record).toMatchObject({ resumeFailures: 0, operatorResets: 1, sha: repair });
+    }
+    const pushed = fixture([row('target', { sha: repair, earlyPush: { ok: true, sha: repair }, previousCi: { headSha: head, ready: { ciFailures: ['test'] } } })]);
+    expect(() => pushed.plan()).toThrow('head moved');
+    const unrelated = fixture(rows());
+    unrelated.move('f'.repeat(40));
+    expect(() => unrelated.plan({ ...input, head: 'f'.repeat(40) })).toThrow('head moved');
+    expect(() => fixture([row('target', { sha: repair, previousCi: { ready: { ciFailures: ['test'] } } })]).plan()).toThrow('head moved');
+  });
+  it('matches an exhausted record on the live head passed by the operator (daemon logs an empty head)', async () => {
+    const f = fixture([row('target', { sha: head.toUpperCase() })]);
+    await f.sink(f.plan({ ...input, head }));
+    expect(f.stored()[0].record.resumeFailures).toBe(0);
+  });
+  it('replays a completed second reset as the recorded no-op', async () => {
+    const f = fixture();
+    await f.sink(f.plan());
+    f.stored()[0].record.resumeFailures = AWAIT_VERIFY_LIMITS.maxResumeFailures;
+    const second = f.plan();
+    await f.sink(second);
+    expect(f.stored()[0].record.operatorResets).toBe(2);
+    const calls = f.writeAwaitVerify.mock.calls.length, comments = f.comments().length;
+    await expect(f.sink(second)).resolves.toMatchObject({ action: 'noop' });
+    expect(f.writeAwaitVerify.mock.calls.length).toBe(calls);
+    expect(f.comments()).toHaveLength(comments);
+  });
 });
