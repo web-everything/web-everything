@@ -76,6 +76,8 @@ function normalizedComponent(part) {
   return text.normalize('NFKC').normalize('NFD').replace(/\p{M}/gu, '')
     .replace(/\p{Cf}/gu, '').replace(/[. ]+$/u, '').toLowerCase();
 }
+// The caller supplies the normalized policy view of one path component.
+export const secretFileName = component => /^\.(?:env.*|netrc|npmrc)$/.test(component) || keyComponent.test(component);
 function excludedComponent(name, leaf, allowCredential = false) {
   // Admit ordinary accented Latin names (e.g. é) but fail closed on remaining
   // non-ASCII forms: no incomplete hand-maintained confusable substitution map.
@@ -99,10 +101,14 @@ function excludedComponent(name, leaf, allowCredential = false) {
 // untracked, modified versus main, or local-only stays excluded. Names that are
 // unsafe for other reasons (key files, dotfiles, .env, non-ASCII) never qualify.
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
-const secretText=[
-  [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
-  [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
-  [/xox[bp]-[A-Za-z0-9-]{8,}/,'slack-token'],
+export const secretText=[
+  [/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/,'pem-header'],
+  [/\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b/,'github-token'],
+  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,'aws-access-key'],
+  [/\bsk-(?:ant-)?(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}/,'sk-token'],
+  [/\bxox[abprs]-(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{10,}/,'slack-token'],
+  [/\bAIza[0-9A-Za-z_-]{35}\b/,'google-api-key'],
+  [/\bnpm_[A-Za-z0-9]{36}\b/,'npm-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
@@ -119,7 +125,7 @@ const physicalTail=/[^\r\n]*/y;
 const continuationRe=new RegExp(`[${lineBreaks}]([\\t ]*)([^${lineBreaks}]*)`,'y');
 const maxContinuationLines=256;
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
-// line that is not. Returns null when more than maxContinuationLines remain (caller refuses).
+// line that is not. Returns null when more than maxContinuationLines remain (caller warns).
 function continuationLines(text,from,indent) {
   const lines=[];
   continuationRe.lastIndex=from;
@@ -130,24 +136,24 @@ function continuationLines(text,from,indent) {
   }
   return lines;
 }
-// Content scan for a name-flagged file (R323: EVERY type, no type-based skip).
-// JSON gets the full structural scan; other UTF-8 text gets raw token patterns
-// and fail-closed secret assignments. Unknown encodings stay excluded.
-// A file that fails (scrubbers, docs spelling out secrets) stays
-// excluded, so a run that needs it falls back to the Mac. Returns the first
-// finding or null when clean.
+// R857: only exact credential formats block. Generic evidence is advisory.
 export function credentialContentFinding(path,content) {
-  // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
-  // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
+  // Also inspect opaque bytes: an encoding warning must never hide an ASCII credential.
+  const raw=textFinding(content.toString('latin1')) ?? textFinding(content.toString('utf8'));
+  if(raw)return raw;
   const leaf=classifyManifestPath(path).names.at(-1);
-  if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
+  return /\.json$/.test(leaf)?designTokenSecretFinding(content):null;
+}
+// Field names are diagnostic data too; never echo a credential-bearing or unbounded name.
+const findingField=field=>textFinding(field)||field.length>80?`field-sha256-${sha(field).slice(0,12)}`:field;
+export function credentialContentWarning(path,content) {
+  const leaf=classifyManifestPath(path).names.at(-1);
+  if(/\.json$/.test(leaf))return designTokenSecretFinding(content,{warnings:true});
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
-  const raw=textFinding(text);
-  if(raw)return raw;
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
-  // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
+  // This advisory heuristic is not a parser for arbitrary formats.
   for(const match of text.matchAll(assignmentLine)) {
     const [,indent,field]=match;
     // `value` is the whole physical (CR/LF-bounded) value, including any text after a NEL/LS/PS
@@ -156,7 +162,7 @@ export function credentialContentFinding(path,content) {
     const tail=physicalTail.exec(text)[0],value=match[3]+tail;
     const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
     // Only dotted context references (optionally joined by ||) prove that the
-    // expression contains no literal credential. Unknown expression forms refuse.
+    // expression contains no literal credential. Unknown expression forms warn.
     // Raw token patterns above still apply, including inside the reference.
     const reference=/^\$\{\{\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+(?:\s*\|\|\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+)*\s*\}\}$/.test(literal);
     const credentialNamed=secretField.test(field);
@@ -165,29 +171,38 @@ export function credentialContentFinding(path,content) {
       // More-indented following lines extend a YAML scalar (plain, quoted or block). Scan every
       // one, singly and joined (a folded scalar can split a secret across short lines).
       continuation=continuationLines(text,match.index+match[0].length+tail.length,indent.length);
-      if(!continuation)return `unbounded-continuation-${field}`;
+      if(!continuation)return `unbounded-continuation-${findingField(field)}`;
       if(credentialNamed) {
         for(const line of [...continuation,continuation.join('')]) {
-          if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${field}`;
+          if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${findingField(field)}`;
         }
       }
     }
     // A whole-value reference with no continuation line cannot hide a literal.
     if(reference&&!continuation.length)continue;
-    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${findingField(field)}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.
-      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
+      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${findingField(field)}`;
     }
   }
   return null;
 }
-// Returns the first secret-like finding, or null when the content is clean.
-export function designTokenSecretFinding(content) {
+// Scan decoded JSON literals as well as raw text; duplicate keys remain visible.
+export function designTokenSecretFinding(content,{warnings=false}={}) {
   let text;
-  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
-  const raw=textFinding(text);
-  if(raw)return raw;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return warnings?'unsupported-text-encoding':textFinding(content.toString('latin1'));}
+  if(!warnings) {
+    const raw=textFinding(text);
+    if(raw)return raw;
+    // Inspect even a non-object or malformed document before issuing its warning.
+    for(const [literal] of text.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
+      let value;try {value=JSON.parse(literal);} catch {continue;}
+      const decoded=textFinding(value);if(decoded)return decoded;
+    }
+    return null;
+  }
+  if(text.includes('\0'))return 'unsupported-text-encoding';
   let json;
   try {json=JSON.parse(text);} catch {return 'unparseable-json';}
   if(!json||typeof json!=='object'||Array.isArray(json))return 'non-object-json';
@@ -201,13 +216,12 @@ export function designTokenSecretFinding(content) {
       else if(token!==',')stack.pop();
       field=undefined;continue;
     }
-    const value=JSON.parse(literal),decoded=textFinding(value);
-    if(decoded)return decoded;
+    const value=JSON.parse(literal);
     // Under a tainted container, property names are secret candidates too.
     if(colon&&stack.at(-1)&&value.length>=20&&entropy(value)>=3.5)return 'high-entropy-nested-key';
     if(colon) {field=value;continue;}
     const name=field!==undefined&&secretField.test(field)?field:stack.at(-1)?'nested':null;
-    if(name&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${name}`;
+    if(name&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${findingField(name)}`;
     field=undefined;
   }
   return null;
@@ -221,12 +235,21 @@ export function classifyManifestPath(path) {
   const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};
 }
-export function manifestEntry(path,content,executable,tracked) {
+// Warnings are bounded, scrubbed diagnostics and must never affect dispatch.
+export function warnCredential(onWarning,path,finding) {
+  if(!onWarning||!finding)return;
+  let detail=`${path}: ${finding}`;
+  for(const [pattern] of secretText)detail=detail.replace(new RegExp(pattern.source,'g'),value=>`[sha256:${sha(value).slice(0,12)}]`);
+  detail=detail.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?').slice(0,4096);
+  try {onWarning('credential-warn',detail);} catch { /* advisory only */ }
+}
+export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
   if(classifyManifestPath(path).credentialSource) {
     const finding=tracked?credentialContentFinding(path,content):'untracked';
-    if(finding)throw Object.assign(new Error(`Excluded credential-named file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
+    if(finding)throw Object.assign(new Error(`Excluded credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
+    warnCredential(onWarning,path.toString('utf8'),credentialContentWarning(path,content));
   }
   return {path,sha256:sha(content),executable,tracked};
 }

@@ -358,3 +358,17 @@ describe('parallel manifest leaves',()=>{
     await expect(buildManifest({cwd,exec,fs:faulty})).rejects.toThrow('read leaf-03.txt');
   });
 });
+
+
+it('R857 full and warm manifests ship generic credential content and report warnings',async()=>{
+  await write('token-notes.md','key: q8Zr2LmX9vT4pW7kJ1nB5cY3\n');
+  await git(['add','.']);await commit();await git(['update-ref','refs/remotes/origin/main','HEAD']);
+  const warnings=[],onWarning=(...args)=>warnings.push(args);
+  const full=await buildManifest({cwd,exec,onWarning});
+  const warm={sha:(await git(['rev-parse','HEAD'])).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
+  const delta=await buildDeltaManifest({cwd,exec,base:warm,onWarning});
+  expect(delta.manifestMode).toBe('git-delta');
+  expect(manifestWire(delta)).toEqual(manifestWire(full));
+  expect(delta.entries.some(e=>e.path.toString()==='token-notes.md')).toBe(true);
+  expect(warnings).toEqual(Array.from({length:2},()=>['credential-warn','token-notes.md: high-entropy-key']));
+});
