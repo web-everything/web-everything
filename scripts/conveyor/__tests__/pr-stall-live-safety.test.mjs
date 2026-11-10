@@ -280,7 +280,8 @@ const guarantees = [
   ['unknown ownership refuses execution', unknownOwner, 'if (entry?.ownerAlive !== false)', 'if (false)'],
   ['exclusive lock refuses another owner without an audit write', heldLock, "fs.openSync(lock, 'wx')", "fs.openSync(lock, 'w')"],
   ['an aged lock whose holder is dead is reclaimed', deadHolderReclaimed, 'reclaimStaleLock(lock);', ''],
-  ['a failed execute-time head read stops later candidates', headReadStops,
+  // 'null' records no reader error, so only the unreadable-head stop holds the second candidate back.
+  ['an unreadable execute-time head read stops later candidates', run => headReadStops(run, 'null'),
     "if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) {", 'if (false) {'],
   ['durable intent precedes dispatch under the lock', durableIntent, "record({ ...i, ts, phase: 'intent', mode: cfg.mode });", ''],
   ['unwritable intent refuses dispatch', run => durableIntent(run, true), "record({ ...i, ts, phase: 'intent', mode: cfg.mode });", ''],
@@ -320,7 +321,7 @@ describe('live restart execution guarantees', () => {
     expect(fs.readFileSync(lock, 'utf8')).toBe(`${process.ppid}\n`);
   });
 
-  it.each(['null', 'malformed'])('a %s execute-time head read stops later candidates', async failure => {
+  it.each(['throw', 'malformed'])('a %s execute-time head read stops later candidates', async failure => {
     await headReadStops(runStallSweep, failure);
   });
 
