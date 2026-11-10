@@ -1603,7 +1603,8 @@ export function createReviewPrSinks({
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
       if (!existsSync(bodyPath)) {
         try {
-          const run = runStore.read(ctx.runId);
+          // The executor's own store first (`ctx.readRun`); the default store only for a caller with no executor.
+          const run = typeof ctx?.readRun === 'function' ? ctx.readRun(ctx.runId) : runStore.read(ctx.runId);
           const staged = run?.id === ctx.runId && run.effects?.find(entry =>
             entry.type === REVIEW_EFFECTS.WRITE_UP && entry.status === 'applied'
             && entry.payload?.bodyFile === payload.bodyFile

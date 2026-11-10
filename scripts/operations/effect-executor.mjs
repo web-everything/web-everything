@@ -374,6 +374,9 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
     try {
       const result = await lookup(live.type)(live.payload, {
         key: live.key, runId: current.id, type: live.type, stepIndex: live.stepIndex, step: live.step, index: live.index,
+        // A read-only handle on THIS executor's store, so a sink that recovers from the run record reads the
+        // record this executor writes, never a store it chose on its own (#6661).
+        readRun: (id) => store.read(id),
       });
       if (isInFlightResult(result)) {
         if (!live.dispatch) {

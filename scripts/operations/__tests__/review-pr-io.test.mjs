@@ -399,6 +399,32 @@ describe('the label sink', () => {
       expect(createFileRunStore(sharedDir).list()).toEqual([]);
     });
 
+    it('recovers from the store the executor was handed, not a store the sink chose on its own', async () => {
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      const { declaration, registry } = stagedRecord();
+      // A non-default store: nothing about this run exists under OPERATION_RUNS_DIR or the shared folder.
+      const store = createMemoryRunStore();
+      const id = 'run-restore-own-store';
+      const gate = async () => ({ allowed: true, headSha: payload.reviewedHead });
+      const historical = `review-set-label.mjs failed and its outcome is UNKNOWN: --body-file=${payload.bodyFile} is unreadable (ENOENT: no such file or directory)`;
+      await runOperationCli({
+        declaration, registry, store, judge: async () => ({}), argv: [], newRunId: () => id,
+        sinks: { ...createReviewPrSinks({ root, publishGate: gate }), [REVIEW_EFFECTS.LABEL]: async () => { throw new Error(historical); } },
+      });
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      const runNode = vi.fn(argv => {
+        expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice('--body-file='.length), 'utf8')).toBe('# staged verdict');
+        return '{"ok":true}';
+      });
+      const resumed = await runOperationCli({
+        declaration, registry, store, judge: async () => ({}), argv: [`--resume=${id}`], newRunId: () => 'unused',
+        sinks: createReviewPrSinks({ root, publishGate: gate, runNode }),
+      });
+      expect(resumed.code).toBe(0);
+      expect(runNode).toHaveBeenCalledTimes(1);
+      expect(createFileRunStore().list()).toEqual([]);
+    });
+
     it('the real review-set-label CLI refuses an unreadable body before any gh call, in a form recovery recognises', () => {
       const bin = mkdtempSync(join(tmpdir(), 'review-pr-io-gh-'));
       const log = join(bin, 'gh.log');
