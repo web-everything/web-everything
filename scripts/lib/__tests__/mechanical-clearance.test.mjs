@@ -42,6 +42,46 @@ describe('mechanical clearance', () => {
   fail('nonrequired failure', 'checks', f => f.checks.push({ name: 'other', conclusion: 'TIMED_OUT' }));
   it('uses latest required run', () => { const f = facts(); f.checks.push({ name: 'test', appId: GITHUB_ACTIONS_APP_ID, conclusion: 'PENDING', id: 2 }); expect(validateMechanicalClearance(f).rule).toBe('checks'); });
   it('successful rerun supersedes an old failed run', () => { const f = facts(); f.checks.unshift({ name: 'test', appId: GITHUB_ACTIONS_APP_ID, conclusion: 'FAILURE', id: 0 }); expect(validateMechanicalClearance(f).cleared).toBe(true); });
+  it('higher-id queued rerun without timestamps supersedes an older success', () => {
+    const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
+    f.checks.push({ ...f.checks[0], id: 2, started_at: null, status: 'queued', conclusion: null });
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+  });
+  it.each([undefined, null, '', 'invalid'])('ambiguous rerun with id %s and no timestamps fails closed in either input order', id => {
+    for (const reverse of [false, true]) {
+      const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
+      f.checks.push({ ...f.checks[0], id, started_at: null, status: 'queued', conclusion: null });
+      if (reverse) f.checks.reverse();
+      expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+    }
+  });
+  it('higher-id success supersedes an older failure even with an earlier timestamp', () => {
+    const f = facts(); f.checks[0].started_at = '2026-11-10T11:00:00Z';
+    f.checks.push({ ...f.checks[0], id: 0, started_at: '2026-11-10T12:00:00Z', conclusion: 'FAILURE' });
+    expect(validateMechanicalClearance(f).cleared).toBe(true);
+  });
+  it('unresolved ambiguous failure prevents clearance in all three-run permutations', () => {
+    for (const order of [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]) {
+      const f = facts();
+      const runs = [
+        { ...f.checks[0], id: undefined, started_at: '2026-11-10T13:00:00Z', conclusion: 'FAILURE' },
+        { ...f.checks[0], id: 1, started_at: '2026-11-10T11:00:00Z', conclusion: 'FAILURE' },
+        { ...f.checks[0], id: 2, started_at: '2026-11-10T12:00:00Z' },
+      ];
+      f.checks.splice(0, 1, ...order.map(index => runs[index]));
+      expect(validateMechanicalClearance(f), `run order: ${order}`).toMatchObject({ cleared: false, rule: 'checks' });
+    }
+  });
+  it('equal ids use timestamps to select the newer run', () => {
+    const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
+    f.checks.push({ ...f.checks[0], started_at: '2026-11-10T11:00:00Z', conclusion: 'FAILURE' });
+    expect(validateMechanicalClearance(f).cleared).toBe(true);
+  });
+  it.each([undefined, 'invalid'])('equal ids with unknown timestamp %s prefer failure', started_at => {
+    const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
+    f.checks.push({ ...f.checks[0], started_at, conclusion: 'FAILURE' });
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+  });
   fail('another app newer success cannot mask a failed Actions check', 'checks', f => {
     f.checks[0].conclusion = 'FAILURE';
     f.checks.push({ ...f.checks[0], appId: 42, id: 99, conclusion: 'SUCCESS' });

@@ -58,19 +58,30 @@ export function validateMechanicalClearance(facts = {}) {
     if (!check || typeof check.name !== 'string') return fail('checks', 'Unreadable check result.');
     // REST uses lowercase conclusions; rollup fixtures and status contexts may use uppercase.
     const normalized = { ...check, conclusion: typeof check.conclusion === 'string' ? check.conclusion.toUpperCase() : null };
-    const rank = [Date.parse(check.started_at ?? check.created_at ?? '') || 0, Number(check.id) || 0];
+    const id = /^(?:0|[1-9]\d*)$/.test(String(check.id)) && Number.isSafeInteger(Number(check.id)) ? Number(check.id) : NaN;
+    const rank = [id, Date.parse(check.started_at ?? check.created_at ?? '')];
     const kind = check.kind ?? 'check-run';
     if (!['check-run', 'status'].includes(kind)) return fail('checks', 'Unreadable check kind.');
     const key = JSON.stringify([kind, check.appId ?? null, check.name]);
-    const previous = latest.get(key);
-    if (!previous || rank[0] > previous.rank[0] || (rank[0] === previous.rank[0] && rank[1] >= previous.rank[1])) latest.set(key, { check: normalized, rank });
+    const previous = latest.get(key) ?? [];
+    const compare = candidate => {
+      for (let i = 0; i < rank.length; i++) {
+        if (!Number.isFinite(rank[i]) || !Number.isFinite(candidate.rank[i])) return 0;
+        if (rank[i] !== candidate.rank[i]) return rank[i] > candidate.rank[i] ? 1 : -1;
+      }
+      return 0;
+    };
+    // Retain every ambiguous candidate until a certainly newer run supersedes it.
+    if (!previous.some(candidate => compare(candidate) < 0)) {
+      latest.set(key, [...previous.filter(candidate => compare(candidate) === 0), { check: normalized, rank }]);
+    }
   }
-  if ([...latest.values()].some(({ check }) => check.kind === 'status'
+  if ([...latest.values()].flat().some(({ check }) => check.kind === 'status'
     ? check.conclusion !== 'SUCCESS'
     : check.status !== 'completed' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion))) return fail('checks', 'A latest head check or status failed or is incomplete; use normal review.');
   if (!REQUIRED_MECHANICAL_CHECKS.every(name => {
-    const check = latest.get(JSON.stringify(['check-run', GITHUB_ACTIONS_APP_ID, name]))?.check;
-    return check?.conclusion === 'SUCCESS' && check.status === 'completed';
+    return latest.get(JSON.stringify(['check-run', GITHUB_ACTIONS_APP_ID, name]))
+      ?.every(({ check }) => check.conclusion === 'SUCCESS' && check.status === 'completed');
   })) return fail('checks', 'Required head checks must all have a latest successful completed GitHub Actions run.');
   return { cleared: true, rule: null, reasons: [], head };
 }
