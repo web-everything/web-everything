@@ -1,11 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { canonicalPaths, validateProtectedPattern, assertProtectedPatterns } from '../audit-path.mjs';
+import { canonicalPaths as canonicalPathsOf, anchorsOf, validateProtectedPattern, assertProtectedPatterns } from '../audit-path.mjs';
 import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern, oracleMatchesPath } from './fixtures/audit-path-old-oracle.mjs';
 
 const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'review-x.mjs', 'docs/', 'guard-*.mjs'];
-// R813(c): P2 is bounded to REAL patterns, and the settings load refuses any other (see the validator describe below).
+// R813(c): P2 is bounded to REAL patterns. The settings load refuses the REFUSED_JUNK subset below (a leading '-' or a '+');
+// the other JUNK shapes are well-formed patterns the validator accepts, so only the P2 rows (not the load) cover them.
 const JUNK = ['scripts/x.mjs42', 'scripts/x.mjs-', 'custom/x.mjs42', 'scripts/guard-bash.mjs4', '4-9', 'L3-L9', '1', 'L42', '42-50', '---a/scripts/x.mjs', 'custom/a+b.mjs'];
+const REFUSED_JUNK = JUNK.filter(x => /^-|\+/.test(x));
+// The anchors argument is required by the module; the tests that mean "no anchors" say so here, once.
+const NO_ANCHORS = new Set();
+const canonicalPaths = (file, anchors = NO_ANCHORS) => canonicalPathsOf(file, anchors);
 const lower = a => a.map(x => x.toLowerCase());
 const globOk = (p, pat) => {
   if (pat.endsWith('/')) return p.startsWith(pat);
@@ -183,6 +188,29 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
     expect(canonicalPaths('repo/scripts/guard-bash.mjs')).toEqual(['repo/scripts/guard-bash.mjs']);
     expect(canonicalPaths('repo/scripts/guard-bash.mjs', ANCHORS)).toEqual(['repo/scripts/guard-bash.mjs', 'scripts/guard-bash.mjs']);
   });
+  it('anchors are required: omitting or mis-building them throws instead of silently dropping the protection', () => {
+    for (const bad of [undefined, null, ['scripts'], 'scripts', {}, 7]) expect(() => canonicalPathsOf('repo/scripts/guard-bash.mjs', bad), String(bad)).toThrow(TypeError);
+    expect(() => canonicalPathsOf('repo/scripts/guard-bash.mjs')).toThrow(TypeError);
+    // Even a hostile report is refused for the missing anchors first, never answered unprotected.
+    expect(() => canonicalPathsOf(null)).toThrow(TypeError);
+  });
+  it('a caller that passes only the patterns keeps a nested protected path protected (anchorsOf)', () => {
+    const anchors = anchorsOf(PATTERNS);
+    expect([...anchors].sort()).toEqual([...ANCHORS].sort());
+    expect(canonicalPathsOf('repo/scripts/guard-bash.mjs', anchors)).toContain('scripts/guard-bash.mjs');
+    expect(canonicalPathsOf('a/b/.claude/settings.json', anchors)).toContain('.claude/settings.json');
+    expect(protects('repo/scripts/guard-bash.mjs')).toBe(true);
+    // A pattern with a wildcard first segment names no anchor; a malformed list is refused outright.
+    expect([...anchorsOf(['*.mjs', '**', 'Scripts/**'])]).toEqual(['scripts']);
+    expect(() => anchorsOf(['scripts/**', 'a b'])).toThrow(/protected pattern/);
+    expect(() => anchorsOf('scripts/**')).toThrow();
+  });
+  it('anchors given in any casing still protect (they are lower-cased inside)', () => {
+    for (const a of [new Set(['SCRIPTS']), new Set(['Scripts'])]) {
+      expect(canonicalPathsOf('repo/scripts/guard-bash.mjs', a)).toContain('scripts/guard-bash.mjs');
+      expect(canonicalPathsOf('REPO/Scripts/Guard-Bash.mjs', a)).toContain('Scripts/Guard-Bash.mjs');
+    }
+  });
 });
 
 describe('P3 every tracked path canonicalises to itself first', () => {
@@ -221,8 +249,16 @@ describe('R813(c) settings validator: a malformed protected pattern fails the lo
     for (const p of ['**', '*', 'scripts/**/', '_headers', '.github/workflows/*.yml', 'a/b-c_d.e/**']) expect(validateProtectedPattern(p), p).toBe(true);
     expect(() => assertProtectedPatterns(PATTERNS)).not.toThrow();
   });
+  it('a terminal line terminator is refused by both strict grammars (JS $ is end-of-input, pinned)', () => {
+    for (const nl of ['\n', '\r\n', '\r', '\u2028', '\u2029']) {
+      expect(validateProtectedPattern('scripts/guard-bash.mjs' + nl), JSON.stringify(nl)).toBe(false);
+      expect(canonicalPaths('scripts/guard-bash.mjs' + nl), JSON.stringify(nl)).toBeNull();
+      expect(canonicalPaths('scripts/guard-bash.mjs:42' + nl), JSON.stringify(nl)).toBeNull();
+      expect(canonicalPaths('"scripts/guard-bash.mjs"' + nl), JSON.stringify(nl)).toBeNull();
+    }
+  });
   it('refuses junk and malformed patterns (red-green: a junk pattern in the settings is refused)', () => {
-    for (const p of JUNK.filter(x => /^-|\+/.test(x)).concat(['', '/', '/abs', 'a//b', './a', 'a/./b', '../a', 'a/../b', 'a/..', 'x.', 'x-', 'x_', 'a b', 'a\\b', '\u0600/x', '"a"', 'a:1', 'a#L1', 'a'.repeat(600), null, 7, undefined])) {
+    for (const p of REFUSED_JUNK.concat(['', '/', '/abs', 'a//b', 'scripts//', 'a//', 'scripts/**//', 'a/\n', 'a\n', 'scripts/guard-bash.mjs\n', '\n', 'a\r', 'a\u2028', './a', 'a/./b', '../a', 'a/../b', 'a/..', 'x.', 'x-', 'x_', 'a b', 'a\\b', '\u0600/x', '"a"', 'a:1', 'a#L1', 'a'.repeat(600), null, 7, undefined])) {
       expect(validateProtectedPattern(p), String(p)).toBe(false);
     }
     expect(() => assertProtectedPatterns(['scripts/**', '---a/scripts/x.mjs'])).toThrow(/protected pattern/);
@@ -234,11 +270,11 @@ describe('R813(c) settings validator: a malformed protected pattern fails the lo
 describe('P2 bounded to real patterns: every tracked path under every past wrapper', () => {
   it('the oracle never protects a wrapped tracked path that the new code lets through', () => {
     const files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 1 << 28 }).split('\0').filter(Boolean);
-    const r = rng(0xbeef);
-    const sample = [];
-    for (let i = 0; i < 250; i++) sample.push(files[Math.floor(r() * files.length)]);
+    expect(files.length).toBeGreaterThan(100);
+    const visited = new Set();
     const wrappers = [x => x, x => '"' + x + '"', x => "'" + x + "'", x => '\u0060' + x + '\u0060', x => '+++ b/' + x, x => '--- a/' + x, x => x + ':42', x => x + ':4-9', x => x + ':1:2', x => x + '#L42', x => x + '#L3-L9', x => 'repo/' + x, x => ' ' + x + ' ', x => x + '.', x => '-' + x, x => './' + x, x => '"' + x + '":42', x => 'i/' + x];
-    for (const f of sample) {
+    for (const f of files) {
+      visited.add(f);
       const segs = f.split('/');
       const pats = [f, segs.length > 1 ? segs.slice(0, -1).join('/') + '/**' : f, segs[0] + '/**'];
       expect(pats.every(p => validateProtectedPattern(p)), f).toBe(true);
@@ -252,5 +288,8 @@ describe('P2 bounded to real patterns: every tracked path under every past wrapp
         expect(ok, input).toBe(true);
       }
     }
-  });
+    // The guarantee is every tracked path, not a sample: the visited set must be exactly the tracked set.
+    expect(visited.size).toBe(new Set(files).size);
+    expect([...visited].sort()).toEqual([...new Set(files)].sort());
+  }, 300_000);
 });

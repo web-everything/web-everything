@@ -28,15 +28,28 @@ function normalise(path) {
 }
 
 /**
- * `anchors` (optional, lower-case): the first folder of each protected glob (`scripts` of `scripts/**`). EVERY form
- * the report yields (as written, side-prefix stripped, line suffix stripped, joined, ...) also yields each trailing
- * sub-path that starts at an anchor, as the old matcher did, so `repo/scripts/x.mjs:42` still reaches `scripts/x.mjs`.
- * Without anchors only the path itself is read.
+ * The anchors for a list of protected patterns: the lower-case first folder of each (`scripts` of `scripts/**`). A
+ * pattern whose first segment holds a wildcard names none. Build `canonicalPaths`'s second argument with this, from the
+ * same patterns the caller matches against; the patterns must pass `assertProtectedPatterns` (this throws otherwise).
+ */
+export function anchorsOf(patterns) {
+  assertProtectedPatterns(patterns);
+  return new Set(patterns.map(p => p.toLowerCase().split('/')[0]).filter(s => !s.includes('*')));
+}
+
+/**
+ * `anchors` (REQUIRED, a Set; `anchorsOf(patterns)` builds it, `new Set()` says "no anchors" on purpose): the first
+ * folder of each protected glob (`scripts` of `scripts/**`). EVERY form the report yields (as written, side-prefix
+ * stripped, line suffix stripped, joined, ...) also yields each trailing sub-path that starts at an anchor, as the old
+ * matcher did, so `repo/scripts/x.mjs:42` still reaches `scripts/x.mjs`. Anchors are lower-cased here, so a caller's
+ * casing cannot switch the protection off. A missing or non-Set `anchors` throws: leaving it out would silently drop
+ * the folder-above-the-repo protection (`repo/scripts/x.mjs` would match no `scripts/**` glob), so it is not a default.
  *
  * A PATH that ends in punctuation (`.` `-` `_` `/`) or holds a `..` segment is refused: no tracked name does either, and
  * the old matcher's trimmed and joined readings of such a name are not worth chasing one by one.
  */
-export function canonicalPaths(file, anchors = null) {
+export function canonicalPaths(file, anchors) {
+  if (!(anchors instanceof Set)) throw new TypeError('canonicalPaths: anchors must be a Set (anchorsOf(patterns), or new Set() for none)');
   if (typeof file !== 'string' || file.length > MAX_AUDIT_PATH) return null;
   const text = file.replace(/^ +| +$/g, '');
   // A leading `word:` reads as a URL scheme (`file:x`, or a top-level `x.mjs:42`): refused, as the old matcher did.
@@ -61,11 +74,12 @@ export function canonicalPaths(file, anchors = null) {
   for (const c of [normalise(text), normalise(text.replace(/[^A-Za-z0-9._/-]/g, ''))]) if (c !== null) out.add(c);
   const loc = (m[4] ?? '').slice(1);
   if (loc) for (const d of [loc, ...loc.split(':'), ...(loc.match(/\d+/g) ?? [])]) out.add(d);
-  if (anchors && anchors.size) {
+  if (anchors.size) {
+    const lowered = new Set([...anchors].map(a => String(a).toLowerCase()));
     for (const c of [...out]) {
       const segs = c.split('/');
       for (let i = 1; i < segs.length; i++) {
-        if (!anchors.has(segs[i].toLowerCase())) continue;
+        if (!lowered.has(segs[i].toLowerCase())) continue;
         const sub = normalise(segs.slice(i).join('/'));
         if (sub !== null) out.add(sub);
       }
