@@ -59,6 +59,12 @@ describe('unfinished retryable record effect', () => {
   ])('escalates %s', (_, rows) => {
     expect(decide(options(rows))).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
   });
+  it('a non-retryable unfinished run escalates and never dispatches a review (so review-loop-cli is not reached)', () => {
+    const o = runFixture(options([{ ...row, retryableRecordEffect: false }]));
+    const out = runRedTeamOnSkip(o).rows[0];
+    expect(out).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
   it('keeps unreadable evidence held', () => {
     expect(decide({ ...options([]), readReviewRuns: () => { throw Error('unreadable'); } }))
       .toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
