@@ -1104,6 +1104,40 @@ describe('runRemote', () => {
       : {mode:'unconfirmed',reason:'ambiguous-result'});
   });
 
+  // R817: a protected receipt that proves the Forge install/supervisor failed is a confirmed, finished result.
+  it.each([['install',97,'forge-install-failed'],['supervisor',254,'forge-supervisor-failed']])(
+    'R817: a verified %s-phase code-%i receipt is not-started (%s), never unconfirmed', async (phase, code, reason) => {
+      const f = fixture({runCode:code, receipt:(_n, value) => JSON.stringify({...value, phase, code})});
+      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason});
+    });
+
+  it.each([
+    ['install phase with a non-sentinel code', 'install', 3, 3],
+    ['supervisor phase with the install sentinel', 'supervisor', 97, 97],
+    ['install phase with the supervisor sentinel', 'install', 254, 254],
+    ['unknown phase with a sentinel code', 'rejected', 97, 97],
+    ['install receipt whose code differs from the run exit', 'install', 97, 1],
+  ])('R817: %s stays unconfirmed', async (_name, phase, code, runCode) => {
+    const f = fixture({runCode, receipt:(_n, value) => JSON.stringify({...value, phase, code})});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
+  it.each(['nonce','run','inputDigest','argvDigest','manifestDigest'])(
+    'R817: an install-phase code-97 receipt with a mismatched %s stays unconfirmed', async field => {
+      const f = fixture({runCode:97, receipt:(_n, value) => JSON.stringify({...value, phase:'install', code:97, [field]:'0'.repeat(32)})});
+      expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+    });
+
+  it('R817: an install-phase code-97 receipt with an extra field (forged shape) stays unconfirmed', async () => {
+    const f = fixture({runCode:97, receipt:(_n, value) => JSON.stringify({...value, phase:'install', code:97, extra:true})});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
+  it('R817: a test-phase code-97 receipt is still a normal remote result', async () => {
+    const f = fixture({runCode:97});
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:97});
+  });
+
   // R595 S1: the launcher's run-time egress-table-absent rejection is written as a plain `snapshot-rejected` record
   // (siblings:false, no delta). The Mac only certifies not-started for siblings/delta/forge-busy rejections, so this
   // record fails closed to unconfirmed (heavy-admission then refuses) rather than silently rerunning local.
