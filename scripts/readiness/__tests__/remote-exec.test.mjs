@@ -1109,24 +1109,8 @@ describe('runRemote', () => {
   it.each([['install',97,'forge-install-failed'],['supervisor',254,'forge-supervisor-failed']])(
     'R817: a verified %s-phase code-%i receipt is not-started (%s), never unconfirmed', async (phase, code, reason) => {
       const f = fixture({runCode:code, receipt:(_n, value) => JSON.stringify({...value, phase, code})});
-      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason,detail:'unclassified (stderr not copied)'});
+      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason});
     });
-
-  it('R817: the failure detail is a fixed-vocabulary classification, never raw stderr, and is logged', async () => {
-    const secrets = ['password=hunter2','Authorization: Bearer abc','ghp_'+'A1b2C3d4'.repeat(3),'https://user:pw@registry.example/x','pass\u200bword=x','tok-en: s3cret','Cookie: a=b','EsecretValue99','EAbc123XYZ'];
-    const stderr = '\u001b[31mnpm ci failed\u0007 ENOSPC: no space left on device, install-cache lock held\n'+secrets.join('\n')+'\n'+'x'.repeat(5000);
-    const f = fixture({runCode:97, receipt:(_n, value) => JSON.stringify({...value, phase:'install', code:97})});
-    const original = f.exec; const log = vi.fn();
-    f.exec = vi.fn(async call => { const r = await original(call); return isRun(call) ? {...r, stderr} : r; });
-    const result = await runRemote({...f, log});
-    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-install-failed'});
-    expect(result.detail.length).toBeLessThanOrEqual(500);
-    expect(result.detail).toBe('ENOSPC; npm ci failed; install-cache; lock; no space left on device');
-    for (const secret of secrets) { expect(result.detail).not.toContain(secret.slice(0, 8)); }
-    expect(log).toHaveBeenCalledWith('forge install failed: '+result.detail+'\n');
-    expect(remoteManifestAPI.forgeFailureTail('weird unknown text '.repeat(500))).toBe('unclassified (stderr not copied)');
-    expect(remoteManifestAPI.forgeFailureTail(undefined)).toBe('unclassified (stderr not copied)');
-  });
 
   it.each([
     ['install phase with a non-sentinel code', 'install', 3, 3],
@@ -2035,7 +2019,7 @@ describe('receipt field binding', () => {
       baseline = {...v};
       return JSON.stringify({...v,phase:'install'});
     }})))
-      .toEqual({mode:'not-started',terminated:true,reason:'forge-install-failed',detail:'unclassified (stderr not copied)'});
+      .toEqual({mode:'not-started',terminated:true,reason:'forge-install-failed'});
     expectValidReceipt(baseline);
   });
 });

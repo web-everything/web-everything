@@ -1360,10 +1360,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(!result || !verifyReceipt(text,expected,result.code)) {
         // R817: a fully verified install/supervisor failure receipt proves the run never reached the tests.
         const failure=result&&forgeFailureReason(text,expected,result.code);
-        if(!failure) return {mode:'unconfirmed',reason:'ambiguous-result'};
-        const detail=forgeFailureTail(result.stderr);
-        log(`forge install failed: ${detail}\n`);
-        return {mode:'not-started',terminated:true,reason:failure,detail};
+        return failure?{mode:'not-started',terminated:true,reason:failure}:{mode:'unconfirmed',reason:'ambiguous-result'};
       }
       if (argv[2] === 'check:standards') {
         observeStandards(result.stdout ?? '', 'stdout');
@@ -1406,25 +1403,6 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
       && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)
       && (failurePhase ? (receipt.phase==='install'&&code===97)||(receipt.phase==='supervisor'&&code===254) : receipt.phase==='test'&&Number.isInteger(code)&&code>=0&&code<255) && receipt.code===code;
   } catch {return false;}
-}
-
-/** R817: what the Forge run stderr says, as a fixed vocabulary only. Nothing from stderr is copied through, so a
- * credential can never reach the returned detail or the gate log (heuristic redaction of free text kept leaking).
- * Output is the de-duplicated, ordered signals found: node/npm error codes (E...) and known install-failure phrases. */
-const FORGE_FAILURE_SIGNALS=[
-  [/\b(?:ENOSPC|EACCES|EPERM|ENOENT|EEXIST|EBUSY|EMFILE|ENOTEMPTY|EROFS|EDQUOT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|E401|E403|E404|E429|E500|E502|E503)\b/g,match=>match], // closed list, never an open pattern
-  [/npm ci validation failed/i,()=>'npm ci validation failed'],[/npm ci failed/i,()=>'npm ci failed'],
-  [/install[- ]cache/i,()=>'install-cache'],[/\block(?:ed| file)?\b/i,()=>'lock'],[/missing: .* from lock file/i,()=>'lockfile out of sync'],
-  [/no space left on device/i,()=>'no space left on device'],[/permission denied/i,()=>'permission denied'],
-  [/timed? ?out/i,()=>'timed out'],[/network|getaddrinfo|ECONN/i,()=>'network'],
-];
-export function forgeFailureTail(stderr) {
-  const text=String(stderr??'').slice(-20000),found=[];
-  for(const [pattern,label] of FORGE_FAILURE_SIGNALS) {
-    const global=pattern.global?pattern:new RegExp(pattern.source,pattern.flags+'g');
-    for(const match of text.matchAll(global)) {const value=label(match[0]);if(!found.includes(value))found.push(value);}
-  }
-  return (found.join('; ')||'unclassified (stderr not copied)').slice(0,500);
 }
 
 /** R817: the launcher's sentinel codes (install 97, supervisor 254) under the SAME integrity checks as a test receipt; only the phase allow-list widens. */
