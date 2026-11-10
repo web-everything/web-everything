@@ -1112,28 +1112,19 @@ describe('runRemote', () => {
       expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason,detail:''});
     });
 
-  it('R817: the failure detail is a bounded, control-free, token-masked stderr tail, and is logged', async () => {
-    const stderr = 'x'.repeat(2000)+'\u001b[31mnpm ci failed\u0007 ghp_'+'A1b2C3d4'.repeat(5)+' token=Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEF end';
+  it('R817: the failure detail is a bounded, control-free stderr tail that withholds anything secret-like, and is logged', async () => {
+    const stderr = 'x '.repeat(1000)+'\u001b[31mnpm ci failed\u0007 at /opt/forge/cache';
     const f = fixture({runCode:97, receipt:(_n, value) => JSON.stringify({...value, phase:'install', code:97})});
     const original = f.exec; const log = vi.fn();
     f.exec = vi.fn(async call => { const r = await original(call); return isRun(call) ? {...r, stderr} : r; });
     const result = await runRemote({...f, log});
     expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-install-failed'});
     expect(result.detail.length).toBeLessThanOrEqual(500);
-    expect(result.detail).toContain('npm ci failed');
+    expect(result.detail).toContain('npm ci failed at /opt/forge/cache'.replace('failed at','failed '+'at'));
     expect(result.detail).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
-    expect(result.detail).not.toMatch(/ghp_|abcdefghijklmnopqrstuvwxyz0123456789/);
-    expect(result.detail).toContain('[masked]');
-    const short = remoteManifestAPI.forgeFailureTail('path /opt/forge/cache ok\nnpm ERR! password=hunter2 and Authorization: Bearer abc123 x_token: s3cret');
-    expect(short).not.toMatch(/hunter2|abc123|s3cret/);
-    expect(remoteManifestAPI.forgeFailureTail('leak aB3/dE5+fG7hJ9kL1mN3pQ5rS7tU9vW1x end')).toBe('leak [masked] end');
-    expect(remoteManifestAPI.forgeFailureTail('at /opt/forge/cache/some/deep/dir/node_modules/pkg ok')).toContain('/opt/forge/cache');
-    expect(remoteManifestAPI.forgeFailureTail('token=\n\nshortSecret123\nnext')).toBe('[masked] next');
-    expect(remoteManifestAPI.forgeFailureTail('token=\rshortSecret123\rnext')).toBe('[masked] next');
-    expect(remoteManifestAPI.forgeFailureTail('token=\nshortSecret123\nnext')).toBe('[masked] next');
-    expect(remoteManifestAPI.forgeFailureTail('password="two words here" tail\n\nnext')).toBe('[masked]');
-    expect(short).toContain('/opt/forge/cache');
     expect(log).toHaveBeenCalledWith('forge install failed: '+result.detail+'\n');
+    for (const secret of ['password=hunter2','Authorization: Bearer abc','token=\n\nshortSecret123','token=\rshortSecret123','password="a\nb\nc\nSECRET"','ghp_'+'A1b2C3d4'.repeat(3),'aB3/dE5+fG7hJ9kL1mN3pQ5rS7tU9vW1xYz','-----BEGIN PRIVATE KEY-----'])
+      expect(remoteManifestAPI.forgeFailureTail('npm ERR! '+secret+'\nmore')).toBe('[withheld: secret-like content]');
   });
 
   it.each([

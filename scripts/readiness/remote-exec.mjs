@@ -1408,15 +1408,13 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
   } catch {return false;}
 }
 
-/** R817: bounded (500 chars), control-free, token-masked tail of the Forge run stderr, safe to print and attach. */
+/** R817: bounded (500 chars), control-free tail of the Forge run stderr, safe to print and attach. Fail closed: any
+ * secret-like keyword or token shape withholds the whole tail rather than trusting line-based masking. */
 export function forgeFailureTail(stderr) {
-  // Secrets are masked per raw line (to end of line, plus the next line for a value wrapped onto it) BEFORE control characters are flattened, so a value can never straddle a newline.
-  return String(stderr??'').replace(/\r\n?|\u2028|\u2029|\x0b|\x0c|\x85/g,'\n').replace(/(?:authorization|auth|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|credential)s?\b["']?\s*[=:][^\n]*(?:\n\s*[^\n]*)?/gi,'[masked]')
-    .replace(/[\x00-\x1f\x7f-\x9f]+/g,' ')
-    .replace(/\b(?:Bearer|Basic)\s+\S+/gi,'[masked]')
-    .replace(/[A-Za-z0-9+/_=-]{32,}/g,run=>/[a-z]/.test(run)&&/[A-Z]/.test(run)&&/\d/.test(run)?'[masked]':run)
-    .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{4,}|\b[A-Za-z0-9+_=-]{24,}/g,'[masked]')
-    .replace(/\s+/g,' ').trim().slice(-500);
+  const text=String(stderr??'').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g,' ').replace(/\s+/g,' ').trim();
+  const mixedRun=(text.match(/[A-Za-z0-9+/_=-]{32,}/g)??[]).some(run=>/[a-z]/.test(run)&&/[A-Z]/.test(run)&&/\d/.test(run));
+  if(/auth|token|secret|passw|pwd|api[_-]?key|access[_-]?key|credential|bearer|basic\s|private[_ -]?key|\b(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{4,}|[A-Za-z0-9+_=-]{32,}/i.test(text)||mixedRun) return '[withheld: secret-like content]';
+  return text.slice(-500);
 }
 
 /** R817: the launcher's sentinel codes (install 97, supervisor 254) under the SAME integrity checks as a test receipt; only the phase allow-list widens. */
