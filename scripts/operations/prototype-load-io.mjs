@@ -419,16 +419,21 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // refers to a real audit), never on a handwritten ready record alone. Honoured, it proceeds in any mode.
       // Only a record findAudit accepts (valid time, current question, matching head) counts; the newest one decides.
       const lcSha = String(input.sha).toLowerCase();
-      const ownWeakenedAll = [...new Set(auditRecords.filter((r) => r && String(r.head).toLowerCase() === lcSha && r.base !== r.head).map((r) => r.base))]
-        .map((base) => findAudit(auditRecords, { head: input.sha, base, questionHash: QUESTION_HASH })).filter((r) => r?.verdict === 'WEAKENED')
-        .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+      const ruledGate = !!out.gate.ruledWeakened;
+      const ownBases = !ruledGate ? [] : [...new Set(auditRecords.filter((r) => r && String(r.head).toLowerCase() === lcSha && r.base !== r.head).map((r) => r.base))];
+      // The usable WEAKENED verdicts (findAudit) whose base is in main: the ruling must rest on a covered audit, not a partial one.
+      const ownWeakenedAll = ownBases.map((base) => findAudit(auditRecords, { head: input.sha, base, questionHash: QUESTION_HASH }))
+        .filter((r) => r?.verdict === 'WEAKENED' && covers(r.base)).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+      // A base's latest raw WEAKENED record also needs disclosure even when findAudit rejects it (its veto still blocks).
+      const rawLatestWeak = ownBases.map((base) => [...auditRecords].reverse().find((r) => r && String(r.head).toLowerCase() === lcSha && r.base === base))
+        .filter((r) => r?.verdict === 'WEAKENED');
       const ownWeakened = ownWeakenedAll[0];
       if (out.gate.ruledWeakened) {
         const ruled = out.gate.ruledWeakened.findings;
         // Every unsuperseded WEAKENED record (any base) must carry non-empty string findings that the ruling discloses.
-        const undisclosed = ownWeakenedAll.flatMap((r) => Array.isArray(r.findings) && r.findings.length && r.findings.every((f) => typeof f === 'string')
+        const undisclosed = [...new Set([...ownWeakenedAll, ...rawLatestWeak])].flatMap((r) => Array.isArray(r.findings) && r.findings.length && r.findings.every((f) => typeof f === 'string')
           ? r.findings.filter((f) => !ruled.includes(f)) : ['(malformed or empty findings)']);
-        if (ownWeakened && undisclosed.length) return stop('no-canonical-audit', { detail: 'ruled-weakened-findings-mismatch', fallback: `The ruling ${out.gate.ruledWeakened.ruling} does not disclose every finding of the canonical WEAKENED audit for ${input.sha}; undisclosed: ${undisclosed.join(' | ')}. Get a ruling covering them.` });
+        if (undisclosed.length) return stop('no-canonical-audit', { detail: 'ruled-weakened-findings-mismatch', fallback: `The ruling ${out.gate.ruledWeakened.ruling} does not disclose every finding of the canonical WEAKENED audit for ${input.sha}; undisclosed: ${undisclosed.join(' | ')}. Get a ruling covering them.` });
         if (!ownWeakened || out.canonicalAudit.reason !== 'weakened') return stop('no-canonical-audit', { detail: 'ruled-weakened-without-canonical-record', fallback: `A ruledWeakened entry applies only when ${input.sha} has a canonical WEAKENED codex-audit record. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry.` });
         console.warn(`WARNING: ruled exception ${out.gate.ruledWeakened.ruling} rests on canonical WEAKENED audit record at ${ownWeakened.at}.`);
       } else
