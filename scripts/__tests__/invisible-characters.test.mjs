@@ -15,10 +15,7 @@ let fixture, root;
 beforeAll(() => { fixture = pinnedFixture(); root = fixture.primary; }, 30_000);
 afterAll(() => fixture?.cleanup());
 function invoke(tool_name, tool_input) {
-  const target = hook.command.match(/node "\$launcher" (scripts\/lint-invisible-characters\.mjs); code=/)?.[1];
-  expect(hook.command).toContain('scripts/hooks/run-pinned-guard.mjs');
-  expect(target).toBe('scripts/lint-invisible-characters.mjs');
-  return fixture.run(root, target, { tool_name, tool_input, cwd: root });
+  return fixture.command(root, hook.command, { tool_name, tool_input, cwd: root });
 }
 
 describe('invisible source characters (#2866)', () => {

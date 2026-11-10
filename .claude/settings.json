@@ -70,7 +70,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-prep.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-prep.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       },
@@ -79,27 +79,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-lane.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-lane.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/lint-locus-prefix.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/lint-locus-prefix.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/lint-invisible-characters.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/lint-invisible-characters.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/check-memory.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/check-memory.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/backlog-guard.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/backlog-guard.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-backward-edge.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-backward-edge.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       },
@@ -108,7 +108,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-bash.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-bash.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       },
@@ -117,7 +117,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-monitor-subagent.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-monitor-subagent.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       }
@@ -127,7 +127,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-passive-wait.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-passive-wait.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       }
@@ -137,11 +137,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-passive-wait.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-passive-wait.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "sh -c 'common=$(git rev-parse --path-format=absolute --git-common-dir) || { echo \"Pinned guard: cannot locate primary repository\" >&2; exit 2; }; primary=\"$common/..\"; case \"$common\" in */.lanes/*) workspace=${common%%/.lanes/*}; primary=\"$workspace/web-everything\"; [ -d \"$primary\" ] || primary=\"$workspace/webeverything\" ;; esac; primary=$(cd \"$primary\" && pwd -P) || { echo \"Pinned guard: primary checkout unavailable\" >&2; exit 2; }; case \"$primary\" in */.lanes/*) echo \"Pinned guard: refusing a lane bootstrap\" >&2; exit 2 ;; esac; launcher=\"$primary/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: primary launcher missing\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-background-running.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-background-running.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       }

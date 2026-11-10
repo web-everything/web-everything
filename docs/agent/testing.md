@@ -1293,16 +1293,49 @@ exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` w
 
 ### Passive-wait hook regression probes
 
-Security hooks (`PreToolUse`, `Stop`, `SubagentStop`) run through the primary checkout's
-`scripts/hooks/run-pinned-guard.mjs`, using a cached archive of the local `origin/main` ref.
-Uncommitted lane guard edits do not affect these hooks. Probe both linked worktrees and
-clone lanes with temporary Git repositories and `WE_PINNED_HOOKS_DIR` under the task's
-`TMPDIR`. Clone lanes under `.lanes/`
-resolve the bootstrap from the sibling `web-everything` primary (legacy: `webeverything`),
-never from their own Git common directory; replace the lane launcher in wrapper probes.
-Cover stdin, exit codes,
-snapshot refresh, offline `latest` fallback and missing-snapshot denial (exit 2).
-The launcher header documents the operator escape for deliberately testing local guards.
+Security hooks (`PreToolUse`, `Stop`, `SubagentStop`) bootstrap the launcher and guards only
+from `${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}`, never the primary or lane copies.
+The launcher requires a real regular file within the clone's `scripts/` tree (symlinks cannot
+escape), sets `WE_HOOK_ROOT` to the real cwd checkout toplevel, and preserves stdin, argv,
+cwd and guard exit codes. Missing clone, launcher, script or Git evidence fails closed with
+stderr and exit 2; settings map any nonzero launcher result to exit 2.
+The hook never fetches: it warns but runs if `.git/FETCH_HEAD` mtime (or HEAD commit time
+when absent) is over 24 hours old. Refresh with `node scripts/hooks/sync-guard-clone.mjs`
+from a repo with the intended origin, or pass `--origin=<url>` from any directory.
+
+The sync script creates a single-branch main clone and records its canonical path in local
+Git config (`we.guardClone`). Subsequent runs validate that ownership, origin, main branch,
+and main-only fetch refspec before fetch/reset/clean. An existing unowned checkout is refused:
+move it aside and rerun sync to create the disposable clone. Never point this at a working
+checkout; all tracked edits and untracked/ignored files in the owned clone are discarded.
+Use an absolute origin URL/path so the scheduler and interactive invocations agree.
+
+Launcher snapshot publication and sync share a non-reclaiming sibling `.guard-lock`
+directory. Under that mutex the launcher copies the scripts tree and package metadata into
+a private revision under `TMPDIR`, then releases the mutex before running the guard.
+Refreshes can reset/clean the clone while delayed imports continue against that private
+revision; only its owning launcher removes it, after the guard exits. Both commands fail
+closed on lock contention and tell the operator to retry. Inspect an abandoned lock only
+after confirming its owner has stopped; never steal it on a timer. A killed launcher can
+leave a revision directory for operator cleanup after confirming no guard still uses it.
+The named concurrent-refresh regression pauses before a delayed import, removes that
+dependency in origin/main, refreshes twice, and verifies the original import and eventual
+revision cleanup. Keep all coordination event-driven, without sleep/poll loops.
+
+For macOS scheduling, initialize the clone first, then copy
+`scripts/hooks/com.we.guard-main-sync.plist.template` to
+`~/Library/LaunchAgents/com.we.guard-main-sync.plist`. Replace every placeholder with an
+XML-escaped absolute value: node executable, canonical guard clone, origin URL, executable
+search PATH (including Git), and an existing log directory. launchd does not expand shell
+variables or tildes. Install with
+`launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.we.guard-main-sync.plist"`;
+remove with `launchctl bootout gui/$(id -u)/com.we.guard-main-sync`.
+It runs every 900 seconds; inspect the configured stderr log after installation.
+
+Use temporary independent guard clones and primary/linked-worktree fixtures under the task's
+`TMPDIR`; replace primary and lane guards/launchers to prove neither runs. Settings-wiring
+probes execute every configured command through `sh -c` with a temporary `WE_GUARD_CLONE`.
+Sync probes use local temporary origins only, including wrong-origin and unowned-target refusals.
 
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
 `agent_transcript_path`, falling back to `transcript_path` only when absent; an unreadable or malformed
@@ -4123,25 +4156,14 @@ mutation enters handled-ID state. Run these and the affected lock/self-sync regr
 
 ## Pinned-hook checkout roots
 
-Snapshot code must resolve operated-checkout paths through `scripts/lib/hook-root.mjs`, not
-its cache location. The launcher sets `WE_HOOK_ROOT` to the real Git toplevel of its cwd;
-a cwd without a resolvable Git root denies even when a cached snapshot exists. Offline
-snapshot fallback requires a verified manifest no older than 24h inside a checkout. Caches and
-`latest` pointers are scoped by SHA-256 of the real Git common directory; legacy global
-pointers are ignored. Each snapshot has a sibling `<sha>.manifest` with sorted file hashes
-and a root digest, and its tree is read-only. Every launch hashes the complete tree and
-reports verification milliseconds; invalid online caches are discarded and rebuilt from Git,
-while offline repairs require valid age evidence and preserve that original timestamp.
-Missing age evidence, expired snapshots and failed Git reconstruction deny. Snapshots must pass
-the launcher's root-helper compatibility probe before any guard runs. Keep direct-execution checks and snapshot
-resource imports tied to `import.meta.url`. Unpinned calls retain the script-parent root.
+Pinned guard code must resolve operated-checkout paths through `scripts/lib/hook-root.mjs`,
+independently of its source location. The launcher sets `WE_HOOK_ROOT` to the real Git toplevel
+of its cwd; an unresolvable root denies. Keep direct-execution checks and resource imports tied
+to `import.meta.url`. Direct calls retain the script-parent root.
 `scripts/hooks/__tests__/hook-root.test.mjs` probes primary/lane protection, seeded daemon
-paths and lint scope through the real launcher using isolated Git snapshots under `TMPDIR`.
-
-Pinned-hook verification, repair, publication and guard execution hold one exclusive per-SHA
-lock using the shared atomic directory primitive. Pruning skips locked snapshots, including
-older revisions still needed for late imports. Contention waits on filesystem events for up
-to 5s, then denies with a retry/operator-inspection message. Locks have no automatic expiry:
-an abandoned lock requires confirming that no launcher or guard uses the snapshot before
-removing it. The named concurrent-launch tests cover cold publication, repair during a
-running guard, pruning overlap and delayed imports; abandoned-lock denial is also exercised.
+paths and lint scope through the real launcher using isolated primary/worktree fixtures under
+`TMPDIR`. The launcher tests execute the configured settings wrapper from linked worktrees
+and clone lanes with replaced lane launchers and guards, proving dedicated-clone execution,
+lane-root propagation and fail-closed denial when clone evidence is missing or incomplete.
+Private scripts revisions and the sync/publication mutex protect delayed imports during
+scheduled reset/clean; their lifetime is the owning guard invocation.
