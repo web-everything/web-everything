@@ -8,7 +8,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { classifyManifestPath, credentialTextFinding, credentialContentFinding, credentialContentWarning, secretFileName } from './forge-exec-manifest.mjs';
+import { classifyManifestPath, credentialTextFinding, credentialBufferFinding, credentialContentFinding, credentialContentWarning, secretFileName } from './forge-exec-manifest.mjs';
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
@@ -286,7 +286,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
       if (got !== sha || type !== 'blob') throw bundleError('bundle-credential-scan-failed');
       const content = out.subarray(newline + 1, newline + 1 + Number(size));
       offset = newline + 1 + Number(size) + 1;
-      const finding = credentialTextFinding(content.toString('latin1')) ?? credentialTextFinding(content.toString('utf8'));
+      const finding = credentialBufferFinding(content);
       // Apply both policy levels to every added blob, including excluded paths in history.
       for (const { label, path } of blobs.get(sha).values()) {
         let policy = null;

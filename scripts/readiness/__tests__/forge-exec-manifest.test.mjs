@@ -110,3 +110,16 @@ describe('credentialContentFinding GitHub Actions references', () => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n  \u00a0' + literal + '\n')).not.toBeNull();
   });
 });
+
+
+describe('credential format byte views', () => {
+  it.each(['latin1', 'utf8', 'utf16le', 'utf16be'])('blocks a GitHub token decoded from %s', encoding => {
+    const token = 'ghp_' + 'a'.repeat(36);
+    const content = encoding === 'utf16be' ? Buffer.from(token, 'utf16le').swap16() : Buffer.from(token, encoding);
+    expect(credentialContentFinding(path, content)).toBe('github-token');
+  });
+  it('scans big-endian whole code units with an odd trailing byte', () => {
+    const content = Buffer.from('ghp_' + 'a'.repeat(36), 'utf16le').swap16();
+    expect(credentialContentFinding(path, Buffer.concat([content, Buffer.from([255])]))).toBe('github-token');
+  });
+});

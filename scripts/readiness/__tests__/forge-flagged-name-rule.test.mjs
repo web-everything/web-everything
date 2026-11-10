@@ -268,7 +268,7 @@ describe('content secret scan',()=>{
     ['PEM','-----'+'BEGIN PRIVATE KEY-----','pem-header'],
     ['AWS','AKIA'+'ABCDEFGHIJKLMNOP','aws-access-key'],
     ...'opsur'.split('').map(kind=>['GitHub '+kind,`gh${kind}_`+'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8','github-token']),
-    ['sk','sk-'+'abcdefghijklmnopqrstuvwxyz0123','sk-token'],
+    ['sk','sk-'+'abcdefghijklmnopqrstuvwxyz012345','sk-token'],
     ['Slack bot','xoxb-'+'12345678-abcdefgh','slack-token'],
     ['Slack user','xoxp-'+'12345678-abcdefgh','slack-token'],
   ])('detects %s signatures in raw text and decoded JSON literals',(_label,value,reason)=>{
@@ -340,15 +340,17 @@ describe('R857 exact credential formats',()=>{
     ['github-token','github_pat_'+'a1_'.repeat(8),'github_pat_'+'a'.repeat(21)],
     ['aws-access-key','AKIA'+'A'.repeat(16),'AKIA'+'A'.repeat(15)],
     ['aws-access-key','ASIA'+'A'.repeat(16),'ASIA'+'A'.repeat(17)],
-    ['sk-token','sk-'+'a'.repeat(19)+'1','sk-'+'some-long-css-class-name-without-digits'],
-    ['sk-token','sk-ant-'+'a'.repeat(19)+'1','sk-ant-'+'a'.repeat(30)],
-    ['slack-token','xoxb-'+'a'.repeat(9)+'1','xoxb-'+'a'.repeat(30)],
+    ['sk-token','sk-'+'a'.repeat(32),'sk-'+'css-class-name'],
+    ['sk-token','sk-ant-'+'a'.repeat(20),'sk-ant-'+'css-name'],
+    ['slack-token','xoxb-'+'a'.repeat(10),'xoxb-'+'a'.repeat(9)],
     ['google-api-key','AIza'+'a'.repeat(35),'AIza'+'a'.repeat(34)],
     ['npm-token','npm_'+'a'.repeat(36),'npm_'+'a'.repeat(35)],
   ];
   it.each(cases)('blocks exact %s, and rejects its near miss %#',(rule,positive,negative)=>{
     const pattern=secretText.find(([,name])=>name===rule)[0];
     expect(pattern.test(positive)).toBe(true);
+    for(const prefix of ['_', '-'])expect(credentialTextFinding(prefix+positive)).toBe(rule);
+    if(rule!=='pem-header')expect(credentialTextFinding('a'+positive)).toBeNull();
     expect(pattern.test(negative)).toBe(false);
     expect(credentialTextFinding(negative)).toBeNull();
     for(const path of ['credentials.txt','tokens.json']) {
@@ -364,8 +366,8 @@ describe('R857 exact credential formats',()=>{
   });
   it.each(['-----'+'BEGIN PRIVATE KEY BLOCK-----','-----'+'BEGIN OPENSSH PRIVATE KEY-----'])(
     'blocks private-key header variant %#',value=>expect(credentialTextFinding(value)).toBe('pem-header'));
-  it.each(['private key','PRIVATE KEY','-----'+'BEGIN','prefix'+githubToken,'_'+githubToken])(
-    'admits prose and tokens without a word boundary %#',value=>expect(credentialTextFinding(value)).toBeNull());
+  it.each(['private key','PRIVATE KEY','-----'+'BEGIN','prefix'+githubToken])(
+    'admits prose and tokens preceded by an alphanumeric prefix %#',value=>expect(credentialTextFinding(value)).toBeNull());
   it.each(['.env','.env.local','.netrc','.npmrc','x.pem','id_rsa','x.key','x.p12','x.pfx','x.jks','x.keystore',
     '.ＥＮＶ.local. ','X.PEM ','id_\u200brsa'])(
     'recognizes normalized secret-file component %s',name=>{

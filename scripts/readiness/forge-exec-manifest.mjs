@@ -103,15 +103,26 @@ function excludedComponent(name, leaf, allowCredential = false) {
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 export const secretText=[
   [/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/,'pem-header'],
-  [/\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b/,'github-token'],
-  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,'aws-access-key'],
-  [/\bsk-(?:ant-)?(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}/,'sk-token'],
-  [/\bxox[abprs]-(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{10,}/,'slack-token'],
-  [/\bAIza[0-9A-Za-z_-]{35}\b/,'google-api-key'],
-  [/\bnpm_[A-Za-z0-9]{36}\b/,'npm-token'],
+  [/(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b/,'github-token'],
+  [/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}\b/,'aws-access-key'],
+  [/(?<![A-Za-z0-9])(?:sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{32,})/,'sk-token'],
+  [/(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}/,'slack-token'],
+  [/(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}\b/,'google-api-key'],
+  [/(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}\b/,'npm-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+// Scan each supported byte view, including BOM-less UTF-16 in either byte order.
+export function credentialBufferFinding(content) {
+  for(const encoding of ['latin1','utf8','utf16le']) {
+    const finding=textFinding(content.toString(encoding));
+    if(finding)return finding;
+  }
+  // swap16 requires whole code units; a trailing byte cannot encode a token character.
+  const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
+  return textFinding(swapped.toString('utf16le'));
+}
+
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
@@ -138,8 +149,8 @@ function continuationLines(text,from,indent) {
 }
 // R857: only exact credential formats block. Generic evidence is advisory.
 export function credentialContentFinding(path,content) {
-  // Also inspect opaque bytes: an encoding warning must never hide an ASCII credential.
-  const raw=textFinding(content.toString('latin1')) ?? textFinding(content.toString('utf8'));
+  // An encoding warning must never hide a credential in another decoded view.
+  const raw=credentialBufferFinding(content);
   if(raw)return raw;
   const leaf=classifyManifestPath(path).names.at(-1);
   return /\.json$/.test(leaf)?designTokenSecretFinding(content):null;

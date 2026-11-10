@@ -63,6 +63,13 @@ const beginMainMerge = (publicContent = 'public update\n') => {
 };
 
 describe('scanBundleRange lane first-parent scope', () => {
+  it.each(['utf16le', 'utf16be'])('blocks a GitHub token in a %s blob', async encoding => {
+    const content = Buffer.from('ghp_' + 'a'.repeat(36), 'utf16le');
+    write('note.txt', encoding === 'utf16be' ? content.swap16() : content);
+    commit('encoded content');
+    expect(await scan()).toEqual({ path: 'note.txt', finding: 'github-token' });
+  });
+
   it('rejects a regular-file-to-symlink mode-only transition with the same prerequisite path and blob', async () => {
     write('link.txt', '.env.local');
     originMain = commit('public regular file');
