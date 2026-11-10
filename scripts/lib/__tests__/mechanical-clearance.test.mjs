@@ -1,6 +1,6 @@
 /** @file Mechanical refresh admission: injected evidence, never network. */
 import { describe, it, expect } from 'vitest';
-import { validateMechanicalClearance, readMechanicalClearanceFacts, recordMechanicalClearance,
+import { validateMechanicalClearance, readMechanicalClearanceFacts, recordMechanicalClearance, decideMechanicalLabelStrip,
   REQUIRED_MECHANICAL_CHECKS } from '../mechanical-clearance.mjs';
 
 const head = 'a'.repeat(40);
@@ -11,7 +11,7 @@ const facts = () => ({ head, author: { login: 'web-everything[bot]', type: 'Bot'
   files: [{ filename: path, status: 'modified' }],
   baseEntry: { type: 'blob', mode: '100644' }, headEntry: { type: 'blob', mode: '100644' },
   content: JSON.stringify({ _doc: 'Seconds', unit: { [testPath]: 450 }, soak: {} }),
-  existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, conclusion: 'SUCCESS', id: 1 })) });
+  existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, conclusion: 'SUCCESS', status: 'completed', id: 1 })) });
 
 describe('mechanical clearance', () => {
   it('clears the refresh workflow identities and seconds', () => expect(validateMechanicalClearance(facts()).cleared).toBe(true));
@@ -152,5 +152,53 @@ describe('durable record', () => {
     let body; const f = facts(); f.author.type = 'User';
     recordMechanicalClearance({ repo: 'owner/repo', num: 1, result: validateMechanicalClearance(f), readComments: () => [], post: text => { body = text; } });
     expect(body).toContain('author: FAIL'); expect(body).toContain('keys: NOT EVALUATED');
+  });
+});
+
+describe('independent check kinds', () => {
+  it('a newer success status cannot hide a failed required check-run', () => {
+    const f = facts(); f.checks[0].conclusion = 'FAILURE';
+    f.checks.push({ kind: 'status', name: 'test', conclusion: 'SUCCESS', id: 99 });
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+  });
+  it('required success without completion evidence fails closed', () => {
+    const f = facts(); delete f.checks[0].status;
+    expect(validateMechanicalClearance(f).rule).toBe('checks');
+  });
+  it('a status alone cannot satisfy a required check', () => {
+    const f = facts(); f.checks[0].kind = 'status';
+    expect(validateMechanicalClearance(f).rule).toBe('checks');
+  });
+  for (const kind of ['check-run', 'status']) for (const conclusion of ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'PENDING', 'UNKNOWN']) {
+    it(`refuses latest nonrequired ${kind} ${conclusion}`, () => {
+      const f = facts(); f.checks.push({ kind, name: 'other', conclusion });
+      expect(validateMechanicalClearance(f).rule).toBe('checks');
+    });
+  }
+  it('tags REST evidence so a newer status cannot hide a check failure', () => {
+    const f = readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: io({ mutate: (url, v) =>
+      url.includes('/check-runs') ? { ...v, check_runs: v.check_runs.map(c => c.name === 'test' ? { ...c, conclusion: 'failure' } : c) }
+        : url.includes('/statuses') ? [{ context: 'test', state: 'success', id: 99, created_at: '2026-11-11T12:00:00Z' }] : v }) });
+    expect(f.checks[0].kind).toBe('check-run');
+    expect(f.checks.at(-1).kind).toBe('status');
+    expect(validateMechanicalClearance(f).rule).toBe('checks');
+  });
+});
+
+describe('mechanical label decision', () => {
+  const pr = { state: 'OPEN', author: { login: 'web-everything[bot]' }, headRefOid: head,
+    labels: [{ name: 'ready-to-merge' }], commits: [{ messageHeadline: 'refresh timings' }] };
+  it('strips missing, refused or stale clearance; preserves current clearance', () => {
+    for (const result of [null, { cleared: false, rule: 'diff-scope', head }, { cleared: true, head: 'b'.repeat(40) }]) {
+      expect(decideMechanicalLabelStrip(pr, result).strip).toBe(true);
+    }
+    expect(decideMechanicalLabelStrip(pr, { cleared: true, head }).strip).toBe(false);
+  });
+  it('never strips AI-generated, accepted, human, closed or unlabelled PRs', () => {
+    for (const extra of [{ commits: [{ messageBody: 'Co-Authored-By: Claude' }] },
+      { labels: [...pr.labels, { name: 'review:accepted' }] }, { author: { login: 'human' } },
+      { state: 'CLOSED' }, { labels: [] }]) {
+      expect(decideMechanicalLabelStrip({ ...pr, ...extra }, null).strip).toBe(false);
+    }
   });
 });

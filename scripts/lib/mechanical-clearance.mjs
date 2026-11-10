@@ -5,6 +5,7 @@
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { createMqLiveReader } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { isAiGeneratedPr, hasLabel } from './ai-pr-authorship.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const REQUIRED_MECHANICAL_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']);
@@ -57,13 +58,16 @@ export function validateMechanicalClearance(facts = {}) {
     // REST uses lowercase conclusions; rollup fixtures and status contexts may use uppercase.
     const normalized = { ...check, conclusion: typeof check.conclusion === 'string' ? check.conclusion.toUpperCase() : null };
     const rank = [Date.parse(check.started_at ?? check.created_at ?? '') || 0, Number(check.id) || 0];
-    const previous = latest.get(check.name);
-    if (!previous || rank[0] > previous.rank[0] || (rank[0] === previous.rank[0] && rank[1] >= previous.rank[1])) latest.set(check.name, { check: normalized, rank });
+    const kind = check.kind ?? 'check-run';
+    if (!['check-run', 'status'].includes(kind)) return fail('checks', 'Unreadable check kind.');
+    const key = `${kind}:${check.name}`;
+    const previous = latest.get(key);
+    if (!previous || rank[0] > previous.rank[0] || (rank[0] === previous.rank[0] && rank[1] >= previous.rank[1])) latest.set(key, { check: normalized, rank });
   }
-  if ([...latest.values()].some(({ check }) => ['FAILURE', 'CANCELLED', 'TIMED_OUT'].includes(check.conclusion))) return fail('checks', 'A latest head check failed, was cancelled, or timed out.');
+  if ([...latest.values()].some(({ check }) => ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'PENDING', 'UNKNOWN'].includes(check.conclusion) || check.conclusion == null)) return fail('checks', 'A latest head check or status failed or is incomplete; use normal review.');
   if (!REQUIRED_MECHANICAL_CHECKS.every(name => {
-    const check = latest.get(name)?.check;
-    return check?.conclusion === 'SUCCESS' && (check.status == null || check.status === 'completed');
+    const check = latest.get(`check-run:${name}`)?.check;
+    return check?.conclusion === 'SUCCESS' && check.status === 'completed';
   })) return fail('checks', 'Required head checks must all have a latest successful completed run.');
   return { cleared: true, rule: null, reasons: [], head };
 }
@@ -149,9 +153,10 @@ export function readMechanicalClearanceFacts({ repo, num, exec = execFileSyncThr
         return ['100644', '100755'].includes(match[1]) && match[2] === 'blob' ? match[3] : null;
       }).filter(path => path !== null);
     }
-    facts.checks = pages(`commits/${facts.head}/check-runs?filter=all`, 'check_runs', 'total_count');
+    facts.checks = pages(`commits/${facts.head}/check-runs?filter=all`, 'check_runs', 'total_count')
+      .map(check => ({ ...check, kind: 'check-run' }));
     const statuses = pages(`commits/${facts.head}/statuses`);
-    facts.checks.push(...statuses.map(status => ({ name: status.context, id: status.id, created_at: status.created_at,
+    facts.checks.push(...statuses.map(status => ({ kind: 'status', name: status.context, id: status.id, created_at: status.created_at,
       conclusion: ({ success: 'SUCCESS', failure: 'FAILURE', error: 'FAILURE', pending: 'PENDING' })[status.state] ?? 'UNKNOWN' })));
     if (api(`pulls/${num}`)?.head?.sha !== facts.head) throw Error('head moved');
   } catch {
@@ -162,6 +167,16 @@ export function readMechanicalClearanceFacts({ repo, num, exec = execFileSyncThr
 
 export function decideMechanicalClearance(options) {
   return validateMechanicalClearance(readMechanicalClearanceFacts(options));
+}
+
+/** Only bot PRs without independent AI or human certification depend on mechanical clearance. */
+export function decideMechanicalLabelStrip(pr, result) {
+  const eligible = !['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())
+    && ['web-everything[bot]', 'app/web-everything'].includes(pr?.author?.login)
+    && hasLabel(pr, 'ready-to-merge') && !isAiGeneratedPr(pr) && !hasLabel(pr, 'review:accepted');
+  const current = result?.cleared === true && typeof result.head === 'string' && result.head.length > 0
+    && typeof pr?.headRefOid === 'string' && result.head.toLowerCase() === pr.headRefOid.toLowerCase();
+  return { strip: eligible && !current, rule: result?.rule ?? (current ? null : 'head') };
 }
 
 /** Idempotent per head. Existing receipts only suppress duplicate recording, never certify a PR. */

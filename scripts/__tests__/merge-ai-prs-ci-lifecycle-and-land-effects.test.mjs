@@ -12,7 +12,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { labelOnGreenVerdict, isRequiredCheckGreen, isRequiredCheckFailed, isRequiredCheckPending, hasLabel, classifyPr, isRebaseDropCandidate, needsManifestStripBeforeMerge, restampAcceptance, spawnReviewSetLabel, isStackedWeCoupleHalf, shouldRepollForLabelLag, shouldLabelOnGreen, resolveRepos, siblingCloneName, regenDerivedOnLand, pushNumberingOnLand, resolvePrimaryPath, syncPrimaryOnLand, resyncDetachedCwdForLand, drainReasonMarker, buildDrainReasonComment, buildHeldReviewHoldReason, hasDrainReasonComment, shouldPostParkReasonComment, LAND_REASON, MERGE_TRACE_KIND, buildMergeTraceReason, CI_LIFECYCLE_LABELS, CI_LIFECYCLE_LABEL_META, lifecycleLabelFromCiTruth, planCiLifecycleLabelUpdate, hasStaleReviewPendingBesideAccept, remoteManifestApiArgs, landedIdsForCandidate, isAiGeneratedPr, isMechanicalMergeCommit } from '../merge-ai-prs.mjs';
+import { reconcileMechanicalClearance, labelOnGreenVerdict, isRequiredCheckGreen, isRequiredCheckFailed, isRequiredCheckPending, hasLabel, classifyPr, isRebaseDropCandidate, needsManifestStripBeforeMerge, restampAcceptance, spawnReviewSetLabel, isStackedWeCoupleHalf, shouldRepollForLabelLag, shouldLabelOnGreen, resolveRepos, siblingCloneName, regenDerivedOnLand, pushNumberingOnLand, resolvePrimaryPath, syncPrimaryOnLand, resyncDetachedCwdForLand, drainReasonMarker, buildDrainReasonComment, buildHeldReviewHoldReason, hasDrainReasonComment, shouldPostParkReasonComment, LAND_REASON, MERGE_TRACE_KIND, buildMergeTraceReason, CI_LIFECYCLE_LABELS, CI_LIFECYCLE_LABEL_META, lifecycleLabelFromCiTruth, planCiLifecycleLabelUpdate, hasStaleReviewPendingBesideAccept, remoteManifestApiArgs, landedIdsForCandidate, isAiGeneratedPr, isMechanicalMergeCommit } from '../merge-ai-prs.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { claudeCommit, humanCommit, greenRollup, aiPr } from './fixtures/merge-ai-prs-fixtures.mjs';
 
@@ -1486,5 +1486,67 @@ describe('the TOTAL ci-lifecycle reconcile clears a stale label even when UNCERT
   it('behavioral: an uncertified PR whose required check is NOT yet green keeps its stale label untouched (never a blind clear)', () => {
     const pr = { statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] };
     expect(isRequiredCheckGreen(pr, 'test')).toBe(false);
+  });
+});
+
+describe('live mechanical reconcile', () => {
+  const head = 'a'.repeat(40);
+  const pr = (extra = {}) => aiPr({ number: 861, state: 'OPEN', author: { login: 'app/web-everything' },
+    commits: [humanCommit], headRefOid: head, labels: [], ...extra });
+  const harness = (results, dryRun = false) => {
+    const reads = [], records = [], writes = [], logs = [];
+    const options = { repo: 'owner/repo', dryRun, refusalLogs: new Set(),
+      decide: () => { reads.push(true); return results.shift(); }, record: o => records.push(o),
+      exec: (...args) => writes.push(args), log: line => logs.push(line) };
+    return { options, reads, records, writes, logs };
+  };
+  it('rechecks pending -> clear -> failure at the same head; dedupes only refusal logs by rule', () => {
+    const pending = { cleared: false, head, rule: 'checks' }, clear = { cleared: true, head };
+    const h = harness([pending, pending, clear, pending, { ...pending, rule: 'diff-scope' }]);
+    const values = Array.from({ length: 5 }, () => reconcileMechanicalClearance(pr(), h.options));
+    expect(h.reads).toHaveLength(5);
+    expect(values.map(v => v?.cleared === true)).toEqual([false, false, true, false, false]);
+    expect(h.records).toHaveLength(1);
+    expect(h.logs).toHaveLength(2);
+  });
+  it('strips a stale label on a new head failing diff-scope', () => {
+    const h = harness([{ cleared: false, head: 'b'.repeat(40), rule: 'diff-scope' }]);
+    reconcileMechanicalClearance(pr({ headRefOid: 'b'.repeat(40), labels: [{ name: 'ready-to-merge' }] }), h.options);
+    expect(h.writes).toHaveLength(1);
+    expect(h.writes[0][1]).toEqual(['pr', 'edit', '861', '--repo', 'owner/repo', '--remove-label', 'ready-to-merge']);
+    expect(h.logs).toHaveLength(1); expect(h.logs[0]).toContain('diff-scope');
+  });
+  it('leaves current cleared labels alone, but rechecks and strips on a later failure', () => {
+    const h = harness([{ cleared: true, head }, { cleared: false, head, rule: 'checks' }]);
+    const p = pr({ labels: [{ name: 'ready-to-merge' }] });
+    reconcileMechanicalClearance(p, h.options); expect(h.writes).toHaveLength(0);
+    reconcileMechanicalClearance(p, h.options); expect(h.writes).toHaveLength(1);
+    expect(h.reads).toHaveLength(2);
+  });
+  it('preserves an AI-coauthored bot PR label when the commit-context read fails', () => {
+    const ai = pr({ labels: [{ name: 'ready-to-merge' }], commits: [claudeCommit()] });
+    expect(isAiGeneratedPr(ai)).toBe(true);
+    for (const commits of [undefined, null, []]) {
+      const h = harness([{ cleared: false, head, rule: 'diff-scope' }]);
+      // A failed context read leaves the listing without usable commit evidence.
+      const listing = { ...ai, commits };
+      reconcileMechanicalClearance(listing, h.options);
+      expect(h.writes).toHaveLength(0);
+      expect(h.reads).toHaveLength(0);
+      expect(listing.labels).toEqual([{ name: 'ready-to-merge' }]);
+    }
+  });
+  it('never strips AI-generated or review:accepted labels', () => {
+    const h = harness([]);
+    for (const extra of [{ commits: [claudeCommit()] }, { labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }] }]) {
+      reconcileMechanicalClearance(pr({ labels: [{ name: 'ready-to-merge' }], ...extra }), h.options);
+    }
+    expect(h.reads).toHaveLength(0); expect(h.writes).toHaveLength(0);
+  });
+  it('DRY_RUN reads live evidence without label or receipt mutations', () => {
+    const h = harness([{ cleared: false, head, rule: 'diff-scope' }, { cleared: true, head }], true);
+    reconcileMechanicalClearance(pr({ labels: [{ name: 'ready-to-merge' }] }), h.options);
+    reconcileMechanicalClearance(pr(), h.options);
+    expect(h.reads).toHaveLength(2); expect(h.writes).toHaveLength(0); expect(h.records).toHaveLength(0);
   });
 });

@@ -228,9 +228,9 @@ import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetti
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
-import { decideMechanicalClearance, recordMechanicalClearance } from './lib/mechanical-clearance.mjs';
+import { decideMechanicalClearance, recordMechanicalClearance, decideMechanicalLabelStrip } from './lib/mechanical-clearance.mjs';
 
-const mechanicalClearanceMemo = new Map(); // R861: one validation and refusal log per repository/PR/head/process.
+const mechanicalClearanceRefusals = new Set(); // Only stderr refusals are memoized; evidence is live every pass.
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
@@ -3057,6 +3057,39 @@ export function labelOnGreenVerdict(pr, { requiredCheck = 'test', label = 'ready
   return { label: true, reason: null };               // label the instant the required check is green
 }
 
+/** Live R861 admission/revocation; injected IO keeps repeated-pass regressions hermetic. */
+export function reconcileMechanicalClearance(pr, { repo, dryRun = false,
+  refusalLogs = mechanicalClearanceRefusals, decide = decideMechanicalClearance,
+  record = recordMechanicalClearance, exec = execFileSync,
+  log = line => process.stderr.write(line) } = {}) {
+  if (!['web-everything[bot]', 'app/web-everything'].includes(pr?.author?.login)
+    || ['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())) return null;
+  const labelled = hasLabel(pr, READY_TO_MERGE_LABEL);
+  // Missing authorship evidence cannot establish that this label depends on mechanical clearance.
+  if (labelled && (!Array.isArray(pr.commits) || pr.commits.length === 0)) return null;
+  if (labelled && !decideMechanicalLabelStrip(pr, null).strip) return null;
+  const result = decide({ repo, num: pr.number }); // Never cache a result, including for the same head.
+  const strip = decideMechanicalLabelStrip(pr, result);
+  if (strip.strip) {
+    const ok = dryRun || applyCiLifecycleLabelPlan({ repo, pr: pr.number, exec,
+      plan: { toRemove: [READY_TO_MERGE_LABEL], toAdd: [] } });
+    log(`mechanical-clearance: #${pr.number} ${dryRun ? 'would strip' : ok ? 'stripped' : 'strip failed for'} ready-to-merge (${strip.rule}); normal review required\n`);
+  } else if (!result.cleared) {
+    const key = `${repo}::${pr.number}::${pr.headRefOid}::${result.rule}`;
+    if (!refusalLogs.has(key)) {
+      refusalLogs.add(key);
+      log(`mechanical-clearance: #${pr.number} refused (${result.rule}); normal review required\n`);
+    }
+  }
+  if (result.cleared && !labelled) {
+    try {
+      if (!dryRun) record({ repo, num: pr.number, result });
+      return result;
+    } catch { /* No durable receipt: retain normal review and retry next pass. */ }
+  }
+  return null;
+}
+
 /** #2230 — should a `--label`-scoped ONE-SHOT drain re-poll once before concluding the queue is empty? GitHub's
  *  `gh pr list --label` index lags the `gh pr edit --add-label` write by a few seconds, so a drain fired
  *  immediately after a producer labels can read the just-labelled PR as ABSENT ("0 to merge") and strand it.
@@ -5236,13 +5269,13 @@ async function runCli() {
     }
     const reconciled = [];
     for (const p of open) {
-      if (p.requiredCheckReadError) continue; // Unknown CI: leave every lifecycle label untouched.
       // #2417 — reuse the commits read `collectOpenPrContext` already fanned out + cached this pass (was a
       // serial per-PR `gh pr view --json commits` here — the #2421 double-read, now collapsed). A PR missing
       // from the map (its context read failed) is skipped, same as the old per-PR fetch-error `continue`.
       const commits = ctx.commitsByPr?.get(`${repo || 'cwd'}::${p.number}`);
-      if (commits == null) continue;
-      const withCommits = { ...p, commits };
+      const withCommits = { ...p, commits: commits ?? p.commits };
+      const mechanicalClearance = reconcileMechanicalClearance(withCommits, { repo: memoRepo(repo), dryRun: DRY_RUN });
+      if (p.requiredCheckReadError || commits == null) continue; // Lifecycle reconciliation still needs complete context.
       let touched = false;
       // ── The legacy #2216 branch: green-but-unlabelled → ready-to-merge (label lander's collection signal),
       //    UNCHANGED — see the `owned` note above for why this stays separate from the add/remove state below. ──
@@ -5252,23 +5285,6 @@ async function runCli() {
       // named PR would never enter the `--label`-scoped candidate set and the ratified #2423 valve would be dead.
       const reliefAllowsPending = (escalationRelief.prs || []).includes(Number(p.number))
         || (!!escalationRelief.passWide && !!label);
-      let mechanicalClearance = null;
-      if (!hasLabel(p, label) && ['web-everything[bot]', 'app/web-everything'].includes(p.author?.login)) {
-        const slug = memoRepo(repo);
-        const key = `${slug}::${p.number}::${p.headRefOid}`;
-        if (!mechanicalClearanceMemo.has(key)) {
-          const result = decideMechanicalClearance({ repo: slug, num: p.number });
-          mechanicalClearanceMemo.set(key, result);
-          if (!result.cleared) process.stderr.write(`mechanical-clearance: #${p.number} refused (${result.rule}); normal review required\n`);
-        }
-        const result = mechanicalClearanceMemo.get(key);
-        if (result.cleared) {
-          try {
-            if (!DRY_RUN) recordMechanicalClearance({ repo: slug, num: p.number, result });
-            mechanicalClearance = result;
-          } catch { /* No durable receipt: retain normal review and retry recording on the next reconcile. */ }
-        }
-      }
       const greenVerdict = hasLabel(p, label)
         ? { label: false, reason: null }
         : labelOnGreenVerdict(withCommits, { requiredCheck: REQUIRED, label, allowPendingReview: reliefAllowsPending, mechanicalClearance });
