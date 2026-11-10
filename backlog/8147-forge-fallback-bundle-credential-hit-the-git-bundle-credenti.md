@@ -1,4 +1,5 @@
 ---
+bornAs: x54p82i
 kind: story
 size: 2
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-11-09"
 tags: []
 ---
 
-# Forge fallback remote-slot-unreadable: runs fall back to the Mac when the remote slot cannot be read
+# Forge fallback bundle-credential-hit: the git bundle credential scan trips and the run falls back to the Mac
 
-Seen in the heavy-admission remote-fallbacks log on 2026-11-09 (lane-29, kind files, detail null) right after the Forge sibling fix. Find why the remote slot read fails, make the cause appear in the fallback detail, and fix it so the run stays on Forge. See we:scripts/readiness/remote-exec.mjs.
+Seen in the heavy-admission remote-fallbacks log on 2026-11-09 (lane-29, kind files, detail null). Find what the bundle scan matches (real secret or false positive), put the matched rule in the fallback detail without printing the secret, and fix the false positive or the source. See we:scripts/readiness/remote-exec.mjs.
 
 ## Acceptance
 
@@ -37,4 +38,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-Checked candidate list; no card covers the remote-slot-unreadable fallback class (found live in R817).
+Checked candidate list; no card covers the bundle-credential-hit fallback class (found live in R817).
