@@ -116,6 +116,16 @@ describe('ruledWeakened union of platform and tool layers', () => {
     expect(merged.map((e) => [e.ref, e.layer])).toEqual([[REF, 'tool']]);
     expect(warnings).toHaveLength(3);
   });
+  it('readyEvidence refuses a record with a non-string audit/auditRuling instead of throwing', () => {
+    const json = (v) => JSON.parse(JSON.stringify(v));
+    const hostile = [json({ toString: null }), json(['R396']), json(['NOT WEAKENED'])];
+    for (const v of hostile) {
+      expect(() => readyEvidence([record({ auditRuling: v })], input, [entry()])).not.toThrow();
+      expect(readyEvidence([record({ auditRuling: v })], input, [entry()])).toBeNull();
+      expect(() => readyEvidence([record({ audit: v })], input, [entry()])).not.toThrow();
+      expect(readyEvidence([record({ audit: v })], input, [entry()])).toBeNull();
+    }
+  });
   it('tolerates non-array layers', () => {
     expect(mergeRuledWeakened(undefined, 'x')).toEqual([]);
   });

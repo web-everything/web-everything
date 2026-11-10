@@ -14,6 +14,8 @@ export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z
 export const safeRef = (ref) => safeRegistrationRef(ref) && ref.startsWith('lane/');
 // Strings only (main #6353's alias rule): RegExp.test coerces, so an array ['<sha>'] would otherwise pass and alias a real sha.
 export const validSha = (sha) => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
+// Coercion-safe text: RegExp.test / Date.parse coerce an object ({"toString":null}) and throw, so only strings pass.
+const text = (v) => (typeof v === 'string' ? v : '');
 const lowerSha = (sha) => (typeof sha === 'string' ? sha.toLowerCase() : sha);
 export function jsonLines(text) {
   return String(text).split(/\r?\n/).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
@@ -44,7 +46,7 @@ export function mergeRuledWeakened(platform, tool, warn = () => {}) {
   return out;
 }
 export function readyEvidence(records, input, ruledWeakened = [], liveFpSource = null) {
-  if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
+  if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(text(input.audit))) return { source: 'arguments', testsRun: input.testsRun };
   // The live fingerprint may be passed lazily (a function): the arguments path above never pays for the git read.
   const liveFp = typeof liveFpSource === 'function' ? liveFpSource() : liveFpSource;
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
@@ -56,9 +58,9 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
   const binds = (e, r) => lowerSha(e.sha) === r.sha && r.sha === live || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
   const judge = (r) => {
-    if (r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || '')) return { source: 'ready-record', record: r };
+    if (r.tests === 'green' && /^NOT WEAKENED$/i.test(text(r.audit))) return { source: 'ready-record', record: r };
     const match = r.tests === 'green' && r.audit === 'WEAKENED'
-      && validSha(r.sha) && RULING.test(r.auditRuling || '')
+      && validSha(r.sha) && RULING.test(text(r.auditRuling))
       && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
       && Array.isArray(ruledWeakened) && ruledWeakened.find((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
         && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
@@ -207,8 +209,8 @@ export function nextMergeRef(branch, remote) {
   return `${branch}-m${numbers.reduce((max, n) => n > max ? n : max, 0n) + 1n}`;
 }
 export function refusal(records, ref, since, alerts = false) {
-  return records.find((r) => r && Date.parse(r.at) >= since && (r.ref === ref || (alerts && JSON.stringify(r).includes(ref)))
-    && (alerts ? /reject|drop|refus|conflict/i.test(JSON.stringify(r)) : /removed|dropped/.test(r.kind || r.event || r.type || '')));
+  return records.find((r) => r && Date.parse(text(r.at)) >= since && (r.ref === ref || (alerts && JSON.stringify(r).includes(ref)))
+    && (alerts ? /reject|drop|refus|conflict/i.test(JSON.stringify(r)) : /removed|dropped/.test(text(r.kind) || text(r.event) || text(r.type))));
 }
 export function prototypeLoadOperation() {
   const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms', 'ruling', 'quote'].map((key) => [key, { type: 'string', required: false, default: '' }]));
