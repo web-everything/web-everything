@@ -3,7 +3,7 @@ import { withSelfSync, safePoint } from '../daemon-self-sync.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { readRebuildState, rebuildStatePath, readReadyCandidate, writeRebuildState, readyCandidatePath, writeReadyCandidate } from '../daemon-rebuild/state.mjs';
-import { addOverlay, removeOverlay } from '../daemon-overlays.mjs';
+import { addOverlay, removeOverlay, recordEdgeResolution } from '../daemon-overlays.mjs';
 import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
 import { fixture } from './helpers/safe-point-fixture.mjs';
 const fixtures = [];
@@ -132,26 +132,75 @@ it('R854: applied A,B with B removed before safe point drops readiness under the
   // The returned reason proves the live locked matcher, not just the pre-check, refused B.
   expect(await rebuild.mock.results.at(-1).value).toMatchObject({ reason: 'overlay-no-longer-wanted' });
 });
-it('adoptReadyOnly adopts a matching real candidate without fetching, planning or smoking', async () => {
+it('adoptReadyOnly fetches before adopting a matching real candidate without planning or smoking', async () => {
   const f = fixture(); fixtures.push(f); f.record();
   const runSmoke = vi.fn();
+  const run = vi.fn((args, opts) => { expect(['commit-tree', 'worktree']).not.toContain(args[0]); return f.run(args, opts); });
   const result = await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true, asJob: true, runSmoke,
-    run: (args, opts) => { expect(['fetch', 'commit-tree', 'worktree']).not.toContain(args[0]); return f.run(args, opts); },
+    run,
     emitEvent: vi.fn(), log: { error: vi.fn() } });
   expect(result).toMatchObject({ moved: true, adopted: true, head: f.target }); expect(runSmoke).not.toHaveBeenCalled();
+  const commands = run.mock.calls.map(([args]) => args[0]);
+  expect(commands.indexOf('fetch')).toBeGreaterThan(-1);
+  expect(commands.indexOf('fetch')).toBeLessThan(commands.indexOf('reset'));
+});
+it.each(['deleted', 'force-pushed'])('adoptReadyOnly never adopts a remotely %s overlay from cached refs', async (change) => {
+  const f = fixture(); fixtures.push(f); f.record();
+  const ref = 'refs/heads/A';
+  if (change === 'deleted') f.remoteGit('update-ref', '-d', ref);
+  else f.remoteGit('update-ref', ref, f.plan.applied[1].sha);
+  expect(f.git('rev-parse', 'refs/remotes/origin/A')).toBe(f.plan.applied[0].sha);
+  const run = vi.fn(f.run);
+  expect(await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true, run,
+    emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: false, reason: 'overlay-set-changed' });
+  expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+  expect(readReadyCandidate(f.root, f.env)).toBeNull();
+});
+it('adoptReadyOnly fetch failure refuses adoption and retains the candidate for retry', async () => {
+  const f = fixture(); fixtures.push(f); f.record();
+  const run = vi.fn((args, opts) => args[0] === 'fetch' ? { status: 1, stdout: '', stderr: 'offline' } : f.run(args, opts));
+  expect(await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true, run,
+    emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: false, reason: 'fetch-failed',
+    alerts: expect.arrayContaining([expect.objectContaining({ kind: 'fetch-failed' })]) });
+  expect(run.mock.calls.filter(([args]) => args[0] === 'fetch')).toHaveLength(2);
+  expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+  expect(readReadyCandidate(f.root, f.env)).toEqual(f.ready);
+});
+it.each(['deleted', 'force-pushed'])('adoptReadyOnly never adopts a remotely %s approved edge from cached refs', async (change) => {
+  const f = fixture(); fixtures.push(f);
+  f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '1';
+  const a = f.plan.applied[0];
+  a.edgeSha = a.sha; a.resolvedVia = 'edge-ref';
+  recordEdgeResolution(f.root, a.ref, { sha: a.edgeSha, by: 'test' }, { env: f.env });
+  f.git('update-ref', 'refs/remotes/origin/edge/A', a.edgeSha);
+  f.remoteGit('update-ref', 'refs/heads/edge/A', a.edgeSha);
+  if (change === 'deleted') f.remoteGit('update-ref', '-d', 'refs/heads/edge/A');
+  else f.remoteGit('update-ref', 'refs/heads/edge/A', f.plan.applied[1].sha);
+  f.record();
+  const run = vi.fn(f.run);
+  expect(await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true, run,
+    emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: false, reason: 'overlay-set-changed' });
+  expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+  expect(readReadyCandidate(f.root, f.env)).toBeNull();
 });
 it.each(['new', 'pulled', 'adopted', 'history', 'unreadable-history', 'missing-tip'])('adoptReadyOnly refuses an omitted %s live overlay', async (change) => {
   const f = fixture(); fixtures.push(f);
   const sha = f.git('commit-tree', `${f.head}^{tree}`, '-p', f.plan.applied[0].sha, '-m', 'new overlay tip');
   if (change === 'new') {
     f.git('update-ref', 'refs/remotes/origin/C', sha);
+    f.remoteGit('update-ref', 'refs/heads/C', sha);
     addOverlay(f.root, { ref: 'C' }, { env: f.env });
   } else if (change === 'pulled') {
     f.git('update-ref', 'refs/remotes/origin/A', sha);
+    f.remoteGit('update-ref', 'refs/heads/A', sha);
   } else if (change === 'adopted') {
     writeRebuildState(f.root, { adopted: { head: f.head, applied: [{ ref: 'C', sha }] } }, f.env);
   } else if (change === 'history') {
     f.git('update-ref', 'refs/remotes/origin/C', sha);
+    f.remoteGit('update-ref', 'refs/heads/C', sha);
     const merge = f.run(['commit-tree', `${f.head}^{tree}`, '-p', f.head, '-p', sha,
       '-m', 'daemon-rebuild: merge overlay C tip'], { env: { ...f.env, ...REBUILD_IDENTITY_ENV } });
     expect(merge.status).toBe(0);

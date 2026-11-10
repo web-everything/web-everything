@@ -35,6 +35,15 @@ export function fixture() {
   const target = git('rev-parse', 'HEAD');
   git('update-ref', 'refs/remotes/origin/candidate', target);
   git('reset', '--hard', head);
+  const remote = join(dir, 'origin.git');
+  git('clone', '--bare', '--shared', '-q', root, remote);
+  const remoteGit = (...args) => {
+    const result = run(args, { cwd: remote });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  for (const a of applied) remoteGit('update-ref', `refs/heads/${a.ref}`, a.sha);
+  git('remote', 'add', 'origin', remote);
   const env = { ...process.env, WE_DAEMON_STATE_DIR: join(dir, 'state'), WE_DAEMON_OVERLAY_DIR: join(dir, 'overlays'),
     WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks'), WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_REBUILD_AS_JOB: '0' };
   for (const a of applied) addOverlay(root, { ref: a.ref }, { env });
@@ -42,5 +51,5 @@ export function fixture() {
   const plan = { finalSha: target, mainSha: head, applied, inputsKey: 'candidate-inputs', decisions: [] };
   const ready = { kind: 'candidate', prevHead: head, adopt: plan, tree: git('rev-parse', `${target}^{tree}`), passedAt: new Date().toISOString() };
   const record = () => writeReadyCandidate(root, ready, env);
-  return { dir, root, run, git, env, head, target, plan, ready, record, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { dir, root, run, git, remoteGit, env, head, target, plan, ready, record, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }

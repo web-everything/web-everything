@@ -775,7 +775,7 @@ async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, 
   return null;
 }
 
-/** Safe-point entry: no recovery, fetch, planning, lease claim or build launch. Caller holds WRITE. */
+/** Safe-point entry: fresh fetch, but no recovery, planning, lease claim or build launch. Caller holds WRITE. */
 export async function adoptReadyRebuild({ root, env, log, run, prState, stateOpts, mainOnly, now }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -798,6 +798,22 @@ export async function adoptReadyRebuild({ root, env, log, run, prState, stateOpt
   if (state.quarantine || state.inProgress || state.unverified) return terminal({ moved: false, reason: 'quarantined' });
   const unsafe = findUnsafeLocalState({ git, knownInputs: knownInputsOf(state) });
   if (!unsafe.safe) return terminal({ moved: false, reason: unsafe.reason });
+  const applied = ready.adopt.applied ?? [];
+  const overlays = [...registry.overlays, ...applied.filter((a) => !registry.overlays.some((o) => o.ref === a.ref))];
+  const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
+  const fetched = fetchMainAndOverlays({ git, overlays, edgeResolve });
+  if (!fetched.ok) {
+    alert('fetch-failed');
+    return terminal({ moved: false, reason: 'fetch-failed' });
+  }
+  for (const ref of fetched.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
+  // Exact ready matches bypass planning: every recorded input must still be the freshly fetched tip.
+  if (applied.some((a) => fetched.goneRefs.includes(a.ref)
+    || verifyRev(git, `refs/remotes/origin/${a.ref}^{commit}`) !== a.sha
+    || (a.edgeSha && (!edgeResolve || verifyRev(git, `refs/remotes/origin/edge/${a.ref}^{commit}`) !== a.edgeSha)))) {
+    dropReadyCandidate({ root, env: stEnv, reason: 'overlay-set-changed' });
+    return terminal({ moved: false, reason: 'overlay-set-changed' });
+  }
   // A prepared record bypasses planning: recheck its still-registered PRs with the same reader.
   for (const applied of ready.adopt.applied ?? []) {
     const overlay = registry.overlays.find((o) => o.ref === applied.ref);
