@@ -91,6 +91,31 @@ describe('ruledWeakened union of platform and tool layers', () => {
     expect(warnings).toHaveLength(bad.length);
     expect(readyEvidence([record()], input, mergeRuledWeakened(bad, []))).toBeNull();
   });
+  it('rejects non-string ref/sha/ruling (JSON-round-tripped) without throwing, warning once per entry', () => {
+    const warnings = [];
+    const json = (v) => JSON.parse(JSON.stringify(v));
+    const bad = [
+      entry({ ruling: json({ toString: null }) }), // RegExp.test coerces -> TypeError
+      entry({ ruling: json(['R396']) }), // array coerces to "R396" and would alias a real ruling
+      entry({ ruling: json({ toString: 'R396' }) }),
+      entry({ ref: json({ toString: null }) }),
+      entry({ sha: json({ toString: null }) }),
+      entry({ sha: json([SHA]) }),
+    ];
+    let merged;
+    expect(() => { merged = mergeRuledWeakened(bad, [], (m) => warnings.push(m)); }).not.toThrow();
+    expect(merged).toEqual([]);
+    expect(warnings).toHaveLength(bad.length);
+  });
+  it('drops non-string tool entries without throwing in the de-dup key, keeping valid ones', () => {
+    const warnings = [];
+    const json = (v) => JSON.parse(JSON.stringify(v));
+    const tool = [entry({ ref: json({ toString: null }) }), entry({ ruling: json({ toString: null }) }), entry({ sha: json([SHA]) }), entry()];
+    let merged;
+    expect(() => { merged = mergeRuledWeakened([], tool, (m) => warnings.push(m)); }).not.toThrow();
+    expect(merged.map((e) => [e.ref, e.layer])).toEqual([[REF, 'tool']]);
+    expect(warnings).toHaveLength(3);
+  });
   it('tolerates non-array layers', () => {
     expect(mergeRuledWeakened(undefined, 'x')).toEqual([]);
   });

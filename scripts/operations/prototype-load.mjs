@@ -27,12 +27,17 @@ const RULING = /^R\d+(?:\+R\d+)*$/;
  *  de-duplicated by ref+sha+ruling (the tool entry wins); each entry carries its source `layer`. Platform entries get
  *  the same shape checks as repo entries; a malformed one is ignored with a warning, never trusted. */
 export function mergeRuledWeakened(platform, tool, warn = () => {}) {
-  const wellFormed = (e) => e && typeof e.ref === 'string' && e.ref && validSha(e.sha) && /^R\d+$/.test(e.ruling || '')
+  // Strings only: RegExp.test and template literals coerce, so a JSON object ({"toString":null}) throws and an array
+  // (['R1']) would alias a real value. Settings JSON is untrusted, so a bad entry is ignored, never allowed to throw.
+  const keyed = (e) => e && typeof e === 'object' && typeof e.ref === 'string' && e.ref && validSha(e.sha) && typeof e.ruling === 'string';
+  const wellFormed = (e) => keyed(e) && /^R\d+$/.test(e.ruling)
     && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim());
   const seen = new Set();
   const out = [];
-  const add = (e, layer) => { const k = `${e.ref}|${lowerSha(e.sha)}|${e.ruling}`; if (!seen.has(k)) { seen.add(k); out.push({ ...e, layer }); } };
-  (Array.isArray(tool) ? tool : []).forEach((e) => { if (e && typeof e === 'object') add(e, 'tool'); });
+  const add = (e, layer) => { const k = JSON.stringify([e.ref, lowerSha(e.sha), e.ruling]); if (!seen.has(k)) { seen.add(k); out.push({ ...e, layer }); } };
+  (Array.isArray(tool) ? tool : []).forEach((e, i) => {
+    if (keyed(e)) add(e, 'tool'); else if (e && typeof e === 'object') warn(`WARNING: ignoring malformed tool prototypeLoad ruledWeakened[${i}] (needs string ref, 40-hex sha, string ruling)`);
+  });
   (Array.isArray(platform) ? platform : []).forEach((e, i) => {
     if (wellFormed(e)) add(e, 'platform'); else warn(`WARNING: ignoring malformed platform prototypeLoad.ruledWeakened[${i}] (needs ref, 40-hex sha, ruling /^R\\d+$/, non-empty findings)`);
   });
