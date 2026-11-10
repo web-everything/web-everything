@@ -203,7 +203,8 @@ export async function fileInCheckout(input, run = runOperationCli) {
 async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.operations', 'handoff', 'cards-to-file.md'),
   dryRun = false, select, since, max = 10, deps = {} } = {}) {
   validateOptions({ max, since, select });
-  const { root = REPO_ROOT, fileItem = fileInCheckout, log = console.log, now = () => new Date().toISOString() } = deps;
+  const { root = REPO_ROOT, fileItem = fileInCheckout, log = console.log, now = () => new Date().toISOString(),
+    appendFile = appendFileSync } = deps;
   source = resolve(expandHome(source));
   // The ledger path is fixed beside the source; it is not an input.
   let ledger = resolve(join(dirname(source), 'cards-filed.jsonl'));
@@ -295,7 +296,7 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
       const existing = readFileSync(ledger, 'utf8');
       if (existing && !existing.endsWith('\n')) separator = '\n';
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    try { appendFileSync(ledger, `${separator}${JSON.stringify(row)}\n`); } catch (error) {
+    try { appendFile(ledger, `${separator}${JSON.stringify(row)}\n`); } catch (error) {
       // The card is already filed: name every filed-but-unledgered number so the operator can add the rows.
       const filed = result.filed.map(filedRow => `${filedRow.card} (${filedRow.tag})`).join(', ');
       throw new Error(safeLog(`ledger append failed (${error.code ?? error.message}); filed but not ledgered: ${filed}`), { cause: error });

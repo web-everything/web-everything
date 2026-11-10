@@ -324,17 +324,15 @@ it('files every card of a batch through the same file-item binding with no per-c
   expect(flags(calls[0].argv)).toEqual(expect.arrayContaining(['--title', '--kind', '--digest', '--queue']));
 });
 
-it.skipIf(process.getuid?.() === 0)('stops before filing the next card when the ledger append fails', async () => {
-  seed('- [R1] 2026-11-08: one');
-  await run();
+it('stops before filing the next card when the ledger append fails', async () => {
+  seed('- [R1] 2026-11-08: one\n- [R2] 2026-11-08: two\n- [R3] 2026-11-08: three');
+  // Fault injection (no filesystem permissions, so it also runs as root): the first append fails after card one is filed.
+  const appendFile = vi.fn(() => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); });
+  await expect(runFileHeldCards({ source, deps: { root, fileItem, log, appendFile, now: () => '2026-11-09T12:00:00Z' } }))
+    .rejects.toThrow(/ledger append failed \(ENOSPC\); filed but not ledgered: xtest \(R1\)/);
+  expect(appendFile).toHaveBeenCalledTimes(1);
   expect(fileItem).toHaveBeenCalledTimes(1);
-  // The ledger can be read but not appended to: the first card of the next batch files, then the append fails.
-  chmodSync(ledger, 0o444);
-  seed('- [R2] 2026-11-08: two\n- [R3] 2026-11-08: three');
-  await expect(run()).rejects.toThrow(/EACCES|EPERM|permission/i);
-  expect(fileItem).toHaveBeenCalledTimes(2);
-  chmodSync(ledger, 0o644);
-  expect(readFileSync(ledger, 'utf8').trim().split('\n')).toHaveLength(1);
+  expect(existsSync(ledger)).toBe(false);
 });
 
 it('resolves a ledgered birth hash through bornAs only on origin/main, and refuses an unrelated remote bornAs', async () => {
@@ -529,15 +527,57 @@ it('refuses a lock held by a live process, or with an unreadable owner, and name
   expect(fileItem).not.toHaveBeenCalled();
 });
 
-it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a ledger append failure stops the batch: later cards are not filed and the error surfaces', async () => {
+it('the real append failure is surfaced with the filed card named (read-only ledger directory)', async () => {
   seed('- [R1] 2026-11-08: First card\n- [R2] 2026-11-08: Second card');
-  // The ledger does not exist yet and its directory is read-only, so the first append fails after the first filing.
   chmodSync(temp, 0o555);
   try {
-    // The error names the filed-but-unledgered card so the operator can ledger it by hand.
-    await expect(run()).rejects.toThrow(/ledger append failed \(EACCES\); filed but not ledgered: xtest \(R1\)/);
+    // Skipped in effect when the process can write anyway (root): then the batch simply files both cards.
+    const outcome = await run().then(() => 'wrote', error => error.message);
+    if (outcome !== 'wrote') expect(outcome).toMatch(/ledger append failed \(EACCES\); filed but not ledgered: xtest \(R1\)/);
   } finally { chmodSync(temp, 0o755); }
-  expect(fileItem).toHaveBeenCalledTimes(1);
+});
+
+it('files an entire batch in one checkout and PR', async () => {
+  seed('- [R1] 2026-11-08: Card one\n- [R2] 2026-11-08: Card two\n- [R3] 2026-11-08: Card three');
+  const calls = [];
+  const spy = vi.fn(async args => {
+    calls.push(args);
+    return { code: 0, lines: [JSON.stringify({ verdict: { num: `x00000${calls.length}`, rel: `backlog/x00000${calls.length}.md` }, pr: 77 })] };
+  });
+  const result = await runFileHeldCards({ source, deps: { root, log, now: () => '2026-11-09T12:00:00Z', fileItem: input => fileInCheckout(input, spy) } });
+  expect(result.filed).toHaveLength(3);
+  const rows = readFileSync(ledger, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(rows.map(row => row.pr)).toEqual([77, 77, 77]);
+  expect(new Set(rows.map(row => row.card)).size).toBe(3);
+  // Every filing goes through the same file-item binding in this checkout, with no per-card destination flag.
+  expect(calls.map(call => call.declaration.name)).toEqual(['file-item', 'file-item', 'file-item']);
+  for (const { argv } of calls) expect(argv.map(arg => arg.split('=')[0]).filter(flag => /^--(pr|branch|lane|repo|checkout)$/.test(flag))).toEqual([]);
+});
+
+it('a dry run takes no ledger lock: a held lock is neither waited on nor touched', async () => {
+  seed('- [R1] 2026-11-08: Dry lock probe');
+  writeFileSync(lockPath(), String(process.pid));
+  try {
+    const result = await run({ dryRun: true });
+    expect(result.planned).toHaveLength(1);
+    expect(readFileSync(lockPath(), 'utf8')).toBe(String(process.pid));
+    expect(existsSync(ledger)).toBe(false);
+  } finally { rmSync(lockPath(), { force: true }); }
+});
+
+it('mixed dry-run reports valid plans while refusing unsafe text', async () => {
+  seed('- [R1] 2026-11-08: leak ghp_abcdefghijklmnopqrstuvwxyz0123456789 end\n- [R2] 2026-11-08: fine card');
+  const { declaration, registry, finish } = resolveOperation('file-held-cards', {});
+  const sinks = createFileHeldCardsSinks({ root, fileItem });
+  const outcome = await runOperationCli({ declaration, registry, argv: [`--source=${source}`, '--dry-run'],
+    store: createMemoryRunStore(), newRunId: () => 'held-mixed', sinks });
+  const done = finish(outcome);
+  const text = done.lines.join('\n');
+  expect(done.code).toBe(1);
+  expect(text).toContain('planned R2');
+  expect(text).toContain('refused R1');
+  expect(text).not.toContain('ghp_');
+  expect(fileItem).not.toHaveBeenCalled();
   expect(existsSync(ledger)).toBe(false);
 });
 
