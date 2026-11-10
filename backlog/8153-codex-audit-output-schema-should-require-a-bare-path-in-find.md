@@ -1,13 +1,14 @@
 ---
+bornAs: xtmbc7g
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/__tests__/audit-settings.test.mjs", "we:scripts/lib/audit-settings.mjs"]
+scope: ["we:scripts/operations/audit-verdict.mjs", "we:scripts/settings/codex-audit.json"]
 dateOpened: "2026-11-10"
 tags: []
 ---
 
-# audit-settings platform:null test gap (WE_PLATFORM_PREFERENCES_FILE lenient fill)
+# codex-audit output schema should require a bare path in finding.file (strict grammar, R787)
 
 Residual of PR #6381 per R827/R825; reinforce later.
 
