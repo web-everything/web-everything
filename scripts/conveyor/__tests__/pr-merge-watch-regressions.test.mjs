@@ -329,7 +329,7 @@ describe('merge-watch settings resolver contract', () => {
     ['tool overrides platform', { readyNotMergingMinutes: 40 }, { readyNotMergingMinutes: 20 }, undefined, 20, 'tool'],
     ['environment overrides tool', { readyNotMergingMinutes: 40 }, { readyNotMergingMinutes: 20 }, '5', 5, 'env'],
   ])('%s and logs the effective value/source', (_name, platform, tool, env, value, source) => {
-    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining(`readyNotMergingMinutes=${value} (${source})`));
   });
 
@@ -345,17 +345,17 @@ describe('merge-watch settings resolver contract', () => {
     ['negative environment value', {}, { readyNotMergingMinutes: 20 }, '-1', 20, 'tool'],
     ['non-finite environment value', {}, { readyNotMergingMinutes: 20 }, 'Infinity', 20, 'tool'],
   ])('ignores invalid %s, retaining and logging the lower layer', (_name, platform, tool, env, value, source) => {
-    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log.mock.calls.flat().join(' ')).toContain(`readyNotMergingMinutes=${value} (${source})`);
   });
 
   it.each(['', '   '])('an empty environment override (%j) preserves tool provenance', env => {
-    expect(resolve({}, { readyNotMergingMinutes: 20 }, env)).toEqual({ readyNotMergingMinutes: 20, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve({}, { readyNotMergingMinutes: 20 }, env)).toEqual({ readyNotMergingMinutes: 20, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('readyNotMergingMinutes=20 (tool)'));
   });
 
   it('accepts zero as a valid environment threshold and logs env provenance', () => {
-    expect(resolve({}, { readyNotMergingMinutes: 20 }, '0')).toEqual({ readyNotMergingMinutes: 0, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve({}, { readyNotMergingMinutes: 20 }, '0')).toEqual({ readyNotMergingMinutes: 0, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('readyNotMergingMinutes=0 (env)'));
   });
 });
