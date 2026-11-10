@@ -1411,7 +1411,7 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
 /** R817: bounded (500 chars), control-free, token-masked tail of the Forge run stderr, safe to print and attach. */
 export function forgeFailureTail(stderr) {
   // Secrets are masked per raw line (to end of line, plus the next line for a value wrapped onto it) BEFORE control characters are flattened, so a value can never straddle a newline.
-  return String(stderr??'').replace(/\r\n?|\u2028|\u2029|\x0b|\x0c|\x85/g,'\n').replace(/(?:authorization|auth|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|credential)s?\b["']?\s*[=:][^\r\n]*(?:\r?\n[^\r\n]*)?/gi,'[masked]')
+  return String(stderr??'').replace(/\r\n?|\u2028|\u2029|\x0b|\x0c|\x85/g,'\n').replace(/(?:authorization|auth|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|credential)s?\b["']?\s*[=:][^\n]*(?:\n\s*[^\n]*)?/gi,'[masked]')
     .replace(/[\x00-\x1f\x7f-\x9f]+/g,' ')
     .replace(/\b(?:Bearer|Basic)\s+\S+/gi,'[masked]')
     .replace(/[A-Za-z0-9+/_=-]{32,}/g,run=>/[a-z]/.test(run)&&/[A-Z]/.test(run)&&/\d/.test(run)?'[masked]':run)

@@ -1124,13 +1124,14 @@ describe('runRemote', () => {
     expect(result.detail).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     expect(result.detail).not.toMatch(/ghp_|abcdefghijklmnopqrstuvwxyz0123456789/);
     expect(result.detail).toContain('[masked]');
-    const short = remoteManifestAPI.forgeFailureTail('npm ERR! password=hunter2 and Authorization: Bearer abc123 x_token: s3cret\n\npath /opt/forge/cache ok');
+    const short = remoteManifestAPI.forgeFailureTail('path /opt/forge/cache ok\nnpm ERR! password=hunter2 and Authorization: Bearer abc123 x_token: s3cret');
     expect(short).not.toMatch(/hunter2|abc123|s3cret/);
     expect(remoteManifestAPI.forgeFailureTail('leak aB3/dE5+fG7hJ9kL1mN3pQ5rS7tU9vW1x end')).toBe('leak [masked] end');
     expect(remoteManifestAPI.forgeFailureTail('at /opt/forge/cache/some/deep/dir/node_modules/pkg ok')).toContain('/opt/forge/cache');
+    expect(remoteManifestAPI.forgeFailureTail('token=\n\nshortSecret123\nnext')).toBe('[masked] next');
     expect(remoteManifestAPI.forgeFailureTail('token=\rshortSecret123\rnext')).toBe('[masked] next');
     expect(remoteManifestAPI.forgeFailureTail('token=\nshortSecret123\nnext')).toBe('[masked] next');
-    expect(remoteManifestAPI.forgeFailureTail('password="two words here" tail\n\nnext')).toBe('[masked] next');
+    expect(remoteManifestAPI.forgeFailureTail('password="two words here" tail\n\nnext')).toBe('[masked]');
     expect(short).toContain('/opt/forge/cache');
     expect(log).toHaveBeenCalledWith('forge install failed: '+result.detail+'\n');
   });
