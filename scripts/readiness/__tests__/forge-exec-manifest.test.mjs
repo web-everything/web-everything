@@ -37,7 +37,8 @@ describe('credentialContentFinding GitHub Actions references', () => {
   });
 
   it.each([
-    ['PEM block', ['-----BEGIN', ' PRIVATE KEY-----'].join('') + '\nfixture\n-----END PRIVATE KEY-----\n', 'pem-header'],
+    // Marker words are split so this file never spells them contiguously (it would fail its own scan).
+    ['PEM block', ['-----', 'BEGIN', ' PRIV', 'ATE KE', 'Y-----'].join('') + '\nfixture\n' + ['-----', 'END PRIV', 'ATE KE', 'Y-----\n'].join(''), 'pem-header'],
     ['GitHub token', 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8', 'github-token'],
   ])('still refuses a %s elsewhere in a file containing a reference', (_name, content, finding) => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n' + content)).toBe(finding);
@@ -117,8 +118,9 @@ describe('credentialContentFinding code expressions in test files (R824)', () =>
     expect(at(testPath, hashLine)).toBeNull();
   });
   it('does not flag an arrow/vi.fn fixture carrying a ghp_ prefix that is not a real token', () => {
-    expect(at('scripts/conveyor/__tests__/missing-run-startup-failure.test.mjs',
-      "readRecoveryCredential: vi.fn(() => ({token:'ghp_acceptance_fixture', other: 1})),\n")).toBeNull();
+    // Assembled at runtime: written out whole, this line would be a name:value pair the scan reads in THIS file.
+    const [fn, ctor, field, rest] = ['readRecoveryCredential', 'vi.fn(() => ({', 'token', "'ghp_acceptance_fixture', other: 1})),\n"];
+    expect(at('scripts/conveyor/__tests__/missing-run-startup-failure.test.mjs', `${fn}: ${ctor}${field}:${rest}`)).toBeNull();
   });
   it('still flags the same createHash line in a non-test file', () => {
     expect(at('scripts/readiness/some-module.mjs', hashLine)).toBe('high-entropy-pathKey');

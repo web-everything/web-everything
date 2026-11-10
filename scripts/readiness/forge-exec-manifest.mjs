@@ -133,6 +133,7 @@ function codeExpression(value) {
   }
   return /=>|^\s*\(|[A-Za-z_$][\w$]*\s*\(/.test(code);
 }
+const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
@@ -205,9 +206,12 @@ export function credentialContentFinding(path,content) {
     // An unquoted value with internal whitespace is a code expression or a sentence, never one opaque secret
     // (`keys: [index], at: r.at });`). Contiguous and quoted values, and continuation lines above, keep the full rule.
     // Only source and prose files qualify (never YAML/INI, where `${{ 'literal' }}` is a real leak shape), and a quote
-    // anywhere in the value keeps it scanned (apostrophes are allowed in .md prose only).
+    // anywhere in the value keeps it scanned (apostrophes and, as code spans, backticks are allowed in .md prose only;
+    // in source a backtick opens a template literal). A value that carries any single opaque token
+    // (`<secret> # prod`, `<secret> (rotated)`, a backticked secret in prose) is a secret with a tail, not prose.
+    // Boundaries pinned in forge-scan-code-expression.test.mjs (whitespace-exemption boundaries).
     const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
-      &&!(leaf.endsWith('.md')?/["]/:/["']/).test(trimmed);
+      &&!(leaf.endsWith('.md')?/["]/:/["'`]/).test(trimmed)&&!trimmed.split(/\s+/).some(opaqueToken);
     if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value)))return `high-entropy-${field}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.

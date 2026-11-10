@@ -13,7 +13,8 @@ Reinforce later. The Forge credential scan skips test-file name:value code expre
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- we:scripts/readiness/__tests__/forge-exec-manifest.test.mjs` with a new test: a test-file `creds: f('<40 random chars>')` is flagged.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/readiness/__tests__/forge-exec-manifest.test.mjs` with a new test named `flags a high-entropy argument inside a test-file credential call`: a test-file `creds: f('<40 random chars>')` is flagged (assertion: `credentialContentFinding` returns `high-entropy-creds`). Today `we:scripts/readiness/__tests__/forge-scan-code-expression.test.mjs` pins this as a ruled residual (returns null), so flipping that pin is the change.
+- [A2] **Executable** — same command, a table-driven test named `flags an unquoted high-entropy value beside a call or arrow in a test file`: `creds: <40 random chars>(x)` and `creds: <40 random chars> => x` in a test file are flagged. Both shapes are pinned today by `pins the ruled test-file residual` in `we:scripts/readiness/__tests__/forge-scan-code-expression.test.mjs`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

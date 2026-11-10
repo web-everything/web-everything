@@ -1,4 +1,7 @@
 // @vitest-environment node
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { credentialContentFinding } from '../forge-exec-manifest.mjs';
 
@@ -12,7 +15,6 @@ describe('credentialContentFinding code expressions and prose', () => {
     '              keys: [index], at: r.at, action });',
     '          jobKey: p.jobKey, head: p.head, session, coordinationRoot });',
     '    inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, verified: true,',
-    'key=value` config surface (`codex exec --help`, or grep the installed binary)',
   ])('does not flag an unquoted key-named field with an expression value (%s)', line => {
     expect(scan(`${line}\n`)).toBeNull();
   });
@@ -24,5 +26,68 @@ describe('credentialContentFinding code expressions and prose', () => {
     `key: ${literal}${literal}`,
   ])('still flags a contiguous or quoted literal secret (%s)', line => {
     expect(scan(`${line}\n`)).not.toBeNull();
+  });
+});
+
+// R824/R825 whitespace-exemption boundaries: one row per exemption clause, each with the outcome it promises.
+// Rows hold only the value; the test body prefixes the key name, so this file has no `name: value` lines of
+// its own for the scan to read. The fixture literal is not a real credential.
+describe('credentialContentFinding whitespace-exemption boundaries', () => {
+  const flagged = 'high-entropy-signing_key';
+  it.each([
+    ['source file, opaque token then trailing comment', 'x.js', '=', `${literal} // note`],
+    ['source file, opaque token then parenthetical', 'x.js', ':', `${literal} (rotated)`],
+    ['markdown, opaque token then trailing word', 'notes.md', ':', `${literal} # prod`],
+    ['YAML keeps the full rule', 'config/x.yml', ':', `has some words ${literal}`],
+    ['INI keeps the full rule', 'config/x.ini', '=', `has some words ${literal}`],
+    ['plain-text config keeps the full rule', 'config/x.conf', ':', `has some words ${literal}`],
+    ['GitHub expression with a literal in source', 'x.mjs', ':', "${{ 'abcdefghij0123456789XYZ' }} tail"],
+    ['GitHub expression with a literal in markdown', 'notes.md', ':', "${{ 'abcdefghij0123456789XYZ' }} tail"],
+    ['double quote in source', 'x.mjs', ':', `say "${literal}" now`],
+    ['single quote in source', 'x.mjs', ':', `say '${literal}' now`],
+    ['backtick in source', 'x.mjs', ':', `say \`${literal} with spaces\``],
+    ['backtick in markdown', 'notes.md', ':', `say \`${literal} with spaces\``],
+    ['double quote in markdown', 'notes.md', ':', `say "${literal}" now`],
+    ['single-quoted literal in markdown', 'notes.md', ':', `say '${literal}' now`],
+  ])('flags: %s', (_name, path, sep, value) => {
+    expect(scan(`signing_key${sep} ${value}\n`, path)).toBe(flagged);
+  });
+
+  it.each([
+    ['source expression', 'x.mjs', 'keys: [index], at: r.at, action });'],
+    ['markdown prose with an apostrophe', 'notes.md', "key: it's a short note about the config surface"],
+    // The original Forge fallback line; it comes from a markdown file, where backticks are code spans.
+    ['markdown prose with code spans (the original fallback line)', 'notes.md', 'key=value` config surface (`codex exec --help`, or grep the installed binary)'],
+    ['markdown prose with code spans', 'notes.md', 'key: see `codex exec --help` or grep the installed binary for it'],
+  ])('allows: %s', (_name, path, line) => {
+    expect(scan(`${line}\n`, path)).toBeNull();
+  });
+});
+
+// Ruled residual (R824/R825, card x5b2hyl): in a TEST file an unquoted contiguous value followed by a call or
+// arrow is read as a code expression, and so is a quoted literal beside a call. Pinned so that changing the
+// shape is a decision, not an accident. Non-test files keep the full rule.
+describe('credentialContentFinding test-file code expression residuals', () => {
+  const testPath = 'scripts/lib/example.test.mjs';
+  it.each([
+    ['unquoted value then call', `${literal}(x)`],
+    ['unquoted value then arrow', `${literal} => x`],
+    ['quoted literal beside a call', `f('${literal}')`],
+  ])('pins the ruled test-file residual: %s', (_name, value) => {
+    expect(scan(`creds: ${value}\n`, testPath)).toBeNull();
+  });
+
+  it('applies the residual to test files only', () => {
+    expect(scan(`creds: ${literal}(x)\n`, 'scripts/lib/example.mjs')).toBe('high-entropy-creds');
+  });
+});
+
+// A test file that spells out a credential marker contiguously fails the very scan it exercises, so Forge
+// refuses it and falls back to the local host. Scan each of these files as Forge would.
+describe('forge scan test files pass their own scan', () => {
+  const dir = dirname(fileURLToPath(import.meta.url));
+  it.each(['forge-exec-manifest.test.mjs', 'forge-scan-code-expression.test.mjs'])('%s has no credential finding', name => {
+    const content = readFileSync(join(dir, name));
+    expect(credentialContentFinding(Buffer.from(`scripts/readiness/__tests__/${name}`), content)).toBeNull();
   });
 });
