@@ -71,6 +71,16 @@ describe('shouldLabelOnGreen (#2216 — post-CI reconcile labels a stranded gree
 //   2. the ratified #2423 valve dies (`--no-review-escalation=<pr#>` still waives the MERGE predicate, but an
 //      unstamped PR never enters the `--label`-scoped candidate set, so there is nothing left for it to waive).
 describe('labelOnGreenVerdict (#2832 — the reason channel and the #2423 relief)', () => {
+  it('mechanical certification pins the head and preserves green and human holds', () => {
+    const pr = aiPr({ commits: [humanCommit], headRefOid: 'ABC', labels: [] });
+    const mechanicalClearance = { cleared: true, head: 'abc' };
+    expect(labelOnGreenVerdict(pr, { mechanicalClearance }).label).toBe(true);
+    expect(labelOnGreenVerdict(pr, { mechanicalClearance: { cleared: true, head: 'old' } }).label).toBe(false);
+    expect(labelOnGreenVerdict(pr, { mechanicalClearance: { cleared: false, head: 'abc' } }).label).toBe(false);
+    expect(labelOnGreenVerdict({ ...pr, labels: [{ name: 'review:human' }] }, { mechanicalClearance }).reason).toBe('held');
+    expect(labelOnGreenVerdict({ ...pr, statusCheckRollup: [] }, { mechanicalClearance }).label).toBe(false);
+    expect(classifyPr({ ...pr, labels: [{ name: 'ready-to-merge' }] }).decision).toBe('merge');
+  });
   it('green + fully-AI + review:pending → refused WITH reason "held" (so the reconcile can say why)', () => {
     expect(labelOnGreenVerdict(aiPr({ labels: [{ name: 'review:pending' }] }), {})).toEqual({ label: false, reason: 'held' });
   });

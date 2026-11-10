@@ -1,0 +1,156 @@
+/** @file Mechanical refresh admission: injected evidence, never network. */
+import { describe, it, expect } from 'vitest';
+import { validateMechanicalClearance, readMechanicalClearanceFacts, recordMechanicalClearance,
+  REQUIRED_MECHANICAL_CHECKS } from '../mechanical-clearance.mjs';
+
+const head = 'a'.repeat(40);
+const path = 'scripts/ci/test-timings.json';
+const testPath = 'scripts/lib/__tests__/sample.test.mjs';
+const facts = () => ({ head, author: { login: 'web-everything[bot]', type: 'Bot' }, commitCount: 1,
+  commits: [{ author: { login: 'github-actions[bot]' }, committer: { login: 'github-actions[bot]' } }],
+  files: [{ filename: path, status: 'modified' }],
+  baseEntry: { type: 'blob', mode: '100644' }, headEntry: { type: 'blob', mode: '100644' },
+  content: JSON.stringify({ _doc: 'Seconds', unit: { [testPath]: 450 }, soak: {} }),
+  existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, conclusion: 'SUCCESS', id: 1 })) });
+
+describe('mechanical clearance', () => {
+  it('clears the refresh workflow identities and seconds', () => expect(validateMechanicalClearance(facts()).cleared).toBe(true));
+  const fail = (name, rule, change) => it(name, () => {
+    const f = facts(); change(f); expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule, head });
+  });
+  fail('another file', 'diff-scope', f => f.files.push({ filename: 'other' }));
+  fail('human title and branch spoof', 'author', f => { f.author = { login: 'human', type: 'User' }; f.title = 'ci: refresh measured unit test timings'; f.branch = 'ci/refresh-test-timings'; });
+  fail('bot login with User type', 'author', f => f.author.type = 'User');
+  fail('human commit', 'commit-identity', f => f.commits[0].author.login = 'human');
+  fail('null committer', 'commit-identity', f => f.commits[0].committer = null);
+  fail('incomplete commits', 'read-error', f => f.commitCount++);
+  for (const status of ['renamed', 'added', 'removed']) fail(status, 'diff-shape', f => f.files[0].status = status);
+  fail('previous filename', 'diff-shape', f => f.files[0].previous_filename = path);
+  for (const mode of ['100755', '120000', '160000']) fail(`mode ${mode}`, 'diff-shape', f => f.headEntry.mode = mode);
+  fail('base mode', 'diff-shape', f => f.baseEntry.mode = '100755');
+  fail('submodule type', 'diff-shape', f => f.headEntry.type = 'commit');
+  fail('malformed JSON', 'schema', f => f.content = '{');
+  fail('unknown top-level key', 'schema', f => f.content = '{"other":{}}');
+  fail('doc must be text', 'schema', f => f.content = '{"_doc":1}');
+  for (const value of ['-1', 'NaN', '"1"', '3601']) fail(`invalid seconds ${value}`, 'schema', f => f.content = `{"unit":{"${testPath}":${value}}}`);
+  for (const key of ['README.md', '../a.test.ts', '/a.test.ts', 'a\\b.test.ts', 'missing.test.ts']) {
+    fail(`invalid or missing test ${key}`, 'keys', f => f.content = JSON.stringify({ unit: { [key]: 1 } }));
+  }
+  it('removed keys pass', () => { const f = facts(); f.content = '{"unit":{}}'; f.existingFiles = []; expect(validateMechanicalClearance(f).cleared).toBe(true); });
+  for (const conclusion of ['FAILURE', 'PENDING', 'CANCELLED', null]) fail(`required check ${conclusion}`, 'checks', f => f.checks[0].conclusion = conclusion);
+  fail('missing required check', 'checks', f => f.checks.pop());
+  fail('nonrequired failure', 'checks', f => f.checks.push({ name: 'other', conclusion: 'TIMED_OUT' }));
+  it('uses latest required run', () => { const f = facts(); f.checks.push({ name: 'test', conclusion: 'PENDING', id: 2 }); expect(validateMechanicalClearance(f).rule).toBe('checks'); });
+  it('successful rerun supersedes an old failed run', () => { const f = facts(); f.checks.unshift({ name: 'test', conclusion: 'FAILURE', id: 0 }); expect(validateMechanicalClearance(f).cleared).toBe(true); });
+  fail('compare cap', 'read-error', f => f.files = Array(300).fill(f.files[0]));
+  fail('oversized blob requires normal review', 'read-error', f => f.content = ' '.repeat(4 * 1024 * 1024 + 1));
+  fail('too many timing keys requires normal review', 'schema', f => f.content = JSON.stringify({ unit: Object.fromEntries(Array.from({ length: 20001 }, (_, i) => [`${i}.test.ts`, 1])) }));
+  fail('read error', 'read-error', f => f.readError = true);
+});
+
+const io = ({ moved = false, broken = null, truncated = false, mutate = (_url, value) => value } = {}) => {
+  let pulls = 0;
+  return (file, args) => {
+    if (file === 'git') {
+      if (args[0] === 'fetch') return '';
+      return `100644 blob ${head}\t${testPath}\0`;
+    }
+    const url = args[1];
+    if (url === broken) throw Error('unreadable');
+    let value;
+    if (url.endsWith('/pulls/1')) value = { user: facts().author, commits: 1, head: { sha: moved && pulls++ ? 'b'.repeat(40) : head }, base: { ref: 'main', sha: 'b'.repeat(40) } };
+    else if (url.includes('/pulls/1/commits')) value = facts().commits;
+    else if (url.includes('/compare/')) value = { files: truncated ? Array(300).fill(facts().files[0]) : facts().files };
+    else if (url.includes('/git/trees/')) {
+      const ref = url.split('/').at(-1);
+      value = { truncated: false, tree: ref === 'scripts-tree' ? [{ path: 'ci', type: 'tree', sha: 'ci-tree' }]
+        : ref === 'ci-tree' ? [{ path: 'test-timings.json', type: 'blob', mode: '100644', sha: 'blob' }]
+          : [{ path: 'scripts', type: 'tree', sha: 'scripts-tree' }] };
+    } else if (url.includes('/git/blobs/')) { const content = facts().content; value = { encoding: 'base64', content: Buffer.from(content).toString('base64'), size: Buffer.byteLength(content) }; }
+    else if (url.includes('/check-runs')) value = { total_count: 5, check_runs: REQUIRED_MECHANICAL_CHECKS.map((name, index) => ({
+      name, id: index + 1, head_sha: head, status: 'completed', conclusion: 'success', started_at: '2026-11-10T12:00:00Z',
+    })) };
+    else if (url.includes('/statuses')) value = [];
+    else throw Error(`unexpected request ${url}`);
+    return JSON.stringify(mutate(url, value));
+  };
+};
+describe('IO closes on incomplete evidence', () => {
+  const read = options => readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: io(options) });
+  it('clears a pinned snapshot with realistic lowercase REST check-run success conclusions', () => expect(validateMechanicalClearance(read()).cleared).toBe(true));
+  for (const conclusion of ['failure', 'cancelled', 'timed_out']) {
+    it(`refuses a required REST check-run with lowercase ${conclusion}`, () => {
+      const mutate = (url, value) => url.includes('/check-runs') ? { ...value,
+        check_runs: value.check_runs.map((check, index) => index === 0 ? { ...check, conclusion } : check) } : value;
+      expect(validateMechanicalClearance(read({ mutate }))).toMatchObject({ cleared: false, rule: 'checks' });
+    });
+    it(`refuses a nonrequired REST check-run with lowercase ${conclusion}`, () => {
+      const mutate = (url, value) => url.includes('/check-runs') ? { ...value, total_count: value.total_count + 1,
+        check_runs: [...value.check_runs, { name: 'other', id: 6, status: 'completed', conclusion }] } : value;
+      expect(validateMechanicalClearance(read({ mutate }))).toMatchObject({ cleared: false, rule: 'checks' });
+    });
+  }
+  it('head moved', () => expect(validateMechanicalClearance(read({ moved: true })).rule).toBe('read-error'));
+  it('compare truncated', () => expect(validateMechanicalClearance(read({ truncated: true })).rule).toBe('read-error'));
+  it('any API failure', () => expect(validateMechanicalClearance(read({ broken: 'repos/owner/repo/pulls/1' })).rule).toBe('read-error'));
+  for (const suffix of ['pulls/1/commits?per_page=100&page=1', `compare/${'b'.repeat(40)}...${head}?per_page=100&page=1`,
+    `git/trees/${head}`, 'git/trees/scripts-tree', 'git/trees/ci-tree', 'git/blobs/blob',
+    `commits/${head}/check-runs?filter=all&per_page=100&page=1`, `commits/${head}/statuses?per_page=100&page=1`]) {
+    it(`read failure at ${suffix}`, () => expect(validateMechanicalClearance(read({ broken: `repos/owner/repo/${suffix}` })).rule).toBe('read-error'));
+  }
+  for (const [name, mutate] of [
+    ['truncated path tree', (url, v) => url.endsWith('/scripts-tree') ? { ...v, truncated: true } : v],
+    ['incomplete commit count', (url, v) => url.endsWith('/pulls/1') ? { ...v, commits: 2 } : v],
+    ['incomplete check count', (url, v) => url.includes('check-runs') ? { ...v, total_count: 6 } : v],
+    ['oversized blob', (url, v) => url.includes('/blobs/') ? { ...v, size: 4 * 1024 * 1024 + 1 } : v],
+    ['truncated blob', (url, v) => url.includes('/blobs/') ? { ...v, content: '' } : v],
+    ['unreadable status list', (url, v) => url.includes('/statuses') ? {} : v],
+    ['page ceiling retains normal review', (url, v) => url.includes('/statuses') ? Array(100).fill({ context: 'other', state: 'success' }) : v],
+  ]) it(name, () => expect(validateMechanicalClearance(read({ mutate })).rule).toBe('read-error'));
+  it('reads every commit page', () => {
+    const mutate = (url, v) => url.endsWith('/pulls/1') ? { ...v, commits: 101 }
+      : url.includes('/commits?') ? Array(url.endsWith('page=1') ? 100 : 1).fill(facts().commits[0]) : v;
+    expect(validateMechanicalClearance(read({ mutate })).cleared).toBe(true);
+  });
+  it('injected head file reader failure closes', () => {
+    const f = readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: io(), listFiles: () => { throw Error('unreadable files'); } });
+    expect(validateMechanicalClearance(f).rule).toBe('read-error');
+  });
+  for (const stage of ['fetch', 'ls-tree']) it(`git ${stage} failure closes`, () => {
+    const exec = (file, args, opts) => { if (file === 'git' && args[0] === stage) throw Error('unreadable git'); return io()(file, args, opts); };
+    expect(validateMechanicalClearance(readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec })).rule).toBe('read-error');
+  });
+  it('truncated git file listing closes', () => {
+    const exec = (file, args, opts) => file === 'git' && args[0] === 'ls-tree' ? '100644 blob' : io()(file, args, opts);
+    expect(validateMechanicalClearance(readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec })).rule).toBe('read-error');
+  });
+  it('a symlink test is not an existing regular file', () => {
+    const exec = (file, args, opts) => file === 'git' && args[0] === 'ls-tree' ? `120000 blob ${head}\t${testPath}\0` : io()(file, args, opts);
+    expect(validateMechanicalClearance(readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec })).rule).toBe('keys');
+  });
+});
+describe('durable record', () => {
+  it('posts verdict and all rule results once per head', () => {
+    const comments = []; const result = validateMechanicalClearance(facts());
+    const options = { repo: 'owner/repo', num: 1, result, readComments: () => comments,
+      post: body => comments.push({ body, author: { login: 'web-everything[bot]' } }) };
+    recordMechanicalClearance(options); recordMechanicalClearance(options);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain(`<!-- mechanical-clearance: head=${head} -->`);
+    for (const rule of ['author', 'commit-identity', 'diff-scope', 'diff-shape', 'schema', 'keys', 'checks']) expect(comments[0].body).toContain(`${rule}: PASS`);
+    expect(comments[0].body).toContain('ET');
+  });
+  it('unreadable comments never posts', () => expect(() => recordMechanicalClearance({ repo: 'owner/repo', num: 1,
+    result: validateMechanicalClearance(facts()), readComments: () => { throw Error('read'); }, post: () => { throw Error('must not post'); } })).toThrow('read'));
+  it('untrusted marker cannot suppress the durable record', () => {
+    let body;
+    recordMechanicalClearance({ repo: 'owner/repo', num: 1, result: validateMechanicalClearance(facts()),
+      readComments: () => [{ body: `<!-- mechanical-clearance: head=${head} -->`, author: { login: 'human' } }], post: text => { body = text; } });
+    expect(body).toContain('cleared');
+  });
+  it('records the failing rule and leaves later rules unevaluated', () => {
+    let body; const f = facts(); f.author.type = 'User';
+    recordMechanicalClearance({ repo: 'owner/repo', num: 1, result: validateMechanicalClearance(f), readComments: () => [], post: text => { body = text; } });
+    expect(body).toContain('author: FAIL'); expect(body).toContain('keys: NOT EVALUATED');
+  });
+});
