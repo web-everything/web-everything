@@ -133,6 +133,23 @@ describe('credentialContentFinding code expressions in test files (R824)', () =>
   it('still flags a bare literal that merely contains a call-like fragment', () => {
     expect(at(testPath, `API_TOKEN: 'q8Zr3LkP0vXw9TnB5mJd2Y(cH7sFgA4uE6oIe1KtN'\n`)).toBe('high-entropy-API_TOKEN');
   });
+  it.each([
+    ['escaped literal', '"\\x61B3dE5fG7hJ9kL2mN4pQ6rS8" + suffix()'],
+    ['interpolated template', '`aB3dE5fG7hJ9kL2mN4pQ6rS8${suffix()}`'],
+    ['comment quote', "/* ' */ 'aB3dE5fG7hJ9kL2mN4pQ6rS8abc('"] ,
+    ['trailing comment', '"aB3dE5fG7hJ9kL2mN4pQ6rS8", // suffix('],
+    ['unclosed template', '`aB3dE5fG7hJ9kL2mN4pQ6rS8abc('],
+  ])('rejects %s forms the skip cannot prove safe, including continuations', (_name, value) => {
+    expect(at(testPath, `creds: ${value}\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, `creds:\n  ${value}\n`)).toBe('high-entropy-creds');
+  });
+  it('ruled residual (R824/R825): a plain quoted literal beside a call is skipped in test files', () => {
+    expect(at(testPath, 'creds: "aB3dE5fG7hJ9kL2mN4pQ6rS8" + suffix()\n')).toBeNull();
+  });
+  it('rejects a multiline template whose literal content resembles a call', () => {
+    expect(at(testPath, `creds: \`${randomValue}abc(\n  \`,\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, `creds: \`\n  ${randomValue}abc(\n  \`,\n`)).toBe('high-entropy-creds');
+  });
   it('always flags a real-format token inside a code expression in a test file', () => {
     const real = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
     expect(at(testPath, `getToken: vi.fn(() => ({token:'${real}'})),\n`)).toBe('github-token');
