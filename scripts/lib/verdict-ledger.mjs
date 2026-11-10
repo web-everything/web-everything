@@ -1230,6 +1230,60 @@ export function appendVerdict(record, opts = {}) {
   return step.value;
 }
 
+/**
+ * Append many records with ONE git push for the holding rows. Same F4 policy as {@link appendVerdict}, row by row:
+ * a CLEARING row is never deferred (git first, per row, exactly as before); a HOLDING row writes home first and
+ * its git row joins a single flush at the end. If that flush misses, EVERY deferred row is flagged
+ * `ledgerWriteMiss: true` (the home rows stay, so each hold still stands). Returns one result per input, in order.
+ * A caller that appends N rows serially pays N git transport round trips; this pays one.
+ *
+ * @param {VerdictRecord[]} records
+ * @param {object} [opts] - as {@link appendVerdict}.
+ * @returns {object[]}
+ */
+export function appendVerdictBatch(records, opts = {}) {
+  const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
+  const results = [];
+  const deferred = []; // { index, record, board }
+  for (const record of records ?? []) {
+    const plan = verdictWritePlan(record, opts);
+    const index = results.length;
+    let step = plan.next();
+    while (!step.done) {
+      const op = step.value;
+      let result;
+      if (op.name === 'home') {
+        try { result = (opts.homeAppend ?? appendVerdictHome)(op.record); }
+        catch (e) { result = homeWriteFailure(e); }
+      } else if (op.name === 'git') {
+        if (!op.board) result = noBoardWriteMiss();
+        else if (!eventClears(op.record)) { deferred.push({ index, record: op.record, board: op.board }); result = { ok: true }; }
+        else result = appendGitRowsSync([op.record], { board: op.board, repo: op.record.repo },
+          opts.gitAppend ? { appendRows: opts.gitAppend } : undefined);
+      } else {
+        result = { ok: false, appended: 0, error: `plugged store ${op.name} is async; use appendVerdictAsync` };
+      }
+      step = plan.next(result);
+    }
+    results.push(step.value);
+  }
+  // One flush per (board, repo): the transport branch is per repo.
+  const groups = new Map();
+  for (const d of deferred) {
+    const k = `${d.board}\0${d.record.repo}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(d);
+  }
+  for (const group of groups.values()) {
+    const flush = appendGitRowsSync(group.map((d) => d.record), { board: group[0].board, repo: group[0].record.repo },
+      opts.gitAppend ? { appendRows: opts.gitAppend } : undefined);
+    if (flush.ok) continue;
+    loud(`verdict-ledger: GIT WRITE MISS (batch of ${group.length}) for ${group[0].record.repo}: ${flush.error} — holds still apply; ledger-write-miss`);
+    for (const d of group) results[d.index] = { ...results[d.index], ledgerWriteMiss: true };
+  }
+  return results;
+}
+
 /** Async entry point with the identical F4 policy, using store contracts for every built-in and plugged store. */
 export async function appendVerdictAsync(record, opts = {}) {
   const plan = verdictWritePlan(record, opts);
