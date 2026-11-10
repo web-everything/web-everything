@@ -1293,6 +1293,17 @@ exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` w
 
 ### Passive-wait hook regression probes
 
+Security hooks (`PreToolUse`, `Stop`, `SubagentStop`) run through the primary checkout's
+`scripts/hooks/run-pinned-guard.mjs`, using a cached archive of the local `origin/main` ref.
+Uncommitted lane guard edits do not affect these hooks. Probe both linked worktrees and
+clone lanes with temporary Git repositories and `WE_PINNED_HOOKS_DIR` under the task's
+`TMPDIR`. Clone lanes under `.lanes/`
+resolve the bootstrap from the sibling `web-everything` primary (legacy: `webeverything`),
+never from their own Git common directory; replace the lane launcher in wrapper probes.
+Cover stdin, exit codes,
+snapshot refresh, offline `latest` fallback and missing-snapshot denial (exit 2).
+The launcher header documents the operator escape for deliberately testing local guards.
+
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
 `agent_transcript_path`, falling back to `transcript_path` only when absent; an unreadable or malformed
 selected file fails open. Keep Monitor cases event-specific: any Monitor call plus passive-wait

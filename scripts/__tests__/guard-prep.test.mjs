@@ -169,6 +169,6 @@ describe('guard-prep', () => {
   it('registers Agent and Task in settings', () => {
     const settings = JSON.parse(readFileSync(join(here, '../../.claude/settings.json'), 'utf8'));
     expect(settings.hooks.PreToolUse.find((entry) => entry.matcher === 'Agent|Task').hooks)
-      .toContainEqual({ type: 'command', command: 'node scripts/guard-prep.mjs' });
+      .toContainEqual({ type: 'command', command: expect.stringMatching(/run-pinned-guard\.mjs.* scripts\/guard-prep\.mjs; code=/) });
   });
 });

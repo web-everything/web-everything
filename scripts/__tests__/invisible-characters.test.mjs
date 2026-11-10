@@ -12,7 +12,12 @@ const settings = JSON.parse(readFileSync(join(root, '.claude/settings.json'), 'u
 const hook = settings.hooks.PreToolUse.find((block) => block.matcher === 'Edit|Write')
   .hooks.find((entry) => entry.command.includes('lint-invisible-characters.mjs'));
 function invoke(tool_name, tool_input) {
-  return spawnSync(process.execPath, [hook.command.slice('node '.length)], {
+  // Exercise the current guard's rules directly; snapshot selection has its own
+  // temporary-Git integration suite and must not use the operator's real cache.
+  const target = hook.command.match(/node "\$launcher" (scripts\/lint-invisible-characters\.mjs); code=/)?.[1];
+  expect(hook.command).toContain('scripts/hooks/run-pinned-guard.mjs');
+  expect(target).toBe('scripts/lint-invisible-characters.mjs');
+  return spawnSync(process.execPath, [join(root, target)], {
     cwd: root, encoding: 'utf8', input: JSON.stringify({ tool_name, tool_input, cwd: root }),
   });
 }

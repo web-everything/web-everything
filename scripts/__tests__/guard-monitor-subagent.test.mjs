@@ -70,7 +70,7 @@ describe('guard-monitor-subagent — CLI and hook wiring', () => {
     const settings = JSON.parse(readFileSync(join(here, '../../.claude/settings.json'), 'utf8'));
     for (const [matcher, script] of [['Monitor', 'guard-monitor-subagent'], ['Bash', 'guard-bash']]) {
       expect(settings.hooks.PreToolUse.find((entry) => entry.matcher === matcher).hooks).toContainEqual({
-        type: 'command', command: `node scripts/${script}.mjs`,
+        type: 'command', command: expect.stringContaining(`node "$launcher" scripts/${script}.mjs; code=$?`),
       });
     }
   });

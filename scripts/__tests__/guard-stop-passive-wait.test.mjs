@@ -232,11 +232,11 @@ describe('guard-stop-passive-wait — real CLI boundary and bounded transcript I
     const settings = JSON.parse(readFileSync(join(here, '../../.claude/settings.json'), 'utf8'));
     for (const event of ['Stop', 'SubagentStop']) {
       expect(settings.hooks[event].flatMap((entry) => entry.hooks)).toContainEqual({
-        type: 'command', command: 'node scripts/guard-stop-passive-wait.mjs',
+        type: 'command', command: expect.stringMatching(/run-pinned-guard\.mjs.* scripts\/guard-stop-passive-wait\.mjs; code=/),
       });
     }
     expect(settings.hooks.PreToolUse.find((entry) => entry.matcher === 'Bash').hooks).toContainEqual({
-      type: 'command', command: 'node scripts/guard-bash.mjs',
+      type: 'command', command: expect.stringMatching(/run-pinned-guard\.mjs.* scripts\/guard-bash\.mjs; code=/),
     });
   });
 });
