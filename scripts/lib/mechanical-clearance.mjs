@@ -50,7 +50,10 @@ export function validateMechanicalClearance(facts = {}) {
     if (!Object.hasOwn(data, group) || !plain(data[group]) || !Object.keys(data[group]).length) return fail('schema', `Timing group ${group} must be a non-empty plain object.`);
     const headKeys = Object.keys(data[group]);
     const baseKeys = plain(baseData[group]) ? Object.keys(baseData[group]) : [];
-    if (headKeys.length < Math.ceil(0.9 * baseKeys.length)) return fail('schema', `Timing group ${group} retains ${headKeys.length}/${baseKeys.length} keys, below 90%; use normal review of the full PR.`);
+    // Compare key SETS: at least 90% of the ORIGINAL keys must still be present (intersection over base count).
+    const headSet = new Set(headKeys);
+    const retained = baseKeys.filter(k => headSet.has(k)).length;
+    if (retained < Math.ceil(0.9 * baseKeys.length)) return fail('schema', `Timing group ${group} retains ${retained}/${baseKeys.length} keys, below 90%; use normal review of the full PR.`);
     for (const [key, value] of Object.entries(data[group])) {
       if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 3600) return fail('schema', 'Durations must be finite seconds between 0 and 3600.');
       keys.push(key);

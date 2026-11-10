@@ -70,6 +70,16 @@ describe('mechanical clearance', () => {
         expect(result.reasons[0]).toContain('normal review');
       }
     });
+    it(`${group} replacing every original key with unrelated existing tests refuses (key sets, not counts)`, () => {
+      const f = facts();
+      const entries = (prefix, n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`${prefix}${i}.test.ts`, 1]));
+      f.baseContent = JSON.stringify({ ...JSON.parse(f.baseContent), [group]: entries('old', 100) });
+      f.content = JSON.stringify({ ...JSON.parse(f.content), [group]: entries('new', 100) });
+      f.existingFiles.push(...Object.keys(entries('new', 100)));
+      const result = validateMechanicalClearance(f);
+      expect(result).toMatchObject({ cleared: false, rule: 'schema' });
+      expect(result.reasons[0]).toContain('retains 0/100');
+    });
     it(`${group} rounds the 90% minimum up`, () => {
       const f = facts(); const data = JSON.parse(f.baseContent); data[group]['removed.test.ts'] = 1;
       f.baseContent = JSON.stringify(data);
