@@ -650,6 +650,25 @@ describe('planRedTeamOnSkip', () => {
       .toBe('red-team result already on head');
     expect(readEvidence).not.toHaveBeenCalled();
   });
+  // A verdict carry posts ONE comment: carried marker, prose, then the re-keyed result. Every "is there a result on
+  // this head" reader must see it as the disposition reader does, or a policy-clear could bury a carried break.
+  const carried = (to, gate = '') => ({ author: { login: 'web-everything' }, created_at: '2026-11-07T12:00:00Z', body: [
+    ...(gate ? [gate] : []), `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${to} patch-id=${'c'.repeat(40)} -->`,
+    'Review verdict carried across an identical contribution.', redTeamMarker(pr, to),
+    '1. [**confirmed**] (edge-case, broken) `x.mjs:1` — carried break'].join('\n') });
+  it('c: a carried result with a confirmed break covers this head (no policy-clear over it)', () => {
+    const readEvidence = vi.fn();
+    expect(redTeamForHead([carried(head)], pr, head)?.findings).toMatchObject([{ confirmed: true, summary: 'carried break' }]);
+    expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carried(head)] }], readEvidence }).why)
+      .toBe('red-team result already on head');
+    expect(readEvidence).not.toHaveBeenCalled();
+  });
+  it('c: a carry envelope that is malformed, untrusted or names another head does not count', () => {
+    const other = 'd'.repeat(40);
+    for (const c of [carried(other), { ...carried(head), author: { login: 'outsider' } },
+      carried(head, `<!-- we:red-team-gate pr=${pr} rev=${other} outcome=sent-back -->`)])
+      expect(redTeamForHead([c], pr, head)).toBeNull();
+  });
   it('refuses unreadable comments or evidence instead of assuming no pass', () => {
     expect(decide({ rawPrs: [{ number: pr, headRefOid: head }] }).action).toBe('skip');
     expect(decide({ readEvidence: () => { throw Error('unreadable'); } }).action).toBe('skip');

@@ -132,16 +132,21 @@ export function redTeamResultId(parsed) {
 
 /**
  * The red-team comment for the LIVE head: the newest one a TRUSTED principal wrote whose marker names this PR and
- * exactly this head. A comment on another head is stale (the fixer already pushed) and is ignored. PURE.
+ * exactly this head. A comment on another head is stale (the fixer already pushed) and is ignored. A result carried
+ * inside a verdict-carry comment counts exactly as {@link readRedTeamDisposition} counts it (one record reader), so
+ * no "is there a result" check can miss a carried break and let a policy-clear bury it. PURE.
  */
 export function redTeamForHead(comments, pr, head) {
+  return redTeamResultCommentForHead(comments, pr, head)?.parsed ?? null;
+}
+
+/** The record {@link redTeamForHead} reads: `{ comment, parsed }`, where `comment` keeps the creation time of the
+ * comment that holds the result (the carry comment for a carried result), or null. PURE. */
+export function redTeamResultCommentForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(live)) return null;
-  const hits = (Array.isArray(comments) ? comments : [])
-    .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
-    .filter((x) => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === live)
-    .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i);
-  return hits.at(-1)?.parsed ?? null;
+  const hit = latestResult(indexedRecords(comments), pr, live);
+  return hit ? { comment: hit.c, parsed: hit.parsed } : null;
 }
 
 // ── The setting ─────────────────────────────────────────────────────────────────────────────────────────────────

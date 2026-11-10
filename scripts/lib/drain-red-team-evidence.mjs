@@ -15,8 +15,7 @@ import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { readRedTeamProbes, redTeamForHead, parseRedTeamComment } from './red-team-gate.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
@@ -729,11 +728,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
 // Breaks are checked by redTeamEnqueueHold BEFORE it reads `ok`, so a recorded break still
 // sends back. Every other unknown reason, any missing bound, and any head without a trusted result comment stays
 // unknown (fail closed).
-// The settling result's own time is the NEWEST trusted comment for this exact head, the one redTeamForHead returns.
-const newestResultComment = (comments, pr, head) => (Array.isArray(comments) ? comments : [])
-  .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
-  .filter(x => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === String(head).toLowerCase())
-  .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i).at(-1)?.c;
+// The settling result's own time is the NEWEST trusted comment for this exact head, the one redTeamForHead returns
+// (the same record reader, so a carried result is dated by its carry comment).
+const newestResultComment = (comments, pr, head) => redTeamResultCommentForHead(comments, pr, head)?.comment;
 // review-unfinished only: its bounded scan may also have left records unread, and the settle bound it carries is the
 // unfinished review's, so the comment must be a whole abandon-horizon newer than the first unread record (one that has
 // been quiet that long is no longer a live review). A scan-capped read needs no such margin: the complete read inspects

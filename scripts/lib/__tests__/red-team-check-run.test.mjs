@@ -399,6 +399,15 @@ describe('red-team check run contract', () => {
       expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
     });
 
+    it('a newer carry whose gate line names another head is not a carry and cannot date the live result', async () => {
+      const io = fixture();
+      const forged = { ...carryComment('2026-11-07T12:00:00Z'),
+        body: `<!-- we:red-team-gate pr=7 rev=${OLD_HEAD} outcome=no-send-back -->\n${carryComment('x').body}` };
+      io.readComments.mockReturnValue([{ ...resultComment(), created_at: '2026-11-07T10:00:00Z' }, forged]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
     it('a newer carry to another head cannot date an older live-head result', async () => {
       const io = fixture();
       const otherHead = { ...carryComment('2026-11-07T12:00:00Z'),
