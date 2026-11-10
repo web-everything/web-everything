@@ -212,6 +212,25 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     restored.s.enqueue({ num: 5283 }, HEAD);
     expect(requests).toBe(2);
   });
+  // #6535 round 10 (operator send-back): only the exact missing / in-progress reasons are recoverable. A prefix match
+  // used to spend the once-per-head request on an external_id mismatch or a truncated history, which no round fixes.
+  it.each([
+    ['no red-team check run on head for web-everything/web-everything#1: external_id missing or mismatching', false],
+    ['red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history', false],
+    ['red-team check run failed (failure)', false],
+    ['no red-team check run on head', true],
+    ['red-team check run in progress or incomplete', true],
+  ])('check-run recovery re-requests only a recoverable reason: %s -> %s', (reason, recoverable) => {
+    const clock = { t: 1000 };
+    const requestRedTeam = vi.fn();
+    const h = harness({ strategy: 'github-merge-queue', now: () => clock.t, labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' },
+      strategyExtra: { readRedTeamCheck: () => ({ ok: false, reason }) }, requestRedTeam });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, reason });
+    clock.t += 60_001;
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    expect(requestRedTeam).toHaveBeenCalledTimes(recoverable ? 1 : 0);
+  });
   it('a passing check ends the recovery wait: a later round on the same head starts a fresh wait (round-4 finding)', () => {
     const clock = { t: 1000 };
     let fact = { ok: false, reason: 'no red-team check run on head' }, requests = 0;

@@ -82,13 +82,43 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  * already shows a result. It first reads the head and posts only when this PR has NO red-team check run there: an
  * existing success needs nothing, and any other run (in progress, failed, unreadable) belongs to a real round and
  * is never overridden. Any refusal or failed post returns `ok:false`; the caller posts no comment and retries.
+ *
+ * Verify after write (#6535 round 10, operator send-back): the highest check-run id is the single authority, and a
+ * round can start between the absence read and the post. So after posting it re-reads this PR's runs on the head. If
+ * any of them is not a completed success (a round's in_progress or failure, whatever its id), or the re-read fails,
+ * it posts a superseding in_progress run, so its own success is never the newest run while a round is unfinished, and
+ * returns `ok:false`; the caller posts no comment and retries. The round's own final publication supersedes that
+ * in_progress run later. No lock and no sleep.
  */
 export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
   const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
   if (fact.ok === true) return { ok: true, reason: 'red-team check already clear on head' };
   if (fact.reason !== 'no red-team check run on head') return failure(`policy-clear check not posted: ${fact.reason}`);
-  return postRedTeamCheckRun({ repo, pr, headSha, gh,
+  const posted = postRedTeamCheckRun({ repo, pr, headSha, gh,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false }) });
+  if (posted.ok !== true) return posted;
+  const after = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
+  const concurrent = after.ok === true
+    && after.runs.some(run => run.status !== 'completed' || run.conclusion !== 'success');
+  if (after.ok === true && !concurrent) return posted;
+  const yielded = postRedTeamCheckRun({ repo, pr, headSha, gh,
+    payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'in_progress', hold: null }) });
+  const why = after.ok === true ? 'policy-clear yielded to a concurrent round'
+    : `policy-clear yielded: re-read after publication failed (${after.reason})`;
+  return failure(yielded.ok === true ? why : `${why}; superseding in_progress not posted (${yielded.reason})`);
+}
+
+/** This PR's red-team runs on the head from the configured app (one bounded read), for verify-after-write. */
+function readRedTeamCheckRuns({ repo, pr, headSha, appId, gh }) {
+  const identity = prIdentity(repo, pr);
+  if (!validApp(appId) || !validHead(headSha) || !identity) return failure('invalid red-team check identity');
+  try {
+    const data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions));
+    if (!Array.isArray(data?.check_runs) || data.check_runs.length > 100 || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
+      return failure('red-team check runs unreadable or incomplete at 100-run bound');
+    return { ok: true, runs: data.check_runs.filter(run => run?.name === 'red-team' && run.external_id === identity
+      && typeof run.head_sha === 'string' && run.head_sha.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(appId)) };
+  } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
 }
 
 /** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a

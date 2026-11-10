@@ -62,6 +62,80 @@ describe('red-team check run contract', () => {
       expect(publish(gh)).toMatchObject({ ok: false, reason: expect.stringContaining('policy-clear check not posted') });
       expect(gh.mock.calls.some(([args]) => args.includes('POST'))).toBe(false);
     });
+    // #6535 round 10 (operator send-back): verify after write. A stateful fake GitHub: POST appends a run with the
+    // next id; `onPost` lets a test insert a concurrent round's run at the moment the success is posted.
+    const liveGh = ({ initial = [], onPost = () => {}, failReadAfterPost = false } = {}) => {
+      const runs = [...initial], posts = [];
+      let nextId = 100;
+      const gh = vi.fn((args, options) => {
+        if (args.includes('POST')) {
+          const payload = JSON.parse(options.input);
+          posts.push(payload);
+          onPost(runs, payload, () => nextId++);
+          runs.push({ ...payload, id: nextId++, app: { id: APP_ID }, conclusion: payload.conclusion ?? null });
+          return JSON.stringify({ id: nextId - 1 });
+        }
+        if (failReadAfterPost && posts.length) throw Error('HTTP 502');
+        return JSON.stringify({ total_count: runs.length, check_runs: runs });
+      });
+      return { gh, runs, posts };
+    };
+    const newest = runs => [...runs].sort((a, b) => b.id - a.id)[0];
+    it('policy-clear cannot supersede a round started after its absence read', () => {
+      // The absence read sees no run; a round then publishes in_progress; the policy-clear success lands NEWER.
+      const fake = liveGh({ onPost: (runs, payload, id) => {
+        if (payload.conclusion === 'success') runs.push(run({ id: id(), status: 'in_progress', conclusion: null }));
+      } });
+      expect(publish(fake.gh)).toEqual({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
+      expect(fake.posts.map(p => p.status)).toEqual(['completed', 'in_progress']);
+      expect(fake.posts.at(-1)).toMatchObject({ name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', status: 'in_progress' });
+      expect(fake.posts.at(-1).conclusion).toBeUndefined();
+      // The newest run (the authority merge-gate reads) is in_progress, never the policy-clear success.
+      expect(newest(fake.runs)).toMatchObject({ status: 'in_progress' });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }))
+        .toEqual({ ok: false, reason: 'red-team check run in progress or incomplete' });
+    });
+    it('yields to a concurrent round that already finished with failure', () => {
+      const fake = liveGh({ onPost: (runs, payload, id) => {
+        if (payload.conclusion === 'success') runs.push(run({ id: id(), conclusion: 'failure' }));
+      } });
+      expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
+      expect(newest(fake.runs)).toMatchObject({ status: 'in_progress' });
+    });
+    it('a clean no-concurrency case publishes exactly one success and no extra in_progress post', () => {
+      const fake = liveGh();
+      expect(publish(fake.gh)).toEqual({ ok: true });
+      expect(fake.posts).toHaveLength(1);
+      expect(fake.posts[0]).toMatchObject({ status: 'completed', conclusion: 'success' });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs })).toMatchObject({ ok: true });
+    });
+    it('another PR\'s run on the same head does not make policy-clear yield', () => {
+      const fake = liveGh({ onPost: (runs, payload, id) => {
+        if (payload.conclusion === 'success') runs.push(run({ id: id(), external_id: 'o/r#8', status: 'in_progress', conclusion: null }));
+      } });
+      expect(publish(fake.gh)).toEqual({ ok: true });
+      expect(fake.posts).toHaveLength(1);
+    });
+    it('fails closed on a failed re-read: supersedes its own success with in_progress and returns ok:false', () => {
+      const fake = liveGh({ failReadAfterPost: true });
+      expect(publish(fake.gh)).toMatchObject({ ok: false, reason: expect.stringContaining('re-read after publication failed') });
+      expect(fake.posts.map(p => p.status)).toEqual(['completed', 'in_progress']);
+      expect(newest(fake.runs)).toMatchObject({ status: 'in_progress' });
+    });
+    it('reports a superseding post that also fails (ok:false, both reasons named)', () => {
+      let reads = 0;
+      const gh = vi.fn(args => {
+        if (args.includes('POST')) {
+          if (gh.mock.calls.filter(([a]) => a.includes('POST')).length > 1) throw Error('HTTP 503');
+          return '{}';
+        }
+        reads++;
+        return JSON.stringify(reads === 1 ? { total_count: 0, check_runs: [] }
+          : { total_count: 1, check_runs: [run({ id: 5, status: 'in_progress', conclusion: null })] });
+      });
+      expect(publish(gh)).toMatchObject({ ok: false,
+        reason: expect.stringMatching(/policy-clear yielded to a concurrent round; superseding in_progress not posted/) });
+    });
     it('fails closed on an unreadable head or a missing app id', () => {
       expect(publish(vi.fn(() => { throw Error('offline'); }))).toMatchObject({ ok: false });
       const gh = ghWith([]);
