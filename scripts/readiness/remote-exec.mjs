@@ -1412,7 +1412,7 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
  * credential can never reach the returned detail or the gate log (heuristic redaction of free text kept leaking).
  * Output is the de-duplicated, ordered signals found: node/npm error codes (E...) and known install-failure phrases. */
 const FORGE_FAILURE_SIGNALS=[
-  [/\bE(?:[A-Z0-9]{3,12})\b/g,match=>match], // ENOSPC, EACCES, ETIMEDOUT, EAI_AGAIN, ELOCKVERIFY ...
+  [/\b(?:ENOSPC|EACCES|EPERM|ENOENT|EEXIST|EBUSY|EMFILE|ENOTEMPTY|EROFS|EDQUOT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|E401|E403|E404|E429|E500|E502|E503)\b/g,match=>match], // closed list, never an open pattern
   [/npm ci validation failed/i,()=>'npm ci validation failed'],[/npm ci failed/i,()=>'npm ci failed'],
   [/install[- ]cache/i,()=>'install-cache'],[/\block(?:ed| file)?\b/i,()=>'lock'],[/missing: .* from lock file/i,()=>'lockfile out of sync'],
   [/no space left on device/i,()=>'no space left on device'],[/permission denied/i,()=>'permission denied'],

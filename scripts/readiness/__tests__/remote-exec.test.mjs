@@ -1113,7 +1113,7 @@ describe('runRemote', () => {
     });
 
   it('R817: the failure detail is a fixed-vocabulary classification, never raw stderr, and is logged', async () => {
-    const secrets = ['password=hunter2','Authorization: Bearer abc','ghp_'+'A1b2C3d4'.repeat(3),'https://user:pw@registry.example/x','pass\u200bword=x','tok-en: s3cret','Cookie: a=b'];
+    const secrets = ['password=hunter2','Authorization: Bearer abc','ghp_'+'A1b2C3d4'.repeat(3),'https://user:pw@registry.example/x','pass\u200bword=x','tok-en: s3cret','Cookie: a=b','EsecretValue99','EAbc123XYZ'];
     const stderr = '\u001b[31mnpm ci failed\u0007 ENOSPC: no space left on device, install-cache lock held\n'+secrets.join('\n')+'\n'+'x'.repeat(5000);
     const f = fixture({runCode:97, receipt:(_n, value) => JSON.stringify({...value, phase:'install', code:97})});
     const original = f.exec; const log = vi.fn();
