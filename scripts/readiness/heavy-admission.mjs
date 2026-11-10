@@ -173,7 +173,7 @@ import {
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { routeNeedsGit } from './needs-git-route.mjs';
-import { capabilityAdvertisesBundle, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
+import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
@@ -487,9 +487,13 @@ export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = 
 }
 
 /** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
-export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync }) {
-  try { return capabilityAdvertisesBundle(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
-  catch { return false; }
+export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync, unknownOk = true }) {
+  // R807: 'yes' routes remote; a fresh "no" stays local; unknown (missing/expired/unreadable) routes remote only when the
+  // caller can enforce the affirmation at prepare (the built-in client); an external client override cannot, so it stays local.
+  let verdict;
+  try { verdict = capabilityBundleVerdict(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
+  catch { verdict = 'unknown'; }
+  return verdict === 'yes' || (verdict === 'unknown' && unknownOk);
 }
 export function writeRunnerCapabilities({ root, host, capabilities, clock = Date.now, write = writeFileSync, mkdir = mkdirSync, rename = renameSync }) {
   try {
@@ -893,7 +897,8 @@ export async function runWithRemoteDecision({
     if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
     return overloaded;
   };
-  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock });
+  const externalClient = policy.settings.remote.clientPath != null || remoteClientOverride != null;
+  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock, unknownOk: !externalClient });
   let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
   if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
     && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);

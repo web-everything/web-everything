@@ -5,6 +5,12 @@ import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
 
 const transactions = new WeakMap();
+// Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
+// still probed every tick, but it must not occupy one of the capacity-bound admissions.
+const NON_RUNNABLE_REASONS = new Set(['review-unfinished']);
+// At most this many probes ride along per repo per tick; attempts rotation (maxAttempts) moves a probe that stays
+// blocked to the tail, so every blocked entry is re-checked in turn.
+const MAX_PROBES = 2;
 const copy = entries => entries.map(entry => ({ ...entry }));
 const note = (log, message) => {
   try { log(`review-daemon: red-team queue ${message}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')); }
@@ -29,6 +35,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       if (!entry || typeof entry.repo !== 'string' || !entry.repo
         || !Number.isSafeInteger(entry.pr) || entry.pr < 1 || !isRealHead(entry.head)
         || entry.key !== `${entry.repo}#${entry.pr}` || keys.has(entry.key)
+        || (entry.blocked !== undefined && !NON_RUNNABLE_REASONS.has(entry.blocked))
         || !Number.isFinite(entry.enqueuedAt) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
       keys.add(entry.key);
       return true;
@@ -82,12 +89,18 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         changed(`enqueue ${key}`);
       }
     },
-    admit(repo, count) {
+    admit(repo, count, { allowProbes = true } = {}) {
+      const validCount = typeof count === 'number' && !Number.isNaN(count); // invalid count fails closed: no probes either
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
-      const admitted = entries.filter(entry => entry.repo === repo).slice(0, bound);
-      const keys = new Set(admitted.map(entry => entry.key));
-      for (const entry of entries.filter(entry => entry.repo === repo)) {
-        note(log, `${keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}`);
+      // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
+      const mine = entries.filter(entry => entry.repo === repo);
+      // Zero admission (unreadable capacity, fail closed) admits no probe either.
+      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount).slice(0, MAX_PROBES).map(entry => entry.key));
+      const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
+      const keys = new Set(runnable.map(entry => entry.key));
+      const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
+      for (const entry of mine) {
+        note(log, `${probes.has(entry.key) ? 'probe' : keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}`);
       }
       return copy(admitted);
     },
@@ -99,10 +112,15 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
         const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip' } : undefined);
+        if (entry.blocked && (dispatched.some(matches) || !NON_RUNNABLE_REASONS.has(failure?.reason))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
+          if (NON_RUNNABLE_REASONS.has(failure.reason)) {
+            // The slot is released (see admit); the normal attempts rotation still bounds how long it stays in front.
+            entry.blocked = failure.reason;
+          }
           entry.attempts++;
           if (entry.attempts >= limit) {
             entries.splice(entries.indexOf(entry), 1);
@@ -117,8 +135,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   };
   const admissions = new Map();
   const admit = queue.admit;
-  queue.admit = (repo, count) => {
-    const result = admit(repo, count);
+  queue.admit = (repo, count, options) => {
+    const result = admit(repo, count, options);
     admissions.set(repo, result);
     return result;
   };
@@ -168,13 +186,31 @@ export function redTeamQueueAdmitCount(capacity) {
   return Math.max(0, Math.floor(Math.min(...bounds)));
 }
 
-export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, log = () => {}, ...rest }) {
+// Capacity is normalized once at intake to max(0, floor(raw)) for every finite figure, so the admission bound and the
+// runner (whose own check is only "> 0") agree: 0.5 is 0, 1.7 is 1, counters never go negative. The shared budget
+// object is floored in place (copying it would disconnect the runner's reservations from the live balance).
+const whole = value => (typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : value);
+function normalizeCapacity(capacity) {
+  if (!capacity || typeof capacity !== 'object') return capacity;
+  if (capacity.budget && typeof capacity.budget === 'object' && whole(capacity.budget.left) !== capacity.budget.left) {
+    capacity.budget.left = whole(capacity.budget.left);
+  }
+  // Floored in place as well: the runner decrements the caller's own object, so a copy would replenish it per call.
+  for (const key of ['lanes', 'remainingStarts']) if (whole(capacity[key]) !== capacity[key]) capacity[key] = whole(capacity[key]);
+  return capacity;
+}
+const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'number' && !Number.isNaN(capacity.lanes)
+  && (capacity.remainingStarts == null || (typeof capacity.remainingStarts === 'number' && !Number.isNaN(capacity.remainingStarts)))
+  && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
+
+export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {}, ...rest }) {
   const candidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
     if (isRealHead(head)) candidates.push({ pr: Number(row.prNumber), head });
   }
+  const capacity = normalizeCapacity(rawCapacity);
   const transaction = transactions.get(queue)?.();
   try {
     queue.sync(repo, candidates);
@@ -186,7 +222,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity, run, 
     const exhausted = bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, exhausted ? Infinity : bound);
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity) });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
