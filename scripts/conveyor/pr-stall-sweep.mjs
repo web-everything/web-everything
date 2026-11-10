@@ -274,8 +274,9 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
               isAlive: () => alive, readPidStart: local.readPidStart })) ownerAlive = false;
           // An earlier restart's abandonment rewrote this record and reset its silence clock. The shared recovery
           // planner proves a bound abandonment (marker binds this writer and evidence, and the local pid probe holds);
-          // anything it does not admit stays unknown.
-          if (ownerAlive !== false && status.staleAbandoned && sameTable) {
+          // anything it does not admit stays unknown. The planner may also judge death by age alone, so the sweep's own
+          // probe must still answer exactly false (R803): a live, unknown or throwing probe keeps the owner held.
+          if (ownerAlive !== false && status.staleAbandoned && sameTable && await local.isAlive(status.pid) === false) {
             const plan = await recoveryPlan({ repo: row.repo, pr: row.number, head, env });
             if (plan?.abandon === false && ['fresh', 'resume'].includes(plan?.mode)) ownerAlive = false;
           }

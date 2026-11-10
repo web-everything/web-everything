@@ -300,8 +300,9 @@ async function inadmissiblePlanStops(run, plan = { mode: 'skip', why: 'owner liv
   expect(records(input.dir).find(r => r.phase === 'error').error).toMatch(/recovery not admissible.*operator/);
 }
 // A renamed-host record that an earlier restart abandoned has a fresh mtime; the bound abandonment is still proof.
-async function boundAbandonmentProvesDead(run, plan = { mode: 'fresh', abandon: false }) {
+async function boundAbandonmentProvesDead(run, plan = { mode: 'fresh', abandon: false }, isAlive = () => false) {
   const input = options(fixture(), {
+    probe: { host: 'fixture-host', namespace: 'fixture-ns', isAlive, readPidStart: () => 'original-owner' },
     readRedTeamStatus: ({ pr: number }) => ({ repo: REPO, pr: number, head: HEAD, status: 'running', host: 'host-before-rename',
       pidNamespace: 'fixture-ns', pid: 12345, pidStart: 'original-owner', startedAt: OLD, staleAbandoned: { at: OLD } }),
     readStatusAt: () => NOW - 60_000,
@@ -354,6 +355,11 @@ const guarantees = [
     const input = await boundAbandonmentProvesDead(run);
     expect(input.dispatchRestart).toHaveBeenCalledTimes(1);
   }, "if (plan?.abandon === false && ['fresh', 'resume'].includes(plan?.mode)) ownerAlive = false;", ''],
+  // The shared plan can admit on age alone; a live owner pid must still hold the restart.
+  ['a bound abandonment never overrides a live owner pid', async run => {
+    const input = await boundAbandonmentProvesDead(run, undefined, () => true);
+    expect(input.dispatchRestart).not.toHaveBeenCalled();
+  }, ' && await local.isAlive(status.pid) === false) {', ') {'],
   ['standard shadow default never executes', shadowDefault,
     "i.action === 'restart-red-team' && cfg.actionModes?.['restart-red-team'] === 'on'", "i.action === 'restart-red-team'"],
 ];
@@ -405,6 +411,12 @@ describe('live restart execution guarantees', () => {
     'a renamed-host abandonment the shared planner does not admit (%s) never dispatches', async (_name, plan) => {
       const input = await boundAbandonmentProvesDead(runStallSweep, plan);
       expect(input.abandonStaleRun).not.toHaveBeenCalled();
+      expect(input.dispatchRestart).not.toHaveBeenCalled();
+    });
+
+  it.each([['unknown', () => null], ['throwing', () => { throw new Error('probe failed'); }]])(
+    'a bound abandonment with a %s owner probe never dispatches', async (_name, isAlive) => {
+      const input = await boundAbandonmentProvesDead(runStallSweep, undefined, isAlive);
       expect(input.dispatchRestart).not.toHaveBeenCalled();
     });
 
