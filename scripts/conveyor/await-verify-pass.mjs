@@ -464,7 +464,7 @@ export async function runAwaitVerifyPass({
         continue;
       }
       // Adopt an infra resume left by an older daemon before it can spend another model turn.
-      if (record?.kind === 'fix' && record.pendingResume?.kind === 'infra') {
+      if (record?.kind === 'fix' && record.pendingResume?.kind === 'infra' && !record.infraRetry?.blocked) {
         record = { ...record }; delete record.pendingResume;
       }
       const pendingNoOp = record?.pendingResume?.kind === 'no-new-commit';
@@ -558,15 +558,39 @@ export async function runAwaitVerifyPass({
         }
         rows.push(row); continue;
       }
-      if (record?.kind === 'fix' && (d.resume === 'infra' || (record.infraRetry?.scheduled && d.action === 'wait'))) {
+      if (record?.kind === 'fix' && (d.resume === 'infra'
+        || (record.infraRetry?.scheduled && d.action === 'wait')
+        || (record.infraRetry?.freshVerify && ['wait', 'rerequest'].includes(d.action)))) {
         const { maxAttempts, backoffMinutes } = recovery.value.infraRetry;
         const source = key => recovery.sources?.[`infraRetry.${key}`] ?? 'standard';
-        row.reason = `${d.reason}; verify.infraRetry.maxAttempts=${maxAttempts} (${source('maxAttempts')}), backoffMinutes=${backoffMinutes} (${source('backoffMinutes')})`;
         const retry = record.infraRetry;
-        if ((retry?.attempts ?? 0) >= maxAttempts) {
-          row.action = retry?.exhausted ? 'wait' : 'infra-retry-exhausted';
-          // Preserve the same-head wait. Exhaustion is an infrastructure hold, never new fixer work.
-          if (!retry?.exhausted) persist({ ...record, infraRetry: { ...retry, exhausted: true } });
+        const step = retry?.blocked?.step ?? marker?.infrastructure?.reason ?? 'unknown';
+        const detail = String(retry?.blocked?.detail ?? marker?.infrastructure?.detail ?? '').slice(0, 160);
+        row.reason = `${d.reason}; verify.infraRetry.maxAttempts=${maxAttempts} (${source('maxAttempts')}), backoffMinutes=${backoffMinutes} (${source('backoffMinutes')}); step=${step} detail=${detail}`;
+        if (retry?.exhausted || (retry?.attempts ?? 0) >= maxAttempts) {
+          if (!retry?.freshVerify && !retry?.blocked) {
+            row.action = 'infra-fresh-verify';
+            // Persist intent before the effect: even an unconfirmed request is never sent twice for this head.
+            if (persist({ ...record, requestedAt: new Date(nowMs).toISOString(), infraRetry: {
+              ...retry, exhausted: true, freshVerify: { requestedAt: new Date(nowMs).toISOString() },
+            } })) {
+              const r = io.rerequest(record.lane);
+              row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
+            }
+            rows.push(row); continue;
+          }
+          if (!retry.blocked && d.action === 'wait'
+            && nowMs - Date.parse(retry.freshVerify.requestedAt) <= ttlMs) {
+            row.action = 'infra-fresh-verify';
+            rows.push(row); continue;
+          }
+          row.action = 'infra-blocked';
+          row.blocked = retry.blocked ?? { at: new Date(nowMs).toISOString(), step, detail };
+          if (!retry.blocked && !persist({ ...record, infraRetry: { ...retry, blocked: row.blocked } })) {
+            rows.push(row); continue;
+          }
+          // Use the normal terminal infra handoff below; it delivers the blocked-on-infra exit and clears the wait.
+          d = { action: 'resume', resume: 'infra', reason: row.reason };
         } else if (!retry?.scheduled) {
           row.action = 'infra-retry-scheduled';
           persist({ ...record, requestedAt: new Date(nowMs).toISOString(), infraRetry: {
@@ -584,7 +608,7 @@ export async function runAwaitVerifyPass({
             row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
           }
         }
-        rows.push(row); continue;
+        if (row.action !== 'infra-blocked') { rows.push(row); continue; }
       }
       if (record?.kind === 'fix' && !record.pendingResume && record.earlyPush?.ok && record.earlyPush.upToDate
         && (record.attempt ?? 1) === 1 && record.earlyPush.attempts === 1

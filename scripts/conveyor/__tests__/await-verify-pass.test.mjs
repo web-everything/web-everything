@@ -1090,7 +1090,7 @@ describe('default IO includes and resumes wrapped workers', () => {
   });
 });
 
-// #5233: infra-only verification never spends another fixer turn.
+// Infra recovery spends a fixer turn only for the terminal blocked-on-infra exit.
 describe('verify-only infra retries', () => {
   const retryPolicy = { value: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 } },
     sources: { 'infraRetry.maxAttempts': 'standard', 'infraRetry.backoffMinutes': 'platform' } };
@@ -1128,18 +1128,106 @@ describe('verify-only infra retries', () => {
     expect(h.calls.rerequest).toHaveLength(1);
     expect(h.calls.resume).toHaveLength(0);
   });
-  it('persists attempts across restarted passes and stops at the cap without waking a fixer', async () => {
+  const exhausted = (infraRetry = {}) => {
+    const h = blocked();
+    h.store.set(rec().sessionId, rec({ retries: 2, infraRetry: { attempts: 3, ...infraRetry } }));
+    h.state.marker = marker('infrastructure-failure', { infrastructure: {
+      reason: 'verify-unsettled', detail: 'x'.repeat(200),
+    } });
+    return h;
+  };
+  it('persists exhaustion before exactly one fresh verify, including historical exhausted state', async () => {
+    for (const previous of [{}, { exhausted: true }]) {
+      const h = exhausted(previous);
+      const request = h.io.rerequest;
+      h.io.rerequest = l => {
+        expect(h.store.get(rec().sessionId).infraRetry).toMatchObject({ exhausted: true,
+          freshVerify: { requestedAt: new Date(T0).toISOString() } });
+        return request(l);
+      };
+      const first = await tick(h, T0);
+      expect(first.rows[0].action).toBe('infra-fresh-verify');
+      expect(first.rows[0].reason).toContain(`step=verify-unsettled detail=${'x'.repeat(160)}`);
+      expect(first.rows[0].reason).not.toContain('x'.repeat(161));
+      await tick(h, T0 + 1);
+      await tick(h, T0 + 2);
+      expect(h.calls.rerequest).toEqual([rec().lane]);
+      expect(h.calls.resume).toEqual([]);
+    }
+  });
+  it.each(['infrastructure-failure', 'absent', 'corrupt', 'overdue'])('fresh %s ends the fix wait through the infra exit once', async status => {
+    const h = exhausted();
+    await tick(h, T0);
+    h.state.marker = status === 'absent' ? null : status === 'corrupt' ? { corrupt: true }
+      : marker(status === 'overdue' ? 'running' : status, { infrastructure: { reason: 'verify-unsettled', detail: 'capacity/wait' } });
+    const now = status === 'overdue' ? T0 + TTL + 1 : T0 + 1;
+    const result = await runAwaitVerifyPass({ io: h.io, nowMs: now, ttlMs: TTL, retryPolicy, allowResume: false });
+    const step = ['absent', 'corrupt'].includes(status) ? 'unknown' : 'verify-unsettled';
+    expect(result.rows[0]).toMatchObject({ action: 'infra-blocked', blocked: { at: new Date(now).toISOString(), step } });
+    expect(result.rows[0].reason).toContain(`step=${step}`);
+    expect(h.store.get(rec().sessionId)).toMatchObject({ infraRetry: { blocked: { step } }, pendingResume: { kind: 'infra' } });
+    await tick(h, now + 1);
+    await tick(h, now + 2);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('blocked-on-infra');
+    expect(h.calls.resume[0].prompt).toContain(`step=${step}`);
+    expect(h.calls.rerequest).toHaveLength(1);
+    expect(h.calls.push).toEqual([]);
+    expect(h.store.size).toBe(0);
+  });
+  it('fresh green follows the normal push and green resume', async () => {
+    const h = exhausted();
+    await tick(h, T0);
+    h.state.marker = marker('green');
+    await tick(h, T0 + 1);
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Verify is GREEN');
+    expect(h.store.size).toBe(0);
+  });
+  it('reports bounded step evidence on scheduled and retry rows, including missing markers', async () => {
+    const h = blocked(); h.state.marker = null;
+    expect((await tick(h, T0)).rows[0].reason).toContain('step=unknown');
+    h.state.marker = marker('infrastructure-failure', { infrastructure: { reason: 'verify-unsettled', detail: 'x'.repeat(200) } });
+    const row = (await tick(h, T0 + 15 * 60_000)).rows[0];
+    expect(row.action).toBe('infra-retry');
+    expect(row.reason).toContain(`step=verify-unsettled detail=${'x'.repeat(160)}`);
+    expect(row.reason).not.toContain('x'.repeat(161));
+  });
+  it('cannot request a fresh verify or deliver a blocked exit when persistence fails', async () => {
+    const h = exhausted(); h.io.writeRecord = () => ({ ok: false });
+    expect((await tick(h, T0)).rows[0].result).toContain('persist-failed');
+    expect(h.calls.rerequest).toEqual([]);
+    h.store.set(rec().sessionId, rec({ retries: 2, infraRetry: { attempts: 3, exhausted: true,
+      freshVerify: { requestedAt: new Date(T0).toISOString() } } }));
+    await tick(h, T0 + 1);
+    expect(h.calls.resume).toEqual([]);
+  });
+  it('keeps the backoff cap across passes, then requests just one final verify', async () => {
     const h = blocked();
     await tick(h, T0);
     for (let attempt = 1; attempt <= 3; attempt++) {
       await tick(h, T0 + attempt * 16 * 60_000);
+      expect(h.calls.rerequest).toHaveLength(attempt);
       h.state.marker = marker('infrastructure-failure');
       await tick(h, T0 + (attempt * 16 + 1) * 60_000);
     }
-    await tick(h, T0 + 100 * 60_000);
-    expect(h.calls.rerequest).toHaveLength(3);
-    expect(h.calls.resume).toHaveLength(0);
-    expect([...h.store.values()][0].infraRetry.exhausted).toBe(true);
+    expect(h.calls.rerequest).toHaveLength(4);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(rec().sessionId).infraRetry).toMatchObject({ attempts: 3, exhausted: true, freshVerify: {} });
+    await tick(h, T0 + 50 * 60_000);
+    expect(h.calls.rerequest).toHaveLength(4);
+  });
+  it('never repeats an unconfirmed fresh request, even with a historical lower retry count', async () => {
+    const h = exhausted();
+    h.io.rerequest = l => { h.calls.rerequest.push(l); return { ok: false, status: 'no-server' }; };
+    await tick(h, T0);
+    const record = h.store.get(rec().sessionId);
+    h.store.set(rec().sessionId, { ...record, retries: 0 });
+    h.state.marker = null;
+    const result = await tick(h, T0 + 1);
+    expect(result.rows[0].action).toBe('infra-blocked');
+    expect(h.calls.rerequest).toHaveLength(1);
+    expect(h.calls.resume).toHaveLength(1);
   });
   it('does not retry a moved head or a dirty lane; a failed store cannot enqueue', async () => {
     for (const state of [lane({ head: OTHER }), lane({ dirty: true })]) {
@@ -1275,7 +1363,7 @@ describe('timeout-only load recovery', () => {
     await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
     expect(h.calls.resume).toHaveLength(1); expect(h.calls.rerequest).toEqual([]);
   });
-  it('red-team: a failed load re-request never escalates the original red; it re-requests, then holds as infra', async () => {
+  it('red-team: a failed load re-request never escalates the original red; it re-requests, then exits blocked on infra', async () => {
     const h = harness({ records: [rec({ attempt: 3 })] });
     h.state.marker = timeout(); h.io.loadHigh = () => true;
     const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL });
@@ -1284,12 +1372,10 @@ describe('timeout-only load recovery', () => {
     h.io.rerequest = l => { h.calls.rerequest.push(l); return { ok: false, status: 'no-server' }; };
     expect((await tick(T0 + 2)).rows[0]).toMatchObject({ action: 'load-rerun', result: 'no-server' });
     // The marker is still the red the re-run was meant to replace: no new verdict, so no red/escalate resume.
-    for (let n = 3; n < 12; n++) await tick(T0 + n * 60 * 60_000);
-    expect(h.calls.resume).toEqual([]);
-    const after = h.store.get(rec().sessionId);
-    expect(after.pendingResume).toBeUndefined();
-    expect(after.retries).toBe(AWAIT_VERIFY_LIMITS.maxRetries);
-    expect(after.infraRetry).toMatchObject({ exhausted: true });
+    for (let n = 3; n < 13; n++) await tick(T0 + n * 60 * 60_000);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('blocked-on-infra');
+    expect(h.store.size).toBe(0);
     expect(h.calls.rerequest.length).toBeGreaterThan(1);
   });
   it('self-review: a stale load red on an up-to-date early push re-requests instead of handing back a no-op', async () => {

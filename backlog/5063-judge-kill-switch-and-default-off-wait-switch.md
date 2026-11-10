@@ -3,10 +3,12 @@ bornAs: x6e8z3o
 kind: story
 size: 3
 parent: "5060"
-status: open
+status: resolved
 blockedBy: ["5062"]
 scope: ["we:scripts/lib/judge-switches.mjs", "we:scripts/conveyor/judge-switch.mjs", "we:scripts/lib/__tests__/judge-switches.test.mjs"]
 dateOpened: "2026-10-03"
+dateStarted: "2026-11-10"
+dateResolved: "2026-11-10"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
 tags: []

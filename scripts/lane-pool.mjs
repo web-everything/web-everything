@@ -77,7 +77,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync, openSync, closeSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
@@ -717,6 +717,74 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
 function ensureRepoSiblings(repo, opts = {}) {
   if (!PORT_BANDS[repo.name]) return; // not the WE pool → no unconditional sibling dependency
   for (const name of SIBLING_REPO_NAMES) ensureOneSibling(repo, name, opts);
+}
+
+// ── heal-siblings (R817) — Forge's remote-exec needs ../frontierui next to every lane ───────────────────
+// Self-heal for the constellation siblings, run by the `gc` tick (and by hand: `heal-siblings [--dry-run]`).
+// It acts ONLY on: (1) a pool-root sibling that is ABSENT or a DANGLING symlink → the existing
+// ensureRepoSiblings/ensureOneSibling path recreates a real clone; (2) a DANGLING symlink at
+// <primary sibling>/<name> (e.g. ~/workspace/frontierui/frontierui) → removed (symlink only; rmSync on a
+// symlink never follows it). A live symlink, a real dir/file, a dirty clone and an untracked `.claude/` are
+// never touched. A lock file bounds concurrent/slow runs: a held, non-stale lock means "skip this tick".
+const HEAL_LOCK_STALE_MS = 15 * 60 * 1000;
+
+function lstatOrNull(p) {
+  try { return lstatSync(p); } catch { return null; }
+}
+
+function planSiblingHeal(repo) {
+  const plan = { removeDangling: [], recreate: [] };
+  for (const name of SIBLING_REPO_NAMES) {
+    const link = join(primarySiblingPath(repo, name), name);
+    const l = lstatOrNull(link);
+    if (l && l.isSymbolicLink() && !existsSync(link)) plan.removeDangling.push(link);
+    const dest = join(repo.poolDir, name);
+    const d = lstatOrNull(dest);
+    if (!d || (d.isSymbolicLink() && !existsSync(dest))) plan.recreate.push(name);
+  }
+  return plan;
+}
+
+function takeHealLock(repo) {
+  const lock = join(repo.poolDir, '.heal-siblings.lock');
+  const st = lstatOrNull(lock);
+  if (st && Date.now() - st.mtimeMs > HEAL_LOCK_STALE_MS) rmSync(lock, { force: true });
+  try {
+    closeSync(openSync(lock, 'wx'));
+    return lock;
+  } catch {
+    return null;
+  }
+}
+
+function healSiblings(repo, { dryRun = false } = {}) {
+  if (!PORT_BANDS[repo.name]) return { skipped: 'not-we-pool' };
+  const plan = planSiblingHeal(repo);
+  if (!plan.removeDangling.length && !plan.recreate.length) return { plan, changed: false };
+  log(`heal-siblings${dryRun ? ' (dry run)' : ''}: remove dangling symlink(s) [${plan.removeDangling.join(', ') || 'none'}]; recreate pool sibling(s) [${plan.recreate.map((n) => join(repo.poolDir, n)).join(', ') || 'none'}]`);
+  if (dryRun) return { plan, changed: false, dryRun: true };
+  mkdirSync(repo.poolDir, { recursive: true });
+  const lock = takeHealLock(repo);
+  if (!lock) {
+    log('heal-siblings: another heal is in flight (lock held) — skipping this pass');
+    return { plan, changed: false, skipped: 'lock-held' };
+  }
+  try {
+    for (const link of plan.removeDangling) {
+      const now = lstatOrNull(link);
+      if (!now || !now.isSymbolicLink() || existsSync(link)) continue; // changed since planning → leave it
+      rmSync(link, { force: true });
+      log(`heal-siblings: removed dangling symlink ${link}`);
+    }
+    for (const name of plan.recreate) ensureOneSibling(repo, name);
+  } finally {
+    try { unlinkSync(lock); } catch { /* already gone */ }
+  }
+  return { plan, changed: true };
+}
+
+function cmdHealSiblings(repo) {
+  healSiblings(repo, { dryRun: !!flags['dry-run'] });
 }
 
 // ── lane-ports registry (#2139) — item → lane page-port mapping for the main-checkout proxy ─────────
@@ -5264,6 +5332,7 @@ async function recoverRepoPool(repo, lanes = classifyLaneNames(readdirSync(repo.
   return result;
 }
 async function cmdGc(repo) {
+  const heal = () => { try { healSiblings(repo); } catch (e) { log(`heal-siblings skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); } };
   const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
   const recover = async () => {
     if (!recoveryEnabled()) return;
@@ -5273,11 +5342,12 @@ async function cmdGc(repo) {
     }
     try { await recoverRepoPool(repo); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   };
-  if (!flags.watch) { const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
+  if (!flags.watch) { heal(); const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
   const tick = async () => {
     let interval = 60000; // unreadable policy refuses the pass, then retries policy later
     try {
       interval = loadHostOverloadSettings({ log }).settings.lanes.gc.schedule;
+      heal();
       const result = pass();
       if (result.ran) await recover();
     } catch (e) { log(`gc skipped: ${e.message}`); }
@@ -5292,6 +5362,7 @@ async function cmdGc(repo) {
 const COMMANDS = {
   // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
   gc: cmdGc,
+  'heal-siblings': cmdHealSiblings,
   provision: cmdProvision,
   refresh: cmdRefresh,
   status: printStatus,
@@ -5311,11 +5382,12 @@ const COMMANDS = {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
-    'usage: lane-pool.mjs <gc|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
+    'usage: lane-pool.mjs <gc|heal-siblings|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
       '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
+      '  # heal-siblings [--dry-run] (R817): recreate an absent/dangling pool-root frontierui/plateau-app clone and remove only a dangling symlink at <primary>/<name>; gc calls it each pass\n' +
       '  # gc/acquire auto-recover backed-up lanes; disable with LANE_POOL_AUTO_RECOVER=0 or LANE_POOL_NO_RECOVER=1\n' +
       '  # status --leased-only (#4345): skip git for every unleased lane, keep the full probe only for leased ones\n' +
       '  # acquire (auto-pick, no --lane): on a full pool, grows it by up to --growth-max-new=N new lanes (default 4, env ' +

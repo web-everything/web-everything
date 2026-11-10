@@ -14,7 +14,7 @@ import { daemonJobsDir, deleteRun } from '../operations/run-store.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { resolvePrSweepSettings } from './pr-sweep.mjs';
-import { resolveStallSweepSettings } from './pr-stall-sweep.mjs';
+import { resolveStallSweepSettings } from './pr-stall-settings.mjs';
 export { resolvePrSweepSettings };
 export const PR_SWEEP_JOB_KIND = HEALTH_PR_SWEEP_KIND;
 const SELF = fileURLToPath(import.meta.url);
