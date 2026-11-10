@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveFixerSlotSettings, FIXER_SLOT_SETTINGS_BUILT_IN, fixSlotState, fixSlotCount, slotCountedItems, admitResumes,
-  awaitPassRunner, releaseOnCompletion,
+  awaitPassRunner, releaseOnCompletion, shouldRetireUnwakeable,
 } from '../fixer-slot-rules.mjs';
 
 const MIN = 60_000;
@@ -114,5 +114,23 @@ describe('R5 release-on-completion — the audit\'s finished-but-holding session
   ])('%s → keep (%s)', (_n, over, reason) => {
     const facts = { enabled: true, claim, completion: done('2026-10-08T19:43:00Z'), awaitingVerify: false, ...over };
     expect(releaseOnCompletion(facts)).toEqual({ release: false, reason });
+  });
+});
+
+
+describe('shouldRetireUnwakeable', () => {
+  it.each(['delivered-previous-ci', 'resume-exhausted'])('requires a dead session and a newer verdict for %s', reason => {
+    for (const sessionLive of [false, true]) for (const newerVerdict of [false, true]) {
+      expect(shouldRetireUnwakeable({ reason, sessionLive, newerVerdict })).toBe(!sessionLive && newerVerdict);
+    }
+  });
+  it.each([null, undefined, 'unknown', 0, 1])('refuses unknown or non-boolean evidence: %s', unknown => {
+    for (const reason of ['delivered-previous-ci', 'resume-exhausted']) {
+      expect(shouldRetireUnwakeable({ reason, sessionLive: unknown, newerVerdict: true })).toBe(false);
+      expect(shouldRetireUnwakeable({ reason, sessionLive: false, newerVerdict: unknown })).toBe(false);
+    }
+  });
+  it.each([null, undefined, 'resume-paused', 'stale'])('refuses other reasons: %s', reason => {
+    expect(shouldRetireUnwakeable({ reason, sessionLive: false, newerVerdict: true })).toBe(false);
   });
 });
