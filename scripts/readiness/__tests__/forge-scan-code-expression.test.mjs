@@ -82,6 +82,15 @@ describe('credentialContentFinding test-file code expression opaque tokens', () 
     ['unquoted token as an argument', `f(${literal}, 1)`],
     ['quoted literal inside an arrow', `() => '${literal}'`],
     ['whitespace-split quoted literal beside a call', `f('${literal.slice(0, 12)} ${literal.slice(12)}')`],
+    // A secret cut into pieces under the length floor; the base scan reads the value whole, so the skip must too.
+    ['dot-split unquoted pieces', `f(${literal.slice(0, 12)}.${literal.slice(12)})`],
+    ['comma-split quoted pieces', `f('${literal.slice(0, 12)}', '${literal.slice(12)}')`],
+    ['plus-concatenated quoted pieces', `f('${literal.slice(0, 12)}' + '${literal.slice(12)}')`],
+    ['adjacent quoted pieces', `f('${literal.slice(0, 12)}','${literal.slice(12)}')`],
+    ['quoted pieces after a call', `f(a) + '${literal.slice(0, 12)}' + '${literal.slice(12)}'`],
+    ['array join of pieces', `f(['${literal.slice(0, 12)}', '${literal.slice(12)}'].join(''))`],
+    ['zero-width split token', `f(${literal.slice(0, 12)}​${literal.slice(12)})`],
+    ['piece hidden behind a call-like quoted fragment', `f('${literal.slice(0, 12)}(', '${literal.slice(12)}')`],
   ])('flags an opaque token in a test-file code expression: %s', (_name, value) => {
     expect(scan(`creds: ${value}\n`, testPath)).toBe('high-entropy-creds');
     expect(scan(`creds:\n  ${value}\n`, testPath)).toBe('high-entropy-creds');
@@ -91,6 +100,8 @@ describe('credentialContentFinding test-file code expression opaque tokens', () 
     ['fixture word beside a call', "f('ghp_acceptance_fixture')"],
     ['long camelCase identifier call', 'readRecoveryCredentialFromStore(arg)'],
     ['long identifier arrow', 'buildHeavyAdmissionRemoteClient => x'],
+    ['long argument list of identifiers', 'someVeryLongFunctionName(argumentNumberOne, argumentNumberTwo)'],
+    ['fixture word pieces', "f('ghp_acceptance', 'fixture_value')"],
   ])('still skips a word-like test-file code expression: %s', (_name, value) => {
     expect(scan(`creds: ${value}\n`, testPath)).toBeNull();
   });

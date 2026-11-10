@@ -113,8 +113,11 @@ const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??n
 // The skip never covers a value that carries a high-entropy token of its own (card x5b2hyl): a quoted literal
 // beside a call (`f('<random>')`) and an unquoted token beside a call or arrow (`<random>(x)`) both keep the
 // scan. Only short fixture words and identifiers (`'ghp_acceptance_fixture'`, `createHash`) are skipped.
-function codeExpression(value) {
+function codeExpression(raw) {
+  // Zero-width and other format characters split a token without changing how it reads; fold them away first.
+  const value=raw.replace(/\p{Cf}/gu,'');
   let code='';
+  const pieces=[];
   for(let i=0;i<value.length;i++) {
     const char=value[i];
     // Comments can contain misleading quotes or calls. Without a full parser,
@@ -133,10 +136,19 @@ function codeExpression(value) {
     if(!closed)return false;
     // A quoted literal that is opaque once whitespace is removed is a secret, whatever it sits beside.
     if(opaqueLiteral(inner.replace(/\s/g,'')))return false;
-    code+=' ';
+    pieces.push(inner);
+    code+='\u0001';
   }
   // An unquoted opaque token (split at punctuation, so a chained secret piece still counts) keeps the scan.
   if(code.split(/[^\w$+/=-]+/).some(opaqueLiteral))return false;
+  // A secret can be cut into short pieces (`'Xk9m...'+'R4tW...'`, `f(a.b)`, `f(x, y)`). The base scan reads the
+  // value whole, so read the arguments whole too: drop call names and keywords, put every quoted literal back
+  // in place, join what is left and test that. Fails closed: long argument lists with several digits also keep
+  // the scan.
+  let next=0;
+  const joined=code.replace(nonCallKeyword,' ').replace(/[A-Za-z_$][\w$]*(?=\s*\()/g,' ')
+    .replace(/\u0001/g,()=>pieces[next++]).replace(/[^\w$+/=-]+/g,'');
+  if(opaqueLiteral(joined))return false;
   // Only an arrow or a call to a real identifier is a code expression. A bare paren, or a keyword before a
   // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
   return /=>|[A-Za-z_$][\w$]*\s*\(/.test(code.replace(nonCallKeyword,' '));
