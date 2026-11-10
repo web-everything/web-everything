@@ -522,7 +522,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
   const discoveryFlags = ['--config','--root','--dir','--project','--workspace','--include','--exclude','--dangerouslyIgnoreUnhandledErrors','-c','-r'];
@@ -532,7 +532,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
   it.each([
@@ -557,7 +557,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -571,7 +571,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -1017,7 +1017,7 @@ describe('runRemote', () => {
     f.argv = ['npm', 'run', 'check:standards', '--', '--unknown'];
     const stage = vi.fn(filesystem.mkdtemp);
     const options = {...f, fs:{...filesystem, mkdtemp:stage}};
-    expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed'});
+    expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed',detail:expect.any(String)});
     const log = vi.fn();
     const decision = await runWithRemoteDecision({
       ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
@@ -1639,7 +1639,7 @@ describe('runRemote', () => {
   it('falls back without exec for a command outside the allowlist', async () => {
     const f = fixture();
     expect(await runRemote({ ...f, argv: ['npm', 'run', 'build'] }))
-      .toEqual({ mode: 'not-started', terminated:true, reason: 'command-not-allowed' });
+      .toEqual({ mode: 'not-started', terminated:true, reason: 'command-not-allowed', detail: expect.any(String) });
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.local).not.toHaveBeenCalled();
   });
@@ -2732,7 +2732,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     const f=siblingsFixture(), fake=f.exec;
     f.exec=vi.fn(async call => call.file==='git' && call.cwd===sibling && gitArgs(call)[0]==='ls-files' && call.args.includes('--')
       ? {code:0,stdout:Buffer.alloc(4*1024*1024+1,97)} : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'sibling-inventory-failed',detail:'unavailable'});
     expect(callsOf(f.exec).some(call=>call.file==='rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
   it('falls back locally as not-started when the installed Forge runner lacks sibling capability', async () => {
@@ -2879,5 +2879,27 @@ describe('optional task-pressure receipt fields',()=>{
   it('still rejects unrelated extra receipt fields alongside a valid note',async()=>{
     expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...note,unexpected:true})})))
       .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+});
+
+describe('safeFallbackDetail', () => {
+  it('passes path: finding for a bundle credential hit', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('bundle-credential-hit','src/app/.env.local: high-entropy-GITHUB_TOKEN')).toBe('src/app/.env.local: high-entropy-GITHUB_TOKEN');
+  });
+  it.each([
+    'a\nb: x', 'a.js: finding\n', 'a.js\n: finding', 'a.js: ghp_'+'A1'.repeat(20), 'a.js: bad finding', '/etc/passwd: x', '../x: y', 'a.js: '+'x'.repeat(250),
+    'a/'+'z'.repeat(40)+': f', 'a.js: x=secretvalue', undefined, 42,
+  ])('yields unavailable for hostile bundle input %j', raw => {
+    expect(remoteManifestAPI.safeFallbackDetail('bundle-credential-hit',raw)).toBe('unavailable');
+  });
+  it('sibling detail is a safe relative path or unavailable', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','plugs/index.js')).toBe('plugs/index.js');
+    expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','/Users/me/x')).toBe('unavailable');
+    expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','a\u0000b')).toBe('unavailable');
+  });
+  it('command detail is the first argv token from the allow-list, else other', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['npm','run','x','--token=abc'])).toBe('npm');
+    expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['./evil-ghp_secret','x'])).toBe('other');
+    expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed','nope')).toBe('other');
   });
 });

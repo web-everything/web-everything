@@ -393,7 +393,9 @@ describe('laneRelevantChangeSince (#4296) — keys marker validity to what chang
    *   changed shape between record time and headSha (only the revert-scenario tests below need it to differ).
    */
   function fakeCommitGit({ sinceRecord, relevantAtHead, relevantAtRecord = relevantAtHead }) {
-    return (args) => {
+    return (rawArgs) => {
+      // The since-record diff now carries `--no-renames`; normalise it so the positional matches below still key on shas.
+      const args = rawArgs.filter((a) => a !== '--no-renames');
       if (args[0] === 'merge-base') return MERGE_BASE;
       if (args[0] === 'diff' && args[2] === RECORD_SHA && args[3] === HEAD_SHA) return sinceRecord.join('\n');
       if (args[0] === 'diff' && args[2] === MERGE_BASE && args[3] === HEAD_SHA) return relevantAtHead.join('\n');
@@ -436,6 +438,7 @@ describe('laneRelevantChangeSince (#4296) — keys marker validity to what chang
   it('nothing changed since the record at all → empty overlap, merge-base never consulted', () => {
     let mergeBaseCalled = false;
     const runGit = (args) => {
+      if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return ''; // ancestry guard, not the relevance merge-base
       if (args[0] === 'merge-base') { mergeBaseCalled = true; return MERGE_BASE; }
       if (args[0] === 'diff') return '';
       throw new Error('unexpected');
@@ -496,7 +499,8 @@ describe('laneRelevantChangeSince (#4296) — keys marker validity to what chang
     // union fix (converge round 1's red-team), it ALSO computes the lane's relevance as of `recordSha`, which is
     // never the checkout's HEAD either.
     const mergeBaseCalls = [];
-    const runGit = (args) => {
+    const runGit = (rawArgs) => {
+      const args = rawArgs.filter((a) => a !== '--no-renames');
       if (args[0] === 'diff' && args[2] === RECORD_SHA && args[3] === HEAD_SHA) return 'scripts/a.mjs';
       if (args[0] === 'merge-base') { mergeBaseCalls.push(args); return MERGE_BASE; }
       if (args[0] === 'diff' && args[2] === MERGE_BASE) return '';
