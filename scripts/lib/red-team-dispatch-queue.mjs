@@ -40,13 +40,14 @@ export function loadRedTeamQueueFloor({ env = process.env,
   return floor;
 }
 
-/** Mutate only the per-tick start allowance; lanes and the shared budget remain independent bounds. */
+/** Raise the per-tick start allowance only within the caller's host ceiling; other bounds stay independent. */
 export function applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log = () => {} } = {}) {
   if (!capacity || !Number.isFinite(capacity.remainingStarts)
+    || typeof capacity.startsCeiling !== 'number' || !(capacity.startsCeiling >= 0)
     || !Number.isInteger(floor?.minConcurrent) || floor.minConcurrent <= 0
     || !Number.isInteger(floor.idlePct) || floor.idlePct < 0 || floor.idlePct > 100
     || !Number.isFinite(cpuIdlePct) || cpuIdlePct < floor.idlePct || cpuIdlePct > 100) return;
-  const minimum = Math.min(floor.minConcurrent, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP);
+  const minimum = Math.min(floor.minConcurrent, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP, capacity.startsCeiling);
   if (capacity.remainingStarts >= minimum) return;
   const before = capacity.remainingStarts;
   capacity.remainingStarts = minimum;

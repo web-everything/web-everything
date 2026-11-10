@@ -673,6 +673,7 @@ export function runReviewTick({
     const recoveryLanes = Math.max(0, acquirable - occupiedLanes);
     let taken = 0;
     const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
+      startsCeiling: Math.max(0, hostLimit - occupiedLanes),
       take: () => { taken++; if (typeof host.take === 'function') host.take(1); } };
     try {
       // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
