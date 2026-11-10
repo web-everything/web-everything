@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validSha, jsonLines } from './prototype-load.mjs';
 import { loadAdoptionMatrixSettingsFile } from '../lib/adoption-matrix-settings.mjs';
@@ -29,6 +29,22 @@ export function adoptionReaderPath({ env = process.env, home = env.HOME || homed
   const config = settings ?? loadAdoptionMatrixSettingsFile(settingsFile);
   const p = env.WE_FIX_READY_PATH || config.fixReadyPath || join(home, 'workspace', '.operations', 'coordination', 'fix-ready.jsonl');
   return p.startsWith('~/') ? join(home, p.slice(2)) : p;
+}
+
+/** The canonical spelling of a ledger path, so two names for one file compare equal: made absolute (against the working
+ *  directory, as both readers do), `.`/`..` collapsed, and symlinks resolved. A ledger that does not exist yet is
+ *  resolved through its deepest existing ancestor directory. */
+export function canonicalPath(p, fsApi = fs) {
+  let rest = '';
+  let cur = resolve(p);
+  for (;;) {
+    try { return join(fsApi.realpathSync(cur), rest); } catch {
+      const up = dirname(cur);
+      if (up === cur) return resolve(p);
+      rest = rest ? join(basename(cur), rest) : basename(cur);
+      cur = up;
+    }
+  }
 }
 
 /** Pure: returns {ok:true, record} or {ok:false, error}. */
@@ -205,7 +221,7 @@ export function main(argv = process.argv.slice(2), deps = {}) {
       file = readyRecordPath({ env, ...(deps.settingsFile ? { settingsFile: deps.settingsFile } : {}) });
       readerPath = adoptionReaderPath({ env, settings: deps.adoptionSettings, settingsFile: deps.adoptionSettingsFile });
     } catch (e) { console.error(`fix-ready-record: cannot resolve the ledger path / adoption-matrix settings: ${e.message}`); return 2; }
-    if (readerPath !== file) {
+    if (canonicalPath(readerPath) !== canonicalPath(file)) {
       console.error(`fix-ready-record: refused: the adoption matrix reads ${readerPath} (WE_FIX_READY_PATH / fixReadyPath) but this writer would append to ${file} (readyRecordPath); make them the same file`);
       return 1;
     }

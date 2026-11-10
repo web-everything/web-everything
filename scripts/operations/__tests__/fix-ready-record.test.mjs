@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import fs, { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildReadyRecord, writeReadyRecord, readyRecordPath, adoptionReaderPath, parseArgs, main } from '../fix-ready-record.mjs';
@@ -169,6 +169,17 @@ describe('fix-ready-record', () => {
     const file = tmp();
     writeFileSync(file, `${JSON.stringify({ ref, sha: sha.toUpperCase(), tests: 'green', audit: 'NOT WEAKENED' })}\n`);
     expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).error).toMatch(/duplicate/);
+  });
+  it('refuses an identical legacy record whose keys are in a different order, leaving the ledger bytes unchanged', () => {
+    const file = tmp();
+    const legacy = `${JSON.stringify({ audit: 'NOT WEAKENED', tests: 'green', sha, ref })}\n`;
+    writeFileSync(file, legacy);
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).error).toMatch(/duplicate/);
+    expect(readFileSync(file, 'utf8')).toBe(legacy);
+    const weakened = `${JSON.stringify({ auditDisclosed: findings, auditRuling: 'R816', audit: 'WEAKENED', tests: 'green', sha, ref })}\n`;
+    writeFileSync(file, weakened);
+    expect(writeReadyRecord({ ...base, audit: 'WEAKENED', auditRuling: 'R816', auditDisclosed: findings }, { file }).error).toMatch(/duplicate/);
+    expect(readFileSync(file, 'utf8')).toBe(weakened);
   });
   it('refuses a second concurrent writer: the duplicate check re-reads under the lock', () => {
     const file = tmp();
@@ -350,10 +361,58 @@ describe('fix-ready-record main()', () => {
       const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'];
       const env = { HOME: dir, WE_FIX_READY_PATH: join(dir, 'elsewhere.jsonl') };
       expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
-      expect(err.mock.calls[0][0]).toMatch(/adoption matrix reads .*elsewhere\.jsonl/);
+      // The diagnostic names BOTH files: where the adoption matrix reads and where the writer would append.
+      expect(err.mock.calls[0][0]).toContain(`adoption matrix reads ${join(dir, 'elsewhere.jsonl')}`);
+      expect(err.mock.calls[0][0]).toContain(`would append to ${join(dir, 'ledger.jsonl')}`);
       expect(main(argv, { env: { HOME: dir }, settingsFile, adoptionSettings: { fixReadyPath: join(dir, 'set.jsonl') } })).toBe(1);
+      expect(err.mock.calls[1][0]).toContain(`adoption matrix reads ${join(dir, 'set.jsonl')}`);
+      expect(err.mock.calls[1][0]).toContain(`would append to ${join(dir, 'ledger.jsonl')}`);
       expect(existsSync(join(dir, 'ledger.jsonl'))).toBe(false);
       expect(existsSync(join(dir, 'elsewhere.jsonl'))).toBe(false);
+      expect(existsSync(join(dir, 'set.jsonl'))).toBe(false);
+    });
+    describe('names for the same file are not a split', () => {
+      const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'];
+      const setup = () => {
+        quiet();
+        const dir = realpathSync(mkdtempSync(join(tmpdir(), 'fix-ready-p-')));
+        mkdirSync(join(dir, 'sub'));
+        const settingsFile = join(dir, 'p.json');
+        const ledger = join(dir, 'ledger.jsonl');
+        writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: ledger }));
+        return { dir, settingsFile, ledger };
+      };
+      it('accepts a `..` segment and a redundant `.` in the reader path', () => {
+        const { dir, settingsFile, ledger } = setup();
+        const env = { HOME: dir, WE_FIX_READY_PATH: `${dir}/sub/../././ledger.jsonl` };
+        expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(0);
+        expect(jsonLines(readFileSync(ledger, 'utf8'))).toHaveLength(1);
+      });
+      it('accepts a relative reader path that resolves to the writer file (via the working directory)', () => {
+        const { dir, settingsFile, ledger } = setup();
+        const cwd = vi.spyOn(process, 'cwd').mockReturnValue(dir);
+        const env = { HOME: dir };
+        expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: './sub/../ledger.jsonl' } })).toBe(0);
+        expect(cwd).toHaveBeenCalled();
+        expect(jsonLines(readFileSync(ledger, 'utf8'))).toHaveLength(1);
+      });
+      it('accepts a symlinked directory that holds the same file', () => {
+        const { dir, settingsFile } = setup();
+        const link = join(dir, 'link');
+        symlinkSync(join(dir, 'sub'), link);
+        // the writer path goes through the symlink, the reader path does not (and neither file exists yet)
+        writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(link, 'l.jsonl') }));
+        const env = { HOME: dir, WE_FIX_READY_PATH: join(dir, 'sub', 'l.jsonl') };
+        expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(0);
+        expect(jsonLines(readFileSync(join(dir, 'sub', 'l.jsonl'), 'utf8'))).toHaveLength(1);
+      });
+      it('still refuses two different files whose names merely look alike', () => {
+        const { dir, settingsFile } = setup();
+        const { err } = quiet();
+        const env = { HOME: dir, WE_FIX_READY_PATH: `${dir}/sub/../other.jsonl` };
+        expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+        expect(err.mock.calls[0][0]).toMatch(/refused/);
+      });
     });
     it('main writes when the override names the same file the writer uses', () => {
       quiet();
@@ -365,14 +424,33 @@ describe('fix-ready-record main()', () => {
       expect(main(argv, { env: { HOME: dir, WE_FIX_READY_PATH: ledger }, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(0);
       expect(jsonLines(readFileSync(ledger, 'utf8'))).toHaveLength(1);
     });
-    it('main fails closed (exit 2) when the adoption-matrix settings cannot be read', () => {
+    it.each([
+      ['a missing file', (dir) => join(dir, 'missing.json'), null],
+      ['malformed JSON', (dir) => join(dir, 'bad.json'), '{not json'],
+    ])('main fails closed (exit 2) when the adoption-matrix settings cannot be read: %s', (_n, pick, content) => {
       const { err } = quiet();
       const dir = mkdtempSync(join(tmpdir(), 'fix-ready-p-'));
       const settingsFile = join(dir, 'p.json');
       writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'ledger.jsonl') }));
+      const adoptionSettingsFile = pick(dir);
+      if (content !== null) writeFileSync(adoptionSettingsFile, content);
       const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'];
-      expect(main(argv, { env: { HOME: dir }, settingsFile, adoptionSettingsFile: join(dir, 'missing.json') })).toBe(2);
+      expect(main(argv, { env: { HOME: dir }, settingsFile, adoptionSettingsFile })).toBe(2);
       expect(err.mock.calls[0][0]).toMatch(/adoption-matrix settings/);
+      expect(existsSync(join(dir, 'ledger.jsonl'))).toBe(false);
+    });
+    it.each([
+      ['a missing prototype-load settings file', (dir) => join(dir, 'nope.json'), null],
+      ['malformed prototype-load settings', (dir) => join(dir, 'p-bad.json'), '{not json'],
+      ['prototype-load settings without readyRecordPath', (dir) => join(dir, 'p-empty.json'), '{}'],
+    ])('main fails closed (exit 2) when the writer ledger path cannot be resolved: %s', (_n, pick, content) => {
+      const { err } = quiet();
+      const dir = mkdtempSync(join(tmpdir(), 'fix-ready-p-'));
+      const settingsFile = pick(dir);
+      if (content !== null) writeFileSync(settingsFile, content);
+      const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'];
+      expect(main(argv, { env: { HOME: dir }, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(2);
+      expect(err.mock.calls[0][0]).toMatch(/cannot resolve the ledger path/);
       expect(existsSync(join(dir, 'ledger.jsonl'))).toBe(false);
     });
   });
