@@ -1,5 +1,5 @@
 /** Host-wide CPU window + hard memory floor. Load averages are display evidence only.
- * Missing/stale/short history uses two uncached top intervals; corrupt evidence holds.
+ * Missing/stale/short or unreadable sampler history holds admission.
  * No background sampler or cache is created here. Every IO boundary is injectable.
  */
 import { readFileSync } from 'node:fs';
@@ -9,8 +9,7 @@ import { dirname, resolve } from 'node:path';
 import * as os from 'node:os';
 import { resourcePaths } from './resource-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { sampleHost, readHostSample } from './host-sample.mjs';
-import { readHostMemoryReading } from './host-load.mjs';
+import { readHostMemoryReading, parseDarwinMemoryPressureLevel } from './host-load.mjs';
 
 export const CLASSES = Object.freeze(['blocker', 'review', 'smoke', 'build', 'background']);
 const DEFAULT_IDLE = Object.freeze({ blocker: 5, review: 10, smoke: 15, build: 15, background: 25 });
@@ -40,7 +39,7 @@ export function loadCapacitySettings({ env = process.env, readFile = readFileSyn
       }
     }
   } catch (error) {
-    if (error.code !== 'ENOENT') throw Error('host-capacity settings unreadable', { cause: error });
+    throw Error('host-capacity settings unreadable', { cause: error });
   }
   const sources = {};
   const setting = (key, fallback) => {
@@ -68,34 +67,33 @@ function readHistory({ root, env, readFile = readFileSync }) {
     const text = readFile(resourcePaths(root ?? resolveCoordinationRoot({ env })).history, 'utf8');
     return text.trim() ? text.trim().split('\n').map(line => JSON.parse(line)) : [];
   } catch (error) {
-    if (error.code === 'ENOENT') return [];
     throw Error('unreadable sampler history');
   }
 }
 
-/** Capacity admission requires complete, plausible CPU evidence from every top interval. */
-function readDirectSample() {
-  return readHostSample({ requireTwoIntervals: true, exec: (command, args) => {
-    const text = childProcess.execFileSync(command, args, { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
-    if (command === 'top') {
-      const lines = String(text ?? '').split('\n').filter(line => /CPU usage:/.test(line));
-      if (lines.length < 2 || !lines.every(line => {
-        const match = line.match(/^\s*CPU usage:\s*([\d.]+)%\s+user,\s*([\d.]+)%\s+sys,\s*([\d.]+)%\s+idle\s*$/);
-        if (!match) return false;
-        const values = match.slice(1).map(Number);
-        const total = values.reduce((sum, value) => sum + value, 0);
-        return values.every(validIdle) && total >= 98 && total <= 102;
-      })) throw Error('invalid top CPU intervals');
-    }
-    return text;
-  } });
+/** Class admission requires readable macOS pressure, even when headroom is available. */
+function readCapacityMemory({ platform, exec, ...options }) {
+  if (platform !== 'darwin') return readHostMemoryReading({ ...options, platform, exec }).mb ?? NaN;
+  let pressure;
+  let level;
+  try {
+    pressure = exec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], { encoding: 'utf8', timeout: 5000 });
+    level = parseDarwinMemoryPressureLevel(pressure);
+  } catch (error) {
+    throw Error('unreadable memory pressure', { cause: error });
+  }
+  if (level !== 'normal') return 0;
+  // Reuse the validated pressure so the shared reader cannot fall back on a second failed probe.
+  return readHostMemoryReading({ ...options, platform, exec: (command, args, opts) =>
+    command === 'sysctl' && args[0] === '-n' && args[1] === 'kern.memorystatus_vm_pressure_level'
+      ? pressure : exec(command, args, opts) }).mb ?? NaN;
 }
 
 /** Returns measured evidence or an explicit unknown; never substitutes load average for CPU. */
 export function readCapacity({ settings, env = process.env, root,
   history = readHistory, readFile,
-  sample = options => sampleHost({ ...options, read: readDirectSample }),
-  memory = options => readHostMemoryReading(options).mb ?? NaN,
+  platform = process.platform, exec = childProcess.execFileSync,
+  memory = readCapacityMemory,
   now = Date.now, load = os.loadavg, cores = () => os.cpus().length } = {}) {
   let source = 'unknown'; let idlePct = null; let memFreeGB = null;
   let loadAvg = null; let loadPerCore = null;
@@ -121,17 +119,12 @@ export function readCapacity({ settings, env = process.env, root,
     const window = parsed.filter(row => row.time >= at - settings.windowSec * 1000
       && Number.isFinite(row.freshUntil) && at <= row.freshUntil);
     const newest = window.reduce((latest, row) => Math.max(latest, row.time), -Infinity);
-    if (at - newest <= settings.maxFreshSec * 1000 && window.length >= 2) {
-      source = 'resource-sampler';
-      idlePct = window.reduce((sum, row) => sum + row.idle, 0) / window.length;
-    } else {
-      source = 'direct';
-      // sampleHost's uncached read itself measures a one-second top interval.
-      const samples = [sample({ ttlMs: 0 }), sample({ ttlMs: 0 })];
-      if (!samples.every(s => s?.ok === true && validIdle(s.idlePct))) throw Error('invalid direct CPU sample');
-      idlePct = (samples[0].idlePct + samples[1].idlePct) / 2;
+    if (window.length < 2 || at - newest > settings.maxFreshSec * 1000) {
+      throw Error('missing, stale or short sampler history');
     }
-    const mb = memory({ env });
+    source = 'resource-sampler';
+    idlePct = window.reduce((sum, row) => sum + row.idle, 0) / window.length;
+    const mb = memory({ env, platform, exec });
     if (!Number.isFinite(mb) || mb < 0) throw Error('unreadable memory headroom');
     memFreeGB = mb / 1024;
     return { idlePct, memFreeGB, source, loadAvg, loadPerCore };

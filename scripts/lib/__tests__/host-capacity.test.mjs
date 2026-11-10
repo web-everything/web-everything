@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { CLASSES, loadCapacitySettings, readCapacity, admit } from '../host-capacity.mjs';
@@ -7,15 +6,7 @@ import { hostLoadAdmission } from '../host-load.mjs';
 import { defaultReviewHostAdmission } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { applyRedTeamQueueFloor, loadRedTeamQueueFloor, raiseReviewStartsPerTick } from '../red-team-dispatch-queue.mjs';
 
-const native = vi.hoisted(() => ({ exec: vi.fn() }));
-vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal(), execFileSync: native.exec }));
-vi.mock('../host-sample.mjs', async importOriginal => {
-  const original = await importOriginal();
-  return { ...original, readHostSample: options => original.readHostSample({ ...options, exec: options.exec ?? native.exec }) };
-});
-const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 afterEach(() => {
-  Object.defineProperty(process, 'platform', platformDescriptor);
   vi.restoreAllMocks();
   syncBuiltinESMExports();
 });
@@ -34,14 +25,6 @@ const evidence = (idle = 40, mem = 4096, extra = {}) => readCapacity({ settings,
   history: () => [row(idle, 60), row(idle)], memory: () => mem, load: () => [79], cores: () => 12,
   sample: () => { throw Error('unexpected direct sample'); }, ...extra });
 const decide = (cls, idle, mem) => admit(cls, { settings, read: () => evidence(idle, mem) });
-const mockDirectTop = text => {
-  Object.defineProperty(process, 'platform', { value: 'darwin' });
-  native.exec.mockReset().mockImplementation(command => command === 'top'
-    ? text : 'System-wide memory free percentage: 86%');
-  vi.spyOn(childProcess, 'execFileSync').mockImplementation(native.exec);
-  syncBuiltinESMExports();
-};
-
 describe('class capacity floors', () => {
   for (const cls of CLASSES) {
     it.each([-0.1, 0, 0.1])(`${cls} at threshold offset %s`, offset => {
@@ -75,63 +58,32 @@ describe('class capacity floors', () => {
 });
 
 describe('window and source selection', () => {
-  it.each([
-    '999% user, 999% sys, 98% idle',
-    ...['user', 'sys', 'idle'].flatMap(field => ['999', '-1', 'NaN', 'Infinity', 'bad', ''].map(value =>
-      ['user', 'sys', 'idle'].map(name => `${name === field ? value : name === 'idle' ? '98' : '1'}% ${name}`).join(', '))),
-    '1% user, 98% idle',
-    '1% user, 1% sys, 95.99% idle',
-    '3% user, 3% sys, 96.01% idle',
-  ].flatMap(line => [0, 1, 2].map(index => ({ line, index }))))('invalid top CPU line $line at index $index fails the direct read and holds', ({ line, index }) => {
-    const lines = Array(3).fill('CPU usage: 1% user, 1% sys, 98% idle');
-    lines[index] = `CPU usage: ${line}`;
-    mockDirectTop(lines.join('\n'));
-    const read = () => evidence(40, 4096, { history: () => [], sample: undefined });
-    expect(read()).toMatchObject({ error: 'invalid direct CPU sample', idlePct: null, source: 'direct' });
-    expect(admit('review', { settings, read })).toMatchObject({ admit: false,
-      reason: expect.stringContaining('hold until readable evidence on next tick') });
-  });
-  it.each([
-    ['0% user, 0% sys, 100% idle', 100],
-    ['100% user, 0% sys, 0% idle', 0],
-    ['0% user, 100% sys, 0% idle', 0],
-    ['1% user, 1% sys, 96% idle', 96],
-    ['3% user, 3% sys, 96% idle', 96],
-    ['1.25% user, 1.25% sys, 97.5% idle', 97.5],
-  ])('valid top CPU bounds and total tolerance: %s', (line, idlePct) => {
-    mockDirectTop(`CPU usage: ${line}\n`.repeat(2));
-    expect(evidence(40, 4096, { history: () => [], sample: undefined }))
-      .toMatchObject({ idlePct, source: 'direct', memFreeGB: 4 });
-  });
-  it.each([0, 1, 2])('default direct sampling requires two top CPU lines (received %s)', count => {
-    mockDirectTop('CPU usage: 1% user, 1% sys, 98% idle\n'.repeat(count));
-    const read = () => evidence(40, 4096, { history: () => [], sample: undefined });
-    const reading = read();
-    if (count < 2) expect(reading.error).toBe('invalid direct CPU sample');
-    else expect(reading).toMatchObject({ idlePct: 98, source: 'direct', memFreeGB: 4 });
-    expect(admit('review', { settings, read }).admit).toBe(count >= 2);
-  });
   it('averages the window so a last-sample spike cannot admit', () => {
     const read = () => evidence(40, 4096, { history: () => [row(100, 100), row(0, 80), row(0, 40), row(25)] });
     expect(read().idlePct).toBeCloseTo(25 / 3);
     expect(admit('review', { settings, read }).admit).toBe(false);
   });
-  it.each([[], [row(40)], [row(40, 100), row(40, 120)]].map(rows => ({ rows })))('missing/short/stale telemetry falls back to two uncached direct intervals: $rows', ({ rows }) => {
-    const sample = vi.fn().mockReturnValueOnce({ ok: true, idlePct: 20 }).mockReturnValueOnce({ ok: true, idlePct: 40 });
-    expect(evidence(40, 4096, { history: () => rows, sample })).toMatchObject({ idlePct: 30, source: 'direct' });
-    expect(sample).toHaveBeenCalledTimes(2);
-    expect(sample).toHaveBeenCalledWith({ ttlMs: 0 });
+  it.each([
+    ['missing', []], ['short', [row(40)]], ['outside window', [row(40, 100), row(40, 120)]],
+  ])('%s telemetry holds without sampling the host', (_name, rows) => {
+    const sample = vi.fn(() => ({ ok: true, idlePct: 100 }));
+    const read = () => evidence(40, 4096, { history: () => rows, sample });
+    expect(read()).toMatchObject({ error: expect.any(String), idlePct: null });
+    expect(admit('review', { settings, read })).toMatchObject({ admit: false,
+      reason: expect.stringContaining('hold until readable evidence on next tick') });
+    expect(sample).not.toHaveBeenCalled();
   });
-  it.each(['expired', 'missing', 'invalid'])('sampler %s freshUntil falls back and cannot admit on expired telemetry', state => {
+  it.each(['expired', 'missing', 'invalid'])('sampler %s freshUntil holds without direct sampling', state => {
     const rows = [row(100, 10), row(100)];
     for (const entry of rows) {
       if (state === 'missing') delete entry.freshUntil;
       else entry.freshUntil = state === 'expired' ? new Date(now() - 1).toISOString() : 'bad';
     }
-    const sample = vi.fn(() => ({ ok: true, idlePct: 0 }));
+    const sample = vi.fn(() => ({ ok: true, idlePct: 100 }));
     const read = () => evidence(100, 4096, { history: () => rows, sample });
-    expect(admit('review', { settings, read })).toMatchObject({ admit: false, source: 'direct' });
-    expect(sample).toHaveBeenCalledTimes(2);
+    expect(read().error).toEqual(expect.any(String));
+    expect(admit('review', { settings, read }).admit).toBe(false);
+    expect(sample).not.toHaveBeenCalled();
   });
   it('excludes expired rows even when the latest row is fresh', () => {
     const expired = { ...row(100, 10), freshUntil: new Date(now() - 1).toISOString() };
@@ -143,11 +95,11 @@ describe('window and source selection', () => {
     expect(evidence(40, 4096, { history: () => rows })).toMatchObject({ source: 'resource-sampler' });
     const sample = vi.fn(() => ({ ok: true, idlePct: 0 }));
     expect(evidence(40, 4096, { settings: { ...settings, maxFreshSec: 5 }, history: () => rows, sample }))
-      .toMatchObject({ source: 'direct', idlePct: 0 });
-    expect(sample).toHaveBeenCalledTimes(2);
+      .toMatchObject({ error: expect.any(String), idlePct: null });
+    expect(sample).not.toHaveBeenCalled();
     const expiredLatest = { ...row(100), freshUntil: new Date(now() - 1).toISOString() };
     expect(evidence(40, 4096, { settings: { ...settings, maxFreshSec: 5 },
-      history: () => [...rows, expiredLatest], sample })).toMatchObject({ source: 'direct', idlePct: 0 });
+      history: () => [...rows, expiredLatest], sample })).toMatchObject({ error: expect.any(String), idlePct: null });
   });
   it.each([() => [row(NaN)], () => [{ sampledAt: 'bad', cpu: { idlePct: 40 } }], () => null,
     () => { throw Error('corrupt history'); }])('misread sampler holds without direct fallback', history => {
@@ -156,11 +108,9 @@ describe('window and source selection', () => {
     expect(admit('review', { settings, read }).admit).toBe(false);
     expect(sample).not.toHaveBeenCalled();
   });
-  it.each([{ ok: false, idlePct: 40 }, { ok: true, idlePct: NaN }, { ok: true, idlePct: 101 }])('misread direct sample holds', result => {
-    expect(admit('review', { settings, read: () => evidence(40, 4096, { history: () => [], sample: () => result }) }).admit).toBe(false);
-  });
   it('parses actual sampler history rows and holds malformed JSON/IO', () => {
-    for (const readFile of [() => '{bad', () => { throw Error('denied'); }]) {
+    for (const readFile of [() => '', () => '{bad', () => { throw Error('denied'); },
+      () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); }]) {
       const read = () => evidence(40, 4096, { history: undefined, root: '/fixture', readFile });
       expect(admit('review', { settings, read }).admit).toBe(false);
     }
@@ -193,14 +143,13 @@ describe('settings evidence failures', () => {
     expect(admit('review', { env: {}, read, readFile })).toMatchObject({ admit: false, reason: expect.stringContaining('settings unreadable') });
     expect(read).not.toHaveBeenCalled();
   });
-  it('unreadable settings hold; missing settings use defaults', () => {
-    const denied = () => { throw Object.assign(Error('denied'), { code: 'EACCES' }); };
-    expect(() => loadCapacitySettings({ env: {}, readFile: denied })).toThrow('settings unreadable');
-    expect(admit('review', { env: {}, readFile: denied, read: () => ({ idlePct: 100, memFreeGB: 8 }) }))
-      .toMatchObject({ admit: false, reason: expect.stringContaining('settings unreadable') });
-    const missing = () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); };
-    expect(loadCapacitySettings({ env: {}, readFile: missing })).toMatchObject({ idlePct: { review: 10 }, minMemoryMb: 2048 });
-    expect(admit('review', { env: {}, readFile: missing, read: () => ({ idlePct: 100, memFreeGB: 8 }) }).admit).toBe(true);
+  it.each(['EACCES', 'ENOENT'])('%s settings hold before reading capacity', code => {
+    const readFile = () => { throw Object.assign(Error('unreadable'), { code }); };
+    const read = vi.fn(() => ({ idlePct: 100, memFreeGB: 8 }));
+    expect(() => loadCapacitySettings({ env: {}, readFile })).toThrow('settings unreadable');
+    expect(admit('review', { env: {}, readFile, read })).toMatchObject({ admit: false,
+      reason: expect.stringContaining('settings unreadable') });
+    expect(read).not.toHaveBeenCalled();
   });
   it('invalid individual settings hold despite stricter floors', () => {
     const readFile = () => JSON.stringify({ hostCapacity: { minMemoryMb: 'bad', windowSec: -1,
@@ -260,18 +209,38 @@ describe('review wiring and red-team floor', () => {
     expect(result.reason).toContain(`memory>=${Math.max(capacityMin, min)}MB`);
   });
   it.each(['2', '4'])('default capacity memory reader holds on macOS pressure %s', pressure => {
-    Object.defineProperty(process, 'platform', { value: 'darwin' });
-    native.exec.mockReset().mockReturnValue(pressure);
-    const read = () => evidence(40, 4096, { memory: undefined });
+    const exec = vi.fn(() => pressure);
+    const read = () => evidence(40, 4096, { memory: undefined, platform: 'darwin', exec });
     expect(read().memFreeGB).toBe(0);
     expect(admit('review', { settings, read }).admit).toBe(false);
-    expect(native.exec).toHaveBeenCalledWith('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], expect.any(Object));
+    expect(exec).toHaveBeenCalledWith('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], expect.any(Object));
   });
-  it('default capacity memory reader holds on unreadable memory evidence', () => {
-    Object.defineProperty(process, 'platform', { value: 'darwin' });
-    native.exec.mockReset().mockImplementation(() => { throw Error('unreadable memory'); });
-    const read = () => evidence(40, 4096, { memory: undefined });
-    expect(admit('review', { settings, read }).admit).toBe(false);
+  const vm = 'Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 2000000.\nPages speculative: 0.\nPages purgeable: 0.\nPages inactive: 0.';
+  it.each(['', 'bad', '0', '3', '8', null, 'denied'])('unreadable/unknown pressure %s holds despite ample headroom', pressure => {
+    const exec = vi.fn((command, args) => {
+      if (args.includes('kern.memorystatus_vm_pressure_level')) {
+        if (pressure === 'denied') throw Object.assign(Error('denied'), { code: 'EACCES' });
+        return pressure;
+      }
+      return command === 'vm_stat' ? vm : 'free = 8192M';
+    });
+    const read = () => evidence(40, 4096, { memory: undefined, platform: 'darwin', exec });
+    expect(read().error).toEqual(expect.stringContaining('memory pressure'));
+    expect(admit('review', { settings, read })).toMatchObject({ admit: false,
+      reason: expect.stringContaining('hold until readable evidence on next tick') });
+    expect(exec.mock.calls.every(([command, args]) => command === 'sysctl' && args.includes('kern.memorystatus_vm_pressure_level'))).toBe(true);
+  });
+  it('normal macOS pressure admits with measured headroom and probes pressure once', () => {
+    const exec = vi.fn((command, args) => args.includes('kern.memorystatus_vm_pressure_level')
+      ? '1' : command === 'vm_stat' ? vm : 'free = 8192M');
+    const read = () => evidence(40, 4096, { memory: undefined, platform: 'darwin', exec });
+    expect(admit('review', { settings, read }).admit).toBe(true);
+    expect(exec.mock.calls.filter(([, args]) => args.includes('kern.memorystatus_vm_pressure_level'))).toHaveLength(1);
+  });
+  it('non-macOS memory does not require the pressure sysctl', () => {
+    const exec = vi.fn(() => { throw Error('unexpected exec'); });
+    expect(evidence(40, 4096, { memory: undefined, platform: 'linux', exec }).error).toBeUndefined();
+    expect(exec).not.toHaveBeenCalled();
   });
   it('red-team floor and review starts use the shared stricter threshold and windowed idle', () => {
     const capacitySettings = loadCapacitySettings({ env: { WE_HOST_CAPACITY_REVIEW_IDLE_PCT: '30' } });

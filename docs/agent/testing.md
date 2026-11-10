@@ -4118,7 +4118,9 @@ memory floor. Review admission and red-team floor raises use its windowed CPU re
 valid legacy red-team idle thresholds can tighten the shared review minimum, while invalid
 legacy thresholds disable the queue floor. Class admission also retains the host
 policy's memory floor and the shared pressure-aware memory reader. Load averages are
-shown for diagnosis only on wired callers. Inject history, clock, memory and sample functions
-in tests: absent/stale/short history samples two uncached one-second intervals, while corrupt
-history or unreadable CPU/memory holds until readable evidence on a subsequent tick.
+shown for diagnosis only on wired callers. Inject history, clock, memory and exec functions
+in tests: absent/stale/short or unreadable sampler history holds; direct CPU sampling is disabled.
+Missing/unreadable settings and unknown/unreadable macOS memory pressure also hold until
+readable evidence on a subsequent tick. The stricter pressure requirement belongs to
+host-capacity; other shared memory-reader callers retain their existing fallback behavior.
 Run the scoped host-capacity, host-load and review-daemon tests via heavy-admission.
