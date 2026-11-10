@@ -1036,6 +1036,8 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     // The default runReview of buildCliDaemonEffects runs with those opts, and the host check it hands every repo's
     // tick is the real one (real host-load + memory readers; the Vitest host seams stand in for the machine).
     vi.stubEnv('WE_REVIEW_FACTS', '0');
+    // Hermetic: the real CPU-idle reading must not raise the per-tick cap in this wiring test.
+    vi.stubEnv('WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE', '0');
     try {
       const seen = [];
       const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
