@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { tmpdir } from 'node:os';
@@ -38,6 +38,7 @@ console.log(revision);
 `);
     f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'original delayed import');
     expect(f.run().status).toBe(0);
+    expect(statSync(join(f.clone, '.git/FETCH_HEAD')).isFile()).toBe(true);
     const child = spawn(process.execPath, [join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/delayed.mjs'], {
       cwd: f.repo, env: f.env, stdio: ['pipe', 'pipe', 'pipe'], timeout: 25_000,
     });
@@ -107,6 +108,50 @@ console.log(revision);
       expect(statSync(f.clone).mode & 0o222, revision).toBe(0);
       expect(statSync(join(f.clone, 'guard')).mode & 0o222, revision).toBe(0);
     }
+  });
+  it('converges initial HEAD to origin/main when origin advances between clone and fetch', () => {
+    const f = fixture();
+    const before = f.git(f.origin, 'rev-parse', 'HEAD');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }).trim();
+    const bin = join(f.temp, 'git-wrapper'); mkdirSync(bin);
+    const marker = join(f.temp, 'cloned-head');
+    // Advance the local origin only after the real clone completes, before the
+    // sync process can fetch. No timing or external remote is involved.
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { execFileSync } = require('node:child_process');
+const { writeFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const git = (...argv) => execFileSync(${JSON.stringify(realGit)}, argv, {
+  encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+});
+process.stdout.write(git(...args));
+if (args.includes('clone')) {
+  writeFileSync(${JSON.stringify(marker)}, git('-C', ${JSON.stringify(f.clone)}, 'rev-parse', 'HEAD').trim());
+  git('-C', ${JSON.stringify(f.origin)}, '-c', 'core.hooksPath=/dev/null', 'commit', '--allow-empty', '-qm', 'advance during initial sync');
+}
+`, { mode: 0o755 });
+    f.env.PATH = bin + ':' + f.env.PATH;
+    const result = f.run();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('Guard clone synchronized to origin/main.');
+    expect(readFileSync(marker, 'utf8')).toBe(before);
+    const after = f.git(f.origin, 'rev-parse', 'HEAD');
+    expect(after).not.toBe(before);
+    expect(f.git(f.clone, 'rev-parse', 'refs/remotes/origin/main')).toBe(after);
+    expect(f.git(f.clone, 'rev-parse', 'HEAD')).toBe(after);
+  });
+  it('refreshes FETCH_HEAD on initial and unchanged syncs without changing HEAD', () => {
+    const f = fixture(); const started = Date.now();
+    const initial = f.run(); expect(initial.status, initial.stderr).toBe(0);
+    const fetchHead = join(f.clone, '.git/FETCH_HEAD');
+    expect(statSync(fetchHead).mtimeMs).toBeGreaterThanOrEqual(started - 1000);
+    const head = f.git(f.clone, 'rev-parse', 'HEAD');
+    const old = new Date(Date.now() - 25*60*60*1000);
+    utimesSync(fetchHead, old, old);
+    const refreshed = Date.now();
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(statSync(fetchHead).mtimeMs).toBeGreaterThanOrEqual(refreshed - 1000);
+    expect(f.git(f.clone, 'rev-parse', 'HEAD')).toBe(head);
   });
   it('supports --origin from outside a repository',()=>{
     const f=fixture(); expect(f.run([`--origin=${f.origin}`],f.temp).status).toBe(0);

@@ -1,6 +1,6 @@
 /** Maintain only the explicitly owned, disposable origin/main guard clone. */
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -34,6 +34,10 @@ try {
   if (!existsSync(clone)) {
     git(process.cwd(), 'clone', '--single-branch', '--branch', 'main', '--no-tags', '--', origin, clone);
     git(clone, 'config', '--local', 'we.guardClone', clone);
+    // A fresh clone has no FETCH_HEAD; publish the same sync evidence as refreshes.
+    git(clone, 'fetch', 'origin', 'main');
+    // Main may have advanced between clone and fetch; apply the fetched revision.
+    git(clone, 'reset', '--hard', 'origin/main');
   } else {
     if (!lstatSync(clone).isDirectory() || realpathSync(clone) !== clone ||
         !lstatSync(join(clone, '.git')).isDirectory() ||
@@ -61,6 +65,9 @@ try {
     if (name !== '.git') execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
   }
   chmodSync(clone, lstatSync(clone).mode & ~0o222);
+  // Record every successful sync, including an unchanged origin/main.
+  const syncedAt = new Date();
+  utimesSync(join(clone, '.git/FETCH_HEAD'), syncedAt, syncedAt);
   process.stdout.write('Guard clone synchronized to origin/main.\n');
 } catch (error) {
   process.stderr.write(`Guard clone sync refused/failed: ${error.message}\n`);

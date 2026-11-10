@@ -11,7 +11,7 @@ export function removeFixture(path) {
 }
 
 /** Operated primary/worktree plus an independent trusted guard clone. */
-export function pinnedFixture() {
+export function pinnedFixture({ launcherOnly = false } = {}) {
   const temp = realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'hook-root-')));
   const primary = join(temp, 'web-everything');
   const env = { ...process.env,
@@ -23,9 +23,14 @@ export function pinnedFixture() {
     return result.stdout.trim();
   };
   mkdirSync(primary);
-  cpSync(join(source, 'scripts'), join(primary, 'scripts'), {
-    recursive: true, filter: path => !path.split('/').includes('__tests__') && !/\.(?:test|spec)\.[^/]+$/.test(path),
-  });
+  if (launcherOnly) {
+    mkdirSync(join(primary, 'scripts/hooks'), { recursive: true });
+    cpSync(join(source, 'scripts/hooks/run-pinned-guard.mjs'), join(primary, 'scripts/hooks/run-pinned-guard.mjs'));
+  } else {
+    cpSync(join(source, 'scripts'), join(primary, 'scripts'), {
+      recursive: true, filter: path => !path.split('/').includes('__tests__') && !/\.(?:test|spec)\.[^/]+$/.test(path),
+    });
+  }
   writeFileSync(join(primary, 'package.json'), '{"type":"module","name":"web-everything"}');
   git(primary, 'init', '-b', 'main');
   git(primary, 'config', 'user.email', 'fixture@example.test');
@@ -37,11 +42,14 @@ export function pinnedFixture() {
   const lane = join(temp, '.lanes/web-everything/lane-1');
   mkdirSync(dirname(lane), { recursive: true });
   git(primary, 'worktree', 'add', '-b', 'lane', lane);
-  const clone = join(temp, '.guard-main');
+  env.HOME = join(temp, 'home with spaces');
+  mkdirSync(join(env.HOME, 'workspace'), { recursive: true });
+  const clone = join(env.HOME, 'workspace/.guard-main');
   git(temp, 'clone', '--single-branch', '--branch', 'main', primary, clone);
   writeFileSync(join(clone, '.git/info/exclude'), 'node_modules\n');
   symlinkSync(join(source, 'node_modules'), join(clone, 'node_modules'), 'dir');
-  env.WE_GUARD_CLONE = clone;
+  writeFileSync(join(clone, '.git/FETCH_HEAD'), '');
+  delete env.WE_GUARD_CLONE;
   return { primary, lane, clone, temp, env, git,
     run(cwd, script, event) {
       return spawnSync(process.execPath, [join(clone, 'scripts/hooks/run-pinned-guard.mjs'), script], {

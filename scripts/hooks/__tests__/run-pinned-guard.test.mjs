@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,10 +13,9 @@ const bashCommand = settings.hooks.PreToolUse.find(group => group.matcher === 'B
 const fixtures = [];
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
 function fixture() {
-  const f = pinnedFixture(); fixtures.push(f);
-  // Both the clone and its parent paths contain spaces in the wiring probes.
-  const clone = join(f.temp, 'guard clone with spaces'); renameSync(f.clone, clone);
-  f.clone = clone; f.env.WE_GUARD_CLONE = clone;
+  const f = pinnedFixture({ launcherOnly: true }); fixtures.push(f);
+  // HOME contains spaces in the wiring probes.
+  const clone = f.clone;
   const probe = `import {readFileSync} from 'node:fs';
 console.log(JSON.stringify({root:process.env.WE_HOOK_ROOT,cwd:process.cwd(),args:process.argv.slice(2),gitKeys:Object.keys(process.env).filter(key=>key.startsWith('GIT_')),input:readFileSync(0,'utf8')}));
 console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT || 0);`;
@@ -73,7 +72,7 @@ describe('dedicated clone guard launcher', () => {
       'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_FUTURE_OVERRIDE']) {
       f.env[key] = join(f.temp, 'invalid');
     }
-    f.env.GIT_WORK_TREE = '/tmp';
+    f.env.GIT_WORK_TREE = f.temp;
     f.env.GIT_CONFIG_COUNT = 'invalid';
     f.env.PROBE_EXIT = '7';
     const result = f.launch();
@@ -82,11 +81,8 @@ describe('dedicated clone guard launcher', () => {
   });
   it('fails closed when the clone is missing even though lane guards exist', () => {
     const f = fixture(); rmSync(f.clone, {recursive:true,force:true});
-    // Run the source launcher to exercise its own clone-missing path.
-    const result = spawnSync(process.execPath, [join(repo,'scripts/hooks/run-pinned-guard.mjs'),'scripts/guard-bash.mjs'], {
-      cwd:f.lane,env:f.env,encoding:'utf8',maxBuffer:1024*1024,
-    });
-    expect(result).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('cannot load dedicated clone guard')});
+    const result = f.command(f.lane, bashCommand, {});
+    expect(result).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('launcher missing')});
   });
   it('denies a non-repository clone with FETCH_HEAD present', () => {
     const f = fixture();
@@ -124,23 +120,91 @@ describe('dedicated clone guard launcher', () => {
   it('refuses a scripts directory symlink that escapes the clone', () => {
     const f = fixture(); const scripts = join(f.temp,'outside-scripts');
     renameSync(join(f.clone,'scripts'),scripts); symlinkSync(scripts,join(f.clone,'scripts'),'dir');
-    expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('regular file inside clone/scripts')});
+    expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('launcher must be located')});
   });
-  it('warns but runs when FETCH_HEAD is stale, preferring its mtime over HEAD time', () => {
-    const f = fixture(); const fetchHead = join(f.clone,'.git/FETCH_HEAD'); writeFileSync(fetchHead,'');
-    const old = new Date(Date.now()-25*60*60*1000); utimesSync(fetchHead,old,old);
-    expect(f.launch()).toMatchObject({status:0,stderr:expect.stringContaining('>24h behind')});
-    utimesSync(fetchHead,new Date(),new Date());
-    expect(f.launch().stderr).toBe('guard stderr\n');
-  });
-  it('falls back to HEAD commit time when FETCH_HEAD is absent', () => {
-    const f = fixture();
-    const commit = spawnSync('git',['-C',f.clone,'-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','--allow-empty','-qm','old'],{
-      env:{...f.env,GIT_AUTHOR_DATE:'2000-01-01T00:00:00Z',GIT_COMMITTER_DATE:'2000-01-01T00:00:00Z'},encoding:'utf8',maxBuffer:1024*1024,
+  function ageHead(f, hours) {
+    const date = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const commit = spawnSync('git', ['-C', f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+      'commit', '--allow-empty', '-qm', 'aged head'], {
+      env: {...f.env, GIT_AUTHOR_DATE:date, GIT_COMMITTER_DATE:date}, encoding:'utf8', maxBuffer:1024*1024,
     });
-    expect(commit.status,commit.stderr).toBe(0);
+    expect(commit.status, commit.stderr).toBe(0);
     f.git(f.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
-    expect(f.launch()).toMatchObject({status:0,stderr:expect.stringContaining('>24h behind')});
+  }
+  it.each([25, 169])('allows a quiet repository with a %sh-old HEAD after a recent sync, without warning', hours => {
+    const f = fixture(); ageHead(f, hours);
+    expect(f.launch()).toMatchObject({status:0, stderr:'guard stderr\n'});
+  });
+  it.each([25, 169])('denies a %sh-old sync even when HEAD is fresh and gives exact recovery paths', hours => {
+    const f = fixture();
+    const old = new Date(Date.now() - hours*60*60*1000);
+    utimesSync(join(f.clone, '.git/FETCH_HEAD'), old, old);
+    const result = f.launch();
+    expect(result).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('last sync was more than 24h ago')});
+    expect(result.stderr).toContain(`node ${join(f.clone, 'scripts/hooks/sync-guard-clone.mjs')}`);
+    expect(result.stderr).toContain(join(f.clone, 'scripts/hooks/com.we.guard-main-sync.plist.template'));
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+  });
+  it('allows a sync just under 24h old', () => {
+    const f = fixture(); const recent = new Date(Date.now() - (24*60*60*1000 - 60_000));
+    utimesSync(join(f.clone, '.git/FETCH_HEAD'), recent, recent);
+    expect(f.launch()).toMatchObject({status:0, stderr:'guard stderr\n'});
+  });
+  it.each(['missing', 'directory', 'future', 'invalid'])('denies %s FETCH_HEAD evidence with exact recovery paths', kind => {
+    const f = fixture(); const path = join(f.clone, '.git/FETCH_HEAD');
+    if (kind === 'missing' || kind === 'directory') {
+      rmSync(path);
+      if (kind === 'directory') mkdirSync(path);
+    } else {
+      const time = kind === 'future' ? new Date(Date.now() + 60*60*1000) : new Date(0);
+      utimesSync(path, time, time);
+    }
+    const result = f.launch();
+    expect(result).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('freshness')});
+    expect(result.stderr).toContain(`node ${join(f.clone, 'scripts/hooks/sync-guard-clone.mjs')}`);
+    expect(result.stderr).toContain(join(f.clone, 'scripts/hooks/com.we.guard-main-sync.plist.template'));
+  });
+  it.each(['--assume-unchanged', '--skip-worktree'])('denies hidden edits and even unmodified %s entries', flag => {
+    const f = fixture(); const script = 'scripts/guard-bash.mjs';
+    f.git(f.clone, 'update-index', flag, script);
+    expect(f.launch()).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('not pristine')});
+    writeFileSync(join(f.clone, script), 'console.log("HIDDEN TAMPERING");');
+    expect(f.git(f.clone, 'status', '--porcelain', '--untracked-files=all')).toBe('');
+    expect(f.launch()).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('not pristine')});
+  });
+  it.each(['ls-files', 'diff-index'])('fails closed on failed %s evidence and disables Git caches', check => {
+    const f = fixture();
+    const realGit = spawnSync('which', ['git'], {encoding:'utf8'}).stdout.trim();
+    const bin = join(f.temp, 'bin'); mkdirSync(bin);
+    const log = join(f.temp, 'git-args.jsonl');
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const {appendFileSync} = require('node:fs');
+const {spawnSync} = require('node:child_process');
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args)+'\\n');
+if (args.includes(${JSON.stringify(check)})) { console.error('unreadable audit evidence'); process.exit(1); }
+const result = spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'});
+process.exit(result.status ?? 2);
+`, {mode:0o755});
+    f.env.PATH = bin + ':' + f.env.PATH;
+    expect(f.launch()).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('denying (exit 2)')});
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const audit = calls.find(args => args.includes(check));
+    expect(audit).toEqual(expect.arrayContaining(['-c', 'core.fsmonitor=false', 'core.untrackedCache=false']));
+    if (check === 'ls-files') expect(audit.slice(-3)).toEqual(['ls-files', '-v', '-z']);
+    else expect(audit.slice(-4)).toEqual(['diff-index', '--quiet', 'HEAD', '--']);
+  });
+  it('derives the clone from its own realpath despite a hostile clone override', () => {
+    const f = fixture(); f.env.WE_GUARD_CLONE = f.lane;
+    expect(f.launch().status).toBe(0);
+  });
+  it('refuses a launcher copied outside the required clone-relative location', () => {
+    const f = fixture(); const misplaced = join(f.temp, 'run-pinned-guard.mjs');
+    copyFileSync(join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'), misplaced);
+    const result = spawnSync(process.execPath, [misplaced, 'scripts/guard-bash.mjs'], {
+      cwd:f.lane, env:f.env, encoding:'utf8', maxBuffer:1024*1024,
+    });
+    expect(result).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('launcher must be located')});
   });
 });
 
@@ -155,10 +219,19 @@ describe('configured settings wrappers executed via sh -c', () => {
       f.env.PROBE_EXIT='7'; expect(f.command(f.lane,command,{}).status).toBe(2); delete f.env.PROBE_EXIT;
     }
   });
-  it('uses HOME/workspace/.guard-main when WE_GUARD_CLONE is unset', () => {
-    const f = fixture(); f.env.HOME=join(f.temp,'home'); mkdirSync(join(f.env.HOME,'workspace'),{recursive:true});
-    renameSync(f.clone,join(f.env.HOME,'workspace/.guard-main')); delete f.env.WE_GUARD_CLONE;
-    expect(f.command(f.lane,bashCommand,{}).status).toBe(0);
+  it('ignores an env-selected launcher for every hook, including when the fixed launcher is missing', () => {
+    const f = fixture(); const hostile = join(f.temp, 'hostile');
+    mkdirSync(join(hostile, 'scripts/hooks'), {recursive:true});
+    writeFileSync(join(hostile, 'scripts/hooks/run-pinned-guard.mjs'), 'console.log("HOSTILE LAUNCHER");');
+    f.env.WE_GUARD_CLONE = hostile;
+    for (const command of commands) {
+      expect(command).not.toContain('WE_GUARD_CLONE');
+      expect(f.command(f.lane,command,{})).toMatchObject({status:0, stdout:expect.not.stringContaining('HOSTILE')});
+    }
+    rmSync(f.clone, {recursive:true, force:true});
+    for (const command of commands) {
+      expect(f.command(f.lane,command,{})).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('launcher missing')});
+    }
   });
   it('fails closed for missing clone, missing launcher, broken launcher and missing guard', () => {
     const f = fixture(); const launcher=join(f.clone,'scripts/hooks/run-pinned-guard.mjs');

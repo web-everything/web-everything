@@ -1294,18 +1294,31 @@ exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` w
 ### Passive-wait hook regression probes
 
 Security hooks (`PreToolUse`, `Stop`, `SubagentStop`) bootstrap the launcher and guards only
-from `${WE_GUARD_CLONE:-$HOME/workspace/.guard-main}`, never the primary or lane copies.
+from `$HOME/workspace/.guard-main`, never an env-selected clone or the primary or lane copies.
+Tests redirect that fixed location through a temporary `HOME`. The launcher derives its clone
+from its own realpath and refuses locations other than `<clone>/scripts/hooks/run-pinned-guard.mjs`.
 The launcher requires a real regular file within the clone's `scripts/` tree (symlinks cannot
 escape), sets `WE_HOOK_ROOT` to the real cwd checkout toplevel, and preserves stdin, argv,
 cwd and guard exit codes. Missing clone, launcher, script or Git evidence fails closed with
 stderr and exit 2; settings map any nonzero launcher result to exit 2.
-The hook never fetches: it warns but runs if `.git/FETCH_HEAD` mtime (or HEAD commit time
-when absent) is over 24 hours old. Refresh with `node scripts/hooks/sync-guard-clone.mjs`
+The hook never fetches. Sync freshness uses only `<clone>/.git/FETCH_HEAD` mtime;
+missing, unreadable, non-file, invalid or future-dated evidence denies execution. A last sync
+older than 24 hours fails closed with exit 2, the exact recovery command
+`node <clone>/scripts/hooks/sync-guard-clone.mjs`, and the launchd template path
+`<clone>/scripts/hooks/com.we.guard-main-sync.plist.template`. An old HEAD commit in a
+quiet repository does not make a recently synchronized clone stale. The pristine check
+requires every `git ls-files -v` tag to be `H`, clean `status --porcelain --untracked-files=all`
+and `diff-index --quiet HEAD --`, and HEAD equal to origin/main. Git checks disable
+`core.fsmonitor` and `core.untrackedCache`. Refresh with `node scripts/hooks/sync-guard-clone.mjs`
 from a repo with the intended origin, or pass `--origin=<url>` from any directory.
 
 The sync script creates a single-branch main clone and records its canonical path in local
 Git config (`we.guardClone`). Subsequent runs validate that ownership, origin, main branch,
-and main-only fetch refspec before fetch/reset/clean. An existing unowned checkout is refused:
+and main-only fetch refspec before fetch/reset/clean. Every successful run updates
+`FETCH_HEAD` mtime, including initial creation and unchanged origin/main. Initial creation
+resets HEAD to the fetched origin/main too; the deterministic clone/fetch race regression
+advances a temporary local origin after clone completes and verifies convergence before success.
+An existing unowned checkout is refused:
 move it aside and rerun sync to create the disposable clone. Never point this at a working
 checkout; all tracked edits and untracked/ignored files in the owned clone are discarded.
 Use an absolute origin URL/path so the scheduler and interactive invocations agree.
@@ -1334,7 +1347,10 @@ It runs every 900 seconds; inspect the configured stderr log after installation.
 
 Use temporary independent guard clones and primary/linked-worktree fixtures under the task's
 `TMPDIR`; replace primary and lane guards/launchers to prove neither runs. Settings-wiring
-probes execute every configured command through `sh -c` with a temporary `WE_GUARD_CLONE`.
+probes execute every configured command through `sh -c` with a temporary `HOME`, including
+a hostile `WE_GUARD_CLONE` that must never select a launcher. Cover assume-unchanged and
+skip-worktree edits, failed index/diff reads, stale or invalid FETCH_HEAD, and old HEAD
+with a fresh sync (no warning). Cover unchanged sync timestamp refreshes.
 Sync probes use local temporary origins only, including wrong-origin and unowned-target refusals.
 
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
