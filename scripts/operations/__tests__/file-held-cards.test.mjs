@@ -286,6 +286,19 @@ it('a closed card with the same title does not suppress a fresh handoff', async 
   const result = await run();
   expect(result.duplicates).toHaveLength(0);
   expect(result.filed).toHaveLength(1);
+  // file-item's own duplicate search sees closed cards, so the filing declares the vetted closed twin (preflight and filing agree).
+  expect(fileItem.mock.calls[0][0].notDuplicateReason).toBe('9-old.md is closed and does not cover this fresh handoff');
+});
+
+it('a card with no closed twin carries no duplicate declaration, and the binding passes one through only when present', async () => {
+  seed('- [R1] 2026-11-08: Fresh unrelated card');
+  await run();
+  expect(fileItem.mock.calls[0][0]).not.toHaveProperty('notDuplicateReason');
+  const spy = vi.fn(async () => ({ code: 0, lines: ['{}'] }));
+  await fileInCheckout({ title: 't', kind: 'task', digest: 'd', queue: 'false' }, spy);
+  await fileInCheckout({ title: 't', kind: 'task', digest: 'd', queue: 'false', notDuplicateReason: 'old.md is closed' }, spy);
+  expect(spy.mock.calls[0][0].argv.some(arg => arg.startsWith('--notDuplicateReason'))).toBe(false);
+  expect(spy.mock.calls[1][0].argv).toContain('--notDuplicateReason=old.md is closed');
 });
 
 it('body status examples do not suppress live-card duplicate detection', async () => {

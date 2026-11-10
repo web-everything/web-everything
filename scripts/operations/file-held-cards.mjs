@@ -196,7 +196,10 @@ export async function fileInCheckout(input, run = runOperationCli) {
   // The shared argv builder expects scope, but unscoped cards must omit that flag.
   // size is never set for a held card; an omitted one must reach file-item as absent, not as the string 'undefined'.
   return fileItemForPrevention({ ...input, scope: input.scope ?? '', size: input.size ?? '' }, {
-    run: args => run({ ...args, argv: args.argv.filter(arg => arg !== '--scope=' && arg !== '--size=') }),
+    // file-item's own duplicate search includes closed cards; a closed twin the caller already vetted is declared
+    // through file-item's own --notDuplicateReason, so preflight and filing agree.
+    run: args => run({ ...args, argv: [...args.argv.filter(arg => arg !== '--scope=' && arg !== '--size='),
+      ...(input.notDuplicateReason ? [`--notDuplicateReason=${input.notDuplicateReason}`] : [])] }),
   });
 }
 
@@ -226,13 +229,14 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
   }
   const cards = selectUnfiled(parseCards(readFileSync(source, 'utf8')), ledgerRows, { select, since, max: Infinity });
   const titles = new Map();
+  const closedTitles = new Map(); // finished cards: never a duplicate here, but file-item's own search still sees them
   for (const name of readdirSync(join(root, 'backlog')).filter(name => name.endsWith('.md'))) {
     const content = readFileSync(join(root, 'backlog', name), 'utf8');
     // The title is the first heading AFTER the front matter: a `# comment` line inside it is not a title.
     const title = content.slice(frontMatterEnd(content)).match(/^#\s+(.+)$/m)?.[1];
     if (!title) continue; // legacy untitled cards cannot be title-matched; they never block a run
     // A finished card does not cover a fresh handoff: only live cards suppress a same-titled line.
-    if (isFinishedCard(content)) continue;
+    if (isFinishedCard(content)) { closedTitles.set(titleKey(title), name); continue; }
     titles.set(titleKey(title), name);
   }
   const result = { planned: [], filed: [], duplicates: [], refused: [], failed: [] };
@@ -272,6 +276,8 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
     }
     if (dryRun) { result.planned.push(summary); continue; }
     const row = { hash: card.hash, ...summary, card: null, filedAt: now() };
+    const closed = input.title.endsWith('…') ? undefined : closedTitles.get(titleKey(input.title));
+    if (closed) input.notDuplicateReason = safeLog(`${closed} is closed and does not cover this fresh handoff`);
     try {
       const response = await fileItem(input);
       const { parseFiledPayload } = await import('./review-loop-cli.mjs');
