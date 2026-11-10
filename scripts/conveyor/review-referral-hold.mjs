@@ -23,6 +23,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
+import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
@@ -46,6 +47,14 @@ export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
+  let retryableRecordEffect = false;
+  try {
+    if (!run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'record' && Array.isArray(run.effects)) {
+      const outstanding = run.effects.filter(e => !['applied', 'declared'].includes(e?.status));
+      retryableRecordEffect = outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
+        && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
+    }
+  } catch { /* Unreadable effects cannot prove a safe record retry. */ }
   const head = read?.netBasis?.rev ?? (suspendedReferralEffect ? run.input?.head : undefined);
   // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
   // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
@@ -97,6 +106,7 @@ export function reviewRunEvidence(run) {
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
+      ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
       incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
@@ -113,6 +123,7 @@ export function reviewRunEvidence(run) {
   } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
+    ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
     // A throwing stage has no pending confirm left. Keep this durable shape wakeable without caching live rulings.
     ...(pending.length && !run.pending && run.stepTimings?.some(t => t?.step === 'stageVerdict'
       && t.startedAt && !t.finishedAt) ? { referralStageRefused: true } : {}),
@@ -290,7 +301,8 @@ function latestReviewAttempt(history) {
 export function findResumableParkedRun(pr, runs, { repo, cardReadable } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
-  if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect) || last.head !== pr.headRefOid) return null;
+  if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect && !last?.retryableRecordEffect) || last.head !== pr.headRefOid) return null;
+  if (last.retryableRecordEffect) return { id: last.id, head: last.head };
   // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
   // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
   // operator's Accept was refused until a person noticed). The hold decides WHEN (its 15/30/60 retry budget); once a

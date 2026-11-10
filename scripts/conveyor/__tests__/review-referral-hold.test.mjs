@@ -58,6 +58,40 @@ const pr = (overrides = {}) => ({ number: 3481, headRefOid: head, headRefName: '
   labels: [{ name: 'review:human' }], comments: [], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...overrides });
 const evidence = opts => reviewRunEvidence(run(opts));
+
+describe('retryable record effects', () => {
+  const saved = () => ({ ...run(), pending: { kind: 'effect', step: 'record', stepIndex: 13 },
+    findings: { ...run().findings, referralVerdict: { verdict: 'accept', pendingReferrals: [] } },
+    effects: [{ type: 'review.write-up', status: 'applied' },
+      { type: 'review.label-swap', status: 'pending', error: '--body-file=gone is unreadable (ENOENT)', unknownAttempts: 0 },
+      { type: 'verdict-ledger.append', status: 'declared' }, { type: 'review.notice', status: 'declared' }] });
+  it.each([0])('resumes only the pending body-file refusal with unknownAttempts=%s, without a ruling', unknownAttempts => {
+    const r = saved(); r.effects[1].unknownAttempts = unknownAttempts;
+    const row = reviewRunEvidence(r);
+    expect(row.retryableRecordEffect).toBe(true);
+    expect(findResumableParkedRun(pr(), [row], { repo })).toEqual({ id: r.id, head });
+    expect(findResumableParkedRun(pr({ headRefOid: 'b'.repeat(40) }), [row], { repo })).toBeNull();
+    expect(findResumableParkedRun(pr(), [row, { ...row, id: 'newer', startedAt: row.startedAt + 1, completedAt: row.completedAt + 1,
+      retryableRecordEffect: false }], { repo })).toBeNull();
+  });
+  it.each([
+    ['unknown write', r => { r.effects[1].unknownAttempts = 1; }],
+    ['unknownAttempts absent', r => { delete r.effects[1].unknownAttempts; }],
+    ['other pending effect', r => { r.effects[2].status = 'pending'; }],
+    ['non-body-file error', r => { r.effects[1].error = 'network timeout'; }],
+    ['other pre-write refusal', r => { r.effects[1].error = 'invalid --repo'; }],
+    ['failed label swap', r => { r.effects[1].status = 'failed'; }],
+    ['resume', r => { r.resumeOf = {}; }],
+    ['missing effects', r => { delete r.effects; }],
+    ['empty effects', r => { r.effects = []; }],
+    ['unreadable effect', r => { r.effects.push(null); }],
+  ])('keeps %s held', (_, mutate) => {
+    const r = saved(); mutate(r);
+    const row = reviewRunEvidence(r);
+    expect(row?.retryableRecordEffect).not.toBe(true);
+    expect(findResumableParkedRun(pr(), row ? [row] : [], { repo })).toBeNull();
+  });
+});
 const hold = (p = pr(), runs = [evidence()], now = at + 1) => decideReferralHold(p, runs, { repo, now });
 
 function reconcile(p) {

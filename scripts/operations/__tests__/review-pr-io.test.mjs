@@ -262,6 +262,59 @@ describe('the label sink', () => {
     addLabel: 'review:accepted', removeLabels: ['review:pending'],
   };
 
+  beforeEach(async () => {
+    await createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root })[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body: '# verdict' }, CTX);
+  });
+
+  it.each([
+    '--body-file=gone.md is unreadable (ENOENT: no such file)',
+    '--body-file=gone.md is empty — pass the verdict write-up',
+    '--body-file must live under the repo root or a temp dir (got gone.md)',
+  ])('recognises and permits recovery only for the body-file refusal: %s', async text => {
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root, runNode: () => { throw new Error(text); } });
+    expect(isPreWriteRefusal(text)).toBe(true);
+    expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error: `review-set-label.mjs failed and its outcome is UNKNOWN: ${text}` })).toBe(true);
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+  });
+
+  it.each(['UNKNOWN: connection reset', '--body-file=gone.md is unreadable after write',
+    'some file is unreadable (ENOENT)', 'invalid --repo'])('does not recover unrelated pending errors: %s', error => {
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root });
+    expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error })).toBe(false);
+  });
+
+  it('restages a recycled lane body from the same run applied write-up before spawning', async () => {
+    rmSync(reviewSidecarDir(root), { recursive: true });
+    const runStore = createMemoryRunStore();
+    // The reader is intentionally keyed by run id; a sibling run is never a fallback.
+    const read = vi.fn(id => id === CTX.runId ? { id, effects: [{ type: REVIEW_EFFECTS.WRITE_UP,
+      status: 'applied', payload: { bodyFile: payload.bodyFile, body: '# recovered verdict' } }] } : null);
+    const runNode = vi.fn(argv => {
+      expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice(12), 'utf8')).toBe('# recovered verdict');
+      return '{"ok":true}';
+    });
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root, runStore: { ...runStore, read }, runNode });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(read).toHaveBeenCalledWith(CTX.runId);
+    expect(runNode).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['missing', 'wrong-run', 'unapplied', 'wrong-file', 'empty', 'non-string', 'unreadable'])('refuses missing bodies with %s evidence before spawning', async mode => {
+    rmSync(reviewSidecarDir(root), { recursive: true });
+    const run = { id: mode === 'wrong-run' ? 'other-run' : CTX.runId, effects: [{
+      type: REVIEW_EFFECTS.WRITE_UP, status: mode === 'unapplied' ? 'pending' : 'applied',
+      payload: { bodyFile: mode === 'wrong-file' ? 'other.md' : payload.bodyFile,
+        body: mode === 'empty' ? '  ' : mode === 'non-string' ? 42 : '# verdict' },
+    }] };
+    const runNode = vi.fn();
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root, runNode, runStore: { read: () => {
+      if (mode === 'unreadable') throw new Error('corrupt record');
+      return mode === 'missing' ? null : run;
+    } } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(runNode).not.toHaveBeenCalled();
+  });
+
   it('shells the SINGLE HOME with the target, the actor and the staged body file', async () => {
     const seen = [];
     const sinks = createReviewPrSinks({ root, publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }), runNode: (argv) => { seen.push(argv); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
@@ -3520,10 +3573,12 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     const runNode = vi.fn(() => '{"ok":true}');
     const sleep = vi.fn(async ms => { time += ms; });
     const sinks = createReviewPrSinks({
+      root,
       env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
       runNode, sleep, now: () => time, out: () => {}, readPublishHead: () => head,
       publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks }),
     });
+    await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: 'v.md', body: '# verdict' }, { runId: 'r' });
     const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
     return { publish, runNode };
   };
