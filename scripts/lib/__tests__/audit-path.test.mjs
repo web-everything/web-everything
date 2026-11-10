@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { canonicalPaths } from '../audit-path.mjs';
+import { canonicalPaths, validateProtectedPattern, assertProtectedPatterns } from '../audit-path.mjs';
 import { oracleMatchesSome, oraclePathCandidates, oracleAnchorsOf, oracleCleanPattern, oracleMatchesPath } from './fixtures/audit-path-old-oracle.mjs';
 
-const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'custom/a+b.mjs', 'review-x.mjs', 'docs/', 'guard-*.mjs', 'scripts/x.mjs42', 'scripts/x.mjs-', 'custom/x.mjs42', 'scripts/guard-bash.mjs4', '4-9', 'L3-L9', '1', 'L42', '42-50'];
+const PATTERNS = ['scripts/guard-bash.mjs', 'scripts/lib/**', '.claude/**', 'custom/**', 'review-x.mjs', 'docs/', 'guard-*.mjs'];
+// R813(c): P2 is bounded to REAL patterns, and the settings load refuses any other (see the validator describe below).
+const JUNK = ['scripts/x.mjs42', 'scripts/x.mjs-', 'custom/x.mjs42', 'scripts/guard-bash.mjs4', '4-9', 'L3-L9', '1', 'L42', '42-50', '---a/scripts/x.mjs', 'custom/a+b.mjs'];
 const lower = a => a.map(x => x.toLowerCase());
 const globOk = (p, pat) => {
   if (pat.endsWith('/')) return p.startsWith(pat);
@@ -136,6 +138,7 @@ describe('P2 monotonic against the old matcher (test-only oracle)', () => {
   });
   it('round-6 rows: anchors reach every canonical form; punctuation-ended and dotdot paths are refused', () => {
     const pats = ['scripts/**', 'guard-*.mjs', 'scripts/x.mjs42', 'scripts/x.mjs-'];
+    // These two junk patterns are refused at settings load (R813(c)); the rows pin that the new code is still safe on them.
     const anchors = oracleAnchorsOf(pats.map(oracleCleanPattern));
     const protectedByNew = f => { const c = canonicalPaths(f, anchors); return c === null || c.some(x => pats.some(p => globOk(x, p))); };
     for (const f of ['repo/scripts/x.mjs:42', 'repo/scripts/../guard-x.mjs', 'scripts/x.mjs-.', 'scripts/x.mjs-', 'repo/scripts/x.mjs#L42', '-/guard-x.mjs', '_/guard-x.mjs', '././guard-x.mjs']) {
@@ -209,5 +212,45 @@ describe('P4 total and bounded', () => {
     canonicalPaths('a-'.repeat(250) + '!');
     canonicalPaths('"' + 'a.'.repeat(250));
     expect(performance.now() - t0).toBeLessThan(100);
+  });
+});
+
+describe('R813(c) settings validator: a malformed protected pattern fails the load closed', () => {
+  it('accepts the real configured shapes', () => {
+    for (const p of PATTERNS) expect(validateProtectedPattern(p), p).toBe(true);
+    for (const p of ['**', '*', 'scripts/**/', '_headers', '.github/workflows/*.yml', 'a/b-c_d.e/**']) expect(validateProtectedPattern(p), p).toBe(true);
+    expect(() => assertProtectedPatterns(PATTERNS)).not.toThrow();
+  });
+  it('refuses junk and malformed patterns (red-green: a junk pattern in the settings is refused)', () => {
+    for (const p of JUNK.filter(x => /^-|\+/.test(x)).concat(['', '/', '/abs', 'a//b', './a', 'a/./b', '../a', 'a/../b', 'a/..', 'x.', 'x-', 'x_', 'a b', 'a\\b', '\u0600/x', '"a"', 'a:1', 'a#L1', 'a'.repeat(600), null, 7, undefined])) {
+      expect(validateProtectedPattern(p), String(p)).toBe(false);
+    }
+    expect(() => assertProtectedPatterns(['scripts/**', '---a/scripts/x.mjs'])).toThrow(/protected pattern/);
+    expect(() => assertProtectedPatterns('scripts/**')).toThrow();
+    expect(() => assertProtectedPatterns(['scripts/**', 'a b'])).toThrow();
+  });
+});
+
+describe('P2 bounded to real patterns: every tracked path under every past wrapper', () => {
+  it('the oracle never protects a wrapped tracked path that the new code lets through', () => {
+    const files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 1 << 28 }).split('\0').filter(Boolean);
+    const r = rng(0xbeef);
+    const sample = [];
+    for (let i = 0; i < 250; i++) sample.push(files[Math.floor(r() * files.length)]);
+    const wrappers = [x => x, x => '"' + x + '"', x => "'" + x + "'", x => '\u0060' + x + '\u0060', x => '+++ b/' + x, x => '--- a/' + x, x => x + ':42', x => x + ':4-9', x => x + ':1:2', x => x + '#L42', x => x + '#L3-L9', x => 'repo/' + x, x => ' ' + x + ' ', x => x + '.', x => '-' + x, x => './' + x, x => '"' + x + '":42', x => 'i/' + x];
+    for (const f of sample) {
+      const segs = f.split('/');
+      const pats = [f, segs.length > 1 ? segs.slice(0, -1).join('/') + '/**' : f, segs[0] + '/**'];
+      expect(pats.every(p => validateProtectedPattern(p)), f).toBe(true);
+      const clean = pats.map(oracleCleanPattern);
+      const anchors = oracleAnchorsOf(clean);
+      for (const w of wrappers) {
+        const input = w(f);
+        if (!oracleMatchesSome(input, pats)) continue;
+        const c = canonicalPaths(input, anchors);
+        const ok = c === null || lower(c).some(x => clean.some(p => oracleMatchesPath(x, p)));
+        expect(ok, input).toBe(true);
+      }
+    }
   });
 });

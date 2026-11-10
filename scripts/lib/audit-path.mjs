@@ -73,3 +73,24 @@ export function canonicalPaths(file, anchors = null) {
   }
   return out.size > MAX_AUDIT_CANDIDATES ? null : [...out];
 }
+
+/**
+ * Load-time validator for a configured protected pattern (R813(c)). A pattern must itself be a well-formed path or
+ * glob under the same strict charset as a report: `[A-Za-z0-9._*-]` segments joined by single `/`, an optional trailing
+ * `/` (a directory), no rooted, `.` or `..` segment, no leading `-`, no trailing `.` `-` `_`, at most 512 characters.
+ * A settings loader must refuse the whole load (fail closed) on any pattern this returns false for, so a junk pattern
+ * (`---a/scripts/x.mjs`, `custom/a+b.mjs`) can never exist for the old matcher's junk readings of a name to hit.
+ */
+export function validateProtectedPattern(pattern) {
+  if (typeof pattern !== 'string' || pattern.length === 0 || pattern.length > MAX_AUDIT_PATH) return false;
+  if (!/^[A-Za-z0-9._*-]+(?:\/[A-Za-z0-9._*-]+)*\/?$/.test(pattern) || pattern.startsWith('-')) return false;
+  const body = pattern.replace(/\/$/, '');
+  if (/[._-]$/.test(body)) return false;
+  return body.split('/').every(seg => seg !== '.' && seg !== '..');
+}
+/** Throws when `patterns` is not an array of well-formed protected patterns; the caller's settings load then fails. */
+export function assertProtectedPatterns(patterns) {
+  if (!Array.isArray(patterns)) throw new Error('protected patterns must be an array');
+  const bad = patterns.filter(p => !validateProtectedPattern(p));
+  if (bad.length) throw new Error('malformed protected pattern(s): ' + bad.map(p => JSON.stringify(p)).join(', '));
+}
