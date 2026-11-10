@@ -120,7 +120,9 @@ const textFinding=(text,patternSource=false)=>secretText.find(([pattern,rule])=>
 function codeExpression(value,mode='legacy') {
   let code='';
   // Punctuation padding must not dilute entropy: check the span and each run of word-ish characters.
-  const safeSpan=span=>!opaqueToken(span.replace(/\s/g,''))&&!opaqueToken(span.replace(/[^A-Za-z0-9]/g,''))&&!span.split(/[^A-Za-z0-9]+/).some(opaqueToken);
+  // Any 20-char window must also be non-opaque, so repeated-character padding of any kind cannot dilute a token.
+  const windowed=text=>{for(let i=0;i+20<=text.length;i++)if(opaqueToken(text.slice(i,i+20)))return true;return false;};
+  const safeSpan=span=>{const flat=span.replace(/\s/g,''),alnum=span.replace(/[^A-Za-z0-9]/g,'');return !opaqueToken(flat)&&!opaqueToken(alnum)&&!span.split(/[^A-Za-z0-9]+/).some(opaqueToken)&&!windowed(flat)&&!windowed(alnum);};
   // Read plain quotes conservatively; escapes and partial strings need a parser.
   const quoteEnd=start=>{
     for(let end=start+1;end<value.length;end++) {

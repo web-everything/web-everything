@@ -129,6 +129,12 @@ describe('credentialContentFinding narrow source exemptions', () => {
       expect(scan(`token: "${pad}${token}${pad}"`, testPath)).not.toBeNull();
     }
   });
+  it('alphanumeric-padded quoted token is still caught', () => {
+    for (const ch of ['A', '0', 'a']) {
+      const pad = ch.repeat(128);
+      expect(scan(`token: "${pad}${token}${pad}"`, testPath)).not.toBeNull();
+    }
+  });
   it('padded quoted token in a test fixture is still caught', () => {
     const pad = '!'.repeat(64);
     expect(scan(`token: "${pad}${token}${pad}"`, testPath)).not.toBeNull();
