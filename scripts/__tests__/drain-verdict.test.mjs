@@ -357,6 +357,60 @@ describe('T5b: review-escalation pass is kept on in the real drain call', () => 
   });
 });
 
+describe('T5c: the spawned drain reads with the workflow token on a fresh runner (no App credentials)', () => {
+  // The child call exactly as runCli spawns it: its argv and its env (a real runner step env, no App vars, no cache).
+  const childCall = (extraEnv = {}) => {
+    const io = ioFor(); Object.assign(io.env, RUNNER_STEP_ENV, extraEnv);
+    runCli(argv, io);
+    const [cmd, args, opts] = io.execFileSync.mock.calls.find(([c, a]) => c === process.execPath && a.some(x => /merge-ai-prs\.mjs$/.test(x)));
+    return { childArgv: [cmd, ...args], env: { ...opts.env } };
+  };
+  // Every IO seam injected: no real token cache, status file, key or shim install is touched.
+  const authFor = async (env, daemon) => {
+    const { ensureFreshGithubAppEnv } = await import('../lib/github-app-auth-env.mjs');
+    const installShim = vi.fn(async () => ({ ok: true }));
+    const result = await ensureFreshGithubAppEnv({ env, daemon, installShim, perOwner: true, caller: 'drain',
+      cachePath: '/nonexistent-fixture/token.json', statusPath: '/nonexistent-fixture/status.json',
+      readCache: () => null, writeCache: vi.fn(), writeStatus: vi.fn(),
+      mint: vi.fn(async () => { throw new Error('mint must not run'); }),
+      policy: { auth: 'app', personalExceptions: {}, source: { auth: 'default' } },
+      log: { log() {}, info() {}, warn() {}, error() {} } });
+    return { result, installShim };
+  };
+
+  it('the real child argv and env classify as a CI read-only dry-run', async () => {
+    const { isCiReadonlyDryRun } = await import('../merge-ai-prs.mjs');
+    const { childArgv, env } = childCall();
+    expect(isCiReadonlyDryRun(env, childArgv)).toBe(true);
+  });
+
+  it('so no gh refusal shim is installed and the inherited GITHUB_TOKEN stays the credential', async () => {
+    const { isCiReadonlyDryRun } = await import('../merge-ai-prs.mjs');
+    const { childArgv, env } = childCall();
+    const { result, installShim } = await authFor(env, !isCiReadonlyDryRun(env, childArgv));
+    expect(installShim).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ applied: false, reason: 'not-configured' });
+    expect(env.WE_GH_DAEMON_CALLER).toBeUndefined();
+    expect(env.GH_TOKEN).toBeUndefined();
+    expect(env.GITHUB_TOKEN).toBe('read-only-fixture');
+  });
+
+  it('a daemon-marked environment still gets the refusal shim (the exemption stays CI-only)', async () => {
+    const { isCiReadonlyDryRun } = await import('../merge-ai-prs.mjs');
+    const { childArgv, env } = childCall({ XPC_SERVICE_NAME: 'com.we.drain' });
+    expect(isCiReadonlyDryRun(env, childArgv)).toBe(false);
+    const { installShim } = await authFor(env, !isCiReadonlyDryRun(env, childArgv));
+    expect(installShim).toHaveBeenCalledTimes(1);
+  });
+
+  it('every drain auth call in merge-ai-prs routes through the CI read-only exemption', () => {
+    const src = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    const calls = src.match(/ensureFreshGithubAppEnv\(\{[^}]*\}\)/g) || [];
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of calls) expect(call).toContain('daemon: !isCiReadonlyDryRun(process.env, process.argv)');
+  });
+});
+
 import { runBatch } from '../drain-classify-only.mjs';
 
 describe('T6: --batch owns the loop, the counting and the exit code', () => {
