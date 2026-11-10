@@ -44,7 +44,7 @@ describe('testFilterArgs', () => {
 
 describe('routeNeedsGit', () => {
   const files = { 'a.test.mjs': "import { execFileSync } from 'node:child_process'; execFileSync('git', ['ls-files'])", 'b.test.mjs': 'expect(1).toBe(1)' };
-  const readFile = (p) => { if (!(p in files)) throw new Error('ENOENT'); return files[p]; };
+  const readFile = (p) => { if (!(p in files)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); return files[p]; };
   it('routes local with reason needs-git and lists the files', () => {
     const r = routeNeedsGit({ argv: ['vitest', 'run', 'a.test.mjs', 'b.test.mjs'], readFile });
     expect(r).toEqual({ local: true, reason: NEEDS_GIT_REASON, files: ['a.test.mjs'] });
@@ -61,7 +61,7 @@ describe('routeNeedsGit', () => {
     expect(routeNeedsGit({ argv: ['vitest', 'run', 'b.test.mjs'], readFile, declared: ['b.test.mjs'] }))
       .toEqual({ local: true, reason: 'needs-git', files: ['b.test.mjs'] });
   });
-  it('default reader refuses outside-root, traversal and non-files', () => {
+  it('default reader refuses outside-root, traversal and non-files (R807: and routes them local)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ngr-'));
     try {
       mkdirSync(join(dir, 'sub'));
@@ -69,8 +69,9 @@ describe('routeNeedsGit', () => {
       writeFileSync(join(dir, 'in.test.mjs'), body);
       writeFileSync(join(dir, '..', `out-${process.pid}.test.mjs`), body);
       expect(routeNeedsGit({ argv: ['vitest', 'run', 'in.test.mjs'], cwd: dir }).local).toBe(true);
-      expect(routeNeedsGit({ argv: ['vitest', 'run', `../out-${process.pid}.test.mjs`], cwd: dir })).toEqual({ local: false });
-      expect(routeNeedsGit({ argv: ['vitest', 'run', 'sub', 'src/**'], cwd: dir })).toEqual({ local: false });
+      expect(routeNeedsGit({ argv: ['vitest', 'run', `../out-${process.pid}.test.mjs`], cwd: dir })).toMatchObject({ local: true, reason: 'needs-git' }); // R807: fail closed
+      expect(routeNeedsGit({ argv: ['vitest', 'run', 'sub'], cwd: dir })).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(routeNeedsGit({ argv: ['vitest', 'run', 'src/**'], cwd: dir })).toMatchObject({ local: true, reason: 'needs-git' });
     } finally { rmSync(join(dir, '..', `out-${process.pid}.test.mjs`), { force: true }); rmSync(dir, { recursive: true, force: true }); }
   });
 });
