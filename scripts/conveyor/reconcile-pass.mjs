@@ -2102,7 +2102,11 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     }
     if (infraClass.kind === 'mixed') return { eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' };
     // Refuse incomplete/mixed inventories before the more expensive immutable source reads.
-    if (!jobs.length || jobs.some((j) => !parseTimeoutFailures(j.log).complete)) throw new Error('incomplete-failure-inventory');
+    // Nothing left after dropping derived checks (review-gate red BY DESIGN under a review hold, or a superseded
+    // cancelled suite) is not an unreadable inventory: say so, or reconcile files an operator ruling-needed event
+    // ("incomplete failure inventory ... rerun spent") for a PR whose CI is green (live 2026-11-09, #6612/#6621).
+    if (!jobs.length) throw new Error('no-primary-failed-checks');
+    if (jobs.some((j) => !parseTimeoutFailures(j.log).complete)) throw new Error('incomplete-failure-inventory');
     const tree = api(`repos/${repo}/git/trees/${head}?recursive=1`);
     if (tree.truncated) throw new Error('truncated-source-tree');
     const sourceEntries = tree.tree.filter((e) => e.type === 'blob' && /\.[cm]?[jt]sx?$/.test(e.path));
