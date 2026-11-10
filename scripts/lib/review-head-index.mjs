@@ -288,7 +288,7 @@ export function seedFromReviewComments(comments) {
     else if (isControlComment(body)) latest = { kind: 'control', body }; // re-arm / stand-down / escalation / hold: not an accept
   }
   if (latest?.kind !== 'accept') return null;
-  let open = null, found = null, depth = 0; // open = { ch, len } of the fence we are inside; depth = open HTML <blockquote> count
+  let open = null, found = null; const stack = []; // open = { ch, len } of the fence we are inside; stack = open HTML container tag names
   for (const line of latest.body.split(/\r?\n/).slice(0, 12)) {
     const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line); // CommonMark: at most 3 spaces of indent (4+ is an indented code block, not a fence)
     if (open) {
@@ -299,11 +299,17 @@ export function seedFromReviewComments(comments) {
     // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
     if (f && !(f[1][0] === '`' && f[2].includes('`'))) { open = { ch: f[1][0], len: f[1].length }; continue; }
     if (/^\s*>/.test(line)) continue;
-    // HTML blockquotes and raw-text/code containers (pre, code, script, style, textarea) quote like Markdown ones: a marker inside one (depth > 0) is quoted text, and the tag lines themselves never carry a marker.
+    // HTML blockquotes and raw-text/code containers (pre, code, script, style, textarea) quote like Markdown ones: a marker inside one (stack non-empty) is quoted text, and the tag lines themselves never carry a marker.
     // Tags are counted in order, case-insensitively, several per line; a stray closer never goes below 0, an unclosed opener quotes the rest.
     let tagLine = false;
-    for (const t of line.matchAll(/<(\/?)(?:blockquote|pre|code|script|style|textarea)(?=[\s/>]|$)/gi)) { tagLine = true; depth = t[1] ? Math.max(0, depth - 1) : depth + 1; }
-    if (tagLine || depth > 0) continue;
+    // A closer pops only back to its own matching opener; a closer with no matching open tag is ignored (fail closed: it can never end another container's quote).
+    for (const t of line.matchAll(/<(\/?)(blockquote|pre|code|script|style|textarea)(?=[\s/>]|$)/gi)) {
+      tagLine = true;
+      const name = t[2].toLowerCase();
+      if (!t[1]) stack.push(name);
+      else { const i = stack.lastIndexOf(name); if (i >= 0) stack.length = i; }
+    }
+    if (tagLine || stack.length > 0) continue;
     const m = MARKER_LINE.exec(line);
     if (m) found = m[1];
   }
