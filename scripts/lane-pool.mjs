@@ -2875,6 +2875,7 @@ async function cmdAcquire(repo) {
       const environmentalOnly = !sawNonHoldProvisionFailure && !sawScanTimeout && !sawLockContention
         && holdRefused.size > 0 && lanes.every((n) => n === selfLane || holdRefused.has(n)); // a busy/leased lane is a real "no lane free", never environmental
       const skippedRelease = unreleasable.size ? `; skipped unreleasable lanes: ${[...unreleasable].map(n => `lane-${n}`).join(', ')}` : '';
+      if (unreleasable.size) fail(`no releasable lane in pool "${repo.name}"${skippedRelease}`, 1); // distinct from the busy-pool wording: never a passing skip
       fail(
         (sawScanTimeout
           ? `no free lane in pool "${repo.name}" — the acquirability scan itself did not finish within the ` +

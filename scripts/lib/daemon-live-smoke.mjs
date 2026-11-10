@@ -462,18 +462,10 @@ async function checkLaneAcquireRelease(ctx) {
     });
     return { ok: true, detail: `acquired + released lane-${laneNum}`, lane: laneNum };
   } catch (e) {
-    // Retry only the ordinary, guarded release; work appearing after admission must stay protected.
-    let cleanedUp = false;
-    try {
-      await runChild('node', ['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${sessionSlug}`], {
-        cwd: root, timeoutMs: budgets.laneReleaseMs, env,
-      });
-      cleanedUp = true;
-    } catch { /* no destructive override; the short lease TTL remains the backstop */ }
     // A stuck release still leaves a REAL lease held against the live pool — surfacing it as a gate failure
     // (never swallowed) is deliberate: a leaked smoke lease is exactly the kind of thing that should block
     // adopting the code that caused it, not just get logged and forgotten.
-    return { ok: false, detail: `acquired lane-${laneNum} but release failed (${cleanedUp ? 'session cleanup succeeded' : 'lease may remain — needs a hand release'}): ${lanePoolFailureLine(e)}`, lane: laneNum, ...childFailureDiagnostics(e) };
+    return { ok: false, detail: `acquired lane-${laneNum} but release failed (lease may remain — needs a hand release): ${lanePoolFailureLine(e)}`, lane: laneNum, ...childFailureDiagnostics(e) };
   }
 }
 

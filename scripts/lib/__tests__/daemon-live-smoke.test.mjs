@@ -1063,7 +1063,7 @@ describe('runLiveSmoke — injected runChild', () => {
     expect(result.pass).toBe(false);
   });
 
-  it('release failure reports bounded UNPUSHED_WORK after deprecation noise and retries safe cleanup', async () => {
+  it('release failure reports bounded UNPUSHED_WORK after deprecation noise', async () => {
     const reason = '  lane-3: UNPUSHED_WORK — unpushed commits: abc123def456; lane and lease kept.';
     const runChild = vi.fn(async (_cmd, args) => {
       if (args[1] === 'acquire') return '{"lane":3}';
@@ -1079,24 +1079,8 @@ describe('runLiveSmoke — injected runChild', () => {
     expect(row.detail).toContain('(truncated)');
     expect(row.detail.length).toBeLessThan(1300);
     const releases = runChild.mock.calls.filter(([, args]) => args[1] === 'release');
-    expect(releases).toHaveLength(2);
-    expect(releases[1][1]).toContain('--all-pools');
+    expect(releases).toHaveLength(1);
     expect(releases.every(([, args]) => !args.includes('--discard') && !args.includes('--force'))).toBe(true);
-  });
-
-  it('reports successful best-effort session cleanup while preserving the first release failure', async () => {
-    const releaseError = Object.assign(new Error('warning'), { status: 1,
-      stderr: '  lane-3: UNPUSHED_WORK — unpushed commits: abc123def456' });
-    const runChild = vi.fn(async (_cmd, args) => {
-      if (args[1] === 'acquire') return '{"lane":3}';
-      if (args[1] === 'release' && args.includes('--lane=3')) throw releaseError;
-      return args[1] === 'list' ? '[]' : '';
-    });
-    const result = await runLiveSmoke({ root: '/x', env: {}, runChild });
-    const row = result.results.find(r => r.name === 'lane-acquire-release');
-    expect(row.ok).toBe(false);
-    expect(row.detail).toContain('session cleanup succeeded');
-    expect(row.detail).toContain('UNPUSHED_WORK — unpushed commits: abc123def456');
   });
 
   // #4139 — live incident (backlog card 4061, row 1): a stray `lane-999999` reached the REAL shared
