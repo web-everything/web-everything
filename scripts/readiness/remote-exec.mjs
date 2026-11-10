@@ -1411,7 +1411,9 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
 /** R817: bounded (500 chars), control-free, token-masked tail of the Forge run stderr, safe to print and attach. */
 export function forgeFailureTail(stderr) {
   return String(stderr??'').replace(/[\x00-\x1f\x7f-\x9f]+/g,' ')
-    .replace(/\b(?:Bearer\s+)?(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{8,}|\b[A-Za-z0-9+/_=-]{32,}/g,'[masked]')
+    .replace(/(?:authorization|auth|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|credential)s?\b["']?\s*[=:]\s*(?:Bearer\s+|Basic\s+)?\S+/gi,'[masked]')
+    .replace(/\b(?:Bearer|Basic)\s+\S+/gi,'[masked]')
+    .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{4,}|\b[A-Za-z0-9+_=-]{24,}/g,'[masked]')
     .replace(/\s+/g,' ').trim().slice(-500);
 }
 
