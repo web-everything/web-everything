@@ -93,6 +93,11 @@ describe('credentialContentFinding test-file code expression residuals', () => {
     ['return keyword before a paren', `return ('${literal}')`],
     ['typeof keyword before a paren', `typeof ('${literal}')`],
     ['await keyword before a paren', `await ('${literal}')`],
+    ['new keyword before a paren', `new ('${literal}')`],
+    ['async keyword before a paren', `async ('${literal}')`],
+    ['function keyword before a paren', `function ('${literal}')`],
+    ['import keyword before a paren', `import ('${literal}')`],
+    ['this keyword before a paren', `this ('${literal}')`],
     ['conditional around a literal', `x ? ('${literal}') : y`],
   ])('flags a test-file credential value that is only a %s', (_name, value) => {
     expect(scan(`creds: ${value}\n`, 'scripts/lib/example.test.mjs')).toBe('high-entropy-creds');

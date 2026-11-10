@@ -135,7 +135,7 @@ function codeExpression(value) {
   // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
   return /=>|[A-Za-z_$][\w$]*\s*\(/.test(code.replace(nonCallKeyword,' '));
 }
-const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|case|in|of|instanceof|if|while|for|switch|catch|with|else|do)(?![\w$])/g;
+const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|case|in|of|instanceof|if|while|for|switch|catch|with|else|do|new|async|function|class|import|super|this|default|let|const|var|extends|as|satisfies|static|get|set)(?![\w$])/g;
 const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
