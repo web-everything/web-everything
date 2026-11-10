@@ -30,7 +30,7 @@ beforeEach(() => {
   git(['fetch', primary, 'main:main'], origin);
   const bin = join(root, 'bin'); mkdirSync(bin);
   writeFileSync(join(bin, 'git'), `#!${process.execPath}
-const { appendFileSync, readFileSync } = require('node:fs');
+const { appendFileSync, readFileSync, writeFileSync, unlinkSync, existsSync } = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const args = process.argv.slice(2);
 appendFileSync(process.env.TEST_GIT_LOG, JSON.stringify({ args, cwd: process.cwd() }) + '\\n');
@@ -48,6 +48,23 @@ if (process.env.TEST_BAD_VERIFY && readFileSync(process.env.TEST_GIT_LOG, 'utf8'
   process.stdout.write('0'.repeat(40) + '\\t' + args.at(-1) + '\\n'); process.exit(0);
 }
 const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+if (result.status === 0 && process.cwd() === process.env.TEST_LEASE_LANE
+    && ((process.env.TEST_LEASE_PHASE === 'fetch' && args.includes('fetch') && args.includes('origin'))
+      || (process.env.TEST_LEASE_PHASE === 'checkout' && args.includes('checkout') && args.includes('-B'))
+      || (process.env.TEST_LEASE_PHASE === 'clean' && args.includes('clean')))) {
+  const marker = process.cwd() + '/.git/.lane-lease';
+  const lease = JSON.parse(readFileSync(marker, 'utf8'));
+  const mode = process.env.TEST_LEASE_CHANGE;
+  writeFileSync(marker, mode === 'unreadable' ? '{' : JSON.stringify(mode === 'expired'
+    ? { ...lease, acquiredAt: '2000-01-01T00:00:00.000Z' }
+    : { ...lease, session: 'new-owner', holder: 'new-holder', acquiredAt: new Date().toISOString() }));
+  if (mode === 'missing') unlinkSync(marker);
+  // Represent the new occupant's work before returning from the interrupted provisioning step.
+  writeFileSync(process.cwd() + '/work.txt', 'new occupant stash');
+  const stashed = spawnSync(${JSON.stringify(realGit)}, ['stash', 'push', '-m', 'new occupant'], { stdio: 'inherit' });
+  if (stashed.status !== 0) process.exit(stashed.status ?? 1);
+  writeFileSync(process.env.TEST_LEASE_RECORD, existsSync(marker) ? readFileSync(marker, 'utf8') : 'missing');
+}
 process.exit(result.status ?? 1);
 `, { mode: 0o755 });
   env = { ...process.env, PATH: bin + ':' + process.env.PATH, LANE_POOL_ROOT: pool,
@@ -62,6 +79,41 @@ process.exit(result.status ?? 1);
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('lane-pool salvage-unpushed', () => {
+  it.each(['unpushed', 'unreadable'])('explicit acquire refuses %s preservation evidence with unpublished main off HEAD', evidence => {
+    const sha = commit(lane, 'unpublished main');
+    git(['checkout', '-b', 'clean-head', 'origin/main'], lane);
+    const head = git(['rev-parse', 'HEAD'], lane);
+    const result = run('acquire', ['--lane=1', '--no-reap'], evidence === 'unreadable' ? { TEST_BAD_HEADS: '1' } : {});
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/unpushed work or unreadable preservation evidence.*salvage-unpushed or inspect it manually/);
+    expect(git(['rev-parse', 'main'], lane)).toBe(sha);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(head);
+    expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('clean-head');
+    expect(existsSync(join(lane, '.git', '.lane-lease'))).toBe(false);
+    expect(events().some(e => e.args.includes('checkout') && e.args.includes('-B'))).toBe(false);
+  });
+
+  it.each(['fetch', 'checkout', 'clean'].flatMap(phase => ['replaced', 'expired', 'unreadable', 'missing'].map(change => [phase, change])))
+  ('salvage aborts destructive work after %s when its lease is %s', (phase, change) => {
+    const sha = commit(lane, 'abandoned work');
+    const record = join(root, 'changed-lease');
+    const result = run('salvage-unpushed', [], {
+      TEST_LEASE_LANE: lane, TEST_LEASE_PHASE: phase, TEST_LEASE_CHANGE: change, TEST_LEASE_RECORD: record,
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/lease changed or expired during salvage/);
+    const marker = join(lane, '.git', '.lane-lease');
+    expect(existsSync(marker) ? readFileSync(marker, 'utf8') : 'missing').toBe(readFileSync(record, 'utf8'));
+    expect(git(['stash', 'list'], lane)).toContain('new occupant');
+    const log = events().filter(e => e.cwd === lane);
+    expect(log.some(e => e.args.includes('stash') && e.args.includes('clear'))).toBe(false);
+    expect(log.some(e => e.args.includes('clean'))).toBe(phase === 'clean');
+    if (phase === 'fetch') {
+      expect(git(['rev-parse', 'HEAD'], lane)).toBe(sha);
+      expect(log.some(e => e.args.includes('checkout') && e.args.includes('-B'))).toBe(false);
+    }
+  });
+
   it.each(['branch', 'stash', 'detached'])('acquire skips free lanes holding unpushed %s work', kind => {
     if (kind === 'stash') {
       writeFileSync(join(lane, 'work.txt'), 'stashed'); git(['stash', 'push'], lane);

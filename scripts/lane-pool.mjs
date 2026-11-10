@@ -2292,7 +2292,7 @@ function scrubClaimedLaneConfig(dir, reason) {
   return removed.length ? undefined : dietConfig;
 }
 
-function provisionClaimedLane(repo, chosen, targetWasReserved) {
+function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructiveStep = () => {} } = {}) {
   const dir = laneDir(repo, chosen);
   const dietConfig = scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
@@ -2379,7 +2379,9 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     if (held) throw Object.assign(new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`), { laneHoldRefusal: true });
     acquireResetSnapshots.set(chosen, before);
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
+    beforeDestructiveStep();
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
+    beforeDestructiveStep();
     git(['clean', '-fd', '--quiet'], dir);
       return { before, baseRef };
     };
@@ -2898,6 +2900,10 @@ async function cmdAcquire(repo) {
   if (flags.lane !== undefined) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
+      if (!targetWasReserved) {
+        const work = unpushedLaneWork(repo, dir, { allowFetch: true });
+        if (work.commits !== '') throw new Error(`lane-${chosen} holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
+      }
       provisionClaimedLane(repo, chosen, targetWasReserved);
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
@@ -3221,11 +3227,18 @@ async function salvageUnpushed(repo, { dryRun = false } = {}) {
         if (io.remoteSha(ref) !== sha) throw new Error(`remote SHA verification failed: ${ref}`);
         journalLaneEvent(dir, { action: 'salvage-push', reason: `verified ${ref}=${sha}`, salvagedTo: ref });
       }
-      if (!sameLease(readLease(dir), claim)) throw new Error('lease changed during salvage; no reset');
+      const assertSalvageLease = () => {
+        const lease = readLease(dir);
+        if (!sameLease(lease, claim) || isLeaseStale(lease, Date.now(), ttlMsFromFlags())) {
+          throw new Error('lease changed or expired during salvage; no further reset or stash clear');
+        }
+      };
+      assertSalvageLease();
       const current = releaseLocalWorkTips(dir);
       if (!current || JSON.stringify(current) !== JSON.stringify(local)) throw new Error('local tips changed during salvage; no reset');
       journalLaneEvent(dir, { action: 'salvage-verified', reason: `all ${refs.length} remote refs verified before reset`, salvagedTo: base });
-      provisionClaimedLane(repo, n, false);
+      provisionClaimedLane(repo, n, false, { beforeDestructiveStep: assertSalvageLease });
+      assertSalvageLease();
       git(['stash', 'clear'], dir);
       journalLaneEvent(dir, { action: 'salvage-reset', reason: `reset after verified salvage; stash cleared`, salvagedTo: base, headAfter: laneHead(dir) });
       log(`salvage-unpushed lane-${n}: pushed and verified ${refs.length} ref(s) under ${base}; reset, stash cleared`);
