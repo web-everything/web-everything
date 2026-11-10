@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildReadyRecord, writeReadyRecord, readyRecordPath, adoptionReaderPath, parseArgs, main } from '../fix-ready-record.mjs';
 import { createAdoptionMatrixReader } from '../adoption-matrix-io.mjs';
+import { parseFixReadyLines } from '../adoption-matrix.mjs';
 import { jsonLines, readyEvidence } from '../prototype-load.mjs';
 
 const sha = 'b7bb8b2743e5c582d44e22e71a40f9e23ae07f6b';
@@ -252,6 +253,33 @@ describe('fix-ready-record', () => {
     expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(true);
     expect(existsSync(`${file}.lock`)).toBe(false);
   });
+  it('stamps every written record with a parseable `at` that the adoption matrix reader accepts (no "malformed")', () => {
+    const file = tmp();
+    const at = Date.parse('2026-11-10T12:00:00.000Z');
+    const a = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => at });
+    const b = writeReadyRecord({ ...base, ref: 'lane/other', audit: 'WEAKENED', auditRuling: 'R816', auditDisclosed: findings }, { file, now: () => at + 5000 });
+    expect(a.record.at).toBe('2026-11-10T12:00:00.000Z');
+    const incomplete = [];
+    const rows = parseFixReadyLines(readFileSync(file, 'utf8'), { onIncomplete: (m) => incomplete.push(m) });
+    expect(incomplete).toEqual([]);
+    expect(rows).toEqual([
+      { ref, at: a.record.at, sha },
+      { ref: 'lane/other', at: b.record.at, sha },
+    ]);
+  });
+  it('ignores `at` when deciding a duplicate: the same record written later is still refused', () => {
+    const file = tmp();
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => 1_700_000_000_000 }).ok).toBe(true);
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => 1_800_000_000_000 }).error).toMatch(/duplicate/);
+    expect(jsonLines(readFileSync(file, 'utf8'))).toHaveLength(1);
+  });
+  it('refuses to write when the clock returns no usable time, and writes nothing', () => {
+    const file = tmp();
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => NaN });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/clock/);
+    expect(existsSync(file)).toBe(false);
+  });
   it('passes a NOT WEAKENED record through the reader as ready-record', () => {
     const r = buildReadyRecord({ ...base, audit: 'NOT WEAKENED' });
     expect(readyEvidence([r.record], { branch: ref, sha }, []).source).toBe('ready-record');
@@ -335,7 +363,7 @@ describe('fix-ready-record main()', () => {
     const { log } = quiet();
     const file = tmp();
     expect(main([`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED'], { file })).toBe(0);
-    expect(jsonLines(readFileSync(file, 'utf8'))).toEqual([{ ref, sha, tests: 'green', audit: 'NOT WEAKENED' }]);
+    expect(jsonLines(readFileSync(file, 'utf8'))).toEqual([{ ref, sha, tests: 'green', audit: 'NOT WEAKENED', at: expect.any(String) }]);
     expect(log.mock.calls[0][0]).toMatch(/wrote lane\/example@/);
   });
   it('reads a WEAKENED record\'s disclosed findings from --auditDisclosed-file', () => {
@@ -344,7 +372,7 @@ describe('fix-ready-record main()', () => {
     const disclosed = tmp();
     writeFileSync(disclosed, JSON.stringify(findings));
     expect(main([`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=WEAKENED', '--auditRuling=R816', `--auditDisclosed-file=${disclosed}`], { file })).toBe(0);
-    expect(jsonLines(readFileSync(file, 'utf8'))[0]).toEqual({ ref, sha, tests: 'green', audit: 'WEAKENED', auditRuling: 'R816', auditDisclosed: findings });
+    expect(jsonLines(readFileSync(file, 'utf8'))[0]).toEqual({ ref, sha, tests: 'green', audit: 'WEAKENED', auditRuling: 'R816', auditDisclosed: findings, at: expect.any(String) });
   });
   it('exits 2 for a missing or malformed --auditDisclosed-file and writes nothing', () => {
     const { err } = quiet();

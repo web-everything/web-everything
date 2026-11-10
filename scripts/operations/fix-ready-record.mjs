@@ -2,7 +2,8 @@
 // Writes ONE fix-ready record for prototype-load. The shape is exactly what readyEvidence() in prototype-load.mjs reads:
 // NOT WEAKENED needs ref + 40-hex sha + tests green; WEAKENED additionally needs auditRuling (R<n>) and a non-empty
 // auditDisclosed array of non-empty strings. A record identical to the latest one for that ref+sha is refused; a different
-// one supersedes it (the reader lets the latest record per sha win). The append is written until complete under a lock file, and cut back if it fails part-way.
+// one supersedes it (the reader lets the latest record per sha win). Each written record also carries `at` (ISO write
+// time), which the adoption matrix reader requires; `at` is ignored when deciding whether a record is a duplicate. The append is written until complete under a lock file, and cut back if it fails part-way.
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -128,14 +129,24 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
   const built = buildReadyRecord(input);
   if (!built.ok) return built;
   const { ref, sha } = built.record;
-  const line = JSON.stringify(built.record);
+  // The adoption matrix reader (parseFixReadyLines) drops any line without a parseable `at`, so every record carries
+  // the write time. `at` is not part of the record's identity: it is left out of the duplicate comparison below.
+  const stamp = now();
+  if (!Number.isFinite(stamp)) return { ok: false, error: 'cannot stamp the record: the clock returned no time' };
+  const record = { ...built.record, at: new Date(stamp).toISOString() };
+  const line = JSON.stringify(record);
   // The adoption matrix reads only the last 1 MiB of the ledger; a record near that size would be written, reported as
   // success, then cut by the reader's tail slice. Refuse it instead.
   if (Buffer.byteLength(line) > MAX_RECORD_BYTES) return { ok: false, error: `record is ${Buffer.byteLength(line)} bytes; the limit is ${MAX_RECORD_BYTES} (the reader keeps only the last 1 MiB of the ledger)` };
   const canon = (r) => JSON.stringify(Object.fromEntries(Object.entries(r).sort(([a], [b]) => (a < b ? -1 : 1))));
   const want = canon(built.record);
   // Key order and sha case in a hand-written ledger line must not hide an identical record.
-  const isDuplicate = (text) => { const prior = latestFor(text, ref, sha); return !!prior && canon({ ...prior, sha }) === want; };
+  const isDuplicate = (text) => {
+    const prior = latestFor(text, ref, sha);
+    if (!prior) return false;
+    const { at: _at, ...rest } = prior; // the write time never makes two records differ
+    return canon({ ...rest, sha }) === want;
+  };
   const duplicate = { ok: false, error: `duplicate: an identical latest record for ${ref}@${sha} already exists` };
   // Fail fast on an unreadable ledger, before touching the filesystem at all.
   const first = readLedger(file, fsApi);
@@ -159,7 +170,7 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
       const written = appendAll(fd, Buffer.from(`${prefix}${line}\n`), fsApi);
       if (!written.ok) return { ok: false, error: written.error };
     } finally { fsApi.closeSync(fd); }
-    return { ok: true, record: built.record, file };
+    return { ok: true, record, file };
   } finally {
     releaseLock(lock, token, fsApi);
   }
