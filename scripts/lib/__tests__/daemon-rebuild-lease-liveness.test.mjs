@@ -132,3 +132,32 @@ describe('claimBuildLease candidate teardown (leaseOwnerIsGone pid-reuse guard)'
     expect(calls).not.toContain(`worktree remove --force ${OLD_PATH}`);
   });
 });
+
+describe('R830 adopt-only lease never blocks a rebuild job', () => {
+  const plan = { finalSha: 'a'.repeat(40), inputsKey: 'k' };
+  it('an adopt-only lease from another LIVE pid (the daemon) is not live, and is reclaimable at once', () => {
+    expect(buildLeaseIsLive(lease(livePid, { adoptOnly: true }), { nowMs })).toBe(false);
+    const state = { building: lease(livePid, { adoptOnly: true }) };
+    const got = claimBuildLease({ state, plan, root: '/nonexistent-root', run: () => ({ status: 0 }), env: {}, nowMs });
+    expect(got).toBeTruthy();
+    expect(got.pid).toBe(process.pid);
+    expect(state.building.token).toBe(got.token);
+    ACTIVE_BUILD_TOKENS.delete(got.token);
+  });
+  it('a lease this process holds (token active) does not block itself after release, and records adoptOnly when asked', () => {
+    const state = { building: null };
+    const got = claimBuildLease({ state, plan, root: '/x', run: () => ({ status: 0 }), env: {}, nowMs, adoptOnly: true });
+    expect(got.token).toBeTruthy();
+    expect(state.building.adoptOnly).toBe(true);
+    ACTIVE_BUILD_TOKENS.delete(got.token);
+    expect(buildLeaseIsLive(state.building, { nowMs })).toBe(false);
+  });
+  it('a dead job pid is reclaimable at once', () => {
+    expect(buildLeaseIsLive(lease(2 ** 22 + 12345), { nowMs })).toBe(false);
+  });
+  it('a live OTHER non-adopt-only job still blocks', () => {
+    expect(buildLeaseIsLive(lease(livePid), { nowMs, startTimeOf: () => nowMs - 3_600_000 })).toBe(true);
+    const state = { building: lease(livePid) };
+    expect(claimBuildLease({ state, plan, root: '/x', run: () => ({ status: 0 }), env: {}, nowMs, startTimeOf: () => nowMs - 3_600_000 })).toBeNull();
+  });
+});
