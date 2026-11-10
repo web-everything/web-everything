@@ -30,8 +30,8 @@ const commit = message => {
   git(lane, ...ident, 'commit', '-q', '-m', message);
   return git(lane, 'rev-parse', 'HEAD');
 };
-const scan = (injectedExec = exec) => scanBundleRange({
-  cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: originMain, exec: injectedExec,
+const scan = (injectedExec = exec, warnings = []) => scanBundleRange({
+  cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: originMain, exec: injectedExec, warnings,
 });
 
 beforeEach(() => {
@@ -63,6 +63,13 @@ const beginMainMerge = (publicContent = 'public update\n') => {
 };
 
 describe('scanBundleRange lane first-parent scope', () => {
+  it.each(['utf16le', 'utf16be'])('blocks a GitHub token in a %s blob', async encoding => {
+    const content = Buffer.from('ghp_' + 'a'.repeat(36), 'utf16le');
+    write('note.txt', encoding === 'utf16be' ? content.swap16() : content);
+    commit('encoded content');
+    expect(await scan()).toEqual({ path: 'note.txt', finding: 'github-token' });
+  });
+
   it('rejects a regular-file-to-symlink mode-only transition with the same prerequisite path and blob', async () => {
     write('link.txt', '.env.local');
     originMain = commit('public regular file');
@@ -92,20 +99,23 @@ describe('scanBundleRange lane first-parent scope', () => {
   it.each([
     ['literal api_key', `api_key: ${literal}\n`, 'high-entropy-api_key'],
     ['GitHub token', `${token}\n`, 'github-token'],
-  ])('still catches a lane-authored %s committed before merging main, even after scrubbing', async (_name, content, finding) => {
+  ])('applies format/block and generic/warn policy to a lane-authored %s committed before merging main, even after scrubbing', async (_name, content, finding) => {
     write('lane.yml', content);
     commit('lane change');
     beginMainMerge();
     commit('merge main');
     write('lane.yml', 'clean\n');
     commit('scrub lane');
-    expect(await scan()).toMatchObject({ path: 'lane.yml', finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='github-token')expect(hit).toMatchObject({path:'lane.yml',finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path:'lane.yml',finding});}
   });
 
   it.each([
     ['literal api_key', `api_key: ${literal}\n`, 'high-entropy-api_key'],
     ['GitHub token', `${token}\n`, 'github-token'],
-  ])('catches a %s introduced only in an evil merge resolution, even after scrubbing', async (_name, content, finding) => {
+  ])('applies format/block and generic/warn policy to a %s introduced only in an evil merge resolution, even after scrubbing', async (_name, content, finding) => {
     write('lane.txt', 'clean lane change\n');
     commit('lane change');
     beginMainMerge();
@@ -113,7 +123,10 @@ describe('scanBundleRange lane first-parent scope', () => {
     commit('merge main with resolution');
     write('resolution.yml', 'clean\n');
     commit('scrub resolution');
-    expect(await scan()).toMatchObject({ path: 'resolution.yml', finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='github-token')expect(hit).toMatchObject({path:'resolution.yml',finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path:'resolution.yml',finding});}
   });
 
   it('fails closed with bundle-credential-scan-failed when first-parent Git scoping fails', async () => {
@@ -132,7 +145,7 @@ describe('scanBundleRange lane first-parent scope', () => {
   it.each([
     ['literal api_key', `api_key: ${literal}\n`, 'high-entropy-api_key'],
     ['GitHub token', `${token}\n`, 'github-token'],
-  ])('catches a %s added and deleted on a merged side branch, though the merge tree is clean', async (_name, content, finding) => {
+  ])('applies format/block and generic/warn policy to a %s added and deleted on a merged side branch, though the merge tree is clean', async (_name, content, finding) => {
     write('lane.txt', 'clean lane change\n');
     commit('lane change');
     git(lane, 'checkout', '-q', '-b', 'side');
@@ -143,7 +156,10 @@ describe('scanBundleRange lane first-parent scope', () => {
     git(lane, 'checkout', '-q', 'lane');
     git(lane, ...ident, 'merge', '--no-ff', '-q', '-m', 'merge side', 'side');
     expect(git(lane, 'ls-tree', '-r', '--name-only', 'HEAD').split('\n')).not.toContain('side.yml');
-    expect(await scan()).toMatchObject({ path: 'side.yml', finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='github-token')expect(hit).toMatchObject({path:'side.yml',finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path:'side.yml',finding});}
   });
 
   // The prerequisite-skip key is path + mode + blob sha: an entry is skipped only when ALL THREE equal origin/main's.
@@ -152,7 +168,9 @@ describe('scanBundleRange lane first-parent scope', () => {
     originMain = commit('public cfg');
     write('cfg.yml', `api_key: ${literal}\n`);
     commit('lane edits cfg');
-    expect(await scan()).toMatchObject({ path: 'cfg.yml', finding: 'high-entropy-api_key' });
+    const warnings=[];
+    expect(await scan(exec,warnings)).toBeNull();
+    expect(warnings).toContainEqual({path:'cfg.yml',finding:'high-entropy-api_key'});
   });
 
   it.each([
@@ -163,7 +181,10 @@ describe('scanBundleRange lane first-parent scope', () => {
     originMain = commit('public blob');
     write(path, `api_key: ${literal}\n`);
     commit('lane copies public blob');
-    expect(await scan()).toMatchObject({ path, finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='excluded-path')expect(hit).toMatchObject({path,finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path,finding});}
   });
 
   it.each(['deploy/id_rsa', 'certs/server.pem', 'keys/signing.key'])('rejects a lane-added regular key file %s even with innocuous contents', async path => {
@@ -260,4 +281,13 @@ describe('logLocalLocation', () => {
     logLocalLocation(result, log);
     expect(log).not.toHaveBeenCalled();
   });
+});
+
+
+it('R857 refuses an unclassifiable bundle path instead of downgrading unknown evidence to a warning',async()=>{
+  write('lane.txt','ordinary change');commit('lane change');
+  const injected=async call=>call.args.includes('--raw')
+    ?{code:0,stdout:Buffer.from(`:000000 100644 ${'0'.repeat(40)} ${'a'.repeat(40)} A\0../bad.txt\0`)}
+    :exec(call);
+  await expect(scan(injected,[])).rejects.toMatchObject({code:'bundle-credential-scan-failed'});
 });
