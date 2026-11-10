@@ -141,23 +141,18 @@ describe('settings evidence failures', () => {
     '{"hostCapacity":"bad"}', '{"hostCapacity":{"idlePct":[]}}'])('malformed settings %s hold before reading capacity', text => {
     const readFile = () => text;
     expect(() => loadCapacitySettings({ env: {}, readFile })).toThrow('settings unreadable');
-    mockSettingsFile(readFile);
     const read = vi.fn(() => ({ idlePct: 100, memFreeGB: 8 }));
-    expect(admit('review', { env: {}, read })).toMatchObject({ admit: false, reason: expect.stringContaining('settings unreadable') });
+    expect(admit('review', { env: {}, read, readFile })).toMatchObject({ admit: false, reason: expect.stringContaining('settings unreadable') });
     expect(read).not.toHaveBeenCalled();
   });
   it('unreadable settings hold; missing settings use defaults', () => {
     const denied = () => { throw Object.assign(Error('denied'), { code: 'EACCES' }); };
     expect(() => loadCapacitySettings({ env: {}, readFile: denied })).toThrow('settings unreadable');
-    mockSettingsFile(denied);
-    expect(admit('review', { env: {}, read: () => ({ idlePct: 100, memFreeGB: 8 }) }))
+    expect(admit('review', { env: {}, readFile: denied, read: () => ({ idlePct: 100, memFreeGB: 8 }) }))
       .toMatchObject({ admit: false, reason: expect.stringContaining('settings unreadable') });
     const missing = () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); };
     expect(loadCapacitySettings({ env: {}, readFile: missing })).toMatchObject({ idlePct: { review: 10 }, minMemoryMb: 2048 });
-    vi.restoreAllMocks();
-    syncBuiltinESMExports();
-    mockSettingsFile(missing);
-    expect(admit('review', { env: {}, read: () => ({ idlePct: 100, memFreeGB: 8 }) }).admit).toBe(true);
+    expect(admit('review', { env: {}, readFile: missing, read: () => ({ idlePct: 100, memFreeGB: 8 }) }).admit).toBe(true);
   });
   it('invalid individual settings preserve stricter floors', () => {
     const readFile = () => JSON.stringify({ hostCapacity: { minMemoryMb: 'bad', windowSec: -1,

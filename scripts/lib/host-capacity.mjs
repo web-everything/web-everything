@@ -110,10 +110,10 @@ export function readCapacity({ settings, env = process.env, root,
 }
 
 /** Unknown class/evidence holds until a subsequent tick obtains a valid reading. */
-export function admit(cls, { read = readCapacity, settings, env = process.env, log = () => {} } = {}) {
+export function admit(cls, { read = readCapacity, settings, env = process.env, log = () => {}, readFile } = {}) {
   let reading = {}; let admitted = false; let detail;
   try {
-    settings ??= loadCapacitySettings({ env, log });
+    settings ??= loadCapacitySettings({ env, log, ...(readFile ? { readFile } : {}) });
     if (!CLASSES.includes(cls)) throw Error('unknown capacity class');
     const threshold = Math.max(DEFAULT_IDLE[cls], settings.idlePct?.[cls]);
     const floor = Math.max(2048, settings.minMemoryMb);
