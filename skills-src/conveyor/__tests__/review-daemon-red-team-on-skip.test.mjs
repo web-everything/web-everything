@@ -8,6 +8,7 @@ import * as reviewJob from '../../../scripts/operations/review-job.mjs';
 import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.mjs';
 import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
+import * as hostSample from '../../../scripts/lib/host-sample.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
 
@@ -17,7 +18,12 @@ const QUEUE_DIR = mkdtempSync(join(tmpdir(), 'we-rtq-test-'));
 const QUEUE_FILE = join(QUEUE_DIR, 'queue.json');
 afterAll(() => rmSync(QUEUE_DIR, { recursive: true, force: true }));
 // A developer's exported WE_RED_TEAM_DISPATCH_QUEUE=off must not flip the tests that expect the queue.
-beforeEach(() => { vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on'); });
+beforeEach(() => {
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '2');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT', '10');
+  vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
+});
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
 /** Mocks evidence for N owed PRs (heads derived per PR) and returns the owed plan/rawPrs. */
@@ -303,6 +309,28 @@ it('a throwing host check blocks recovery-only starts', () => {
   const { options, recoveryDispatch } = recoveryTickFixture();
   runReviewTick({ ...options, hostAdmission: () => { throw Error('host unreadable'); } });
   expect(recoveryDispatch).not.toHaveBeenCalled();
+});
+
+it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
+    if (idle === 'throws') throw new Error('sample unavailable');
+    return { idlePct: idle };
+  });
+  vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(o => ({ rawPrs: o.rawPrs }));
+  const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip')
+    .mockReturnValue({ rows: [], dispatched: [], notStarted: [] });
+  const capacity = { lanes: 4, remainingStarts: 1, budget: { left: 3 } };
+  const budget = capacity.budget;
+  try {
+    cliReviewTickOpts({ log: { error: vi.fn() } }).redTeamOnSkip({
+      repo: 'fixture/cpu-floor', plan: { refusals: [] }, rawPrs: [], capacity,
+    });
+    expect(hostSample.sampleHost).toHaveBeenCalledOnce();
+    expect(recovery.mock.calls[0][0].capacity).toBe(capacity);
+    expect(capacity).toEqual({ lanes: 4, remainingStarts: idle === 'throws' ? 1 : 2, budget: { left: 3 } });
+    expect(capacity.budget).toBe(budget);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
 
 it('ordinary and recovery starts share maxPerTick=1', () => {

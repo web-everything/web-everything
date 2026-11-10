@@ -88,6 +88,49 @@ describe('setting-driven red-team queue floor', () => {
     JSON.stringify({ redTeam: { queue: { minConcurrent, minConcurrentIdlePct } } });
   const load = (text, env = {}) => loadRedTeamQueueFloor({ env, file, readFile: () => text });
 
+  it.each([
+    ['missing redTeam', {}],
+    ['missing queue', { redTeam: {} }],
+    ['missing minimum', { redTeam: { queue: { minConcurrentIdlePct: 10 } } }],
+  ])('%s disables the floor without increasing capacity', (_name, configuration) => {
+    const configured = load(JSON.stringify(configuration));
+    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10 });
+    const bound = capacity(1);
+    const log = vi.fn();
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100, log });
+    expect(bound).toEqual(capacity(1));
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing file threshold', {}],
+    ['empty environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: '' }],
+    ['blank environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: ' ' }],
+    ['nonfinite environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: 'Infinity' }],
+  ])('%s defaults to 10 while retaining the configured minimum', (_name, env) => {
+    const configured = load(JSON.stringify({ redTeam: { queue: { minConcurrent: 3 } } }), env);
+    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10 });
+    const bound = capacity(1);
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 9 });
+    expect(bound.remainingStarts).toBe(1);
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 10 });
+    expect(bound).toEqual({ lanes: 1, remainingStarts: 3, budget: { left: 1 } });
+  });
+
+  it.each([
+    ['file', settings(99), {}, 4],
+    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 4],
+    ['invalid environment', settings(4), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: 'bad' }, 0],
+    ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
+  ])('%s minimum resolves with a hard cap of four and invalid overrides disable it', (_name, text, env, expected) => {
+    const configured = load(text, env);
+    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10 });
+    const bound = { lanes: 10, remainingStarts: 1, budget: { left: 10 } };
+    applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100 });
+    expect(bound.remainingStarts).toBe(Math.max(1, expected));
+    expect(redTeamQueueAdmitCount(bound)).toBe(Math.max(1, expected));
+  });
+
   it('loads defaults 2/10 from the real shipped settings file with no environment overrides', () => {
     expect(loadRedTeamQueueFloor({ env: {} })).toEqual(floor);
     expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(4);
@@ -114,7 +157,7 @@ describe('setting-driven red-team queue floor', () => {
         floor: configured, readCpuIdlePct: () => 50, run, log: f.log });
       expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4]);
       expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(4);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `))).toHaveLength(2);
+      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(2);
     },
   );
 
@@ -136,7 +179,7 @@ describe('setting-driven red-team queue floor', () => {
         floor, readCpuIdlePct: () => idle, run, log: f.log });
       expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3].slice(0, admits));
       expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(admits);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `))).toHaveLength(holds);
+      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(holds);
     },
   );
 

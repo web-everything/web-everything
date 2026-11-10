@@ -93,9 +93,10 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
 import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
+import { sampleHost } from '../../scripts/lib/host-sample.mjs';
 import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
-import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
+import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
@@ -1257,6 +1258,7 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 /** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
 let redTeamDispatchQueue;
+let redTeamQueueFloor;
 export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
@@ -1288,7 +1290,12 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         options.log(`review-daemon: red-team queue on (source: ${queueSetting === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`);
         redTeamDispatchQueue = createRedTeamDispatchQueue({ log: options.log });
       }
-      return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip });
+      if (redTeamQueueFloor === undefined) {
+        try { redTeamQueueFloor = loadRedTeamQueueFloor({ log: options.log }); }
+        catch { redTeamQueueFloor = null; }
+      }
+      return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
+        floor: redTeamQueueFloor, readCpuIdlePct: () => sampleHost().idlePct });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,
