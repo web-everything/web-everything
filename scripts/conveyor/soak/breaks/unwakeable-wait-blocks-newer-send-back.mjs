@@ -1,6 +1,7 @@
 /** A stale unwakeable wait (its session is gone) must be retired once a newer review:changes send-back exists. */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { runSlotAwareAwaitPass } from '../../await-verify-loop.mjs';
 
 const LOOP = 'scripts/conveyor/await-verify-loop.mjs';
@@ -22,7 +23,7 @@ export default {
       ['delivered-previous-ci', { pendingResume: { kind: 'red', delivered: true } }],
       ['resume-exhausted', { pendingResume: { kind: 'red', detail: 'previous-head CI failures' } }],
     ]) {
-      const record = { v: 1, sessionId: 'fix-6595', who: 'fix-6595', repo: 'web-everything/web-everything', pr: 6595,
+      const record = { v: 1, sessionId: 'fix-6595', who: 'fix-6595', repo: CONSTELLATION_REPOS.we.slug, pr: 6595,
         kind: 'fix', sha: '7'.repeat(40), lane: '/lanes/lane-9', ref: 'lane/stale-fix', attempt: 1,
         requestedAt: REQUESTED, ...over };
       const store = new Map([[record.sessionId, record]]);
