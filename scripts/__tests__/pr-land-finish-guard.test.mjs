@@ -156,3 +156,44 @@ describe('resolveFinishGuardVerdict (#4296) — a real merge of origin/main touc
     expect(gate).toMatchObject({ ok: false, status: 'absent', reason: 'unverified' });
   });
 });
+
+describe('resolveFinishGuardVerdict — a green marker carries over docs-only commits (delivery-blocker R826)', () => {
+  const setup = () => {
+    writeAndAdd('scripts/a.mjs', 'base\n');
+    commit('base');
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    writeAndAdd('scripts/a.mjs', 'lane edit\n');
+    commit('fix');
+    const sha = headSha();
+    writeGreenMarker(sha);
+    return sha;
+  };
+  const verdict = () => resolveFinishGuardVerdict({ gitDir: gitDirOf(dir), headSha: headSha(), remote: 'origin', base: 'main', runGit, readMarker: readVerifyMarker });
+
+  it('accepts a backlog card committed after the marker', () => {
+    setup();
+    writeAndAdd('backlog/9999-x.md', 'card\n');
+    commit('card');
+    expect(verdict()).toMatchObject({ ok: true, reason: 'verified' });
+    expect(verdict().detail).toMatch(/verify-marker carried from/);
+  });
+  it('REFUSES a code commit after the marker', () => {
+    setup();
+    writeAndAdd('scripts/a.mjs', 'more code\n');
+    commit('code');
+    expect(verdict().ok).toBe(false);
+  });
+  it('REFUSES a script under docs/ (only .md counts)', () => {
+    setup();
+    writeAndAdd('docs/tool.mjs', 'x\n');
+    commit('docs script');
+    expect(verdict().ok).toBe(false);
+  });
+  it('REFUSES a marker on a non-ancestor commit', () => {
+    setup();
+    execFileSync('git', ['checkout', '-q', '--orphan', 'other'], { cwd: dir });
+    writeAndAdd('backlog/1-y.md', 'c\n');
+    commit('orphan card');
+    expect(verdict().ok).toBe(false);
+  });
+});
