@@ -231,7 +231,7 @@ export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBran
   // An API failure is a named transient error, never a git fallback.
   if (run === undefined && (readsSource ?? resolveDrainReadsSource().value) === 'api') {
     // The whole read (ref, commit, each tree, contents: several calls) shares ONE 20 s deadline, like the old single git call.
-    try { text = unwrap(readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, source: reader, timeoutMs: GIT_TIMEOUT_MS, deadlineAt: Date.now() + GIT_TIMEOUT_MS })); }
+    try { text = unwrap(readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, source: reader, timeoutMs: GIT_TIMEOUT_MS, deadlineAt: Date.now() + GIT_TIMEOUT_MS, priority: true })); }
     catch (e) { return { source, error: flatText(`branch unreadable: ${e.message}`), transient: e instanceof DrainReadError && e.transient }; }
     if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   } else {

@@ -5,21 +5,16 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSyncThrottled, ghAuthIdentity } from '../lib/gh-throttle.mjs';
+import { createHash } from 'node:crypto';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { recoveryPreflight, recoveryPushCredential } from './recovery-preflight.mjs';
+export { recoveryPushCredential } from './recovery-preflight.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
 import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
 
 export const RECOVERY_COMMIT_MARKER = 'Conveyor-Missing-Run-Recovery:';
-
-export function recoveryPushCredential(token, env = {}) {
-  if (!token) return false;
-  // Unknown installation tokens include Actions' default GITHUB_TOKEN. Only trust
-  // the token-bound provenance set by our installation-token minting code.
-  if (token.startsWith('ghs_')) return ghAuthIdentity({ ...env, GH_TOKEN: token }).startsWith('app-installation-');
-  return /^(ghp_|github_pat_|gho_)/.test(token);
-}
 
 const defaultReadCache = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
 
@@ -36,15 +31,16 @@ export function ownerInstallationToken(repo, { env = process.env, readCache = de
   return typeof cached.token === 'string' && cached.token.startsWith('ghs_') ? cached.token : null;
 }
 
-export function pushMissingRunCommit(d, {
+export function pushMissingRunCommit(d, options = {}) {
+  const {
   repo, defaultBranch = 'main', exec = execFileSyncThrottled, env = process.env,
   checkClaim = pushRefusal, readCache = defaultReadCache, now = Date.now(),
-} = {}) {
+  } = options;
   const action = 'pull-request-push';
   const defer = (error) => ({ ok: false, action, deferred: true, error });
   let scratch;
   let stage = 'preflight';
-  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, killSignal: 'SIGKILL', env };
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 120000, killSignal: 'SIGKILL', env };
   try {
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo || '') || !Number.isSafeInteger(d?.prNumber)
       || !/^[a-f0-9]{40}$/.test(d?.headSha || '') || !d?.headRefName?.startsWith('lane/')) {
@@ -63,7 +59,7 @@ export function pushMissingRunCommit(d, {
     if (pr.mergeable !== true) return defer(pr.mergeable === false ? 'PR has merge conflicts; conflict repair must run first' : 'PR mergeability is unknown; retry after GitHub recalculates');
     const claim = () => checkClaim({ repo, branch: d.headRefName });
     const held = claim();
-    if (held) return defer(held.message);
+    if (held !== null) return defer(held?.message || 'fix claim held or unreadable; needs human/ci-heal inspection');
     stage = 'credential';
     // Prefer the repo OWNER's own installation token (xgq539z) so a plateauapp/frontier-ui PR is pushed with
     // an identity that can write to it, even when the daemon's env token belongs to another org.
@@ -72,6 +68,22 @@ export function pushMissingRunCommit(d, {
     // An ineligible credential is structural (config, not a race): count it so the per-sha cap hands the PR
     // off instead of re-planning it every tick forever.
     if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, action, error: MISSING_RUN_CREDENTIAL_REFUSAL };
+    // Explicit admission inputs opt into the full contract. Presence (even an
+    // undefined value) matters: incomplete inputs must fail closed. Legacy
+    // callers without these inputs retain their existing writer checks.
+    if (['recoveryEvidence', 'attemptsForSha', 'attemptsForPr', 'maxRetriesPerSha', 'maxRetriesPerPr']
+      .some(key => Object.hasOwn(options, key))) {
+      const admission = recoveryPreflight({ ...options, repo, head: d.headSha, headRefName: d.headRefName,
+        defaultBranch, claimed: false, token,
+        env: ownerToken ? { ...env,
+          WE_GH_AUTH_INSTALLATION: String(installationForOwner(ownerOfSlug(repo), env)),
+          WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(token).digest('hex'),
+        } : env,
+        pr: { state: pr.state, baseRefName: pr.base.ref, isCrossRepository: false,
+          mergeable: 'MERGEABLE', headRefOid: pr.head.sha, headRefName: pr.head.ref },
+      });
+      if (!admission.allow) return defer(admission.reason);
+    }
     scratch = mkdtempSync(join(tmpdir(), 'we-missing-run-'));
     // Pin git to the credential just validated, overriding stored helpers and auth
     // headers. The secret is only in the child environment, never argv or logs.
@@ -94,7 +106,7 @@ export function pushMissingRunCommit(d, {
       'commit-tree', tree, '-p', d.headSha, '-m', `ci: recover missing PR checks\n\n${RECOVERY_COMMIT_MARKER} ${d.headSha}`);
     if (!/^[a-f0-9]{40}$/.test(newHeadSha)) throw new Error('invalid commit');
     const heldAtPush = claim();
-    if (heldAtPush) return defer(heldAtPush.message);
+    if (heldAtPush !== null) return defer(heldAtPush?.message || 'fix claim held or unreadable; needs human/ci-heal inspection');
     stage = 'push';
     git('push', `--force-with-lease=${ref}:${d.headSha}`, remote, `${newHeadSha}:${ref}`);
     return { ok: true, action, newHeadSha };
