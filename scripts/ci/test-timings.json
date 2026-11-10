@@ -1711,6 +1711,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/clone-single-owner-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
   "scripts/conveyor/soak/breaks/stall-sweep-informational-refusal.soak.test.mjs": 2,
