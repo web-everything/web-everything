@@ -794,6 +794,8 @@ export function appendVerifyRemoteReport(env, result) {
 /** R324: old Forge runners omit limits; their operator setting is the bounded fallback. */
 export function resolveRemoteSlotUnits({policy, kind, telemetry, priority = false}) {
   const r = policy.settings.remote;
+  // Only elastic kinds read telemetry; a concurrent health refresh that cached a failed read must not strand the rest.
+  if (!['FULL', 'soak', 'standards'].includes(kind)) return {units: 1, source: 'default'};
   if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0) throw new Error('Unreadable run count');
   // An explicitly unreadable limits report must never turn into the legacy setting fallback.
   let auto = r.autoSlotUnits, source = 'setting';
