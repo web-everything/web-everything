@@ -17,7 +17,7 @@
  * path citation, the shape #883 and the #2978 Grounding filter both REQUIRE — through the same path and
  * asserts it passes. A gate that blocks correct authorship is a gate that gets turned off.
  *
- * THE MARKER IS SYNTHETIC. `sk-SYNTHETIC0000TESTMARKERNOTREAL` was never issued by any service and matches
+ * THE MARKER IS SYNTHETIC. the synthetic marker (see fixtures/sample-strings.mjs) was never issued by any service and matches
  * no live credential; it is shaped only to trip the `sk-`-prefix rule. No real secret appears in this repo.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -26,12 +26,13 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync,
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SYNTHETIC_MARKER } from './fixtures/sample-strings.mjs';
 
 const SCRIPTS = dirname(dirname(fileURLToPath(import.meta.url))); // .../scripts
 const ROOT = dirname(SCRIPTS);
 
 /** The one marker every real-path test writes. Obviously synthetic — never a live credential. */
-const MARKER = 'sk-SYNTHETIC0000TESTMARKERNOTREAL';
+const MARKER = SYNTHETIC_MARKER;
 /** Ordinary, correct authorship: a `we:`-prefixed citation. Must pass every gate. */
 const CLEAN = 'Grounded in we:scripts/lib/secret-scrub.mjs — the pure publish-seam detector.';
 

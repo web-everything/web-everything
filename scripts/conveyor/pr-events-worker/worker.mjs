@@ -41,7 +41,7 @@ export class PrEventLog extends DurableObject {
     this.log = createEventLog(this.storageAdapter);
   }
   append(record, now) { return this.log.append(record, now); }
-  readPrs(cursor, limit) { return this.log.readPrs(cursor, limit); }
+  readPrs(cursor, limit, now) { return this.log.readPrs(cursor, limit, now); }
   bootstrap(input, now) { return this.log.bootstrap(input, now); }
   touch(now) { return this.log.touch(now); }
   read(cursor, limit) { return this.log.read(cursor, limit); }

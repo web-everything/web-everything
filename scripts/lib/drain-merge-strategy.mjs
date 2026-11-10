@@ -38,7 +38,7 @@ import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { labelSignature } from './drain-prestage.mjs';
-import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
@@ -362,13 +362,13 @@ export function createDrainMergeStrategy({
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();
         if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
-        const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha, live.reviews);
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
           standingRuling: grantScopeFor(c, headSha, pages.flat()) });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
-    enqueue(c, headSha, { comments = null, prepared = null } = {}) {
+    enqueue(c, headSha, { comments = null, prepared = null, sameHeadAdmission } = {}) {
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
@@ -396,7 +396,7 @@ export function createDrainMergeStrategy({
       let deadlineOverride = false;
       // Head-bound file preparation is reusable; authorization evidence is always live.
       if (safety.value.waitForRedTeamBeforeEnqueue) {
-        const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         const pending = before.redTeamPending?.[key];
         const sameHead = pending?.headSha === headSha;
         const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
@@ -413,6 +413,7 @@ export function createDrainMergeStrategy({
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
+        evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha, live.reviews);
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
         try {
           const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
@@ -453,7 +454,10 @@ export function createDrainMergeStrategy({
           // (all read by redTeamEnqueueHold above), or a card-only diff that owes no pass. Never a timed bypass.
           const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
           const source = deadline.sources?.deadlineAction ?? 'standard';
-          const missing = !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          // Unknown run evidence (`ok:false`, e.g. a capped scan) is never "missing": a run may exist past the cap, so
+          // it neither re-requests nor reaches the operator override; it holds below with its reason named.
+          const unknown = evidence.ok === false;
+          const missing = !unknown && !evidence.inFlight && !evidence.queued && !evidence.recorded;
           if (missing && deadlineAction === 'requeue-then-hold') {
             // The one re-request for this head gets its own full wait before the operator is asked.
             if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
@@ -480,7 +484,7 @@ export function createDrainMergeStrategy({
             const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
               : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
               : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
-              : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
+              : unknown ? `run evidence unknown (${evidence.reason})` : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
             const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
             if (wait.deadlineHeldAt == null) {
               wait.deadlineHeldAt = now();
@@ -563,7 +567,7 @@ export function createDrainMergeStrategy({
           return commented && labelled;
         } });
       if (poison) return poison;
-      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec,
+      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
         humanOnlyLicense: () => {
           const setting = resolveApprovalLicensesEnqueue({ env, readFile });
           say(`  human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
@@ -573,6 +577,7 @@ export function createDrainMergeStrategy({
         },
         ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
+        if (r.reason === 'mq-same-head-failed') return { enqueued: false, kind: 'mq-same-head-failed', reason: r.error };
         if (r.humanOnly) {
           void appendDaemonEvent({ kind: 'needs-you', repo: slugOf(c.repo), pr: c.num, daemon: 'drain',
             detail: `Operator must re-approve the current head or queue it: ${r.licenseReason || r.error}` }, { env }).catch(() => {});

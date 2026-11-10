@@ -22,9 +22,9 @@
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
 import { renderOperatorSendBackBrief, renderOperatorSendBackReviewBlock } from './operator-send-backs.mjs';
-import { readReferralRecords, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
+import { readReferralRecords, referralRecheck, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
 import { isRestackOf } from './restack-equivalence.mjs';
-import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { JUDGE_ACTOR, OPERATOR_LOGINS, isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
 export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
@@ -71,6 +71,20 @@ function currentRecords(snaps, head) {
   const latest = new Map();
   for (const s of snaps) if (s.record.head === head && s.record.attempted) latest.set(s.record.runId, s);
   return [...latest.values()];
+}
+
+/** Carries are evidence to re-check, never proof that a run re-confirmed the finding on this head. */
+const reproducedOnHead = (record, key) => (record.verified ?? []).some((v) => v?.key === key && v.outcome === 'reproduced');
+const unverifiedFromRecords = (records, merelyPending = () => true) => records.flatMap(({ record }) => record.referrals.flatMap((f) => {
+  const recheck = referralRecheck(record, f.key);
+  return recheck && !reproducedOnHead(record, f.key) && merelyPending(record, f.key) ? [{ finding: findingView(f), runId: record.runId, priorHead: recheck.fromHead ?? null }] : [];
+}));
+
+/** Current-head re-check carries, including append-only `record.rechecks`, independent of prior rulings. */
+export function unverifiedOnHead(pr, _opts = {}) {
+  const head = String(pr?.headRefOid ?? '').toLowerCase();
+  if (!SHA.test(head)) return [];
+  return unverifiedFromRecords(currentRecords(recordSnapshots(pr?.comments, head), head));
 }
 
 /**
@@ -175,7 +189,7 @@ const isFindingBlock = (b) => b.source === 'record' || b.source === 'structured'
  * Confirmed findings on the current head that repeat a finding already ruled `block` on an earlier head.
  * `misses` = distinct heads, after the ruling, on which the finding came back (the current head included).
  * A ruling the operator wrote AFTER this head's record is a fresh ruling on it, not an ignored one.
- * @returns {null|{head:string, misses:number, escalate:boolean, sentBack:boolean, sentBackAt:?number, matches:Array<object>}}
+ * @returns {null|{head:string, misses:number, escalate:boolean, sentBack:boolean, sentBackAt:?number, matches:Array<object>, unverified:Array<object>}}
  */
 export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStalls = false,
   restackOf = (from, to) => isRestackOf({ fromHead: from, toHead: to }),
@@ -219,13 +233,19 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
   (Array.isArray(pr?.comments) ? pr.comments : []).forEach((c, index) => {
     const parsed = parseOperatorRulingComment(c);
     for (const x of parsed?.record?.rulings ?? []) {
+      if (parsed.record.actor === JUDGE_ACTOR && x.result !== 'block') continue;
+      // Structural parsing proves authorship, not current judge authority. Use
+      // the same authorized rows as the acceptance gate before retiring a hold.
+      if (parsed.record.actor === JUDGE_ACTOR && !operatorRulings.some(o =>
+        o.actor === JUDGE_ACTOR && o.head === parsed.record.head && o.runId === x.runId
+        && o.key === x.key && o.result === x.result && o.at === parsed.record.at)) continue;
       const ruled = allRecords.find((r) => r.runId === x.runId && r.head === parsed.record.head)?.referrals.find((f) => f.key === x.key);
       if (ruled) structured.push({ index, result: x.result, clearing: clearingView(ruled), supersedes: x.supersedes ?? [] });
       // An `auto-policy` structured `block` (review.referralDefault=auto-block) is a standing block like a reviewer's: the
       // same finding coming back on a later head is an ignored ruling, so a fixer that keeps missing escalates to the
       // operator instead of being auto-blocked forever. The operator's own structured blocks are NOT registered here
       // (operator mode is unchanged).
-      if (ruled && x.result === 'block' && String(parsed.record.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR) {
+      if (ruled && x.result === 'block' && [AUTO_POLICY_ACTOR, JUDGE_ACTOR].includes(String(parsed.record.actor ?? '').toLowerCase())) {
         blocks.set(`structured:${index}:${x.runId}:${x.key}`, { source: 'structured', rulingId: operatorRulingId({ head: parsed.record.head, runId: x.runId, key: x.key, at: parsed.record.at }),
           finding: findingView(ruled), clearing: clearingView(ruled), ruling: x.reason ?? parsed.record.reason, priorHead: parsed.record.head, index, at: sinceOf(c) });
       }
@@ -280,30 +300,15 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     const seen = snaps.find((s) => s.record.rulings.some((x) => x.id === ruling.id && x.result === 'not-real'));
     return seen ? seen.index : null;
   };
-  // PR #5762 @5eba5a13 (2026-10-21): a finding the reviewer only CARRIED onto this head for re-check (`recheck.fromHead`),
-  // and has not ruled here yet, did not "come back" when the head it was carried from ruled it not-real with evidence
-  // after the block: the latest ruling in that finding's own lineage is "fixed", so the old block is satisfied and the
-  // carried copy is simply pending its re-check (it still holds acceptance through the pending gate). A fresh re-raise
-  // (no `recheck`) or a re-check carried from a head that ruled it block, or left it open, still came back.
-  /** Thread position of the counted not-real-with-evidence ruling the re-check source head gave this finding, or null. */
-  const recheckClearanceAt = (f) => {
-    const from = String(f?.recheck?.fromHead ?? '').toLowerCase();
-    if (!SHA.test(from) || from === head) return null;
-    const latestOnFrom = new Map();
-    for (const s of snaps) if (s.record.head === from && s.record.referrals.some((x) => x.key === f.key)) latestOnFrom.set(s.record.runId, s);
-    let at = null;
-    for (const { record } of latestOnFrom.values()) {
-      const ruled = activeRulings(record, f.key);
-      if (!ruled.length) continue;
-      if (ruled.some((r) => r.result !== 'not-real')) return null; // any other standing ruling there: fail closed
-      const seen = notRealClearanceAt(record, f.key, from);
-      if (seen === null) return null;
-      at = at === null ? seen : Math.max(at, seen);
-    }
-    return at;
-  };
-
   const matches = [];
+  // A carry is unverified only while the finding is merely pending on this head: a ruling here (a reviewer's, or an
+  // auto-policy block) means a run looked at it again, and a `reproduced` verification re-confirms it outright.
+  const merelyPending = (record, key) => {
+    const hereState = gateState(record);
+    return !activeRulings(record, key).length && !!hereState && hereState.pending.includes(key) && !hereState.blocked.includes(key)
+      && !operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === key);
+  };
+  const unverified = unverifiedFromRecords(cur, merelyPending);
   const restacks = new Map();
   let worst = 0;
   for (const { record } of cur) {
@@ -311,6 +316,9 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     // against an earlier in-record block is a deliberate re-ruling of it.
     const rulingsHere = (key) => activeRulings(record, key);
     for (const f of record.referrals) {
+      // A carried re-check has no confirming run on this head, whatever its source head ruled.
+      // Keep it visible as unverified; the pending-findings gate still holds acceptance.
+      if (referralRecheck(record, f.key) && !reproducedOnHead(record, f.key) && merelyPending(record, f.key)) continue;
       const g = findingView(f);
       if (matches.some((m) => m.finding.key === g.key)) continue;
       if (rulingsHere(f.key).some((r) => r.result === 'block')) continue;
@@ -322,26 +330,19 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // auto-block on 166d067, the same finding re-raised on the fix head dfa0b5c and auto-blocked again; the fixer
       // found it already fixed, ended without a push, and was re-dispatched ~25 times with no escalation).
       if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key
-        && String(o.actor ?? '').toLowerCase() !== AUTO_POLICY_ACTOR)
+        && OPERATOR_LOGINS.includes(String(o.actor ?? '').toLowerCase()))
         || (record.carried ?? []).some((c) => c.key === f.key && c.result !== 'block'
           && carriedBackingHolds(c, { repo: record.repo, pr: record.pr, operatorRulings }))) continue;
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;
       const clearedAt = notRealClearanceAt(record, f.key);
-      // Only while the finding is still merely PENDING on this head: any ruling here (a reviewer's, or a structured
-      // auto-policy block outside `record.rulings`) means it was looked at again, and the ladder counts as before.
-      const hereState = gateState(record);
-      const stillPending = !rulingsHere(f.key).length && !!hereState && hereState.pending.includes(f.key) && !hereState.blocked.includes(f.key)
-        && !operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key);
-      const recheckClearedAt = stillPending ? recheckClearanceAt(f) : null;
       for (const c of blocks.values()) {
         if (c.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
         if (!matchesBlock(g, c)) continue;
         if (c.source === 'record' && rulingsHere(f.key).length) continue;
         if (overruled(c)) continue;
         if (isFindingBlock(c) && clearedAt !== null && clearedAt > c.index) continue; // satisfied, not came back
-        if (isFindingBlock(c) && recheckClearedAt !== null && recheckClearedAt > c.index) continue; // re-check pending, not came back
         if (!b || c.index > b.index) b = c;
       }
       if (!b) continue;
@@ -371,7 +372,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
   // A fixer that was sent back, ended, and left this head unchanged missed once more: the ladder counts it.
   const returns = fixerReturnsAfter(pr?.comments, sent, { countInfraStalls });
   const effective = worst + returns;
-  return { head, misses: worst, returns, effectiveMisses: effective, escalate: effective >= humanAt, sentBack: sent !== null, sentBackAt: sent, noticedRungs: noticedRungs(pr?.comments, head), matches };
+  return { head, misses: worst, returns, effectiveMisses: effective, escalate: effective >= humanAt, sentBack: sent !== null, sentBackAt: sent, noticedRungs: noticedRungs(pr?.comments, head), matches, unverified };
 }
 
 /** Leading text of the fix-end marker (`we:scripts/conveyor/fix-procedure.mjs#FIX_END_MARKER`; a test pins them equal). */
@@ -444,4 +445,5 @@ export function fixerRulingBrief({ matches, rung = null, source = null, items = 
 export const rulingDisputeText = (prNumber, ig, trail = '') => `PR #${prNumber}: ${ig.matches.length} confirmed finding(s) the operator ruled "block" came back on the new head `
   + (ig.returns ? `(${ig.misses} miss(es) after the ruling, and ${ig.returns} fixer turn(s) ended without a new head)` : `(${ig.misses} misses after the ruling)`)
   + ' — fixer and reviewer disagree; a person (or an arbiter) must decide.' + (trail ? ` Ladder so far: ${trail}.` : '') + ' '
-  + ig.matches.map((m) => `${where(m.finding)}`).join(', ');
+  + ig.matches.map((m) => `${where(m.finding)}`).join(', ')
+  + (ig.unverified?.length ? ` Unverified on head (not re-confirmed by a run on this head): ${ig.unverified.map((m) => where(m.finding)).join(', ')}.` : '');

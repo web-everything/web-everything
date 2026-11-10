@@ -22,7 +22,7 @@ const NOW = Date.parse('2026-10-22T13:00:00Z');
 const at = minutes => new Date(NOW - minutes * 60_000).toISOString();
 const facts = overrides => ({ number: 1, title: 'fixture', labels: [], headSha: SHA, round: 1, cap: 5,
   redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
-  openReferrals: [], openSendBacks: [], lastFixLoop: null, humanRequired: null,
+  suspendedReferralRun: null, openReferrals: [], openSendBacks: [], lastFixLoop: null, humanRequired: null,
   minutesSinceUpdate: 1, fixerRunning: false, inCi: false, owner: null, evidenceErrors: [], ...overrides });
 const pr = overrides => ({ number: 1, title: 'fixture $(touch sentinel)', headRefOid: SHA, baseRefOid: BASE, labels: [],
   updatedAt: at(1), createdAt: at(120), body: '<!-- authored-by-actor: author -->', author: { login: 'author' },
@@ -43,7 +43,7 @@ function fixture(overrides = {}) {
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const readComments = vi.fn(() => []);
   const shape = vi.fn(() => ({ humanRequired: false }));
-  const options = { gh, now: () => NOW, readLedgerRows: () => [], readFixRows: () => [],
+  const options = { findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: () => [], readFixRows: () => [],
     readJobs: () => [], readComments, cache: memoryCache(), shape, baseCap: 5, cardReadable: () => false, ...overrides };
   return { ...options, read: createJudgeSweepFactsReader(options) };
 }
@@ -220,7 +220,7 @@ describe('stall judgment reasons and compatibility', () => {
       { number: 3, round: 1, needsJudgment: false, reason: 'waiting for fixes', nextOwner: 'nobody' },
     ].map(row => ({ title: 'fixture', labels: row.number === 3 ? ['review:changes'] : [], headSha: SHA, cap: 5,
       redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
-      openReferrals: [], openSendBacks: [], lastFixLoop: null, humanRequired: null,
+      suspendedReferralRun: null, openReferrals: [], openSendBacks: [], lastFixLoop: null, humanRequired: null,
       minutesSinceUpdate: 1, evidenceErrors: [], ownerSince: 1,
       nextStep: expect.stringMatching(/^[^\r\n]+$/), ...row }));
     expect(buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs: old })).toEqual({
@@ -845,4 +845,10 @@ describe('declared CLI registration', () => {
       expect(JSON.parse(printed.lines[0])).toMatchObject({ counts: { needsJudgment: 0, noAction: 1 }, prs: [{ number: 1 }] });
     }
   });
+});
+
+it('R746 assigns suspended mandatory referrals to the judge with run and findings intact', () => {
+  const suspendedReferralRun = { runId: 'review-pr-held', ageMinutes: 3, findings: [{ key: 'k', summary: 'guard' }] };
+  expect(needsJudgment(facts({ suspendedReferralRun }))).toEqual({ needsJudgment: true, reason: 'suspended-referral-run' });
+  expect(buildJudgeSweepBundle({ prs: [facts({ suspendedReferralRun })] }).prs[0].suspendedReferralRun).toEqual(suspendedReferralRun);
 });

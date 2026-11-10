@@ -18,10 +18,12 @@ import { createFileItemReader } from '../file-item-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import * as operatorTaskModule from '../../backlog/operator-task.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 
 const brief = 'A bounded task.\n\n' + ['Design', 'MVP', 'Done when', 'Edge cases', 'Test plan', 'Proof plan']
   .map(h => `## ${h}\nConcrete handling in we:scripts/example.mjs.\n`).join('\n');
-const context = { existingIds: [], today: '2026-10-13', dir: '/repo/backlog',
+const context = { searchDuplicates: () => ({ backlog: [] }), existingIds: [], today: '2026-10-13', dir: '/repo/backlog',
   originMainSha: 'a'.repeat(40), operatorTask: { enabled: true }, sessionRole: 'orchestrator' };
 const input = { title: 'Operator task', kind: 'story', size: '1', scope: 'we:scripts/example.mjs',
   digest: brief, operatorTask: true };
@@ -103,6 +105,22 @@ describe('operator authority is not part of this feature (card xqqmw6g)', () => 
 });
 
 describe('operator task settings', () => {
+  it('cascades the duplicate threshold, rejecting invalid overrides and logging provenance', () => {
+    const resolved = resolveOperatorTaskSettings({
+      platform: { operatorTask: { duplicateThreshold: 0.4 } },
+      tool: { operatorTask: { duplicateThreshold: 2 } },
+    });
+    expect(resolved.value.duplicateThreshold).toBe(0.4);
+    expect(resolved.sources.duplicateThreshold).toBe('platform');
+    expect(resolved.invalid).toContain('tool.duplicateThreshold=2');
+    const lines = [];
+    const value = readOperatorTaskSettings({ env: { WE_POLICY_CASCADE_LOG: '1' },
+      platform: { operatorTask: { duplicateThreshold: 0.4 } },
+      tool: { operatorTask: { duplicateThreshold: 0.9 } }, log: line => lines.push(line) });
+    expect(value.duplicateThreshold).toBe(0.9);
+    expect(lines.join('\n')).toContain('duplicateThreshold=0.9 (tool)');
+  });
+
   it('resolves admission and post-build leaves together, retaining defaults for invalid overrides', () => {
     expect(resolveOperatorTaskSettings({
       platform: { operatorTask: { enabled: false, postBuild: { edgeLoad: false, report: false } } },
@@ -113,7 +131,7 @@ describe('operator task settings', () => {
         'postBuild.liveProof': 'tool', 'postBuild.report': 'tool' },
       invalid: ['tool.postBuild.edgeLoad="yes"'],
     });
-    expect(resolveOperatorTaskSettings().value).toEqual({ enabled: true,
+    expect(resolveOperatorTaskSettings().value).toEqual({ enabled: true, duplicateThreshold: 0.7,
       postBuild: { edgeLoad: false, liveProof: false, report: true } });
   });
   it('cascades valid leaves and logs their source', () => {

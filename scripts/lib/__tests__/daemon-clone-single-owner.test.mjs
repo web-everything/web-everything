@@ -59,27 +59,80 @@ describe('resolveCloneOwnership and owner heartbeat', () => {
     expect(ownership(['scripts/custom-owner.mjs'])).toMatchObject({ owner: true });
     expect(ownership(['review-daemon.mjs'])).toMatchObject({ owner: false });
   });
-  it('missing heartbeat fails closed to owner-stale-fallback', () => {
-    expect(ownership(['other.mjs'])).toMatchObject({ owner: true, reason: 'owner-stale-fallback' });
+  it('missing heartbeat elects the sole live sibling', () => {
+    expect(ownership(['other.mjs'])).toMatchObject({ owner: true, reason: 'owner-stale-elected' });
   });
   it('default heartbeat freshness ends exactly at fifteen minutes', () => {
     heartbeat(T - 15 * 60_000 + 1);
     expect(ownership(['other.mjs']).owner).toBe(false);
     heartbeat(T - 15 * 60_000);
-    expect(ownership(['other.mjs'])).toMatchObject({ owner: true, reason: 'owner-stale-fallback' });
+    expect(ownership(['other.mjs'])).toMatchObject({ owner: true, reason: 'owner-stale-elected' });
   });
   it('configured freshness and heartbeat refresh use injected time', () => {
     env.WE_DAEMON_CLONE_OWNER_STALE_MS = '100';
     heartbeat(T - 100);
-    expect(ownership(['other.mjs']).reason).toBe('owner-stale-fallback');
+    expect(ownership(['other.mjs']).reason).toBe('owner-stale-elected');
     heartbeat();
     expect(ownership(['other.mjs']).owner).toBe(false);
   });
-  it('unreadable heartbeat fails closed with the named fallback', () => {
+  it('unreadable legacy heartbeat elects a live sibling', () => {
     heartbeat();
     const file = onlyFile();
     rmSync(file); mkdirSync(file); // EISDIR even when the test runs as root.
-    expect(ownership(['other.mjs'])).toMatchObject({ owner: true, reason: 'owner-stale-fallback' });
+    expect(ownership(['other.mjs'])).toMatchObject({ owner: true, reason: 'owner-stale-elected' });
+  });
+});
+
+describe('deterministic fallback election and fencing', () => {
+  const beat = (key, nowMs = T) => lock.touchOwnerHeartbeat(root, { lockRoot, nowMs, key });
+  it('elects the lowest live stable key independent of heartbeat order or clock offsets', () => {
+    beat('z.mjs', T + 500); beat('a.mjs', T - 500);
+    expect(ownership(['z.mjs']).owner).toBe(false);
+    expect(ownership(['a.mjs']).owner).toBe(true);
+  });
+  it('rejects a previous epoch after takeover and never invokes its rebuild', async () => {
+    beat('z.mjs'); const old = ownership(['z.mjs']);
+    beat('a.mjs'); const next = ownership(['a.mjs']);
+    expect(next.epoch).toBeGreaterThan(old.epoch);
+    const rebuild = vi.fn();
+    expect(await lock.withCloneOwnership(root, old, rebuild, { lockRoot })).toMatchObject({ owner: false });
+    expect(rebuild).not.toHaveBeenCalled();
+  });
+  it('holds the election fence through a rebuild while leaving reader admission independent', async () => {
+    beat('z.mjs'); const lease = ownership(['z.mjs']);
+    const value = await lock.withCloneOwnership(root, lease, async () => {
+      beat('a.mjs');
+      expect(ownership(['a.mjs'])).toMatchObject({ owner: false, reason: 'owner-election-contended' });
+      expect(lock.acquireRead(root, { lockRoot, owner: 'reader' }).ok).toBe(true);
+      lock.releaseRead(root, { lockRoot, owner: 'reader' });
+      return 'rebuilt';
+    }, { lockRoot });
+    expect(value).toBe('rebuilt');
+    expect(ownership(['a.mjs']).epoch).toBeGreaterThan(lease.epoch);
+  });
+  it('missing daemon identity refuses election', () => {
+    expect(ownership([])).toMatchObject({ owner: false, reason: 'owner-key-missing' });
+  });
+  it.each(['{broken', JSON.stringify({ key: 'z.mjs', epoch: Number.MAX_SAFE_INTEGER, session: 'old' })])(
+    'unreadable or exhausted epoch evidence refuses election: %s', (contents) => {
+      const file = join(lock.cloneLockDirs(root, lockRoot).base, 'owner-lease.json');
+      mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, contents);
+      expect(ownership(['a.mjs'])).toMatchObject({ owner: false, reason: 'owner-election-unavailable' });
+    });
+  it('future configured-owner heartbeat is live only within thirty seconds of reader time', () => {
+    heartbeat(T + 30_000);
+    expect(ownership(['z.mjs']).owner).toBe(false);
+    heartbeat(T + 30_001);
+    expect(ownership(['z.mjs']).owner).toBe(true);
+  });
+  it('excludes a heartbeat beyond the bounded future skew', () => {
+    beat('a.mjs', T + 60_000);
+    expect(ownership(['z.mjs']).owner).toBe(true);
+  });
+  it('every sibling publishes its own candidacy even when the configured owner is live', () => {
+    heartbeat(); ownership(['z.mjs']);
+    expect(ownership(['a.mjs'], { nowMs: T + 15 * 60_000 }).owner).toBe(true);
+    expect(ownership(['z.mjs'], { nowMs: T + 15 * 60_000 }).owner).toBe(false);
   });
 });
 
@@ -282,10 +335,10 @@ describe('withSelfSync single owner', () => {
     nowMs += 1;
     await w.synced.tickOnce();
     expect(alert.mock.calls).toEqual([
-      ['clone-owner-stale', expect.objectContaining({ clone: 'wev-review-daemon', entry: 'other.mjs', reason: 'owner-stale-fallback' }), T],
-      ['clone-owner-stale', expect.objectContaining({ reason: 'owner-stale-fallback' }), T + 15 * 60_000],
+      ['clone-owner-stale', expect.objectContaining({ clone: 'wev-review-daemon', entry: 'other.mjs', reason: 'owner-stale-elected' }), T],
+      ['clone-owner-stale', expect.objectContaining({ reason: 'owner-stale-elected' }), T + 15 * 60_000],
     ]);
-    expect(log.error.mock.calls.filter(([line]) => line.includes('clone ownership=owner-stale-fallback'))).toHaveLength(2);
+    expect(log.error.mock.calls.filter(([line]) => line.includes('clone ownership=owner-stale-elected'))).toHaveLength(2);
   });
   it('failed stale-owner alert delivery does not freeze fallback or retry every tick', async () => {
     const alert = vi.fn(() => { throw new Error('sink unavailable'); });

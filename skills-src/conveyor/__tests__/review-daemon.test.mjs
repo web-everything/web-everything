@@ -1,5 +1,6 @@
 import { dispatchReview } from '../../../scripts/operations/review-dispatch.mjs';
 import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
+import { sweepAuthorStamps } from '../../../scripts/lib/author-stamp-restore.mjs';
 /**
  * @file skills-src/conveyor/__tests__/review-daemon.test.mjs
  * @description Unit proof of #3876's standalone Review daemon — the pure loop (mirrors #3870's own tests)
@@ -38,6 +39,13 @@ const sweepHumanSurfaceReparkMock = vi.fn(() => []);
 vi.mock('../../../scripts/conveyor/human-surface-repark.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   return { ...actual, sweepHumanSurfaceRepark: (...args) => sweepHumanSurfaceReparkMock(...args) };
+});
+// PR #6409 review: the author-stamp sweep shells real `gh` reads. The daemon and the real hold sweep both import
+// this one wrapper, so a test can prove the stamp sweep is reached through the unmocked hold sweep.
+const sweepAuthorStampsMock = vi.fn(() => []);
+vi.mock('../../../scripts/lib/author-stamp-restore.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, sweepAuthorStamps: (...args) => sweepAuthorStampsMock(...args) };
 });
 
 import {
@@ -871,6 +879,106 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(failed.deferredForHost).toBe(2);
   });
 
+  it.each([2, 3])('reserves a host start for red-team recovery before %i ordinary reviews owed', (owed) => {
+    const order = [];
+    let recoveryStartsAvailable;
+    const take = vi.fn();
+    const dispatch = vi.fn(({ pr }) => { order.push('ordinary'); return { agentId: `agent-${pr}` }; });
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      order.push('red-team');
+      recoveryStartsAvailable = capacity.remainingStarts;
+      if (capacity.remainingStarts < 1) return { dispatched: [] };
+      capacity.take();
+      capacity.remainingStarts--;
+      return { dispatched: [{ prNumber: 900, agentId: 'red-team' }] };
+    });
+    const out = runReviewTick({ reconcile: () => reviewsPlan(owed), dispatch, redTeamOnSkip,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2, take }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+    expect(recoveryStartsAvailable).toBeGreaterThanOrEqual(1);
+    expect(order).toEqual(['red-team', 'ordinary']);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.dispatched).toHaveLength(1);
+    const totalStarts = out.dispatched.length + out.redTeamOnSkip.dispatched.length;
+    expect(totalStarts).toBeLessThanOrEqual(2);
+    expect(take).toHaveBeenCalledTimes(totalStarts);
+  });
+
+  it.each([1, 2])('with maxPerTick=%i, ordinary keeps a start and recovery uses only a reserved start', (maxPerTick) => {
+    const order = [];
+    const dispatch = vi.fn(({ pr }) => { order.push('ordinary'); return { agentId: `agent-${pr}` }; });
+    const take = vi.fn();
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      order.push('red-team');
+      if (capacity.remainingStarts < 1) return { dispatched: [] };
+      capacity.take();
+      capacity.remainingStarts--;
+      return { dispatched: [{ prNumber: 900, agentId: 'red-team' }] };
+    });
+    const out = runReviewTick({ reconcile: () => reviewsPlan(2), dispatch, redTeamOnSkip,
+      hostAdmission: () => ({ admitted: true, maxPerTick, take }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(maxPerTick === 1 ? ['ordinary', 'red-team'] : ['red-team', 'ordinary']);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(maxPerTick - 1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.dispatched).toHaveLength(1);
+    expect(out.reviewsOwed).toBe(2);
+    expect(out.deferredForHost).toBe(1);
+    expect(out.dispatched.length + out.redTeamOnSkip.dispatched.length).toBe(maxPerTick);
+    expect(take.mock.calls).toEqual(Array.from({ length: maxPerTick }, () => [1]));
+  });
+
+  it('counts a red-team start exactly once after recovery throws and continues ordinary dispatch within host and lane bounds', () => {
+    // Exercise each bound independently; three reports of the same start must consume only one seat.
+    for (const [maxPerTick, lanes] of [[3, 5], [5, 3]]) {
+      const take = vi.fn();
+      const log = vi.fn();
+      const order = [];
+      const dispatch = vi.fn(({ pr }) => { order.push('ordinary'); return { agentId: `agent-${pr}` }; });
+      const redTeamOnSkip = vi.fn(({ capacity }) => {
+        order.push('red-team');
+        capacity.remainingStarts--;
+        capacity.lanes--;
+        capacity.take();
+        throw new Error('recovery failed after starting');
+      });
+      const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, redTeamOnSkip, log,
+        hostAdmission: () => ({ admitted: true, maxPerTick, take }), acquirableLanes: () => lanes,
+        tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      });
+      expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('red-team recovery failed'));
+      const ordinaryStarts = Math.min(maxPerTick - 1, lanes - 1);
+      expect(dispatch).toHaveBeenCalledTimes(ordinaryStarts);
+      expect(out.dispatched).toHaveLength(ordinaryStarts);
+      expect(out.dispatched.length).toBeLessThanOrEqual(maxPerTick - 1);
+      expect(out.dispatched.length + 1).toBeLessThanOrEqual(lanes);
+      expect(order).toEqual(['red-team', ...Array(ordinaryStarts).fill('ordinary')]);
+      expect(take).toHaveBeenCalledTimes(ordinaryStarts + 1);
+      expect(take.mock.calls).toEqual(Array.from({ length: ordinaryStarts + 1 }, () => [1]));
+    }
+  });
+
+  it('keeps host-start enforcement when lane capacity is unbounded and recovery starts nothing', () => {
+    // Default acquirableLanes is Infinity: Infinity - Infinity must not poison occupiedLanes with NaN.
+    for (const redTeamOnSkip of [vi.fn(() => ({ dispatched: [] })), vi.fn(() => { throw new Error('boom'); }), undefined]) {
+      const take = vi.fn();
+      const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+      const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, redTeamOnSkip, log: () => {},
+        hostAdmission: () => ({ admitted: true, maxPerTick: 2, take }),
+        tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+      // Recovery started nothing, so the whole host budget (2) is still available to ordinary reviews.
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      expect(out.dispatched).toHaveLength(2);
+      expect(take).toHaveBeenCalledTimes(2);
+    }
+  });
+
   it('host admission (verify-admission audit): one shared per-tick budget across repos, evaluated once', async () => {
     const { sharedHostBudget } = await import('../review-daemon.mjs');
     const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
@@ -1253,6 +1361,51 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(starved.pendingNotDispatched[0].reasons.join('\n')).toMatch(/no acquirable lane this tick \(0 acquirable\)/);
   });
 
+  it('refreshes the cap deferral reason to live 6 of 6 after four starts, rather than reporting the initial 2 of 6', () => {
+    const liveReviewBudget = { left: 4, live: 2, max: 6, reason: 'live review rounds 2 of maxLiveReviewRounds=6 (env)' };
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const prs = Array.from({ length: 5 }, (_, i) => ({ number: 100 + i, labels: ['review:pending'] }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, liveReviewBudget,
+      readPrs: () => prs, readAgents: () => [], tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(dispatch).toHaveBeenCalledTimes(4);
+    expect(out.dispatched).toHaveLength(4);
+    expect(liveReviewBudget.left).toBe(0);
+    expect(out.deferredForCap).toBe(1);
+    expect(out.pendingNotDispatched).toHaveLength(1);
+    const reasons = out.pendingNotDispatched.flatMap(p => p.reasons).join('\n');
+    expect(reasons).toContain('held by the live-review cap');
+    expect(reasons).not.toContain('live review rounds 2 of maxLiveReviewRounds=6');
+    expect(reasons).toContain('live review rounds 6 of maxLiveReviewRounds=6 (env)');
+    expect(out.deferredForCapReason).toContain('live review rounds 6 of maxLiveReviewRounds=6 (env)');
+  });
+
+  it('reports host start exhaustion with one review owed and live 2 of 6, never a live-review cap hold while capacity remains', () => {
+    const liveReviewBudget = { left: 4, live: 2, max: 6, reason: 'live review rounds 2 of maxLiveReviewRounds=6 (env)' };
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      if (capacity.remainingStarts < 1) return { dispatched: [] };
+      capacity.take();
+      capacity.remainingStarts--;
+      capacity.budget.left--;
+      return { dispatched: [{ prNumber: 900, agentId: 'red-team' }] };
+    });
+    const out = runReviewTick({ reconcile: () => reviewsPlan(2), dispatch, redTeamOnSkip, liveReviewBudget,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2 }),
+      readPrs: () => [{ number: 100, labels: ['review:pending'] }, { number: 101, labels: ['review:pending'] }], readAgents: () => [],
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(out.pendingNotDispatched).toHaveLength(1);
+    const reasons = out.pendingNotDispatched.flatMap(p => p.reasons).join('\n');
+    expect(reasons).toMatch(/host start budget|host admission/);
+    expect(reasons).not.toContain('held by the live-review cap');
+    expect(liveReviewBudget.left).toBe(2);
+    expect(out).toMatchObject({ deferredForHost: 1, deferredForCap: 0, deferredForCapReason: null });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(1);
+  });
+
   it('scarce review seats go main-fix first, then review:human / ready-to-merge, oldest first', async () => {
     const { orderReviewsForDispatch } = await import('../review-daemon.mjs');
     const reviews = [{ prNumber: 9 }, { prNumber: 8 }, { prNumber: 7 }, { prNumber: 6, mainFix: true }, { prNumber: 5 }];
@@ -1389,6 +1542,20 @@ describe('buildCliDaemonEffects.onTick — logs the exact pause line when authPa
 });
 
 describe('buildCliDaemonEffects.onTick — logs an accept carry-forward entry from the hold-reconcile sweep (card xu7kxtt)', () => {
+  it('logs stamp restore and refusal outcomes with their reasons and strips terminal controls', () => {
+    const lines = [];
+    const fx = buildCliDaemonEffects({ owner: 'o', log: { error: (l) => lines.push(l) }, reapSessions: () => null, runReview: () => ({}) });
+    fx.onTick({
+      repos: [{ repo: 'o/n' }], reviewsOwed: 0, dispatched: [], failed: [],
+      holdReconcile: [
+        { repo: 'o/n', num: 6244, stampRestore: 'restore', detail: { reason: 'history agrees' } },
+        { repo: 'o/n', num: 7, stampRestore: 'refuse', detail: { reason: 'unreadable\nedit\u001b' } },
+      ],
+    });
+    expect(lines).toContain('review-daemon: o/n#6244 author-stamp restore - history agrees');
+    expect(lines).toContain('review-daemon: o/n#7 author-stamp refuse - unreadable edit ');
+  });
+
   // PR #4631 round 5 (same class as the sweep call): the log line that makes a carry visible was wired with no test, so deleting it
   // left the daemon carrying clearances silently.
   it('logs the carry outcome, its detail and its error, one line per entry', () => {
@@ -1447,6 +1614,13 @@ describe('runReviewTick — reconcile itself is isolated (regression, #xvzwiew l
       holdReconcile: [], holdReconcileError: null,
     });
     expect(dispatch).not.toHaveBeenCalled(); // reconcile crashed before any PR was identified
+  });
+
+  it('a DEFERRED PR read is "owed unknown" on the reconcile-failed channel, never a silent 0 owed', () => {
+    const reconcile = vi.fn(() => ({ outcome: 'deferred-low-budget', deferred: true, message: 'author lookup throttled', dispatch: [], refusals: [], notes: [], prs: 0, agents: 0 }));
+    const out = runReviewTick({ reconcile, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(out.reviewsOwed).toBe(0);
+    expect(out.reconcileError).toMatch(/deferred.*owed unknown.*author lookup throttled/);
   });
 
   it('a successful reconcile still reports reconcileError: null (never undefined)', () => {
@@ -1626,7 +1800,8 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
       reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
       repo: 'web-everything/web-everything',
     });
-    expect(sweepHumanSurfaceReparkMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything' });
+    expect(sweepHumanSurfaceReparkMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', restoreStamps: sweepAuthorStamps });
+    expect(sweepReviewHoldLabelsMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', restoreStamps: sweepAuthorStamps });
     expect(r.holdReconcile.map((h) => h.num)).toEqual([5193, 7]);
     expect(r.holdReconcile[0].repark).toBe('reparked');
   });
@@ -1643,7 +1818,47 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
       reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
       holdReconcile, repo: 'plateauapp/plateau-app',
     });
-    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app' });
+    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app', restoreStamps: sweepAuthorStamps });
+  });
+
+  it('passes the stamp sweep to holdReconcile with shared reads', () => {
+    let listedPrs;
+    const holdReconcile = vi.fn(({ listPrs }) => { listedPrs = listPrs(); return []; });
+    const prs = [{ number: 6244, labels: [] }];
+    runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      holdReconcile, repo: 'o/n', readPrs: () => prs, readAgents: () => [],
+    });
+    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'o/n', restoreStamps: sweepAuthorStamps,
+      listPrs: expect.any(Function) });
+    expect(listedPrs).toBe(prs);
+  });
+
+  it('runs the stamp sweep exactly once through the real hold sweep on the shared-reads path', async () => {
+    const { sweepReviewHoldLabels: realSweep } = await vi.importActual('../../../scripts/conveyor/review-hold-reconcile.mjs');
+    // Only the hold sweep's GitHub-facing seams are hermetic; the daemon's own arguments pass through untouched.
+    sweepReviewHoldLabelsMock.mockImplementationOnce((opts) => realSweep({
+      provider: { currentRepo: () => 'o/n', readPrState: () => ({}), setLabels: () => {}, postComment: () => {} },
+      exec: () => '', numberingRestamp: () => null, readComments: () => [], acceptCarry: () => null,
+      settings: { referralDefault: 'operator' },
+      readPr: ({ number }) => ({ number, state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [], comments: [] }),
+      log: () => {}, ...opts,
+    }));
+    sweepAuthorStampsMock.mockClear();
+    sweepAuthorStampsMock.mockReturnValueOnce([
+      { num: 6244, action: 'restore', detail: { reason: 'history agrees' } },
+      { num: 6245, action: 'skip', detail: { reason: 'already stamped' } },
+    ]);
+    const r = runReviewTick({
+      reconcile: () => ({ dispatch: [], refusals: [] }), dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], repo: 'o/n',
+      readPrs: () => [{ number: 6244, labels: [] }, { number: 6245, labels: [] }], readAgents: () => [],
+    });
+    expect(sweepAuthorStampsMock).toHaveBeenCalledTimes(1);
+    expect(sweepAuthorStampsMock).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/n', dryRun: false }));
+    expect(r.holdReconcile.filter((h) => h.stampRestore)).toEqual([
+      { num: 6244, stampRestore: 'restore', detail: { reason: 'history agrees' } },
+    ]);
   });
 
   it('folds a real finding onto the tick result under `holdReconcile`', () => {
@@ -2371,7 +2586,9 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
     });
     dispatched.push(out.dispatched.length);
     if (conclusion !== 'success') {
-      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: expect.stringMatching(/^review-ci: required-checks-not-successful: daemon-soak=\w+$/) }]);
+      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: conclusion === 'failure'
+        ? 'review-ci: ci-red: daemon-soak=failure'
+        : 'review-ci: required-checks-not-successful: daemon-soak=pending' }]);
       expect(tagRound).not.toHaveBeenCalled();
       expect(spawnAgent).not.toHaveBeenCalled();
     }

@@ -4,7 +4,7 @@ import { buildClearedHumanMarker, buildReviewedShaMarker, parseLatestHumanCleare
 
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
-const clearance = sha => ({ author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('operator')}` });
+const clearance = sha => ({ id: 'IC_clearance', author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('operator')}` });
 const plan = extra => planHumanSurfaceRepark({ currentLabels: labels, files: ['.github/workflows/ci.yml'], headSha: head, comments: [], surfaces: 'narrow', ...extra });
 
 describe('human surface re-park plan', () => {
@@ -187,7 +187,7 @@ describe('human surface re-park sweep', () => {
     const readComments = vi.fn(() => {
       const snapshot = [...thread];
       // A ceremony lands after the complete read, beyond the state's first page.
-      thread.push({ id: 'C_clear', ...clearance(head) });
+      thread.push({ ...clearance(head), id: 'C_clear' });
       return snapshot;
     });
     f.provider.readPrState.mockImplementation(() => ({ ...f.state, comments: thread.slice(0, 100) }));
@@ -257,15 +257,15 @@ describe('human surface re-park sweep', () => {
   it('observes clearance added by editing an existing comment', () => {
     const f = fixture();
     const oldAcceptance = { id: 'C_existing', author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
-    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [{ id: 'C_existing', ...clearance(head) }] });
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [{ ...clearance(head), id: 'C_existing' }] });
     expect(f.run({ readComments: () => [oldAcceptance] })).toEqual([]);
     expect(f.calls).toEqual([]);
   });
   it('observes a new ceremony with the same body as an older, superseded clearance', () => {
     const f = fixture();
-    const oldClearance = { id: 'C_old', ...clearance(head) };
+    const oldClearance = { ...clearance(head), id: 'C_old' };
     const acceptance = { id: 'C_accept', author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
-    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [oldClearance, acceptance, { id: 'C_new', ...clearance(head) }] });
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [oldClearance, acceptance, { ...clearance(head), id: 'C_new' }] });
     expect(f.run({ readComments: () => [oldClearance, acceptance] })).toEqual([]);
     expect(f.calls).toEqual([]);
   });
@@ -287,7 +287,7 @@ describe('human surface re-park sweep', () => {
     const clear = () => {
       // The label-less clear-human ceremony: swap (accepted already live) then the trusted clearance comment.
       live.labels = [...new Set([...live.labels.filter(l => l !== 'review:human'), 'review:accepted'])];
-      live.comments.push({ id: 'C_clear', ...clearance(head) });
+      live.comments.push({ ...clearance(head), id: 'C_clear' });
       // A changes bounce after the ceremony carries no reviewed-sha marker, so the clearance stays "latest".
       if (bounce) live.labels = [...live.labels.filter(l => l !== 'review:accepted'), 'review:changes'];
     };
@@ -340,7 +340,7 @@ describe('human surface re-park sweep', () => {
     const park = { id: 'C_park', createdAt: PARK_AT, author: { login: 'web-everything' }, body: buildHumanSurfaceReparkComment({ headSha: head, hits: [] }) };
     // The park's own label write, seconds after its comment.
     const ownAdd = [{ event: 'labeled', label: 'review:human', createdAt: '2026-10-14T10:00:02Z' }];
-    function heal({ labels: l = ['review:human', 'ready-to-merge'], comments = [park, { id: 'C_clear', ...clearance(head) }], dryRun = false, headRefOid = head, events = ownAdd } = {}) {
+    function heal({ labels: l = ['review:human', 'ready-to-merge'], comments = [park, { ...clearance(head), id: 'C_clear' }], dryRun = false, headRefOid = head, events = ownAdd } = {}) {
       const live = { state: 'OPEN', headRefOid, labels: [...l], comments };
       const effects = [];
       const provider = {
@@ -369,7 +369,7 @@ describe('human surface re-park sweep', () => {
       expect(r.results).toEqual([{ num: 7, skipped: 'heal read failed: offline' }]);
     });
     it('keeps the hold when the park comment has no timestamp', () => {
-      const r = heal({ comments: [{ ...park, createdAt: undefined }, { id: 'C_clear', ...clearance(head) }] });
+      const r = heal({ comments: [{ ...park, createdAt: undefined }, { ...clearance(head), id: 'C_clear' }] });
       expect(r.effects).toEqual([]);
     });
     it('withdraws its own marked park beside a clearance of the live head', () => {
@@ -378,7 +378,7 @@ describe('human surface re-park sweep', () => {
       expect(r.results).toEqual([{ num: 7, repark: 'withdrawn', head, reason: 'healed a park that lost a race with a human clearance' }]);
     });
     it('withdraws a marked park beside review:accepted when the park marker is the last trusted comment', () => {
-      const r = heal({ labels: ['review:human', 'review:accepted'], comments: [{ id: 'C_clear', ...clearance(head) }, park] });
+      const r = heal({ labels: ['review:human', 'review:accepted'], comments: [{ ...clearance(head), id: 'C_clear' }, park] });
       expect(r.effects).toEqual([{ add: 'review:accepted', remove: ['review:human'] }]);
     });
     it('leaves review:human beside review:accepted when the clearance is last (a keep-clearance park may not have commented yet)', () => {
@@ -387,7 +387,7 @@ describe('human surface re-park sweep', () => {
     });
     it('withdraws a mechanical-hold hand-off park whose own re-check never ran', () => {
       const handoff = { id: 'C_handoff', createdAt: PARK_AT, author: { login: 'web-everything' }, body: `🧑‍⚖️ review — mechanical hold handed to the operator\n\n<!-- mechanical-hold-handoff: ${head} -->` };
-      const r = heal({ comments: [{ id: 'C_clear', ...clearance(head) }, handoff] });
+      const r = heal({ comments: [{ ...clearance(head), id: 'C_clear' }, handoff] });
       expect(r.live.labels).toContain('review:accepted');
       expect(r.live.labels).not.toContain('review:human');
     });
@@ -405,11 +405,11 @@ describe('human surface re-park sweep', () => {
       expect(r.results).toEqual([{ num: 7, repark: 'would-withdraw', head }]);
     });
     it.each([
-      ['no marker (another park)', { comments: [{ id: 'C_clear', ...clearance(head) }] }],
-      ['a marker for an older head', { comments: [{ ...park, body: buildHumanSurfaceReparkComment({ headSha: 'b'.repeat(40), hits: [] }) }, { id: 'C_clear', ...clearance(head) }] }],
-      ['an untrusted marker', { comments: [{ ...park, author: { login: 'outsider' } }, { id: 'C_clear', ...clearance(head) }] }],
+      ['no marker (another park)', { comments: [{ ...clearance(head), id: 'C_clear' }] }],
+      ['a marker for an older head', { comments: [{ ...park, body: buildHumanSurfaceReparkComment({ headSha: 'b'.repeat(40), hits: [] }) }, { ...clearance(head), id: 'C_clear' }] }],
+      ['an untrusted marker', { comments: [{ ...park, author: { login: 'outsider' } }, { ...clearance(head), id: 'C_clear' }] }],
       ['no clearance of the live head', { comments: [park, { id: 'C_clear', ...clearance('b'.repeat(40)) }] }],
-      ['a later trusted comment (another hold may have re-added review:human)', { comments: [park, { id: 'C_clear', ...clearance(head) }, { id: 'C_rearm', author: { login: 'web-everything' }, body: '🔁 review re-armed' }] }],
+      ['a later trusted comment (another hold may have re-added review:human)', { comments: [park, { ...clearance(head), id: 'C_clear' }, { id: 'C_rearm', author: { login: 'web-everything' }, body: '🔁 review re-armed' }] }],
       ['a review:changes bounce', { labels: ['review:human', 'review:changes'] }],
       ['a mechanical hold', { labels: ['review:human', 'review:held-mechanical'] }],
     ])('leaves the hold with %s', (_name, extra) => {

@@ -24,6 +24,7 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node
 import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveFixDispatchMaxConcurrent, isPidAlive } from '../lib/dispatch-throttle.mjs';
@@ -34,7 +35,7 @@ import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import {
-  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, awaitPassRunner, releaseOnCompletion,
+  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, classifyStaleOwed, classifyUnwakeableWait, awaitPassRunner, releaseOnCompletion,
 } from './fixer-slot-rules.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -92,16 +93,65 @@ export function defaultSlotCountedFixClaims({
 
 // ── the cycle ────────────────────────────────────────────────────────────────────────────────────────────────
 
+const resumeMisses = new Map();
+
 /**
  * The verify-verdict pass, R3-gated. Off → one pass exactly as today. On → phase A pushes and records the owed wake-up
  * without waking anyone; phase B wakes only the admitted resumes (oldest first). Deferred ones keep their pending
  * resume on disk and their reserved slot (R2). Every effect is the pass's own (injectable `runPass`, `io`).
  */
-export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap }) {
+export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap, log = console.log }) {
   if (!settings.parkedReleasesSlot || !allowResume) return runPass({ io, allowResume, nowMs, ttlMs });
+  const beforeA = new Map(structuredClone(io.listRecords()).map(({ key, record }) => [key, record]));
   const a = await runPass({ io, allowResume: false, nowMs, ttlMs });
-  const records = io.listRecords();
-  const owedFix = records.filter(({ record: r }) => r?.pendingResume?.kind && SLOT_KINDS.has(r.kind));
+  // Detach the snapshot so even an in-place update during a PR read is detectable.
+  const allRecords = structuredClone(io.listRecords());
+  const allOwed = allRecords.filter(({ record: r }) => r?.pendingResume?.kind && SLOT_KINDS.has(r.kind));
+  const prFacts = new Map();
+  const states = new Map(); // At most one state read per distinct owed PR per pass.
+  for (const { key, record } of allOwed) {
+    const id = JSON.stringify([record.repo, record.pr]);
+    if (!states.has(id)) {
+      try { states.set(id, await io.prState?.(record.repo, record.pr) ?? null); }
+      catch { states.set(id, null); }
+    }
+    prFacts.set(key, states.get(id));
+  }
+  const stale = new Set(classifyStaleOwed({ owed: allOwed, prFacts, records: allRecords, nowMs }));
+  const cleared = [];
+  for (const { key, record } of allOwed) if (stale.has(key)) {
+    try {
+      // PR reads can yield while a worker re-marks this key. Never clear that replacement.
+      const current = io.listRecords().find(e => e.key === key)?.record;
+      if (!current?.pendingResume?.kind || !isDeepStrictEqual(current, record)) continue;
+      // The store also compares after atomically moving the file; leave the lane-local waiter alone.
+      if (typeof io.clearStoredRecordIf === 'function' && (await io.clearStoredRecordIf(key, record))?.cleared === true) cleared.push(key);
+    } catch { /* Failed cleanup must not reserve admission capacity or stop live resumes. */ }
+  }
+  // Trust the pass's verdicts: other waits can still wake and must retain admission.
+  const unwakeable = new Map();
+  for (const row of a.rows ?? []) {
+    const reason = classifyUnwakeableWait(row);
+    // A verdict binds to the exact record phase A read; a record re-marked since is a new one and keeps admission.
+    const now = allOwed.find((e) => e.key === row.key)?.record;
+    // Re-read after the PR-state reads too: a re-mark during them replaces the record the verdict was about.
+    const live = io.listRecords().find((e) => e.key === row.key)?.record;
+    if (reason && now && beforeA.has(row.key) && isDeepStrictEqual(beforeA.get(row.key), now) && isDeepStrictEqual(live, now)) unwakeable.set(row.key, reason);
+  }
+  const excluded = [];
+  for (const { key, record } of allOwed) {
+    const reason = stale.has(key) ? 'stale' : prFacts.get(key)?.open === false ? 'closed-pr' : unwakeable.get(key);
+    if (!reason) continue;
+    excluded.push({ key, reason });
+    log(`await-verify: excluded from fix-slot admission ${key} (pr #${record.pr}): ${reason}`);
+  }
+  // Exclusion itself never clears the retained repair inventory.
+  const skipped = new Set(excluded.map(({ key }) => key));
+  const records = allRecords.filter(({ key }) => !skipped.has(key));
+  const owedFix = allOwed.filter(({ key }) => !skipped.has(key));
+  const owedKeys = new Set(owedFix.map(({ key }) => key));
+  for (const key of resumeMisses.keys()) if (!owedKeys.has(key)) resumeMisses.delete(key);
+  // Keep every claim: without a retained wait, its worker conservatively counts as active.
   const activeCount = claimStates(claims, records, { nowMs, ttlMs }).filter((x) => x.state === 'active').length;
   const { admit, defer } = admitResumes({
     owed: owedFix.map(({ key, record }) => ({ key, requestedAtMs: ms(record.requestedAt) })), activeCount, cap, parkedReleasesSlot: true,
@@ -109,21 +159,44 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const deferred = new Set(defer);
   const wake = records.filter(({ key, record }) => record?.pendingResume?.kind && !deferred.has(key));
   const wakeKeys = new Set(wake.map((e) => e.key));
+  const order = new Map(admit.map((key, i) => [key, i]));
   const b = wake.length
-    ? await runPass({ io: { ...io, listRecords: () => io.listRecords().filter((e) => wakeKeys.has(e.key)), listSalvage: undefined }, allowResume: true, nowMs, ttlMs })
+    ? await runPass({ io: { ...io, listRecords: () => io.listRecords().filter((e) => wakeKeys.has(e.key))
+      .sort((x, y) => (order.get(x.key) ?? admit.length) - (order.get(y.key) ?? admit.length)), listSalvage: undefined }, allowResume: true, nowMs, ttlMs })
     : { rows: [] };
+  const pending = new Set(io.listRecords().filter(({ record }) => record?.pendingResume?.kind).map(({ key }) => key));
+  for (const key of admit) {
+    if (pending.has(key)) resumeMisses.set(key, (resumeMisses.get(key) ?? 0) + 1);
+    else resumeMisses.delete(key);
+  }
   // Phase A answers `resume-paused` (allowResume:false) for every record it would have woken; that word is not shown.
   // A record pushed in phase A keeps its push row, with the phase-B wake (or the deferral) appended to its result.
   const pushedA = (r) => (r.result && r.result !== 'resume-paused' ? `${r.result}; ` : '');
-  const rows = (a.rows ?? []).filter((r) => !wakeKeys.has(r.key) && !deferred.has(r.key));
+  const rows = (a.rows ?? []).filter((r) => !skipped.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
+  for (const { key, record } of allOwed) {
+    if (unwakeable.get(key) === 'resume-exhausted') {
+      rows.push({ key, pr: record.pr, who: record.who, action: 'resume', reason: 'resume-exhausted-excluded',
+        result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)' });
+    } else if (prFacts.get(key)?.open === false && !stale.has(key)) {
+      rows.push({ key, pr: record.pr, who: record.who, action: 'resume',
+        reason: 'closed-pr-inventory-held', result: 'closed PR, failure inventory held' });
+    }
+  }
   for (const r of a.rows ?? []) {
-    if (deferred.has(r.key)) rows.push({ ...r, action: 'resume', reason: 'fix-slot-full', result: `${pushedA(r)}resume-deferred (fix slot full, ${activeCount} working ≥ cap ${cap})` });
+    if (deferred.has(r.key)) {
+      const record = owedFix.find(e => e.key === r.key)?.record;
+      const owedAhead = owedFix.filter(e => ms(e.record.requestedAt) < ms(record?.requestedAt)).length;
+      rows.push({ ...r, action: 'resume', reason: 'fix-slot-full', result: `${pushedA(r)}resume-deferred (fix slot full: ${owedAhead} owed ahead, ${admit.length} admitted, ${activeCount} working, cap ${cap})` });
+    }
   }
   for (const r of b.rows ?? []) {
     const before = (a.rows ?? []).find((x) => x.key === r.key && pushedA(x));
-    rows.push(before ? { ...r, action: before.action, reason: before.reason, result: `${pushedA(before)}${r.result}` } : r);
+    const row = before ? { ...r, action: before.action, reason: before.reason, result: `${pushedA(before)}${r.result}` } : { ...r };
+    const misses = order.has(r.key) ? resumeMisses.get(r.key) ?? 0 : 0;
+    if (misses >= 3) row.result = `${row.result}; missed ${misses}x`;
+    rows.push(row);
   }
-  return { rows, admitted: admit, deferred: defer };
+  return { rows, admitted: admit, deferred: defer, cleared, excluded };
 }
 
 const latestFinite = (list) => { const ok = list.filter(Number.isFinite); return ok.length ? Math.max(...ok) : null; };

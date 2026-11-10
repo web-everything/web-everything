@@ -1,5 +1,7 @@
+import { resolveMechanicalCarrySetting } from './human-clearance-mechanical-carry-setting.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 import { proposeHumanRequired } from './direction-aware-human.mjs';
+import { resolveReviewCareExemptPaths, validateCareExemptPaths, matchesCareExemptPath, isProtectedCarePath } from './review-care-exempt-paths.mjs';
 /**
  * review-escalation.mjs — the DETERMINISTIC drain review-escalation rubric (#2171, under #2162).
  *
@@ -25,7 +27,17 @@ import { POLICY_THRESHOLDS, POLICY_VERSION, POLICY_DIGEST } from './review-polic
 // #4140 — the shared trusted-author gate every coverage-deciding marker reader (`parseReviewedSha`,
 // `parseReviewedDiff`, `parseReviewedContribution`, `parseLatestHumanClearedSha`) now runs every comment through
 // before matching its marker, closing the residual `marker-authorship.mjs`'s own header named as a follow-up.
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isTrustedMarkerAuthor, OPERATOR_LOGINS } from './marker-authorship.mjs';
+
+// Restated from operator-identity.mjs#isHumanOperatorComment, deliberately not imported: operator-identity.mjs imports
+// red-team-gate.mjs, which imports this module, so importing it here is a cycle that leaves red-team-gate's
+// REVIEWED_SHA_MARKER in its temporal dead zone at load. Keep the two definitions identical.
+function isHumanOperatorComment(c) {
+  const a = typeof c === 'string' ? null : (c?.author ?? c?.user);
+  const login = String((typeof c === 'string' ? '' : (c?.author?.login ?? c?.user?.login)) ?? '').toLowerCase();
+  return login.length > 0 && String(a?.type ?? '') !== 'Bot' && !login.includes('[bot]')
+    && a?.is_bot !== true && OPERATOR_LOGINS.includes(login);
+}
 
 /** Shared operation identity; core consumers must not import operation declarations. */
 export const REVIEW_PR_OP_ID = 'review-pr';
@@ -46,7 +58,7 @@ const isQuotedHtmlBlock = (t) => t.type === 'html_block' && /<(?:pre|code)[\s>]/
 const md = new MarkdownIt({ html: true });
 // #x169fqe — the transient lane bookkeeping the reviewed-diff fingerprint excludes, imported rather than
 // re-spelled so the fingerprint and the rebase-drop pass that removes the file can never disagree on its name.
-import { LANE_MANIFEST } from './rebase-drop-manifest.mjs';
+import { isMechanicalDiffSection } from './transient-paths.mjs';
 
 // Keep the forge port independent of the policy graph (which imports the fix-procedure caller).
 import { REVIEW_LABELS } from './review-labels.mjs';
@@ -516,17 +528,33 @@ export function deriveCareLevel({ signals = {}, humanRequired = false } = {}) {
  */
 export function plainDiffPath(entry) {
   if (typeof entry !== 'string' || !entry) return entry;
+  const sides = diffPathSides(entry);
+  return sides[sides.length - 1];
+}
+
+/**
+ * ONE numstat display entry → its plain paths: `[old, new]` for a rename, `[path]` otherwise. Same decoding as
+ * `plainDiffPath` (which returns the last element). A rule that must hold for a file wherever it moved — e.g.
+ * "guard, egress and trust-chain files always contribute review care" — checks EVERY side, so renaming a
+ * protected file into an exempt location cannot drop it (#6433 review).
+ * @param {string} entry one `parseNumstat` changed-file entry
+ * @returns {string[]} the plain old and new paths (one element when not a rename)
+ */
+export function diffPathSides(entry) {
+  if (typeof entry !== 'string' || !entry) return [entry];
   // Quoted rename: git quotes each SIDE in full and never uses the brace form when quoting is needed.
   const quotedRename = entry.match(/^(".*")\s=>\s(".*")$/);
-  if (quotedRename) return unquoteGitPath(quotedRename[2]);
+  if (quotedRename) return [unquoteGitPath(quotedRename[1]), unquoteGitPath(quotedRename[2])];
   // Compact brace rename — `<prefix>{<old> => <new>}<suffix>`; either side may be empty. Non-greedy on the old
   // side so the FIRST `{…}` group wins (git emits at most one).
   const braced = entry.match(/^(.*?)\{(.*?) => (.*?)\}(.*)$/);
-  if (braced) return collapseSlashes(`${braced[1]}${braced[3]}${braced[4]}`);
+  if (braced) {
+    return [collapseSlashes(`${braced[1]}${braced[2]}${braced[4]}`), collapseSlashes(`${braced[1]}${braced[3]}${braced[4]}`)];
+  }
   // Plain rename (no quoting, no common prefix/suffix). See the residual above for the ` => `-in-path case.
   const idx = entry.indexOf(' => ');
-  if (idx !== -1) return unquoteGitPath(entry.slice(idx + 4));
-  return unquoteGitPath(entry);
+  if (idx !== -1) return [unquoteGitPath(entry.slice(0, idx)), unquoteGitPath(entry.slice(idx + 4))];
+  return [unquoteGitPath(entry)];
 }
 
 // `dir/{sub => }/thing.md` → `dir/` + `` + `/thing.md` → `dir//thing.md`; git's own rendering of the same
@@ -682,6 +710,32 @@ export function parseDeviationDisclosure(body) {
   return text === '' ? '(no reason provided)' : text;
 }
 
+/** Count additions/deletions only from complete unified hunks; missing/truncated evidence cannot reduce care. */
+function changedLineCount(section) {
+  if (typeof section !== 'string') return null;
+  let oldLeft = 0, newLeft = 0, count = 0, seen = false;
+  for (const line of section.split('\n')) {
+    const header = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (header) {
+      if (oldLeft || newLeft) return null;
+      oldLeft = Number(header[2] ?? 1);
+      newLeft = Number(header[4] ?? 1);
+      seen = true;
+    } else if (seen && (oldLeft || newLeft)) {
+      if (line.startsWith('+')) { newLeft--; count++; }
+      else if (line.startsWith('-')) { oldLeft--; count++; }
+      else if (line.startsWith(' ')) { oldLeft--; newLeft--; }
+      else if (!line.startsWith('\\')) return null;
+      if (oldLeft < 0 || newLeft < 0) return null;
+    }
+  }
+  // A present section with no hunk at all (binary, pure rename, mode-only, empty new file) changes no counted
+  // line — numstat reports 0 or `-` for it. The caller's total-equality check still refuses a section that
+  // was truncated before its first hunk.
+  if (!seen) return section.split('\n').some(line => line.startsWith('@@')) ? null : 0;
+  return !oldLeft && !newLeft ? count : null;
+}
+
 export function scoreEscalation({
   changedFiles = [],
   diffLines = 0,
@@ -696,6 +750,7 @@ export function scoreEscalation({
   basisNarrowed = true,
   deviation = null,
   humanSurfaces,
+  careExemptPaths = resolveReviewCareExemptPaths().value,
   readOnlyOps = new Set(),
   directionAwareLive = false,
 } = {}) {
@@ -725,7 +780,29 @@ export function scoreEscalation({
   const ownFiles = Array.isArray(changedFiles) ? changedFiles : [];
   // The CUMULATIVE list, exactly as supplied — this and only this is the hunks' basis (#2890 finding 4 below).
   const cumulativeFiles = Array.isArray(humanBasisFiles) ? humanBasisFiles : ownFiles;
-  const basisFiles = unionPaths(cumulativeFiles, ownFiles);
+  const gateBasis = unionPaths(cumulativeFiles, ownFiles);
+  // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
+  const fileHunksOf = fileHunksResolver(diffHunks);
+  const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
+  // Protected rules are judged on EVERY side of an entry — the raw display string and both plain rename paths —
+  // so moving a guard, egress, trust-chain, engine or sensitive file into an exempt location keeps its care.
+  const careSides = f => [...new Set([f, ...diffPathSides(f)])];
+  // Sensitive surfaces stay in care even when their human category is currently disabled.
+  const sensitiveFiles = new Set(sensitiveSurfaceHits(gateBasis.flatMap(careSides), fileHunksOf,
+    normalizeHumanSurfaces('broad')).map(hit => hit.file));
+  const isCareProtected = f => careSides(f).some(side => isTrustChainPath(side) || isEngineTierPath(side)
+    || isProtectedCarePath(side) || sensitiveFiles.has(side));
+  const exemptions = validateCareExemptPaths(careExemptPaths);
+  // A rename is exempt only when EVERY side is exempt: moving a statute, tool or other authored file into an
+  // exempt location is still a change to that file (and deletes it from where it was).
+  const entryExempt = f => !isCareProtected(f) && diffPathSides(f).every(side => matchesCareExemptPath(side, exemptions));
+  // A plain target alias of a retained rename (`changedFiles` may list both spellings) resolves to the same diff
+  // section, so it must not subtract that section's lines either.
+  const retainedTargets = new Set(gateBasis.filter(f => !entryExempt(f)).map(plainDiffPath));
+  const exemptFiles = gateBasis.filter(f => entryExempt(f) && !retainedTargets.has(plainDiffPath(f)));
+  const exemptSet = new Set(exemptFiles);
+  const basisFiles = gateBasis.filter(f => !exemptSet.has(f));
+  if (exemptFiles.length) signals.careExempt = exemptFiles;
 
   // A trust-chain path ALWAYS escalates (even a relocated engine file that no longer matches `^scripts/`) —
   // isTrustChainPath covers both tiers, so the lander always gets an independent review whether or not it also
@@ -736,15 +813,12 @@ export function scoreEscalation({
 
   // All touch-set gates use the cumulative basis and each file's own hunks. The configured categories
   // decide which principle triggers require human review; inactive triggers still raise AI care via blast-radius.
-  const gateBasis = basisFiles;
-  // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
-  const fileHunksOf = fileHunksResolver(diffHunks);
   const surfaces = gateBasis.map((f) => { const hunks = fileHunksOf(f); return { file: f, hunks, triggers: principleSurfaceTriggers(f, hunks) }; });
   const categoryFor = { 'leash-path': 'gate-self', 'statute-anchor': 'statute', 'marked-invariant': 'marked-invariant' };
   const demoted = {};
   for (const [trigger, category] of Object.entries(categoryFor)) {
     if (resolvedSurfaces.categories.includes(category)) continue;
-    const files = surfaces.filter(x => x.triggers.includes(trigger)).map(x => x.file);
+    const files = surfaces.filter(x => !exemptSet.has(x.file) && x.triggers.includes(trigger)).map(x => x.file);
     if (files.length) {
       demoted[category] = files;
       for (const file of files) if (!blastFiles.includes(file)) blastFiles.push(file);
@@ -770,7 +844,6 @@ export function scoreEscalation({
 
   // Keep one permission-change token so every existing clearance consumer sees the same sensitive holds.
   const otherHumanForced = humanForced;
-  const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
   if (permissionHits.length) {
     humanForced = true;
     signals.permissionChange = [...new Set(permissionHits.map((x) => x.file))];
@@ -814,7 +887,7 @@ export function scoreEscalation({
   //
   // Default `true`: every caller that supplies no flag (including every pre-#3343 one) scores exactly as before.
   // Flagged only when something was actually scored — an empty basis has no verdict to qualify.
-  const basisUntrusted = basisNarrowed === false && basisFiles.length > 0;
+  const basisUntrusted = basisNarrowed === false && gateBasis.length > 0;
   if (basisUntrusted) {
     signals.basisUntrusted = true;
     reasons.push('basis un-narrowed (merge-base unresolved) — the scored file set may include upstream-only changes');
@@ -824,7 +897,42 @@ export function scoreEscalation({
   // monotone rule as the file basis above: a stacked/self-declared base can raise this number, never lower it.
   // Still a CAPACITY dial and never a refusal (#3320) — crossing the threshold adds a reason and lifts the care
   // level, which is what routes more reviewers at it.
-  const scoredDiffLines = Math.max(Number(diffLines) || 0, Number(cumulativeDiffLines) || 0);
+  let scoredDiffLines = Math.max(Number(diffLines) || 0, Number(cumulativeDiffLines) || 0);
+  if (exemptFiles.length) {
+    if (!basisFiles.length) scoredDiffLines = 0;
+    else {
+      // Subtract exempt lines on EACH basis separately, then take the max (#6433 red team): the hunks describe
+      // the cumulative basis only, so subtracting an ancestor's exempt lines from max(own, cumulative) could hide
+      // a stacked child's own non-exempt delta.
+      const ownLines = Number(diffLines) || 0;
+      const cumulativeLines = Number(cumulativeDiffLines) || 0;
+      // Exempt lines in one basis, from its own hunks. Rename display spellings and the plain target resolve to
+      // the same section, so each section is counted once. The hunks must PROVABLY describe this basis: every
+      // file's section complete and their total equal to the basis's line count. Otherwise (a missing, binary or
+      // truncated section; or hunks from another basis, such as the base-tip text paired with ancestry counts
+      // when the merge-base lookup failed) nothing is subtracted, so upstream drift on an exempt file can never
+      // hide this PR's own lines (#6433 self-review).
+      const exemptLinesIn = (files, total) => {
+        const sum = list => {
+          const counts = [...new Set(list.map(f => fileHunksOf(f)))].map(changedLineCount);
+          return counts.every(n => n !== null) ? counts.reduce((a, b) => a + b, 0) : null;
+        };
+        if (sum(files) !== total) return 0;
+        return sum(files.filter(f => exemptSet.has(f))) ?? 0;
+      };
+      const allExempt = (files) => files.length > 0 && files.every(f => exemptSet.has(f));
+      // The own delta IS the hunks' basis only when no separate cumulative list was supplied, or when the caller
+      // handed the very same list for both (the non-stacked net-diff and gh-files shapes). Equal contents are
+      // not proof: a stacked child can touch the same files with a different per-file split. Otherwise the own
+      // count stays whole unless every own file is exempt (fail closed).
+      const ownIsHunkBasis = !Array.isArray(humanBasisFiles) || humanBasisFiles === changedFiles;
+      const ownScored = allExempt(ownFiles) ? 0
+        : ownIsHunkBasis ? Math.max(0, ownLines - exemptLinesIn(ownFiles, ownLines)) : ownLines;
+      const cumulativeScored = allExempt(cumulativeFiles) ? 0
+        : Math.max(0, cumulativeLines - exemptLinesIn(cumulativeFiles, cumulativeLines));
+      scoredDiffLines = Math.max(ownScored, cumulativeScored);
+    }
+  }
   if (scoredDiffLines >= t.diffLines) { signals.size = scoredDiffLines; reasons.push(`size (${scoredDiffLines} ≥ ${t.diffLines} changed lines)`); }
 
   if (Number(dismissedFindings) > 0) { signals.dismissedFindings = Number(dismissedFindings); reasons.push(`dismissed-findings (${dismissedFindings} pre-PR review finding(s) the lane dismissed)`); }
@@ -1537,7 +1645,6 @@ export function normalizeDiffFingerprint(diffText) {
   if (/^[0-9a-f]{64}$/.test(trimmed)) return trimmed;
   // The EXACT header git emits for the repo-root manifest, whatever the change kind (add/modify/delete all carry
   // both sides). An exact-equality test cannot be widened by a crafted path the way a substring test was.
-  const MANIFEST_HEADER = `diff --git a/${LANE_MANIFEST} b/${LANE_MANIFEST}`;
   // SPLIT THE RAW TEXT, NOT THE TRIMMED COPY (PR #1086 review, blocker 2 — second pass). Trimming the whole diff
   // strips trailing whitespace off the LAST line, so a ride-in whose only change was a meaningful trailing space
   // at end-of-diff still collided even after the per-line strip was removed. Whitespace is content everywhere,
@@ -1550,7 +1657,7 @@ export function normalizeDiffFingerprint(diffText) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     // A `diff --git` header opens a new file section and therefore always ends any skip in progress.
-    if (line.startsWith('diff --git ')) inManifestSection = line === MANIFEST_HEADER;
+    if (line.startsWith('diff --git ')) inManifestSection = isMechanicalDiffSection(lines, i);
     if (inManifestSection) continue;
     if (!keepIndexAt.has(i) && /^index [0-9a-f]+\.\.[0-9a-f]+/.test(line)) continue;
     kept.push(line);
@@ -1704,7 +1811,6 @@ export function normalizeContributionFingerprint(diffText) {
   const trimmed = diffText.trim();
   if (!trimmed) return null;
   if (/^[0-9a-f]{64}$/.test(trimmed)) return trimmed;
-  const MANIFEST_HEADER = `diff --git a/${LANE_MANIFEST} b/${LANE_MANIFEST}`;
   // `@@ -<start>[,<len>] +<start>[,<len>] @@[ <section heading>]` — git omits `,<len>` when it is exactly 1.
   const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
   const kept = [];
@@ -1727,7 +1833,7 @@ export function normalizeContributionFingerprint(diffText) {
     if (line.startsWith('diff --git ')) {
       // A new file section always ends any skip AND any hunk in progress.
       closeRun();
-      inManifestSection = line === MANIFEST_HEADER;
+      inManifestSection = isMechanicalDiffSection(lines, i);
       inHunk = false;
       if (!inManifestSection) kept.push(line);
       continue;
@@ -1918,6 +2024,100 @@ export function parseChangesVerdictProse(body) {
   return actor ? { actor, channel: at === -1 ? '' : m[1].slice(at + 5).trim(), end: m.index + m[0].length } : null;
 }
 
+/** R706 — a carrier cites the original human comment, never another carrier. */
+export const CLEARED_FROM_MARKER = 'cleared-from';
+const CLEARED_FROM_ID_RE = /^[A-Za-z0-9_=-]{4,}$/;
+const CLEARED_FROM_RE = new RegExp(`<!--\\s*${CLEARED_FROM_MARKER}:\\s*([^>]*?)\\s*-->`, 'g');
+const safeClearanceId = id => typeof id === 'string' && id.trim() === id && CLEARED_FROM_ID_RE.test(id);
+export function buildClearedFromMarker(id) {
+  return safeClearanceId(id)
+    ? `<!-- ${CLEARED_FROM_MARKER}: ${id} -->` : '';
+}
+
+// Whether a trusted automation comment carrying `cleared-human` is a PROVEN carrier of the ACTIVE human source:
+// a readable poster, exactly one citation of that source, and the same reviewed-diff (or, under R711's explicit
+// trust-drain-record setting, a drain receipt bound to an established chain SHA and this carrier's SHA).
+function provenCarrier(c, { body, sha, login, knownPoster, sourceId, chainShas, byId, mechanicalCarry }) {
+  if (!knownPoster) return false; // Unknown poster (including viewer-only evidence) can never carry a clearance.
+  if (/^(unknown|ghost|none|null|undefined)$/i.test(String(login).trim())) return false; // a placeholder login is an unreadable author
+  const citations = [...body.matchAll(new RegExp(CLEARED_FROM_RE.source, 'g'))];
+  if (citations.length !== 1) return false;
+  const citedId = citations[0][1].trim();
+  const source = byId.get(citedId);
+  if (!sourceId || sourceId !== citedId || !source || !isHumanOperatorComment(source)) return false;
+  const sourceBody = typeof source.body === 'string' ? source.body : '';
+  if (!parseReviewedShaMarker(sourceBody)
+    || !(new RegExp(CLEARED_HUMAN_RE.source).test(sourceBody)
+      || new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(sourceBody))) return false;
+  const fingerprint = parseReviewedDiff([c]);
+  if (fingerprint && fingerprint === parseReviewedDiff([source])) return true;
+  // R711: only the explicit operator setting trusts a drain's mechanical receipt.
+  // Its predecessor must already belong to this human source's proven chain.
+  const receipts = [...body.matchAll(/<!--\s*human-clearance-carried:\s*from=([0-9a-f]{7,40}) to=([0-9a-f]{7,40}) diff=([0-9a-f]{64})\s*-->/gi)];
+  const receipt = receipts.length === 1 ? receipts[0] : null;
+  return mechanicalCarry === 'trust-drain-record' && !!receipt && !!fingerprint
+    && receipt[3].toLowerCase() === fingerprint
+    && chainShas.includes(receipt[1].toLowerCase())
+    && receipt[2].toLowerCase() === sha;
+}
+
+// One ordered state machine for latest coverage, historical coverage, and original-source resolution.
+// Invalid carriers mask no coverage but end the chain; trusted plain accepts reset the active source, even on another head.
+// `states.activeSourceId` is the source a NEXT carrier could still cite (null once anything ended the chain).
+// `mechanicalCarry` is an optional test override; production resolves the R711 policy from the shared cascade.
+function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCarrySetting().value } = {}) {
+  const thread = Array.isArray(comments) ? comments : [];
+  const byId = new Map();
+  for (const c of thread) {
+    if (!safeClearanceId(c?.id)) continue;
+    // Ambiguous ids are unreadable evidence, never a choice of which source to trust.
+    // The same comment can appear twice (an embedded page overlapping the full thread): an identical copy is one
+    // comment; two DIFFERENT comments sharing an id are ambiguous evidence.
+    const seen = byId.get(c.id);
+    // "Same author" includes the bot identity: copies that disagree on is_bot or type are ambiguous, never one comment.
+    const who = x => { const a = x?.author ?? x?.user; return [a?.login, a?.is_bot === true, String(a?.type ?? '')].join('\u0000'); };
+    const same = seen && seen.body === c.body && who(seen) === who(c);
+    byId.set(c.id, byId.has(c.id) && !same ? null : (seen ?? c));
+  }
+  const states = [];
+  let sourceId = null;
+  let chainShas = [];
+  for (const c of thread) {
+    const login = c?.author?.login ?? c?.user?.login;
+    const knownPoster = typeof login === 'string' && login.trim().length > 0;
+    if (!isTrustedMarkerAuthor(c)) continue; // operators are trusted authors, so every human clearance passes this
+    const human = isHumanOperatorComment(c);
+    const body = typeof c?.body === 'string' ? c.body : '';
+    // A plain accept's marker name is matched case-insensitively here so it can never be dodged by casing.
+    const sha = parseReviewedShaMarker(body)
+      || (human ? '' : (new RegExp(REVIEWED_SHA_RE.source, 'i').exec(body)?.[1] ?? '').toLowerCase());
+    if (!sha) continue;
+    const hasMarker = new RegExp(CLEARED_HUMAN_RE.source).test(body);
+    const cleared = hasMarker || (human && new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(body));
+    if (human) {
+      sourceId = cleared && safeClearanceId(c.id) && !!byId.get(c.id) && byId.get(c.id).body === c.body ? c.id : null;
+      chainShas = [sha];
+    } else if (hasMarker) {
+      // R728: an unproven carrier stamps a head no human cleared, like a plain accept. It masks nothing (no state is
+      // pushed, so the original head keeps its clearance), but it ENDS the chain: no later carrier may cite past it.
+      if (!provenCarrier(c, { body, sha, login, knownPoster, sourceId, chainShas, byId, mechanicalCarry })) {
+        sourceId = null;
+        chainShas = [];
+        continue;
+      }
+      chainShas.push(sha);
+    } else {
+      // A trusted plain accept of ANY head (related or not) ends the clearance chain: no later carrier may cite the
+      // old source, so a carrier can never revive a clearance a plain accept already superseded.
+      sourceId = null;
+      chainShas = [];
+    }
+    states.push({ sha, cleared, sourceId, c });
+  }
+  states.activeSourceId = sourceId;
+  return states;
+}
+
 /**
  * #xuboo0q — did the LATEST accept-shaped comment (whichever comment stamped the most recent `reviewed-sha`
  * marker) ALSO carry the `clear-human` ceremony marker IN THAT SAME COMMENT? Pure.
@@ -1932,6 +2132,11 @@ export function parseChangesVerdictProse(body) {
  * `review-set-label.mjs --to=clear-human` comment stamps `reviewed-sha` and `cleared-human` together, so a
  * later plain accept (which stamps `reviewed-sha` alone) correctly reports no human coverage for its head.
  *
+ * R706: trusted automation may carry this clearance only by citing the active original human comment
+ * exactly once, with the same non-null reviewed-diff fingerprint. R711's explicit trust-drain-record setting
+ * also accepts a drain receipt bound to an established clearance-chain SHA and carrier SHA. Invalid carriers are skipped entirely;
+ * a trusted plain accept resets the source and supersedes the clearance.
+ *
  * @returns {string|null} the reviewed SHA, lowercased, ONLY when the latest accept-shaped comment was a
  *   `clear-human` ceremony; `null` when it was a plain accept, or no accept-shaped comment exists at all.
  *
@@ -1940,43 +2145,37 @@ export function parseChangesVerdictProse(body) {
  * `reviewed-sha` + `cleared-human` comment posted after a REAL plain accept upgraded that accept into a human
  * clearance (review round 1 on PR #2716 — the "piggyback").
  */
-export function parseLatestHumanClearedSha(comments) {
-  let latestSha = null;
-  let latestWasHumanCleared = false;
-  for (const c of Array.isArray(comments) ? comments : []) {
-    const body = c && typeof c.body === 'string' ? c.body : '';
-    if (!body) continue;
-    if (!isTrustedMarkerAuthor(c)) continue; // #4140 — an untrusted commenter's marker is never counted
-    REVIEWED_SHA_RE.lastIndex = 0;
-    let m;
-    let bodySha = null;
-    while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
-    if (bodySha === null) continue; // not an accept-shaped comment — carries no reviewed-sha at all
-    CLEARED_HUMAN_RE.lastIndex = 0;
-    let bodyHumanCleared = CLEARED_HUMAN_RE.exec(body) !== null;
-    if (!bodyHumanCleared) {
-      CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
-      bodyHumanCleared = CLEARED_HUMAN_PROSE_RE.exec(body) !== null;
-    }
-    latestSha = bodySha;
-    latestWasHumanCleared = bodyHumanCleared;
-  }
-  return latestWasHumanCleared ? latestSha : null;
+export function parseLatestHumanClearedSha(comments, options) {
+  const latest = humanClearanceStates(comments, options).at(-1);
+  return latest?.cleared ? latest.sha : null;
+}
+
+/** The comment that carries the active clearance (a human original, or a PROVEN carrier); null when none stands. */
+export function latestHumanClearanceComment(comments, options) {
+  const latest = humanClearanceStates(comments, options).at(-1);
+  return latest?.cleared ? latest.c : null;
+}
+
+/** Original human comment id of the active clearance; absent or superseded evidence → null. */
+export function latestHumanClearanceSourceId(comments, options) {
+  // A chain ended after the latest clearance (an unproven carrier) leaves no source a new carrier may cite.
+  const states = humanClearanceStates(comments, options);
+  const latest = states.at(-1);
+  return latest?.cleared ? states.activeSourceId : null;
 }
 
 /**
  * Whether any trusted-comment prefix human-cleared this head, even if a later plain accept hides it.
- * Each new clearance comes from one comment's paired markers, so checking comments individually preserves
- * prefix semantics without repeatedly scanning the growing thread.
+ * The shared ordered scan checks each carrier against the active original source at that prefix.
  * @param {Array<object>} comments comments in thread order
  * @param {string} headSha head to protect (case-insensitive)
  * @returns {boolean} false for non-array/empty comments or a blank head
  * @example headEverHumanCleared(comments, 'abcdef1')
  */
-export function headEverHumanCleared(comments, headSha) {
+export function headEverHumanCleared(comments, headSha, options) {
   if (!Array.isArray(comments) || typeof headSha !== 'string' || !headSha.trim()) return false;
   const head = headSha.toLowerCase();
-  return comments.some((c) => isTrustedMarkerAuthor(c) && parseLatestHumanClearedSha([c]) === head);
+  return humanClearanceStates(comments, options).some(state => state.cleared && state.sha === head);
 }
 
 /**

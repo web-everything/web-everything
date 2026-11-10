@@ -73,12 +73,14 @@ import {
   acceptResumeCommand, buildAcceptQueueEntry, buildPreventionFilingInput, buildPreventionQueueEntry, preventionHeadMarker,
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
-  roundCardsFindingsMarker, roundCardsHeadMarker,
+  roundCardsFindingsMarker, roundCardsHeadMarker, postAcceptAdvisoryDecision,
 } from '../lib/review-loop-policy.mjs';
+import { resolvePostAcceptAdvisorySettings } from '../lib/post-accept-advisory-settings.mjs';
+import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating } from './review-pr-io.mjs';
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { findResumableParkedRun, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -559,6 +561,9 @@ export async function runReviewLoopOnce({
   parallelJudges = false, seatLanes = null,
   readAcceptancePr = defaultReadResumePr, cardReadable = referralCardReadable,
   acceptPolicy = unattendedAcceptPolicy(),
+  advisorySettings = resolvePostAcceptAdvisorySettings, recordAdvisoryShadow = recordPostAcceptAdvisoryShadow,
+  recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
+  advisoryLog = line => console.error(line),
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
@@ -588,7 +593,33 @@ export async function runReviewLoopOnce({
     const acceptHeld = o.resume?.value === 'accept' ? acceptHold(o.run, { filed: true }) : null;
     const resume = acceptHeld ? null : o.resume;
     return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes })
-      .then((out) => (acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out));
+      .then(async (out) => {
+        if (out?.run) {
+          try {
+            const resolved = advisorySettings({ log: advisoryLog });
+            const mode = resolved?.value?.mode;
+            const invalid = !resolved || Array.isArray(resolved) || !resolved.value || Array.isArray(resolved.value)
+              || !['off', 'shadow', 'on'].includes(mode)
+              || (resolved.invalid !== undefined && typeof resolved.invalid !== 'boolean') || resolved.invalid === true;
+            const settings = { value: { mode: invalid ? 'shadow' : mode }, invalid };
+            if (invalid) advisoryLog('post-accept-advisory warning: invalid resolved settings; using shadow');
+            if (settings.value.mode !== 'off') {
+              await recordAdvisoryLoops({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, runId: out.run.id, now, out: advisoryLog });
+              if (out.run.verdict) await recordAdvisoryRating({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, runId: out.run.id, now, out: advisoryLog,
+                findings: Object.hasOwn(out.run.verdict, 'admittedFindings')
+                  ? out.run.verdict.admittedFindings : out.run.verdict.findings });
+              if (out.stopped === 'complete' && out.run.findings?.confirm === 'accept') await recordAdvisoryShadow({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, loopsAfter: null, now, out: advisoryLog,
+                decision: postAcceptAdvisoryDecision({ verdict: out.run.verdict, mode: settings.value.mode, invalid: settings.invalid }) });
+            }
+          } catch (error) {
+            try { advisoryLog(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+          }
+        }
+        return acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out;
+      });
   };
   const heldLine = (held) => `Unattended accept parked after filing: ${held}.`;
   if (parsed.control.help) {
@@ -616,13 +647,14 @@ export async function runReviewLoopOnce({
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
-  } else {
+  }
+  if (!parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused) {
     // Card xq1xbsl — A RULING ON AN UNCHANGED HEAD RESUMES THE PAUSED REVIEW; IT DOES NOT START A NEW PANEL. A fresh
     // panel judges the same head again, raises referrals the first one did not, and parks the PR for a ruling it
     // already had (live 2026-10-08, #4361/#4388). The parked run already holds the panel's verdict and findings, so it
     // goes back to the step that reads the rulings and carries on from there. New referrals come only from a new push.
-    let resumedId = null;
-    if (parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
+    let resumedId = parsed.control.resume ?? null;
+    if (!resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
       try { resumedId = findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }); } catch { resumedId = null; }
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
@@ -633,7 +665,9 @@ export async function runReviewLoopOnce({
       // A run parked on a confirm, or one an earlier resume rewound and never finished (it died or threw part-way).
       // "Unfinished" = the earlier resume never got through `advise` (the same test `reviewRunEvidence` applies).
       const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
-      const attempts = unfinishedResume ? Number(parked.resumeOf.attempts) || 1 : 0;
+      const suspendedEffect = !parked?.resumeOf && parked?.pending?.kind === 'effect' && parked.pending.step === RESUME_STEP;
+      const effectAttempts = Math.max(0, Number(parked?.referralEffectResumeAttempts) || 0);
+      const attempts = suspendedEffect ? effectAttempts : unfinishedResume ? Number(parked.resumeOf.attempts) || 1 : 0;
       // A resume that keeps failing is bounded: after RESUME_MAX_ATTEMPTS the round falls back to a fresh review.
       // `review.seatsByTouchSet` — a parked run is resumed only under the roster it was judged with; a declaration that
       // seats the security juror differently would reason about a run shape that no longer exists, so that case
@@ -643,6 +677,16 @@ export async function runReviewLoopOnce({
       // Card 5752 — a parked run whose referral persist failed and whose retry budget is spent is never replaced by a
       // fresh panel: that is the operator's call now (the exhausted hold raises the needs-you), so the round refuses.
       const parkedEvidence = parked && parked.op === declaration.name ? reviewRunEvidence(parked) : null;
+      if (parkedEvidence?.referralStageRefused) {
+        let ruled = false;
+        try {
+          ruled = declaration.steps[parked.cursor]?.name === 'stageVerdict'
+            && refusedReferralsAreRuled({ ...readAcceptancePr(parked.input), number: parked.input.pr }, parkedEvidence,
+              { repo: parked.input.repo, cardReadable });
+        } catch { /* unreadable live evidence keeps the refusal */ }
+        if (!ruled) return { code: 2, run: parked, stopped: 'refused',
+          lines: [`error: run ${parked.id} still requires readable standing referral rulings on its reviewed head; resume after ruling every finding.`] };
+      }
       const resumeAdvise = parkedEvidence?.resumeAdvise === true;
       const adviseAttempts = Math.max(0, Number(parked?.resumeOf?.adviseAttempts) || 0);
       // A fresh-panel fallback cannot resolve an unknown external write. Keep its non-idempotent replay fence
@@ -652,14 +696,17 @@ export async function runReviewLoopOnce({
         return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} has an unresolved advisory effect; `
           + 'automatic retries are spent and no fresh panel is started. Resolve the saved effect outcome first.'] };
       }
+      if (suspendedEffect && effectAttempts >= RESUME_MAX_ATTEMPTS) {
+        return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} suspended referral resume attempts spent; inspect run store and ruling.`] };
+      }
       if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
         persistSpent = parked.id;
       } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
-        && (parked.pending?.kind === 'confirm' || unfinishedResume)) {
+        && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused || suspendedEffect)) {
         // Continue an interrupted advisory step in place: its effect history skips applied writes and refuses
         // unknown non-idempotent outcomes. Rewinding it would discard both protections. Persistence attempts do
         // not consume this later step's retry budget.
-        rewound = resumeAdvise ? { ...parked, resumedAt: now() }
+        rewound = suspendedEffect ? { ...parked, resumedAt: now(), referralEffectResumeAttempts: effectAttempts + 1 } : resumeAdvise ? { ...parked, resumedAt: now() }
           : rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
         // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass
         // finishes. Keep what it set aside (`resumeOf`) so a resume that fails part-way still reads as the parked run
@@ -670,7 +717,7 @@ export async function runReviewLoopOnce({
         // budget too, never reach the RESUME_MAX_ATTEMPTS fresh-panel fallback with the budget unspent.
         const persistRetries = Math.max(0, Number(parked.resumeOf?.persistRetries) || 0)
           + (reviewRunEvidence(parked)?.persistenceFailed ? 1 : 0);
-        rewound = { ...rewound, resumeOf: unfinishedResume
+        if (!suspendedEffect) rewound = { ...rewound, resumeOf: unfinishedResume
           ? { ...parked.resumeOf, attempts: attempts + 1, ...(persistRetries ? { persistRetries } : {}),
             ...(resumeAdvise ? { adviseAttempts: adviseAttempts + 1 } : {}) }
           : { verdict: parked.findings?.referralVerdict ?? parked.verdict ?? null,

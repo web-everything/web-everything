@@ -18,7 +18,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * lanes are long-lived under `~/workspace/.lanes/<repo>/lane-<n>` and merely fetch + hard-reset to
  * origin/main between batches. Git OBJECTS are shared with the primary checkout via `git clone
  * --reference`, so a lane costs little disk and clones fast (objects come from the local primary, not the
- * network). Node deps (`node_modules`) are NOT shared — `ensureDeps` runs `npm ci` per lane on a fresh
+ * network). Node deps (`node_modules`) are per lane — `ensureDeps` prefers pnpm 12 with a shared store on a fresh
  * clone or when the lockfile changes, so each lane can run its own gate.
  *
  * Repo-parameterized: the pool is keyed by repo NAME, so cross-repo slice 4 (lanes of
@@ -33,7 +33,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
  *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) OPT-IN bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure, instead of failing on the very first full-pool reading (omitted ⇒ today's instant-fail, unchanged); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
- *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved]   # #2275 hand a leased lane back to the pool (own lease, or --force); #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
+ *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved] [--discard]   # #2275 hand a leased lane back to the pool (own lease, or --force); refuses unpushed commits or tracked changes unless --discard explicitly accepts their loss; #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
  *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
  *   node scripts/lane-pool.mjs trim    [--max=N] [--dry-run] [--json]  # #4025 shrink the pool toward a cap (default per-repo, `LANE_POOL_TRIM_MAX` overridable): deletes HIGHEST-numbered lane dirs first among those with no live (or provably dead) lease, never reserved, nothing uncommitted beyond the scratch allowlist, and every ahead commit provably pushed — a lane with real unpushed/uncommitted work is reported, never removed. Crash-safe (rename to `.trash-<n>` then delete). Wired into `scripts/conveyor/lane-pool-health-watch.mjs`'s periodic pass.
  *   node scripts/lane-pool.mjs map     --lane=N --item=NNN[,NNN…]   # register item(s) → lane page-port (#2139 proxy)
@@ -79,12 +79,14 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  */
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
 import { readGit, execRead } from './lib/proc-read.mjs';
+import { createBuildOutputCleaner } from './lib/lane-build-output.mjs';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './lib/git-bounded.mjs';
 import { ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } from './lib/lane-alternates.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
@@ -124,7 +126,7 @@ import { retryTransientGit } from './lib/git-fetch-retry.mjs';
 import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } from './lib/lane-repair.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
-import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
+import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, touchFreeLaneList, isProvablyCleanAndPushed, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
 import { normScope } from './readiness/scope-lease.mjs';
@@ -174,7 +176,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
-import { realSalvageIo, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
+import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
 import {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
 } from './lib/lane-salvage.mjs';
@@ -190,7 +192,8 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
-import { dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
+import { dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig, LANE_CONFIG_LIST_ARGS } from './lib/lane-git-hardening.mjs';
+import { laneMaskingConfig, laneRedirectConfig, wellFormedConfigList, withHonestReportingPins } from './lib/health-watch-lane-scan.mjs';
 import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -298,6 +301,8 @@ const tryGit = (args, cwd, opts = {}) => {
   }
 };
 
+const { cleanIgnoredBuildOutput } = createBuildOutputCleaner(git);
+
 // Live-fire dispatch test, 2026-08-29: `git fetch origin --prune` crashed `provision`/`acquire` outright —
 // "error: cannot lock ref '<ref>': is at X but expected Y" — a transient race over the SHARED object store
 // every lane clones `--reference` (two lanes' fetches touching the same `refs/remotes/origin/*` at once).
@@ -331,8 +336,7 @@ function fetchOriginPruneWithRetry(dir, dietConfig) {
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 
 // #3265 — the pool root is DERIVED from the checkout, not assumed from `$HOME`. Pure core + its
-// rationale live in `./lib/lane-pool-paths.mjs` (this file runs its CLI at import, so nothing here is
-// unit-testable by importing it).
+// rationale live in `./lib/lane-pool-paths.mjs`.
 // The checkout ROOT, not the cwd: `defaultPoolRoot` is pure and cannot tell `<checkout>/scripts` from
 // `<checkout>`, so handing it a subdirectory would put the pool INSIDE the repo (#1539 reviewer, round 2).
 // A lane needs no normalising — `workspaceFor` strips at `.lanes` from any depth — but this is the honest
@@ -388,12 +392,17 @@ function resolveRepo(repoFlags = flags) {
   let discoveredPrimaryPath = null;
   let referenceValidated = false; // true only when the ownership scan above proved the reference is not a lane
   let originBase = topLevel;
-  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
-    const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
-    // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
-    // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
-    // disk. A worktree of a non-lane primary stays usable (the daemon rebuild smoke runs from one).
-    // An unreadable owner is refused: a failed read must not fall back to the path-only check.
+  const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
+  // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
+  // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
+  // disk. A worktree of a non-lane primary stays usable (the daemon rebuild smoke runs from one).
+  // An unreadable owner is refused: a failed read must not fall back to the path-only check.
+  // The reference/cwd can itself be an agent-owned lane. Never promote its remote
+  // into the trust anchor for a preservation proof, even for --dry-run or --pool.
+  // Check both the supplied path and Git's answer (core.worktree can redirect it),
+  // before and after symlink resolution. Recognize lane-N in other pool roots too;
+  // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
+  const scanOwnership = () => {
     let unreadableOwner = false;
     const owners = [];
     const gitOwnerPaths = [referencePath, topLevel].flatMap((dir) => {
@@ -406,13 +415,13 @@ function resolveRepo(repoFlags = flags) {
       return [gitDir, commonDir, commonDir && dirname(commonDir)].filter(Boolean);
     });
     const originSourcePaths = [referencePath, topLevel, ...gitOwnerPaths].flatMap(path => [resolve(path), resolveReal(path)]);
-    // The reference/cwd can itself be an agent-owned lane. Never promote its remote
-    // into the trust anchor for a preservation proof, even for --dry-run or --pool.
-    // Check both the supplied path and Git's answer (core.worktree can redirect it),
-    // before and after symlink resolution. Recognize lane-N in other pool roots too;
-    // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
-    if (unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
-      || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
+    const laneShaped = unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
+      || path.split(sep).some(part => /^lane-\d+$/.test(part)));
+    return { unreadableOwner, owners, originSourcePaths, laneShaped };
+  };
+  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
+    const { unreadableOwner, owners, originSourcePaths, laneShaped } = scanOwnership();
+    if (laneShaped) {
       // Old live daemons export the smoke owner, but not LANE_POOL_CANONICAL_ORIGIN.
       // Trust that owner only for its own named, linked candidate; a lane's remote is never an anchor.
       const liveClone = process.env.WE_SMOKE_LIVE_CLONE;
@@ -474,7 +483,13 @@ function resolveRepo(repoFlags = flags) {
   const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
   const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
   // alternatesReferencePath: the object store lanes may borrow. A primary found by name replaces the invoking lane.
-  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath: discoveredPrimaryPath || (referenceValidated ? topLevel : null), branch, poolDir: join(POOL_ROOT, name) };
+  const alternatesReferencePath = discoveredPrimaryPath || (referenceValidated ? topLevel : null);
+  // primaryPath: the checkout whose own auth config the release proof may use (PR #6319 send-back). Only a primary
+  // found by name or a reference the ownership scan proved is not a lane — also when an explicit --origin skipped the
+  // origin scan above. Null means no validated primary: the proof then runs under the strict lane transport rules.
+  const primaryPath = alternatesReferencePath
+    || (repoFlags.origin && (cmd === 'gc' || cmd === 'release') && !scanOwnership().laneShaped ? topLevel : null);
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath, primaryPath, branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);
@@ -808,20 +823,8 @@ function existingPools() {
 
 // ── deps (node_modules) — not shared by --reference, so installed per lane on fresh-clone / lockfile change ──
 const DEPS_MARKER = (dir) => join(dir, '.git', '.lane-pool-deps'); // inside .git ⇒ never tracked or git-cleaned
-function lockHash(dir) {
-  const lock = join(dir, 'package-lock.json');
-  const pkg = join(dir, 'package.json');
-  const file = existsSync(lock) ? lock : existsSync(pkg) ? pkg : null;
-  if (!file) return null;
-  return createHash('sha256').update(readFileSync(file)).digest('hex');
-}
-function depsReady(dir) {
-  const want = lockHash(dir);
-  if (want === null) return 'n/a'; // no package.json → nothing to install
-  if (!existsSync(join(dir, 'node_modules'))) return 'missing';
-  const have = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  return have === want ? 'ok' : 'stale';
-}
+// Hashing, readiness and the install orchestration live in lib/lane-deps-installer.mjs (unit-tested there).
+const depsReady = (dir) => laneDepsReady(dir, DEPS_MARKER(dir));
 // #3461 — `npm ci`/`npm install` here is a DELIBERATE, NAMED EXCEPTION to the heavy-command admission queue
 // (`scripts/readiness/heavy-admission.mjs`), not an oversight. #3456's own ruling is explicit that the cap
 // applies at heavy-command-INVOCATION time, never at lane-ACQUIRE time — "a lane may always be acquired
@@ -834,16 +837,13 @@ function depsReady(dir) {
 // that is comparatively cheap and already deduped by `depsReady`'s lockfile-hash skip (most acquires do
 // nothing here at all). This function stays ungated.
 function ensureDeps(dir) {
-  const state = depsReady(dir);
-  if (state === 'n/a' || state === 'ok') return state;
-  const useCi = existsSync(join(dir, 'package-lock.json'));
-  log(`  deps ${state} → npm ${useCi ? 'ci' : 'install'} in ${dir} …`);
-  // #x5n4zn3 review — npm's stdout goes to OUR stderr (fd 2), never our stdout: `acquire --json` prints its
-  // result on stdout, and a caller that captures it (`orphan-claim-release.mjs`'s `acquireLane`) must parse
-  // pure JSON even on the acquires that actually install. Stays visible on a terminal either way.
-  execFileSync('npm', [useCi ? 'ci' : 'install'], { cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL' });
-  writeFileSync(DEPS_MARKER(dir), lockHash(dir));
-  return 'installed';
+  const storeDir = resolvePnpmStoreDir();
+  // The runtime routes installer stdout to OUR stderr: acquire --json must remain pure JSON (tested in the lib).
+  return ensureLaneDeps({
+    dir, markerPath: DEPS_MARKER(dir), storeDir,
+    log: message => log(`  ${message} in ${dir} …`),
+    ...createLaneDepsRuntime({ dir, storeDir, installTimeoutMs: NPM_TIMEOUT_MS }),
+  });
 }
 
 // ── lease (#2275) — an exclusive hold so a lane is never recycled or double-acquired while in use ─────
@@ -1462,6 +1462,7 @@ function refreshLane(repo, n, { force = false } = {}) {
     action: 'refresh-reset', before, headAfter: laneHead(dir),
     reason: force ? `refresh --force (${verdict.reason})` : 'refresh — clean lane fast-forwarded', loud: verdict.loud || undefined,
   });
+  cleanIgnoredBuildOutput(dir);
   return { skipped: false, dirty: false, uncommitted: 0, ahead: 0 };
 }
 
@@ -2128,7 +2129,10 @@ function scrubClaimedLaneConfig(dir, reason) {
   let dietConfig;
   // Reuse an unchanged scrub read for the next fetch. Removing an include can also remove diet settings.
   const { removed, kept } = scrubRiskyLaneConfig(dir, { log, onConfig: (output) => { dietConfig = laneDietConfigState(output); } });
-  if (removed.length) journalLaneEvent(dir, { action: 'config-scrub', removed, kept, reason });
+  // A lane config key can embed a credentialed URL (url.<base>.insteadOf, http.<url>.*): journal it redacted.
+  if (removed.length) {
+    journalLaneEvent(dir, { action: 'config-scrub', removed: removed.map(redactUrlCredentials), kept: kept.map(redactUrlCredentials), reason });
+  }
   return removed.length ? undefined : dietConfig;
 }
 
@@ -2239,6 +2243,8 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
       reason: `acquire → ${baseRef}${flags.force ? ' (--force)' : ''}`, session: flags.session || process.env.LANE_SESSION || undefined,
       loud: before.unpushed ? true : undefined,
     });
+    // Cleanup failures reach claim rollback after journalling, outside the corruption retry.
+    cleanIgnoredBuildOutput(dir);
     unmapLanes(repo, [chosen]); // a reset lane no longer renders its old item (#2139)
     clearForeignVerifyMarker(dir);
   }
@@ -2247,6 +2253,11 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
   if (!flags['no-install']) ensureDeps(dir);
   return dir;
 }
+
+// Event-driven free-lane-list refresh (acquire/release/trim): see free-lane-list.mjs#touchFreeLaneList.
+const touchFreeList = (repo, lane, free) => touchFreeLaneList({
+  path: resolveFreeLaneListPath({ repoName: repo.name, poolDir: repo.poolDir }), repoName: repo.name, poolDir: repo.poolDir, lane, free,
+});
 
 async function cmdAcquire(repo) {
   const assertExpectedHolder = (dir) => {
@@ -2495,6 +2506,10 @@ async function cmdAcquire(repo) {
     // the SAME static list again on a later poll tick, which would just re-try the identical dead ends until
     // `--wait-ms` ran out instead of ever reaching the scan.
     let freeListExhausted = !freeList;
+    // The `--no-reset` guard's live remote heads: ONE lazy ls-remote per acquire call (only if a candidate is ahead),
+    // shared by every candidate. A failed probe is an empty set, so an ahead lane then fails closed.
+    let noResetRemoteShasValue = null;
+    const noResetRemoteShas = () => (noResetRemoteShasValue ??= liveRemoteShas(repo));
     while (chosen === null) {
       // #3383 — the scan's own budget is now the FULL configured/default scan timeout (`--scan-timeout-ms` /
       // `LANE_POOL_LIST_SCAN_TIMEOUT_MS`), never shrunk to this caller's OWN remaining `--wait-ms`: the
@@ -2506,7 +2521,7 @@ async function cmdAcquire(repo) {
       let candidateDirs;
       let usingFreeList = false;
       if (!freeListExhausted) {
-        const freeCands = freeLaneCandidates(freeList, { exclude: excluded });
+        const freeCands = freeLaneCandidates(freeList, { exclude: excluded, nowMs: Date.now(), maxAgeMs: freeListMaxAgeMs() });
         if (freeCands.length) {
           candidateDirs = freeCands.map((n) => laneDir(repo, n));
           usingFreeList = true;
@@ -2568,6 +2583,16 @@ async function cmdAcquire(repo) {
         // blip, the #2924 re-verify, a bad `--base`, an npm hiccup) — none of which are reasons to give up on
         // every OTHER candidate this pool might still offer.
         try {
+          // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
+          // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
+          // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
+          // scan's own (`effectiveDirtyOrAhead`: litter-only dirt is clean; an ahead commit counts as pushed only if a
+          // LIVE remote head contains it or it is patch-equivalent, e.g. squash-merged) — never a stricter or looser
+          // hand-rolled one, and never a possibly-stale local remote-tracking ref.
+          if (flags['no-reset']) {
+            const doa = effectiveDirtyOrAhead(laneDir(repo, pick), repo.branch, noResetRemoteShas);
+            if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
+          }
           provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
           chosen = pick;
           break;
@@ -2778,6 +2803,7 @@ async function cmdAcquire(repo) {
   }
   if (occupant) log(`  occupant: ${occupant} (--adopt) — Edit/Write from any OTHER session is now refused (#2997)`);
   else log(`  occupant: NOT declared — hand this lane off with \`node scripts/lane-pool.mjs adopt --lane=${chosen}\` run BY the agent that will work in it (or re-run acquire with --adopt if that is you); until then the Edit/Write guard stays fail-open for this lane`);
+  touchFreeList(repo, chosen, false);
   if (flags.json) process.stdout.write(JSON.stringify({ lane: chosen, path: dir, session, holder: holderSlug, workerSession: occupant, purpose: flags.purpose || null, branch: repo.branch, base: flags.base || null, reserved: !!flags.reserve }, null, 2) + '\n');
   else process.stdout.write(dir + '\n'); // stdout = path only, so `LANE=$(… acquire)` captures it clean
 }
@@ -2818,6 +2844,234 @@ function assertReleaseReservedScoped() {
   if (flags['release-reserved'] && flags.all) {
     fail('--release-reserved may not be combined with --all — it is the deliberate single-lane un-reserve; pass an explicit --lane=N');
   }
+}
+
+// Only tracked changes are in scope by design; untracked files do not block release, and litter is reaped separately.
+// `git status` trusts index flags, so assume-unchanged / skip-worktree entries are compared by mode and content here, and
+// `--ignore-submodules=none` overrides a lane's diff.ignoreSubmodules / submodule.*.ignore (fsmonitor is pinned off
+// by the lane git env). Returns the change lines ('' when clean), or null when any evidence is unreadable.
+// Every release evidence read ignores lane-written history rewrites: a `refs/replace/*` ref or `.git/info/grafts`
+// could otherwise make a listed origin sha appear to contain an unpushed commit, or swap HEAD's tree under status.
+// A lane-written `.git/objects/info/commit-graph` does the same through its cached parent links, so the graph is off.
+// The honest-reporting pins (scripts/lib/health-watch-lane-scan.mjs) also beat a host-level fileMode/ignoreStat that
+// would hide lane edits.
+const withoutCommitGraph = env => {
+  const n = Number.parseInt(String(env.GIT_CONFIG_COUNT ?? '0'), 10);
+  const at = Number.isInteger(n) && n > 0 ? n : 0;
+  return { ...env, [`GIT_CONFIG_KEY_${at}`]: 'core.commitGraph', [`GIT_CONFIG_VALUE_${at}`]: 'false', GIT_CONFIG_COUNT: String(at + 1) };
+};
+// Inherited git config env is dropped first (PR #6319 send-back): GIT_CONFIG_PARAMETERS outranks the indexed pins below,
+// so an inherited `'core.fileMode'='false'` would hide a chmod from status, and GIT_CONFIG_GLOBAL/SYSTEM can re-scope
+// keys. Only the pins installed here (hardening, honest reporting, commit-graph off) are command-scope config.
+const releaseEvidenceEnv = (args, extraEnv = {}) => {
+  const base = scrubGitRepoEnv(isReadOnlyGit(args) ? { ...LANE_GIT_ENV, GIT_OPTIONAL_LOCKS: '0' } : LANE_GIT_ENV);
+  return withoutCommitGraph(withHonestReportingPins(laneGitHardeningEnv({
+    ...base, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent', ...extraEnv,
+  })));
+};
+const releaseEvidenceGit = (args, dir, opts = {}, extraEnv = {}) => tryGit(args, dir, { ...opts, env: releaseEvidenceEnv(args, extraEnv) });
+// Stat-trust config (core.checkStat / core.trustctime / core.ignoreStat) is pinned to git's defaults by the shared lane
+// git env (scripts/lib/lane-git-hardening.mjs), for this read and every earlier refreshing status in the release flow.
+// A hand-forged index stat cache is not covered: a full content rehash costs minutes on a large lane (residual,
+// tracked as #xuuhfpf).
+const HIDDEN_ENTRY_HASH_LIMIT = 1000;
+function releaseTrackedChanges(dir) {
+  // Lane-owned config that makes status under-report (core.fileMode=false, autocrlf, sparse, …) or points it at another
+  // worktree (core.worktree) is refused outright: no clean read on top of it can be trusted.
+  // Only the lane's own scopes are inspected; NOSYSTEM drops the system file Apple Git labels scope `unknown`, which
+  // the well-formed check (like the health-watch probe it shares) would otherwise refuse on every lane.
+  const config = releaseEvidenceGit([...LANE_CONFIG_LIST_ARGS], dir, {}, { GIT_CONFIG_NOSYSTEM: '1' });
+  if (config === null || !wellFormedConfigList(config)) return null;
+  const masking = [...laneMaskingConfig(config), ...laneRedirectConfig(config).filter(key => /^core\.worktree$/i.test(key))];
+  const status = releaseEvidenceGit(['status', '--porcelain', '--untracked-files=no', '--ignore-submodules=none'], dir);
+  const listing = status === null ? null : releaseEvidenceGit(['ls-files', '-z', '-s', '-v'], dir);
+  if (listing === null) return null;
+  const hidden = masking.map(key => `lane config ${key} can hide tracked changes; unset it`);
+  const compare = [];
+  for (const entry of listing.split('\0')) {
+    if (!entry) continue;
+    const match = /^(\S) (\d{6}) ([a-f0-9]{40}|[a-f0-9]{64}) \d\t([\s\S]+)$/.exec(entry);
+    if (!match) return null;
+    const [, tag, mode, sha, path] = match;
+    // Lowercase tag = assume-unchanged; S/s = skip-worktree. Every other entry is already covered by status.
+    if (!/^(?:[a-z]|S)$/.test(tag)) continue;
+    let stat;
+    try { stat = lstatSync(join(dir, path)); } catch { hidden.push(`${path} (hidden by index flags: missing from worktree)`); continue; }
+    // Links and gitlinks are not content-compared here: a flagged one is reported rather than trusted.
+    if (!['100644', '100755'].includes(mode) || !stat.isFile()) { hidden.push(`${path} (hidden by index flags)`); continue; }
+    // An executable-bit flip keeps the blob sha, so compare the mode as git records it (owner x bit) before content.
+    // core.fileMode=false is refused above as masking config, so the filesystem bit is always meaningful here.
+    if (((stat.mode & 0o100) ? '100755' : '100644') !== mode) { hidden.push(`${path} (hidden by index flags: mode changed)`); continue; }
+    compare.push({ path, sha });
+  }
+  if (compare.length > HIDDEN_ENTRY_HASH_LIMIT) return null;
+  if (compare.length) {
+    const hashes = releaseEvidenceGit(['hash-object', '--no-filters', '--', ...compare.map(({ path }) => path)], dir);
+    const lines = hashes === null ? [] : hashes.split('\n');
+    if (lines.length !== compare.length) return null;
+    compare.forEach(({ path, sha }, i) => { if (lines[i] !== sha) hidden.push(`${path} (hidden by index flags: modified)`); });
+  }
+  return [status, ...hidden.map(line => `?! ${line}`)].filter(Boolean).join('\n');
+}
+
+// Commits count as preserved only when the canonical origin lists them RIGHT NOW (ls-remote of the pool's resolved
+// origin, run in the primary checkout), or when a salvage push verified its remote SHA. No local refs/remotes/* ref is
+// proof: a lane can make one stale, forged or a symbolic alias of its own branch. A listed tip the lane has not
+// fetched is skipped (`--ignore-missing`); if that leaves commits unproven, one hardened object-only fetch of the origin
+// heads runs (into a private ref namespace it deletes again, never refs/remotes/*) and the check repeats. A failed
+// listing or fetch never releases: it keeps the stricter result.
+const releaseRemoteHeads = new Map();
+function releaseUnprovenCommits(dir, salvage, proof) {
+  // On a refusal without remote proof, name the commits local tracking refs do not cover. This is an operator hint
+  // for the message only; it never authorizes a release.
+  const refused = why => ({ commits: null, why, hint: releaseEvidenceGit(['rev-list', '--max-count=20', 'HEAD', '--branches', '--not',
+    '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*'], dir) });
+  let heads = proof?.key ? releaseRemoteHeads.get(proof.key) : undefined;
+  if (!heads) {
+    if (!proof?.io) return refused(proof?.why || 'canonical origin unresolved');
+    try { heads = proof.io.remoteHeads(); } catch (e) { return refused(msgOf(e)); }
+    if (proof.key) releaseRemoteHeads.set(proof.key, heads);
+  }
+  // A stash holds tracked work too: every stash entry (refs/stash and its reflog) is a tip like any branch.
+  const stashRef = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/stash'], dir);
+  const stashes = stashRef ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : stashRef;
+  if (stashes === null) return { commits: null };
+  // The ref itself too: a stash ref with an expired, deleted or never-written reflog lists no entries.
+  // Every local tip is listed explicitly and must have its object: `--ignore-missing` (needed for the unfetched origin
+  // tips below) would otherwise silently drop a branch, HEAD or stash tip whose object the lane deleted, and so prove
+  // nothing about it. for-each-ref still lists a broken ref, so a missing object is caught here and fails closed.
+  // Only HEAD, local branches and the stash are lane work: lane acquire resets the checked-out branch and worktree
+  // only, so a commit held under another namespace (refs/tags/*, refs/salvage/*, refs/work/*) stays in the clone.
+  const localHeads = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/heads/'], dir);
+  const headSha = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
+  if (localHeads === null || !headSha) return { commits: null };
+  const tips = [headSha, ...localHeads.split('\n'), ...(stashRef ? stashRef.split('\n') : []),
+    ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  const present = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], dir,
+    { stdio: ['pipe', 'pipe', 'pipe'], input: tips.map(sha => `${sha}\n`).join('') });
+  const presentLines = present === null ? [] : present.split('\n');
+  if (presentLines.length !== tips.length || !presentLines.every(line => / commit$/.test(line))) return { commits: null };
+  const input = [...tips, ...[...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
+    .map(line => `${line}\n`).join('');
+  const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir,
+    { stdio: ['pipe', 'pipe', 'pipe'], input });
+  let commits = unproven();
+  if (commits === '') return { commits };
+  // The verification fetch must never move lane work (PR #6319, R639). Refuse up front on a symbolic tracking ref a
+  // fetch could write through, snapshot every local branch, the stash and HEAD around the (object-only) fetch, and
+  // refuse naming the ref if anything moved — without recomputing the proof against the changed refs.
+  const symrefs = releaseEvidenceGit(['for-each-ref', '--format=%(refname)%00%(symref)', 'refs/remotes/origin/'], dir);
+  if (symrefs === null) return { commits };
+  // Only the ordinary origin/HEAD alias of a plain origin/* ref passes; Git reports a symref's final target, so a chain
+  // through another symref is caught too.
+  const unsafe = (symrefs ? symrefs.split('\n') : []).map(line => line.split('\0'))
+    .filter(([name, target]) => target && !(name === 'refs/remotes/origin/HEAD' && target.startsWith('refs/remotes/origin/') && target !== name))
+    .map(([name, target]) => `${name} is a symbolic ref to ${target}`);
+  if (unsafe.length) {
+    return { commits, note: `${unsafe.slice(0, 5).join('; ')}; a fetch would write through it — remove it (git update-ref --no-deref -d <ref>)` };
+  }
+  const snapshot = () => {
+    const refs = releaseEvidenceGit(['for-each-ref', '--format=%(refname) %(objectname) %(symref)', 'refs/heads/', 'refs/stash'], dir);
+    if (refs === null) return null;
+    const head = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
+    const branch = releaseEvidenceGit(['symbolic-ref', '--quiet', 'HEAD'], dir);
+    // The proof protects every stash reflog entry, so record them all: dropping an older entry leaves the tip as is.
+    const hasStash = refs ? refs.split('\n').some(line => line.startsWith('refs/stash ')) : false;
+    const reflog = hasStash ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : '';
+    if (reflog === null) return null;
+    return new Map([...(refs ? refs.split('\n') : []), `HEAD ${head ?? '-'} ${branch ?? '-'}`,
+      `refs/stash@{reflog} ${reflog.split('\n').filter(Boolean).join(',') || '-'}`].map(line => [line.split(' ')[0], line]));
+  };
+  const before = snapshot();
+  if (!before) return { commits };
+  // A failed or refused fetch keeps the unfetched, stricter result and names why (a redirected ref directory, …).
+  try { proof.io.fetchVerifyObjects(dir); } catch (e) { return { commits, note: msgOf(e) }; }
+  const after = snapshot();
+  if (!after) return { commits };
+  const moved = [...new Set([...before.keys(), ...after.keys()])].filter(ref => before.get(ref) !== after.get(ref));
+  if (moved.length) {
+    return { commits, note: `${moved.slice(0, 5).join(', ')}${moved.length > 5 ? ` (+${moved.length - 5} more)` : ''} changed during the verification fetch; inspect the lane manually` };
+  }
+  return { commits: unproven() };
+}
+
+// A lane-written `.git/commondir` (or a `.git` gitfile / symlink) moves refs, objects and config to another
+// repository, so every evidence read would judge that repository instead of the lane. Refuse before reading through
+// it: the lane's .git must be a real directory with no commondir, and git must resolve both its git dir and common
+// dir to it. Returns '' when the lane owns its git dir, else the refusal reason (unreadable counts as redirected).
+function releaseGitDirRedirect(dir) {
+  const own = join(dir, '.git');
+  const present = path => { try { lstatSync(path); return true; } catch (e) { return e?.code !== 'ENOENT'; } };
+  let real;
+  try {
+    if (!lstatSync(own).isDirectory()) return 'lane .git is not a directory (gitfile or symlink); inspect it manually';
+    real = realpathSync(own);
+  } catch { return 'lane .git is unreadable; inspect it manually'; }
+  if (present(join(own, 'commondir'))) return 'lane .git/commondir redirects refs and objects to another repository; remove it';
+  const dirs = releaseEvidenceGit(['rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-common-dir'], dir);
+  const lines = dirs === null ? [] : dirs.split('\n');
+  const ownsPath = path => { try { return realpathSync(path) === real; } catch { return false; } };
+  if (lines.length !== 2 || !lines.every(ownsPath)) return 'lane git dir does not resolve to its own .git; inspect it manually';
+  return '';
+}
+// Runs before ANY release work (config scrub, litter cleanup, salvage push): through a redirect those would edit the
+// other repository's config or push its commits. `--discard` does not override it — the lane is not safe to reuse
+// until its own .git is restored. Same contract as the work refusal: exit 1, a loud journal line, the lane in `kept`.
+function releaseRedirectRefuses(dir, label) {
+  const redirect = releaseGitDirRedirect(dir);
+  if (!redirect) return false;
+  const details = boundedDetails(`lane git dir redirected: ${redirect}`);
+  log(`  ${String(label).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')}: KEPT — ${details}; lane and lease kept, no config scrub, ` +
+    'litter cleanup or salvage push ran, and --discard does not override this. Restore the lane\'s own .git, then retry release.');
+  journalLaneEvent(dir, { action: 'release-refused', reason: `KEPT — ${details}`, loud: true }, { unlessRepeat: true });
+  process.exitCode = 1;
+  return { reason: 'git-dir-redirected', details };
+}
+
+// Every refusal string (the stderr log, the journal line and `--json` details) passes `safe`, which strips URL
+// credentials: a failed listing or fetch message carries the origin URL (scripts/lib/lane-pool-salvage-push.mjs).
+function releaseWorkRefuses(dir, label, salvage, proof) {
+  const safe = value => redactUrlCredentials(String(value)).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+  const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+  const { commits, why, hint, note } = releaseUnprovenCommits(dir, salvage, proof);
+  const tracked = releaseTrackedChanges(dir);
+  if (commits === '' && tracked === '') return false;
+  const details = [
+    note ? `verification fetch refused: ${safe(note).slice(0, 300)}` : '',
+    why ? `commits cannot be proven on the canonical origin (${safe(why).slice(0, 300)})${hint
+      ? `; local commits not on any origin tracking ref: ${hint.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : ''}; inspect local history manually`
+      : commits === null ? 'commit evidence unreadable or exceeds the Git output limit; inspect local history manually'
+      : commits ? `unpushed commits: ${commits.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : '',
+    tracked === null ? 'tracked status unreadable or exceeds the Git output limit; inspect the index and worktree manually'
+      : tracked ? `tracked changes: ${safe(tracked)}` : '',
+  ].filter(Boolean).join('; ');
+  if (flags.discard) {
+    log(`  WARNING ${safe(label)}: --discard accepts loss on reuse of ${details}; releasing`);
+    return false;
+  }
+  const branch = tryGit(['symbolic-ref', '--quiet', '--short', 'HEAD'], dir) || `lane/${basename(dir)}-preserve`;
+  // Push to the canonical origin the guard proves against: the lane's own `origin` remote is lane-writable, so a push
+  // there can land in a repository the retry never lists. Credentials in a URL are never echoed.
+  const target = proof?.url ? releasePushTarget(proof.url) : '<canonical-origin-url>';
+  log(`  ${safe(label)}: UNPUSHED_WORK — ${details}; lane and lease kept. Preserve work (commit tracked changes first):\n` +
+    `    git -C ${quote(safe(dir))} push ${quote(safe(target))} HEAD:refs/heads/${quote(safe(branch))}\n` +
+    '    Push other unpushed local branches too, then retry release; pass --discard to deliberately release without preserving this work.');
+  // Even when a caller ignores the exit code (the drain's release-on-land, a launch-failure un-reserve, the reaper),
+  // the refusal leaves this loud journal line, and `--json` names the kept lane. Callers reading `kept`: #x3h0sng.
+  const bounded = boundedDetails(details);
+  journalLaneEvent(dir, {
+    action: 'release-refused', reason: `UNPUSHED_WORK — ${bounded}`, loud: true, unpushed: true,
+  }, { unlessRepeat: true });
+  process.exitCode = 1;
+  return { reason: 'unpushed-work', details: bounded };
+}
+
+// Bound a refusal's details for the journal and `--json`; a cut is marked so the text never reads as complete.
+const RELEASE_DETAILS_LIMIT = 1000;
+function boundedDetails(text) {
+  const value = String(text);
+  return value.length <= RELEASE_DETAILS_LIMIT ? value : `${value.slice(0, RELEASE_DETAILS_LIMIT)}… (truncated)`;
 }
 
 // #2667 — cross-pool release-by-session. `release --all-pools --session=<slug>` sweeps EVERY pool under
@@ -2883,6 +3137,7 @@ async function cmdReleaseAllPools(repo) {
   // `execFileSync`, so it inherits whatever directory that process happens to be running from).
   const pools = existingPools();
   const perPool = [];
+  const kept = []; // lanes the unpushed-work guard kept, named in --json (the drain reading it: #x3h0sng)
   let released = 0;
   for (const name of pools) {
     const poolDir = join(POOL_ROOT, name);
@@ -2899,14 +3154,30 @@ async function cmdReleaseAllPools(repo) {
         log(`  ${name}/lane-${n}: ${describeLease(lease)} — reserved; skipped (un-reserve is single-lane --release-reserved)`);
         continue;
       }
-      if (recoveryEnabled()) {
-        // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote.
+      const redirected = releaseRedirectRefuses(dir, `${name}/lane-${n}`);
+      if (redirected) { kept.push({ pool: name, lane: n, ...redirected }); continue; }
+      let salvage, salvageIo, laneIo, proofWhy;
+      // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote. The
+      // release proof needs that origin even when recovery (salvage) is off.
+      try {
         salvageRepo ??= name === repo.name ? repo
           : resolveRepo({ reference: primarySiblingPath(repo, name), pool: name });
-        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
-        if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        laneIo = realSalvageIo({ repo: salvageRepo, preflightLaneDir: dir });
+      } catch (e) {
+        proofWhy = `origin of pool ${name} unresolved: ${msgOf(e)}`;
+      }
+      if (recoveryEnabled()) salvageIo = laneIo;
+      const proof = { io: salvageRepo?.originUrl ? laneIo : null, key: salvageRepo?.originUrl ? `${name}\0${salvageRepo.originUrl}` : null, why: proofWhy,
+        url: salvageRepo?.originUrl || null };
+      scrubClaimedLaneConfig(dir, 'before release work check');
+      cleanLaneLitter(dir);
+      if (salvageIo) {
+        salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
+        if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; checking remaining work before release`);
         else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
       }
+      const refusedWork = releaseWorkRefuses(dir, `${name}/lane-${n}`, salvage, proof);
+      if (refusedWork) { kept.push({ pool: name, lane: n, ...refusedWork }); continue; }
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
         log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
         continue;
@@ -2928,8 +3199,8 @@ async function cmdReleaseAllPools(repo) {
       unmapLanes({ referencePath: repo.registryReferencePath || repo.referencePath, name }, lanes);
     }
   }
-  if (released === 0) log(`  no leases held by ${selectorLabel} in any pool (${pools.length} pool(s) scanned)`);
-  if (flags.json) process.stdout.write(JSON.stringify({ session: session || null, item: wantItem, released, pools: perPool }, null, 2) + '\n');
+  if (released === 0 && kept.length === 0) log(`  no leases held by ${selectorLabel} in any pool (${pools.length} pool(s) scanned)`);
+  if (flags.json) process.stdout.write(JSON.stringify({ session: session || null, item: wantItem, released, pools: perPool, kept }, null, 2) + '\n');
 }
 
 function deliveredLeaseForLane(dir, lease) {
@@ -2977,6 +3248,7 @@ async function cmdRelease(repo) {
   else if (flags.lane !== undefined) { targets = [Number(flags.lane)]; targeted = true; }
   else return fail('release needs --lane=N or --all');
   let released = 0;
+  const kept = []; // lanes kept by the work guard, a hold or a failed card save (named in --json for callers)
   for (const n of targets) {
     const dir = laneDir(repo, n);
     const lease = readLease(dir);
@@ -3047,7 +3319,11 @@ async function cmdRelease(repo) {
     // litter, the other 2 clean-but-ahead — the whole pool read 0 of 48 acquirable at once). Any
     // non-allowlisted dirty state (real uncommitted work) is left completely untouched by this call.
     // The snapshot and litter `status` / `clean` would run a lane-set clean filter, which no env pin reaches (PR #5775).
-    const salvageIo = recoveryEnabled() && repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
+    // The release proof (releaseWorkRefuses) reads the canonical origin even when recovery (salvage) is off.
+    const redirected = releaseRedirectRefuses(dir, `lane-${n}`);
+    if (redirected) { kept.push({ lane: n, ...redirected }); continue; }
+    const laneIo = repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
+    const salvageIo = recoveryEnabled() ? laneIo : null;
     scrubClaimedLaneConfig(dir, 'before release snapshot');
     const beforeLitter = laneStateSnapshot(dir, `origin/${repo.branch}`);
     // xbdixjc — a release by anyone but the holder (the reaper's `--force`, a delivered-lease release) may not
@@ -3057,7 +3333,9 @@ async function cmdRelease(repo) {
     // spawned share that id, so it cannot tell the holder from a sibling (or from a reaper launched by the same
     // session). Such a caller may still release an unparked lane; it may not drop a parked one.
     const holderProven = leaseOwnedBy(lease, session) || (!!laneHolderSlug(lease) && !!session && laneHolderSlug(lease) === session);
-    if (laneHoldRefuses(dir, 'release', { byHolder: holderProven, unpushed: beforeLitter.unpushed ?? undefined })) continue;
+    const held = laneHoldRefuses(dir, 'release', { byHolder: holderProven, unpushed: beforeLitter.unpushed ?? undefined });
+    // A hold is deliberate (exit stays 0, the refusal is journalled loud above), but a JSON caller still sees why.
+    if (held) { kept.push({ lane: n, reason: 'held', details: String(held.reason).slice(0, 1000) }); continue; }
     const litter = cleanLaneLitter(dir);
     if (litter?.removed?.length) {
       journalLaneEvent(dir, {
@@ -3070,8 +3348,16 @@ async function cmdRelease(repo) {
     if (!sameLease(readLease(dir), lease)) { log(`  lane-${n}: lease changed since it was read — not releasing; re-run if lane-${n} still looks wrong`); continue; }
     const cards = salvageLaneCards({ dir, lane: n, pool: basename(repo.poolDir), reason: `release of lane-${n} (${lease.purpose || 'no purpose'})`,
       isLeaseCurrent: () => sameLease(readLease(dir), lease) });
-    if (cards.status === 'unknown') log(`  WARNING lane-${n}: card salvage skipped (${cards.reason}); releasing without cleaning — inspect the lane before reuse`);
-    if (cards.status === 'failed') { log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`); continue; }
+    if (cards.status === 'unknown') log(`  WARNING lane-${n}: card salvage skipped (${cards.reason}); checking remaining work before release`);
+    if (cards.status === 'failed') {
+      log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`);
+      // Same contract as the unpushed-work refusal: exit 1, a loud journal line, and the lane named in `kept`.
+      const details = boundedDetails(`card files could not be saved: ${String(cards.reason).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')}`);
+      journalLaneEvent(dir, { action: 'release-refused', reason: `KEPT — ${details}`, loud: true }, { unlessRepeat: true });
+      process.exitCode = 1;
+      kept.push({ lane: n, reason: 'card-salvage-failed', details });
+      continue;
+    }
     if (cards.status === 'salvaged') {
       log(`  lane-${n}: saved ${cards.removed.length} leftover card file(s) to ${cards.outDir} and cleaned them`);
       journalLaneEvent(dir, { action: 'card-salvage', before: beforeLitter, removed: cards.removed, salvagedTo: cards.outDir, reason: 'release saved and cleaned leftover backlog card files' });
@@ -3082,15 +3368,19 @@ async function cmdRelease(repo) {
     // have released and a brand-new acquirer could already be sitting on this exact lane. An unconditional
     // `rmSync` here would destroy that NEW holder's live lease, not the one this call actually decided to drop
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
+    let salvage;
     if (recoveryEnabled()) {
       if (!repo.originUrl) {
-        log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage and releasing anyway — inspect the lane before reuse`);
+        log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage; checking remaining work before release`);
       } else {
-        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
-        if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
+        if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; checking remaining work before release`);
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }
     }
+    const refusedWork = releaseWorkRefuses(dir, `lane-${n}`, salvage, { io: laneIo, key: repo.originUrl ? `${repo.name}\0${repo.originUrl}` : null,
+      url: repo.originUrl || null });
+    if (refusedWork) { kept.push({ lane: n, ...refusedWork }); continue; }
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
@@ -3123,10 +3413,14 @@ async function cmdRelease(repo) {
     // `release --force` reclaim, which delegates here) leaves the registry pointing at a lane that is free
     // again, and conveyor-state.mjs's health-stall scan overcounts `building` forever.
     unmapLanes({ ...repo, referencePath: repo.registryReferencePath || repo.referencePath }, [n]);
+    // Only a lane PROVEN clean and IN SYNC with the integration branch right now is published as free. Stricter than the
+    // scan's bar (an ahead-but-pushed lane is not published; the scan can still find it), so a lane is never over-advertised.
+    const afterRelease = isReservedLease(lease) ? null : laneStateSnapshot(dir, `origin/${repo.branch}`);
+    touchFreeList(repo, n, isProvablyCleanAndPushed(afterRelease, { requireInSync: true }));
     log(`  released lane-${n} (was ${describeLease(lease)})`);
     released++;
   }
-  if (flags.json) process.stdout.write(JSON.stringify({ released, targets }, null, 2) + '\n');
+  if (flags.json) process.stdout.write(JSON.stringify({ released, targets, kept }, null, 2) + '\n');
 }
 
 function printStatus(repo) {
@@ -4297,6 +4591,7 @@ function cmdTrim(repo) {
     }
     unmapLanes(repo, [...toRemoveSet]); // stop proxying a lane before its files are deleted (#2139)
     for (const t of trashed) rmSync(t, { recursive: true, force: true });
+    for (const t of toRemoveSet) touchFreeList(repo, t, false);
     invalidateListCache(repo); // #xn432dz — the pool shape changed
   }
 
@@ -4825,7 +5120,7 @@ function cmdUnmap(repo) {
 // reading a flag meant for a different command is a much smaller, less surprising mistake than an
 // unrecognized flag vanishing outright, and a flat set can't drift out of sync with which command reads what.
 const KNOWN_FLAGS = new Set([
-  'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'force', 'item', 'json', 'lane',
+  'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
   'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
@@ -4888,6 +5183,8 @@ async function cmdGc(repo) {
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────
+// Forwarding entry modules and symlinked scripts also dispatch this CLI on import.
+// Importable cleanup helpers live in lib/lane-build-output.mjs instead.
 const COMMANDS = {
   // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
   gc: cmdGc,

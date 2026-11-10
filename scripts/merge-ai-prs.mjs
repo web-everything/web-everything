@@ -2,6 +2,10 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
+import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
+import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
+import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -179,8 +183,10 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydrated, resolvePrListPaging } from './lib/pr-list-paged.mjs';
+import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { resolveCardNumbering } from './lib/policy-cascade.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
@@ -198,6 +204,7 @@ import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequi
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
+import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
@@ -234,7 +241,7 @@ import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-
 import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
-import { readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
+import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -248,6 +255,8 @@ export { remoteManifestApiArgs };
 function recordEnqueue(outcomes, repo, outcome) {
   return recordEnqueueOutcome({ outcomes, repo, outcome, emit: appendDaemonEvent });
 }
+
+const mqSameHeadRefreshStore = createMqSameHeadRefreshStore({ path: mqSameHeadRefreshStatePath() });
 
 const REVIEW_BASELINE_STATE_PATH = resolve(process.cwd(), '.claude/skills/drain/review-baseline-state.json');
 
@@ -4818,6 +4827,67 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
+  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
+    // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
+    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
+      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
+      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
+      enqueueAllowed: () => {
+        const repo = c.repo ?? localSlug;
+        const exec = createMqLiveReader();
+        const gh = args => exec('gh', args, { encoding: 'utf8', timeout: 60_000,
+          maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { personalRoute: false } });
+        const log = line => process.stderr.write(`  ${line}\n`);
+        try {
+          const comments = readCompletePrComments(c.num, { repo, exec });
+          if (!Array.isArray(comments)) throw Error('complete comments unreadable');
+          const safety = readDrainQueueSafety({ log });
+          if (safety.value.waitForRedTeamBeforeEnqueue) {
+            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
+            const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
+              readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
+              cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
+              unedited: target => readUneditedCommentIds(target, { gh }),
+            });
+            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
+          }
+          // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
+          const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,
+            '--json', 'headRefOid,baseRefName'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'pipe'] }));
+          if (live?.headRefOid !== sha || typeof live.baseRefName !== 'string' || !live.baseRefName) return false;
+          const read = readPinnedChangedFiles({ headSha: sha, base: live.baseRefName, cwd: process.cwd(), exec });
+          if (read.error) return false;
+          const workflow = resolveDrainWorkflowEditHuman();
+          log(`policy · drainWorkflowEditHuman=${workflow.value} (${workflow.source})`);
+          if (decideDrainWorkflowEditHold({ files: read.files, filesComplete: true, headSha: sha,
+            humanClearedSha: parseLatestHumanClearedSha(comments), setting: workflow.value }).hold) return false;
+          const surface = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
+          if (!surface.hold) return true;
+          if (!surface.humanOnly) return false;
+          const setting = resolveApprovalLicensesEnqueue();
+          log(`human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
+          if (!setting.value) return false;
+          const license = proveHumanOnlyLicense({ repo, pr: c.num, headSha: sha, cwd: process.cwd(), exec });
+          return license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
+        } catch { return false; }
+      } });
+    const guard = mqSameHeadGuard({ refresh, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      log: line => process.stderr.write(`${line}\n`) });
+    // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
+    const shown = { line: guard.reason ?? guard.line };
+    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
+    const result = mergeStrategy.enqueue(c, sha, { ...options,
+      // The early queued bypass authorizes bookkeeping only. If membership disappears during the
+      // strategy's other checks, require fresh timeline admission immediately before any mutation.
+      sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+        allowAlreadyQueued: false, refresh, log: line => process.stderr.write(`${line}\n`) }) });
+    if (result?.enqueued === true) {
+      try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
+    }
+    return result;
+  }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
     queueOwnsFreshness: () => mergeStrategy.queueOwnsFreshness(null),
@@ -5086,14 +5156,14 @@ async function runCli() {
       if (slug) {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+        const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
           heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
-          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } });
+          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
         return resolveListedChecks(repo, listed.rows);
       }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      return resolveListedChecks(repo, JSON.parse(stdout.trim() || '[]'));
+      return resolveListedChecks(repo, parseListOutput(stdout, { repo }));
     },
     // #2417 — fan out the per-PR manifest + commits reads across ALL repos' open PRs at once (bounded pool), cached
     // across `--watch` passes on unchanged head SHA + body. Returns key→{manifest, commits, degraded}.
@@ -5288,6 +5358,49 @@ async function runCli() {
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  // Shared by the full cascade and the green-event shortcut, including --json callers.
+  let asyncShadow;
+  let shadowObserved = false;
+  if (!DRY_RUN) {
+    try { asyncShadow = createAsyncShadow(); } catch { /* Timing only. */ }
+  }
+  const summarizeAsyncShadow = (outcomes, candidates) => {
+    try {
+      const byPr = new Map(candidates.map(c => [`${c.repo || localSlug}#${Number(c.num)}`, c]));
+      for (const outcome of outcomes) {
+        if (outcome.outcome !== 'not-enqueued') continue;
+        const c = byPr.get(`${outcome.repo || localSlug}#${Number(outcome.num)}`);
+        if (c) asyncShadow?.noteSkipReason(`${c.repo || localSlug}#${c.num}@${c.headSha}`, outcome.kind);
+      }
+      const summary = asyncShadow?.emitSummary();
+      if (summary) process.stderr.write(`async-drain-shadow: summary n=${summary.n} median=${summary.medianDeltaMs == null ? 'null' : summary.medianDeltaMs / 1000}s p90=${summary.p90DeltaMs == null ? 'null' : summary.p90DeltaMs / 1000}s readyNotReached=${summary.readyNotReached}\n`);
+    } catch { /* Best-effort timing only. */ }
+  };
+  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
+  if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
+  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false } = {}) => {
+    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
+    // still need the drain's rebase/refresh path, regardless of the head's human approval.
+    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
+    try {
+      if (strict && (!['on', 'off'].includes(approvedHeadSetting?.value)
+          || !['env', 'settings'].includes(approvedHeadSetting?.source)))
+        throw new Error('approval settings unreadable or unresolvable; operator must inspect approval configuration');
+      const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
+      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
+      // Refresh authorization must observe approval added since the memo was populated.
+      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
+        expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
+          ? (strict ? createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args, opts) : readGh(args, opts))
+          : execFileSync(file, args, { ...opts, cwd }) });
+      if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
+      return decision.hold;
+    } catch (e) {
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
+      if (strict) return true;
+      return false;
+    }
+  };
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
   // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
@@ -5302,6 +5415,7 @@ async function runCli() {
     const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
     const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
     passMainFix = mainFixFrom(hold);
+    let prestageShadowCandidate;
     const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
@@ -5316,8 +5430,16 @@ async function runCli() {
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
       // The cached base was verified unchanged, and preparation required it to be the default branch.
-      beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
-      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      beforeEnqueue: (c, sha, entry) => {
+        prestageShadowCandidate = { repo: c.repo || localSlug, num: c.num, headSha: sha };
+        // Eligibility was just checked live. No label reads are added for telemetry.
+        try {
+          asyncShadow?.observePass({ candidates: [prestageShadowCandidate], observedPrs: [prestageShadowCandidate] });
+          shadowObserved = true;
+        } catch { /* Timing only. */ }
+        return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
+      },
+      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow),
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
@@ -5326,6 +5448,7 @@ async function runCli() {
         enqueueOutcomes: [] };
       recordEnqueue(result.enqueueOutcomes, localSlug,
         { num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast });
+      summarizeAsyncShadow(result.enqueueOutcomes, prestageShadowCandidate ? [prestageShadowCandidate] : []);
       return { result, merged: [], failedMerges: [], pendingRebased: [], deferred: [], duplicateIdsOnMain: [] };
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
@@ -5384,7 +5507,7 @@ async function runCli() {
         '--json', RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '')];
       const { stdout } = await execFileP('gh', listArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      return JSON.parse(stdout.trim() || '[]');
+      return parseListOutput(stdout, { repo });
     };
     try {
       const slug = repo || localSlug;
@@ -5426,9 +5549,9 @@ async function runCli() {
           if (!snapshotSeed) {
             try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
           }
-          listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+          listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
-            maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
+            maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
           drainHeavyCacheByRepo.set(repo, listed.cache);
         } else if (!slug) {
           // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
@@ -5700,24 +5823,6 @@ async function runCli() {
     }
   }
 
-  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
-  if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
-  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha) => {
-    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
-    // still need the drain's rebase/refresh path, regardless of the head's human approval.
-    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
-    try {
-      const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
-      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
-      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
-        expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }) });
-      if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
-      return decision.hold;
-    } catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy rebase/refresh path\n`);
-      return false;
-    }
-  };
   // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
   const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
     ...unknownRecovery, repo: repo || localSlug, num,
@@ -6505,7 +6610,7 @@ async function runCli() {
         // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
         // A MANUAL freeze is the operator's stop-the-line: quarantine never relaxes it (stop mode for every PR).
         const mode = resolveRedMainMode();
-        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual');
+        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual') && !sig.sources.includes('freeze-unreadable');
         let qList = null;
         let filesOf = () => null;
         if (quarantine) {
@@ -6664,6 +6769,19 @@ async function runCli() {
     return p;
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge' && !v.prestagePendingCi); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
+  if (!DRY_RUN) {
+    try {
+      // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
+      // A failed prestage attempt can fall through within this same sweep, not a later missed pass.
+      asyncShadow?.observePass({ countMissed: !shadowObserved,
+        // A filtered/targeted listing is not evidence that another PR disappeared.
+        observedPrs: verdicts.map(c => ({ repo: c.repo || localSlug, num: c.num })),
+        candidates: toMerge.map(c => ({
+          repo: c.repo || localSlug, num: c.num, headSha: c.headSha,
+          readyAtMs: readyInfoMemo.has(`${c.repo || localSlug}#${c.num}@${c.listedHeadSha || c.headSha || null}`) ? readyInfoOf(c).readyAtMs : null,
+        })) });
+    } catch { /* Timing observations never affect enqueue decisions. */ }
+  }
   const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
   // #xc7p3q9 (R6) — the held couple's members (its `skip` carrier + its deferred impl half — both carry
   // `coupleDeferReason:'held'`) so `decideBatchesIdleExit` can SUBTRACT them from `considered` rather than waive
@@ -6804,7 +6922,8 @@ async function runCli() {
   if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
   const branchPreparationRequired = createBranchPreparationRequired({ enabled: numberingOnBranch,
     serial: resolvedMergePolicy.policy.concurrency.enqueue === 1,
-    readFiles: (c, sha) => readGit(['ls-tree', '-r', '--name-only', sha, '--', 'backlog/'], {
+    // -z: line output C-quotes non-ASCII names, which would hide a pending hash card.
+    readFiles: (c, sha) => readGit(['ls-tree', '-r', '-z', '--name-only', sha, '--', 'backlog/'], {
       cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo), encoding: 'utf8',
     }), hasPendingCards: (files) => hashBacklogFiles(files).length > 0 });
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
@@ -7158,7 +7277,7 @@ async function runCli() {
           // it is what serializes the actual merge write, not just NNN allocation. Inside the lock, the re-check
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
           if (shouldPrepareBranchBeforeEnqueue({ required: branchPreparationRequired(c), enqueues: mergeStrategy.enqueues(c.repo) })) {
-            const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
+            const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, shadow: resolveCardNumbering().value.shadow, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
             if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }
           const landLock = withLandWriteLock(() => {
@@ -7166,7 +7285,7 @@ async function runCli() {
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
             const groupHeld = cardGrouping.holdFor(c);
             if (groupHeld) return { skipped: 'card-group-hold', reason: groupHeld.reason };
-            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }, approvedHeadHold); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
@@ -7205,6 +7324,7 @@ async function runCli() {
           if (landLock.result?.enqueued === true) {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
             await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
+            try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: traceHeadSha }); } catch { /* timing only */ }
           }
           if (landLock.result?.enqueued === false) {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
@@ -7587,9 +7707,10 @@ async function runCli() {
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
   // #5444 — SHADOW ONLY: the pure ledger gate beside the label gate for every considered PR, journaled as one run
   // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
+  summarizeAsyncShadow(enqueueOutcomes, toMerge);
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
-  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
+  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked, enqueueOutcomes });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);

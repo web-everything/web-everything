@@ -3,7 +3,7 @@ bornAs: x60c5ua
 kind: task
 parent: "4075"
 status: open
-scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs"]
+
 dateOpened: "2026-09-29"
 tags: []
 ---
@@ -31,3 +31,12 @@ we:backlog/4314-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md's
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+## Findings (standalone worker, 2026-11-02)
+
+The build-dispatch daemon held #4485 with:
+
+> worker-declined: Not prepared: #4485 — could-not-prepare. The unresolved choice is whether outcome coverage uses a structured authoring contract or best-effort prose inference. The card promises recognition “in any … wording,” including arbitrary documented outcomes, but defines no matching contract. Choosing structured annotations would change authoring policy; choosing heuristics would narrow that guarantee. The current lint interface also lacks source-reading support ('we:scripts/check-standards-rules.mjs:1385'); both production callers would need consideration ('we:scripts/check-standards.mjs:982', 'we:scrip…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.

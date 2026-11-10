@@ -1,8 +1,8 @@
 /** GitHub/file observations for judge-sweep-facts. No GitHub mutations or agent dispatches. */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -28,6 +28,12 @@ import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseFindings } from '../review-corpus/mine-review-corpus.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
+import { findSuspendedReferralRuns, resolveReferralJudgeWindow } from '../lib/suspended-referral-run.mjs';
+import { resolveRunsDir } from './run-store.mjs';
+import { publishAttention } from './needs-you-feed.mjs';
+import { createActionStore } from './action-store.mjs';
+import { actionResource } from './action-record.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 import { STALL_DEFAULTS } from './judge-sweep-facts.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
@@ -124,9 +130,58 @@ function readRows(repo) {
   return rows;
 }
 
+const staleFailure = (behind, what) => failure(`checkout-stale (${behind} behind): ${what}`);
+
+/** Fetch origin/main and count how far this checkout is behind it. Any doubt throws (fail closed). */
+export function readCheckoutState({ exec = execFileSync, root = rootDir() } = {}) {
+  const git = args => String(exec('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 120_000,
+    maxBuffer: 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })).trim();
+  git(['fetch', '--quiet', 'origin', 'main']);
+  const count = git(['rev-list', '--count', 'HEAD..origin/main']);
+  // An empty or odd count must read as unknown, never as 0 behind.
+  if (!/^\d+$/.test(count)) throw new Error('unreadable behind count');
+  return { behind: Number(count) };
+}
+
+/** Run the reader from a throwaway worktree of origin/main so code and cards never come from a stale checkout. */
+export function readFromFreshOrigin({ repo, checkCoverage, root = rootDir(), exec = execFileSync } = {}) {
+  const tmp = mkdtempSync(join(tmpdir(), 'judge-facts-fresh-'));
+  const tree = join(tmp, 'tree');
+  const git = args => exec('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 300_000, maxBuffer: 1024 * 1024 });
+  try {
+    git(['worktree', 'add', '--detach', '--quiet', tree, 'origin/main']);
+    // Dependencies are installed per checkout; reuse this one's (the fresh tree has the same lockfile family).
+    if (!existsSync(join(root, 'node_modules'))) throw new Error('node_modules missing in this checkout');
+    symlinkSync(join(root, 'node_modules'), join(tree, 'node_modules'));
+    // Static child import keeps this generated program from making daemon import closures incomplete.
+    const script = `import { createJudgeSweepFactsReader } from ${JSON.stringify(join(tree, 'scripts/operations/judge-sweep-facts-io.mjs'))};`
+      + `process.stdout.write(JSON.stringify(createJudgeSweepFactsReader({ checkoutState: () => ({ behind: 0 }) })(${JSON.stringify({ repo, checkCoverage })})));`;
+    try {
+      return JSON.parse(String(exec(process.execPath, ['--input-type=module', '-e', script], { cwd: tree, encoding: 'utf8',
+        timeout: 600_000, maxBuffer: 64 * 1024 * 1024 })));
+    } catch (error) {
+      const lines = String(error?.stderr ?? '').split('\n').map(l => l.trim()).filter(l => l && !/^Node\.js v/.test(l));
+      const detail = (lines.find(l => /Error/.test(l)) ?? lines.at(-1) ?? error?.message ?? '').slice(0, 300);
+      throw new Error(`fresh reader failed: ${detail}`);
+    }
+  } finally {
+    try { git(['worktree', 'remove', '--force', tree]); } catch { /* directory deleted, then registration pruned, below */ }
+    rmSync(tmp, { recursive: true, force: true });
+    // A registration that cannot be pruned is a refusal, not a silent leak.
+    try { git(['worktree', 'prune']); } catch (error) { throw new Error(`worktree cleanup failed: ${String(error?.message ?? error).slice(0, 200)}`); }
+  }
+}
+
+const validFreshPr = p => p && typeof p === 'object' && Number.isSafeInteger(p.number) && p.number > 0
+  && /^[a-f0-9]{40}$/i.test(p.headSha ?? '') && Array.isArray(p.labels) && Array.isArray(p.evidenceErrors)
+  && Number.isFinite(p.minutesSinceUpdate);
+const validFreshFacts = facts => facts && typeof facts === 'object' && Array.isArray(facts.prs) && facts.prs.every(validFreshPr);
+
 /** Injectable at every boundary; tests never need the host's credentials, process table, or ledgers. */
 export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.now(),
   readFile = readFileSync,
+  findSuspendedRuns = findSuspendedReferralRuns, publishAlert, alertClaimsDir,
+  env = process.env, log = line => console.error(line),
   exec = execFileSync,
   readLedgerRows = readRows, readFixRows = readFixLoopRows,
   readJobs = () => parseLiveJobs(exec('ps', ['-axo', 'pid,etime,command'], {
@@ -140,6 +195,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
   })),
   baseCap = resolveRoundCap(process.env),
   readStallThresholds = resolveStallThresholds,
+  checkoutState = readCheckoutState, readFresh = readFromFreshOrigin,
   cardReadable = ref => referralCardReadable(ref, rootDir(), { readOnPr: () => {
     // Remote card verification would break this operation's list + comments-only call budget.
     throw failure('remote referral card requires operator verification');
@@ -147,6 +203,20 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
 } = {}) {
   return ({ repo = JUDGE_SWEEP_REPO, checkCoverage } = {}) => {
     if (repo.length > 200 || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw failure('repo must be owner/name (at most 200 characters)');
+    // Evidence never depends on this checkout's age: behind origin/main means read from origin/main, else refuse.
+    {
+      let behind;
+      try { behind = checkoutState()?.behind; } catch { behind = undefined; }
+      if (!Number.isSafeInteger(behind) || behind < 0) throw staleFailure('unknown', 'cannot prove this checkout is current with origin/main');
+      if (behind > 0) {
+        let facts;
+        try { facts = readFresh({ repo, checkCoverage, behind }); } catch (error) {
+          throw staleFailure(behind, `fresh origin/main read failed (${String(error?.message ?? error).slice(0, 200)})`);
+        }
+        if (!validFreshFacts(facts)) throw staleFailure(behind, 'fresh origin/main read malformed');
+        return facts;
+      }
+    }
     const start = now();
     const thresholds = readStallThresholds();
     let calls = 0;
@@ -211,7 +281,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         minutesSinceHeadChange: minutesSince(lastCommit?.committedDate),
         minutesSinceFixDispatch: minutesSince(lastDispatch?.at),
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
-        openReferrals: null, openSendBacks: null, lastFixLoop, humanRequired: null,
+        suspendedReferralRun: null, openReferrals: null, openSendBacks: null, lastFixLoop, humanRequired: null,
         minutesSinceFixLoop: lastFixLoop && Number.isFinite(Date.parse(lastFixLoop.at))
           ? Math.max(0, (start - Date.parse(lastFixLoop.at)) / 60_000) : null,
         minutesSinceUpdate: Math.max(0, (start - Date.parse(p.updatedAt)) / 60_000),
@@ -276,6 +346,46 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         const ignored = ignoredRulings(view, { restackOf: () => false });
         result.ignoredFindingReturned = (ignored?.effectiveMisses ?? 0) >= 2;
       } catch { evidenceErrors.push('comment evidence unreadable or budget exhausted'); }
+      try {
+        const suspended = findSuspendedRuns({ repo, pr: p.number, head: headSha, now: start });
+        for (const held of suspended) {
+          const evidence = { runId: held.id, ageMinutes: held.ageMs / 60_000, findings: held.findings };
+          result.suspendedReferralRun ??= evidence;
+          // Require an explicit ruling for every saved finding; an empty thread proves none.
+          const ruled = held.findings.length > 0 && held.findings.every(f =>
+            result.openReferrals?.some(r => r.key === f.key && r.ruled === true));
+          const window = resolveReferralJudgeWindow({ env, log, readFile });
+          if (!ruled && evidence.ageMinutes >= window.value.referralWindowMinutes && (publishAlert || !isUnderTest(process.env))) {
+            const publish = publishAlert ?? publishAttention;
+            // Reserve the run before publication, including across processes. No expiry or liveness probe:
+            // an uncertain publication stays claimed for operator inspection rather than being sent twice.
+            const dir = alertClaimsDir ?? join(resolveRunsDir(), 'referral-judge-alert-claims');
+            mkdirSync(dir, { recursive: true });
+            const store = createActionStore({ root: join(dir, createHash('sha256').update(held.id).digest('hex')), now: () => start });
+            const resource = actionResource(repo, { type: 'pr', id: String(p.number) });
+            const kind = 'suspended-referral-no-ruling';
+            if (store.attempts(resource).some(r => r.kind === kind && r.state === 'terminal' && r.outcome === 'settled')) continue;
+            const claim = store.claim({ resource, kind, owner: `judge-sweep:${process.pid}`, evidence: { runId: held.id, head: headSha } });
+            if (!claim.ok) continue;
+            let rec = claim.record;
+            const sending = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+              from: 'intent', to: 'dispatching', patch: { dispatchingSince: start } });
+            if (!sending.ok) throw Error('referral alert claim lost; inspect run store');
+            rec = sending.record;
+            log(`${repo}#${p.number} NEEDS-YOU run ${held.id}: referral judge referralWindowMinutes=${window.value.referralWindowMinutes} source=${window.sources.referralWindowMinutes}`);
+            publish({ repo, pr: p.number, head: headSha, kind: 'suspended-referral-no-ruling',
+              reason: `PR #${p.number} run ${held.id} awaits referral ruling: ${held.findings.map(f => `${f.key}: ${f.summary}`).join('; ') || 'inspect saved referral findings'}`,
+              pick: `https://github.com/${repo}/pull/${p.number}` });
+            const observed = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+              from: 'dispatching', to: 'observed', patch: { handle: 'needs-you-feed' } });
+            if (!observed.ok) throw Error('referral alert observation lost; inspect run store');
+            rec = observed.record;
+            const settled = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+              from: 'observed', to: 'terminal', patch: { outcome: 'settled' } });
+            if (!settled.ok) throw Error('referral alert settlement lost; inspect run store');
+          }
+        }
+      } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
       if (labels.includes('review:human')) {
         try {
           // A retarget or base advance can change the net files without changing the head.

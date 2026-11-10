@@ -22,6 +22,9 @@ vi.mock('../lane-repair.mjs', async original => ({
   ...(await original()), healLaneRefs: vi.fn(() => ({ actions: ['removed stale objects/info/commit-graph cache'] })),
 }));
 
+// Hermetic default cwd: an empty dir, so the guard never sees the host checkout's commit-graph and the exact git call
+// sequences these tests pin hold on any host (a lane clone has a graph; CI's checkout may not).
+const hermeticCwd = mkdtempSync(join(tmpdir(), 'poison-admission-cwd-'));
 const headSha = 'b'.repeat(40);
 const repo = 'fixture/poison-admission';
 const c = { num: 5969, repo };
@@ -35,6 +38,7 @@ function gitEvidence({ collision = true, fail, mainKey = 'bornAs', mainValue = '
     switch (args[0]) {
       case 'diff': return path;
       case 'fetch': return '';
+      case 'commit-graph': return ''; // the guard verifies an existing cache first; hosts with one (lane clones) must not leak in
       case 'show': return text;
       case 'ls-remote': return `${'a'.repeat(40)}\trefs/heads/main\n`;
       case 'grep':
@@ -64,7 +68,7 @@ function strategy(evidence, { pages = () => '[[]]', deliver = () => { throw new 
     redTeamDeadline: { value: { deadlineAction: 'hold' } },
     cardGroupHold: () => null, batching: { gate: () => ({ admit: true }) },
     readFile: () => JSON.stringify({ pending: [], followedUp: [] }), writeState: vi.fn(),
-    log: { write: vi.fn() }, ...where,
+    log: { write: vi.fn() }, cwd: hermeticCwd, ...where,
   });
   return { s, exec };
 }

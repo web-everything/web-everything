@@ -70,6 +70,7 @@ export default defineConfig({
       'scripts/__tests__/gate-entrypoint-integration.test.mjs',
       'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
       'scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs',
+      'scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',
       'scripts/__tests__/lane-pool-acquire-base.test.mjs',
       'scripts/__tests__/publish-secret-gate.test.mjs',
@@ -111,6 +112,7 @@ export default defineConfig({
       // #4122 — same tier: real throwaway origin/reference/pool, real spawned `lane-pool.mjs acquire`/
       // `provision` children, a PATH git shim tracing lane git calls (proof of the free-lane-list fast path).
       'scripts/__tests__/lane-pool-acquire-free-list.test.mjs',
+      'scripts/__tests__/lane-pool-free-list-event-refresh.test.mjs',
       // #x96v5hl — same `lane-pool-trim.test.mjs` barrier-plus-real-concurrent-spawn technique (a real
       // `release`/`acquire` child paused mid-run via an env-var test seam, a second real concurrent CLI child
       // racing into that exact window): proof of the release/reap and stale-reclaim TOCTOU fixes.
@@ -164,6 +166,8 @@ export default defineConfig({
       ['scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs', 'forks'],
       // Existing/added-file pairs run multiple real-git rebuilds and hit the unit shard's 5s deadline too.
       ['scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs', 'forks'],
+      // Fallback's harness-backoff case runs three real-git rebuilds; preserve its 5s deadline under less contention.
+      ['scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs', 'forks'],
       ['scripts/operations/__tests__/wake-cli.test.mjs', 'forks'],
       ['scripts/operations/__tests__/dispatch-spawn-live.test.mjs', 'forks'],
       // Rust parity tests compile the scanner and scan the real repository. A separate threads pool

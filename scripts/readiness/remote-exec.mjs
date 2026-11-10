@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
+import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
+import {routeNeedsGit} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
 
 const ROOT = '/srv/forge-exec';
@@ -74,6 +76,25 @@ export function isAllowedCommand(argv) {
   return allowedCommand(argv);
 }
 
+/** Strip leading ./ from Vitest file arguments without changing execution policy. */
+export function normalizeRemoteArgv(argv) {
+  if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
+    || argv[0] !== 'npx' || argv[1] !== 'vitest' || !['run', 'related'].includes(argv[2])) return argv;
+  const normalized = argv.slice(0, 3);
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i];
+    // These two-token options take values, not positional file filters.
+    if (arg === '-t' || arg === '--config') {
+      normalized.push(arg);
+      if (++i < argv.length) normalized.push(argv[i]);
+    } else {
+      // A positional path must never become an option when its prefix is removed.
+      normalized.push(arg.startsWith('./') && !arg.slice(2).startsWith('-') ? arg.slice(2) : arg);
+    }
+  }
+  return normalized;
+}
+
 export function filterEnv(env = {}) {
   if (Object.hasOwn(env, 'DIFF_COVERAGE_BASE') && !allowedEnv({DIFF_COVERAGE_BASE:env.DIFF_COVERAGE_BASE}))
     throw Object.assign(new Error('Invalid DIFF_COVERAGE_BASE: use local fallback'), {code:'invalid-diff-coverage-base'});
@@ -108,7 +129,7 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, signal }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
       cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
@@ -129,6 +150,9 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
         if (stream === child.stdout) stdout.push(chunk);
       });
     }
+    // x40a9dk: an aborted client stops the local ssh; the Forge side is then ended by the protected finish.
+    const stop = () => { child.kill('SIGTERM'); };
+    if (signal) { if (signal.aborted) stop(); else { signal.addEventListener('abort', stop, { once: true }); child.once('close', () => signal.removeEventListener('abort', stop)); } }
     child.on('error', reject);
     child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
       : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout) }));
@@ -1035,6 +1059,14 @@ export function spawnPresync({cwd,host,env=process.env,spawnFn=spawn}={}) {
   } catch { /* presync is best effort */ }
 }
 
+/** One `location=local reason=…` line per local-fallback result; control and line/paragraph separators are stripped so a reason can never forge extra log lines. */
+export function logLocalLocation(result,log) {
+  if((result?.mode==='not-started'||result?.mode==='fallback')&&result.reason) {
+    const reason=String(result.reason).replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu,'');
+    (log??(text=>process.stderr.write(text)))(`location=local reason=${reason}\n`);
+  }
+}
+
 export async function runRemote(options={}) {
   const clock=options.clock??Date.now,timings=[],start=clock();
   const pending=new Map();
@@ -1044,6 +1076,7 @@ export async function runRemote(options={}) {
     return extra=>{pending.delete(item);Object.assign(item,{ms:Math.max(0,Math.round(clock()-at)),...extra});};
   };
   const result=await executeRemote({...options,clock,timings,begin});
+  logLocalLocation(result,options.log);
   for(const [item,at] of pending)item.ms=Math.max(0,Math.round(clock()-at));
   timings.push({stage:'total',startedAtET:easternTimestamp(start),ms:Math.max(0,Math.round(clock()-start))});
   // Only the real transport presyncs; injected transports opt in explicitly.
@@ -1052,12 +1085,25 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, onRun, log = text=>process.stderr.write(text) } = {}) {
+/** R807: fail closed. A scan that throws is treated as git-needing, so the run needs an affirmed bundle or falls back local. */
+export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit}){
+  try{return route({argv,cwd}).local===true;}catch{return true;}
+}
+
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
+  if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
+  argv = normalizeRemoteArgv(argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
-  const needsGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
+  const bundleTransport=resolveTransport(transport)==='git-bundle';
+  const standardsNeedGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
+  // git-bundle only: a test file that spawns git also gets a real worktree (otherwise it stays on the git-less snapshot).
+  let testNeedsGit=false;
+  if(bundleTransport&&!standardsNeedGit)testNeedsGit=detectTestNeedsGit({argv,cwd});
+  const needsGit=standardsNeedGit||testNeedsGit;
+  let bundleDirectory;
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   try {exec=await bindGit({cwd,env,exec});}catch(error){return fallback(error.code??'unbound-worktree');}
   sshOptions ??= connectionOptions();
@@ -1070,6 +1116,8 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   // All speculative children are drained and all rejections observed before fallback.
   if(initial[0].status==='rejected'||initial[0].value.code!==0||initial[1].status==='rejected')return fallback('forge-unreachable');
   const unwrap=result=>{if(result.status==='rejected')throw result.reason;return result.value;};
+  // x40a9dk: only the client-kill `cancelSignal` cancels the run; the timeout `signal` never does.
+  const cancel = { signal: cancelSignal ?? new AbortController().signal };
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
   let incompleteStandards = false;
@@ -1081,6 +1129,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
+    ...(command === 'run' ? {signal: cancel.signal} : {}),
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
   let run;
   let staging;
@@ -1089,10 +1138,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     if (!run || finished) return null;
     finished = true;
     const done=begin('finish-receipt');
-    try{return await ssh('finish', {nonce,run});}finally{done();}
+    try{return await ssh('finish', {nonce,run,...(cancel.signal.aborted?{cancel:true}:{})});}finally{done();}
   };
   try {
-    let expected, expectedManifest, delta, transferBytes=0, transferCount=0;
+    let expected, expectedManifest, delta, transferBytes=0, transferCount=0, bundlePlan;
     try {
       const manifestDone=begin('manifest-build');
       const substages=substageTimer(clock),beginSub=stage=>substages.begin(stage);
@@ -1178,7 +1227,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const inputDigest = delta ? await digestDeltaInput(delta,workStage,cwd,exec) : await digestInput(workStage, selected);
       stageDone();
       const prepareDone=begin('forge-prepare');
-      const prepared = await ssh('prepare',{nonce,label:runId,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
+      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1},...(slotUnits > 1 ? {slotUnits} : {}),...(bundleTransport?{gitBundle:true}:{}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
       prepareDone();
       if(prepared.code !== 0) {
         // Prepare precedes every byte transfer and cannot have started work.
@@ -1193,7 +1242,26 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
+      if(bundleTransport)try{onCapabilities?.(preparation.capabilities);}catch{ /* advisory routing cache only */ }
       if(needsGit&&preparation.capabilities?.gitWorktree!==2)return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
+      // An old runner is never fed a bundle: check:standards keeps the GitHub-fetch path, a git-spawning test stays local.
+      let useBundle=bundleTransport&&needsGit&&runnerSupportsBundle(preparation.capabilities);
+      // R559: bundle mode needs a recently fetched public main on the mirror and a credential-clean range. Either
+      // failure falls back: check:standards keeps the rsync/GitHub-fetch path, a git-spawning test stays local.
+      let bundleRefusal;
+      if(useBundle&&mainFreshness(preparation.capabilities,bundleMainMaxAgeMs)!=='fresh')bundleRefusal='bundle-main-stale';
+      if(useBundle&&!bundleRefusal){
+        const planDone=begin('git-bundle-plan');
+        bundleDirectory=await makeBundleDirectory();
+        try{bundlePlan=await planBundle({cwd,head:logicalHead,runnerBase:preparation.capabilities.gitBundleBase,exec,directory:bundleDirectory});}
+        catch(error){
+          bundleRefusal=['bundle-credential-hit','bundle-credential-scan-too-large'].includes(error.code)?error.code:'git-bundle-failed';
+          log(`bundle: refused (${bundleRefusal}${error.detail?': '+error.detail:''}); falling back\n`);
+        }
+        planDone({shipMode:bundlePlan?.mode??'refused'});
+      }
+      if(bundleRefusal){useBundle=false;bundlePlan=undefined;}
+      if(testNeedsGit&&!useBundle)return {mode:'not-started',terminated:true,reason:bundleRefusal??'forge-runner-too-old'};
       // forge-exec-run.mjs is separately installed by forge-setup.sh. Redeploy
       // that fixed wrapper before siblings can run; old runners stay local.
       if (manifest.siblings && preparation.capabilities?.siblings !== 1)
@@ -1218,6 +1286,18 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
         './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
+      if(bundlePlan){
+        const bundleDone=begin('git-bundle');
+        if(bundlePlan.mode!=='none'){
+          const sent=await exec({file:'rsync',args:['-a','--chmod=Fa+r','--no-links','--safe-links',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
+            bundlePlan.file,`${host}:${runRoot}/${run}/bundle/git.bundle`],cwd:bundleDirectory});
+          if(sent.code!==0)throw Object.assign(new Error('Bundle copy failed'),{code:'git-bundle-failed',detail:'bundle-copy-failed'});
+        }
+        // The tip must still be the one that was bundled.
+        const after=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
+        if(after.code!==0||protocolText(after.stdout,128).trim()!==logicalHead)throw new Error('Git HEAD changed during snapshot; use local fallback');
+        bundleDone({shipMode:bundlePlan.mode,bytesSent:bundlePlan.bytes??0});
+      }
       if (manifest.siblings) {
         const inventory = Buffer.concat(manifest.siblings.frontierui.entries.flatMap(entry => [Buffer.from('./'),entry.path,Buffer.from([0])]));
         const siblingsCopied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
@@ -1232,10 +1312,11 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
+      if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
       return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
@@ -1244,7 +1325,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const runAt=clock(),runDone=begin('forge-run');
       let result;
       try {
-        result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
+        if (!cancel.signal.aborted) result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {}),...(bundlePlan?{bundle:{...bundleEvidence(bundlePlan),maxMainAgeMs:bundleMainMaxAgeMs}}:{})},true);
       } catch { /* Only a protected finish response can resolve lost run output. */ }
       finally {runDone();}
       const receipt = await finish();
@@ -1265,11 +1346,16 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
         return {mode:'not-started',terminated:true,reason:'forge-rejected:'+reply.reason};
+      }
+      // x40a9dk: a cancelled client is terminated only when the protected finish succeeded (it reaps the worker
+      // UID and removes the run), answering either a matching receipt or the null of a run killed before one.
+      if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code))) {
+        return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {
@@ -1287,15 +1373,24 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {
     try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }
-    finally {if (staging) await fs.rm(staging, {recursive:true, force:true});}
+    finally {await removeBundleDirectory(bundleDirectory).catch(()=>{});if (staging) await fs.rm(staging, {recursive:true, force:true});}
   }
 }
 
 export function verifyReceipt(text, expected, code) {
   try {
     const receipt=JSON.parse(text);
-    return receipt && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
-      && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources').sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
+    const taskFields=['processCount','tasksMax','tasksNear','tasksNote'];
+    const presentTasks=taskFields.filter(key=>Object.hasOwn(receipt,key));
+    // This diagnostic is optional for old runners, but a partial or inconsistent note is not evidence.
+    const validTasks=presentTasks.length===0 || (presentTasks.length===taskFields.length
+      && Number.isSafeInteger(receipt.processCount) && receipt.processCount>=0
+      && Number.isSafeInteger(receipt.tasksMax) && receipt.tasksMax>0
+      && receipt.tasksNear===true && BigInt(receipt.processCount)*5n>BigInt(receipt.tasksMax)*4n
+      && typeof receipt.tasksNote==='string' && receipt.tasksNote.trim().length>0 && receipt.tasksNote.length<=256
+      && !/[\x00-\x1f\x7f-\x9f]/.test(receipt.tasksNote));
+    return receipt && validTasks && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
+      && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources'&&!taskFields.includes(key)).sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
       && (!Object.hasOwn(receipt,'resources') || (receipt.resources && !Array.isArray(receipt.resources)
         && Object.keys(receipt.resources).sort().join(',')==='cpuUsec,memoryPeakBytes,oomKills,slotCpus'
         && ['cpuUsec','memoryPeakBytes','oomKills'].every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
@@ -1308,7 +1403,8 @@ export function verifyReceipt(text, expected, code) {
 
 /** Explicit remote CLI request; the shared decision contract owns safe local admission. */
 export async function main(options = {}) {
-  if (!isAllowedCommand(options.argv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
+  const remoteArgv = normalizeRemoteArgv(options.argv);
+  if (!isAllowedCommand(remoteArgv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
   const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
   const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});
@@ -1321,7 +1417,7 @@ export async function main(options = {}) {
     argv:options.argv, cwd:options.cwd, env:options.env, policy,
     timeoutMs:options.timeoutMs, log:options.log,
     host:options.host, readTelemetry:options.readTelemetry, lockRoot:options.lockRoot, clock:options.clock,
-    remoteExec:async decisionOptions=>{const value=await remoteExecutor(decisionOptions);capturedTimings=value?.timings;return value;},
+    remoteExec:async decisionOptions=>{const value=await remoteExecutor({...decisionOptions,argv:remoteArgv});capturedTimings=value?.timings;return value;},
   });
   if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes${t.presyncClaimed?` presynced ${t.presyncClaimed.count} files ${t.presyncClaimed.bytes} bytes`:''}`:''}${t.substages?.length ? `\n${t.substages.map(s=>`  ${s.stage} | ${s.ms}`).join('\n')}`:''}`)].join('\n')+'\n');
   if (result.handled) return result.exitCode;

@@ -31,7 +31,7 @@ export const ACCEPTED_EVENTS = Object.freeze({
   check_suite: new Set(['completed']),
   check_run: new Set(['completed']),
   pull_request_review: new Set(['submitted', 'dismissed']),
-  // Kept ONLY when the comment is on a PR and is an advisory note or an operator ruling (see classifyPrComment);
+  // Kept ONLY when the comment is on a PR and is an advisory note, an operator ruling or a red-team result (see classifyPrComment);
   // stored as a `kind` tag — never the body. Live 2026-10-09 (PR #4624): these are what make a fix owed, and the
   // fix daemon could not wake on them.
   issue_comment: new Set(['created']),
@@ -42,9 +42,16 @@ export const ACCEPTED_EVENTS = Object.freeze({
  *  bundle must not import repo code. */
 export const OPERATOR_RULING_COMMENT_MARKER = 'mandatory-referral-operator-ruling-v1';
 
-/** PURE: `'advisory'`, `'ruling'`, or `null` for a PR comment body. */
+/** The red-team result comment's leading marker. Inlined (the Worker bundle must not import repo code); a test pins
+ *  it equal to `red-team-gate.mjs#RED_TEAM_COMMENT_MARKER`. */
+export const RED_TEAM_COMMENT_MARKER = '<!-- we:red-team-advisory';
+const RED_TEAM_MARKER_RE = new RegExp(`^${RED_TEAM_COMMENT_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} pr=\\d+ rev=[0-9a-f]{7,64} -->`, 'i');
+
+/** PURE: `'advisory'`, `'ruling'`, `'redteam'`, or `null` for a PR comment body. */
 export function classifyPrComment(body) {
   const b = typeof body === 'string' ? body : '';
+  // Same shape the gate parses: the marker leads the (CRLF-normalised, left-trimmed) body.
+  if (RED_TEAM_MARKER_RE.test(b.replace(/\r\n/g, '\n').trimStart())) return 'redteam';
   if (b.includes(OPERATOR_RULING_COMMENT_MARKER)) return 'ruling';
   if (/^\*\*Verdict:\*\*/m.test(b) && /^Net basis: `[a-f0-9]+\.\.[a-f0-9]+`/im.test(b)) return 'advisory';
   return null;
@@ -262,6 +269,8 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       storage.insert(seq, record.id || null, now, JSON.stringify(stored));
       storage.setMeta('head', String(seq));
       storage.setMeta('lastEventAt', String(now));
+      // Per-repo clock: only this repo's own events ever move it (R417).
+      if (typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
       foldObservation(storage, stored);
       storage.prune(seq - maxEvents, now - retentionMs);
       return { seq, duplicate: false };
@@ -280,14 +289,19 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // webhook). Their field clock is the cursor the listing was taken at, so any later delivery wins.
       for (const pr of input.prs) foldObservation(storage, { ...pr, number: undefined, prs: [pr.number], repo: input.repo,
         type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor });
-      const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId };
+      const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId, at: now };
+      // Import history for the NEW per-repo coverage only (fail closed); it changes no seeding behaviour.
+      const seen = storage.getProjection('repoImports', input.repo) || { repo: input.repo, others: [] };
+      const priorLatest = storage.getProjection('bootstrap', input.repo);
+      storage.putProjection('repoImports', input.repo, { repo: input.repo, listed: input.prs.map((p) => p.number),
+        others: priorLatest ? [...seen.others, priorLatest.baseCursor] : seen.others });
       storage.putProjection('bootstrap', input.repo, result);
       storage.putProjection('imports', importKey, { input: JSON.stringify(input), result });
       return { ...result, duplicate: false };
     }); },
-    readPrs(cursor, limit) { return storage.transaction(() => {
+    readPrs(cursor, limit, now = Date.now()) { return storage.transaction(() => {
       const envelope = log.read(cursor, limit);
-      return { ...envelope, prs: projectPrRows(storage), stateCursor: envelope.head,
+      return { ...envelope, prs: projectPrRows(storage), stateCursor: envelope.head, repos: repoFreshness(storage, envelope.head, now),
         coverage: { ...JSON.parse(storage.getMeta('coverage')), bootstrap: storage.listProjection('bootstrap') } };
     }); },
     /** A verified delivery we chose not to store (ping, ignored action) still proves the pipe is alive. */
@@ -311,6 +325,33 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     },
   };
   return log;
+}
+
+const FUTURE_SKEW_MS = 60_000;
+/** Per-repo `{ bootstrapAt, lastEventAt, coverage }`, each from that repo's OWN bootstrap/event rows. Times are the
+ *  Worker's clock at write, beyond the reader's now + 60 s rejected as null with coverage false (never trust a future time). Coverage = bootstrap
+ *  complete with a recorded time AND no events pruned since its base cursor (conservative: the ring is global). */
+function repoFreshness(storage, head, now) {
+  const clamp = (v) => (Number.isFinite(v) && v <= now + FUTURE_SKEW_MS ? v : null); // a future time is rejected, never shown as fresh
+  const oldest = storage.minSeq();
+  const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
+  const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i]));
+  const openRows = storage.listProjection('prs').filter((r) => r.state === 'open');
+  const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
+  const out = {};
+  for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
+    const b = boots.get(repo);
+    const bootstrapAt = b ? clamp(b.at) : null;
+    const gap = b ? head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1) : true;
+    const lastEventAt = clamp(lastEvent.get(repo));
+    const badEvent = lastEvent.has(repo) && lastEventAt == null; // an unreadable/future event time voids coverage
+    // Open rows the Worker holds that the latest COMPLETE listing left out (rows a later event touched are newer, not omitted).
+    const omittedOpen = b && b.status === 'complete' ? openRows.filter((r) => r.repo === repo && (r.fields?.state || 0) <= b.baseCursor &&
+      !(imports.get(repo)?.listed || []).includes(r.number)).map((r) => r.number).sort((x, y) => x - y) : [];
+    out[repo] = { bootstrapAt, lastEventAt, omittedOpen, coverage: !omittedOpen.length && !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent &&
+      (imports.get(repo)?.others || []).every((c) => c < b.baseCursor) };
+  }
+  return out;
 }
 
 const numOrNull = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
@@ -391,7 +432,7 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
     const cursor = c == null || c === '' ? null : (/^\d+$/.test(c) ? Number(c) : null);
     const limit = Number(url.searchParams.get('limit')) || DEFAULT_PAGE_LIMIT;
     const log = await getLog();
-    return json(200, { ...(await (url.pathname === '/prs' ? log.readPrs(cursor, limit) : log.read(cursor, limit))), now: now() });
+    return json(200, { ...(await (url.pathname === '/prs' ? log.readPrs(cursor, limit, now()) : log.read(cursor, limit))), now: now() });
   }
 
   return json(404, { error: 'not found' });

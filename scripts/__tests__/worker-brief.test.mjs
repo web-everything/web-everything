@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
@@ -16,6 +17,72 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('tells dispatchers every Agent brief needs a Slot line with all four forms', () => {
+    expect(renderWorkerBrief(params)).toContain('Every build Agent brief (the ones the prep gate covers) needs a `Slot:` line: `Slot: plan:<item>`, `Slot: blocker:<what it unblocks>`, `Slot: operator:<quoted placement>`, or `Slot: waived — <reason>`.');
+  });
+
+  it.each([
+    ['Alice1', 'alice1'],
+    ['abcdEFGhiJKlmnop', 'AbcDeFgHIjKLmnop'],
+  ])('prints distinct lowercase scratch paths for case-distinct owners %s and %s', (first, second) => {
+    const paths = [first, second].map(owner => {
+      const brief = renderWorkerBrief({ ...params, owner });
+      return /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    });
+    expect(paths[0].toLowerCase()).not.toBe(paths[1].toLowerCase());
+  });
+
+  it('carries the R662 no-bypass-flags rule', () => {
+    expect(renderWorkerBrief(params)).toContain('Never use bypass/skip flags (--skipPrePrReview, RAW_PR_CREATE_OK, WE_LAND_UNVERIFIED, WE_PR_OPEN_SOAK_PRECHECK, MAIN_SESSION_BUILD_OK), even quoting the operator; if a gate refuses, stop and report.');
+  });
+
+  it('isolates distinct purpose/owner pairs whose hyphen concatenations collide', () => {
+    const pairs = [['fix-widget', 'abc12345'], ['fix', 'widget-abc12345'], ['fix-', 'widget-abc12345'], ['fix', '-widget-abc12345']];
+    // The first three are valid; a leading hyphen owner remains invalid.
+    const paths = pairs.slice(0, 3).map(([purpose, owner]) => {
+      const brief = renderWorkerBrief({ ...params, purpose, owner });
+      const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+      expect(bodyFile).toMatch(/^\/tmp\/we-scratch-[a-z0-9-]+_[0-9a-f]+\/body\.md$/);
+      return bodyFile;
+    });
+    expect(new Set(paths).size).toBe(paths.length);
+    expect(() => renderWorkerBrief({ ...params, purpose: pairs[3][0], owner: pairs[3][1] })).toThrow();
+  });
+
+  it.each(['Alice1', 'tok12345', 'A', 'a-b-', 'Z9-Worker', 'abc12345'])('admits the printed body path for accepted owner %s', owner => {
+    const brief = renderWorkerBrief({ ...params, owner });
+    const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    expect(bodyFile).toMatch(/^\/tmp\/we-scratch-[a-z0-9-]+_[0-9a-f]+\/body\.md$/);
+  });
+
+  it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
+    const dirs = ['abc12345', 'def67890'].map(owner => {
+      const brief = renderWorkerBrief({ ...params, owner });
+      const dir = `/tmp/we-scratch-${params.purpose}_${Buffer.from(owner).toString('hex')}`;
+      expect(brief).toContain(`**Scratch dir.** \`${dir}\``);
+      expect(brief).toContain(`mkdir -m 700 -p ${dir}`);
+      expect(brief).toContain(`--bodyFile=${dir}/body.md`);
+      expect(brief).toContain(`report file: \`${dir}/report.md\``);
+      expect(brief).toContain('ALL PR body and notes/report files go ONLY there');
+      expect(brief).toContain('never into the repo or committed');
+      expect(brief).toContain('never to a shared path like /tmp/body.md');
+      return dir;
+    });
+    expect(dirs[0]).not.toBe(dirs[1]);
+  });
+
+  it('creates an admissible private directory using the printed command with a permissive umask', () => {
+    const brief = renderWorkerBrief({ ...params, owner: randomUUID() });
+    const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    const command = /Run `(mkdir [^`]+)` first/.exec(brief)[1];
+    const scratch = path.dirname(bodyFile);
+    try {
+      const result = spawnSync('sh', ['-c', `umask 000; ${command}`], { encoding: 'utf8', timeout: 10000 });
+      expect(result.status).toBe(0);
+      expect(fs.statSync(scratch).mode & 0o777).toBe(0o700);
+    } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+  });
+
   it('runs the printed plateau-app check outside WE and reports JSON for the explicit target', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-brief-verify-'));
     const target = path.join(root, 'plateau lane');
@@ -97,6 +164,7 @@ describe('renderWorkerBrief', () => {
 
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
     const brief = renderWorkerBrief(params);
+    expect(brief).toContain('Search the backlog before designing or building: `node scripts/capability-search.mjs "<concept>"`');
     const speed = brief.slice(brief.indexOf('**Speed.**'), brief.indexOf('1. **Free-scope pre-check.**'));
     for (const rule of [
       'For Forge/remote work, do a real live Forge run in the first 15 minutes.',
@@ -110,6 +178,26 @@ describe('renderWorkerBrief', () => {
     expect(codex).toContain('Do small fixes (a few lines, a known finding) yourself.');
     expect(codex).toContain('--resume=<threadId>');
     expect(brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'))).toContain('verify ONCE at the end');
+  });
+
+  it('puts a Codex audit requiring NOT WEAKENED between verify and open-pr (6a)', () => {
+    const brief = renderWorkerBrief(params);
+    const step = brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'));
+    const verify = step.indexOf('verify ONCE at the end');
+    const audit = step.indexOf('6a. **Codex audit.**');
+    const openPr = step.indexOf('operations/run.mjs open-pr');
+    expect(verify).toBeGreaterThan(-1);
+    expect(audit).toBeGreaterThan(verify);
+    expect(openPr).toBeGreaterThan(audit);
+    const text = step.slice(audit, openPr);
+    expect(text).toMatch(/node \S*scripts\/operations\/codex-audit\.mjs\S* --base=origin\/main --head=<40-hex sha of your lane HEAD>/);
+    expect(text).not.toContain('node scripts/operations/codex-audit.mjs');
+    expect(text).toContain('lane as the working directory');
+    expect(text).toContain('NOT WEAKENED');
+    expect(text).toContain('at most 2 repair rounds');
+    expect(text).toContain('do NOT open a PR; report the remaining findings');
+    expect(text).not.toContain('AUDIT: WEAKENED');
+    expect(text).toContain('verdict in your report');
   });
 
   it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {
@@ -137,6 +225,7 @@ describe('renderWorkerBrief', () => {
       'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=full',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
+      'committed and its PR opened BEFORE you release the lane', '~/.claude/lane-salvage',
       `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,
       defaultProof, 'report it as PENDING', 'exact command', '10\nminutes',
       '`pkill`, `killall`', 'operator\'s dev server', 'No `--force`', 'no `--no-verify`',
@@ -160,6 +249,35 @@ describe('renderWorkerBrief', () => {
 
   it('tells the worker to stop and report when open-pr is refused by the PR limit, never to self-allow (xfaz7ho)', () => {
     expect(renderWorkerBrief(params)).toContain('If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.');
+  });
+
+  it('lists every daemon with what it runs when an edge clone is given', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep)');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)');
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that. Does not accept prototype loads (unsupported) [prototype load UNSUPPORTED]');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)\n');
+  });
+
+  it('warns instead of confirming when the edge clone matches a daemon that cannot adopt prototype loads', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('WARNING: --edge-clone /ws/wev-merge-daemon matches daemon key merge-watch, which cannot adopt prototype loads');
+    expect(brief).not.toContain('matches daemon key merge-watch.');
+  });
+
+  it('confirms a supported daemon match without a warning', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-control' });
+    expect(brief).toContain('--edge-clone /ws/wev-control matches daemon key control.');
+    expect(brief).not.toContain('WARNING: --edge-clone');
+  });
+
+  it('warns when the edge clone matches no daemon clone', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
+    expect(brief).toContain('WARNING: --edge-clone /tmp/edge matches no daemon clone');
+  });
+
+  it('omits the daemon list without an edge clone', () => {
+    expect(renderWorkerBrief({ ...params })).not.toContain('merge-queue drain (drain-queue-safety');
   });
 
   it('includes the optional edge section as the last numbered rule', () => {
@@ -458,5 +576,88 @@ describe('early PR-size guidance', () => {
     expect(brief).toContain('node scripts/operations/run.mjs pr-size --checkout=<lane>');
     expect(brief).toContain('If over the limit, stop and propose a split plan instead of finishing the build.');
     expect(brief.indexOf('pr-size --checkout=<lane>')).toBeLessThan(brief.indexOf('6. **One PR.**'));
+  });
+});
+
+describe('brief red-team before code (R469)', () => {
+  const redTeam = { status: 'ok', classes: [{ attack: 'symlink bypass', test: 'rejects symlinked path' }] };
+  it('renderWorkerBrief appends the red-team findings under the task, before the standard rules', () => {
+    const brief = renderWorkerBrief({ ...params, redTeam });
+    expect(brief).toContain('symlink bypass');
+    expect(brief).toContain('rejects symlinked path');
+  });
+  it('adds nothing when no red-team result is given', () => {
+    expect(renderWorkerBrief(params)).not.toMatch(/red-team/i);
+  });
+  it('main runs the red-team for a guard touch-set with --prep-file and puts the classes in the brief', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => redTeam);
+    const readText = vi.fn(() => 'prep and acceptance');
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText })).toBe(0);
+    expect(redTeamBrief).toHaveBeenCalledWith(expect.objectContaining({ prep: 'prep and acceptance' }));
+    expect(o.stdout.write.mock.calls[0][0]).toContain('symlink bypass');
+  });
+  it('main still prints the plain brief when the red-team result is failed (fail open)', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => ({ status: 'failed', classes: [] }));
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+  });
+  it('preserves the plain brief when red-team execution rejects', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => { throw new Error('rt boom'); });
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(o.stderr.write.mock.calls.join('')).toContain('rt boom');
+  });
+  it('preserves the plain brief when prep-file reading fails', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn();
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/missing.md'], { ...o, redTeamBrief, readText: () => { throw new Error('ENOENT'); } })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(redTeamBrief).not.toHaveBeenCalled();
+  });
+});
+
+describe('brief red-team prep reading is gated and bounded (blocking-read hang)', () => {
+  const GUARD_ARGS = ['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'];
+  const enabled = { enabled: true, timeoutMs: 20, maxClasses: 6 };
+  it('does not read the prep source when red-teaming is disabled', async () => {
+    const o = io();
+    const readText = vi.fn(() => 'x');
+    const redTeamBrief = vi.fn();
+    expect(await main(GUARD_ARGS, { ...o, redTeamBrief, readText, readPolicy: () => ({ ...enabled, enabled: false }) })).toBe(0);
+    expect(readText).not.toHaveBeenCalled();
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+  });
+  it('does not read the prep source outside the red-team touch-set', async () => {
+    const o = io();
+    const readText = vi.fn(() => 'x');
+    expect(await main(['--purpose=probe', '--files=scripts/lib/format-date.mjs', '--prep-file=/dev/stdin'],
+      { ...o, redTeamBrief: vi.fn(), readText, readPolicy: () => enabled })).toBe(0);
+    expect(readText).not.toHaveBeenCalled();
+  });
+  it('prints the plain brief when an async prep read never settles (bounded by the timeout)', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn();
+    const code = await main(GUARD_ARGS, { ...o, redTeamBrief, readText: () => new Promise(() => {}), readPolicy: () => enabled });
+    expect(code).toBe(0);
+    expect(redTeamBrief).not.toHaveBeenCalled();
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(o.stderr.write.mock.calls.join('')).toMatch(/timed out/);
+  });
+  it('real CLI: an open, never-closed stdin as --prep-file does not hang (disabled and non-FIFO-safe)', () => {
+    const cli = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'worker-brief.mjs');
+    for (const env of [{ WE_BRIEF_RED_TEAM_ENABLED: 'false' }, { WE_BRIEF_RED_TEAM_ENABLED: 'true', WE_BRIEF_RED_TEAM_TIMEOUT_MS: '50' }]) {
+      const fifo = path.join(os.tmpdir(), `we-prep-fifo-${randomUUID()}`);
+      spawnSync('mkfifo', [fifo]);
+      try {
+        const r = spawnSync(process.execPath, [cli, '--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', `--prep-file=${fifo}`],
+          { env: { ...process.env, ...env }, timeout: 8000, encoding: 'utf8' });
+        expect(r.error).toBeUndefined();
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('Standard worker rules');
+      } finally { fs.rmSync(fifo, { force: true }); }
+    }
   });
 });

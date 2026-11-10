@@ -148,6 +148,7 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
+      # Base-branch Actions caches are readable by fork PRs. Keep private FUI code on the runner.
       - name: Install + build FUI tools
         working-directory: frontierui
         run: |
@@ -210,7 +211,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: web-everything
-          fetch-depth: 0 # unit shards run live-git-history tests; shallow/blobless broke them (follow-up: make shallow-safe)
+          fetch-depth: 50 # live-git tests use the HEAD window; main's full history comes from the blobless fetch below
+      - name: Fetch main history (blobless)
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        working-directory: web-everything
+        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: ${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}
@@ -240,6 +245,7 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
       # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui
@@ -252,6 +258,7 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
+      # Vite can transform private sibling imports; its cache must also stay on the runner.
       # Card 11: files are assigned to a shard by MEASURED time (scripts/ci/shard-assign.mjs +
       # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
       # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
@@ -463,6 +470,7 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: frontierui
@@ -475,6 +483,7 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
+      # Vite can transform private sibling imports; its cache must also stay on the runner.
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
@@ -502,7 +511,7 @@ jobs:
   # 50-tick baseline PLUS all 18 break scenarios serially: 10-12min when daemon code changed — the slowest job in
   # CI (`test` runs 4-6min) — and growing by one scenario every time a new live daemon break gets a regression
   # test. Now three jobs:
-  #   job `daemon-soak-scope` — the path-touch check, run ONCE (not per-shard) so the ~10s no-daemon-code skip
+  #   job `daemon-soak-scope` — legacy paths OR derived soak import/literal-path closure, run ONCE (not per-shard) so the ~10s no-daemon-code skip
   #                 stays exactly as cheap as it was in the single-job version.
   #   job `soak-shard`  — an 8-way matrix (`scripts/conveyor/soak/shard-files.mjs`): shard 1 is ALWAYS the 50-tick
   #                 baseline alone (it dwarfs any one break scenario, so a blind file-count split would strand it
@@ -528,6 +537,9 @@ jobs:
       - name: Fetch main history (blobless)
         run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
 
+      - name: Check soak scope safeguards (Node builtins only)
+        run: node scripts/conveyor/soak/soak-scope.mjs --self-test
+
       - name: Does this PR touch daemon code?
         id: scope
         env:
@@ -537,9 +549,11 @@ jobs:
           if [ "${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           # Only the PR's contribution: base may have advanced, and HEAD is checkout's synthetic merge.
           # --no-renames preserves the source path when daemon code is moved outside the scope.
-          changed="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
+          # core.quotePath=false keeps non-ASCII paths unquoted, so they compare equal to the scope keys.
+          changed="$(git -c core.quotePath=false diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
           hits="$(printf '%s\n' "$changed" | grep -E '^(skills-src/conveyor/|scripts/conveyor/|scripts/lib/daemon-|scripts/lib/gh-app-shim|scripts/lib/main-staleness|scripts/lane-pool|scripts/review-set-label\.mjs$|scripts/operations/[^/]*dispatch[^/]*$|vitest\.soak\.config\.ts$)' || true)"
-          if [ -n "$hits" ]; then
+          derived="$(printf '%s\n' "$changed" | node scripts/conveyor/soak/soak-scope.mjs)" || derived="run=true"
+          if [ -n "$hits" ] || [ "$derived" != "run=false" ]; then
             echo "Daemon code touched — running the soak:"; printf '  %s\n' $hits
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -570,8 +584,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # quarantine-skip must prove which files the PR changes against its merge base.
-          fetch-depth: 0
+          # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
+          # (below); quarantine-skip deepens further, or fails closed (runs everything), if the base is unprovable.
+          fetch-depth: 50
+      - name: Fetch main history (blobless)
+        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
 
       - uses: actions/setup-node@v4
         with:
@@ -686,6 +703,7 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): the `@frontierui/*` alias resolves to sibling source and
       # `build:docs` calls the pinned component-render CLI produced by build:tools.
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui
@@ -736,119 +754,6 @@ jobs:
         run: npm run test:interaction
         env:
           WE_INTERACTION_ONLY: "1"
-
-  # Diff-driven test-selection MEASURE lane (#2681). The SHADOW full-suite compare that produces the false-green
-  # signal the eventual default-on shrink reads — a false-green is a full-suite failure that fell OUTSIDE what
-  # `vitest related` on the PR's diff would have run. This job is EVIDENCE-GATHERING, never a gate:
-  #   • OFF BY DEFAULT (`if:` below) — runs only on manual dispatch or when the repo var
-  #     `WE_MEASURE_TEST_SELECTION == '1'` is set. This is the DoD's "flag-gated; NOT defaulted until the measured
-  #     false-green rate is acceptable": the required `test`/`smoke` gates and the `push:[main]` full-suite
-  #     backstop are UNCHANGED; nothing here can block a merge (its own result is not a required check).
-  #   • It runs the FULL suite once with the json reporter (the shadow full run), computes the diff-driven
-  #     selection decision off the PINNED merge-base, and records whether any full-suite failure escaped the
-  #     selected set — the false-green sample — as an artifact. `continue-on-error` so even a red shadow run only
-  #     records; it never reds CI.
-  # Widen the shrink allow-list / flip the default only once this lane's recorded false-green rate is acceptable.
-  test-selection-measure:
-    if: ${{ github.event_name == 'workflow_dispatch' || vars.WE_MEASURE_TEST_SELECTION == '1' }}
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    # xd1sfms (#4075/#3383) — this lane is OFF by default today (see the `if:` above), so no successful
-    # run in the 2026-09-25 sample ever executed it (every sampled run shows it `skipped`) — no real p95
-    # exists yet. Sized conservatively off its own steps instead: it runs the FULL unsharded unit suite
-    # once (unlike `test-shard`'s 1/9 coverage split) plus the full real-git integration suite, so budget well
-    # above a single shard's 15min. `continue-on-error: true` already keeps a genuine timeout here from
-    # ever reddening CI; this only stops a hang from tying up a runner for the 360-min default.
-    timeout-minutes: 30
-    steps:
-      # Same sibling layout as `test-shard` — the unit suite needs the FUI sibling for the `@frontierui/*` alias.
-      # Shallow checkout plus blobless main history preserves the pinned-base merge base (#2681).
-      - name: Checkout WE
-        uses: actions/checkout@v4
-        with:
-          path: web-everything
-          fetch-depth: 50
-      - name: Fetch main history (blobless)
-        working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
-      - name: Mint FUI read token (GitHub App)
-        id: fui-app-token
-        if: vars.WE_APP_ID != ''
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.WE_APP_ID }}
-          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
-          owner: frontier-ui
-          repositories: frontierui
-          permission-contents: read
-      - name: Checkout FUI (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: frontier-ui/frontierui
-          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
-          path: frontierui
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            web-everything/package-lock.json
-            frontierui/package-lock.json
-
-      - name: Install + build FUI tools
-        working-directory: frontierui
-        run: |
-          npm ci
-          npm run build:tools
-
-      - name: Install
-        working-directory: web-everything
-        run: npm ci
-
-      # The shadow FULL run — the whole unit suite with the json reporter, so the measure step has per-file
-      # pass/fail. `|| true`: a red shadow run must still record (the false-green signal LIVES in a red full run).
-      - name: Shadow full-suite run (json report)
-        working-directory: web-everything
-        run: npx vitest run --reporter=json --outputFile=vitest-full.json || true
-
-      # Record the false-green sample: decide off the diff, compare against the shadow full run's failures, append.
-      - name: Record false-green signal (#2681)
-        working-directory: web-everything
-        run: node scripts/readiness/test-selection.mjs --measure --vitest-json=vitest-full.json
-        env:
-          # Evaluate the decision AS IF the shrink were on, so the measure reflects what shrink WOULD do —
-          # without any real gate depending on it (this job gates nothing).
-          WE_DIFF_TEST_SELECTION: "1"
-          WE_FALSE_GREEN_LOG: false-green-log.json
-
-      - name: Upload false-green sample
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: false-green-signal
-          path: web-everything/false-green-log.json
-          if-no-files-found: warn
-
-      # Free byproduct of the shadow run above: per-test durations are already in vitest-full.json, this
-      # job just never looked at them. Printed straight into the CI log (no artifact download needed) as an
-      # early-warning signal for individual slow tests and files creeping up before they dominate a shard —
-      # this job runs the SAME real-git/subprocess integration config as `npm run test:integration:vitest`
-      # too, so both tiers are covered. Report-only: never fails the job.
-      - name: Report slowest tests (unit)
-        if: always()
-        working-directory: web-everything
-        run: node scripts/dev/report-slow-tests.mjs vitest-full.json --top=40 || true
-
-      - name: Shadow integration-suite run (json report)
-        if: always()
-        working-directory: web-everything
-        run: npx vitest run --config vitest.integration.config.ts --reporter=json --outputFile=vitest-integration.json || true
-
-      - name: Report slowest tests (integration)
-        if: always()
-        working-directory: web-everything
-        run: node scripts/dev/report-slow-tests.mjs vitest-integration.json --top=40 || true
 
   # Visual-regression guard (#2177 / #1966). Builds the docs site (same sibling layout as deploy.yml)
   # and runs `check:visual` against committed -chromium-linux baselines. Separate job so its ~2–3 min

@@ -17,12 +17,13 @@
  * `NOTREAL`, `EXAMPLE`) or random-looking filler that was never issued by any service.
  */
 import { describe, it, expect } from 'vitest';
+import { SYNTHETIC_MARKER, pemBlock, ghTokenSynthetic, slackSynthetic, awsSynthetic } from './fixtures/sample-strings.mjs';
 import {
   scrubPublish, scrubReasons, isOpaquePublishToken, shannonEntropy,
 } from '../lib/secret-scrub.mjs';
 
 /** The one marker the whole #3015 suite writes through real paths. Obviously synthetic; never issued. */
-export const SYNTHETIC_MARKER = 'sk-SYNTHETIC0000TESTMARKERNOTREAL';
+export { SYNTHETIC_MARKER };
 
 describe('scrubPublish — rejects a credential in every family it claims', () => {
   const reject = (label, value) => it(label, () => {
@@ -31,15 +32,15 @@ describe('scrubPublish — rejects a credential in every family it claims', () =
   });
 
   reject('the suite-wide synthetic api-key marker', `we saw ${SYNTHETIC_MARKER} in the log`);
-  reject('a PEM private-key block', '-----BEGIN RSA PRIVATE KEY-----\nSYNTHETICNOTREAL\n-----END');
-  reject('a GitHub token', 'rotate ghp_SYNTHETIC0000abcdefABCDEF0123456789 now');
+  reject('a PEM private-key block', pemBlock());
+  reject('a GitHub token', `rotate ${ghTokenSynthetic()} now`);
   reject('a GitHub fine-grained PAT', `github_pat_${'S'}YNTHETIC00_${'a'.repeat(50)}`);
   // No digit run after the prefix, on purpose. The digits-then-digits-then-blob shape is what GitHub's own
   // push protection recognises as a live Slack token — it rejected this push when the fixture had one, even
   // though the value was invented. A fixture that trips a real scanner is a fixture that could be mistaken
   // for a credential, which is exactly what this repo must never commit. This still trips `xox[baprs]-`.
-  reject('a Slack token', 'xoxb-NOTAREALTOKEN-SYNTHETIC-NOTREAL');
-  reject('an AWS access key id', 'AKIASYNTHETIC0000NR was in the env');
+  reject('a Slack token', slackSynthetic());
+  reject('an AWS access key id', `${awsSynthetic()} was in the env`);
   reject('a Google API key', 'AIzaSyNOTREALsynthetic0000000000000000000');
   reject('a JWT', 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJTWU5USEVUSUMifQ.c3ludGhldGlj');
   reject('a URL with inline credentials', 'psql postgres://admin:hunter2Trombone@db.internal/app');
@@ -106,7 +107,7 @@ describe('scrubPublish vs scrubReasons — the widths differ ON PURPOSE (#3015)'
   });
 
   it('both seams still reject a real credential — the narrowing never crosses that line', () => {
-    for (const v of [SYNTHETIC_MARKER, 'ghp_SYNTHETIC0000abcdefABCDEF0123456789', 'AKIASYNTHETIC0000NR']) {
+    for (const v of [SYNTHETIC_MARKER, ghTokenSynthetic(), awsSynthetic()]) {
       expect(scrubReasons(v).length).toBeGreaterThan(0);
       expect(scrubPublish(v).length).toBeGreaterThan(0);
     }

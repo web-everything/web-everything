@@ -110,15 +110,16 @@ import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-transcript-policy.mjs';
 import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
-import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
+import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
+  realpathSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -244,6 +245,14 @@ export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputS
   }
 }
 
+/** R650: directory of refusing vitest/playwright/npx shims, prepended to PATH inside Codex runs only. */
+export const CODEX_SHIM_DIR = resolve(process.env.WE_CODEX_SHIM_DIR || join(dirname(new URL(import.meta.url).pathname), 'codex-shims'));
+/** PATH with the shim dir first (deduped). */
+export function codexShimPath(env = process.env) {
+  const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
+  return [CODEX_SHIM_DIR, ...rest].join(':');
+}
+
 export function buildCodexDirectTaskArgv({
   cwd,
   outputLastMessageFile,
@@ -304,6 +313,8 @@ export function buildCodexDirectTaskArgv({
     }
     argv.push('-c', 'sandbox_workspace_write.network_access=true');
     if (writableRoots.length) argv.push('-c', `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`);
+    // R650: shim dir first on the shell PATH so bare vitest/playwright/npx-vitest refuse (heavy-admission bypass).
+    argv.push('-c', `shell_environment_policy.set.PATH=${JSON.stringify(codexShimPath(env))}`);
     if (tempRoot) {
       for (const name of ['TMPDIR', 'TMP', 'TEMP']) {
         argv.push('-c', `shell_environment_policy.set.${name}=${JSON.stringify(tempRoot)}`);
@@ -571,6 +582,123 @@ export function collectAndClearRolloutQuota({
     try { removeFileFn(rolloutFile); } catch { /* best-effort cleanup — nothing further to do if this fails too */ }
   }
   return { quota, rolloutFile, deleted: true };
+}
+
+// ── scratch-clone cleanup (R731 slice 1) ─────────────────────────────────────────────────────────
+/**
+ * Delete a scratch clone ONLY when nothing in it could be lost. Kept (and the path reported) when any of these
+ * holds: `git status` shows anything (untracked files are forced visible with `--untracked-files=all`, so a
+ * user's `status.showUntrackedFiles=no` cannot hide them), an ignored entry other than a `node_modules`
+ * DIRECTORY exists (the installed dependencies are expected; a gitignored `.env`, `coverage/`, notes file, or a
+ * file / symlink named `node_modules` is not), HEAD is not `startSha`, a stash exists, or a local branch holds a commit that `startSha` does not
+ * reach, or a submodule exists (its stashes and branches live in its own repository, invisible to every parent
+ * read). No patch is written: the clone itself is the preserved artifact. Fails closed: if any of those reads
+ * fails, the clone is kept. Every read runs with the shared lane git hardening (config pins such as
+ * `core.fsmonitor=false`, repository-location env scrubbed); a clone that defines a filter driver is kept; and
+ * `-C dir` must be the clone's own top level, else the clone is kept. Synchronous, so a signal handler can call it.
+ *
+ * Accepted gaps (recorded, not hidden): an annotated or lightweight TAG on a commit outside `startSha`'s history
+ * is not checked, because the clone copies the source repo's tags and many of those legitimately sit off-history;
+ * ignored files inside a `node_modules`-named directory are treated as dependencies; reflog-only commits are
+ * not checked. Refs checked: every ref except `refs/remotes/*` and `refs/tags/*` (plus the stash).
+ */
+export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmFn = rmSync } = {}) {
+  const keep = (reason) => ({ removed: false, path: dir, reason });
+  // Codex can write this clone's git config and the CLI may inherit GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE: run every
+  // read with the shared lane pins (`core.fsmonitor=false` — a hook could otherwise run on the host or report "clean"),
+  // no replace refs, no optional index lock, and the repository-location env scrubbed so `-C dir` cannot inspect another repo.
+  // `core.fileMode=true` is pinned for cleanup only: Codex (or the host) can set `core.fileMode=false` in the clone's
+  // config, which hides an executable-bit change from `status`. Forcing it on can only keep more clones (a filesystem
+  // that cannot hold the bit reports a change), never delete one that holds a mode edit.
+  const gitHardened = (args) => String(execFn('git', ['-C', dir, '--no-optional-locks', ...laneGitConfigArgs(), '-c', 'core.fileMode=true', '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: GIT_STEP_TIMEOUT_MS }));
+  const git = (...args) => gitHardened(args);
+  try {
+    // A filter driver would run on worktree content during `status`; refuse such a clone (kept, not deleted).
+    assertNoLaneFilterDrivers(gitHardened);
+    // `-C dir` must be the clone's own top level: with `.git` removed git would walk up and report on a parent repo.
+    if (realpathSync(git('rev-parse', '--show-toplevel').trim()) !== realpathSync(dir)) return keep('not the clone\'s own repository');
+    // Two reads: `--untracked-files=all` lists every changed/untracked file; `--ignored=traditional` (with
+    // `--untracked-files=normal`) lists ignored paths collapsed to their top directory, so `node_modules/`
+    // stays one line instead of thousands.
+    if (git('status', '--porcelain', '--untracked-files=all').trim() !== '') return keep('uncommitted changes');
+    const ignored = git('status', '--porcelain', '--untracked-files=normal', '--ignored=traditional')
+      .split('\n').filter((line) => line.startsWith('!! '));
+    // Directory-only exception: git prints an ignored directory with a trailing `/` and an ignored file or symlink
+    // without one, so a regular file (or link) named `node_modules` is NOT the installed dependencies and keeps the clone.
+    const isDependencyDir = (line) => line.endsWith('/') && line.slice(3).replace(/\/+$/, '').split('/').pop() === 'node_modules';
+    if (ignored.some((line) => !isDependencyDir(line))) return keep('ignored files present');
+    if (!startSha) return keep('no baseline commit recorded');
+    const head = git('rev-parse', 'HEAD').trim();
+    if (head !== startSha) return keep('HEAD moved');
+    if (git('stash', 'list').trim() !== '') return keep('stash present');
+    // Any ref except the source's remote-tracking refs and tags (see the accepted gaps above): local branches,
+    // custom refs such as `refs/codex/*`, notes, the stash.
+    if (git('rev-list', '--max-count=1', '--exclude=refs/remotes/*', '--exclude=refs/tags/*', '--all', '--not', startSha).trim() !== '') {
+      return keep('a ref holds commits outside the start');
+    }
+    // Linked worktrees would be orphaned by the delete and may hold a detached-HEAD commit.
+    if (git('worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length > 1) return keep('linked worktree present');
+    // A submodule is its own repository (its own stashes, branches, reflog, objects under `.git/modules`) that none
+    // of the parent reads above can see, so any submodule keeps the clone: a gitlink in the index, or a surviving
+    // `.git/modules` directory (a submodule removed from the index leaves its repository behind).
+    if (git('ls-files', '--stage').split('\n').some((l) => l.startsWith('160000 '))) return keep('submodule present');
+    if (existsSync(resolve(dir, git('rev-parse', '--git-path', 'modules').trim()))) return keep('submodule present');
+    // `git status` cannot see edits to files marked assume-unchanged (lowercase tag) or skip-worktree (`S`).
+    if (git('ls-files', '-v').split('\n').some((l) => /^[a-zS] /.test(l))) return keep('files hidden from status (assume-unchanged / skip-worktree)');
+  } catch {
+    return keep('status unreadable');
+  }
+  try {
+    rmFn(dir, { recursive: true, force: true });
+  } catch {
+    return keep('delete failed');
+  }
+  return { removed: true, path: dir, reason: 'clean' };
+}
+
+/**
+ * Applies `cleanupScratchClone` when the run ends normally (`finish()`). Created before the clone exists;
+ * `arm(dir, startSha)` binds it. `finish()` is idempotent and removes the listeners. The signal handler NEVER
+ * deletes (the worker may still be writing): it prints the `scratch clone KEPT (...)` line, removes its
+ * listeners, and — because listening swallowed the signal's default action — re-raises the same
+ * signal on `proc` when no other listener remains, so the process still terminates as it would have. When another
+ * listener (the CLI's own handler) exists, it is left to do the exiting.
+ */
+export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmFn = rmSync } = {}) {
+  let target = null;
+  let result = null;
+  let signaled = false;
+  const run = () => {
+    if (result) return result;
+    if (!target) return null;
+    // A signal already told the operator the clone is KEPT; a later finish() must not contradict that.
+    if (signaled) { result = { removed: false, path: target.dir, reason: 'interrupted by signal' }; return result; }
+    result = cleanupScratchClone({ ...target, execFn, rmFn });
+    return result;
+  };
+  const report = (r) => {
+    if (r && !r.removed) { try { process.stderr.write(`codex-direct-task: scratch clone KEPT (${r.reason}): ${r.path}\n`); } catch { /* best-effort */ } }
+  };
+  const handlers = {};
+  const off = () => { for (const sig of Object.keys(handlers)) proc.removeListener(sig, handlers[sig]); };
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    handlers[sig] = () => {
+      // A signal NEVER deletes: the worker may still be writing (its kill is a separate listener), so the
+      // clone is kept and its path reported. Only a normal run end (`finish()`) applies the delete rule.
+      signaled = true;
+      try { if (target) report({ removed: false, path: target.dir, reason: 'interrupted by signal' }); } catch { /* never throw from a signal handler */ }
+      off();
+      // We swallowed the default action by listening; restore it when nobody else is listening.
+      if (typeof proc.kill === 'function' && proc.listenerCount(sig) === 0) proc.kill(proc.pid, sig);
+    };
+    proc.prependListener(sig, handlers[sig]);
+  }
+  return {
+    arm(dir, startSha) { target = { dir, startSha }; },
+    setStart(startSha) { if (target) target.startSha = startSha; },
+    finish() { off(); return run(); },
+  };
 }
 
 // ── impure: scratch clone, diff capture, gate ────────────────────────────────────────────────────
@@ -939,7 +1067,7 @@ export async function runCodexDirectExec({
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
   const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
-  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
+  const argv = buildCodexDirectTaskArgv({ env, route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
   const prompt = buildCodexPrompt(task, { review, policy });
   writeFileSync(logFile, '', { flag: resumeThreadId ? 'a' : 'w' });
   // A resumed turn that emits no final file must not reuse an earlier completion report.
@@ -949,7 +1077,7 @@ export async function runCodexDirectExec({
     let child;
     try {
       child = spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
-        env: !review && tempRoot ? { ...env, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : env });
+        env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } });
     } catch (e) {
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;
@@ -1078,7 +1206,38 @@ export async function runCodexDirectExec({
  * @param {Function} [opts.loadTranscriptCheck] - injectable lazy checker import.
  * @returns {Promise<object>} the full report — see the CLI's `--json` output for its exact shape.
  */
-export async function codexDirectTask({
+export async function codexDirectTask(opts = {}) {
+  if (opts.dir) return runCodexDirectTask(opts);
+  const guard = createScratchGuard({ execFn: opts.execFn });
+  let report;
+  try {
+    report = await runCodexDirectTask({ ...opts, scratchGuard: guard });
+  } catch (error) {
+    const cleanup = guard.finish();
+    if (cleanup && !cleanup.removed && error && typeof error === 'object') {
+      try { error.scratchCleanup = cleanup; error.message += ` [scratch clone KEPT (${cleanup.reason}): ${cleanup.path}]`; } catch { /* frozen error */ }
+    }
+    throw error;
+  }
+  const cleanup = guard.finish();
+  if (cleanup && report.scratch?.created) {
+    report.scratch.cleanup = cleanup;
+    if (cleanup.removed) {
+      // The clone (and the default Codex event log inside its `.git`) no longer exists: keep the paths for
+      // provenance but mark them gone, so a consumer does not follow them. A caller-supplied `--log` outside
+      // the clone is untouched.
+      const inside = (p) => typeof p === 'string' && (p === cleanup.path || p.startsWith(cleanup.path + sep));
+      report.dirRemoved = true;
+      // No caller `--log` → the log is the default one inside the clone's `.git`, gone by construction. (A
+      // path-prefix test alone is wrong on macOS: `tmpdir()` is `/var/...` but git reports `/private/var/...`.)
+      report.logFileRemoved = !opts.logFile || inside(report.logFile);
+    }
+  }
+  return report;
+}
+
+async function runCodexDirectTask({
+  scratchGuard,
   caller = 'codex-direct-task.mjs', repo, pr, card, usageTaskKind,
   task,
   outputSchemaFile,
@@ -1148,7 +1307,8 @@ export async function codexDirectTask({
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
     scratch = await setupScratchClone({
-      repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
+      repoRoot, mkTempDir: (prefix) => { const d = mkTempDir(prefix); scratchGuard?.arm(d); return d; },
+      execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
@@ -1161,6 +1321,7 @@ export async function codexDirectTask({
   }
 
   const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
+  scratchGuard?.setStart(startSha);
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
@@ -1666,17 +1827,25 @@ async function main() {
     console.log(JSON.stringify(report, null, 2));
   } else {
     console.log('\n──────────────────────────────────────────────────────────');
-    console.log(`codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
-    if (report.scratch.created && report.scratch.realOrigin) {
+    const removed = Boolean(report.scratch.cleanup?.removed);
+    console.log(removed
+      ? `codex-direct-task: scratch clone (deleted) → ${report.scratch.cleanup.path}`
+      : `codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
+    if (!removed && report.scratch.created && report.scratch.realOrigin) {
       console.log(report.scratch.originWired
         ? `  origin wired to the real remote (--wire-origin-to-remote): ${report.scratch.realOrigin}`
         : `  origin left at the local clone source (#3782, not push-capable). Real remote: ${report.scratch.realOrigin}\n`
           + `    to push from here yourself: git -C ${report.dir} remote set-url origin ${report.scratch.realOrigin}`);
     }
+    if (report.scratch.cleanup) {
+      console.log(report.scratch.cleanup.removed
+        ? '  scratch clone was clean: deleted'
+        : `  scratch clone KEPT (${report.scratch.cleanup.reason}): ${report.scratch.cleanup.path}`);
+    }
     console.log(`  thread: ${report.events.threadId ?? '<none>'}  turns: ${report.events.turns}  terminal: ${report.events.terminal ?? '<none — timed out or killed>'}  timedOut: ${report.timedOut}  exit: ${report.exitCode}`);
     console.log(`  tool calls: ${report.events.commands.length}  files touched: ${report.events.filesChanged.length}`);
     for (const f of report.events.filesChanged) console.log(`    - ${f.kind} ${f.path}`);
-    console.log(`  log: ${report.logFile}`);
+    console.log(report.logFileRemoved ? `  log: ${report.logFile} (deleted with the clean scratch clone)` : `  log: ${report.logFile}`);
     if (report.quotaUsedPercent !== null) {
       console.log(`  quota: ${report.quotaUsedPercent}% used of a ${report.quotaWindowMinutes}min window (plan: ${report.quotaPlanType})${report.quotaRolloutCleared ? ' — rollout file cleared after read' : ''}`);
     }
@@ -1690,7 +1859,9 @@ async function main() {
       for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}${report.gate.unavailable ? ` — ${s.output}` : ''}`);
     }
     if (report.selfReview.notes.length) console.log(renderSelfReviewNotes(report.selfReview));
-    console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
+    console.log(removed
+      ? '\n  NOTHING WAS COMMITTED OR PUSHED. The scratch clone had no changes, so it was deleted.'
+      : '\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }
   if (flags.job) return jobExitCode(report);

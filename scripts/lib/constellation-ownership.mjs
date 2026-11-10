@@ -66,11 +66,11 @@ export function classify(paths, map) {
 }
 
 /** Keep unique index paths still present, including dangling symlinks and unmerged index entries. */
-export function existingTrackedPaths(paths) {
+export function existingTrackedPaths(paths, lstat = path => lstatSync(resolve(root, path))) {
   // ls-files repeats a path for each unmerged stage; ownership counts working-tree leaves.
   return [...new Set(paths)].filter(path => {
     try {
-      lstatSync(resolve(root, path));
+      lstat(path);
       return true;
     } catch (error) {
       // A removed parent, or one replaced by a file, also removes its index children.
@@ -97,35 +97,47 @@ export function totals(files, readContent = readTracked) {
     const entry = result[destination];
     entry.files++;
     if (content.includes(0)) continue;
-    for (const byte of content) if (byte === 10) entry.lines++;
+    // indexOf is native; a per-byte JS loop over the whole tree made the classify CLI test slow (2.4s idle, 15s timeouts under load, PRs 6419/6426).
+    for (let at = content.indexOf(10); at !== -1; at = content.indexOf(10, at + 1)) entry.lines++;
     if (content.length && content[content.length - 1] !== 10) entry.lines++;
   }
   return result;
 }
 
-function main(args) {
+export function main(args, io = {}) {
+  const {
+    root: base = root,
+    listTracked = () => execFileSync('git', ['ls-files', '-z'], { cwd: base, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+      .split('\0').filter(Boolean),
+    lstat = path => lstatSync(resolve(base, path)),
+    read,
+    out = text => process.stdout.write(text),
+  } = io;
   if (args[0] !== 'classify' || args.length > 2 || (args[1] !== undefined && args[1] !== '--json')) {
     throw new Error('Usage: node scripts/lib/constellation-ownership.mjs classify [--json]');
   }
-  const map = JSON.parse(readFileSync(resolve(root, 'config/constellation-ownership.json'), 'utf8'));
-  const paths = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
-    .split('\0').filter(Boolean);
-  const result = classify(existingTrackedPaths(paths), map);
-  result.totals = totals(result.files);
-  if (args[1] === '--json') process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+  const map = JSON.parse(readFileSync(resolve(base, 'config/constellation-ownership.json'), 'utf8'));
+  const result = classify(existingTrackedPaths(listTracked(), lstat), map);
+  result.totals = totals(result.files, read);
+  if (args[1] === '--json') out(JSON.stringify(result, null, 2) + '\n');
   else {
     for (const [destination, count] of Object.entries(result.totals)) {
-      process.stdout.write(`${destination}: ${count.files} files, ${count.lines} lines\n`);
+      out(`${destination}: ${count.files} files, ${count.lines} lines\n`);
     }
-    process.stdout.write('reclassified:\n' + JSON.stringify(result.reclassified, null, 2) + '\n');
+    out('reclassified:\n' + JSON.stringify(result.reclassified, null, 2) + '\n');
+  }
+}
+
+/** CLI wrapper: returns the exit code; error text is JSON-quoted so filenames/control text stay inert. */
+export function runCli(args, io = {}) {
+  const { err = text => process.stderr.write(text), ...rest } = io;
+  try { main(args, rest); return 0; }
+  catch (error) {
+    err(JSON.stringify(error.message) + '\n');
+    return 1;
   }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { main(process.argv.slice(2)); }
-  catch (error) {
-    // JSON quoting keeps any filename/control text inert in terminal diagnostics.
-    process.stderr.write(JSON.stringify(error.message) + '\n');
-    process.exitCode = 1;
-  }
+  process.exitCode = runCli(process.argv.slice(2));
 }

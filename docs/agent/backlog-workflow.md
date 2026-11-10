@@ -7,7 +7,9 @@ The backlog is the website-as-source-of-truth tracker for ideas, issues, and dec
 ```
 backlog/<id>.md            # one markdown file per item — metadata frontmatter + a markdown body (its title/summary/detail). The only file you create to add an item.
 src/_data/backlog.js       # the loader — parses backlog/*.md into the `backlog` array the pages + validator all consume (single source)
-src/backlog.njk            # the /backlog/ index (filter + grid/list toggle, status-ordered, live-collects project open questions)
+src/backlog.njk            # /backlog/: non-resolved tiles + active/open prioritisation, live project questions
+src/backlog-resolved.njk   # /backlog/resolved/: resolved history, separate saved facets
+src/_includes/backlog-tracked.njk # shared tile builder + grid/list/facet UI; partitions before rendering
 src/backlog-pages.njk      # paginates the array → one /backlog/{id}/ detail page per item (renders the body)
 reports/                   # deep thinking — a backlog item links OUT to a report; the report is not the tracker
 ```

@@ -1533,6 +1533,18 @@ Every edit — including an ad-hoc "just fix this one thing" — happens in an *
 node scripts/lane-pool.mjs status --json     # per-lane path / head / clean / deps
 node scripts/lane-pool.mjs provision --count=N   # create/refresh N lanes
 ```
+Lane deps prefer pnpm 12+ with matching lockfiles and a shared store at `~/.cache/we-pnpm-store` (override `WE_PNPM_STORE_DIR`); npm ci remains the per-lane fallback, and backend switches rebuild `node_modules`. A lane whose marker matches either backend's current hash is left alone, so a lane changes backend only when its install inputs change: the lockfiles, or for pnpm the store path and the store's generation token (`.we-lane-store-generation`, created once per store). A pnpm lane also reads stale when a top-level `node_modules` link no longer resolves (store content deleted under it), and an install during which the store was wiped and recreated stamps no marker. A not-ready pnpm lane always reinstalls from an empty `node_modules`. The shared store trades per-lane isolation for disk and speed: a write into a store file is visible to every lane and survives `git clean`. To recover, delete the whole store directory; the recreated store gets a new token, so every pnpm lane reads stale and reinstalls on its next acquire. Lockfile parity also requires each pnpm package's registry integrity to be one of npm's hashes for that name@version; any other pnpm resolution fails parity, and lanes then use npm ci. Keep `package-lock.json` authoritative for npm and run `npm run check:lockfile-parity` after lockfile updates.
+
+With a `packageManager` pin, pnpm 12 writes a YAML stream containing an environment lockfile
+and a project lockfile. The parity reader and installer helper run before `node_modules`
+exists, so they must import only `node:` builtins. Keep a copied-script child-process
+regression with real YAML lockfiles and no dependency installation. Parity must read all
+documents and select the project importer;
+the environment's own `packages` map is not project dependency evidence. Run the
+`pnpm --version` probe from `os.tmpdir()`, since probing inside the repository can rewrite
+its lockfile. Regression coverage lives in `check-lockfile-parity.test.mjs` and
+`lane-deps-installer.test.mjs` under `scripts/__tests__/`.
+
 Use a `clean` lane. `git -C <lane> reset --hard <sha>` to check out any local commit (shared objects — no fetch needed, works for un-pushed HEADs).
 
 **2 — Boot the lane's OWN dev pair.** The `.env.local` port pair is **not auto-loaded** — export it first, or the servers fall back to the main band (`:3000`/`:8080`) and collide:
@@ -2389,6 +2401,20 @@ uses the existing evidence/hand-back resume; a real red resumes the repair loop.
 Exhaustion is logged once and retains the infrastructure wait for operator recovery;
 it never creates a new fixer. Probe restart persistence, write failure, head movement,
 and both terminal verdicts with the pass's injected ports.
+
+Timeout-only fix reds under high host load wait for a quiet host before a same-head
+reverify. `verify.loadRetry.maxAttempts` defaults to 3 through the policy cascade;
+`WE_VERIFY_LOAD_RETRY_MAX_ATTEMPTS` supplies the environment override. Its counter
+is persisted before requesting and does not consume ordinary retries. If that request
+fails (or never runs), the old red is not a new verdict: the harness re-requests it under
+the ordinary retry and infra-retry bounds and never escalates it.
+While a load retry exists on the record, its sha is known red: a running or overdue
+retry is never pushed early or handed back as a no-op. A deferral refreshes the
+record's `requestedAt`, so the session reaper keeps the fixer exempt until the
+deferral's own two-hour cap; after that the red ladder resumes it.
+Missing per-test timeout evidence, assertions, truncated inventories, low load on first
+observation, and exhaustion retain the normal red/escalation path. Inject `loadHigh`
+to probe both transitions, write failure, and the unchanged no-push kinds.
 
 `verify.gateCeiling` defaults to `load-scaled`, using rebuild smoke's bounded load/core
 factor; `fixed` restores 30 minutes. `VERIFY_DISPATCH_TIMEOUT_MS` is an absolute override.
@@ -3743,6 +3769,51 @@ invariants: a credential source must pass the public-blob checks before entering
 corpus. Do not claim independent mutation coverage for those redundant checks from a test
 that already refuses at source admission.
 
+
+## Post-accept advisory shadow evidence
+
+`review-loop-policy.test.mjs` exercises invalid settings with advisory-only findings, concurrent
+ledger writers (including separate Node processes), malformed persisted rows, and later loop
+observations. Accept-time `loopsAfter: null` means unmeasured; only later `kind: loops` observations
+supply measurements. A numeric accept-time count seeds the per-accept measurements; only higher
+counts advance the latest value per repo/PR/head. Equal or lower explicit replays append nothing,
+and historical replay rows cannot lower the report or the next run's count. The named accept-count,
+persisted-replay, and interleaved-accept probes in `review-loop-policy.test.mjs` pin these guarantees.
+`review-loop-cli.test.mjs` compares every live effect against mode off for an
+advisory-bearing accept, including settings and recorder failures.
+Persisted observations lock beside the ledger for at most two seconds. A busy/orphaned lock
+reports a shadow miss and preserves live review; an operator can inspect the writer and remove
+an orphaned `.lock` before retrying the observation.
+
+## Post-accept advisory replay probes
+
+The shadow advisory ledger uses recorded order, unique accepted-head identities, and a per-accept
+set of measured run IDs. Persist a run marker even when no earlier accept exists; otherwise a
+restart can turn an old run into a later run against a newly accepted head. Historical accepts
+also fence their own head when migrating to run markers. Probe partial fanout writes followed by
+a later accept and restart, concurrent duplicate and distinct runs, and duplicate or inconsistent
+persisted rows. The report and recorder share the replay reducer so skipped rows cannot suppress
+a valid replacement or inflate measurements. Keep these probes in the three review-loop-policy,
+review-loop-cli, and review-pr-io test files.
+
+
+## Post-accept advisory production ratings
+
+The CLI records later verdict ratings after the loop recorder has established the run marker.
+`advisory-rating` rows name an earlier would-card accept and reuse its repository/PR/head identity.
+Match cited findings with `roundCardsFindingsFingerprint`; without a valid path, require a stable
+finding ID rather than the fingerprint's prose fallback. Replay and the writer share this identity
+helper and the recorded-order boundary. Deduplicate by accepted head, finding identity, impact,
+and verdict across runs. Both confirmed and plausible broken ratings have production writers;
+only confirmed ratings increase `laterBroken`, while plausible ratings feed `unconfirmedBroken`.
+The CLI regression compares all live effects with mode off and exercises replay and writer/logger
+failures. Policy and persisted-IO probes cover refusal, lock ownership, and concurrent deduplication.
+
+The auto-discovered `post-accept-advisory-shadow-replay` soak scenario drives the production
+review loop with in-memory runs, ledger IO and effect sinks. It replays an accepted head and
+a later reviewed head, compares off/shadow/on live effects, distinguishes confirmed from plausible
+broken ratings, and injects writer and logger failures without contacting GitHub or changing Git.
+
 ## Verdict-ledger contention regression (R365 fix 2)
 
 `verdict-ledger-io.test.mjs` uses local bare origins and real rejected pushes to
@@ -3765,3 +3836,270 @@ polling sleep, then adoption and cleanup; immediate adoption alone does not exer
 For new operation refusal branches, use table-driven cases for every bad-input detail and invalid numeric
 shape, and assert the operator-facing fallback text. Pair state producers with a consumer integration test;
 test failed persistence warnings explicitly so callers cannot promise an event that was never tracked.
+
+## UID scanner idle proofs
+
+An absent UID does not guarantee an idle result from a shared host's `/proc`: repeated process
+churn or unreadable credentials deliberately retain reservations. In `forge-exec-run-reap.test.mjs`,
+keep the live host busy probe, but pin the idle probe's PID listing to the test process and read
+its real status file. Inject process churn, unreadable entries, and settled scans separately to
+verify the production scanner's fail-closed behavior without relying on host quiescence.
+
+## PR sweep invariant replay (R437)
+
+`scripts/conveyor/__tests__/pr-sweep.test.mjs` covers the all-open-PR shell, state clocks
+independent of `updatedAt`, dependency ordering, and alert-backoff migration. Backoff is
+explicit in `prSweep.alertBackoffMinutes`; omitted settings retain legacy one-shot callers.
+Dependency annotations are report-only and scoped to one repository. Markdown quotations,
+fences and inline code do not create dependency edges. The four incident shapes are replayed
+with injected readers in `pr-sweep-invariant-four-cases.soak.test.mjs`; run that file with
+`--config vitest.soak.config.ts` through heavy admission (the unit config excludes soak files).
+
+PR dependency edges require the target in the same repository's current open-PR listing.
+The named blocker-removal regression in `pr-sweep.test.mjs` keeps the textual annotation
+unchanged while removing the target, then proves the dependent regains a stall episode and alert.
+The named cross-repository number-collision regression lists the same dependent number in
+two repositories, with its blocker open only in one and absent or merged in the other.
+Both listing orders must preserve the other repository's stall episode and eventual alert.
+Its same-repository control uses
+`Blocked by: #6244`; dependency phrases accept an optional colon, still excluding quoted
+examples and references split across lines.
+
+`prSweep.deadlineMinutes` accepts either a positive scalar for every action budget or a
+per-action map. The settings-to-evaluator contract cases in `pr-sweep.test.mjs` exercise
+both shapes from tool and environment settings, including effective deadlines and provenance.
+
+When the invariant digest producer is enabled, its owner-signal failures must mark the shared digest incomplete.
+`pr-stall-digest.test.mjs` exercises the real sweep and feed publisher across an owner-read
+failure, recovery, and a later confirmed PR removal: incomplete evidence preserves the open
+invariant item, while a complete listing may clear it.
+
+Dependency extraction uses Markdown block structure to exclude indented code and lazy
+blockquote continuations as well as fences; inline code retains the conservative exclusion
+for unterminated spans. The indented/quoted-example sweep regressions prove these examples
+cannot suppress a stall episode. Empty diffs take precedence over dependency waits in the
+action, deadline, violation, legacy report, and digest while preserving dependency metadata.
+The four-case soak keeps a live blocker on its empty-diff fixture to pin that precedence.
+
+Legacy sweep/detector rows retain their original shape unless dependencies, empty-diff
+precedence, or configured alert backoff require enrichment. New invariant rows carry their
+own metadata; the feed serializer omits extensions absent from a legacy item. An explicit
+sweep-off or digest-false pass preserves detector-only behavior: agent listing failures do
+not make the independent detector incomplete, while enabled invariant producers still
+preserve published items when ownership cannot be read.
+
+The named `mode=off`, `digest=false`, and `enabled invariant producer` cases in
+`pr-stall-digest.test.mjs` seed a real detector feed item before an owner-read failure.
+With independent PR/detector reads succeeding, the disabled producers allow complete
+passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
+The tests also require the detector digest to remain enabled, excluding disable-time
+clearing as a false-positive proof of detector completeness.
+
+## Shard split-retry evidence
+
+`verify-shard-run` retries incomplete inventory once in at most two halves to surface
+failures. The retry never yields PASS: the first TIMEOUT, NOT-RUN, or FAIL half
+keeps its status (TIMEOUT/NOT-RUN exit 124). Otherwise, observed failure evidence
+makes the shard FAIL (exit 1). Every other retry
+outcome is UNSETTLED (exit 75), including all halves passing. Retry output and
+failure details remain visible, and each shard contributes one final result.
+Admission forwards child exit codes, so exit 75 cannot prove the command never ran;
+nonzero exits other than 75 are failure evidence even without inventory, and
+cannot be cleared by passing retries. Exit 0 or 75 with missing inventory remains
+unsettled-eligible in the absence of failure evidence. Ordinary complete remote
+failures can be cleared by a complete passing local confirmation, in both the shard
+wrapper and ordinary phases. Incomplete shards retain failure evidence, including
+a complete remote failure or nonzero exit followed by incomplete local confirmation
+and passing split retries.
+Infrastructure
+exits retain their classification, and UNSETTLED retains `verify-unsettled` only
+when the caller supplies no failing-test identities (`failureDetails.tests` is empty
+or absent); an empty collector object or progress summary is not a test failure.
+Exit 75 with recorded failures stays red and does not authorize local confirmation
+in either path. Ordinary remote phases confirm a reported remote exit 75 without
+failures locally because the nested admission wrapper can use it for deferral. The shard wrapper owns its
+own confirmation and retry, so its terminal UNSETTLED result is never confirmed
+again by verify-lane. Signals, watchdog timeouts, unknown run locations, and
+reported local failures still prohibit remote confirmation.
+First-attempt passes are unchanged. The scoped regressions live in
+`scripts/lib/__tests__/verify-shard-run.test.mjs`; run them through heavy admission.
+The cross-path confirmation policy is pinned in `verify-remote-routing-shard.test.mjs`,
+and `verify-lane.test.mjs` exercises exit 75 without FAIL output through the real CLI.
+Child report identities re-emitted as FAIL lines must strip C0/C1 controls and Unicode
+line separators; the hostile-input table checks the resulting failure collector entries.
+When changing an existing test's expected verdict, disclose the behavior change in
+the PR description so reviewers can distinguish a policy change from a regression fix.
+
+Persistent GitHub 5xx soak fixtures must account for both retry ladders: `withListRetry`
+repeats the list read three times, and each attempt can sleep again in `gh-throttle`.
+The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
+`WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
+fail-closed reads across reconcile and dispatch smoke passes within the unchanged
+90-second tick bound; shortening only the outer list backoff does not suffice.
+
+## Lane release preservation guard
+
+`lane-pool release` checks HEAD and every local branch against the branch tips the pool's canonical
+origin lists right now (`ls-remote` checked against the primary checkout and run outside any repository, so a
+helper planted in the primary after the check never runs; `ops/*` excluded) after known-litter
+cleanup and salvage. No local `refs/remotes/*` ref is proof: stale, forged and symbolic-alias tracking
+refs all still refuse. A listed tip the lane has not fetched triggers one hardened fetch before refusing.
+That fetch is object-only: it writes into a fresh `refs/release-verify/<nonce>/*` namespace (no
+`FETCH_HEAD`), which it deletes again without dereferencing, so it never writes a lane-controlled ref.
+A symbolic ref under `refs/remotes/origin/` other than the ordinary `origin/HEAD` alias refuses before
+any fetch (the salvage fetch too), and if any local branch, the stash or HEAD moved during the fetch,
+release refuses naming the ref instead of recomputing the proof.
+Each snapshotted ref kind has a named mutation scenario: a branch moved or deleted, a detached HEAD moved,
+HEAD switched to a twin branch, and the stash moved or dropped. The snapshot also records every stash reflog
+entry, so dropping an older entry while the tip stays refuses too (its own row). Rows whose move hides the work
+then release with no fault, so only the movement check kept it; the other rows still refuse on that retry.
+An unresolved origin or an unreadable listing refuses; every named pool in a fixture therefore needs
+its primary checkout (a sibling of the reference) so release can resolve that origin.
+The listing checks the primary's config with a primary-only rule: ordinary extra remotes (`upstream`, a fork)
+and operator auth/signing keys pass; URL rewrites (`insteadOf` / `pushInsteadOf`) and any remote named like the
+canonical origin URL still refuse. Salvage transport (`fetchHeads`, `push`, `remoteSha`) keeps the stricter lane rule.
+Tracked changes are read with `--ignore-submodules=none`, and assume-unchanged / skip-worktree entries
+are compared by executable mode and content, so index flags and submodule-ignore config cannot hide an edit
+or a chmod. Past 1000 flagged entries the check fails closed; flagged links and gitlinks are reported, never trusted.
+Every evidence read drops inherited git config env first (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT/KEY/VALUE`,
+global and system config), so a caller's `core.fileMode=false` cannot hide a chmod. Tests pass such env through
+`runPool`'s `extraEnv`. The refusal's preservation command pushes to the canonical origin URL, not the lane's
+own `origin` remote, which the lane can rewrite.
+Known limit: other entries still trust the index stat cache, so a lane that hand-rewrites `.git/index`
+with stat fields matching an edited file reads clean. Release does not refuse that shape yet; the
+bounded content check is #8143. Tests must not promise refusal for it until that lands.
+A lane whose `.git` is not a real directory, carries a `.git/commondir`, or does not resolve its git dir and
+common dir to its own `.git` refuses before any release work (config scrub, litter cleanup, salvage push,
+evidence reads): those redirect refs, objects and config to another repository, so every later step would
+read or write the wrong one. `--discard` does not override it; it is listed with `reason: 'git-dir-redirected'`.
+Its tests also run with recovery on, with an ahead commit and litter present, and assert no salvage ref, no
+salvage record and the litter kept; a control case shows the same spy sees an un-redirected lane's salvage.
+The 1000-entry hash bound is pinned by tampering only the last, then only the first, of exactly 1000 flagged
+entries (each refuses by name), and by 1001 flagged entries failing closed.
+Untracked files deliberately do not block release: the guard covers tracked changes only.
+URL-based salvage may leave no tracking ref: only its verified
+remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
+intentionally release tracked edits or unpreserved commits must pass `--discard` explicitly; `--force`
+only overrides ownership. Unreadable or oversized Git evidence keeps the lease and names manual
+inspection or deliberate `--discard` as the operator fallback.
+A work refusal exits 1, names each kept lane in `--json` (`kept: [{ pool?, lane, reason: 'unpushed-work', details }]`)
+and journals a loud `release-refused` line. A failed card save does the same with `reason: 'card-salvage-failed'`;
+a lane hold stays exit 0 (it journals `hold-refused`) but is listed with `reason: 'held'`. Tests pin the exit code,
+the `kept` list and the journal line. Callers that ignore the exit code (the drain's release-on-land,
+a launch-failure un-reserve, the reaper) do not yet read `kept`; that caller-side work is #8142.
+Canonical-origin isolation fixtures must assert refusal and an unchanged lease when the owning pool's
+origin is unresolved. Reclaim fixtures with rejected salvage must first assert that reaper release
+refuses, then explicitly discard the lease to exercise reclaim on unpreserved work. The card-filer soak
+likewise checks that unreadable status keeps the lease before testing a deliberate discard.
+
+## Author-stamp repair daemon wiring
+
+PR author logins from `gh pr view` can carry `app/`, while GraphQL edit editor logins do not.
+Normalize only the PR author by removing one leading `app/` and comparing case-insensitively.
+The review daemon must explicitly pass `restoreStamps: sweepAuthorStamps` to hold reconciliation,
+including with shared PR reads: an injected listing otherwise suppresses the default stamp sweep.
+Keep daemon wiring tests hermetic by inspecting the passed function without invoking it;
+the stamp and hold-reconcile suites exercise the repair through injected IO.
+Every default restoration read (listing, live body, history, pre-write body) goes through
+`createMqLiveReader`, so the smoke read memo (`WE_GH_READ_MEMO_DIR`) can never serve the pre-write
+comparison a cached body. The regression drives the real `gh-throttle` memo with a fake `gh`.
+Hold reconciliation's default PR state, review and comment readers (`createLiveHoldReaders`) strip
+the memo too, because `readLiveState` is re-read right before each label write.
+
+### Author-stamp restoration evidence
+
+`author-stamp-restore` fixtures must preserve GraphQL editor `__typename` alongside
+`login`: `app/X` PR authors match only `Bot` editors, and plain `X` authors match only
+`User` editors. Missing or unknown types refuse. Historical bodies must be plain
+snapshots; a hunk header, word-diff token (`[-`, `-]`, `{+`, `+}`), or HTML in any snapshot
+refuses the whole history without writing. Every occurrence of `authored-by-actor:`
+must belong to a complete marker occupying an entire unindented line outside a code
+fence, with only optional trailing whitespace. Exercise malformed markers in an
+otherwise eligible oldest author snapshot, without an earlier forgery masking the
+refusal; keep the pr-land final standalone marker as a positive case. Refusal directs operators to inspect
+the complete GitHub history manually; never turn ambiguous delta text into a stamp.
+
+## Bounded review run scans
+
+Review evidence scans stat candidates before parsing, read them by mtime descending (equal mtimes by
+ascending id, for drain and recovery alike, so both read the same window), and parse at most `runs.scan.maxParses` (standard default 300) per read, including historical/recovery fallbacks.
+The setting resolves through the shared standard/platform/tool cascade; `scripts/settings/runs-scan.json`
+leaves the tool value unset so platform preferences apply. No environment override is added.
+The shared finder continues from its cursor; it never retains a folder of payloads. Exhausting the
+budget before completion returns `{ok:false, reason:"scan-capped"}` and logs the limit/source. The
+enqueue gate, status labels and recovery scheduler hold on unknown evidence. A confirmed break
+recorded in the PR's comments still takes precedence: the gate returns its send-back hold and the
+status labels mark the PR `red-team:blocked`. Past the red-team deadline, unknown evidence never
+counts as "no run": it is neither re-requested nor enqueued by the operator override, and it holds
+with its reason named. Inspect omitted run
+records before deliberately raising the limit. Genuine folder exhaustion still means no match.
+Choose both head-specific and any-head matches by read-step `startedAt`, never file mtime.
+A record is written after its read step starts, so its mtime is an upper bound on that start.
+The scan therefore stops early, well below the cap, once every unread record was last written
+more than 2 s (`RUN_MTIME_SLACK_MS`) before the exact-head match started: none of them can be a
+newer run. A match whose start cannot rule out the omitted records still holds as `scan-capped`.
+With no exact-head match in a capped window, a carried head still resolves through the any-head
+query once the newest same-PR run started after every omitted record was written, and a head with a
+status file also needs every omitted record written no later than that status. An unreviewed head
+holds: past the cap, the absence of an exact-head run cannot be proven.
+Recovery's carry fallback reuses the same scan, so one recovery read stays inside one parse budget.
+When recovery's own exact-head query is capped, it reads that carry fallback before holding: a
+carry the drain can settle from the scan is returned as carry evidence with no newest run (which
+recovery never treats as owed); any other capped answer still holds as `scan-capped`.
+Equal starts retain the drain's ascending / recovery's descending ID tie order. A start-less
+same-PR run last written before the selected run started is older and ignored; any other start-less
+run among two or more returns `run-start-missing` and holds. A single run needs no ordering and
+remains usable without a timestamp. A newer unfinished attempt holds as `review-unfinished`.
+A verdict-less run that run-store calls terminal (nothing pending or in flight) and that has not been
+written for an hour (`ABANDONED_REVIEW_AFTER_MS`) is abandoned: it is neither evidence nor unfinished,
+so a crashed re-review cannot hold a PR forever. A run waiting on a pending step or effect is never
+abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
+Unreadable records still throw, never skip.
+
+The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
+test `settings-files`; use heavy admission.
+
+
+## Refused referral reviews re-read standing rulings
+
+A `stageVerdict` refusal has consumed its confirm and has no `pending` step. Preserve that
+shape in `reviewRunEvidence`; live thread evidence must stay outside its durable projection cache.
+Before releasing or rewinding this refusal, re-derive `mandatoryReferralState` through
+`liveReferralState`, requiring every saved pending finding key in the same run/head record.
+Reason tokens such as `author-stamp-missing` (`PENDING_REASON_TOKENS`, the one set `attempted`,
+`count` and this check share) name no finding: the empty
+live pending list answers them, so an unstamped PR body still resumes once every finding is ruled. Missing
+records, partial rulings, malformed comments, unreadable cards and subject mismatches keep it
+blocked. A comment timestamp alone cannot prove a ruling stands. Reuse `mandatoryReferrals`
+rewind so the sink, reducer and acceptance gates still decide the resulting verdict.
+`review-ruling-resume.test.mjs` covers explicit and automatic resumes without new jurors,
+and the closed paths; run it and the referral-hold suites through heavy-admission.
+
+
+## Suspended mandatory-referral handoff (R746)
+
+A `review-pr` run pending an effect at `mandatoryReferrals` is incomplete panel evidence,
+but a recorded referral ruling on its unchanged head can wake that exact pending effect.
+`review-ruling-resume.test.mjs` covers in-place replay, unchanged effect keys, no new panel,
+and the separate `RESUME_MAX_ATTEMPTS` budget. Do not route existing `resumeOf` persistence
+retries through this path: they retain their original retry accounting.
+The judge facts reader observes the shared run store; hermetic facts fixtures must inject
+`findSuspendedRuns`. `suspended-referral-run.test.mjs` covers the bounded scan and window
+cascade; judge facts IO tests cover durable per-run alert claims and ruled-finding suppression.
+Alert claims never expire automatically: uncertain publication requires operator inspection
+of `referral-judge-alert-claims` in the shared runs directory, rather than a liveness probe.
+
+
+## Shared clone owner election and deferred-mutation retries
+
+`daemon-clone-single-owner.test.mjs` pins live-key election using stable string ordering,
+reader-clock heartbeat ages with a 30-second future-skew bound, and monotonic persisted epochs.
+Election and rebuild execution share a coordination mutex, independent of the reader/writer
+locks. A live local process retains that fence through a paused event loop; a provably dead
+process permits reclamation. Unknown lock liveness or corrupt/exhausted epochs defer rebuilds;
+the operator must inspect and repair coordination evidence before rebuilding resumes.
+`daemon-rebuild-request-failures.test.mjs` distinguishes explicit rebuild failures from neutral
+job/lock outcomes, including persisted request retention. `daemon-self-sync-mutation-due.test.mjs`
+requires failed/refused mutations to remain pending and retry on the next tick; only a completed
+mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
+`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.

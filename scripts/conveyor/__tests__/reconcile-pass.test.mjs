@@ -1640,3 +1640,152 @@ it('re-probes a bound PID on each pass, discarding an earlier live result even w
   expect(assessLiveness([{ agent: dead }])).toBeNull();
   expect(enrichAgents([row], { probe: () => null })[0]).not.toHaveProperty('pidAlive');
 });
+
+
+describe('pid reuse: a process that started after the session registered is not that session', () => {
+  const ps = (lstart) => () => `S ${lstart} claude bg-spare x\n`;
+  const SESSION_MS = Date.parse('2026-11-03T14:00:00Z');
+  it('reused pid (process started 1h after the session) reads dead', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: ps('Tue Nov  3 15:00:00 2026') })).toMatchObject({ alive: false, reason: 'started-after-holder' });
+  });
+  it('live holder (pre-warmed bg-spare started before the session) reads alive', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: ps('Tue Nov  3 13:00:00 2026') }).alive).toBe(true);
+  });
+  it('unreadable ps stays unknown (fail closed: keep)', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: () => { throw Object.assign(new Error('x'), { stderr: 'boom' }); } }).alive).toBeNull();
+  });
+  it('dead holder reads dead; enrichAgents passes the session start through to the probe', async () => {
+    const { enrichAgents, probePid } = await import('../reconcile-pass.mjs');
+    const seen = [];
+    // Mirrors the production call shape: probe(pid, kill, identity, opts) — opts is the FOURTH argument.
+    const probe = (pid, _kill, _identity, opts) => { seen.push(opts); return probePid(pid, () => { throw Object.assign(Error('x'), { code: 'ESRCH' }); }, undefined, opts); };
+    const out = enrichAgents([{ pid: 66752, startedAt: SESSION_MS, state: 'working' }], { probe })[0];
+    expect(out.pidAlive).toBe(false);
+    expect(seen[0]).toEqual({ startedBy: SESSION_MS });
+  });
+});
+
+it('enrichAgents default probe path: reused pid (process newer than session) is marked pidAlive:false', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  // pid of THIS test process; claim a session that registered long before this process started.
+  const out = enrichAgents([{ pid: process.pid, startedAt: Date.parse('2020-01-01T00:00:00Z'), state: 'working' }],
+    { readLaneHead: () => null })[0];
+  expect(out.pidAlive).toBe(false);
+});
+
+it('enrichAgents reads ISO-string and numeric-string startedAt for the reuse guard', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  for (const startedAt of ['2020-01-01T00:00:00Z', String(Date.parse('2020-01-01T00:00:00Z'))]) {
+    expect(enrichAgents([{ pid: process.pid, startedAt, state: 'working' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+  }
+});
+
+// Red-team round 5 (PR #6346): a wrapped worker resumed by the harness keeps its first-launch startedAt while its new
+// child pid started later. The reuse guard must not call that live child a recycled pid.
+it('enrichAgents keeps a resumed wrapped worker alive: its startedAt is the first launch, its child pid is newer', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { wrappedRecordToAgentRow } = await import('../../operations/worker-wrapper-launch.mjs');
+  const { COMPLETION_RECORD_V2 } = await import('../../operations/completion-store.mjs');
+  const firstLaunch = Date.parse('2020-01-01T00:00:00Z');
+  const row = wrappedRecordToAgentRow({
+    v: COMPLETION_RECORD_V2, launcher: 'claude-p', role: 'fix', status: 'started', session: 'fix-1', pid: process.pid,
+    startedAt: new Date(firstLaunch).toISOString(), cwd: '/lane',
+  }, { isAlive: () => true });
+  expect(row).toMatchObject({ kind: 'wrapped-worker', pid: process.pid, startedAt: firstLaunch });
+  expect(enrichAgents([row], { readLaneHead: () => null })[0].pidAlive).toBe(true);
+  // the same pid on a NON-wrapped row with the same old start is still a reused pid (the guard stays armed there)
+  expect(enrichAgents([{ ...row, kind: 'bg' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+});
+
+it('holderStartedBy: null for a wrapped worker, the parsed start for any other row, null when unreadable', async () => {
+  const { holderStartedBy } = await import('../../lib/pid-alive.mjs');
+  const { startedAtMs } = await import('../reconcile-core.mjs');
+  expect(holderStartedBy({ kind: 'wrapped-worker', startedAt: 1_700_000_000_000 }, startedAtMs)).toBeNull();
+  expect(holderStartedBy({ kind: 'bg', startedAt: 1_700_000_000_000 }, startedAtMs)).toBe(1_700_000_000_000);
+  expect(holderStartedBy({ startedAt: '2020-01-01T00:00:00Z' }, startedAtMs)).toBe(Date.parse('2020-01-01T00:00:00Z'));
+  expect(holderStartedBy({ startedAt: 'nope' }, startedAtMs)).toBeNull();
+  expect(holderStartedBy(null, startedAtMs)).toBeNull();
+});
+
+describe('freshAgentStatus — uncached status read at decision time', () => {
+  it('returns the row status for the matching sessionId; unreadable/absent fails closed to null', async () => {
+    const { freshAgentStatus } = await import('../reconcile-pass.mjs');
+    const exec = () => JSON.stringify([{ sessionId: 'a', status: 'busy' }, { sessionId: 'b', status: 'idle' }]);
+    const seen = [];
+    expect(freshAgentStatus({ sessionId: 'b' }, (...a) => { seen.push(a); return exec(); })).toBe('idle');
+    expect(seen[0][0]).toBe('claude');
+    expect(seen[0][1]).toEqual(['agents', '--json']);
+    expect(freshAgentStatus({ sessionId: 'zzz' }, exec)).toBeNull();
+    expect(freshAgentStatus({ sessionId: 'b' }, () => { throw new Error('x'); })).toBeNull();
+  });
+});
+
+describe('makeReconcileIdleFinishedInfoFor — the reconcile-only wiring of the idle-row override (R810)', () => {
+  it('opts in with the 3x hung grace and the injected exec for the fresh read; a busy fresh read keeps the session', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'reconcile-idle-wiring-'));
+    const cwd = '/Users/fixture/workspace/dispatch-1';
+    const sessionId = 'sess-wiring-0001';
+    mkdirSync(join(root, cwd.replaceAll('/', '-')), { recursive: true });
+    vi.stubEnv('CLAUDE_PROJECTS_DIR', root);
+    vi.resetModules();
+    try {
+      const { makeReconcileIdleFinishedInfoFor } = await import('../reconcile-pass.mjs');
+      const now = Date.now();
+      const MIN = 60_000;
+      const write = (minsAgo) => writeFileSync(join(root, cwd.replaceAll('/', '-'), `${sessionId}.jsonl`), `${JSON.stringify({
+        type: 'assistant', timestamp: new Date(now - minsAgo * MIN).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'x' } }] },
+      })}\n`);
+      const execFor = (status) => () => JSON.stringify([{ sessionId, status }]);
+      const row = { cwd, sessionId, status: 'idle' };
+      write(100);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(true);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('busy') })(row, now, 10 * MIN).finished).toBe(false);
+      write(75); // inside 3 x 30 min
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('defaultReadAgents — the production default wires the reconcile-only idle-row override (R810)', () => {
+  it('a listed idle row ending on a dangling call, silent past 3x the hung threshold, is marked idleFinished; a busy fresh read is not', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'reconcile-default-wiring-'));
+    const cwd = '/Users/fixture/workspace/dispatch-2';
+    const sessionId = 'sess-default-0001';
+    mkdirSync(join(root, cwd.replaceAll('/', '-')), { recursive: true });
+    vi.stubEnv('CLAUDE_PROJECTS_DIR', root);
+    vi.resetModules();
+    try {
+      const { defaultReadAgents } = await import('../reconcile-pass.mjs');
+      const now = Date.now();
+      const MIN = 60_000;
+      writeFileSync(join(root, cwd.replaceAll('/', '-'), `${sessionId}.jsonl`), `${JSON.stringify({
+        type: 'assistant', timestamp: new Date(now - 100 * MIN).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'x' } }] },
+      })}\n`);
+      const none = () => null;
+      const read = (freshStatus) => defaultReadAgents({
+        exec: () => JSON.stringify([{ sessionId, cwd, name: 'ci-heal-1', status: freshStatus, state: 'blocked', pid: 1 }]),
+        env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' }, now, hungThresholdMs: 30 * MIN, completionFor: none, hungInfoFor: none, authExpiredInfoFor: none,
+        bgIsolationStallInfoFor: none, listJobs: () => [],
+      });
+      expect(read('idle').find((r) => r.sessionId === sessionId)?.idleFinished).toBe(true);
+      expect(read('busy').find((r) => r.sessionId === sessionId)?.idleFinished).not.toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

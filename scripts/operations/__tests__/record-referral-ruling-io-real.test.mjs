@@ -32,7 +32,7 @@ it('resolves --card in a real checkout and plans a ruling the gate would honour'
     const record = { version: 1, repo: 'o/r', pr: 9, head, runId, reviewer, authorBody: '<!-- authored-by-actor: a -->', attempted: true,
       referrals: [{ key, seat, original, finding: normalizeFinding(original) }],
       rulings: [{ id: `${runId}:0`, key, reviewerId: reviewer.id, lens: 'correctness', result: 'block', rationale: 'gap', evidence: ['diff'] }] };
-    const readJson = () => ({ headRefOid: head, body: record.authorBody, createdAt: '2026-10-04T00:00:00Z',
+    const readJson = (args) => args[0] === 'api' ? { login: 'chalbert', type: 'User' } : ({ headRefOid: head, body: record.authorBody, createdAt: '2026-10-04T00:00:00Z',
       comments: [{ body: renderReferralRecord(record), author: { login: 'web-everything' } }] });
     const read = createRecordReferralRulingReader({ root, readJson, now: () => '2026-10-04T14:30:00Z', env: { CLAUDE_CODE_SESSION_ID: 's' } })
       ({ repo: 'o/r', pr: 9, card: 'xvm9vbu' });

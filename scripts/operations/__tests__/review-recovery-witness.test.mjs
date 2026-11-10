@@ -1,11 +1,11 @@
 // @vitest-environment node
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, utimesSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { pidNamespace, pidStartTime } from '../../lib/pid-alive.mjs';
+import { pidAlive, pidNamespace, pidStartTime } from '../../lib/pid-alive.mjs';
 import { withFileLock } from '../../lib/atomic-json-file.mjs';
 import * as evidence from '../../lib/drain-red-team-evidence.mjs';
 import * as recovery from '../../lib/review-red-team-on-skip.mjs';
@@ -13,6 +13,7 @@ import { createReviewJobIo, dispatchReviewJob, runReviewJob, runReviewJobCli } f
 import { newRunRecord, resolveRunsDir } from '../run-store.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { runRedTeam, runExtraSeatsCli } from '../review-extra-seats.mjs';
+import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { resumeRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 
 const interruption = vi.hoisted(() => ({ boundary: null }));
@@ -51,6 +52,9 @@ afterEach(() => { interruption.boundary = null; dirs.splice(0).forEach(dir => rm
 const repo = 'web-everything/web-everything', pr = 7537, head = 'a'.repeat(40);
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } } });
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+// The lookup orders review runs by their read-step start and fails closed (run-start-missing) when
+// several runs for one PR lack it, so synthetic runs carry an explicit start like real ones do.
+const readStartedAt = startedAt => ({ stepTimings: [{ step: 'read', stepIndex: 0, startedAt }] });
 function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'we-7537-')); dirs.push(dir);
   const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_STALE_RUN_MS: '1000' };
@@ -59,7 +63,7 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
   writeFileSync(path, JSON.stringify({ repo, pr, head, status, result: null, pid: 99999999,
     host: foreign ? 'foreign' : hostname(), pidNamespace: pidNamespace(), pidStart: ageMs ? new Date(Date.now() - ageMs).toISOString() : '2020-01-01T00:00:00Z', loopPayload: { findings: {} } }));
   const run = join(env.WE_SHARED_RUNS_DIR, 'review-pr-7537.json');
-  writeFileSync(run, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537', op: 'review-pr', input: { repo, pr } }), ...payload() }));
+  writeFileSync(run, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537', op: 'review-pr', input: { repo, pr } }), ...readStartedAt('2026-01-01T00:00:00.000Z'), ...payload() }));
   const probe = { host: hostname(), namespace: pidNamespace(), isAlive: () => false, readPidStart: () => '2020-01-01T00:00:00Z' };
   const readWitness = () => evidence.readRecoveryWitness({ ...key, runsDir: env.WE_SHARED_RUNS_DIR, readScorecards: () => seats });
   const decide = () => recovery.planRedTeamRecovery(readWitness(), { now: Date.now(), probe, deadlineMs: 1000 });
@@ -173,9 +177,9 @@ it.each([10, 12, 'status rewritten', 'marker removed', 'seat appended'])('B / ma
     const original = readFileSync(f.run, 'utf8'), at = statSync(f.run).mtimeMs;
     const older = join(f.env.WE_SHARED_RUNS_DIR, 'review-pr-7537-older-accept.json');
     const newer = join(f.env.WE_SHARED_RUNS_DIR, 'review-pr-7537-newer-reject.json');
-    writeFileSync(older, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-older-accept', op: 'review-pr', input: { repo, pr } }), ...payload() }));
+    writeFileSync(older, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-older-accept', op: 'review-pr', input: { repo, pr } }), ...readStartedAt('2025-12-31T00:00:00.000Z'), ...payload() }));
     utimesSync(older, new Date(at - 2000), new Date(at - 2000));
-    writeFileSync(newer, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-newer-reject', op: 'review-pr', input: { repo, pr } }), ...payload(), verdict: { verdict: 'reject' } }));
+    writeFileSync(newer, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-newer-reject', op: 'review-pr', input: { repo, pr } }), ...readStartedAt('2026-01-02T00:00:00.000Z'), ...payload(), verdict: { verdict: 'reject' } }));
     utimesSync(newer, new Date(at + 2000), new Date(at + 2000));
     expect(readFileSync(f.run, 'utf8')).toBe(original);
     expect(f.readWitness().newest).toMatchObject({ id: 'review-pr-7537-newer-reject', verdict: { verdict: 'reject' } });
@@ -617,8 +621,338 @@ it.each(['stale-recovery', 'failed-seat-retry'].flatMap(kind => [false, true].ma
     readStatus: () => evidence.readRedTeamStatus(f.key), readEvidence: () => ({ loopPayload: f.readWitness().newest,
       inFlight: false, queued: false, recorded: f.seats.length > 0, seatRecorded: f.seats.length > 0,
       completedRecorded: false, failedSeatCount: f.seats.length }),
-    setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(),
+    // Pin the historical cooldown: a freshly superseding writer has not earned a refill.
+    setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
     recoveryOptions: { now: Date.now(), probe: f.probe, deadlineMs: 1000 } });
   expect(next[0].action).toBe(superseded ? 'skip' : 'dispatch');
   if (!superseded) expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+});
+
+// A host rename after a crash leaves a record no local pid probe can settle. Recovery applies the same stale-record rule the
+// evidence reader uses; before this it returned 'owner live or age unknown' forever for a record with no birth time.
+describe('stale record owned by a foreign host name', () => {
+  const stale = (f, { ageMs = 3 * 3_600_000, ...patch } = {}) => {
+    writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, pidNamespace: null, pidStart: null, ...patch }));
+    const at = new Date(Date.now() - ageMs);
+    utimesSync(f.path, at, at);
+    return recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env });
+  };
+  it('recovers a stale foreign-host record with no birth time once its pid is gone', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f)).toMatchObject({ mode: 'fresh', abandon: true });
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+  });
+  it('keeps a stale foreign-host record recoverable after its own abandonment rewrote the file (mtime reset)', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f)).toMatchObject({ mode: 'fresh', abandon: true });
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+    expect(Date.now() - statSync(f.path).mtimeMs).toBeLessThan(60_000);
+    expect(recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env }))
+      .toMatchObject({ mode: 'fresh', abandon: false });
+  });
+  // After the abandonment the file is freshly rewritten, so the stale-age rule cannot kill it: only the marker-binding shortcut
+  // can. Each clause of that shortcut (writer, evidence) is therefore defended by its own test that tampers with ONLY that field.
+  const abandoned = () => {
+    const f = fixture({ foreign: true });
+    stale(f);
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+    const markerPath = `${f.path}.stale-redispatch-1`, marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+    const plan = () => recovery.planRedTeamRecovery(f.readWitness(), { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env });
+    expect(marker.writer).toBe(f.readWitness().rawWriter.sha256);
+    expect(marker.evidence).toBe(f.readWitness().evidenceSha256);
+    expect(plan()).toMatchObject({ mode: 'fresh', abandon: false });
+    return { f, markerPath, marker, plan };
+  };
+  it('does not treat an abandonment whose marker names a different writer as proof of death', () => {
+    const { markerPath, marker, plan } = abandoned();
+    writeFileSync(markerPath, JSON.stringify({ ...marker, writer: 'x'.repeat(64) }));
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('does not treat an abandonment whose marker names different evidence as proof of death', () => {
+    const { markerPath, marker, plan } = abandoned();
+    writeFileSync(markerPath, JSON.stringify({ ...marker, evidence: 'y'.repeat(64) }));
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('does not treat an abandonment with no marker as proof of death', () => {
+    const { f, markerPath, plan } = abandoned();
+    rmSync(markerPath);
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    expect(f.readWitness().markers.redispatch).toBeNull();
+  });
+  // Rewrite the abandoned writer (new bytes) and rebind the marker to them, so only the probe clauses decide.
+  const rebound = (patch, { expectFresh = true } = {}) => {
+    const a = abandoned(), { f, markerPath, marker } = a;
+    writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, ...patch }));
+    writeFileSync(markerPath, JSON.stringify({ ...marker, writer: f.readWitness().rawWriter.sha256 }));
+    if (expectFresh) expect(a.plan()).toMatchObject({ mode: 'fresh' });
+    return a;
+  };
+  it('does not treat a bound abandonment as proof of death while its pid is alive here with the recorded birth time', () => {
+    const { f, plan } = rebound({ pidStart: 'birth-a' });
+    f.probe.isAlive = () => true; f.probe.readPidStart = () => 'birth-a';
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    f.probe.readPidStart = () => 'birth-b';
+    expect(plan()).toMatchObject({ mode: 'fresh' });
+  });
+  it('holds a bound abandonment whose pid is alive here with no recorded birth time', () => {
+    const { f, plan } = rebound({});
+    f.probe.isAlive = () => true;
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('holds a bound abandonment whose birth time is unreadable or whose probe throws', () => {
+    const { f, plan } = rebound({ pidStart: 'birth-a' });
+    f.probe.isAlive = () => true; f.probe.readPidStart = () => null;
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    f.probe.readPidStart = () => { throw Error('ps failed'); };
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  // The shortcut is for FOREIGN hosts only. A same-host record with no usable pid reaches the shortcut's clauses; the control
+  // (same record, foreign host) is recovered, so the host clause alone is what holds the same-host one.
+  it('does not apply the foreign-host abandonment shortcut to a same-host record', () => {
+    expect(rebound({ pid: null }).plan()).toMatchObject({ mode: 'fresh' });
+    const { plan } = rebound({ pid: null, host: hostname() }, { expectFresh: false });
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  // A record with no host name cannot be shown to belong to another host; the shortcut must hold it (the foreign control is fresh).
+  it('does not apply the foreign-host abandonment shortcut to a record with no host', () => {
+    for (const host of [undefined, '']) {
+      const { plan } = rebound({ pid: null, host }, { expectFresh: false });
+      expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    }
+  });
+  it('the production recovery probe supplies host, namespace and the real pid probes', () => {
+    const probe = recovery.recoveryProbe();
+    expect(probe).toMatchObject({ host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime });
+  });
+  it('does not treat a bound abandonment from another pid namespace as proof of death', () => {
+    // Same rewrite with the namespace unset is recovered (the control), so the namespace is what holds it.
+    expect(rebound({ pidNamespace: null }).plan()).toMatchObject({ mode: 'fresh' });
+    const { plan } = rebound({ pidNamespace: 'pid:[other-namespace]' }, { expectFresh: false });
+    expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+
+  // The planner-side "pid alive here" rule for a stale foreign-host record that DOES carry a birth time: a matching birth time
+  // holds, a verified mismatch (pid reuse) recovers, and an unreadable birth time (null or a throwing probe) holds.
+  describe('with a recorded birth time and the pid alive here', () => {
+    const recent = () => new Date(Date.now() - 60_000).toISOString();
+    const withBirth = (readPidStart) => {
+      const f = fixture({ foreign: true });
+      f.probe.isAlive = () => true; f.probe.readPidStart = readPidStart;
+      return stale(f, { pidStart: recent() });
+    };
+    it('holds on a matching birth time', () => {
+      let birth; const f = fixture({ foreign: true });
+      birth = recent(); f.probe.isAlive = () => true; f.probe.readPidStart = () => birth;
+      expect(stale(f, { pidStart: birth })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    });
+    it('recovers on a verified birth-time mismatch (pid reuse)', () => {
+      expect(withBirth(() => 'a different birth time')).toMatchObject({ mode: 'fresh', abandon: true });
+    });
+    it('holds when the birth time is unreadable', () => {
+      expect(withBirth(() => null)).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    });
+    it('holds when the birth-time probe throws', () => {
+      expect(withBirth(() => { throw Error('ps failed'); })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    });
+  });
+  it('holds a stale foreign-host record whose status mtime is unreadable', () => {
+    const f = fixture({ foreign: true });
+    stale(f);
+    // 0 is what the evidence reader defaults to; undefined and NaN are what a failed stat yields.
+    for (const statusAt of [undefined, null, 0, NaN]) {
+      expect(recovery.planRedTeamRecovery({ ...f.readWitness(), statusAt }, { now: Date.now(), probe: f.probe, deadlineMs: 7_200_000, env: f.env }))
+        .toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    }
+  });
+  it('holds a fresh foreign-host record', () => {
+    expect(stale(fixture({ foreign: true }), { ageMs: 60_000 })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('holds a stale foreign-host record whose pid is alive here', () => {
+    const f = fixture({ foreign: true });
+    f.probe.isAlive = () => true;
+    expect(stale(f)).toMatchObject({ mode: 'skip' });
+  });
+  // Same stale age and no usable pid, but the record names THIS host: only the planner's host argument keeps it out of the stale rule.
+  it('holds a stale record that names this host', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f, { host: hostname(), pid: null })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    expect(stale(fixture({ foreign: true }), { pid: null })).toMatchObject({ mode: 'fresh', abandon: true });
+  });
+  it('holds a stale foreign-host record from a different pid namespace', () => {
+    const f = fixture({ foreign: true });
+    expect(stale(f, { pidNamespace: 'pid:[other-namespace]' })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+  });
+  it('holds a stale foreign-host record when the pid probe throws', () => {
+    const f = fixture({ foreign: true });
+    f.probe.isAlive = () => { throw Error('probe failed'); };
+    expect(stale(f)).toMatchObject({ mode: 'skip' });
+  });
+});
+
+// The stale window setting reaches recovery only through `env` at each planner call site (review-job admission, the abandon
+// step and the red-team-on-skip dispatcher). A record 12 minutes old is inside the 30 minute default but past a 10 minute
+// setting, so each entry point must honour the setting (and hold the record when it is absent). Dropping `env` at any one
+// site makes that site fall back to the default and these tests redden.
+describe('foreign-host stale window setting reaches every recovery entry point', () => {
+  const windowed = (set) => {
+    const f = fixture({ foreign: true });
+    if (set) f.env.WE_RED_TEAM_FOREIGN_HOST_STALE_MS = '600000';
+    writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, pidNamespace: null, pidStart: null }));
+    const at = new Date(Date.now() - 12 * 60_000);
+    utimesSync(f.path, at, at);
+    return f;
+  };
+  const skipRun = (f, dispatch) => recovery.runRedTeamOnSkip({ repo, env: f.env, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+    rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readWitness: f.readWitness,
+    readEvidence: () => ({ loopPayload: f.readWitness().newest, inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+    abandon: () => ({ ok: true }), setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(), now: Date.now,
+    capacity: { lanes: 1 }, dispatch });
+
+  // Admission refuses a plan that still owes an abandonment (`abandon: true`) with 'recovery evidence changed'; a plan held as
+  // alive refuses with 'owner live or age unknown'. So the two messages tell apart "the setting was read" from "it was dropped".
+  it('review-job admission honours the setting', () => {
+    const f = windowed(true);
+    const before = readFileSync(f.path, 'utf8');
+    expect(() => f.admit()).toThrow('recovery evidence changed');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+  it('review-job admission holds the record inside the default window', () => {
+    const f = windowed(false);
+    const before = readFileSync(f.path, 'utf8');
+    expect(() => f.admit()).toThrow('owner live or age unknown');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+  it('the abandon step honours the setting', () => {
+    const f = windowed(true);
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(true);
+  });
+  it('the abandon step holds the record inside the default window', () => {
+    const f = windowed(false);
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, probe: f.probe, deadlineMs: 7_200_000 }).ok).toBe(false);
+  });
+  it('the red-team-on-skip dispatcher honours the setting', () => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    expect(skipRun(windowed(true), dispatch).dispatched).toMatchObject([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+  it('the red-team-on-skip dispatcher holds the record inside the default window', () => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    const result = skipRun(windowed(false), dispatch);
+    expect(result.dispatched).toEqual([]);
+    expect(result.rows[0]).toMatchObject({ action: 'skip', why: 'owner live or age unknown' });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+// R754: an old marker represents one abandonment; refills retain that history.
+function spentRecovery() {
+  const f = fixture();
+  expect(f.abandon().ok).toBe(true);
+  f.admit();
+  const now = Date.now(), abandonedAt = new Date(now - 31 * 60_000).toISOString();
+  const markerPath = `${f.path}.stale-redispatch-1`;
+  const { abandonments: _history, ...legacy } = JSON.parse(readFileSync(markerPath, 'utf8'));
+  const marker = { ...legacy, abandonedAt };
+  writeFileSync(markerPath, JSON.stringify(marker));
+  const options = { now, probe: f.probe, deadlineMs: 1000,
+    setting: { retryCooldownMin: 30, staleRedispatchDailyCap: 3 } };
+  return { ...f, now, marker, markerPath, options,
+    plan: () => recovery.planRedTeamRecovery(f.readWitness(), options) };
+}
+
+it('R754 refills a stale no-result writer past cooldown and appends legacy history', () => {
+  const f = spentRecovery();
+  expect(f.plan()).toMatchObject({ mode: 'fresh', abandon: true, refill: true });
+  expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, now: () => f.now,
+    probe: f.probe, deadlineMs: 1000, setting: f.options.setting }).ok).toBe(true);
+  expect(JSON.parse(readFileSync(f.markerPath, 'utf8')).abandonments)
+    .toEqual([f.marker.abandonedAt, new Date(f.now).toISOString()]);
+  expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+});
+
+it('R754 holds a spent stale writer within cooldown', () => {
+  const f = spentRecovery(); f.options.now -= 2 * 60_000;
+  expect(f.plan()).toMatchObject({ mode: 'skip', why: 'stale re-dispatch cooldown active' });
+});
+
+it.each(['writer findings', 'seat findings', 'completed seat', 'result'])('R754 never refills with %s', kind => {
+  const f = spentRecovery();
+  if (kind === 'seat findings' || kind === 'completed seat') f.seats.push({ dispatchKind: 'review-seat', seat: 'red-team',
+    repo, pr, rev: head, status: kind === 'completed seat' ? 'ok' : 'unparseable',
+    ...(kind === 'seat findings' ? { findings: [{ text: 'found' }] } : {}) });
+  else writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed,
+    ...(kind === 'result' ? { result: 'failed' } : { findings: [{ text: 'found' }] }) }));
+  expect(f.plan()).toMatchObject({ mode: 'skip', why: 'stale re-dispatch already spent' });
+});
+
+it('R754 daily cap escalates through the existing mechanism once per head across ticks', () => {
+  const f = spentRecovery(), publishNeedsYou = vi.fn();
+  writeFileSync(f.markerPath, JSON.stringify({ ...f.marker,
+    abandonments: [f.marker.abandonedAt, f.marker.abandonedAt, f.marker.abandonedAt] }));
+  for (let tick = 0; tick < 2; tick++) {
+    const [row] = recovery.planRedTeamOnSkip({ repo,
+      refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+      rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readWitness: f.readWitness,
+      setting: { enabled: true, ...f.options.setting }, lastDispatch: new Map(), recoveryOptions: f.options });
+    expect(row).toMatchObject({ action: 'skip', why: 'stale re-dispatch daily cap reached',
+      escalate: true, escalationContext: expect.any(String) });
+    settleRedTeamSkip({ repo, pr, head, redTeam: { status: 'skipped', reason: row.why },
+      io: { env: f.env, publishNeedsYou } });
+  }
+  expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+});
+
+it.each(['timestamp', 'history timestamp', 'shape', 'missing now', 'run unreadable', 'marker unreadable'])(
+  'R754 holds on %s', kind => {
+    const f = spentRecovery();
+    if (kind === 'timestamp') writeFileSync(f.markerPath, JSON.stringify({ ...f.marker, abandonedAt: 'invalid' }));
+    if (kind === 'history timestamp') writeFileSync(f.markerPath, JSON.stringify({ ...f.marker, abandonments: ['invalid', f.marker.abandonedAt] }));
+    if (kind === 'shape') writeFileSync(f.markerPath, JSON.stringify({ abandonedAt: f.marker.abandonedAt }));
+    if (kind === 'missing now') delete f.options.now;
+    if (kind === 'run unreadable') writeFileSync(f.run, '{');
+    if (kind === 'marker unreadable') writeFileSync(f.markerPath, '{');
+    expect(recovery.planRedTeamOnSkip({ repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+      rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readWitness: f.readWitness,
+      setting: { enabled: true, ...f.options.setting }, lastDispatch: new Map(), recoveryOptions: f.options })[0].action).toBe('skip');
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness, now: () => f.options.now,
+      probe: f.probe, deadlineMs: 1000, setting: f.options.setting }).ok).toBe(false);
+  });
+
+it('R754 allows refill at the exact cooldown boundary', () => {
+  const f = spentRecovery(); f.options.now = Date.parse(f.marker.abandonedAt) + 30 * 60_000;
+  expect(f.plan()).toMatchObject({ mode: 'fresh', refill: true });
+});
+
+it('R754 expires abandonments at the 24-hour boundary', () => {
+  const f = spentRecovery();
+  const old = new Date(f.now - 86_400_000).toISOString();
+  writeFileSync(f.markerPath, JSON.stringify({ ...f.marker, abandonments: [old, old, f.marker.abandonedAt] }));
+  expect(f.plan()).toMatchObject({ mode: 'fresh', refill: true });
+});
+
+it.each(['before marker', 'after marker', 'before writer', 'after writer'])(
+  'R754 refill preserves one spend across interruption %s', boundary => {
+    const f = spentRecovery();
+    const abandon = () => recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness,
+      now: () => f.now, probe: f.probe, deadlineMs: 1000, setting: f.options.setting });
+    interruption.boundary = boundary;
+    expect(abandon().ok).toBe(false);
+    interruption.boundary = null;
+    expect(abandon().ok).toBe(true);
+    expect(JSON.parse(readFileSync(f.markerPath, 'utf8')).abandonments)
+      .toEqual([f.marker.abandonedAt, new Date(f.now).toISOString()]);
+    expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+  });
+
+it.each(['after marker', 'after writer'])('R754 holds an interrupted refill whose history is unreadable (%s)', boundary => {
+  const f = spentRecovery();
+  const abandon = () => recovery.abandonStaleRedTeamRun(f.key, { readWitness: f.readWitness,
+    now: () => f.now, probe: f.probe, deadlineMs: 1000, setting: f.options.setting });
+  interruption.boundary = boundary;
+  expect(abandon().ok).toBe(false);
+  interruption.boundary = null;
+  const marker = JSON.parse(readFileSync(f.markerPath, 'utf8'));
+  writeFileSync(f.markerPath, JSON.stringify({ ...marker, abandonments: ['unreadable'] }));
+  expect(f.plan()).toMatchObject({ mode: 'skip', why: 'stale re-dispatch evidence unreadable; inspect stored evidence' });
+  expect(abandon().ok).toBe(false);
 });

@@ -286,8 +286,10 @@ function readBaseTip({ base, cwd, exec }) {
  * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function, humanOnlyLicense?:Function}} o
  *   `cwd`: a clone of `repo`. `humanOnlyLicense(hold)` may authorize a human-only hold with a proven tier;
  *   absent, unreadable or unlicensed evidence retains the hold. Successful results carry `licensedBy`.
+ *   `sameHeadAdmission()` revalidates the drain's timeline admission immediately before a fresh mutation;
+ *   already-queued bookkeeping skips it, and unreadable decisions retain the hold.
  */
-export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null, humanOnlyLicense }) {
+export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null, humanOnlyLicense, sameHeadAdmission }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (repo or PR number is malformed)' };
   }
@@ -323,6 +325,14 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
   const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });
   const existing = queueState();
   if (existing.inQueue === true && existing.head === headSha) return { ok: true, already: true, ...licenseResult };
+  // A prior already-queued observation must never license a new mutation after a concurrent removal.
+  // Run the drain's fresh admission only on the mutating path; unknown evidence fails closed.
+  if (sameHeadAdmission != null) {
+    let decision;
+    try { decision = sameHeadAdmission(); } catch { /* Unreadable admission retains the hold below. */ }
+    if (decision?.hold !== false) return { ok: false, held: true, reason: 'mq-same-head-failed',
+      error: decision?.line || 'mq-same-head-failed: unreadable fresh merge-queue admission; inspect timeline before retrying' };
+  }
   try {
     const out = JSON.parse(exec('gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
     const errs = out?.errors;

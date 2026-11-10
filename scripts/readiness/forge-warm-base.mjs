@@ -205,6 +205,10 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
   await git(['fetch','--no-tags','--no-recurse-submodules','--no-write-fetch-head',URL,'+refs/heads/main:refs/remotes/origin/main']);
   const fetchedAtMs=Math.floor(clock()),sha=(await git(['rev-parse','refs/remotes/origin/main'])).toString('ascii').trim();
   if(!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha))throw new Error('Invalid public main SHA');
+  // R559: stamp every successful public-main fetch so bundle mode can bound how stale this mirror's main may be.
+  {const stamp=join(root,'.main-fetched.tmp');
+   await fs.writeFile(stamp,JSON.stringify({sha,fetchedAtMs}),{mode:0o644});
+   await fs.rename(stamp,join(root,'main-fetched.json'));}
   const publish=async sha=>{
     const pending=join(root,sha+'.tmp'),tree=join(pending,'tree');
     await fs.mkdir(pending,{mode:0o700});await fs.mkdir(tree,{mode:0o755});

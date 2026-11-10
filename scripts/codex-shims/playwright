@@ -1,0 +1,5 @@
+#!/bin/sh
+. "$(dirname "$0")/_guard.sh"
+we_guard playwright "$@"
+we_real playwright || { echo "playwright: real binary not found" >&2; exit 127; }
+exec "$WE_REAL" "$@"

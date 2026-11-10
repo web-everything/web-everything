@@ -66,29 +66,22 @@ describe('credential-name rule (R321)',()=>{
       expect(source,path).toBeDefined();expect(alias,path).toMatchObject({sha256:source.sha256,tracked:false,sourcePath:Buffer.from(path)});
     }
   },30000);
-  it('excludes real tracked pattern-spelling files individually and retains the missing-test fallback',async()=>{
+  it('ships every real tracked credential-named file (R352) and retains the missing-test fallback for a refused test',async()=>{
     const repo=fileURLToPath(new URL('../../../',import.meta.url));
     const inventory=await exec({file:'git',args:['ls-files','-z'],cwd:repo});
     expect(inventory.code).toBe(0);
     const flagged=inventory.stdout.toString().split('\0').filter(p=>p&&classifyManifestPath(Buffer.from(p)).credentialSource);
-    const refused=[],refusedTests=[];
+    expect(flagged).toContain('scripts/lib/secret-scrub.mjs');
+    // R352: no real tracked file spells out a secret any more, so none is refused.
+    const refused=[];
     for(const p of flagged){
       const bytes=await fs.readFile(join(repo,p));
-      if(credentialContentFinding(Buffer.from(p),bytes)){
-        if(isTestFile(Buffer.from(p))){refusedTests.push([p,bytes]);continue;}
-        refused.push(p);
-      }
-      await write(p,bytes);
+      if(credentialContentFinding(Buffer.from(p),bytes))refused.push(p);
     }
-    expect(flagged).toContain('scripts/lib/secret-scrub.mjs');
-    expect(refused).toContain('scripts/lib/secret-scrub.mjs');
-    await git(['add','.']);await commit();
-    const manifest=await buildManifest({cwd,exec});
-    expect(names(manifest.excluded)).toEqual(expect.arrayContaining(refused));
-    expect(names(manifest.entries)).toContain('keep.txt');
-    for(const p of refused)expect(names(manifest.entries)).not.toContain(p);
-    expect(refusedTests.length).toBeGreaterThan(0);
-    for(const [p,bytes] of refusedTests)await write(p,bytes);
+    expect(refused).toEqual([]);
+    // The fallback itself stays covered by a synthetic refused test file, header assembled at run time.
+    const refusedTest='scripts/__tests__/token-sample.test.mjs';
+    await write(refusedTest,`// ${'-----'+'BEGIN'} sample\n`);
     await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-test-file'});
   });

@@ -8,7 +8,10 @@
  * second caller must not be able to lose them by construction.
  */
 import { describe, it, expect } from 'vitest';
-import { stageOnTransportBranch, reclaimStrandedTransportWorktrees } from '../git-transport-branch.mjs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { stageOnTransportBranch, reclaimStrandedTransportWorktrees, readFromTransportBranch } from '../git-transport-branch.mjs';
 
 /** Every side effect stubbed, filesystem included. See the header of the module under test for why. */
 const stub = ({ diff = 'ops/x/a.json', onRun } = {}) => {
@@ -403,4 +406,135 @@ describe('the dirty guard sees untracked files whatever the git config says (red
       expect(readFileSync(j(wt, kept), 'utf8')).toMatch(/request written|edited and hidden/);
     } finally { rmf(root, { recursive: true, force: true }); }
   });
+});
+
+describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gtb-ttl-'));
+  const stampDir = join(dir, 'we-ops-fetch');
+  const stampFile = join(stampDir, encodeURIComponent('ops/x'));
+  const mk = () => {
+    const calls = [];
+    const logs = [];
+    let t = 1_000_000;
+    const run = (args) => {
+      calls.push(args[0]);
+      if (args[0] === 'rev-parse') return `${dir}\n`;
+      if (args[0] === 'ls-tree') return 'p';
+      return args[0] === 'show' ? 'text' : '';
+    };
+    const read = (over = {}) => readFromTransportBranch({
+      board: '/board', branch: 'ops/x', paths: ['p'], run, now: () => t, log: (m) => logs.push(m),
+      env: {}, ...over,
+    });
+    return { calls, logs, read, tick: (ms) => { t += ms; } };
+  };
+  const fetches = (c) => c.filter((x) => x === 'fetch').length;
+  const reset = () => rmSync(stampDir, { recursive: true, force: true });
+
+  it('a read within the TTL skips the fetch and logs the source', () => {
+    reset(); const m = mk();
+    m.read(); m.tick(5_000); m.read();
+    expect(fetches(m.calls)).toBe(1);
+    expect(m.logs.join('\n')).toMatch(/source=origin/);
+    expect(m.logs.join('\n')).toMatch(/source=cache/);
+  });
+  it('a read past the TTL fetches again', () => {
+    reset(); const m = mk();
+    m.read(); m.tick(31_000); m.read();
+    expect(fetches(m.calls)).toBe(2);
+  });
+  it('the TTL is overridable by env', () => {
+    reset(); const m = mk();
+    const env = { WE_OPS_FETCH_TTL_MS: '1000' };
+    m.read({ env }); m.tick(2_000); m.read({ env });
+    expect(fetches(m.calls)).toBe(2);
+  });
+  it('a write always fetches, even with a fresh stamp', () => {
+    reset(); const m = mk();
+    m.read();
+    const s = stub();
+    stage(s);
+    expect(s.calls.some((c) => c.args?.[0] === 'fetch')).toBe(true);
+  });
+  it('a failed fetch writes no stamp, so the next read fetches again', () => {
+    reset(); const m = mk();
+    const run = (a) => { m.calls.push(a[0]); if (a[0] === 'rev-parse') return `${dir}\n`; throw new Error('net'); };
+    expect(() => m.read({ run })).toThrow();
+    expect(existsSync(stampFile)).toBe(false);
+  });
+  it('two overlapping reads each fetch or skip correctly, with no deadlock', () => {
+    reset(); const m = mk();
+    // overlap: the second read starts while the first one's fetch is still running (no stamp yet)
+    let inner = 0;
+    const run = (a) => {
+      m.calls.push(a[0]);
+      if (a[0] === 'rev-parse') return `${dir}\n`;
+      if (a[0] === 'fetch' && inner === 0) { inner += 1; m.read(); }
+      if (a[0] === 'ls-tree') return 'p';
+      return a[0] === 'show' ? 'text' : '';
+    };
+    m.read({ run });
+    expect(fetches(m.calls)).toBe(2); // both missed and fetched; harmless, same as before
+    m.read(); // stamp now fresh: skip
+    expect(fetches(m.calls)).toBe(2);
+    expect(readdirSync(stampDir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+  it('the red-main-freeze branch is never served from cache (freeze recheck freshness)', () => {
+    reset(); const m = mk();
+    m.read({ branch: 'ops/red-main-freeze' }); m.read({ branch: 'ops/red-main-freeze' });
+    expect(fetches(m.calls)).toBe(2);
+    expect(m.logs.join('\n')).toMatch(/never-cached/);
+  });
+  it('the quarantine branch (a merge/skip decision input) is never served from cache', () => {
+    reset(); const m = mk();
+    m.read({ branch: 'ops/quarantine' }); m.read({ branch: 'ops/quarantine' });
+    expect(fetches(m.calls)).toBe(2);
+  });
+  it('a decision-free branch like review-requests is cached', () => {
+    reset(); const m = mk();
+    m.read({ branch: 'ops/review-requests' }); m.read({ branch: 'ops/review-requests' });
+    expect(fetches(m.calls)).toBe(1);
+  });
+  it('fresh: true always fetches even with a fresh stamp, while an ordinary read still hits the cache', () => {
+    reset(); const m = mk();
+    m.read(); m.read({ fresh: true }); m.read({ fresh: true });
+    expect(fetches(m.calls)).toBe(3);
+    expect(m.logs.join('\n')).toMatch(/fresh-required/);
+    m.read(); // the earlier fresh fetches did not break the ordinary cache
+    expect(fetches(m.calls)).toBe(3);
+  });
+  it('an unreadable stamp fails closed: fetch', () => {
+    reset(); const m = mk();
+    mkdirSync(stampDir, { recursive: true });
+    writeFileSync(stampFile, 'garbage');
+    m.read();
+    expect(fetches(m.calls)).toBe(1);
+  });
+});
+
+it('signedTransportVerifiesBeforePush: signature failure never pushes', () => {
+  const s = stub();
+  expect(() => stage(s, { sign: { keyPath: 'key', verify: () => { throw new Error('invalid signature'); } } })).toThrow(/signature/);
+  expect(s.calls.some(c => c.args?.[0] === 'push')).toBe(false);
+});
+it('signed transport signs, verifies, then pushes; unsigned path stays unchanged', () => {
+  const s = stub(); let verified = false;
+  stage(s, { sign: { keyPath: 'key', verify: () => { verified = true; expect(s.calls.some(c => c.args?.[0] === 'push')).toBe(false); } } });
+  expect(verified).toBe(true);
+  expect(s.calls.find(c => c.args?.includes('commit')).args).toContain('-S');
+});
+
+it('ignoresAmbientSignerTrust: explicit signers and empty keyring; verifies reported fingerprint', async () => {
+  const { verifySignedTransportCommit } = await import('../git-transport-branch.mjs');
+  const seen = [];
+  const run = (args, opts) => {
+    seen.push({ args, opts });
+    return 'Good "git" signature with ED25519 key SHA256:trusted';
+  };
+  const allowedSigners = [{ key: 'ssh-ed25519 AAAA', fingerprint: 'SHA256:trusted' }];
+  expect(verifySignedTransportCommit({ run, cwd: 'fixture', commit: 'a'.repeat(40), allowedSigners })).toBe('SHA256:trusted');
+  expect(seen[0].args).toContain('gpg.format=ssh');
+  expect(seen[0].args.some(a => a.startsWith('gpg.ssh.allowedSignersFile='))).toBe(true);
+  expect(seen[0].opts.env.GNUPGHOME).toBeTruthy();
+  expect(() => verifySignedTransportCommit({ run: () => 'Good signature SHA256:ambient', cwd: 'fixture', commit: 'a'.repeat(40), allowedSigners })).toThrow(/signer|signature/);
 });

@@ -1,3 +1,5 @@
+import { buildRedTeamCardInput } from '../../operations/red-team-gate-apply.mjs';
+import { createHash } from 'node:crypto';
 /**
  * Card x1b8hlo — the red-team gate's pure half: the parser (pinned against the real renderer and the live #4722
  * comment), the setting cascade, the decision, and the operator-queue reason.
@@ -6,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
-  liveResultGateState,
+  liveResultGateState, redTeamResultId, classOnlyCards, parseRedTeamGateMarker,
 } from '../red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -328,5 +330,233 @@ describe('readRedTeamDisposition: only a human operator releases a break held at
       expect(heldBy(clear({ author: { login: 'chalbert[bot]' } }))).toBe(1);
     });
     it('posted by a human operator releases it', () => expect(heldBy(clear(human))).toBe(0));
+  });
+});
+
+describe('redTeamResultId digest covers every finding-shaped line (card 43)', () => {
+  const ID = redTeamResultId(parseRedTeamComment(BODY_4722));
+  const added = (line) => `${BODY_4722}\n${line}`;
+  const FORGED = [
+    '   3. [**confirmed**] (edge-case, broken) `a.mjs:1` — an indented extra finding the strict parser skips.',
+    '3. [**CONFIRMED**] (edge-case, broken) `a.mjs:1` — wrong case.',
+    '3. [**confirmed**] edge-case broken — malformed, no parenthesised class.',
+  ];
+  it('unchanged findings keep the same digest', () => {
+    expect(redTeamResultId(parseRedTeamComment(BODY_4722))).toBe(ID);
+    expect(redTeamResultId(parseRedTeamComment(`${BODY_4722}\nunrelated prose line`))).toBe(ID);
+  });
+  for (const line of FORGED) {
+    it(`an appended finding-shaped line changes the digest: ${line.slice(0, 40)}`, () => {
+      expect(redTeamResultId(parseRedTeamComment(added(line)))).not.toBe(ID);
+    });
+  }
+  it('a result with no extra finding-shaped lines keeps its pre-change v1 id (existing records still apply)', () => {
+    // Computed with redTeamResultId from 29f8bc0100, before finding-shaped lines keyed the digest.
+    expect(ID).toBe('d2c3f139283ef987');
+  });
+  for (const emphasis of ['__confirmed__', '*confirmed*', '_confirmed_']) {
+    it(`an appended [${emphasis}] finding changes the digest and invalidates the old sent-back record`, () => {
+      const line = `2. [${emphasis}] (security, broken) -- New break.`;
+      const edited = added(line);
+      const parsed = parseRedTeamComment(edited);
+      expect(parsed.shapedLines).toEqual([line]);
+      expect(parsed.findings).toEqual(parseRedTeamComment(BODY_4722).findings);
+      expect(redTeamResultId(parsed)).not.toBe(ID);
+      const record = bot(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.SENT_BACK, ID));
+      expect(liveResultGateState([bot(BODY_4722), record], 4722, HEAD).outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(true);
+      expect(liveResultGateState([bot(edited), record], 4722, HEAD).outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(false);
+    });
+  }
+  it('changing a skipped finding-shaped line changes a v2 id without altering blocking classification', () => {
+    const before = parseRedTeamComment(added(FORGED[0]));
+    const after = parseRedTeamComment(added(FORGED[0].replace('extra finding', 'edited finding')));
+    expect(before.shapedLines).toHaveLength(1);
+    expect(after.shapedLines).toHaveLength(1);
+    expect(redTeamResultId(before)).not.toBe(ID);
+    expect(redTeamResultId(after)).not.toBe(ID);
+    expect(redTeamResultId(after)).not.toBe(redTeamResultId(before));
+    expect(before.findings.map(breakClass)).toEqual(['broken', 'degraded']);
+    expect(after.findings.map(breakClass)).toEqual(before.findings.map(breakClass));
+    expect(planRedTeamActions(after)).toEqual(planRedTeamActions(before));
+  });
+  it('skipped finding-shaped lines do not alter blocking classification', () => {
+    const before = parseRedTeamComment(BODY_4722);
+    expect(before.findings.map(breakClass)).toEqual(['broken', 'degraded']);
+    const lines = [...FORGED];
+    for (const verdict of ['confirmed', 'not confirmed', 'unverifiable']) {
+      for (const emphasis of ['*', '_', '__', '***', '*_']) {
+        lines.push(`3. [${emphasis}${verdict}${emphasis}] (security, broken) — New break.`);
+      }
+    }
+    for (const line of lines) {
+      const after = parseRedTeamComment(added(line));
+      expect(after.shapedLines).toEqual([line.trim()]);
+      expect(after.findings.map(breakClass)).toEqual(before.findings.map(breakClass));
+      expect(planRedTeamActions(after)).toEqual(planRedTeamActions(before));
+    }
+  });
+  it('shapedLines preserves the compared and serialized parsed shape while keying the digest', () => {
+    const before = parseRedTeamComment(BODY_4722);
+    const after = parseRedTeamComment(added(FORGED[0]));
+    const expected = { pr: 4722, rev: HEAD, findings: before.findings };
+    expect(before.shapedLines).toEqual([]);
+    expect(after.shapedLines).toEqual([FORGED[0].trim()]);
+    expect(after).toEqual(expected);
+    expect(Object.keys(after)).toEqual(['pr', 'rev', 'findings']);
+    expect(Object.getOwnPropertyDescriptor(after, 'shapedLines').enumerable).toBe(false);
+    expect(JSON.stringify(after)).toBe(JSON.stringify(expected));
+    expect(JSON.stringify(after)).toBe(JSON.stringify(before));
+    expect(redTeamResultId(after)).not.toBe(redTeamResultId(before));
+  });
+  it('a removed or changed finding changes the digest', () => {
+    expect(redTeamResultId(parseRedTeamComment(BODY_4722.replace('Restarting with', 'Restarted with')))).not.toBe(ID);
+    expect(redTeamResultId(parseRedTeamComment(BODY_4722.replace(/\n2\. \[\*\*confirmed.*?\n/s, '\n')))).not.toBe(ID);
+  });
+  it('a sent-back record keyed on the old digest does not apply to the edited result (fails closed)', () => {
+    const record = bot(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.SENT_BACK, ID));
+    const before = liveResultGateState([bot(BODY_4722), record], 4722, HEAD);
+    expect(before.outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(true);
+    const after = liveResultGateState([bot(added(FORGED[0])), record], 4722, HEAD);
+    expect(after.resultId).not.toBe(ID);
+    expect(after.outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(false);
+  });
+});
+
+
+describe('finding class gate', () => {
+  const classSetting = { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} };
+  const deferredBody = () => BODY_4722.split('2. [**confirmed**]')[0] + '   - Class: theoretical-race → defer-card (basis: requires concurrent replacement)\n';
+  it('preserves an operator block on a class-deferred finding', () => {
+    const body = deferredBody();
+    const parsed = parseRedTeamComment(body);
+    const id = redTeamResultId(parsed);
+    const comments = [bot(body),
+      bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP, id)}\n- 1 confirmed break(s) NOT sent back: cap (#1).`),
+      { author: { login: 'chalbert' }, createdAt: '2026-10-10T02:05:41Z',
+        body: `${redTeamGateMarker(4722, HEAD, 'operator-block', id)}\n- 1 confirmed break(s) sent back to the fixer (#1).` }];
+    const read = setting => readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting, env: {} });
+    expect(planRedTeamActions(parsed, classSetting).card).toHaveLength(1);
+    const deferred = read(classSetting);
+    expect(deferred.held).toEqual(parsed.findings);
+    expect(deferred.sendBack).toEqual([]);
+    expect(deferred.dispositions.get(1).state).toBe('held');
+    const fixNow = read({ ...classSetting, findingClasses: { 'theoretical-race': 'fix-now' } });
+    expect(fixNow.held).toEqual(parsed.findings);
+    expect(fixNow.dispositions.get(1).state).toBe('held');
+  });
+  it.each(['security-reachable-today', 'theoretical-race'])('revoking security deferral reopens a recorded class-only card (%s)', findingClass => {
+    const body = deferredBody().replace('Class: theoretical-race', `Class: ${findingClass}`)
+      + '   - Security class: security-reachable-today\n';
+    const parsed = parseRedTeamComment(body);
+    const allowed = { ...classSetting, findingClasses: { 'security-reachable-today': 'defer-card', allowSecurityDefer: true } };
+    expect(planRedTeamActions(parsed, allowed).card).toHaveLength(1);
+    const comments = [bot(body), bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed), null, classOnlyCards(planRedTeamActions(parsed, allowed).card, allowed).map(f => f.index))}\n- 1 finding(s) filed as a follow-up card (#1).`)];
+    const read = (thread, setting) => readRedTeamDisposition({ comments: thread, pr: 4722, head: HEAD, setting, env: {} });
+    expect(read(comments, allowed)).toMatchObject({ sendBack: [], held: [] });
+    const revoked = { ...allowed, findingClasses: { ...allowed.findingClasses, allowSecurityDefer: false } };
+    const reopened = read(comments, revoked);
+    expect(reopened.sendBack).toHaveLength(1);
+    expect(reopened.held).toEqual([]);
+    expect(reopened.dispositions.get(1).state).toBe('open');
+    const capped = [...comments, bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP, redTeamResultId(parsed))}\n- 1 confirmed break(s) NOT sent back: cap.`)];
+    expect(read(capped, revoked)).toMatchObject({ sendBack: [], held: parsed.findings });
+    expect(read(comments, { ...revoked, broken: 'card' })).toMatchObject({ sendBack: [], held: [] });
+  });
+  it('preserves an unclassified recorded card when ordinary policy now sends back', () => {
+    const body = BODY_4722.split('2. [**confirmed**]')[0];
+    const parsed = parseRedTeamComment(body);
+    const comments = [bot(body), bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed))}\n- 1 finding(s) filed as a follow-up card (#1).`)];
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: classSetting, env: {} }))
+      .toMatchObject({ sendBack: [], held: [] });
+  });
+  it('preserves a classified ordinary-policy card when ordinary policy later sends back', () => {
+    const body = deferredBody().replace('edge-case, broken)', 'edge-case, degraded)');
+    const parsed = parseRedTeamComment(body);
+    const cardSetting = { ...CONFIRMED_BREAKS_DEFAULTS, degraded: 'card', findingClasses: { 'theoretical-race': 'fix-now' } };
+    const f = parsed.findings[0];
+    expect(f.impact).toBe('degraded');
+    expect(planRedTeamActions({ findings: [f] }, cardSetting).card).toEqual([f]);
+    expect(classOnlyCards([f], cardSetting)).toEqual([]);
+    const marker = redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed), null, classOnlyCards([f], cardSetting).map(x => x.index));
+    expect(marker).not.toContain('class=');
+    const comments = [bot(body), bot(`${marker}\n- 1 finding(s) filed as a follow-up card (#1).`)];
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { ...cardSetting, degraded: 'send-back' }, env: {} }))
+      .toMatchObject({ sendBack: [], held: [] });
+  });
+  it('round-trips the class-only card indices on the gate marker', () => {
+    const marker = redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, '0123456789abcdef', null, [3, 1, 3]);
+    expect(marker).toContain(' class=1,3 -->');
+    expect(parseRedTeamGateMarker(marker)).toMatchObject({ outcome: 'card-queued', classCards: [1, 3] });
+    expect(parseRedTeamGateMarker(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, '0123456789abcdef')).classCards).toBeUndefined();
+  });
+  it('cards deferred findings without a send-back or admission hold or operator ruling', () => {
+    const parsed = parseRedTeamComment(deferredBody());
+    expect(parsed.findings[0]).toMatchObject({ findingClass: 'theoretical-race', classBasis: 'requires concurrent replacement' });
+    expect(planRedTeamActions(parsed, classSetting)).toMatchObject({ sendBack: [], card: parsed.findings });
+    const state = readRedTeamDisposition({ comments: [bot(deferredBody())], pr: 4722, head: HEAD, setting: classSetting });
+    expect(state.sendBack).toEqual([]);
+    expect(state.held).toEqual([]);
+    const comments = [bot(deferredBody()), bot(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP, redTeamResultId(parsed)))];
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: classSetting }).held).toEqual([]);
+    expect(redTeamRulingNeeded({ comments: [bot(deferredBody())], number: 4722, headRefOid: HEAD }, classSetting)).toBeNull();
+  });
+  it('puts classification in the follow-up card title and digest', () => {
+    const input = buildRedTeamCardInput({ repo: 'owner/repo', pr: 4722, head: HEAD, findings: parseRedTeamComment(deferredBody()).findings });
+    expect(input.title).toContain('theoretical-race');
+    expect(input.digest).toContain('Class: theoretical-race');
+    expect(input.digest).toContain('requires concurrent replacement');
+  });
+  it('does not trust the rendered action, and missing basis or an operator override blocks', () => {
+    const parsed = parseRedTeamComment(deferredBody().replace('→ defer-card', '→ fix-now'));
+    expect(planRedTeamActions(parsed, classSetting).card).toHaveLength(1);
+    expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: { 'theoretical-race': 'fix-now' } }).sendBack).toHaveLength(1);
+    delete parsed.findings[0].classBasis;
+    expect(planRedTeamActions(parsed, classSetting).sendBack).toHaveLength(1);
+  });
+  it('rekeys v3 results when only findingClass changes', () => {
+    const a = parseRedTeamComment(deferredBody());
+    const b = parseRedTeamComment(deferredBody().replace('Class: theoretical-race', 'Class: coverage-or-style'));
+    expect(a.findings[0].classBasis).toBe(b.findings[0].classBasis);
+    expect(redTeamResultId(a)).not.toBe(redTeamResultId(b));
+  });
+  it('keeps old v1/v2 result ids and keys class and basis only in v3', () => {
+    const parsed = parseRedTeamComment(BODY_4722);
+    const fields = ['index', 'confirmed', 'recheckOutcome', 'category', 'impact', 'file', 'line', 'summary', 'scenario', 'recheck'];
+    const rows = parsed.findings.map(f => fields.map(k => f[k] ?? null));
+    expect(redTeamResultId(parsed)).toBe(createHash('sha256').update(JSON.stringify(['v1', rows])).digest('hex').slice(0, 16));
+    const malformed = parseRedTeamComment(BODY_4722 + '\n 3. [confirmed] malformed');
+    expect(redTeamResultId(malformed)).toBe(createHash('sha256').update(JSON.stringify(['v2', rows, malformed.shapedLines])).digest('hex').slice(0, 16));
+    const classified = parseRedTeamComment(deferredBody());
+    const id = redTeamResultId(classified);
+    classified.findings[0].classBasis = 'other basis';
+    expect(redTeamResultId(classified)).not.toBe(id);
+  });
+});
+
+describe('planRedTeamActions: class deferral × confirmed × impact', () => {
+  const deferredClasses = { 'theoretical-race': 'defer-card', 'coverage-or-style': 'defer-card' };
+  const finding = (confirmed, impact, findingClass) => ({ index: 1, confirmed, impact, findingClass, classBasis: 'basis' });
+  const where = (plan, f) => (plan.card.includes(f) ? 'card' : plan.sendBack.includes(f) ? 'sendBack' : 'advisory');
+  const cases = [];
+  for (const findingClass of ['theoretical-race', 'coverage-or-style']) {
+    for (const impact of ['broken', 'degraded']) {
+      cases.push([true, impact, findingClass, 'card']);
+      cases.push([false, impact, findingClass, 'advisory']);
+    }
+  }
+  it.each(cases)('confirmed=%s impact=%s class=%s → %s', (confirmed, impact, findingClass, expected) => {
+    const f = finding(confirmed, impact, findingClass);
+    const setting = { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferredClasses };
+    expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe(expected);
+  });
+  it('an unconfirmed deferred-class finding is never carded even if ordinary policy would send back', () => {
+    const f = finding(false, 'broken', 'theoretical-race');
+    const setting = { ...CONFIRMED_BREAKS_DEFAULTS, unconfirmed: 'send-back', findingClasses: deferredClasses };
+    expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('advisory');
+  });
+  it('an unconfirmed finding of a fix-now class follows ordinary policy', () => {
+    const f = finding(false, 'broken', 'live-reproduced');
+    const setting = { ...CONFIRMED_BREAKS_DEFAULTS, unconfirmed: 'send-back', findingClasses: deferredClasses };
+    expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('sendBack');
   });
 });

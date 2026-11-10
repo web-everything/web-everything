@@ -2,11 +2,12 @@
 bornAs: xq7aczc
 kind: story
 size: 3
-status: active
+status: resolved
 scaffoldedBy: "drain-fastdrain-holds"
 dateScaffolded: "2026-10-17"
 scope: ["we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-11-07"
 tags: []
 ---
 

@@ -7,6 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
+import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import nodeFs from 'node:fs';
@@ -18,8 +19,9 @@ import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
-import { planRetirements } from './prototype-retire.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -168,12 +170,22 @@ async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, en
 }
 
 /** Real retirement proof: refresh each registered ref's tracking ref, then decide with git and GitHub evidence. */
-function defaultRetirePlanner({ rows, git, gh }) {
-  const fetched = rows.filter((row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0);
-  const unfetched = rows.filter((row) => !fetched.includes(row)).map((row) => ({ ref: row.ref, action: 'keep', reason: 'fetch-failed' }));
+function defaultRetirePlanner({ rows, proofRows = [], git, gh }) {
+  const refresh = (row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0;
+  const fetched = rows.filter(refresh);
+  // Registrations withheld from `rows` (the candidate being loaded) can still be the base a sibling is redundant with.
+  // Each is cited only after its own tracking ref was refreshed: a stale tip is no proof, and a base gone from origin is not cited.
+  const listed = new Set(rows.map((row) => row.ref));
+  const wantedBases = new Set(fetched.map((row) => mergeRefBase(row.ref)).filter(Boolean));
+  const proof = proofRows.filter((row) => wantedBases.has(row.ref) && !listed.has(row.ref) && refresh(row));
+  const unfetchedRows = rows.filter((row) => !fetched.includes(row));
+  if (!unfetchedRows.length && !fetched.length) return [];
+  // GitHub evidence is bound to origin's repository and host, for fetched and unfetched registrations alike.
+  const { repo, gh: originGh } = resolveOriginRepository({ git, gh });
+  // A deleted branch retires only on proof of its last tip (planFetchFailed); everything else is kept.
+  const unfetched = unfetchedRows.map((row) => planFetchFailed({ row, git, gh: originGh, repo }));
   if (!fetched.length) return unfetched;
-  const repoName = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
-  return [...planRetirements({ rows: fetched, git, gh, repo: repoName.code === 0 ? repoName.stdout.trim() : '' }), ...unfetched];
+  return [...planRetirements({ rows: fetched, proofRows: proof, git, gh: originGh, repo }), ...unfetched];
 }
 
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
@@ -183,12 +195,16 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner }) {
+  retirePlanner = defaultRetirePlanner, fingerprint = null }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
-  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS }, platform: platform.prefs.prototypeLoad, tool });
+  // Audit mode is a scalar: normalize before the cascade can flatten an invalid object into no leaves.
+  const auditModeLayer = (layer) => layer?.canonicalAuditMode === undefined ? layer
+    : { ...layer, canonicalAuditMode: layer.canonicalAuditMode === 'warn' ? 'warn' : 'refuse' };
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'warn' },
+    platform: auditModeLayer(platform.prefs.prototypeLoad), tool: auditModeLayer(tool) });
   const config = policy.value;
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
@@ -254,6 +270,22 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
   };
   return async function load(input) {
+    // R503: the live head's net-diff fingerprint, computed once and only when some evidence for another sha stores one.
+    // Any git failure is no carry (null), never a throw.
+    let liveFpMemo;
+    const liveFingerprint = (evidence) => {
+      if (liveFpMemo !== undefined) return liveFpMemo;
+      // The record must name another head (audit) or sha (ready record): a headless record can never carry (main #6353).
+      // Shas compare case-insensitively, as the pure layer does, so the live head's own records never count as another head.
+      const live = String(input.sha).toLowerCase();
+      const same = (v) => typeof v === 'string' && v.toLowerCase() === live;
+      if (!evidence.some((r) => r?.fingerprint && (r.head || r.sha) && !same(r.sha) && !same(r.head))) return null;
+      try {
+        requireGit('fetch', 'origin', 'main', input.branch);
+        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
+      } catch { liveFpMemo = null; }
+      return liveFpMemo;
+    };
     const out = { ok: false, daemon: input.daemon, clone: null, cloneSource: null, registered: false, adopted: false,
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
       dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
@@ -287,7 +319,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     const retireStep = (rows, exclude) => {
       const candidates = rows.filter((row) => !exclude.includes(row.ref));
       if (!candidates.length) { out.retirePlan = []; return []; }
-      const plan = retirePlanner({ rows: candidates, git: (args) => git(...args), gh: (args) => execute('gh', args) });
+      // `rows` is the FULL registry: the candidate itself is withheld from deletion (`candidates`) but stays proof context.
+      const plan = retirePlanner({ rows: candidates, proofRows: rows, git: (args) => git(...args), gh: (args) => execute('gh', args) });
       if (!Array.isArray(plan)) throw new Error('retirement plan unreadable');
       out.retirePlan = plan;
       // Only a decision for a listed candidate with a full tip can retire anything.
@@ -305,8 +338,19 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out.retired.map((r) => r.ref);
     };
     try {
-      const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;
-      if (!daemon) return stop('unknown-daemon');
+      const resolved = resolveDaemonKey(config.daemons, config.daemonAliases, input.daemon);
+      if (!resolved.key) {
+        const list = resolved.valid.join(', ');
+        return stop('unknown-daemon', { validDaemons: resolved.valid, detail: resolved.reason === 'ambiguous' ? `ambiguous-daemon:${resolved.candidates.join('|')}` : 'unknown-daemon',
+          fallback: `${resolved.reason === 'ambiguous' ? `"${input.daemon}" matches several daemons (${resolved.candidates.join(', ')}). ` : `"${input.daemon}" is not a daemon key. `}Valid keys: ${list}. Pass --daemon=<key>; launchd labels, clone dir names and the daemonAliases table are also accepted when they match exactly one daemon.` });
+      }
+      if (resolved.key !== input.daemon) { out.requestedDaemon = input.daemon; input = { ...input, daemon: resolved.key }; out.daemon = resolved.key; }
+      const daemon = config.daemons[resolved.key];
+      // A daemon whose self-sync can never adopt an overlay (e.g. main-only) refuses up front, before any plist/git work or registration.
+      if (typeof daemon.unsupported === 'string' && daemon.unsupported) {
+        return stop('unsupported-daemon', { detail: `unsupported-daemon:${resolved.key}`,
+          fallback: `Daemon "${resolved.key}" cannot adopt prototype loads: ${daemon.unsupported}` });
+      }
       if (daemon.clone) {
         out.clone = resolve(expand(config.workspaceRoot), expand(daemon.clone));
         out.cloneSource = `settings:prototype-load.json#daemons.${input.daemon}.clone`;
@@ -316,6 +360,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const wd = JSON.parse(plist.stdout).WorkingDirectory;
         if (typeof wd !== 'string' || !wd.startsWith('/')) return stop('bad-input', { resolution: 'missing absolute WorkingDirectory' });
         out.clone = wd; out.cloneSource = `plist:${daemon.label}`;
+      }
+      if (input.forceAdopt) {
+        // R508: queue ONE operator-ruled adoption of ONE build. `--sha` is the full 40-hex id of the build the rebuild
+        // will hold (the `target` in the daemon's held / smoke-rejected state — main plus the applied overlays), NOT a
+        // branch tip unless there are no overlays. A smoke failure on any other build never consumes the request. The
+        // smoke still runs and its result is recorded next to the force; refused without a ruling id, a verbatim quote and a sha.
+        const req = requestForceAdopt({ root: out.clone, env, daemon: input.daemon, ruling: input.ruling, quote: input.quote, sha: input.sha, dryRun: input.dryRun });
+        out.forceAdopt = req.ok ? { requested: !input.dryRun, dryRun: !!input.dryRun, ruling: req.record.ruling, sha: req.record.sha } : { requested: false, refused: req.reason };
+        out.ok = req.ok;
+        return req.ok ? out : stop('force-adopt-refused', { forceAdopt: out.forceAdopt });
       }
       if (input.retire) {
         // Retire-only: no candidate, only the registrations proved retired are dropped.
@@ -336,8 +390,35 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
       stage = 'no-ready';
-      out.gate = readyEvidence(jsonLines(read(expand(config.readyRecordPath))), input);
+      const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
+      out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,
+        () => liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])]));
+      if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED. Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
       if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: `No fix-ready record in ${config.readyRecordPath} matches ref=${input.branch} sha=${input.sha}. A record needs the fields {"ref":"${input.branch}","sha":"${input.sha}","tests":"green","audit":"NOT WEAKENED"}; write it after the scoped tests pass and the Codex audit says NOT WEAKENED, or pass --tests-run and --audit="NOT WEAKENED".` });
+      stage = 'no-canonical-audit';
+      let auditRecords = [];
+      try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }
+      const mode = config.canonicalAuditMode === 'warn' ? 'warn' : 'refuse';
+      let fetchedMain = false;
+      const covers = (base) => { try {
+        if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
+        return ancestor(base, 'origin/main');
+      } catch { return false; } };
+      const liveFp = liveFingerprint(auditRecords);
+      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp) };
+      if (!out.canonicalAudit.ok) {
+        const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
+        if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
+        // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
+        // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.
+        // Fail closed: a record sha that is not a string is never the live head's own record.
+        const carriedGate = out.gate.record && (typeof out.gate.record.sha !== 'string' || out.gate.record.sha.toLowerCase() !== String(input.sha).toLowerCase());
+        if (out.canonicalAudit.reason === 'weakened' && carriedGate && !out.gate.ruledWeakened) {
+          return stop('no-canonical-audit', { detail: 'carried-ready-over-weakened-audit', fallback: `The canonical audit says WEAKENED, and the ready record was carried from ${out.gate.record.sha}. Fix the weakening and re-audit, or get an operator ruling (ruledWeakened). ${fallback}` });
+        }
+        console.warn(`WARNING: canonical audit ${out.canonicalAudit.reason}; proceeding in warn mode. ${fallback}`);
+      }
+      stage = 'no-ready';
       requireGit('fetch', 'origin', input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
       if (tip !== input.sha) return stop('no-ready', { gate: { ...out.gate, reason: 'sha-not-branch-tip', tip }, fallback: `${input.sha} is not the tip of ${input.branch}: the branch tip is ${tip}. Load the tip (re-run tests and audit if the code changed) or push the branch back to the tested sha.` });

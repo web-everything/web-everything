@@ -40,7 +40,7 @@ function fixture() {
   const state = mktemp('we-overlay-rr-state-');
   // gh stub: no PR heads any ref; every other GitHub question fails (fails closed in the planner).
   const bin = mktemp('we-overlay-rr-gh-');
-  writeFileSync(join(bin, 'gh'), '#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo "[]"; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo web-everything/web-everything; exit 0; fi\nexit 1\n', { mode: 0o755 });
+  writeFileSync(join(bin, 'gh'), '#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo "[]"; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo \'{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}\'; exit 0; fi\nexit 1\n', { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_DAEMON_OVERLAY_DIR: state, WE_DAEMON_OVERLAY_STACK_BASES: '{}', WE_OVERLAY_NO_PR: 'warn' };
   /** Commit `file` on `ref` (starting from `from`) and push it; returns the new tip. */
   const push = (ref, file, content, from = 'origin/main') => {
@@ -67,8 +67,8 @@ function fixture() {
     const name = readdirSync(state).find((n) => n.endsWith('.json'));
     return JSON.parse(readFileSync(join(state, name), 'utf8')).overlays.find((o) => o.ref === ref);
   };
-  /** Replace the gh stub: `prs` is what every `pr list` answers; `repo view` still names the repo. */
-  const ghPrs = (prs) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo web-everything/web-everything; exit 0; fi\nexit 1\n`, { mode: 0o755 });
+  /** Replace the gh stub: `prs` is what every `pr list` answers, `activity` what the ref activity log answers (default: unreadable); `repo view` still names the repo. */
+  const ghPrs = (prs, activity) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\n${activity ? `if [ "$1" = "api" ]; then echo '${JSON.stringify(activity)}'; exit 0; fi\n` : ''}if [ "$1 $2" = "repo view" ]; then echo '{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}'; exit 0; fi\nexit 1\n`, { mode: 0o755 });
   /** Squash-merge: main gets the same content in a NEW commit, then the branch is deleted. Returns the main commit. */
   const squash = (ref, file, content) => {
     gitOk(author, ['fetch', '-q', 'origin']);
@@ -280,7 +280,11 @@ describe('daemon-overlay.mjs retire', () => {
 });
 
 describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
-  const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip, mergeCommit: { oid: mergeOid } });
+  const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip,
+    headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false, mergeCommit: { oid: mergeOid } });
+  /** The ref activity GitHub reports for a branch last deleted at `tip`. */
+  const deletedAt = (tip) => [{ ref: 'refs/heads/lane/sq', activity_type: 'branch_deletion', before: tip, after: '0'.repeat(40), timestamp: '2026-11-02T11:00:00Z' },
+    { ref: 'refs/heads/lane/sq', activity_type: 'push', before: '1'.repeat(40), after: tip, timestamp: '2026-11-02T10:00:00Z' }];
   const setup = () => {
     const f = fixture();
     const tip = f.push('lane/sq', 'a.txt', 'squashed\n');
@@ -290,14 +294,59 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
   };
   const retire = (f, tip) => f.run(['retire', '--ref=lane/sq', `--expected-tip=${tip}`]);
 
-  it('retires when the merged PR headed this ref at the expected tip and its merge commit is on main', () => {
+  it('retires when the merged PR headed this ref, the branch was last deleted at its head, and its merge commit is on main', () => {
     const { f, tip, mergeOid } = setup();
-    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    f.ghPrs([merged('lane/sq', tip, mergeOid)], deletedAt(tip));
     const r = retire(f, tip);
     expect(r.status, r.stderr).toBe(0);
     expect(JSON.parse(r.stdout)).toMatchObject({ retired: true, reason: 'pr-squash-merged' });
     expect(f.list()).toEqual([]);
     expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: 'lane/sq', tip });
+  });
+
+  it('keeps a deleted branch when GitHub cannot show its activity', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    const r = retire(f, tip);
+    expect(r.status, r.stderr).toBe(3);
+    expect(JSON.parse(r.stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+    expect(f.events().some((event) => event.kind === 'auto-retired')).toBe(false);
+  });
+
+  it('keeps a deleted reused branch registered after unmerged work with only an older merged PR', () => {
+    const f = fixture();
+    const oldTip = f.push('lane/sq', 'a.txt', 'first\n');
+    const mergeOid = f.squash('lane/sq', 'a.txt', 'first\n');
+    const currentTip = f.push('lane/sq', 'b.txt', 'unmerged reuse\n', oldTip);
+    expect(f.run(['add', '--ref=lane/sq', '--pr=7']).status).toBe(0);
+    const before = f.entry('lane/sq');
+    gitOk(f.author, ['push', '-q', 'origin', ':refs/heads/lane/sq']);
+    // The log shows the name reused after the merged PR and deleted again at the unmerged tip.
+    f.ghPrs([merged('lane/sq', oldTip, mergeOid)], deletedAt(currentTip));
+    // Neither a caller's historical tip nor the actual deleted tip authorizes the drop.
+    for (const tip of [oldTip, currentTip]) {
+      const r = retire(f, tip);
+      expect(r.status, r.stderr).toBe(3);
+      expect(JSON.parse(r.stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+      expect(f.entry('lane/sq')).toEqual(before);
+    }
+    expect(f.events().some((event) => event.kind === 'auto-retired')).toBe(false);
+  });
+
+  it('keeps an unmerged deleted origin registration when a same-named fork PR merged', () => {
+    const f = fixture();
+    const tip = f.push('lane/sq', 'unique.txt', 'unmerged origin work\n');
+    expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
+    const mergeOid = gitOk(f.author, ['rev-parse', 'origin/main']);
+    gitOk(f.author, ['push', '-q', 'origin', ':refs/heads/lane/sq']);
+    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), isCrossRepository: true,
+      headRepository: { nameWithOwner: 'contributor/web-everything' } }], deletedAt(tip));
+    const r = retire(f, tip);
+    expect(r.status, r.stderr).toBe(3);
+    expect(JSON.parse(r.stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+    expect(f.events().some((event) => event.kind === 'auto-retired')).toBe(false);
   });
 
   it('restores the registration when the branch is recreated at the proved tip before the drop', async () => {
@@ -323,31 +372,32 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
       prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
       tip: () => null, afterDrop: () => { throw new Error('killed'); } } })).rejects.toThrow('killed');
     expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => null } })).toEqual([{ ref: 'lane/sq', outcome: 'drop-confirmed' }]);
+    expect(f.list()).toEqual([]);
   });
 
   it('refuses when the merge commit is not an ancestor of main', () => {
     const { f, tip } = setup();
-    f.ghPrs([merged('lane/sq', tip, tip)]); // the (deleted) branch tip is not on main
+    f.ghPrs([merged('lane/sq', tip, tip)], deletedAt(tip)); // the (deleted) branch tip is not on main
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
     expect(f.list()).toEqual(['lane/sq']);
   });
 
   it('refuses when the merged PR head was a different commit than the expected tip', () => {
     const { f, tip, mergeOid } = setup();
-    f.ghPrs([merged('lane/sq', 'e'.repeat(40), mergeOid)]);
+    f.ghPrs([merged('lane/sq', 'e'.repeat(40), mergeOid)], deletedAt(tip));
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false });
     expect(f.list()).toEqual(['lane/sq']);
   });
 
   it('refuses when two merged PRs headed this ref (ambiguous)', () => {
     const { f, tip, mergeOid } = setup();
-    f.ghPrs([merged('lane/sq', tip, mergeOid, 7), merged('lane/sq', tip, mergeOid, 8)]);
+    f.ghPrs([merged('lane/sq', tip, mergeOid, 7), merged('lane/sq', tip, mergeOid, 8)], deletedAt(tip));
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
   });
 
   it('refuses when the PR is not merged', () => {
     const { f, tip, mergeOid } = setup();
-    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), state: 'CLOSED' }]);
+    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), state: 'CLOSED' }], deletedAt(tip));
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
   });
 
@@ -362,7 +412,7 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
     const mergeOid = f.squash('lane/sq', 'a.txt', 'first\n');
     const tip2 = f.push('lane/sq', 'b.txt', 'extra unmerged work\n', tip);
-    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    f.ghPrs([merged('lane/sq', tip, mergeOid)], deletedAt(tip));
     expect(JSON.parse(retire(f, tip2).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
     expect(f.list()).toEqual(['lane/sq']);
   });
@@ -426,12 +476,12 @@ describe('inferPrNumber origin identity and incomplete evidence', () => {
   const originUrl = 'git@github.com:web-everything/web-everything.git';
   const sameRepo = { number: 9, headRefName: 'lane/known',
     headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false };
-  function infer(prs, { repo = 'web-everything/web-everything', originStatus = 0, listStatus = 0, repoStatus = 0, raw } = {}) {
+  function infer(prs, { repo = 'web-everything/web-everything', host = 'github.com', originStatus = 0, listStatus = 0, repoStatus = 0, raw } = {}) {
     const calls = [];
     const value = inferPrNumber({ root: '/unused', ref: 'lane/known', env: {}, run: (cmd, args) => {
       calls.push([cmd, ...args]);
       if (cmd === 'git') return { status: originStatus, stdout: originUrl };
-      if (args[0] === 'repo') return { status: repoStatus, stdout: repo };
+      if (args[0] === 'repo') return { status: repoStatus, stdout: JSON.stringify({ nameWithOwner: repo, url: `https://${host}/${repo}` }) };
       return { status: listStatus, stdout: raw ?? JSON.stringify(prs) };
     } });
     return { value, calls };
@@ -441,8 +491,15 @@ describe('inferPrNumber origin identity and incomplete evidence', () => {
     const { value, calls } = infer([sameRepo]);
     expect(value).toBe(9);
     expect(calls[0]).toEqual(['git', 'remote', 'get-url', 'origin']);
-    expect(calls[1]).toEqual(['gh', 'repo', 'view', originUrl, '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+    expect(calls[1]).toEqual(['gh', 'repo', 'view', originUrl, '--json', 'nameWithOwner,url']);
+    expect(calls[2][calls[2].indexOf('--repo') + 1]).toBe('github.com/web-everything/web-everything');
     expect(calls[2][calls[2].indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['headRepository', 'isCrossRepository']));
+  });
+
+  it('keeps the resolved origin host in inferred PR reads', () => {
+    const { value, calls } = infer([sameRepo], { host: 'enterprise.example' });
+    expect(value).toBe(9);
+    expect(calls[2][calls[2].indexOf('--repo') + 1]).toBe('enterprise.example/web-everything/web-everything');
   });
 
   it.each([

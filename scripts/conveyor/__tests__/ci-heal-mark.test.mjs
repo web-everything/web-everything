@@ -229,7 +229,7 @@ describe('CI-heal acceptance replay through the actual CLI', () => {
       git('remote', 'add', 'origin', dir);
       const { buildVerdictComment } = reviewLabel;
       const state = { state: 'OPEN', headRefOid: healedHead, headRefName: 'lane', labels: [{ name: 'review:accepted' }],
-        comments: [{ author: AUTOMATION, body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: reviewedHead, reviewedDiff, ...(scenario === 'human' ? { to: 'clear-human', clearerId: 'operator' } : {}) }) }] };
+        comments: [{ id: 'IC_review', author: scenario === 'human' ? { login: 'chalbert' } : AUTOMATION, body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: reviewedHead, reviewedDiff, ...(scenario === 'human' ? { to: 'clear-human', clearerId: 'operator' } : {}) }) }] };
       if (scenario === 'missing') state.comments = [];
       writeFileSync(join(dir, 'state.json'), JSON.stringify(state));
       mkdirSync(join(dir, 'bin'));

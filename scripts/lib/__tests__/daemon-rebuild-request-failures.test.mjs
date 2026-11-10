@@ -51,10 +51,22 @@ function owner(rebuild, overrides = {}) {
   });
   return { synced, alert, log, tick };
 }
-const refused = () => vi.fn(async () => ({ moved: false, reason: 'tick-in-progress' }));
+const failed = () => vi.fn(async () => ({ moved: false, reason: 'smoke-failed' }));
 const alertsOf = (w, kind) => w.alert.mock.calls.filter(([name]) => name === kind);
 
 describe('rebuild request failure budget and retention', () => {
+  it.each(['tick-in-progress', 'rebuild-job-running', 'reader-priority', 'writer-active',
+    'clone-non-owner', 'deferred', 'refused-by-lock', 'reader-wait-timeout', 'dirty'])('neutral %s leaves the failure budget untouched', async (reason) => {
+    maxFailures('1'); const req = publish();
+    await owner(vi.fn(async () => ({ moved: false, reason }))).synced.tickOnce();
+    expect(pending()).toMatchObject({ id: req.id });
+    expect(fs.existsSync(failureFile())).toBe(false);
+  });
+  it('an unspecified result cannot spend the failure budget through the ledger API', () => {
+    maxFailures('1'); const req = publish();
+    lock.recordRebuildRequestResult(root, { id: req.id, lockRoot, env, nowMs });
+    expect(pending()).toMatchObject({ id: req.id });
+  });
   it('TTL alone keeps an unacknowledged request pending with zero counted failures', () => {
     const req = publish(); nowMs += 101;
     expect(pending()).toMatchObject({ id: req.id });
@@ -67,7 +79,7 @@ describe('rebuild request failure budget and retention', () => {
   });
   it('a stale owner keeps retrying below the budget and alerts at most once per fifteen minutes', async () => {
     maxFailures('100');
-    const req = publish(); const rebuild = refused(); const w = owner(rebuild);
+    const req = publish(); const rebuild = failed(); const w = owner(rebuild);
     nowMs = T + 101;
     await w.synced.tickOnce();
     expect(rebuild).toHaveBeenCalledTimes(1);
@@ -84,8 +96,8 @@ describe('rebuild request failure budget and retention', () => {
     ]);
     expect(alertsOf(w, 'rebuild-request-abandoned')).toEqual([]);
   });
-  it('the default budget abandons on the fifth refusal, not on the first four', async () => {
-    const req = publish(); const rebuild = refused(); const w = owner(rebuild);
+  it('the default budget abandons on the fifth real failure, not on the first four', async () => {
+    const req = publish(); const rebuild = failed(); const w = owner(rebuild);
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       await w.synced.tickOnce();
       expect(pending()).toMatchObject({ id: req.id });
@@ -100,7 +112,7 @@ describe('rebuild request failure budget and retention', () => {
   });
   it.each(['0', '-1', 'invalid'])('invalid failure budget %s falls back to five attempts', async (value) => {
     maxFailures(value);
-    const req = publish(); const w = owner(refused());
+    const req = publish(); const w = owner(failed());
     for (let attempt = 0; attempt < 4; attempt += 1) {
       await w.synced.tickOnce(); expect(pending()).toMatchObject({ id: req.id });
     }
@@ -108,7 +120,7 @@ describe('rebuild request failure budget and retention', () => {
   });
   it('configured failure counts persist in the clone lock base across daemon restarts', async () => {
     maxFailures('3');
-    const req = publish(); const rebuild = refused();
+    const req = publish(); const rebuild = failed();
     await owner(rebuild).synced.tickOnce();
     expect(pending()).toMatchObject({ id: req.id });
     expect(fs.existsSync(failureFile())).toBe(true);
@@ -118,7 +130,7 @@ describe('rebuild request failure budget and retention', () => {
     expect(rebuild).toHaveBeenCalledTimes(3);
     expect(pending()).toBeNull();
   });
-  it.each(['tick-in-progress', 'dirty', 'smoke-rejected', 'rebuild-job-running'])('a refused/failed rebuild (%s) consumes an attempt', async (reason) => {
+  it.each(['smoke-failed', 'fetch-failed', 'smoke-rejected'])('an explicitly failed rebuild (%s) consumes an attempt', async (reason) => {
     maxFailures('1'); publish();
     const w = owner(vi.fn(async () => ({ moved: false, reason })));
     await w.synced.tickOnce();
@@ -139,7 +151,7 @@ describe('rebuild request failure budget and retention', () => {
   });
   it('TTL expiry after the configured counted failures abandons with the named alert', async () => {
     maxFailures('2');
-    const req = publish(); const w = owner(refused());
+    const req = publish(); const w = owner(failed());
     await w.synced.tickOnce(); expect(pending()).toMatchObject({ id: req.id });
     nowMs += 101; await w.synced.tickOnce();
     expect(pending()).toBeNull();
@@ -153,25 +165,25 @@ describe('rebuild request failure budget and retention', () => {
   ])('a successful %s rebuild clears before exhausting the failure budget', async (_name, result) => {
     maxFailures('5');
     const req = publish();
-    await owner(refused()).synced.tickOnce(); expect(pending()).toMatchObject({ id: req.id });
+    await owner(failed()).synced.tickOnce(); expect(pending()).toMatchObject({ id: req.id });
     await owner(vi.fn(async () => result)).synced.tickOnce();
     expect(pending()).toBeNull();
   });
   it('a newly published request gets a fresh budget independent of the preceding id', async () => {
     maxFailures('2');
-    const old = publish(); await owner(refused()).synced.tickOnce();
+    const old = publish(); await owner(failed()).synced.tickOnce();
     const next = publish(); expect(next.id).not.toBe(old.id);
-    await owner(refused()).synced.tickOnce(); expect(pending()).toMatchObject({ id: next.id });
-    await owner(refused()).synced.tickOnce(); expect(pending()).toBeNull();
+    await owner(failed()).synced.tickOnce(); expect(pending()).toMatchObject({ id: next.id });
+    await owner(failed()).synced.tickOnce(); expect(pending()).toBeNull();
   });
   it("a replacement published during the old request's last failed attempt survives abandonment", async () => {
     maxFailures('1'); const old = publish(); let next;
-    const w = owner(vi.fn(async () => { next = publish(); return { moved: false, reason: 'dirty' }; }));
+    const w = owner(vi.fn(async () => { next = publish(); return { moved: false, reason: 'smoke-failed' }; }));
     await w.synced.tickOnce();
     expect(next.id).not.toBe(old.id);
     expect(pending()).toMatchObject({ id: next.id });
     // The old attempt must not be charged against the replacement's budget.
-    await owner(refused()).synced.tickOnce(); expect(pending()).toBeNull();
+    await owner(failed()).synced.tickOnce(); expect(pending()).toBeNull();
   });
   it.each(['directory', '{broken', '{}', 'null'])('unreadable/incomplete failure ledger (%s) stays pending even after a successful rebuild', async (contents) => {
     maxFailures('1'); const req = publish();
@@ -187,12 +199,12 @@ describe('rebuild request failure budget and retention', () => {
   it("a non-owner neither rebuilds nor spends the owner's retry budget", async () => {
     maxFailures('1'); const req = publish();
     lock.touchOwnerHeartbeat(root, { lockRoot, nowMs });
-    const rebuild = refused(); const w = owner(rebuild, { entries: ['other.mjs'] });
+    const rebuild = failed(); const w = owner(rebuild, { entries: ['other.mjs'] });
     await w.synced.tickOnce(); await w.synced.tickOnce();
     expect(rebuild).not.toHaveBeenCalled();
     expect(fs.existsSync(failureFile())).toBe(false);
     expect(pending()).toMatchObject({ id: req.id });
-    await owner(refused()).synced.tickOnce(); expect(pending()).toBeNull();
+    await owner(failed()).synced.tickOnce(); expect(pending()).toBeNull();
   });
 });
 
@@ -208,11 +220,11 @@ describe('failure evidence publication safeguards', () => {
       }
       return original(from, to);
     });
-    await owner(refused()).synced.tickOnce();
+    await owner(failed()).synced.tickOnce();
     expect(pending()).toMatchObject({ id: req.id });
     expect(fs.existsSync(failureFile())).toBe(false);
     rename.mockRestore();
-    await owner(refused()).synced.tickOnce(); expect(pending()).toBeNull();
+    await owner(failed()).synced.tickOnce(); expect(pending()).toBeNull();
   });
   it('a corrupt request with unknown generation cannot be acknowledged or abandoned against a later publication', async () => {
     maxFailures('1'); publish();
@@ -227,7 +239,7 @@ describe('failure evidence publication safeguards', () => {
       return read(path, ...args);
     });
     const w = owner(vi.fn(async () => ({ moved: false, reason: 'up-to-date' })));
-    await w.synced.tickOnce(); await owner(refused()).synced.tickOnce();
+    await w.synced.tickOnce(); await owner(failed()).synced.tickOnce();
     expect(pending()).toEqual({ corrupt: true, id: 'corrupt:unknown' });
     expect(fs.existsSync(join(base(), 'rebuild-request-ack.json'))).toBe(false);
     expect(fs.existsSync(failureFile())).toBe(false);

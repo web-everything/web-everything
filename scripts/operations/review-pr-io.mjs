@@ -43,7 +43,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, unlinkSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -907,6 +907,24 @@ export function createChangedLinesReader(ghJson) {
   };
 }
 
+/** Required checks that evaluate the review verdict itself, so they cannot be a precondition of publishing it. */
+const VERDICT_DEPENDENT_CHECKS = Object.freeze(['merge-gate', 'review-gate']);
+/**
+ * The strict gate's "some required rows are not green" refusals (review-ci-gate.mjs#reviewCiGate): a required
+ * review-gate among them names the reason `required-review-gate-conflict`. A trusted stale required-set read
+ * suffixes either one (review-ci-gate-io.mjs#withSource). Any other reason is not an affected-rows judgment.
+ */
+const AFFECTED_ROW_REFUSALS = Object.freeze(['required-checks-not-successful', 'required-review-gate-conflict']);
+const STALE_CACHE_SUFFIX = / \(stale-cache cache-age-ms=[^()]*\)$/;
+
+/** True when a strict refusal on the reviewed head is held up ONLY by missing/pending verdict-dependent checks. */
+function onlyVerdictDependentPending(ci, reviewedHead) {
+  if (ci?.allowed !== false || ci.headSha !== reviewedHead || typeof ci.reason !== 'string') return false;
+  if (!AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))) return false;
+  return Array.isArray(ci.affected) && ci.affected.length > 0
+    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name) && ['missing', 'pending'].includes(row?.reason));
+}
+
 /**
  * THE SINKS, bound to a repo root and an output channel.
  *
@@ -931,6 +949,8 @@ export function createReviewPrSinks({
   sameGapJudge,
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  now = Date.now,
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -985,6 +1005,28 @@ export function createReviewPrSinks({
         throw notApplied('review void: head moved or current head could not be read');
     };
     await assertHead();
+    if ((policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
+      const deadline = now() + policy.startEarlyPublishWaitMs;
+      const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
+      for (;;) {
+        let ci;
+        try { ci = await publishGate({ ...args, policy: strictPolicy }); }
+        catch { /* Missing/unreadable CI evidence waits; it never authorizes acceptance. */ }
+        await assertHead();
+        if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
+          throw notApplied('review void: head moved or CI became red');
+        if (ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
+        // merge-gate / review-gate evaluate THIS verdict and only appear after it lands: waiting on them deadlocks the
+        // accept. Judge the rest; the merge itself still enforces them. Any other affected row keeps the hold.
+        if (onlyVerdictDependentPending(ci, payload.reviewedHead)) return;
+        if (ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path');
+        const remaining = deadline - now();
+        if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head');
+        // Clamp to Node's timer range even when an operator configures a very large poll interval.
+        await sleep(Math.min(policy.startEarlyPollMs, remaining, 2147483647));
+        await assertHead();
+      }
+    }
     if (!policy.cancelOnCiRed) return;
     let ci;
     try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
@@ -1824,4 +1866,79 @@ function safeJson(stdout) {
     try { return JSON.parse(lines[i]); } catch { /* keep walking back */ }
   }
   return null;
+}
+
+/** Advisory observations use a separate shadow ledger, never judgment-bearing verdict events. */
+export async function recordPostAcceptAdvisoryShadow(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryShadow', options);
+}
+
+export async function recordPostAcceptAdvisoryLoops(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryLoops', options);
+}
+
+export async function recordPostAcceptAdvisoryRating(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryRating', options);
+}
+
+// Injected IO shares an in-process queue; persisted IO additionally locks beside the ledger across processes.
+const advisoryWrites = new Map();
+async function recordAdvisoryObservation(recorder, options) {
+  try {
+    return await recordAdvisoryObservationContained(recorder, options);
+  } catch { return null; }
+}
+
+async function recordAdvisoryObservationContained(recorder, options) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) return null;
+  const injected = Object.hasOwn(options, 'readLedgerRows') || Object.hasOwn(options, 'appendLedgerRow');
+  const path = options.ledgerPath ?? join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');
+  const previous = advisoryWrites.get(path) ?? Promise.resolve();
+  const pending = previous.then(async () => {
+    let lock;
+    const lockPath = `${path}.lock`;
+    try {
+      if (injected && (typeof options.readLedgerRows !== 'function' || typeof options.appendLedgerRow !== 'function')) {
+        throw new Error('incomplete shadow ledger IO; supply both reader and writer');
+      }
+      if (!injected) {
+        mkdirSync(dirname(path), { recursive: true });
+        const deadline = Date.now() + 2000;
+        for (;;) {
+          try { lock = openSync(lockPath, 'wx'); break; }
+          catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            if (Date.now() >= deadline) throw new Error('shadow ledger lock busy after 2000ms; inspect writer before removing an orphaned lock');
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+        }
+      }
+      const policy = await import('../lib/review-loop-policy.mjs');
+      return await policy[recorder]({
+        readLedgerRows: () => {
+          let text;
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+          return text.split('\n').filter(Boolean).flatMap(line => {
+            try { return [JSON.parse(line)]; } catch { return []; }
+          });
+        },
+        appendLedgerRow: row => {
+          let text = '';
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+          const separator = text && !text.endsWith('\n') ? '\n' : '';
+          appendFileSync(path, `${separator}${JSON.stringify(row)}\n`);
+          return { ok: true };
+        },
+        ...options,
+      });
+    } catch (error) {
+      try { options.out?.(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+      return null;
+    } finally {
+      if (lock !== undefined) { closeSync(lock); unlinkSync(lockPath); }
+    }
+  });
+  advisoryWrites.set(path, pending);
+  try { return await pending; }
+  finally { if (advisoryWrites.get(path) === pending) advisoryWrites.delete(path); }
 }

@@ -1090,6 +1090,14 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     if (bare.length)
       err(`Backlog item "${id}" scope has non-repo-qualified entr${bare.length > 1 ? 'ies' : 'y'} ${JSON.stringify(bare)} — every scope entry must carry a <repo>: locus prefix (e.g. "we:src/backlog-view/", "fui:plugs/…", "plateau:…"), NOT a bare path. A bare path is rejected by the write-time locus-prefix hook (#883) and, unqualified, the scope-lease engine (readiness/scope-lease.mjs) reads its repo as null so it never matches an observed we:-qualified file — the lane's overlap is silently never detected and two overlapping lanes could both launch.`);
 
+    // BEGIN scope whitespace warning
+    if (!isTerminalStatus(raw?.status)) {
+      const combined = scope.filter((entry) => /\s/.test(entry));
+      if (combined.length)
+        warn(`Backlog item "${id}" has scope entries containing whitespace ${JSON.stringify(combined)} — list one path per array entry.`);
+    }
+    // END scope whitespace warning
+
     // ── Scope defaults to FILE-LEVEL — flag a bare DIRECTORY scope unless justified (#2739) ──
     // The #2619/#2679 finer-lease principle: a lane's scope-lease should cover the SPECIFIC files it writes, not
     // a whole directory. A dir-level entry — a repo-qualified prefix ending in `/` with no filename (e.g.
@@ -2621,7 +2629,7 @@ mark("Demos: operational-wiring gate (routing/base-path/registry/dev-fallback)")
 // define any of the shared badge macros locally. Mechanical guard so the parity rule isn't just a comment.
 {
   const SHARED_BADGE_MACROS = ['kindBadge', 'statusBadge', 'sizeBadge', 'tierBadge', 'unslicedBadge', 'metaBadge', 'epicStatusBadge', 'tagsRow', 'childCircle', 'blockerChip'];
-  for (const rel of ['src/backlog.njk', 'src/backlog-pages.njk']) {
+  for (const rel of ['src/backlog.njk', 'src/backlog-pages.njk', 'src/_includes/backlog-tracked.njk']) {
     const file = join(ROOT, rel);
     if (!existsSync(file)) continue;
     const src = readFileSync(file, 'utf8');
@@ -2637,14 +2645,15 @@ mark("Backlog badge single-source (anti-drift)");
 // ── 10. Backlog kind-filter UI must cover every BACKLOG_KIND ───────────────────
 // The /backlog/ board hides any card whose `data-kind` is not an *active filter chip*
 // (src/assets/js/home-display.js → `failKind`). The chip set is built from hard-coded kind
-// lists in src/backlog.njk (the "Tracked work" facet + the "Prioritisation" table facet). When a
+// lists in src/_includes/backlog-tracked.njk (shared grid facet) + src/backlog.njk (table facet). When a
 // new kind is added to BACKLOG_KINDS (the SoT in check-standards-rules.mjs) but a UI list is not
 // updated, EVERY item of that kind renders into the DOM yet is permanently invisible — there is no
 // chip to re-enable it. That is exactly how `type: review` items (#602/#610) vanished from the board
 // while passing every other check. Assert each hard-coded list covers the full kind vocabulary so
 // the drift fails the gate instead of silently swallowing a whole class of items.
 try {
-  const njk = readFileSync(join(ROOT, 'src/backlog.njk'), 'utf8');
+  const njk = ['src/backlog.njk', 'src/_includes/backlog-tracked.njk']
+    .map((rel) => readFileSync(join(ROOT, rel), 'utf8')).join('\n');
   // Both facets declare their order as a bracketed string-array literal of kind tokens. Match every
   // `[ "story", "epic", … ]` whose members are all known kinds — that uniquely identifies the two
   // kind-filter lists without coupling to surrounding template syntax.

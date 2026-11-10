@@ -46,6 +46,23 @@ const mutationCalls = (rebuild) => rebuild.mock.calls.filter(([options]) => opti
 const startLine = (job) => `daemon-self-sync: readonly job ${job.id} deferred mutation ${job.result.mutation}; running it on the owning tick`;
 
 describe('owner handoff of readonly rebuild-job mutations', () => {
+  it.each(['throws', 'reader-priority'])('retries a pending mutation after %s and marks only its successful retry', async (failure) => {
+    let attempts = 0;
+    const rebuild = vi.fn(async (options) => {
+      if (!options?.adoptOnly) return normalResult();
+      if (++attempts === 1) {
+        if (failure === 'throws') throw new Error('retry me');
+        return { moved: false, reason: failure };
+      }
+      return { moved: false, reason: 'needs-build' };
+    });
+    const w = fixture({ rebuild });
+    await w.synced.tickOnce();
+    expect(fs.existsSync(marker())).toBe(false);
+    await w.synced.tickOnce(); await w.synced.tickOnce();
+    expect(mutationCalls(rebuild)).toHaveLength(2);
+    expect(fs.readFileSync(marker(), 'utf8')).toContain('job-old');
+  });
   it.each(['clone-ref-repair', 'clone-reclone', 'index-lock-recovery', 'dirty-tree-recovery'])('owner runs deferred %s once before normal discovery queues the next job', async (mutation) => {
     const job = due(`job-${mutation}`, mutation);
     const w = fixture({ readLatestRebuildJobResult: vi.fn(() => job) });
@@ -152,7 +169,7 @@ describe('owner handoff of readonly rebuild-job mutations', () => {
     expect(first.rebuild.mock.calls.filter((args) => args.length === 0)).toHaveLength(2);
     expect(second.rebuild.mock.calls).toEqual([[]]);
   });
-  it.each(['throws', 'tick-in-progress', 'reader-priority', 'dirty'])('a mutation that %s logs and alerts once, then falls through without a duplicate mutation loop', async (failure) => {
+  it.each(['throws', 'tick-in-progress', 'reader-priority', 'dirty'])('a mutation that %s stays pending and retries once on each tick', async (failure) => {
     const job = due(`failed-${failure}`);
     const rebuild = vi.fn(async (options) => {
       if (!options?.adoptOnly) return normalResult();
@@ -162,14 +179,15 @@ describe('owner handoff of readonly rebuild-job mutations', () => {
     const w = fixture({ rebuild, readLatestRebuildJobResult: vi.fn(() => job) });
     await expect(w.synced.tickOnce()).resolves.toBe('ticked');
     await expect(w.synced.tickOnce()).resolves.toBe('ticked');
-    expect(rebuild.mock.calls).toEqual([[MUTATION], [], []]);
-    expect(w.alert).toHaveBeenCalledOnce();
+    expect(rebuild.mock.calls).toEqual([[MUTATION], [], [MUTATION], []]);
+    expect(fs.existsSync(marker())).toBe(false);
+    expect(w.alert).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(w.alert.mock.calls[0])).toContain(job.id);
     expect(JSON.stringify(w.alert.mock.calls[0])).toContain(job.result.mutation);
     const failedLogs = w.log.error.mock.calls.filter(([line]) => String(line).includes(job.id)
       && /mutation/i.test(String(line)) && /fail|refus|tick-in-progress|reader-priority|dirty/i.test(String(line)));
     // Exclude the required start line, whose job id may itself include a failure word.
-    expect(failedLogs.filter(([line]) => line !== startLine(job))).toHaveLength(1);
+    expect(failedLogs.filter(([line]) => line !== startLine(job))).toHaveLength(2);
   });
   it('a non-owner never reads finished jobs, mutates, queues jobs, or writes the handled-ID marker', async () => {
     touchOwnerHeartbeat(root, { lockRoot, nowMs: T });

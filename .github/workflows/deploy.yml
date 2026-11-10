@@ -197,6 +197,10 @@ jobs:
           npm ci
           npm run build:docs
 
+      - name: Guard asset sizes
+        working-directory: web-everything
+        run: node scripts/check-site-asset-size.mjs _site
+
       - name: Deploy Worker + assets
         uses: cloudflare/wrangler-action@v3
         with:

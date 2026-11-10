@@ -17,7 +17,10 @@ function registerPassthroughs(eleventyConfig) {
   eleventyConfig.addWatchTarget("src/_data/adapters");
 
   eleventyConfig.addPassthroughCopy("src/css");
-  eleventyConfig.addPassthroughCopy("src/assets");
+  // Eleventy 2 forwards copy options to recursive-copy; filter paths are relative to src/assets.
+  eleventyConfig.addPassthroughCopy("src/assets", {
+    filter: (path) => !path.split("/").includes("__tests__") && !/\.(test|spec)\.[^/]*$/.test(path),
+  });
   eleventyConfig.addPassthroughCopy("demos");
   eleventyConfig.addPassthroughCopy("plugs");
   // Design-reference corpus (#382): serve the WebP shots under the gallery page's URL, and watch

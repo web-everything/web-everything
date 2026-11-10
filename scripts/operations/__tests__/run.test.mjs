@@ -88,7 +88,7 @@ describe('run.mjs dispatch-lane CLI preflight (real child process, real git)', (
 });
 
 // Item activity uses the real registration/parser/envelope, with external reads injected.
-import { resolveOperation } from '../run.mjs';
+import { resolveOperation, finishCodexAudit } from '../run.mjs';
 import { itemActivityOperation } from '../item-activity.mjs';
 import { createItemActivityReader } from '../item-activity-io.mjs';
 import { createRegistry, isReadOnlyOperation } from '../registry.mjs';
@@ -273,3 +273,18 @@ it('real lane slot passes while override cannot suppress the dispatch guard', as
     expect(r.stderr).not.toMatch(/Refusing|override/);
   });
 }, 120_000);
+
+describe('finishCodexAudit non-zero resume', () => {
+  const run = { verdict: { code: 0, stdout: 'verdict: NOT WEAKENED\n', stderr: '' } };
+  it('surfaces the refusal lines when resuming a completed run exits non-zero', () => {
+    const r = finishCodexAudit({ run, code: 2, lines: ['error: run is already complete; --answer=accept refused'], json: false });
+    expect(r.code).toBe(2);
+    expect(r.lines.join('\n')).toContain('--answer=accept refused');
+    expect(r.lines.join('\n')).toContain('NOT WEAKENED');
+  });
+  it('does not duplicate lines or change json/zero-exit output', () => {
+    expect(finishCodexAudit({ run, code: 0, lines: ['x'], json: false }).lines).toEqual(['verdict: NOT WEAKENED']);
+    expect(finishCodexAudit({ run, code: 2, lines: ['x'], json: true }).lines).toEqual(['x']);
+    expect(finishCodexAudit({ run: null, code: 2, lines: ['x'], json: false }).lines).toEqual(['x']);
+  });
+});

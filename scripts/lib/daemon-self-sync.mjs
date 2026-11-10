@@ -6,7 +6,7 @@
  * Stale requests retry with alerts bounded to 15 minutes; corrupt requests and unreadable ledgers stay pending.
  * Success or the persisted failure budget concludes requests, with an operator-visible abandonment alert.
  * Finished readonly jobs hand deferred mutations to one owner adopt-only pass before new work is queued.
- * Atomic handled IDs survive restarts; a process-wide attempt guard bounds retries when state is unreadable.
+ * Atomic handled IDs survive restarts; failed mutations release the attempt guard for next-tick retry.
  * @description xv6fciw (narrow slice of decision #3681) — keep a daemon's DEDICATED clone on `origin/main`
  *   without a human re-syncing it, and restart the daemon onto new code between ticks.
  *
@@ -118,21 +118,24 @@
  * gate would defeat the whole point of gating rebuilds in the first place).
  */
 
+import { workspaceFor } from './lane-pool-paths.mjs';
+import { daemonCloneRoots } from './daemon-clone-registry.mjs';
 import { gitRun, isCodePath } from './main-staleness.mjs';
 import { collectImportClosure, closureHits } from './import-closure.mjs';
 
 export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
+import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
 import { readReadyCandidate } from './daemon-rebuild/state.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
-  acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter,
-  resolveCloneOwnership, touchOwnerHeartbeat, readRebuildRequest, recordRebuildRequestResult,
+  acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter, withWriteLock,
+  resolveCloneOwnership, withCloneOwnership, readRebuildRequest, recordRebuildRequestResult,
 } from './daemon-clone-lock.mjs';
-import { basename, dirname, join } from 'node:path';
-import fs, { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import fs, { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
@@ -144,7 +147,74 @@ import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
-import { maybeMaintainClone, cloneHasRebuildJob } from './clone-maintenance.mjs';
+import { maybeMaintainClone, cloneHasRebuildJob, runMaintenanceGit, maintenanceGitDir, cloneGitIsBusy } from './clone-maintenance.mjs';
+
+export { cloneGitIsBusy };
+
+function maintenanceObjectsDir(gitDir) {
+  let common = gitDir;
+  try { common = resolve(gitDir, readFileSync(join(gitDir, 'commondir'), 'utf8').trim()); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  return realpathSync(join(common, 'objects'));
+}
+
+/** Scan known daemon clones, workspace checkouts and numbered pool lanes for borrowers. */
+export function cloneHasObjectBorrowers(root, { roots, workspace = workspaceFor(root) } = {}) {
+  const children = (dir) => {
+    try { return readdirSync(dir, { withFileTypes: true }).filter(e => e.isDirectory() || e.isSymbolicLink()).map(e => join(dir, e.name)); }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  };
+  roots ??= [...daemonCloneRoots(workspace), ...children(workspace),
+    ...children(join(workspace, '.daemon-clones')),
+    ...children(join(workspace, '.lanes')).flatMap(children)];
+  if (roots.length > 4096) throw new Error('borrower scan exceeds 4096 roots; inspect clone borrowers manually');
+  const objects = maintenanceObjectsDir(maintenanceGitDir(root));
+  for (const clone of new Set(roots)) {
+    let gitDir;
+    try { gitDir = maintenanceGitDir(clone); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    const cloneObjects = maintenanceObjectsDir(gitDir);
+    let text;
+    try { text = readFileSync(join(cloneObjects, 'info/alternates'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (text.split(/\r?\n/).filter(line => line.trim()).some(line =>
+      realpathSync(resolve(cloneObjects, line.trim())) === objects)) return true;
+  }
+  return false;
+}
+
+/** Async so the clone lock heartbeat stays live while packing. Best effort, bounded, local packing only. Never expire unreachable objects. */
+export async function maintainCloneObjects({ root, run = runMaintenanceGit, hasBorrowers = cloneHasObjectBorrowers,
+  isBusy = cloneGitIsBusy, timeoutMs = 60_000, log = console, env = process.env } = {}) {
+  try {
+    if (hasBorrowers(root) !== false || isBusy(root) !== false) return { skipped: true };
+    const childEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+    for (const args of [['config', '--local', 'fetch.unpackLimit', '1'],
+      ['config', '--local', 'transfer.unpackLimit', '1'], ['prune-packed'], ['repack', '-d', '-l']]) {
+      const result = await run(args, { cwd: root, env: childEnv, timeout: timeoutMs, killSignal: 'SIGKILL' });
+      if (result.status !== 0) throw new Error(`git ${args[0]} failed`);
+    }
+    return { skipped: false };
+  } catch (error) {
+    try { log.error?.(`daemon-self-sync: object maintenance skipped/failed: ${error.message}; inspect clone before retrying`); } catch { /* diagnostic only */ }
+    return { skipped: true, reason: 'maintenance-failed' };
+  }
+}
+
+/** All merge/adoption entry points share the same best-effort maintenance guard. */
+async function maintainObjectsUnderWriteLock({ root, env = process.env, log = console,
+  maintainObjects = maintainCloneObjects, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
+  ...options } = {}) {
+  try {
+    await withWriteLock(root, async () => {
+      if (await hasMaintenanceRebuildJob() !== false) return;
+      await (maintainObjects ?? maintainCloneObjects)({ root, env, log, ...options });
+    }, { ...(env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {}),
+      waitMs: 0, owner: `clone-object-maintenance:${process.pid}` });
+  } catch (error) {
+    try { log.error?.(`daemon-self-sync: object maintenance failed: ${error.message}; inspect clone before retrying`); } catch { /* diagnostic only */ }
+  }
+}
 
 /** PURE: env → rebuild.maxAdoptWaitTicks → default, with the effective policy source. */
 export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
@@ -233,11 +303,16 @@ export function decideSelfSync({ fetched, behind, dirty, onBase }) {
  * timed-out merge → aborted (itself under the same timeout) and reported as `conflict`; a failed/timed-out
  * `status` → `status-failed` (fail closed — an uninspected tree is never treated as clean); a failed/timed-out
  * (or non-numeric) `rev-list --count` → `count-failed` (never coerced to 0 / `up-to-date`); a failed/timed-out
- * `symbolic-ref` → `head-failed`.
- * @param {{root:string, base?:string, run?:typeof gitRun, timeoutMs?:number}} o
- * @returns {{merged:boolean, commits:number, reason:string}}
+ * `symbolic-ref` → `head-failed`. Successful merges attempt object maintenance under a fresh WRITE lock,
+ * checking rebuild evidence under that lock. Unavailable locks/evidence or failed maintenance leave the
+ * successful merge result intact; maintenance errors log an operator inspection hint.
+ * @param {{root:string, base?:string, run?:typeof gitRun, timeoutMs?:number,
+ *   env?:NodeJS.ProcessEnv, log?:Console, maintainObjects?:typeof maintainCloneObjects,
+ *   hasMaintenanceRebuildJob?:()=>boolean|Promise<boolean>}} o
+ * @returns {Promise<{merged:boolean, commits:number, reason:string}>}
  */
-export function selfSyncCheckout({ root, base = 'main', run = gitRun, timeoutMs = 60_000 }) {
+export async function selfSyncCheckout({ root, base = 'main', run = gitRun, timeoutMs = 60_000,
+  maintainObjects = maintainCloneObjects, env = process.env, log = console, hasMaintenanceRebuildJob }) {
   const git = (args) => run(args, { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
   repairCloneRefs(root, { log: (m) => console.error(m) }); // prune dangling remote-tracking refs before any fetch (no re-clone: this tick does not hold the clone write lock)
   const fetched = git(['fetch', 'origin', base, '--quiet']).status === 0;
@@ -260,6 +335,8 @@ export function selfSyncCheckout({ root, base = 'main', run = gitRun, timeoutMs 
     git(['merge', '--abort']);
     return { merged: false, commits: 0, reason: 'conflict' };
   }
+  await maintainObjectsUnderWriteLock({ root, env, log, maintainObjects, hasMaintenanceRebuildJob,
+    ...(run === gitRun ? {} : { run }), timeoutMs });
   return { merged: true, commits: behind, reason: 'merged' };
 }
 
@@ -384,9 +461,10 @@ export function decidePocSelfSync({ dirty, onBranch, main, poc }) {
  * is reported as `reason: 'merged-partial'` so the caller still restarts onto it while logging that the other
  * source needs a hand merge.
  * @param {{root:string, base?:string, pocBranch:string, run?:typeof gitRun, timeoutMs?:number}} o
- * @returns {{merged:boolean, commits:number, reason:string}}
+ * @returns {Promise<{merged:boolean, commits:number, reason:string}>}
  */
-export function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitRun, timeoutMs = 60_000 }) {
+export async function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitRun, timeoutMs = 60_000,
+  maintainObjects = maintainCloneObjects, env = process.env, log = console, hasMaintenanceRebuildJob }) {
   if (!pocBranch) throw new TypeError('selfSyncCheckoutPoc requires a pocBranch');
   assertSafeBranchName(pocBranch, 'pocBranch');
   assertSafeBranchName(base, 'base');
@@ -431,7 +509,11 @@ export function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitR
   if (decision.mergeMain) mergeRef(`origin/${base}`, behindMain);
   if (!conflicted && decision.mergePoc) mergeRef(`origin/${pocBranch}`, behindPoc);
 
-  if (mergedAny) return { merged: true, commits, reason: conflicted ? 'merged-partial' : 'merged' };
+  if (mergedAny) {
+    await maintainObjectsUnderWriteLock({ root, env, log, maintainObjects, hasMaintenanceRebuildJob,
+      ...(run === gitRun ? {} : { run }), timeoutMs });
+    return { merged: true, commits, reason: conflicted ? 'merged-partial' : 'merged' };
+  }
   return { merged: false, commits: 0, reason: 'conflict' };
 }
 
@@ -600,7 +682,7 @@ export function readLatestRebuildJobResult(root, env = process.env, { store = cr
   } catch { return null; }
 }
 
-// Kept across withSelfSync wrappers: even an unwritable marker cannot repeat one attempt per process.
+// Kept across wrappers: completed mutations stay deduplicated even if the marker is unwritable.
 // The promise also makes a concurrent tick wait for the attempt before it can queue its next job.
 const mutationDueAttempts = new Map();
 function mutationDuePath(root, env) { return join(daemonStateDir(env), `${cloneKey(root)}.mutation-due.json`); }
@@ -745,7 +827,7 @@ export function withSelfSync(effects, {
   readLatestRebuildJobResult: readLatestJobOpt,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
-  maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
+  maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
   const realIo = rebuildOpt === undefined;
@@ -755,7 +837,7 @@ export function withSelfSync(effects, {
   let readyIdentity = null;
   let adoptWaitTicks = 0;
   const rebuildAsJob = rebuildAsJobOpt === undefined ? resolveSelfSyncRebuildAsJob({ entries, env }) : !!rebuildAsJobOpt;
-  const rebuildImpl = rebuildOpt ?? ((o = {}) => rebuildClone({
+  const rebuildFn = rebuildOpt ?? ((o = {}) => rebuildClone({
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
   let tickOwnership = null;
@@ -789,9 +871,19 @@ export function withSelfSync(effects, {
         success, ...requestCallbacks() });
     };
     let result;
-    try { result = await rebuildImpl(...args); }
+    try {
+      result = await withCloneOwnership(root, tickOwnership, async () => {
+        const rebuilt = await rebuildFn(...args);
+        if (rebuilt?.moved && rebuilt.adopted && (maintainObjects || realIo)) {
+          await maintainObjectsUnderWriteLock({ root, log, env, maintainObjects, hasMaintenanceRebuildJob });
+        }
+        return rebuilt;
+      }, cloneLockOpts());
+    }
     catch (error) { record(false); throw error; }
-    record(!!result?.moved || result?.reason === 'up-to-date');
+    if (result?.moved || result?.reason === 'up-to-date') record(true);
+    else if (result?.reason !== 'reader-wait-timeout' && (result?.failed === true || result?.status === 'failed'
+      || FAILURE_REASONS.has(String(result?.reason).split(':', 1)[0]))) record(false);
     return result;
   };
   const bg = background === undefined
@@ -816,7 +908,8 @@ export function withSelfSync(effects, {
     if (previous) { await previous; return; }
     let complete;
     const pending = new Promise((resolve) => { complete = resolve; });
-    mutationDueAttempts.set(key, pending); // claim before awaiting the repair, including refused/thrown attempts
+    mutationDueAttempts.set(key, pending); // Deduplicate concurrent attempts, release failed attempts for the next tick.
+    let succeeded = false;
     try {
       const path = mutationDuePath(root, env);
       const handled = readHandledMutations(path);
@@ -829,19 +922,22 @@ export function withSelfSync(effects, {
         if (!result?.moved && !['up-to-date', 'needs-build', 'clone-recloned', 'ready-adopted'].includes(result?.reason)) {
           throw new Error(`refused: ${result?.reason ?? 'no-result'}`);
         }
-      } catch (error) {
-        const detail = mutationLogValue(error?.message ?? error);
-        log.error?.(`daemon-self-sync: readonly job ${id} deferred mutation ${mutation} failed: ${detail}; continuing normal discovery`);
-        try { progress?.alert?.('readonly-job-mutation-failed', { id: job.id, mutation: job.result.mutation, error: detail }, now()); }
-        catch { /* alert delivery cannot create a second mutation attempt */ }
-      } finally {
+        succeeded = true;
         handled.add(job.id);
         try { writeHandledMutations(path, handled); }
         catch (error) {
           log.error?.(`daemon-self-sync: readonly job ${id} handled state unavailable (${error.code ?? 'write-failed'}); this process will not retry it`);
         }
+      } catch (error) {
+        const detail = mutationLogValue(error?.message ?? error);
+        log.error?.(`daemon-self-sync: readonly job ${id} deferred mutation ${mutation} failed: ${detail}; continuing normal discovery`);
+        try { progress?.alert?.('readonly-job-mutation-failed', { id: job.id, mutation: job.result.mutation, error: detail }, now()); }
+        catch { /* alert delivery cannot create a second mutation attempt */ }
       }
-    } finally { complete(); }
+    } finally {
+      if (!succeeded) mutationDueAttempts.delete(key);
+      complete();
+    }
   };
   const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
@@ -1034,23 +1130,21 @@ export function withSelfSync(effects, {
         lastOwnershipReason = tickOwnership.reason;
         log.error?.(`daemon-self-sync: clone ownership=${tickOwnership.reason}; rebuild=${tickOwnership.owner}`);
       }
-      if (tickOwnership.reason === 'owner-stale-fallback' && typeof progress?.alert === 'function'
+      if (tickOwnership.reason === 'owner-stale-elected' && typeof progress?.alert === 'function'
         && ownershipNowMs - lastOwnerStaleAlertAt >= 15 * 60_000) {
         // Count attempts too: an unavailable alert sink must not turn every tick into an alert storm.
         lastOwnerStaleAlertAt = ownershipNowMs;
         try {
           progress.alert('clone-owner-stale', { clone: basename(root), entry: basename(String(entries?.[0] || '')),
             reason: tickOwnership.reason }, ownershipNowMs);
-        } catch { /* alert delivery never freezes the legacy rebuild fallback */ }
-      }
-      // A fallback sibling must NOT impersonate the dead owner by refreshing its heartbeat.
-      if (tickOwnership.reason === 'owner-entry') {
-        try { touchOwnerHeartbeat(root, { ...cloneLockOpts(), nowMs: now() }); }
-        catch (error) { log.error?.(`daemon-self-sync: owner heartbeat unavailable; siblings may use owner-stale-fallback (${error.code ?? 'write-failed'})`); }
+        } catch { /* alert delivery never freezes the elected rebuild owner */ }
       }
       if (tickOwnership.owner) readOwnerRequest();
       if (resolvedPocBranch && tickOwnership.owner) {
-        const r = syncPoc({ root, base, pocBranch: resolvedPocBranch, ...(timeoutMs != null ? { timeoutMs } : {}) });
+        const r = await withCloneOwnership(root, tickOwnership, () => syncPoc({ root, base, pocBranch: resolvedPocBranch, env, log,
+          hasMaintenanceRebuildJob, ...(maintainObjects ? { maintainObjects } : {}),
+          ...(timeoutMs != null ? { timeoutMs } : {}) }), cloneLockOpts());
+
         if (r.merged) {
           const partial = r.reason === 'merged-partial';
           log.error?.(

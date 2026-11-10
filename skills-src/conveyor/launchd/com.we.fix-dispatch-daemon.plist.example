@@ -48,6 +48,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/you/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>--max-old-space-size=4096</string>
 		<string>/Users/you/workspace/wev-fix-daemon/skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs</string>
 	</array>
 	<key>RunAtLoad</key>

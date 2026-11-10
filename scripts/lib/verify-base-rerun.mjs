@@ -9,6 +9,11 @@
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { isolatedRetryArgv } from './gate-timeout-retry.mjs';
+
+export function baseRerunArgv(files) {
+  return isolatedRetryArgv(files);
+}
 
 export const PRE_EXISTING_ON_MAIN = 'pre-existing-on-main';
 const key = (t) => `${t.file}\u0000${t.name ?? ''}`;
@@ -71,7 +76,8 @@ export async function runVitestOnBase({ git, repo, baseSha, files, tmp, timeoutM
     if (existsSync(join(repo, 'node_modules'))) symlinkSync(join(repo, 'node_modules'), join(wt, 'node_modules'), 'dir');
     const collector = collectorFactory({ cwd: wt });
     const { code, signal } = await new Promise((resolve, reject) => {
-      const child = spawnFn('npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...files.map(f => `./${f}`)],
+      const argv = baseRerunArgv(files);
+      const child = spawnFn(argv[0], argv.slice(1),
         { cwd: wt, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
       const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
       for (const name of ['stdout', 'stderr']) { child[name].setEncoding('utf8'); child[name].on('data', c => collector.push(c, name)); }

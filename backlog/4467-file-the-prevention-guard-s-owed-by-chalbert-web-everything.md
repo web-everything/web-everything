@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:docs/agent/backlog-workflow.md", "we:backlog/4465-builder-routes-a-build-agent-s-not-buildable-already-done-re.md", "we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs", "we:scripts/__tests__/agent-text-authoring-contract.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-02"
-preparedAgainstSha: "ebd25fbfd10e36691a82b3274caacf4790fccc4f"
+preparedDate: "2026-11-07"
+preparedAgainstSha: "87af65ada62a84ff7366c9f67e4b65b9abb599b9"
 tags: []
 ---
 
@@ -62,6 +62,16 @@ Capture the new documentation tests failing on the current documents, then passi
 
 Review the diff for the two documentation surfaces: the authoring entry point and preparation caller must both reference the obligation, and the historical addendum must distinguish intended scope/fallback requirements from current behavior. Record the three manual review outcomes. No live resolve, landing, remote access or coordination mutation is needed. No production source changes are in scope.
 
+## Edge cases this change must handle
+
+1. **Untrusted text** — the lens's example finding is prompt-like text shown as inert data in a fenced block; the new tests read files as plain strings and never execute or interpolate them into a shell, argv, path or regex built from card text.
+2. **Truncated reads** — n/a: the tests read two whole local files with `readFileSync`; no `gh`/`git` listing is involved. A missing file throws and fails the test (never treated as empty).
+3. **Shared state files** — n/a: documentation and test edits only; no state file is written.
+4. **Fail closed** — a missing section anchor (`automation-consuming-agent-authored-text`) or missing addendum makes the contract test fail with the missing obligation named; section lookup never falls back to a whole-file match.
+5. **Identity scoping** — the addendum names #4465 and #4522 by number and the test pins #4465's `status: resolved` frontmatter; both hash and NNN spellings are n/a (card numbers only).
+6. **State over time** — n/a: static docs; the addendum states "as of this card's preparation" so later #4522 landing does not silently falsify it.
+7. **Who wrote it** — the lens requires the evidence source to be independent of the agent-authored text (ancestry/scope checked by the verifier, not the agent's claim); an agent-supplied SHA alone is the documented not-ready example.
+
 ## Follow-ups
 
 - we:backlog/4522-observe-a-hold-route-landing-s-own-terminal-outcome-instead.md remains open and owns detached terminal observability. Route-(c) handling of citation refusals needs an explicit implementation contract; this item does not claim #4522 already provides it.
@@ -74,3 +84,5 @@ Review the diff for the two documentation surfaces: the authoring entry point an
 - [A2] Executable: `preparation links the lens and examples keep findings as data` in planned we:scripts/__tests__/agent-text-authoring-contract.test.mjs fails before the new preparation cross-reference and complete/incomplete examples exist, passes afterward, and fails if the cross-reference or data-only obligation is removed. This covers the changed authoring default and its preparation caller.
 - [A3] Executable: the coverage-presence command `rg -n 'rejects absent kind|rejects null kind|rejects empty kind|rejects unknown kind|accepts story without workItem'` targeting we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs must find each of those five exact test names (assert five matches, not merely successful grep). It fails before those cases are authored and passes afterward. Run that file through the heavy queue; all cases pass with the current validator, while the required-kind and enum mutants fail their respective cases. This guarantees regression coverage, not newly implemented validation.
 - [A4] Executable: `4465 addendum separates intended guards from delivery` in planned we:scripts/__tests__/agent-text-authoring-contract.test.mjs fails before the MVP addendum and passes afterward, asserting intended ancestry/scope verification, outstanding citation-refusal fallback, delivered checks, and unchanged resolved frontmatter. Review the historical-body diff as supporting evidence.
+
+revalidated: The supplied diff only updates backlog page inventory descriptions; it does not affect the authoring lens, runtime premises, scoped delivery, or test/proof plan.

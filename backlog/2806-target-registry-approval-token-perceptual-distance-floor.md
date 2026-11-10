@@ -189,7 +189,7 @@ latest `@vN`", `verifyChain` never groups and only walks append order. `verifyCh
 recomputing each digest from its stored fields + the prior entry's stored digest; a mismatch at index *i* means
 entry *i* (or anything before it) was altered after the fact without re-minting, and is reported at that exact
 index. Chosen
-over the two named alternatives: a **signed head** needs a private key WE has no infrastructure to hold or
+over the two named alternatives: a **signed head** needs a private-key WE has no infrastructure to hold or
 rotate (and would misrepresent authenticity, contradicting #2); an **external anchor** (timestamp service)
 needs network access, breaking the offline/deterministic posture every other WE gate holds to. Grep confirms
 this repo has never built prev-entry chaining before (`grep -rn -E "prevHash|previousHash|chainHash|merkle"

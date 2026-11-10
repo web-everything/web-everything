@@ -60,7 +60,10 @@
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
-import { relative, sep } from 'node:path';
+import { relative, sep, join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+// Absolute path of the wrapper beside this module: a daemon verifies a lane checkout that may not contain it yet.
+const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
 import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS, findLastGreenAncestor, decideSinceLastGreen } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
@@ -132,7 +135,7 @@ export function composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds = 
 }
 
 /** Single-quote a string for safe inclusion in a shell command (handles an embedded `'`). */
-function shellQuote(str) {
+export function shellQuote(str) {
   return `'${String(str).replace(/'/g, `'\\''`)}'`;
 }
 
@@ -197,6 +200,21 @@ export function stampedTimeoutFactor(gate) {
   return match ? Number(match[1]) / VITEST_BASE_TIMEOUTS.testTimeout : 1;
 }
 
+/** Compare default gates across checkouts, ignoring only the absolute shard-wrapper root.
+ * Keep every argument and remaining shell step exact; the matched plan executes our own wrapper.
+ * The quoted path accepts shellQuote's escaped apostrophes as well as ordinary checkout names.
+ */
+const SHARD_WRAPPER_PREFIX = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
+/** A sharded selected-test command from ANY checkout root (shellQuote'd absolute wrapper path). */
+export const isShardWrapperCommand = command => typeof command === 'string' && SHARD_WRAPPER_PREFIX.test(command);
+export function gateCommandsEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  if (left === right) return true;
+  const leftPrefix = SHARD_WRAPPER_PREFIX.exec(left), rightPrefix = SHARD_WRAPPER_PREFIX.exec(right);
+  return !!leftPrefix && !!rightPrefix
+    && left.slice(leftPrefix[0].length) === right.slice(rightPrefix[0].length);
+}
+
 /**
  * #66 — recognize a dispatched child's `--gate` as the requester's DEFAULT gate even when the requester resolved it
  * under different settings than this child (an older lane base without the settings file, or a session whose env
@@ -225,7 +243,7 @@ export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, v
   let other;
   try { other = resolveUnder(otherEnv); } catch { return null; }
   if (!other || other.decision?.selectionMode?.mode === ours) return null;
-  if (other.command === gate) return other;
+  if (gateCommandsEqual(other.command, gate)) return other;
   return matchUnderSelection({ gate, env: otherEnv, resolved: other, resolveUnder, variants });
 }
 
@@ -246,7 +264,7 @@ function matchUnderSelection({ gate, env, resolved, resolveUnder, variants }) {
         for (const policy of VERIFY_STANDARDS_POLICIES) {
           let variant;
           try { variant = resolveUnder({ ...env, ...selection, WE_VERIFY_STANDARDS: policy }); } catch { continue; }
-          if (variant?.command !== gate || !sameDiff(variant)) continue;
+          if (!gateCommandsEqual(variant?.command, gate) || !sameDiff(variant)) continue;
           if (relatedMode === ours.relatedMode && factor === ours.factor && limit === null) return resolved;
           const plan = resolveUnder({ ...env, ...selection });
           return sameDiff(plan) ? plan : null;
@@ -429,11 +447,19 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
-    const vitestCmd = selection?.status === 'selection-truncated'
+    let vitestCmd = selection?.status === 'selection-truncated'
       ? `npx vitest run ${selection.tests.map(shellQuote).join(' ')} --passWithNoTests${timeoutFlags}`
       : targets.length
       ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests${timeoutFlags}`
       : `echo ${shellQuote('verify-lane: no remaining changed file for vitest to relate — vitest half skipped (deletions or excluded untracked scratch)')}`;
+    if (selection?.status === 'selection-truncated' && settings.shardMinTests > 0
+      && selection.tests.length >= settings.shardMinTests) {
+      const shards = { count: Math.ceil(selection.tests.length / settings.shardSize), size: settings.shardSize, parallel: settings.shardParallel };
+      selection.shards = shards;
+      decision.shards = shards;
+      decision.reasons = [...decision.reasons, `${shards.count} shards (size ${shards.size}, parallel ${shards.parallel}); shardMinTests=${settings.shardMinTests} (${settingsSource.shardMinTests}), shardSize=${settings.shardSize} (${settingsSource.shardSize}), shardParallel=${settings.shardParallel} (${settingsSource.shardParallel}), phaseTimeoutMs=${settings.phaseTimeoutMs} (${settingsSource.phaseTimeoutMs})`];
+      vitestCmd = `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=${shards.count} --parallel=${shards.parallel} --budget-ms=${Math.floor(0.9 * settings.phaseTimeoutMs)} -- ${vitestCmd}`;
+    }
     // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
     // imports nothing, so it was never selected. Run the marked scanners scoped to the changed files (cost ~ the number
     // of changed files, never the whole repo); see scripts/lib/repo-scan-tests.mjs. Scanner reach is the full changed
@@ -870,6 +896,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
       ? decision.referencedTests.filter(file => !decision.relatedFiles.includes(file)).length : null,
     // #5128 — what the related-test selection ran and why; `status: 'selection-truncated'` means farther tests were left to CI.
     selection: decision?.selection ? {
+      ...(decision.selection.shards ? { shards: decision.selection.shards } : {}),
       status: decision.selection.status, fullTestCount: decision.selection.fullTestCount,
       selectedTestCount: decision.selection.selectedTestCount, directTestCount: decision.selection.directTestCount,
       droppedCount: decision.selection.droppedCount, depth: decision.selection.depth, maxDepth: decision.selection.maxDepth,

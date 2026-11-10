@@ -1,5 +1,10 @@
 {
   "prComments": {
     "mode": "on-change-or-action"
+  },
+  "conveyor": {
+    "notes": {
+      "informationalKinds": ["timeout-retry-fallback-heal"]
+    }
   }
 }

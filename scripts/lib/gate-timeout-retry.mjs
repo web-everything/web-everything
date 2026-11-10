@@ -6,6 +6,11 @@ export const MAX_TIMEOUT_LOG_BYTES = 2 * 1024 * 1024;
 /** 75c — more failing files than this is not a flake; the gate stays red with no retry. */
 export const MAX_ISOLATED_RETRY_FILES = 3;
 
+export function isolatedRetryArgv(files, timeoutFlags = []) {
+  return ['npx', 'vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
+    ...timeoutFlags, ...files.map(f => `./${f}`)];
+}
+
 /** The marker label for a retry that passed alone: every failure was in an untouched file and went green in isolation. */
 export const FLAKY_OUTSIDE_DIFF = 'flaky-outside-diff';
 /** The marker label for a retry that still failed alone: the gate stays red. */

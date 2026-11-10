@@ -11,12 +11,14 @@
  */
 import { appendFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
 import { cascadePolicy, readPlatformPreferences, logCascadeSources } from '../lib/policy-cascade.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { readRedTeamStatus as defaultReadRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { pidNamespace, pidStartTime } from '../lib/pid-alive.mjs';
 import { readConfirmedBreaks } from '../lib/red-team-gate.mjs';
 import { detectRoundCap, judgeRound } from '../lib/round-judge.mjs';
 import { assessPrSweep } from '../operations/pr-sweep-core.mjs';
@@ -32,10 +34,17 @@ export const STALL_SWEEP_DIR_ENV = 'WE_PR_STALL_SWEEP_DIR';
 /** The standard values; the classifier's policies are leaves of the same block, checked by its validators. */
 export const STALL_SWEEP_DEFAULTS = Object.freeze({ mode: 'off', intervalMinutes: 15, maxActionsPerSweep: 3, maxActionsPerHour: 6,
   maxActionsPerPrHead: 1, digest: true, ...CLASSIFY_DEFAULTS });
-const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
+const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'maxRedTeamRestartsPerHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
 const SETTINGS_FILE = join(ROOT, 'scripts/settings/pr-stall-sweep.json');
 const envName = (k) => `WE_PR_STALL_SWEEP_${k.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 const msg = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 200);
+
+/** Only ESRCH proves absence; unexpected probe failures leave ownership unknown. */
+export function pendingOwnerPidAlive(pid, kill = (p, s) => process.kill(p, s)) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try { kill(pid, 0); return true; }
+  catch (e) { return e?.code === 'ESRCH' ? false : e?.code === 'EPERM' ? true : null; }
+}
 
 /** `prStallSweep` under the cascade. Every leaf's source is returned and logged. Never throws. */
 export function resolveStallSweepSettings({ env = process.env, read = readFileSync, log = console.error } = {}) {
@@ -48,7 +57,7 @@ export function resolveStallSweepSettings({ env = process.env, read = readFileSy
     const raw = env[envName(k)];
     if (raw === undefined) continue;
     envValues[k] = typeof d === 'boolean' ? (['1', 'true'].includes(raw) ? true : ['0', 'false'].includes(raw) ? false : raw)
-      : typeof d === 'number' ? Number(raw) : String(raw).trim().toLowerCase();
+      : typeof d === 'number' ? (k === 'maxRedTeamRestartsPerHead' && String(raw).trim() === '' ? raw : Number(raw)) : String(raw).trim().toLowerCase();
   }
   const valid = { ...CLASSIFY_VALID, mode: (v) => STALL_SWEEP_MODES.includes(v), digest: (v) => typeof v === 'boolean',
     ...Object.fromEntries(['intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead'].map((k) => [k, (v) => Number.isSafeInteger(v) && v > 0])) };
@@ -63,11 +72,23 @@ export function resolveStallSweepSettings({ env = process.env, read = readFileSy
   // A block that is present but not an object (`false`, `"off"`, `[]`) is unusable policy, not "no settings".
   const isBlock = (b) => !!b && typeof b === 'object' && !Array.isArray(b);
   if (!isBlock(tool) || !isBlock(platform)) { layerUnreadable = true; errors.push('a prStallSweep block is not an object'); }
+  // A present but invalid restart budget disables restarts at that layer, preserving its provenance.
+  const closeRestartBudget = (layer, name) => {
+    const k = 'maxRedTeamRestartsPerHead';
+    if (isBlock(layer) && Object.hasOwn(layer, k) && !valid[k](layer[k])) {
+      errors.push(`${name}.${k}=${JSON.stringify(layer[k])} (invalid; restarts disabled)`);
+      return { ...layer, [k]: 0 };
+    }
+    return layer;
+  };
+  tool = closeRestartBudget(tool, 'tool'); platform = closeRestartBudget(platform, 'platform');
+  Object.assign(envValues, closeRestartBudget(envValues, 'env'));
   tool = scalarsOnly(tool, 'tool'); platform = scalarsOnly(platform, 'platform');
   // The kill switch fails closed: a mode PRESENT in any layer but unusable (including `{}`, which the cascade's leaf
   // flattening would drop) turns the sweep OFF.
   const rawModes = [tool?.mode, platform?.mode].filter((m) => m !== undefined);
-  const out = cascadePolicy('prStallSweep', tool, { standard: STALL_SWEEP_DEFAULTS, envValues, valid, platform, env, log: () => {} });
+  // Suppress the intermediate log without consuming the shared logger's deduplication entry.
+  const out = cascadePolicy('prStallSweep', tool, { standard: STALL_SWEEP_DEFAULTS, envValues, valid, platform, env: { ...env, WE_POLICY_CASCADE_LOG: '0' }, log: () => {} });
   const value = { ...out.value }; const sources = { ...out.sources }; const bad = [...out.invalid];
   // A leaf check cannot see shape (`{maxActionsPerHour: {a: 5}}` has a valid leaf): every resolved scalar is checked
   // again, and a bad one falls back to the standard.
@@ -127,17 +148,29 @@ export function planStallActions(items, { history = [], now, limits }) {
   const done = history.filter((h) => h?.phase === 'would-do' || h?.phase === 'intent');
   let hour = done.filter((h) => Date.parse(h.ts) >= now - 3_600_000).length;
   const perHead = new Map();
-  for (const h of done) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
+  const perAction = new Map();
+  const bucket = it => `${it.prHead}|${it.action}`;
+  for (const h of done) perAction.set(bucket(h), (perAction.get(bucket(h)) ?? 0) + 1);
+  // R452: red-team restarts have their OWN per-head budget (maxRedTeamRestartsPerHead) and neither spend nor are blocked by
+  // the shared maxActionsPerPrHead, which stays in force, unchanged, for every other action kind.
+  for (const h of done) if (h.action !== 'restart-red-team') perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
   const seen = new Set(done.map((h) => `${h.key}|${h.action}`));
   const once = new Set(done.map((h) => h.onceKey).filter(Boolean));
   const act = []; const held = [];
   for (const it of items) {
     if (it.lane === 'operator') continue;
     if (seen.has(`${it.key}|${it.action}`) || (it.onceKey && once.has(it.onceKey))) continue;
+    const restart = it.action === 'restart-red-team';
+    const restartCap = limits.maxRedTeamRestartsPerHead;
+    const restartFull = restart
+      && (!CLASSIFY_VALID.maxRedTeamRestartsPerHead(restartCap) || (perAction.get(bucket(it)) ?? 0) >= restartCap);
+    const headFull = !restart && (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead;
     const why = act.length >= limits.maxActionsPerSweep ? 'per-sweep cap' : hour >= limits.maxActionsPerHour ? 'per-hour cap'
-      : (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead ? 'per-PR-head cap' : null;
+      : restartFull ? 'red-team restart per-head cap; operator must inspect the pending head'
+        : headFull ? 'per-PR-head cap' : null;
     if (why) { held.push({ ...it, held: why }); continue; }
-    act.push(it); hour += 1; perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
+    act.push(it); perAction.set(bucket(it), (perAction.get(bucket(it)) ?? 0) + 1); hour += 1;
+    if (!restart) perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
   }
   return { act, held };
 }
@@ -181,7 +214,7 @@ const ghFiles = (gh) => (repo, n) => {
  * `gh` is the ONLY GitHub seam (read verbs only: `pr list`, `pr view`, `api` GET); tests pin that.
  */
 export async function runStallSweep({ now = Date.now(), env = process.env, state = {}, settings, gh = (f, a, o) => execFileSync(f, a, o),
-  read, readFiles, judge = judgeRound, dir, log = console.error, force = false } = {}) {
+  read, readFiles, readRedTeamStatus = defaultReadRedTeamStatus, probe, judge = judgeRound, dir, log = console.error, force = false } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
   const cfg = s.value;
   // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
@@ -211,6 +244,8 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     && Array.isArray(p.comments) && p.comments.every((c) => typeof c?.author?.login === 'string' && typeof c.body === 'string' && Number.isFinite(Date.parse(c.createdAt)));
   let readFailed = !Array.isArray(raw.prs) || !raw.prs.every(readable);
   const items = [];
+  const pending = [];
+  // A live job proves ownership, so its pending row is not stalled; restarting it risks a duplicate run.
   for (const row of report.prs.filter((r) => r.stalled)) {
     const pr = prs.get(`${row.repo}#${row.number}`);
     const head = String(pr?.headRefOid ?? '');
@@ -224,10 +259,52 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         verdict = cap?.trigger === trigger ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: pr.comments, files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
       } catch (e) { base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); verdict = null; readFailed = true; }
     }
-    const c = classifyStall({ row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) });
+    const context = { row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) };
+    const metadata = { repo: row.repo, pr: row.number, head, prHead: `${row.repo}#${row.number}@${head.toLowerCase()}`, state: row.waitingOn, title: String(row.title ?? '').slice(0, 120), verdict: verdict?.verdict ?? null };
+    if (['red-team-pending', 'drain-skip:red-team-pending'].includes(row.waitingOn)) {
+      let status; let ownerAlive = null;
+      try {
+        status = await readRedTeamStatus({ repo: row.repo, pr: row.number, head, env });
+        if (status !== null) {
+          const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+          if (!object(status) || status.unreadable
+            || !['queued', 'running', 'finished', 'failed', 'skipped'].includes(status.status)
+            || !(status.result == null || typeof status.result === 'string' || object(status.result))) {
+            throw new Error('unreadable red-team status content');
+          }
+          if (status.repo !== row.repo || Number(status.pr) !== row.number || status.head !== head) throw new Error('red-team status identity mismatch');
+          if (['queued', 'running'].includes(status.status)) {
+            // Missing timing uses the pending-age deadline; malformed owner fields cannot be evidence.
+            const text = value => typeof value === 'string' && value.trim().length > 0;
+            if (['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => status[field] != null && !text(status[field]))
+              || (status.pid != null && (!Number.isSafeInteger(status.pid) || status.pid <= 0))
+              || !['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => text(status[field]))) {
+              throw new Error('unreadable active red-team status shape');
+            }
+          }
+        }
+      } catch (e) { status = { unreadable: true }; readFailed = true; base.errors.push(`red-team ${row.repo}#${row.number}: ${msg(e)}`); }
+      try {
+        if (['queued', 'running'].includes(status?.status)) {
+          const local = probe ?? { host: hostname(), namespace: pidNamespace(), isAlive: pendingOwnerPidAlive, readPidStart: pidStartTime };
+          if (status.host === local.host && status.pidNamespace === local.namespace && Number.isSafeInteger(status.pid) && status.pid > 0) {
+            const alive = await local.isAlive(status.pid);
+            if (alive === false) ownerAlive = false;
+            else if (alive === true) {
+              const start = status.pidStart ? await local.readPidStart(status.pid) : null;
+              // A missing birth time cannot prove PID reuse; retain the live-owner hold.
+              ownerAlive = !start || !status.pidStart || start === status.pidStart;
+            }
+          }
+        }
+      } catch (e) { ownerAlive = null; base.errors.push(`red-team owner ${row.repo}#${row.number}: ${msg(e)}`); }
+      pending.push({ context, metadata, status, ownerAlive });
+      continue;
+    }
+    const c = classifyStall(context);
     // An unreadable row or unreadable evidence anywhere makes the whole pass incomplete (it still reaches the operator).
     if (c?.reason?.startsWith('fail-closed: classifier error') || c?.action === 'unreadable-evidence' || verdict?.evidence?.failClosed) readFailed = true;
-    if (c) items.push({ ...c, repo: row.repo, pr: row.number, head, prHead: `${row.repo}#${row.number}@${head.toLowerCase()}`, state: row.waitingOn, title: String(row.title ?? '').slice(0, 120), verdict: verdict?.verdict ?? null });
+    if (c) items.push({ ...c, ...metadata });
   }
 
   // Read the budget, plan and durably record under ONE lock on the audit dir, so two overlapping passes can never both
@@ -237,8 +314,25 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   function commit() {
   // Fail closed: an unreadable PR, file list or audit history means NO action this pass.
   const { records: history, complete: historyOk } = readAuditHistory(outDir);
+  for (const { context, metadata, status, ownerAlive } of pending) {
+    const restarts = history.filter(h => ['would-do', 'intent'].includes(h.phase) && h.prHead === metadata.prHead && h.action === 'restart-red-team');
+    const latest = restarts.length ? restarts.reduce((latest, h) => Math.max(latest, Date.parse(h.ts)), -Infinity) : null;
+    const c = classifyStall({ ...context, redTeam: { now, ageMinutes: context.row.ageMinutes, status, ownerAlive,
+      restarts: restarts.length, minutesSinceLastRestart: latest === null ? null : (now - latest) / 60_000 } });
+    if (c?.reason?.startsWith('fail-closed: classifier error')) readFailed = true;
+    if (c) items.push({ ...c, ...metadata });
+  }
   const incomplete = raw.unreadable.length > 0 || readFailed || !historyOk;
   const plan = incomplete ? { act: [], held: [] } : planStallActions(items, { history, now, limits: cfg });
+  for (const held of plan.held.filter(i => i.action === 'restart-red-team' && i.held === 'per-PR-head cap')) {
+    const entry = pending.find(p => p.metadata.prHead === held.prHead);
+    const restarts = [...history.filter(h => ['would-do', 'intent'].includes(h.phase)), ...plan.act]
+      .filter(h => h.prHead === held.prHead && h.action === 'restart-red-team').length;
+    items.push({ ...held, lane: 'operator', action: 'red-team-restart-exhausted',
+      key: `${held.prHead}:red-team-restart-exhausted`, held: undefined,
+      command: entry?.context.row.next?.command ?? null,
+      reason: `red-team restart held by the per-head ceiling (per-PR-head cap); ${restarts} restarts so far; pending age ${entry?.context.row.ageMinutes} minutes; operator must inspect the pending head (needs-you)` });
+  }
   const ts = new Date(now).toISOString();
   const logged = new Set(history.map((h) => `${h.phase}|${h.key}|${h.action}|${h.held ?? ''}`));
   const fresh = (r) => !logged.has(`${r.phase}|${r.key}|${r.action}|${r.held ?? ''}`);

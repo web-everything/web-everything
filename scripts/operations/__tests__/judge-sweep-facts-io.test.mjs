@@ -3,7 +3,11 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
-import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
+import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin } from '../judge-sweep-facts-io.mjs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildShapePlan } from '../../review-core-cli.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
@@ -31,7 +35,8 @@ it.each([
       ...(standing ? { standingRuling: `${repo}#6000`, head, episode: `${repo}#1@${head}:review:12/12` } : {}),
     }) }];
   const calls = [];
-  const reader = createJudgeSweepFactsReader({
+  const reader = createJudgeSweepFactsReader({ findSuspendedRuns: () => [],
+    checkoutState: () => ({ behind: 0 }),
     gh: args => {
       calls.push(args);
       if (args[0] !== 'pr' || args[1] !== 'list') throw new Error('unexpected extra GitHub read');
@@ -54,6 +59,8 @@ const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
   baseRefOid: 'b'.repeat(40), labels: [], assignees: [], updatedAt: at,
   body: '<!-- authored-by-actor: author -->', createdAt: at, ...extra });
 const options = (extra = {}) => ({
+  findSuspendedRuns: () => [],
+  checkoutState: () => ({ behind: 0 }),
   exec,
   gh: () => JSON.stringify([pr()]), now: () => Date.parse(at), baseCap,
   readLedgerRows: () => [], readFixRows: () => [], readJobs: () => [], readComments: () => [],
@@ -324,19 +331,19 @@ it.each([
     gh: () => JSON.stringify([humanPr({ files: changedFiles.map(path => ({ path })) })]),
   });
   vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', before);
-  const reader = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  const reader = createJudgeSweepFactsReader({ findSuspendedRuns: () => [], ...readerOptions, cache: createShapeCache(io) });
   expect(reader({ repo }).prs[0].humanRequired).toBe(initial);
   expect(reader({ repo }).prs[0].humanRequired).toBe(initial);
   expect(shape).toHaveBeenCalledTimes(1);
   vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', after);
   expect(buildShapePlan({ changedFiles }).humanRequired).toBe(expected);
-  const fresh = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  const fresh = createJudgeSweepFactsReader({ findSuspendedRuns: () => [], ...readerOptions, cache: createShapeCache(io) });
   const facts = fresh({ repo }).prs[0];
   expect(facts.evidenceErrors).toEqual([]);
   expect(facts.humanRequired).toBe(expected);
   expect(reader({ repo }).prs[0].humanRequired).toBe(expected);
   expect(shape).toHaveBeenCalledTimes(3);
-  const reloaded = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  const reloaded = createJudgeSweepFactsReader({ findSuspendedRuns: () => [], ...readerOptions, cache: createShapeCache(io) });
   expect(reloaded({ repo }).prs[0].humanRequired).toBe(expected);
   expect(shape).toHaveBeenCalledTimes(3);
 });
@@ -523,4 +530,201 @@ it.each([
 it('flags a ledger row that names the PR head but is malformed as unreadable evidence', () => {
   const facts = ledgerFacts([ledgerRow({ verdict: 7 })]);
   expect(facts.evidenceErrors).toContain('verdict ledger row malformed');
+});
+
+// Evidence must never depend on how stale the caller's checkout is (R372).
+
+const goodPr = { number: 7, headSha: head, labels: [], evidenceErrors: [], minutesSinceUpdate: 5 };
+const freshFacts = { generatedAt: at, prs: [goodPr] };
+const staleOptions = extra => options({ gh: vi.fn(() => { throw new Error('stale checkout must not read locally'); }), ...extra });
+
+it('reads facts from a fresh origin/main when the checkout is behind', () => {
+  const readFresh = vi.fn(() => freshFacts);
+  const reader = createJudgeSweepFactsReader(staleOptions({ checkoutState: () => ({ behind: 1232 }), readFresh }));
+  expect(reader({ repo })).toEqual(freshFacts);
+  expect(readFresh).toHaveBeenCalledWith(expect.objectContaining({ repo, behind: 1232 }));
+});
+
+it('reads in place and never builds a fresh checkout when the checkout is current', () => {
+  const readFresh = vi.fn();
+  expect(createJudgeSweepFactsReader(options({ readFresh }))({ repo }).prs).toHaveLength(1);
+  expect(readFresh).not.toHaveBeenCalled();
+});
+
+it('refuses loudly with checkout-stale (N behind) when the fresh read fails, with no local fallback', () => {
+  const readFresh = vi.fn(() => { throw new Error('worktree add failed'); });
+  const reader = createJudgeSweepFactsReader(staleOptions({ checkoutState: () => ({ behind: 1232 }), readFresh }));
+  expect(() => reader({ repo })).toThrow(/checkout-stale \(1232 behind\)/);
+});
+
+it.each([null, {}, { prs: 'x' }, []])('refuses a malformed fresh read (%j) as checkout-stale', bad => {
+  const reader = createJudgeSweepFactsReader(staleOptions({ checkoutState: () => ({ behind: 3 }), readFresh: () => bad }));
+  expect(() => reader({ repo })).toThrow(/checkout-stale \(3 behind\)/);
+});
+
+it.each([() => { throw new Error('fetch failed'); }, () => ({ behind: -1 }), () => ({ behind: Number.NaN }), () => null])(
+  'refuses when freshness cannot be proven, without reading locally', checkoutState => {
+    const gh = vi.fn();
+    const reader = createJudgeSweepFactsReader(options({ gh, checkoutState, readFresh: () => freshFacts }));
+    expect(() => reader({ repo })).toThrow(/checkout-stale \(unknown behind\)/);
+    expect(gh).not.toHaveBeenCalled();
+  });
+
+it('does not trust an inherited env flag: freshness is still checked and fails closed', () => {
+  vi.stubEnv('WE_JUDGE_FACTS_FRESH_CHILD', '1');
+  const gh = vi.fn();
+  const reader = createJudgeSweepFactsReader(options({ gh, checkoutState: () => { throw new Error('fetch failed'); } }));
+  expect(() => reader({ repo })).toThrow(/checkout-stale \(unknown behind\)/);
+  expect(gh).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['an empty prs list shape is allowed', [], true],
+  ['a PR with no fields', [{}], false],
+  ['a non-numeric PR number', [{ ...goodPr, number: '7' }], false],
+  ['a malformed head', [{ ...goodPr, headSha: 'abc' }], false],
+  ['missing evidenceErrors', [{ ...goodPr, evidenceErrors: undefined }], false],
+  ['non-array labels', [{ ...goodPr, labels: 'x' }], false],
+  ['a non-finite age', [{ ...goodPr, minutesSinceUpdate: null }], false],
+  ['a valid PR', [goodPr], true],
+])('validates the fresh PR shape: %s', (_name, prs, ok) => {
+  const reader = createJudgeSweepFactsReader(staleOptions({ checkoutState: () => ({ behind: 2 }),
+    readFresh: () => ({ generatedAt: at, prs }) }));
+  if (ok) expect(reader({ repo }).prs).toEqual(prs);
+  else expect(() => reader({ repo })).toThrow(/checkout-stale \(2 behind\)/);
+});
+
+// Real git and a real child process: only the stub module the child imports is a fixture.
+const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
+function gitFixture() {
+  const tmp = mkdtempSync(join(tmpdir(), 'jsf-real-'));
+  const origin = join(tmp, 'origin'), clone = join(tmp, 'clone');
+  mkdirSync(join(origin, 'scripts/operations'), { recursive: true });
+  git(origin, 'init', '-q', '-b', 'main');
+  git(origin, 'config', 'user.email', 'a@b.c'); git(origin, 'config', 'user.name', 'x');
+  writeFileSync(join(origin, 'scripts/operations/judge-sweep-facts-io.mjs'),
+    "import { existsSync } from 'node:fs';\nexport const createJudgeSweepFactsReader = o => () => ({ generatedAt: 't', source: 'fresh', behind: o.checkoutState().behind,\n  deps: existsSync('node_modules'), prs: [] });\n");
+  git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'one');
+  execFileSync('git', ['clone', '-q', origin, clone]);
+  mkdirSync(join(clone, 'node_modules'));
+  return { tmp, origin, clone, advance: () => { writeFileSync(join(origin, 'n.txt'), String(Math.random()));
+    git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'more'); } };
+}
+
+it('counts commits behind origin/main with real git', () => {
+  const f = gitFixture();
+  try {
+    expect(readCheckoutState({ root: f.clone })).toEqual({ behind: 0 });
+    f.advance(); f.advance();
+    expect(readCheckoutState({ root: f.clone })).toEqual({ behind: 2 });
+  } finally { rmSync(f.tmp, { recursive: true, force: true }); }
+});
+
+it.each(['', '  ', 'abc', '-1', '1.5'])('treats a non-numeric count (%j) as unknown, never as 0 behind', out => {
+  const run = (_bin, args) => (args.includes('rev-list') ? out : '');
+  expect(() => readCheckoutState({ root: '/x', exec: run })).toThrow();
+});
+
+it('fails closed when the fetch fails', () => {
+  const f = gitFixture();
+  try {
+    git(f.clone, 'remote', 'set-url', 'origin', join(f.tmp, 'missing'));
+    expect(() => readCheckoutState({ root: f.clone })).toThrow();
+  } finally { rmSync(f.tmp, { recursive: true, force: true }); }
+});
+
+it('reads from a real origin/main worktree, links dependencies, and leaves no worktree behind', () => {
+  const f = gitFixture();
+  try {
+    f.advance(); git(f.clone, 'fetch', '-q', 'origin', 'main');
+    const facts = readFromFreshOrigin({ repo, root: f.clone });
+    expect(facts).toMatchObject({ source: 'fresh', behind: 0, deps: true });
+    expect(git(f.clone, 'worktree', 'list').split('\n')).toHaveLength(1);
+  } finally { rmSync(f.tmp, { recursive: true, force: true }); }
+});
+
+it('cleans up the worktree registration and temp dir when the fresh child fails', () => {
+  const f = gitFixture();
+  try {
+    // Preserve the child's named import so the fixture reaches the intended runtime failure.
+    writeFileSync(join(f.origin, 'scripts/operations/judge-sweep-facts-io.mjs'),
+      'export const createJudgeSweepFactsReader = () => { throw new Error("child boom"); };\n');
+    git(f.origin, 'commit', '-qam', 'break'); git(f.clone, 'fetch', '-q', 'origin', 'main');
+    const before = readdirSync(tmpdir()).filter(n => n.startsWith('judge-facts-fresh-')).length;
+    expect(() => readFromFreshOrigin({ repo, root: f.clone })).toThrow(/fresh reader failed.*child boom/s);
+    expect(git(f.clone, 'worktree', 'list').split('\n')).toHaveLength(1);
+    expect(readdirSync(tmpdir()).filter(n => n.startsWith('judge-facts-fresh-')).length).toBe(before);
+  } finally { rmSync(f.tmp, { recursive: true, force: true }); }
+});
+
+it('prunes the registration even when git cannot remove the worktree', () => {
+  const f = gitFixture();
+  try {
+    f.advance(); git(f.clone, 'fetch', '-q', 'origin', 'main');
+    const calls = [];
+    const flaky = (bin, args, opts) => {
+      if (bin === 'git') calls.push(args.filter(a => ['remove', 'prune', 'add'].includes(a))[0]);
+      if (bin === 'git' && args.includes('remove')) throw new Error('remove failed');
+      return execFileSync(bin, args, opts);
+    };
+    readFromFreshOrigin({ repo, root: f.clone, exec: flaky });
+    expect(git(f.clone, 'worktree', 'list').split('\n')).toHaveLength(1);
+    expect(calls.filter(Boolean)).toEqual(['add', 'remove', 'prune']);
+  } finally { rmSync(f.tmp, { recursive: true, force: true }); }
+});
+
+it('fails closed when neither remove nor prune can clear the worktree registration', () => {
+  const f = gitFixture();
+  try {
+    f.advance(); git(f.clone, 'fetch', '-q', 'origin', 'main');
+    const broken = (bin, args, opts) => {
+      if (bin === 'git' && (args.includes('remove') || args.includes('prune'))) throw new Error('git refused');
+      return execFileSync(bin, args, opts);
+    };
+    expect(() => readFromFreshOrigin({ repo, root: f.clone, exec: broken })).toThrow(/worktree cleanup failed/);
+  } finally { rmSync(f.tmp, { recursive: true, force: true }); }
+});
+
+
+it('R746 exposes a suspended run and alerts once per run past the sourced window without PR mutations', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'referral-alert-'));
+  try {
+    const publishAlert = vi.fn(), log = vi.fn(), alertRepo = JUDGE_SWEEP_REPO;
+    const suspended = { id: 'review-pr-suspended', ageMs: 3600000, findings: [{ key: 'k', summary: 'broken guard' }] };
+    const reader = createJudgeSweepFactsReader(options({ findSuspendedRuns: () => [suspended], publishAlert,
+      alertClaimsDir: dir, log, env: { WE_REFERRAL_JUDGE_WINDOW_MIN: '60' } }));
+    const first = reader({ repo: alertRepo }).prs[0];
+    expect(first.suspendedReferralRun).toEqual({ runId: suspended.id, ageMinutes: 60, findings: suspended.findings });
+    expect(publishAlert).toHaveBeenCalledTimes(1);
+    expect(publishAlert.mock.calls[0][0]).toMatchObject({ repo: alertRepo, pr: 1, head, kind: 'suspended-referral-no-ruling', pick: `https://github.com/${alertRepo}/pull/1`, reason: expect.stringContaining(suspended.id) });
+    expect(log.mock.calls.flat().join(' ')).toMatch(/60.*source=env/);
+    expect(reader({ repo: alertRepo }).prs[0]).toEqual(first);
+    expect(publishAlert).toHaveBeenCalledTimes(1);
+    expect(first.labels).toEqual([]); expect(first.latestVerdict).toBeNull();
+    suspended.id = 'review-pr-next'; suspended.ageMs = 59 * 60000;
+    reader({ repo: alertRepo }); expect(publishAlert).toHaveBeenCalledTimes(1);
+    suspended.ageMs = 60 * 60000; reader({ repo: alertRepo }); expect(publishAlert).toHaveBeenCalledTimes(2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+it('R746 fails closed on unreadable suspended-run evidence', () => {
+  expect(read({ findSuspendedRuns: () => { throw Error('bad'); } }).evidenceErrors)
+    .toContain('suspended referral run evidence unreadable; inspect run store');
+});
+
+it('R746 does not alert when all suspended findings have recorded rulings', () => {
+  const record = referralRecord(['ruled guard']);
+  record.rulings = [{ id: 'ruling-1', key: record.referrals[0].key, reviewerId: record.reviewer.id,
+    lens: record.reviewer.lens, result: 'block', rationale: 'repair it', evidence: ['diff'] }];
+  const publishAlert = vi.fn();
+  const row = read({ readComments: () => [comment(renderReferralRecord(record))], publishAlert,
+    findSuspendedRuns: () => [{ id: 'review-pr-ruled', ageMs: 7200000,
+      findings: [{ key: record.referrals[0].key, summary: 'ruled guard' }] }] });
+  expect(row.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
+  expect(row.evidenceErrors).toEqual([]); expect(publishAlert).not.toHaveBeenCalled();
+});
+it('R746 never publishes or writes alert claims in tests without an injected publisher', () => {
+  const exec = vi.fn();
+  const row = read({ exec, alertClaimsDir: 'invalid-unwritable-claim-location',
+    findSuspendedRuns: () => [{ id: 'review-pr-unruled', ageMs: 7200000, findings: [{ key: 'k', summary: 'guard' }] }] });
+  expect(row.evidenceErrors).toEqual([]); expect(exec).not.toHaveBeenCalled();
 });

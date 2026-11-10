@@ -1,22 +1,31 @@
 // @vitest-environment node
 // The job child runs under plain Node; happy-dom's AbortController is not one child_process accepts.
 import { it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
+import { withPathLock } from '../../readiness/with-lock.mjs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync, appendFileSync, statSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { EventEmitter } from 'node:events';
-import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure, coronerExtractorArgs } from '../nightly-coroner-job.mjs';
+import { spawnToolFreeCoronerJudge, appendHeldCoronerCard, coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure, coronerExtractorArgs } from '../nightly-coroner-job.mjs';
 import { createJobStore, enqueueJob, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
 import { markLaunching } from '../../lib/daemon-jobs.mjs';
 import coronerSmell from '../health-smells/nightly-coroner-failed.mjs';
 import { emptyHealthState, runHealthTick } from '../health-watch-core.mjs';
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync), renameSync: vi.fn(actual.renameSync) };
+});
+const providers = vi.hoisted(() => ({ judgeSpawn: vi.fn(), codexJudgeSpawn: vi.fn() }));
+vi.mock('../../lib/judge-spawn.mjs', () => ({ judgeSpawn: providers.judgeSpawn }));
+vi.mock('../../lib/codex-judge-spawn.mjs', () => ({ codexJudgeSpawn: providers.codexJudgeSpawn }));
+const proposedFix = 'Add bounded retries to the gate runner.';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'nightly-coroner-')); roots.push(root); return root; };
-afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.clearAllMocks(); vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 it.each([
   ['2026-10-17T02:16:59Z', '2026-10-15', null],
   ['2026-10-17T02:17:00Z', '2026-10-15', '2026-10-16'],
@@ -156,10 +165,234 @@ function extraction(root) {
   mkdirSync(ops, { recursive: true });
   writeFileSync(join(ops, 'coroner-extract.mjs'), '');
   return { input: { night: '2026-10-16', until: '2026-10-17T02:17:00.000Z', dir, sourceRoot: root },
-    io: { root, home, statusFeed: join(home, 'needs-you-events.jsonl'), acquire: vi.fn(async () => lane), release: vi.fn(async () => {}), sweep: vi.fn(async () => {}), run: vi.fn(async () => JSON.stringify({ changeRequests: { rounds: 2 } })) } };
+    io: { root, home, statusFeed: join(home, 'needs-you-events.jsonl'), acquire: vi.fn(async () => lane), release: vi.fn(async () => {}), sweep: vi.fn(async () => {}),
+      judge: vi.fn(async () => ({ value: { verdicts: [] } })), fileItem: vi.fn(async () => ({ id: 'test-card' })),
+      run: vi.fn(async () => JSON.stringify({ errorRates: {}, changeRequests: { rounds: 2 } })) } };
 }
+// These fixtures exercise the new default without permitting live judge/file-item IO.
+function judgedExtraction() {
+  const fixture = extraction(temp());
+  const metrics = { errorRates: { gateRuns: { causes: Object.fromEntries(Array.from({ length: 6 }, (_, n) =>
+    [`cause-${n}`, { count: n + 1, minutes: 60 - n, examples: [{ ref: `PR #${101 + n}`, at: fixture.input.until }] }])) } } };
+  fixture.io.run.mockResolvedValue(JSON.stringify(metrics));
+  fixture.io.judge.mockImplementation(async () => {
+    const { rankFrictions } = await import('../../operations/coroner-judge.mjs');
+    return { value: { verdicts: rankFrictions(metrics).map(({ key }, n) => n === 1
+      ? { key, verdict: 'COVERED-BY', coveredBy: 'PR #42' } : { key, verdict: 'NEW', proposedFix }) } };
+  });
+  fixture.io.fileItem.mockImplementation(async () => ({ id: `card-${fixture.io.fileItem.mock.calls.length}` }));
+  return { ...fixture, metrics };
+}
+function seedUnjudgedReport({ input, io, metrics }) {
+  // Historical extraction receipt: no judge receipt exists, and the extractor must not be re-run.
+  mkdirSync(io.home, { recursive: true }); mkdirSync(input.dir, { recursive: true });
+  const window = { since: '2026-10-16T02:17:00.000Z', until: input.until };
+  writeFileSync(join(io.home, `coroner-${input.night}.md`), [
+    `# Nightly coroner — ${input.night}`, '',
+    'Deterministic extraction is ready. Operator judgment is pending; no agent session was launched.', '',
+    '## Extraction (includes change-request rounds when available)', '', '```json', JSON.stringify(metrics, null, 2), '```', '',
+    '## False findings', '', 'Extractor not present.', '', `<!-- nightly-coroner ${JSON.stringify(window)} -->`, '',
+  ].join('\n'));
+  writeFileSync(join(input.dir, 'nightly-coroner-cursor.json'), JSON.stringify({ lastNight: input.night, lastEnd: input.until }));
+}
+
+it('appends numbered held cards in the handoff home by default and recovers existing key receipts', async () => {
+  const { input, io } = judgedExtraction();
+  mkdirSync(io.home, { recursive: true });
+  const heldPath = join(io.home, 'cards-to-file.md');
+  writeFileSync(heldPath, '7. (earlier, held) **Existing item.**\n');
+  delete io.fileItem;
+  await extractNightlyCoroner(input, io);
+  const held = readFileSync(heldPath, 'utf8');
+  expect(held).toMatch(/^8\. \*\*Coroner:[^\n]*\*\* \(coroner-2026-10-16, held\)/m);
+  expect(held).toContain(`    Fix idea: ${proposedFix}\n`); expect(held).toContain('Evidence:');
+  expect(held).toContain('PR #101'); expect(held).toContain('Size 3.');
+  expect(held).toMatch(/^    Coroner key: gateRuns:cause-0$/m);
+  expect(held.match(/Coroner key:/g)).toHaveLength(3);
+  expect(io.run).toHaveBeenCalledOnce();
+  const statePath = join(input.dir, 'nightly-coroner-judge.json');
+  const original = JSON.parse(readFileSync(statePath, 'utf8'));
+  rmSync(statePath); // Crash after sink append, before durable judge state.
+  await extractNightlyCoroner(input, io);
+  expect(readFileSync(heldPath, 'utf8')).toBe(held);
+  const recovered = JSON.parse(readFileSync(statePath, 'utf8'));
+  expect(recovered.filed).toEqual(original.filed);
+  expect(recovered.completed[input.night].filed).toBe(3);
+  expect(io.run).toHaveBeenCalledOnce();
+});
+it('preserves a concurrent append between the held-list read and append without replacing the file', async () => {
+  const home = temp(), path = join(home, 'cards-to-file.md');
+  const original = '7. (earlier, held) **Existing item.**\n';
+  const concurrent = '8. (other-writer, held) **Concurrent item.**\n';
+  writeFileSync(path, original);
+  const actual = await vi.importActual('node:fs');
+  vi.mocked(readFileSync).mockImplementationOnce((...args) => {
+    expect(args[0]).toBe(path);
+    const snapshot = actual.readFileSync(...args);
+    appendFileSync(path, concurrent);
+    return snapshot;
+  });
+  vi.mocked(readFileSync).mockImplementationOnce((...args) => {
+    expect(args[0]).toBe(path);
+    expect(() => withPathLock(path, () => {}, { timeoutMs: 0 })).toThrow(/timed out/); // the shared list lock is held
+    return actual.readFileSync(...args);
+  });
+  const receipt = appendHeldCoronerCard({ key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3',
+    count: 2, minutes: 10, examples: [{ ref: 'PR #42' }], proposedFix }, { home, night: '2026-10-16' });
+  const held = readFileSync(path, 'utf8');
+  expect(held.startsWith(original + concurrent)).toBe(true);
+  expect(held).toContain('    Coroner key: ci:flaky\n');
+  expect(held).toContain(`    Fix idea: ${proposedFix}\n`);
+  expect(statSync(path).ino).not.toBe(0); // the shared primitive writes atomically under the lock; no append is lost
+  const numbers = [...held.matchAll(/^(\d+)\. /gm)].map((match) => Number(match[1]));
+  expect(numbers).toEqual([7, 8, 9]);
+  expect(new Set(numbers).size).toBe(numbers.length);
+  expect(receipt).toEqual({ id: 'cards-to-file.md#9' });
+  expect(held).toMatch(/^9\. \*\*[^\n]*\(coroner-2026-10-16, held\)[^\n]*\n(?:[^\n]*\n)*?    Coroner key: ci:flaky$/m);
+  expect(() => withPathLock(path, () => {}, { timeoutMs: 0 })).not.toThrow(); // released
+});
+it('refuses filing while another writer holds the shared held-list lock and names manual recovery', () => {
+  const home = temp(), path = join(home, 'cards-to-file.md');
+  const held = '7. (earlier, held) **Existing item.**\n';
+  writeFileSync(path, held);
+  const input = { key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3', count: 2, minutes: 10, examples: [{ ref: 'PR #42' }], proposedFix };
+  withPathLock(path, () => {
+    expect(() => appendHeldCoronerCard(input, { home, night: '2026-10-16' }))
+      .toThrow('held list busy; retry later or run manual /coroner');
+  });
+  expect(readFileSync(path, 'utf8')).toBe(held);
+  expect(appendHeldCoronerCard(input, { home, night: '2026-10-16' })).toEqual({ id: 'cards-to-file.md#8' });
+});
+it('refuses a held key without a numbered receipt and leaves the held list untouched', () => {
+  const home = temp(); const path = join(home, 'cards-to-file.md');
+  const held = 'Coroner key: ci:flaky\n'; writeFileSync(path, held);
+  expect(() => appendHeldCoronerCard({ key: 'ci:flaky' }, { home, night: '2026-10-16' })).toThrow('run manual /coroner');
+  expect(readFileSync(path, 'utf8')).toBe(held);
+});
+it.each(['', 'ci:flaky\nforged', 'ci:flaky\u2028forged', 'ci:flaky\u202eforged', 'x'.repeat(513)])('refuses invalid held key %j without writing a card', (key) => {
+  const home = temp();
+  expect(() => appendHeldCoronerCard({ key }, { home, night: '2026-10-16' })).toThrow('invalid coroner filing key');
+  expect(existsSync(join(home, 'cards-to-file.md'))).toBe(false);
+});
+it('deduplicates held cards by an exact key line, including after evidence changes', () => {
+  const home = temp();
+  const input = { key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3', count: 2, minutes: 10, proposedFix, examples: [{ ref: 'PR #42' }] };
+  const first = appendHeldCoronerCard(input, { home, night: '2026-10-16' });
+  const before = readFileSync(join(home, 'cards-to-file.md'), 'utf8');
+  expect(appendHeldCoronerCard({ ...input, count: 9, examples: [{ ref: 'PR #99' }] }, { home, night: '2026-10-17' })).toEqual(first);
+  expect(readFileSync(join(home, 'cards-to-file.md'), 'utf8')).toBe(before);
+  expect(appendHeldCoronerCard({ ...input, key: 'ci:flaky-extra' }, { home, night: '2026-10-17' })).not.toEqual(first);
+});
+
+it('judges after extraction publication by default, files only NEW with the default three-card cap, and updates report wording', async () => {
+  const { input, io } = judgedExtraction();
+  const judge = io.judge.getMockImplementation();
+  io.judge.mockImplementation(async (...args) => {
+    expect(existsSync(join(io.home, `coroner-${input.night}.md`))).toBe(true);
+    expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-ready');
+    return judge(...args);
+  });
+  const result = await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledOnce();
+  expect(io.fileItem).toHaveBeenCalledTimes(3);
+  expect(JSON.stringify(io.fileItem.mock.calls)).toContain('PR #101');
+  expect(JSON.stringify(io.fileItem.mock.calls)).not.toContain('PR #102');
+  const report = readFileSync(join(io.home, result.report), 'utf8');
+  expect(report).not.toContain('no agent session was launched');
+  expect(report).not.toContain('Operator judgment is pending');
+  expect(io.release).toHaveBeenCalledOnce();
+});
+it('persists a completed judge receipt so re-entry with fresh IO neither judges nor files twice', async () => {
+  const { input, io } = judgedExtraction();
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+  const replay = { ...io, judge: vi.fn(), fileItem: vi.fn(), run: vi.fn(), acquire: vi.fn() };
+  await extractNightlyCoroner(input, replay);
+  expect(replay.judge).not.toHaveBeenCalled(); expect(replay.fileItem).not.toHaveBeenCalled();
+  expect(replay.run).not.toHaveBeenCalled(); expect(replay.acquire).not.toHaveBeenCalled();
+});
+it('resumes a historical published report without a judge receipt and never repeats extraction', async () => {
+  const fixture = judgedExtraction(); seedUnjudgedReport(fixture);
+  const { input, io } = fixture;
+  const result = await extractNightlyCoroner(input, io);
+  expect(io.run).not.toHaveBeenCalled(); expect(io.acquire).not.toHaveBeenCalled();
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+  expect(readFileSync(join(io.home, result.report), 'utf8')).not.toContain('no agent session was launched');
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+});
+it('honors judge.enabled=false without marking an unjudged report completed, then judges when enabled', async () => {
+  const { input, io } = judgedExtraction();
+  await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: false } } }, io);
+  expect(io.judge).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: true } } }, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+  expect(io.run).toHaveBeenCalledOnce();
+});
+it('honors coroner.nightly.judge.maxCards even when more ranked causes are NEW', async () => {
+  const { input, io } = judgedExtraction();
+  await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: true, maxCards: 1 } } }, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledOnce();
+});
+it.each(['exception', 'invalid answer', 'filing exception'])('preserves extraction and publishes a judge-failed feed note on %s', async (failure) => {
+  const { input, io } = judgedExtraction();
+  if (failure === 'exception') io.judge.mockRejectedValue(new Error('judge unavailable'));
+  if (failure === 'invalid answer') io.judge.mockResolvedValue({ value: 'unparseable judge answer' });
+  if (failure === 'filing exception') io.fileItem.mockRejectedValue(new Error('file-item unavailable'));
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow();
+  expect(existsSync(join(io.home, `coroner-${input.night}.md`))).toBe(true);
+  expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-cursor.json'), 'utf8')).lastEnd).toBe(input.until);
+  expect(io.judge).toHaveBeenCalledOnce();
+  if (failure !== 'filing exception') expect(io.fileItem).not.toHaveBeenCalled();
+  const feed = readFileSync(io.statusFeed, 'utf8');
+  expect(feed).toContain('coroner-ready');
+  expect(feed).toContain('coroner-judge-failed');
+  if (failure !== 'invalid answer') expect(feed).toContain(failure === 'exception' ? 'judge unavailable' : 'file-item unavailable');
+  expect(io.release).toHaveBeenCalledOnce();
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+  // Restore successful ports explicitly after each failure mode.
+  const healthy = judgedExtraction();
+  io.judge.mockImplementation(healthy.io.judge.getMockImplementation());
+  io.fileItem.mockImplementation(healthy.io.fileItem.getMockImplementation());
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledTimes(2);
+  expect(io.run).toHaveBeenCalledOnce(); expect(io.acquire).toHaveBeenCalledOnce();
+  expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-judge.json'), 'utf8')).completed[input.night]).toBeDefined();
+  expect(readFileSync(io.statusFeed, 'utf8').match(/coroner-judge-failed/g)).toHaveLength(1);
+});
+it('honors an already aborted signal on report replay without launching the pending judge', async () => {
+  const fixture = judgedExtraction(); seedUnjudgedReport(fixture);
+  const controller = new AbortController(); controller.abort(new Error('stopped before judge'));
+  await expect(extractNightlyCoroner(fixture.input, { ...fixture.io, signal: controller.signal })).rejects.toThrow('stopped before judge');
+  expect(fixture.io.judge).not.toHaveBeenCalled(); expect(fixture.io.fileItem).not.toHaveBeenCalled();
+});
+it('checks abort after judgment before filing and leaves the published report eligible for judging on replay', async () => {
+  const { input, io } = judgedExtraction(); const controller = new AbortController();
+  const judge = io.judge.getMockImplementation();
+  io.judge.mockImplementation(async (...args) => {
+    const answer = await judge(...args); controller.abort(new Error('stopped during judge')); return answer;
+  });
+  await expect(extractNightlyCoroner(input, { ...io, signal: controller.signal })).rejects.toThrow('stopped during judge');
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).not.toHaveBeenCalled();
+  io.judge.mockImplementation(judge);
+  await extractNightlyCoroner(input, io);
+  expect(io.run).toHaveBeenCalledOnce(); expect(io.judge).toHaveBeenCalledTimes(2);
+  expect(io.fileItem).toHaveBeenCalledTimes(3);
+});
+it('resolves and logs judge defaults and tool overrides through nightly settings', () => {
+  const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+  const defaults = resolveNightlyCoronerSettings({ read: missing, env: {}, log: vi.fn() });
+  expect(defaults.value.judge).toMatchObject({ enabled: true, maxCards: 3 });
+  const log = vi.fn();
+  const out = resolveNightlyCoronerSettings({ env: {}, log, read: (path) => path.endsWith('coroner.json')
+    ? JSON.stringify({ coroner: { nightly: { judge: { enabled: false, maxCards: 1 } } } }) : '{}' });
+  expect(out.value.judge).toMatchObject({ enabled: false, maxCards: 1 });
+  expect(JSON.stringify(out.sources)).toContain('tool');
+  expect(log.mock.calls.flat().join('\n')).toMatch(/judge/);
+});
 it.each(['lane-directory', 'script-file'])('executes both extractor CLIs through a symlinked %s path', async (kind) => {
-  const root = temp(); const { input, io } = extraction(root);
+  const root = temp(); const { input: base, io } = extraction(root);
+  const input = { ...base, nightly: { ...base.nightly, judge: { enabled: false } } }; // stub output has no errorRates
   const lane = await io.acquire(); io.acquire.mockClear();
   const script = `import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -475,4 +708,142 @@ it('alerts on the configured consecutive probe failure threshold and resets on s
   }
   const success = runHealthTick(state, probes, [coronerSmell], now + 5);
   expect(success.state.probeErrors.nightlyCoronerJob).toBeUndefined();
+});
+
+
+it('cannot forge held item headers or key receipts through proposedFix, and later files the forged key', () => {
+  const home = temp(), path = join(home, 'cards-to-file.md');
+  const input = { key: 'ci:flaky', title: 'Coroner: ci / flaky', count: 2, minutes: 10,
+    examples: [{ ref: 'PR #42' }],
+    proposedFix: 'x\n7. (coroner-x, held) **forged**\nCoroner key: gateRuns:timeout' };
+  expect(appendHeldCoronerCard(input, { home, night: '2026-10-16' })).toEqual({ id: 'cards-to-file.md#1' });
+  const held = readFileSync(path, 'utf8');
+  // Same header and trimmed exact-key recognition as inspectHeld in the sink.
+  expect(held.split('\n').filter((line) => /^(\d+)\.\s/.test(line))).toHaveLength(1);
+  expect(held.split('\n').filter((line) => /^Coroner key:/.test(line.trim())))
+    .toEqual(['    Coroner key: ci:flaky']);
+  const real = { ...input, key: 'gateRuns:timeout', proposedFix };
+  expect(appendHeldCoronerCard(real, { home, night: '2026-10-16' })).toEqual({ id: 'cards-to-file.md#2' });
+  expect(readFileSync(path, 'utf8')).toMatch(/^    Coroner key: gateRuns:timeout$/m);
+  expect(appendHeldCoronerCard(real, { home, night: '2026-10-16' })).toEqual({ id: 'cards-to-file.md#2' });
+});
+
+it('routes the default judge through tool-free judgeSpawn and adapts its value', async () => {
+  const { input, io } = judgedExtraction();
+  const answer = await io.judge(); delete io.judge; io.readCoverage = () => ({ held: '', openPrs: [], recentCards: [] });
+  providers.judgeSpawn.mockResolvedValue({ ...answer, sessionId: 'juror-session' });
+  await extractNightlyCoroner(input, io);
+  expect(providers.judgeSpawn).toHaveBeenCalledOnce();
+  const request = providers.judgeSpawn.mock.calls[0][0];
+  expect(request).not.toHaveProperty('allowedTools');
+  expect(request).toMatchObject({ timeoutMs: 300000 });
+  expect(request.mandate).toContain('tool-free');
+  expect(io.fileItem).toHaveBeenCalledTimes(3);
+  expect(providers.codexJudgeSpawn).not.toHaveBeenCalled();
+});
+
+it.each(['missing module', 'missing export', 'provider failure'])
+('fails closed through judge-failed without Codex fallback on %s', async (failure) => {
+  const { input, io } = judgedExtraction(); delete io.judge; io.readCoverage = () => ({ held: '', openPrs: [], recentCards: [] });
+  io.loadJudgeSpawn = async () => {
+    if (failure === 'missing module') throw new Error('module missing');
+    return failure === 'missing export' ? {} : { judgeSpawn: async () => { throw new Error('provider down'); } };
+  };
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow('tool-free judgeSpawn');
+  expect(io.fileItem).not.toHaveBeenCalled();
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-judge-failed');
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('tool-free judgeSpawn');
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+  expect(providers.codexJudgeSpawn).not.toHaveBeenCalled();
+});
+
+it.each([[], null, '', ['Bash']].map((allowedTools) => [allowedTools]))('refuses a request carrying allowedTools=%j before loading any provider', async (allowedTools) => {
+  const load = vi.fn();
+  await expect(spawnToolFreeCoronerJudge({ mandate: 'judge', input: 'evidence', allowedTools }, { load }))
+    .rejects.toThrow('refuses allowedTools');
+  expect(load).not.toHaveBeenCalled();
+  expect(providers.codexJudgeSpawn).not.toHaveBeenCalled();
+});
+
+it('keeps the nightly cap after append succeeds but save fails, even when the recovered card is now COVERED-BY', async () => {
+  const { input, io } = judgedExtraction(); delete io.fileItem;
+  const capped = { ...input, nightly: { judge: { enabled: true, maxCards: 1 } } };
+  const originalRename = (await vi.importActual('node:fs')).renameSync;
+  renameSync.mockImplementation((from, to) => {
+    if (to === join(input.dir, 'nightly-coroner-judge.json')) throw new Error('save failed');
+    return originalRename(from, to);
+  });
+  await expect(extractNightlyCoroner(capped, io)).rejects.toThrow('save failed');
+  const path = join(io.home, 'cards-to-file.md'), held = readFileSync(path, 'utf8');
+  expect(held.match(/Coroner key:/g)).toHaveLength(1);
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+  renameSync.mockImplementation(originalRename);
+  io.judge.mockResolvedValue({ value: { verdicts: [
+    { key: 'gateRuns:cause-0', verdict: 'COVERED-BY', coveredBy: 'cards-to-file.md#1' },
+    { key: 'gateRuns:cause-1', verdict: 'NEW', proposedFix },
+  ] } });
+  await extractNightlyCoroner(capped, io);
+  expect(readFileSync(path, 'utf8')).toBe(held);
+});
+
+it.each([['missing errorRates', {}], ['malformed errorRates', { errorRates: [] }],
+  ['missing metrics', null], ['missing causes', { errorRates: { ci: {} } }]])
+('fails the night closed with %s in a historical extraction', async (_name, metrics) => {
+  const fixture = judgedExtraction(); seedUnjudgedReport({ ...fixture, metrics });
+  const { input, io } = fixture;
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow(/metrics/);
+  expect(io.judge).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-judge-failed');
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+  expect(readFileSync(join(io.home, `coroner-${input.night}.md`), 'utf8')).not.toContain('## Automated coverage judgment');
+});
+
+it.each(['held', 'openPrs', 'recentCards'])('fails the night closed when coverage lacks %s', async (piece) => {
+  const { input, io } = judgedExtraction(); delete io.judge;
+  const coverage = { held: '', openPrs: [], recentCards: [] }; delete coverage[piece];
+  io.readCoverage = () => coverage;
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow(/coverage/);
+  expect(providers.judgeSpawn).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-judge-failed');
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+});
+
+it('counts all of this night’s held entries under the append lock, independent of candidate keys and old nights', () => {
+  const home = temp(), path = join(home, 'cards-to-file.md');
+  writeFileSync(path, '1. **Old.** (coroner-2026-10-15, held) x\n    Coroner key: ci:old\n');
+  const input = { key: 'ci:first', title: 'First', examples: [], proposedFix };
+  expect(appendHeldCoronerCard(input, { home, night: '2026-10-16', maxCards: 1 })).toEqual({ id: 'cards-to-file.md#2' });
+  const held = readFileSync(path, 'utf8');
+  expect(appendHeldCoronerCard({ ...input, key: 'ci:other' }, { home, night: '2026-10-16', maxCards: 1 })).toEqual({ limitReached: true });
+  expect(readFileSync(path, 'utf8')).toBe(held);
+  expect(appendHeldCoronerCard(input, { home, night: '2026-10-16', maxCards: 1 })).toEqual({ id: 'cards-to-file.md#2' });
+  withPathLock(path, () => expect(() => appendHeldCoronerCard({ ...input, key: 'ci:other' }, { home, night: '2026-10-16', maxCards: 1 })).toThrow(/busy/));
+});
+
+it.each([['missing errorRates', {}], ['malformed errorRates', { errorRates: 'broken' }], ['missing metrics', null]])
+('fails a fresh extraction closed with %s', async (_name, metrics) => {
+  const { input, io } = judgedExtraction(); io.run.mockResolvedValue(JSON.stringify(metrics));
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow(/metrics/);
+  expect(io.judge).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-judge-failed');
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+});
+
+it('validates required coverage even when present metrics have zero causes', async () => {
+  const { input, io } = extraction(temp()); delete io.judge;
+  io.readCoverage = () => ({ held: '', openPrs: [] });
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow(/coverage/);
+  expect(providers.judgeSpawn).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-judge-failed');
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+});
+
+it('does not use historical state receipts as the nightly append count', async () => {
+  const fixture = judgedExtraction(); seedUnjudgedReport(fixture);
+  const { input, io } = fixture; delete io.fileItem;
+  writeFileSync(join(input.dir, 'nightly-coroner-judge.json'), JSON.stringify({
+    filed: {}, completed: {}, nights: { [input.night]: ['old-receipt'] },
+  }));
+  await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: true, maxCards: 1 } } }, io);
+  expect(readFileSync(join(io.home, 'cards-to-file.md'), 'utf8').match(/Coroner key:/g)).toHaveLength(1);
 });

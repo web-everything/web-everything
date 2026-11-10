@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/operations/open-pr-io.mjs", "we:scripts/operations/__tests__/open-pr-io.test.mjs", "we:scripts/operations/__tests__/open-pr.test.mjs", "we:scripts/operations/effect-executor.mjs", "we:scripts/operations/__tests__/effect-executor.test.mjs", "we:scripts/lib/primary-checkout.mjs", "we:scripts/lib/__tests__/primary-checkout.test.mjs", "we:scripts/lib/daemon-sync-timeout-scan.mjs", "we:scripts/lib/__tests__/daemon-sync-timeout-scan.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/conveyor/soak/define-break-test.mjs", "we:scripts/conveyor/soak/__tests__/define-break-test.test.mjs", "we:scripts/conveyor/soak/run.mjs", "we:scripts/conveyor/soak/__tests__/run.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-01"
-preparedAgainstSha: "f2f29efc53968a5f81915c02718717bfe832bb38"
+preparedDate: "2026-11-03"
+preparedAgainstSha: "3ad6c4114ae1bd031a903c786de603faef122335"
 tags: []
 ---
 
@@ -80,3 +80,5 @@ Each named test below is to be authored during implementation. Each [A<n>] group
 - Other daemon families can be enrolled in the timeout scanner after auditing their tick call graphs and budgets. This item establishes enforcement for the reviewed build-dispatch daemon, not a claim of fleet-wide coverage.
 - A shared primary-checkout resolver is available for future callers that actually mean the primary checkout. Do not migrate coordination-sidecar or lane-relative paths merely because they use a similar home-relative layout.
 - If the measured additional CLI executions exceed the current soak budget, optimize scenario scheduling while preserving independent CLI assertions and full coverage; do not waive crashes or silently skip slow scenarios. Any broader CI topology change requires its own accurately scoped work.
+
+revalidated: The supplied diff only extends unrelated backlog template checks; it does not change the preparation’s premises, design, scope, or test/proof plan.

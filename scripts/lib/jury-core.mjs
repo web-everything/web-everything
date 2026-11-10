@@ -1,3 +1,4 @@
+import { FINDING_CLASSES, classAction, readFindingClassPolicy, validAlsoClasses } from './finding-class-policy.mjs';
 /**
  * jury-core.mjs — the subject-agnostic JURY ENGINE core (#2653, foundational slice of epic #2649).
  *
@@ -39,11 +40,13 @@
  */
 import { FALSE_FINDING_CAUSES } from './false-finding-causes.mjs';
 import { createHash } from 'node:crypto';
+import { canonicalRepoSlug } from './repo-slug.mjs';
 import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
 import { CARE_LEVELS } from './review-escalation.mjs';
-import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isTrustedMarkerAuthor,
+  readJudgeActorPolicy } from './marker-authorship.mjs';
 // #2438's labelled data fence (#2967 moved it to a leaf so this module can reach it — `review-core.mjs`,
 // where it used to live, imports THIS module, so importing back would be a cycle).
 import { FENCED_DATA_RULE, fenceUntrusted } from './mandate-fence.mjs';
@@ -372,6 +375,10 @@ export function normalizeFinding(raw) {
   if (!String(summary).trim()) return null;
   /** @type {Finding} */
   const out = { summary: String(summary).trim() };
+  if (raw.securityReachableToday === true) out.securityReachableToday = true;
+  if (FINDING_CLASSES.includes(raw.findingClass)) out.findingClass = raw.findingClass;
+  if (out.findingClass && validAlsoClasses(raw.alsoClasses, out.findingClass).length) out.alsoClasses = validAlsoClasses(raw.alsoClasses, out.findingClass);
+  if (typeof raw.classBasis === 'string') out.classBasis = raw.classBasis.trim();
   if (raw.file) out.file = String(raw.file);
   if (raw.failure_scenario) out.failure_scenario = String(raw.failure_scenario);
   if (raw.category) out.category = String(raw.category);
@@ -1384,8 +1391,8 @@ export function redTeamRequired(verdict) {
  * @param {{ran?: boolean, findings?: Finding[]|Array<object>}} [o]
  * @returns {'accept'|'changes'|'needs-human'|'prevention-outstanding'}
  */
-export function foldRedTeamVerdict({ ran = false, findings = [] } = {}) {
-  return deriveVerdict({ findings, humanRequired: !ran });
+export function foldRedTeamVerdict({ ran = false, findings = [], findingClasses = readFindingClassPolicy() } = {}) {
+  return deriveVerdict({ findings: findings.filter(f => classAction(f, findingClasses) !== 'defer-card'), humanRequired: !ran });
 }
 
 /**
@@ -3117,7 +3124,7 @@ export const CARRY_SEVERITY_FIELDS = Object.freeze(['verdict', 'impactIfUnfixed'
  * ignored-ruling ledger (`ruling-ledger.mjs#ignoredRulings`), so they cannot disagree on whether a carry stands.
  */
 export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] }) {
-  const backing = operatorRulings.filter(o => o.repo === repo && o.pr === pr
+  const backing = operatorRulings.filter(o => sameOwnerRuling(o, repo) && o.pr === pr
     && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
   return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
 }
@@ -3154,19 +3161,45 @@ function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings
     return latest && latest.from.runId === carried.from.runId && latest.from.key === carried.from.key
       && latest.result === carried.result && latest.card === carried.card ? backing : null;
   }
+  // A legacy-owner block on this finding written AFTER the backing ruling withdraws the carry, as it ends
+  // `findCarriedOperatorRuling`'s search: the persisted carry must not outlive the hold that search honours.
+  const after = operatorRulings.slice(operatorRulings.lastIndexOf(backing) + 1);
+  for (const o of after) {
+    if (!isLegacyOwnerBlock(o, repo) || o.pr !== pr || o.head === head) continue;
+    const ruled = (Array.isArray(records) ? records : []).find(r => r.runId === o.runId && r.head === o.head && r.pr === pr
+      && canonicalRepoSlug(r.repo) === canonicalRepoSlug(repo))?.referrals.find(f => f.key === o.key)?.finding;
+    if (!ruled || sameFindingForClearing(ruled, target.finding)) return null;
+  }
   const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
     && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
   const from = source?.referrals.find(x => x.key === carried.from.key);
   return source && (!from || !sameFindingForClearing(from.finding, target.finding)) ? null : backing;
 }
 
+/** A `block` spelled with the repo's other (legacy/alias) owner: never adopted onto the record's spelling. */
+const isLegacyOwnerBlock = (o, repo) => Boolean(o) && o.result === 'block' && o.repo !== repo
+  && canonicalRepoSlug(o.repo) === canonicalRepoSlug(repo);
+/**
+ * Whether an operator ruling belongs to `repo`'s thread-order decision on a subject: a clearance only under the exact
+ * spelling (it was adopted onto the record's spelling when it rules one), a block ALSO under the legacy spelling it was
+ * written with. A hold must never be hidden by a spelling mismatch, so every "latest ruling on this subject" read
+ * uses this one definition.
+ */
+const sameOwnerRuling = (o, repo) => o.repo === repo || isLegacyOwnerBlock(o, repo);
+
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
   for (const o of [...operatorRulings].reverse()) {
-    if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
-    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
+    // A block written under the repo's legacy owner stays under that spelling (see `readOperatorRulings`), so it is
+    // matched by canonical repo: it must end this search exactly like a block spelled as the records are.
+    const legacyBlock = isLegacyOwnerBlock(o, repo);
+    if (o.head === head || (o.repo !== repo && !legacyBlock) || o.pr !== pr) continue;
+    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.pr === pr
+      && (r.repo === repo || (legacyBlock && canonicalRepoSlug(r.repo) === canonicalRepoSlug(repo))));
     const finding = record?.referrals.find(f => f.key === o.key)?.finding;
+    // A legacy-owner block whose record or finding cannot be read fails closed: nothing carries past it.
+    if (legacyBlock && !finding) return null;
     // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
     // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
     if (!finding || !sameFindingForClearing(finding, target)) continue;
@@ -3296,6 +3329,18 @@ export function isSecurityClassFinding(f) {
 export function findSameHeadSiblingRuling(referral, { records = [], operatorRulings = [], head, repo, pr, sameGapDecisions } = {}) {
   if (!referral?.key || !referral.finding || !head || !repo || !pr
     || !Array.isArray(records) || !Array.isArray(operatorRulings)) return null;
+  // A legacy-owner block stays under its written spelling. It must still veto a sibling carry, including one
+  // already persisted, or an adopted clearance on another run could erase the hold. Unlike visible blocks,
+  // these cannot participate in exact thread-order overrides: only an explicit ruling on the target can clear it.
+  for (const o of operatorRulings) {
+    if (!o || o.result !== 'block' || o.head !== head || o.pr !== pr || o.repo === repo
+      || canonicalRepoSlug(o.repo) !== canonicalRepoSlug(repo)) continue;
+    const record = records.find(r => r?.runId === o.runId && r.head === head && r.repo === repo && r.pr === pr);
+    const ruled = record?.referrals?.find(f => f.key === o.key);
+    if (!ruled?.finding || o.key === referral.key || sameGapSameHead(
+      { ...ruled.finding, original: ruled.original ?? ruled.finding },
+      { ...referral.finding, original: referral.original ?? referral.finding }, { decisions: sameGapDecisions })) return null;
+  }
   const seen = new Set();
   for (const o of [...operatorRulings].reverse()) {
     if (!o || o.head !== head || o.repo !== repo || o.pr !== pr || !o.runId || !o.key) continue;
@@ -3396,7 +3441,7 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   }
   // An operator ruling is decided by the LATEST one on its (head, run, finding): a block the operator later re-ruled
   // is no longer standing (the same rule `carriedBackingHolds` applies to an operator carry).
-  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === repo && o.pr === pr);
+  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameOwnerRuling(o, repo) && o.pr === pr);
   if (ops.some(o => o.result === 'block' && sameId(o.head, o.runId, o.key)
     && ops.filter(p => p.head === o.head && p.runId === o.runId && p.key === o.key).at(-1) === o)) return null;
   return ruling;
@@ -3543,8 +3588,16 @@ export function referralRecordState(record, options = {}) {
     // #4979 — the operator's ruling on THIS exact (repo, PR, head, run, finding) is the explicit, authorized
     // supersession: the latest one decides, over the reviewer's. It is pinned to the record's head, so a new
     // head (or an unreadable card) leaves the finding pending exactly like a reviewer ruling would.
-    const operator = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === record.repo
-      && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key).at(-1);
+    const onSubject = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameOwnerRuling(o, record.repo)
+      && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key);
+    // A legacy-owner block stays invisible as a ruling (it holds the finding PENDING, never cleared), so one written
+    // after a clearance spelled as the record withdraws that clearance instead of being skipped by the spelling filter.
+    const operator = onSubject.filter(o => !isLegacyOwnerBlock(o, record.repo)).at(-1);
+    if (operator && operator.result !== 'block'
+      && onSubject.slice(onSubject.lastIndexOf(operator) + 1).some(o => isLegacyOwnerBlock(o, record.repo))) {
+      pending.push(f.key);
+      continue;
+    }
     if (operator) {
       if (head !== record.head || (operator.result === 'card' && !cardReadable(operator.card))) pending.push(f.key);
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
@@ -3788,10 +3841,14 @@ export function validateOperatorRuling(r) {
   try {
     if (!r || r.version !== 1 || !/^[^/\s]+\/[^/\s]+$/.test(r.repo) || !Number.isInteger(r.pr) || r.pr < 1
       || !/^[a-f0-9]{40}$/.test(r.head)) return false;
-    if (typeof r.actor !== 'string' || !/^[\w-]+$/.test(r.actor)) return false;
+    if (typeof r.actor !== 'string' || !(/^[\w-]+$/.test(r.actor) || r.actor === JUDGE_ACTOR)) return false;
     // `auto-policy` (review.referralDefault=auto-block) is NOT an operator. It may only HOLD: every ruling is `block`.
     if (r.actor.toLowerCase() === AUTO_POLICY_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
+    else if (r.actor === JUDGE_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
     else if (!OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
+    // PR #6529: the optional `poster` binds who may author the comment. Only an operator ruling carries it, and it can
+    // only name that same operator (lower-case, as the identity check returns it).
+    if (r.poster !== undefined && (r.poster !== r.actor.toLowerCase() || !OPERATOR_LOGINS.includes(r.poster))) return false;
     if (typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel) || r.channel.length > 200) return false;
     if (typeof r.reason !== 'string' || !r.reason.trim() || r.reason.length > 4000) return false;
     if (typeof r.at !== 'string' || !Number.isFinite(Date.parse(r.at))) return false;
@@ -3827,11 +3884,34 @@ export function buildOperatorRulingComment(r) {
   });
   const auto = r.actor.toLowerCase() === AUTO_POLICY_ACTOR;
   return `## ${auto ? 'Automatic policy ruling' : 'Operator ruling'} on mandatory referrals\n\n`
-    + (auto ? `Recorded by policy, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`. The operator can override it with a card or not-real ruling.\n`
+    + (r.actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n` : auto ? `Recorded by policy, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`. The operator can override it with a card or not-real ruling.\n`
       : `Recorded on the operator's explicit instruction: @${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n`)
     + `This rules only on the findings listed; it applies to this head only and does not change review labels.\n\n`
     + `${quote}\n\n${lines.join('\n')}\n\n`
     + `<!-- ${OPERATOR_RULING_MARKER}: ${Buffer.from(JSON.stringify(r)).toString('base64')} -->`;
+}
+
+/**
+ * When operator-ruling `poster` stamping shipped (PR #6529, commit 564af17f8b). An unstamped ruling posted by
+ * automation counts as a legacy ruling only if GitHub dated the comment before this. A fixed constant on purpose:
+ * a setting or environment override would reopen the bypass it closes.
+ */
+export const OPERATOR_RULING_POSTER_STAMP_CUTOFF = '2026-11-08T12:22:33Z';
+const OPERATOR_RULING_POSTER_STAMP_CUTOFF_MS = Date.parse(OPERATOR_RULING_POSTER_STAMP_CUTOFF);
+
+/**
+ * True only when GitHub's own metadata proves the comment was written AND last edited before poster stamping
+ * shipped. GitHub keeps `created_at` on an edit, so a creation date alone would let anyone holding the App
+ * credential rewrite an old automation comment into a fresh unstamped clearing ruling. The edit proof is GraphQL
+ * `includesCreatedEdit === false` (never edited) or a REST `updated_at` / `updatedAt` before the cutoff. Missing or
+ * unparseable metadata is not proof.
+ */
+function commentPredatesPosterStamp(comment) {
+  if (!comment || typeof comment !== 'object') return false;
+  const ms = (at) => (typeof at === 'string' ? Date.parse(at) : NaN);
+  if (!(ms(comment.createdAt ?? comment.created_at) < OPERATOR_RULING_POSTER_STAMP_CUTOFF_MS)) return false;
+  return comment.includesCreatedEdit === false
+    || ms(comment.updatedAt ?? comment.updated_at) < OPERATOR_RULING_POSTER_STAMP_CUTOFF_MS;
 }
 
 /**
@@ -3848,9 +3928,32 @@ export function parseOperatorRulingComment(comment) {
   let record = null;
   try { record = match ? JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')) : null; } catch { record = null; }
   const head = typeof record?.head === 'string' && /^[a-f0-9]{40}$/.test(record.head) ? record.head : undefined;
+  if (record?.actor === JUDGE_ACTOR && (!AUTOMATION_LOGINS.includes(login)
+    || !Array.isArray(record.rulings) || record.rulings.some(x => x?.result !== 'block'))) return null;
   if (!trusted || !record || !validateOperatorRuling(record)) return { malformed: true, head };
   try { if (buildOperatorRulingComment(record) !== normalized) return { malformed: true, head }; }
   catch { return { malformed: true, head }; }
+  // A judge record only adds holds (#6494): no supersession (a judge block never retires a standing ruling) and no
+  // review-clearance token anywhere — the red-team reader's refusal. Checked only AFTER the integrity check above, so a
+  // hand-edited judge comment stays malformed (and holds) instead of being silently dropped.
+  if (record.actor === JUDGE_ACTOR && (record.rulings.some(x => Array.isArray(x?.supersedes) && x.supersedes.length)
+    || JUDGE_RESERVED_TOKEN_RE.test(normalized))) return null;
+  // PR #6529 red team (rounds 2-3, card x5dmuoa): a record stamped with `poster` names the ONE login that may author it
+  // (the writer stamps the identity it checked). Any other author — an automation copy posted after a per-call credential
+  // fallback split the check from the post, or another operator — can only HOLD: its clearing rows (card / not-real) are
+  // dropped and its `block` rows are kept, so a re-block meant to withdraw an earlier clearance still withdraws it (fail
+  // closed). With no block row it is no ruling at all (null, not `malformed`, so a clearing copy a failed cleanup left
+  // behind can never block the operator's own re-run).
+  // An unstamped record authored by an operator keeps the trusted-author rule above. An unstamped record authored by
+  // automation (PR #5925: operator rulings posted under the App before the stamp existed) keeps it ONLY when GitHub
+  // dated the comment, and its last edit, before poster stamping shipped. Omitting `poster` is otherwise a bypass (PR
+  // #6529 red team, result 5acf690a8e9b87a6): a missing, unparseable or later date reads exactly like a poster mismatch.
+  const legacyAutomation = record.poster === undefined && !OPERATOR_LOGINS.includes(login)
+    && !commentPredatesPosterStamp(comment);
+  if (legacyAutomation || (record.poster !== undefined && login !== record.poster)) {
+    const holds = record.rulings.filter(x => x.result === 'block');
+    return holds.length ? { record: { ...record, rulings: holds } } : null;
+  }
   return { record };
 }
 
@@ -3864,10 +3967,45 @@ export function operatorRulingId(o) {
 }
 
 /** Every valid operator ruling in thread order, flattened to one entry per (run, finding). */
-export function readOperatorRulings(comments, { head } = {}) {
+export function readOperatorRulings(comments, { head, judgePolicy = () => readJudgeActorPolicy().value } = {}) {
   const rulings = [];
   let malformed = false;
   const current = /^[a-f0-9]{40}$/.test(head ?? '') ? head : null;
+  // #6170 — a repo that changed owner is spelled two ways in one thread (a ruling written from a clone with the old
+  // origin, records written under the new name). A ruling takes the spelling of the ONE record it rules on, found by
+  // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
+  // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
+  let recordRepos, blockRepos;
+  let judge; // the judge policy, read once per call and only when a judge record is met
+  const blockSubject = (repo, pr, head, runId, key) => JSON.stringify([canonicalRepoSlug(repo), pr, head, runId, key]);
+  const spellingOf = (repo, pr, head, runId, key, result) => {
+    // A `block` never adopts: only a clearing ruling is made MORE visible, so a spelling mismatch can never hide a hold.
+    if (result === 'block' || canonicalRepoSlug(repo) === repo) return repo;
+    recordRepos ??= readReferralRecords(comments).records;
+    // Only a record that names THIS finding counts, and only when every such record agrees on one spelling: an
+    // ambiguous match keeps the ruling's own spelling, so it can never attach to a record it does not rule.
+    const spellings = new Set(recordRepos.filter(x => x.pr === pr && x.head === head && x.runId === runId
+      && canonicalRepoSlug(x.repo) === canonicalRepoSlug(repo) && x.referrals.some(f => f.key === key)).map(x => x.repo));
+    if (spellings.size !== 1) return repo;
+    const [recordRepo] = spellings;
+    // Only a block on this exact subject that would stay invisible under the record's spelling vetoes adoption.
+    // Blocks already spelled like the record retain ordinary thread ordering, including later operator overrides.
+    if (!blockRepos) {
+      blockRepos = new Map();
+      for (const c of Array.isArray(comments) ? comments : []) {
+        const r = parseOperatorRulingComment(c)?.record;
+        if (!r) continue;
+        for (const y of r.rulings) {
+          if (y.result !== 'block') continue;
+          const subject = blockSubject(r.repo, r.pr, r.head, y.runId, y.key);
+          if (!blockRepos.has(subject)) blockRepos.set(subject, new Set());
+          blockRepos.get(subject).add(r.repo);
+        }
+      }
+    }
+    const blocks = blockRepos.get(blockSubject(repo, pr, head, runId, key));
+    return blocks && [...blocks].some(spelling => spelling !== recordRepo) ? repo : recordRepo;
+  };
   for (const comment of Array.isArray(comments) ? comments : []) {
     const parsed = parseOperatorRulingComment(comment);
     if (!parsed) continue;
@@ -3875,7 +4013,13 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
-      rulings.push(Object.freeze({ operator: true, repo: r.repo, pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+      if (r.actor === JUDGE_ACTOR) {
+        if (x.result !== 'block') continue;
+        // An unreadable policy refuses every judge row (fail closed) and is not re-read per row.
+        if (judge === undefined) { try { judge = judgePolicy() ?? null; } catch { judge = null; } }
+        if (judge?.enabled !== true || judge.actor !== JUDGE_ACTOR) continue;
+      }
+      rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId, x.key, x.result), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }

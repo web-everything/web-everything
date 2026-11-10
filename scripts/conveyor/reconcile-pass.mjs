@@ -1,6 +1,7 @@
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
+import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { pidIdentity } from '../lib/pid-alive.mjs';
+import { pidIdentity, holderStartedBy } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * reconcile-pass.mjs — the thin IO shell around `we:scripts/conveyor/reconcile-core.mjs` (#3296): read the four
@@ -77,21 +78,27 @@ import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.
 // `reconcile-core.mjs`-adjacent imports below) so it never collides with an overlay editing that region.
 import { getRequiredStatusChecks, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
-import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
+import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
+import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
+import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
+import { isGhThrottled } from '../lib/gh-deferred.mjs';
+import { withListRetry } from '../lib/gh-list-retry.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
+import { prFactKey, readThroughShadow } from './planner-fact-cache.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
 import { enrichPrsWithStandDownAutoProceed } from './stand-down-auto-proceed-io.mjs';
-import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
+import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, startedAtMs, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -110,7 +117,7 @@ import {
   // PR #2793 review — the per-PR evidence the green-check path now also requires (see `isMainGreenFixOwed`).
   mainLatestGreenShaForCheck,
 } from './main-red-recovery.mjs';
-import { readHungInfo, resolveHungThresholdMs, readClaudeAuthExpiredInfo, readIdleFinishedInfo, resolveIdleFinishedThresholdMs } from './hung-session.mjs';
+import { readHungInfo, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER, readClaudeAuthExpiredInfo, readIdleFinishedInfo, resolveIdleFinishedThresholdMs } from './hung-session.mjs';
 import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 // #4263 — the pure escalation reader (no fs/network of its own) reconcile-core.mjs already imports; re-scanning
 // comments HERE with the SAME function, never a re-derived copy, is what lets this enrich step find exactly the
@@ -312,22 +319,207 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments } = {}) {
-  const enrich = rows => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}) });
+/** `PR_LIST_JSON_FIELDS` minus `author`: `author` is not a snapshot field, so asking for it made EVERY production read
+ *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
+export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
+const pagedHeavyCache = new Map();
+/** A `fresh` read may reuse a cached heavy read (comments/body/files) only if it was taken AFTER its PR's `updatedAt`
+ *  second had ended: updatedAt has 1 s granularity, so a comment posted in the same second as a cached read would leave
+ *  updatedAt unchanged and stay invisible (a stand-down missed after the planner's baseline probe).
+ *  The proof uses SERVER timestamps only (never the local clock, which may be skewed against GitHub's): each newly
+ *  fetched entry is stamped `serverSeenMs` = the newest `updatedAt` in the same listing that preceded its heavy read.
+ *  Server time was therefore at least that value when the heavy read ran, so the entry is settled iff
+ *  `serverSeenMs - updatedAt >= FRESH_SETTLE_MS`. No stamp (a legacy or injected entry) fails closed: re-fetched. */
+export const FRESH_SETTLE_MS = 2000;
+export function stampServerSeen(prior, next, rows) {
+  const seen = Math.max(...(rows || []).map(r => Date.parse(r?.updatedAt)).filter(Number.isFinite));
+  if (!Number.isFinite(seen)) return next;
+  return Object.fromEntries(Object.entries(next || {}).map(([n, e]) =>
+    [n, e && e !== prior?.[n] && !Number.isFinite(e.serverSeenMs) ? { ...e, serverSeenMs: seen } : e]));
+}
+export function settledHeavyCache(cache) {
+  return Object.fromEntries(Object.entries(cache || {}).filter(([, e]) => Number.isFinite(e?.serverSeenMs)
+    && Number.isFinite(Date.parse(e?.updatedAt)) && e.serverSeenMs - Date.parse(e.updatedAt) >= FRESH_SETTLE_MS));
+}
+const authorByPr = new Map();
+
+/** An immutable per-PR fact (author), read through the ETag-cached REST reader and remembered in-process.
+ *  Shape matches `gh pr list --json author`. A failed/empty read FAILS CLOSED (the 5xx retry wrapper covers a transient one). */
+/** Bounds on ONE read's author lookups: the read runs synchronously inside the daemon's event loop, so it may never
+ *  wait on dozens of gh slots (live 2026-11-03 17:23 ET: a tick wedged for 18 minutes). Past either bound the read
+ *  is deferred (retry next tick); lookups already done stay memoised, so ticks converge. */
+/** The per-call timeout (AUTHOR_LOOKUP_TIMEOUT_MS) kills `gh` (execFileSync: code ETIMEDOUT).
+ *  That says nothing about the PR: it defers the read exactly like a slot throttle, it is no hard failure. */
+export function isGhCallTimeout(e) {
+  if (!e) return false;
+  if (e.code === 'ETIMEDOUT') return true; // execFileSync's own timeout marker; a bare SIGKILL (OOM, operator) is NOT a timeout
+  return /\b(ETIMEDOUT|timed out|Client\.Timeout|context deadline exceeded)\b/i.test(`${e.message ?? ''}\n${e.stderr ?? ''}`);
+}
+export const AUTHOR_LOOKUP_BUDGET = 16;
+export const AUTHOR_LOOKUP_DEADLINE_MS = 12_000;
+export const AUTHOR_LOOKUP_TIMEOUT_MS = 8_000;
+
+// A PR's author never changes, so resolved authors are also persisted (host-shared, next to the PR snapshot): one-shot
+// pass processes (smokes, CLI passes) start cold every time and would otherwise never converge under the per-read budget.
+const authorFile = () => (prSnapshotEnabled(process.env) ? join(prSnapshotDir(process.env), 'pr-authors.json') : null);
+let authorsLoaded = false;
+let authorSaveWarned = false;
+function loadAuthors() {
+  if (authorsLoaded) return;
+  authorsLoaded = true;
+  const f = authorFile();
+  if (!f) return;
+  try { for (const [k, v] of Object.entries(JSON.parse(readFileSync(f, 'utf8')))) if (v?.login && !authorByPr.has(k)) authorByPr.set(k, v); } catch { /* none yet */ }
+}
+function saveAuthors() {
+  const f = authorFile();
+  if (!f) return;
+  try { mkdirSync(dirname(f), { recursive: true }); const tmp = `${f}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(Object.fromEntries(authorByPr))); renameSync(tmp, f); }
+  catch (e) {
+    // Not fatal for this read, but one-shot passes depend on this file to converge under the lookup budget: say so (once).
+    if (!authorSaveWarned) { authorSaveWarned = true; console.error(`reconcile-pass: author memo not persisted (${String(e?.message ?? e).split('\n')[0]}) — cold passes may defer until it is writable`); }
+  }
+}
+
+export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget = AUTHOR_LOOKUP_BUDGET, deadlineMs = AUTHOR_LOOKUP_DEADLINE_MS, now = () => Date.now() } = {}) {
+  if (!repo) return rows;
+  loadAuthors();
+  const startedAt = now();
+  let lookups = 0;
+  const out = rows.map(pr => {
+    if (pr?.author || !Number.isInteger(pr?.number)) return pr;
+    const key = `${repo}#${pr.number}`;
+    if (!authorByPr.has(key)) {
+      if (lookups >= budget || now() - startedAt >= deadlineMs) {
+        throw Object.assign(new Error(`author lookups for ${repo} over budget (${lookups} done) — deferring the read`), { authorLookupDeferred: true });
+      }
+      lookups++;
+      let u;
+      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)', execOpts: { timeout: AUTHOR_LOOKUP_TIMEOUT_MS } })?.json?.user; }
+      catch (cause) {
+        // A gh SLOT throttle (no slot within the wait, not a server failure) defers the WHOLE read: never accept the row
+        // without its author, never hard-fail — the tick retries next time. A genuine 4xx / missing login still fails closed.
+        if (isGhThrottled(cause) || isGhCallTimeout(cause)) throw Object.assign(new Error(`author lookup of ${key} throttled or timed out — deferring the read`, { cause }), { authorLookupDeferred: true });
+        throw Object.assign(new Error(`author of ${key} unreadable — refusing to accept the row without it`, { cause }), { code: 'pr-author-unreadable', stderr: cause?.stderr });
+      }
+      if (!u?.login) throw Object.assign(new Error(`author of ${key} missing from the REST response — refusing to accept the row without it`), { code: 'pr-author-unreadable' });
+      authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
+      saveAuthors();
+    }
+    return { ...pr, author: authorByPr.get(key) };
+  });
+  for (const flag of ['sampled', 'discoveryIncomplete']) if (rows[flag] === true) Object.defineProperty(out, flag, { value: true }); // .map drops non-enumerable flags
+  return out;
+}
+
+export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null,
+  readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {},
+  // `fresh`: skip the host-shared snapshot (valid ~75 s, may predate the caller's own baseline probe) but still read small
+  // pages — never the heavy 200-row `gh pr list`. The fix daemon plans from such a read.
+  fresh = false } = {}) {
+  const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
+  const enrich = rows => {
+    if (factCache?.mode !== 'shadow') return enrichFresh(rows);
+    const out = [];
+    for (const pr of rows) {
+      const key = prFactKey({ ...pr, repo: attributionRepo ?? repo });
+      let freshPr;
+      const { shadow } = readThroughShadow({
+        cache: factCache, key,
+        // Keep time-sensitive annotations outside the stored heavy-read facts.
+        readFresh: () => {
+          const hydrated = enrichFresh([pr], { annotate: row => row });
+          if (hydrated.length !== 1) return { discoveryIncomplete: true };
+          freshPr = hydrated[0];
+          const { commits, comments, commentsComplete } = freshPr;
+          return { repo: attributionRepo ?? repo, number: pr.number,
+            ...(commits !== undefined ? { commits } : {}),
+            ...(comments !== undefined ? { comments } : {}),
+            ...(commentsComplete !== undefined ? { commentsComplete } : {}) };
+        },
+        complete: row => rows.discoveryIncomplete !== true && !rows.deferred
+          && !pr.discoveryIncomplete && !pr.deferred && !pr.readFailed && !pr['read-failed']
+          && !['deferred-low-budget', 'read-failed'].includes(pr.outcome)
+          && row.discoveryIncomplete !== true
+          && (!Object.hasOwn(freshPr ?? {}, 'commits') || Array.isArray(freshPr.commits)),
+      });
+      if (!shadow.same) console.error(`planner-cache-diff ${JSON.stringify({ repo: attributionRepo ?? repo, number: pr.number, diffs: shadow.diffs })}`);
+      if (!freshPr) continue;
+      // Annotate only the fresh hydrated row; the cache never supplies planner input.
+      const annotated = enrichPrsWithCompleteComments([freshPr], {
+        repo: attributionRepo ?? repo, readComments: () => freshPr.comments,
+      });
+      out.push(...annotated);
+    }
+    if (rows.discoveryIncomplete === true || out.length !== rows.length) Object.defineProperty(out, 'discoveryIncomplete', { value: true });
+    return out;
+  };
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
+  // Production path: ONE retried read (shared snapshot, else small pages) — a 502/503/504 is retried with backoff and a
+  // persistent failure THROWS (and raises a `gh-list-failed` event), it never reads as an empty list / "0 owed".
+  const direct = () => {
+    const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS];
+    if (repo) argv.push('--repo', repo);
+    // #x5n4zn3 — was bare (no timeout).
+    const out = exec('gh', argv, {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+      throttle: { deferrable: true }, // this reader checks isGhDeferred below
+    });
+    if (isGhDeferred(out)) return JSON.parse(String(out));
+    const parsed = parseListOutput(out, { repo });
+    // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
+    if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
+    return parsed;
+  };
+  if (exec === execFileSyncThrottled && repo) {
+    const usePaged = fresh || prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
+    let listed;
+    try { listed = withListRetry(() => {
+      const shared = fresh ? null : readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
+      if (shared) {
+        // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE or a rebuild-smoke child) is accepted; a sample flag in a live read is not.
+        if (shared.sampled === true && !sampleContextDeclared(process.env)) throw Object.assign(new Error(`open-PR snapshot for ${repo} is a sample but no sample is declared — refusing a partial inventory`), { code: 'pr-list-truncated' });
+        if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
+        return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest }) : shared; // author lookups sit INSIDE the retried read
+      }
+      if (!usePaged) return direct(); // snapshot explicitly disabled (opt-out / hermetic tests): the legacy direct read, no author fill
+      const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
+        cache: fresh ? settledHeavyCache(pagedHeavyCache.get(repo)) : (pagedHeavyCache.get(repo) || {}), maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
+      pagedHeavyCache.set(repo, stampServerSeen(pagedHeavyCache.get(repo), paged.cache, paged.rows));
+      // A capped inventory is incomplete discovery: fail loudly rather than plan as if the omitted PRs did not exist.
+      if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });
+      // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.
+      assertInventoryComplete({ repo, rows: paged.rows, totalCount: paged.totalCount, truncated: paged.truncated });
+      return withRestAuthors(paged.rows, { repo, readRest });
+    }, { repo, op: 'reconcile-pr-list', ...retryOpts }); } catch (e) {
+      if (e?.authorLookupDeferred) return { outcome: 'deferred-low-budget', deferred: true, priority: 'background', reason: 'author-lookup-throttled', message: String(e.message) };
+      throw e;
+    }
+    if (!Array.isArray(listed)) return listed;
+    return enrich(listed);
+  }
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
-  const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS];
-  if (repo) argv.push('--repo', repo);
-  // #x5n4zn3 — was bare (no timeout).
-  const out = exec('gh', argv, {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-    throttle: { deferrable: true }, // this reader checks isGhDeferred below
+  const rows = direct();
+  return Array.isArray(rows) ? enrich(rows) : rows;
+}
+
+/** UNCACHED `claude agents --json` status for one row's sessionId, or null when unreadable/absent (fail closed). */
+export function freshAgentStatus(row, exec = execFileSync) {
+  try {
+    const rows = JSON.parse(String(exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' }) || '[]'));
+    const hit = Array.isArray(rows) ? rows.find((r) => r?.sessionId && r.sessionId === row?.sessionId) : null;
+    return hit && typeof hit.status === 'string' ? hit.status : null;
+  } catch { return null; }
+}
+
+/** The reconcile-only idle-finished reader: opts in to the idle-row override with the full 3x hung pending-call grace
+ *  and an UNCACHED status read (R810); the session reaper never passes these opts. */
+export function makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec = execFileSync } = {}) {
+  return (a, n, t) => readIdleFinishedInfo(a, n, t, {
+    trustIdleRow: true, pendingGraceMs: hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER, freshStatusFor: (row) => freshAgentStatus(row, exec),
   });
-  if (isGhDeferred(out)) return JSON.parse(String(out));
-  const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? enrich(parsed) : [];
 }
 
 /**
@@ -362,7 +554,7 @@ export function defaultReadAgents({
   exec = execFileSync, env = process.env, completionFor = tryReadCompletion,
   hungInfoFor = readHungInfo, now = Date.now(), hungThresholdMs = resolveHungThresholdMs(env),
   authExpiredInfoFor = readClaudeAuthExpiredInfo,
-  idleFinishedInfoFor = readIdleFinishedInfo, idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
+  idleFinishedInfoFor = makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec }), idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
   bgIsolationStallInfoFor = readBgIsolationStallInfo,
   listJobs = undefined,
 } = {}) {
@@ -424,7 +616,7 @@ export function resolveLaneHead(cwd, exec = execFileSync) {
  * @param {Function} [identity]
  * @returns {boolean|null}
  */
-export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pidIdentity) {
+export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pidIdentity, { startedBy = null } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     kill(pid, 0);
@@ -432,7 +624,7 @@ export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pi
     if (e && e.code === 'ESRCH') return false;
     if (e?.code !== 'EPERM') return null;
   }
-  try { return identity(pid).alive; } catch { return null; }
+  try { return (Number.isFinite(startedBy) ? identity(pid, { startedBy }) : identity(pid)).alive; } catch { return null; }
 }
 
 /**
@@ -451,7 +643,8 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
   return (Array.isArray(agents) ? agents : []).map((a) => {
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
-    const alive = probe(Number.isInteger(a?.pid) ? a.pid : null);
+    const alive = probe(Number.isInteger(a?.pid) ? a.pid : null, undefined, undefined,
+      { startedBy: holderStartedBy(a, startedAtMs) });
     const { pidAlive: previousPidAlive, ...fresh } = a;
     return {
       ...fresh,
@@ -1094,13 +1287,13 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * `defaultReadPrs` already fetched every field for.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
- *   readPulls?:Function, repo?:string|null, defaultBranch?:string}} [o]
+ *   readPulls?:Function, repo?:string|null, defaultBranch?:string, onShadowFact?:Function|null}} [o]
  * @returns {Array<object>}
  */
 export function enrichPrsWithAlreadyLandedFacts(prs, {
   fetchRef = defaultFetchRef, readMergeBase = defaultReadMergeBase, readChanges = defaultReadChanges,
   findMatchingCommit = defaultFindMatchingMainCommit, readPulls = defaultReadPullsForCommit,
-  repo = null, defaultBranch = 'main',
+  repo = null, defaultBranch = 'main', onShadowFact = null,
 } = {}) {
   const list = Array.isArray(prs) ? prs : [];
   const mainRef = mainRefFor(defaultBranch);
@@ -1112,9 +1305,15 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
 
     fetchRef(prNumber, {});
     const base = readMergeBase(headSha, mainRef, {});
-    if (!base) return pr; // no common history to bound the search by — never guess
+    if (!base) {
+      try { onShadowFact?.(prNumber, { alreadyLanded: unread() }); } catch { /* Shadow reporting cannot affect reconciliation. */ }
+      return pr; // no common history to bound the search by — never guess
+    }
     const changes = readChanges(base, headSha, {});
-    if (!changes.length) return pr; // could not even read the diff — never guess containment from nothing
+    if (!changes.length) {
+      try { onShadowFact?.(prNumber, { alreadyLanded: unread() }); } catch { /* Shadow reporting cannot affect reconciliation. */ }
+      return pr; // could not even read the diff — never guess containment from nothing
+    }
 
     const fileMatches = changes.map((change) => ({
       file: change.path, matchedCommit: findMatchingCommit(change, { base, mainRef }),
@@ -1235,7 +1434,8 @@ export function enrichPrsWithSystemFixFacts(prs, { readSystemFixState = defaultR
 export function enrichPrsWithFixClaims(prs, { repo = 'we', readClaim = readLiveFixClaim } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
     let entry = null;
-    try { entry = readClaim({ repo, pr: Number(pr?.number) }); } catch { entry = null; }
+    // R502 item 4: a failed read is marked `fixClaimUnknown` (additive) so recovery rules that need PROOF of no claim fail closed.
+    try { entry = readClaim({ repo, pr: Number(pr?.number) }); } catch { return { ...pr, fixClaimUnknown: true }; }
     if (!entry?.meta?.who) return pr;
     return { ...pr, fixClaim: { who: entry.meta.who, why: entry.meta.why ?? '', claimedAt: entry.meta.claimedAt ?? null } };
   });

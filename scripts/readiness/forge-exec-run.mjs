@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
-import {readLimits, slotCpus, scopeLauncherArgv} from './forge-exec-limits.mjs';
+import {readLimits, slotLimits, scopeLauncherArgv, DEFAULT_LIMITS} from './forge-exec-limits.mjs';
 import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
 import {open, mkdir, readdir, writeFile, appendFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
@@ -9,9 +9,10 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree} from './forge-exec-bases.mjs';
+import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchStamp} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
+const FORGE_RUN_WALL_MS = 1_740_000;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const runName = value => typeof value === 'string' && /^r-[a-f0-9]{32}$/.test(value);
 const nonceOK = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
@@ -107,13 +108,116 @@ const exactKeys = (v,keys) => v && typeof v === 'object' && !Array.isArray(v) &&
 const validET = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}-0[45]:00$/.test(value)
   && Number.isFinite(Date.parse(value)) && easternTimestamp(Date.parse(value)) === value;
 const duration = n => Number.isSafeInteger(n) && n >= 0;
+/** Bounded resource grant from trusted per-slot limits, never from task env. */
+export function elasticRunLimits(limits, slot, units = 1) {
+  if (!Number.isSafeInteger(units) || units < 1 || units > 256) throw new Error('Invalid slot units');
+  const single = slotLimits(limits, slot);
+  const quota = value => typeof value === 'string' && /^[1-9]\d*%$/.test(value) ? Number(value.slice(0, -1)) : NaN;
+  const cpu = quota(single.cpuQuota) * units;
+  const parentCpu = quota(limits.parent?.cpuQuota);
+  if (!Number.isSafeInteger(cpu) || (units > 1 && (!Number.isSafeInteger(parentCpu) || cpu > parentCpu))) throw new Error('Slot units exceed parent CPU quota');
+  const memory = /^([1-9]\d*)([KMGT]?)$/.exec(single.memoryMax);
+  // An unlimited operator cap stays unlimited when scaled, as TasksMax does.
+  if (units > 1 && single.memoryMax !== 'infinity' && !memory) throw new Error('Unreadable slot memory limit');
+  const memoryMax = units === 1 || single.memoryMax === 'infinity' ? single.memoryMax : String(BigInt(memory[1]) * BigInt(units)) + memory[2];
+  // A finite scaled memory grant can never exceed a finite parent ceiling (as the CPU grant above).
+  if (units > 1 && memoryMax !== 'infinity' && limits.parent?.memoryMax !== undefined && limits.parent.memoryMax !== 'infinity') {
+    const bytes = text => { const m = /^([1-9]\d*)([KMGT]?)$/.exec(text); return m ? BigInt(m[1]) * 1024n ** BigInt('KMGT'.indexOf(m[2]) + 1) : null; };
+    const parentBytes = bytes(limits.parent.memoryMax);
+    if (parentBytes === null || bytes(memoryMax) > parentBytes) throw new Error('Slot units exceed parent memory limit');
+  }
+  return {cpuQuota:cpu+'%',memoryMax,cpus:Math.max(1,Math.ceil(cpu/100)),
+    tasksMax:single.tasksMax === 'infinity' ? 'infinity' : single.tasksMax * units,ioWeight:single.ioWeight};
+}
+
+/** Optional receipt-only diagnostic. Unknown evidence never certifies a healthy task count. */
+export function taskPressureNote(processCount, tasksMax) {
+  if (!Number.isSafeInteger(processCount) || processCount < 0 || !Number.isSafeInteger(tasksMax)
+    || tasksMax < 1 || BigInt(processCount) * 5n <= BigInt(tasksMax) * 4n) return {};
+  return {processCount,tasksMax,tasksNear:true,
+    tasksNote:`${processCount} cgroup tasks (processes and threads) exceed 80% of TasksMax=${tasksMax}`};
+}
+
+/** The transient scope replaces the single-slot slice ceiling only for an elastic grant. */
+export function elasticScopeArgv({limits,slot,units = 1,...options}) {
+  const launcher = scopeLauncherArgv({slot,...options});
+  if (units > 1) {
+    const grant = elasticRunLimits(limits,slot,units);
+    launcher[launcher.findIndex(arg=>arg.startsWith('--slice='))] = '--slice=forge-exec.slice';
+    launcher.splice(launcher.indexOf('--'),0,'--property=CPUQuota='+grant.cpuQuota,
+      '--property=MemoryMax='+grant.memoryMax,'--property=MemorySwapMax=0',
+      '--property=TasksMax='+grant.tasksMax,'--property=IOWeight='+grant.ioWeight);
+  }
+  return launcher;
+}
+
+/** Receipts keep runner allocation and negotiation state private in every protocol version. */
+export function createRunReceipt(prepared, payload, tasks = {}) {
+  const state = {v:prepared.v,nonce:prepared.nonce,run:prepared.run};
+  return {...state,...payload,...(prepared.receiptCapabilities?.taskPressure === 1 ? tasks : {})};
+}
+
+/** Old telemetry clients send no stdin (and old runners ignore it). Bound negotiation before sampling. */
+export function readTelemetryRequest(input) {
+  if (input.isTTY) return Promise.resolve({});
+  return new Promise(resolve => {
+    let text = '', settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      input.removeListener('data',data); input.removeListener('end',end); input.removeListener('error',unknown);
+      input.pause(); resolve(value);
+    };
+    const unknown = () => {
+      process.stderr.write('forge-exec-run: telemetry capability unavailable; using legacy schema\n');
+      finish({});
+    };
+    const data = chunk => {
+      text += chunk.toString('utf8');
+      if (Buffer.byteLength(text) > 1024) unknown();
+    };
+    const end = () => {
+      if (!text.trim()) return finish({});
+      try {
+        const value = JSON.parse(text);
+        finish(value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+      } catch { unknown(); }
+    };
+    const timer = setTimeout(unknown,250);
+    input.on('data',data); input.once('end',end); input.once('error',unknown);
+    input.resume();
+  });
+}
+
+// R518: a prepared->running rename can make ONE directory listing miss a live run entirely (neither name seen). The
+// active-run list is only published when two consecutive listings agree. Otherwise `stable` is false and `count` is the
+// size of the UNION of every listing taken, at least 1 (the churn itself proves a run exists), so a reader that falls
+// back to the zero-active-runs rule never sees a false zero.
+export async function stableActiveRunIds(list,tries=5) {
+  const ids=names=>[...new Set(names.filter(n=>/^r-[a-f0-9]{32}\.(prepared|running)$/.test(n)).map(n=>n.slice(0,-n.split('.').pop().length-1)))].sort();
+  const union=new Set();
+  let previous=ids(await list());
+  previous.forEach(id=>union.add(id));
+  for(let i=1;i<tries;i++){
+    const next=ids(await list());
+    next.forEach(id=>union.add(id));
+    if(next.length===previous.length&&next.every((id,j)=>id===previous[j]))return {stable:true,ids:next,count:next.length};
+    previous=next;
+  }
+  return {stable:false,ids:undefined,count:Math.max(1,union.size)};
+}
 export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
   const v=JSON.parse(text.toString());
-  if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
+  const legacy = {...v}; delete legacy.limits;
+  // R518: activeRunIds is optional (an older Forge omits it); when present it must be exactly the active runs.
+  const withIds=exactKeys(legacy,'activeRunIds,activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET');
+  if (!(withIds||exactKeys(legacy,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET')) || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
+    || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
+      ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
       || (exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET') && typeof r.prewarmed==='boolean'))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
@@ -385,7 +489,44 @@ finally:
 // A root supervisor is a subreaper: children which call setsid/double-fork are
 // adopted here, and killed before the ops process publishes any evidence.
 export const supervisorSource = String.raw`
-import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat
+import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat, threading, select, traceback
+# Diagnostics are best-effort: a closed, broken or full-and-undrained stderr pipe
+# must never abort or block worker cleanup, status publication or the supervisor's
+# own exit. The write goes straight to the descriptor (never through sys.stderr,
+# whose pending buffer would make the interpreter's exit flush fail or block).
+# A pipe with no room is skipped without starting a thread (so a stalled sink
+# never adds a task to the run cgroup); otherwise the write runs on a daemon
+# thread that is waited for only briefly. One failed, partial or stalled write
+# disables the rest. Uncaught errors are reported through the same path.
+diag_off = False
+def diag(message):
+    global diag_off
+    if diag_off: return
+    def emit(fd):
+        global diag_off
+        try:
+            data = message.encode('utf-8', 'replace')
+            while data:
+                data = data[os.write(fd, data):]
+        except BaseException:
+            diag_off = True
+    try:
+        fd = sys.stderr.fileno()
+        probe = select.poll()
+        probe.register(fd, select.POLLOUT)
+        ready = probe.poll(0)
+        if not ready or ready[0][1] & (select.POLLERR | select.POLLHUP | select.POLLNVAL) or not ready[0][1] & select.POLLOUT:
+            diag_off = True
+            return
+        sender = threading.Thread(target=emit, args=(fd,), daemon=True)
+        sender.start()
+        sender.join(0.25)
+        if sender.is_alive(): diag_off = True
+    except BaseException:
+        diag_off = True
+def crash_hook(kind, error, trace):
+    diag(''.join(traceback.format_exception(kind, error, trace)))
+sys.excepthook = crash_hook
 PR_SET_CHILD_SUBREAPER = 36
 if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
     raise RuntimeError('subreaper unavailable')
@@ -405,6 +546,10 @@ with os.fdopen(fd) as stream:
     reservation = json.load(stream)
 if any(reservation.get(key) != writer.get(key) for key in ('run', 'nonce', 'slot')):
     raise RuntimeError('Reservation mismatch; use local fallback')
+# The cancellation path is root/ops-owned and unique to this run, so a late
+# cancellation cannot stop a replacement reservation on the same worker UID.
+def cancelled():
+    return bool(cfg.get('cancel')) and os.path.lexists(cfg['cancel'])
 # Keep the lease in a root child even if the supervisor is killed mid-fork.
 # Close its copy only AFTER UID drop, before exposing any task-controlled code.
 writer_fds = (writer_fd,)
@@ -417,16 +562,77 @@ def drop():
     elif os.getuid() != uid or os.getgid() != gid:
         raise RuntimeError('cannot drop identity')
     os.close(writer_fd)
-if 'archive' in cfg:
-    # Only the fixed cache-extraction command receives an archive descriptor.
-    # It runs as the worker; neither tar nor the task can write the cache.
-    archive = os.open(cfg['archive'], os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop, pass_fds=writer_fds)
-    finally: os.close(archive)
+if cancelled():
+    code = 255
 else:
-    child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
-code = child.wait()
+    if 'archive' in cfg:
+        # Only the fixed cache-extraction command receives an archive descriptor.
+        # It runs as the worker; neither tar nor the task can write the cache.
+        archive = os.open(cfg['archive'], os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop, pass_fds=writer_fds)
+        finally: os.close(archive)
+    else:
+        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
+    started = time.monotonic()
+    orphan_seen = {}
+    def supervision_expired():
+        now = time.monotonic()
+        processes = {}
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit(): continue
+            try:
+                with open('/proc/' + entry + '/stat', 'rb') as stream:
+                    data = stream.read()
+                fields = data[data.rfind(b')')+2:].split()
+                processes[int(entry)] = (fields[0], int(fields[1]))
+            except (FileNotFoundError, ProcessLookupError): pass
+        # Age only live, directly adopted orphans, never the main child.
+        orphans = {pid for pid, (state, ppid) in processes.items()
+                   if ppid == os.getpid() and pid != child.pid and state != b'Z'}
+        for pid in list(orphan_seen):
+            if pid not in orphans: del orphan_seen[pid]
+        for pid in orphans: orphan_seen.setdefault(pid, now)
+        expired = {pid for pid, first in orphan_seen.items()
+                   if (now - first) * 1000 >= cfg.get('orphanGraceMs', 60000)}
+        found, frontier = set(expired), set(expired)
+        while frontier:
+            frontier = {pid for pid, (_, ppid) in processes.items()
+                        if ppid in frontier and pid != child.pid} - found
+            found.update(frontier)
+        for pid in found:
+            if processes[pid][0] == b'Z': continue
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        if cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
+            diag('forge-exec-run: wall limit exceeded; killing child tree\n')
+            return True
+        return False
+    if cfg.get('cancel'):
+        while True:
+            if cancelled():
+                # Stop the direct child even on a host with no readable proc entry;
+                # the existing descendant/UID sweep below proves full termination.
+                try: child.kill()
+                except ProcessLookupError: pass
+                code = 255
+                break
+            if supervision_expired():
+                code = 124
+                break
+            try:
+                code = child.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired: pass
+    else:
+        while True:
+            if supervision_expired():
+                code = 124
+                break
+            try:
+                code = child.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired: pass
 # All descendants run as the dedicated uid. Include live descendants before
 # killing their parents, then reap orphans adopted by this subreaper.
 def children():
@@ -456,6 +662,28 @@ def uid_processes():
             if data[data.rfind(b')')+2:].split()[0] != b'Z': found.add(int(entry))
         except (FileNotFoundError, ProcessLookupError): pass
     return found
+# Sample before cleanup erases current task pressure. Kernel task counts include threads.
+# Peak is optional on older kernels; current still captures hung/cancelled children.
+process_count = None
+if cfg.get('usage') is not None:
+    try:
+        with open('/proc/self/cgroup') as stream:
+            cgroup = stream.read(4097)
+        if len(cgroup) > 4096: raise ValueError('oversized cgroup path')
+        task_path = next(line.split(':', 2)[2] for line in cgroup.splitlines() if line.startswith('0::'))
+        task_base = '/sys/fs/cgroup/' + task_path.lstrip('/')
+        samples = []
+        for name in ('pids.peak', 'pids.current'):
+            try:
+                with open(task_base + '/' + name) as stream: value = stream.read(65)
+                if len(value) > 64 or not value.strip().isascii() or not value.strip().isdigit(): continue
+                count = int(value)
+                if count <= 9007199254740991: samples.append(count)
+            except (OSError, ValueError): pass
+        if samples: process_count = max(samples)
+    except (OSError, StopIteration, ValueError): pass
+    if process_count is None:
+        diag('forge-exec-run: task-pressure sample unavailable; near-limit status unknown; inspect the run cgroup\n')
 deadline = time.monotonic() + 30
 while True:
     # Escaped sessions and externally reparented children still belong only to
@@ -483,15 +711,20 @@ if 'usage' in cfg:
             except (OSError, ValueError, KeyError): return None
         usage = {'memoryPeakBytes': counter('memory.peak'), 'cpuUsec': counter('cpu.stat', 'usage_usec'), 'oomKills': counter('memory.events', 'oom_kill')}
     except (OSError, StopIteration): pass
+    usage['processCount'] = process_count
     fd = os.open(cfg['usage'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, 'w') as result: json.dump(usage, result)
 fd = os.open(cfg['status'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
 with os.fdopen(fd, 'w') as result: result.write(str(code if 0 <= code <= 255 else 255))
 sys.exit(0)
 `;
-function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={}) {
+export function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd,timeoutMs}={}) {
   return new Promise((resolve,reject) => {
     const child = spawn(file,args,{cwd,env,detached,stdio:[input === undefined ? 'ignore':'pipe',inherit?'inherit':'pipe',inherit?'inherit':'pipe',...(passFd===undefined?[]:[passFd])]});
+    const timer=timeoutMs===undefined?undefined:setTimeout(()=>{
+      try {child.kill('SIGKILL');} catch { /* ignore a process already gone */ }
+      resolve({code:null,timedOut:true});
+    },timeoutMs);
     const stdout=[],stderr=[];
     let bytes=0,overflow=false;
     for (const [name,stream] of [['stdout',child.stdout],['stderr',child.stderr]]) stream?.on('data',chunk => {
@@ -499,13 +732,13 @@ function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={
       if (bytes > LIMIT) {overflow=true; child.kill('SIGKILL'); return;}
       if(name==='stdout') stdout.push(chunk); else stderr.push(chunk);
     });
-    child.on('error',reject);
+    child.on('error',error => {clearTimeout(timer); reject(error);});
     // exit rather than close: detached children must not hold the output pipes open.
     child.on('exit',code => {
       if (detached) {try {process.kill(-child.pid,'SIGKILL');} catch { /* group already gone */ }}
     });
-    child.on('close',code => overflow ? reject(new Error('Output limit exceeded')) : resolve({code:code??254,
-      stdout:Buffer.concat(stdout).toString('utf8'),stderr:Buffer.concat(stderr).toString('utf8')}));
+    child.on('close',code => {clearTimeout(timer); overflow ? reject(new Error('Output limit exceeded')) : resolve({code:code??254,
+      stdout:Buffer.concat(stdout).toString('utf8'),stderr:Buffer.concat(stderr).toString('utf8')});});
     if(input!==undefined) {child.stdin.on('error',()=>{}); child.stdin.end(input);}
   });
 }
@@ -546,7 +779,7 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -559,6 +792,15 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
   let operator={uid:process.getuid(),gid:process.getgid()};
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
   const busy=()=>Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop the reserved UID before removing its worker-active lock'),{code:'forge-busy'});
+  async function requireEgressTable() {
+    if(testRoot&&!testEgressProbe&&!testExecute)return;
+    try {
+      // Exec injection is only available to the explicit test-root harness.
+      const result=testRoot&&testEgressProbe?await testEgressProbe():await (testRoot&&testExecute?testExecute:execute)('/usr/sbin/nft',['list','table','inet','forge_exec_egress'],{env:{PATH:'/usr/sbin:/usr/bin:/bin',LANG:'C'},timeoutMs:5000});
+      if(result?.code===0&&!result.timedOut)return;
+    } catch { /* all probe failures require local fallback */ }
+    throw Object.assign(new Error('Egress table inet forge_exec_egress absent; use local fallback'),{code:'egress-table-absent'});
+  }
   async function identity(user) {
     if(!isolatedWorkers)return {uid:process.getuid(),gid:process.getgid()};
     let ids;
@@ -650,9 +892,10 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       recent.push(JSON.parse(await readPinned(join(receipts,name))));
     recent.sort((a,b)=>Date.parse(b.startedAtET)-Date.parse(a.startedAtET)||a.runId.localeCompare(b.runId));
     const cores=cpus().length;
+    const active=await stableActiveRunIds(()=>readdir(receipts));
     const value={sampledAtET:easternTimestamp(clock()),cores,loadPerCore:loadavg()[0]/cores,
       memFreePct:freemem()/totalmem()*100,
-      activeRuns:names.filter(n=>/^r-[a-f0-9]{32}\.(prepared|running)$/.test(n)).length,recent:recent.slice(0,50)};
+      activeRuns:active.count,...(active.stable?{activeRunIds:active.ids}:{}),recent:recent.slice(0,50)};
     parseTelemetry(JSON.stringify(value));
     await atomicJSON(join(receipts,'telemetry.json'),value);
     return value;
@@ -808,15 +1051,21 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     // must read every active pin before deciding which public bases to prune.
     await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
-  async function workCommand(worker,argv,work,env,archive) {
+  async function workCommand(worker,argv,work,env,archive,{cleanup=false}={}) {
     const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
     if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
     if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
-    const {limits,warnings}=testRoot?{limits:{},warnings:[]}:await readLimits();
+    const {limits,warnings}=testRoot?{limits:testLimits??DEFAULT_LIMITS,warnings:[]}:await readLimits();
     for(const warning of warnings) process.stderr.write('forge-exec-run: '+warning.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
-    const cpus=slotCpus(limits,slot);
-    env={WE_VITEST_MAX_WORKERS:String(cpus),...env,FORGE_SLOT_CPUS:String(cpus)};
-    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
+    const units = worker.reservation?.slotUnits ?? 1;
+    if (units > 1 && warnings.length) throw new Error('Unreadable elastic limits');
+    const grant = elasticRunLimits(limits,slot,units);
+    const cpus = grant.cpus;
+    env={WE_VITEST_MAX_WORKERS:String(cpus),...env,
+      ...(units > 1 ? {WE_VITEST_MAX_WORKERS:String(cpus)} : {}),FORGE_SLOT_CPUS:String(cpus)};
+    const cancel=!cleanup&&worker.reservation?statePath(worker.reservation.run,'cancel'):undefined;
+    if(cancel&&await lstat(cancel).catch(error=>{if(error.code!=='ENOENT')throw error;}))return {code:255,stdout:'',stderr:'Run cancelled before worker launch',slotCpus:cpus};
+    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus,tasksMax:grant.tasksMax};
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
     const usage=status+'.usage';
@@ -824,15 +1073,15 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     try {
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
-      const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(archive?{archive}:{}),...ids})});
+      const launcher=elasticScopeArgv({limits,units,slot,unit,sudo:false,source:supervisorSource,
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
       if(!Number.isInteger(code) || code<0 || code>255) throw new Error('Invalid supervisor status');
       let measured;
       try {measured=JSON.parse((await readPinned(usage)).toString());} catch(error) {if(error.code!=='ENOENT')throw error;}
-      return {...result,code,usage:measured,slotCpus:cpus};
+      return {...result,code,usage:measured,slotCpus:cpus,tasksMax:grant.tasksMax};
     } finally {await Promise.all([rm(status,{force:true}),rm(usage,{force:true})]);}
   }
   async function exclusiveWorker(action,record) {
@@ -969,12 +1218,15 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
   }
   return {
     assertContained,
-    async telemetry() {
+    async telemetry(request) {
       // Idle hosts and fresh installs have no background sampler. Sample the
       // actual host on every SSH request; the Mac health cache bounds reads.
       await init();
       await reap();
-      return publishTelemetry();
+      const value = await publishTelemetry();
+      if (request?.capabilities?.limits !== 1) return value;
+      const {limits,warnings} = await readLimits();
+      return {...value,limits:warnings.length ? null : {parent:{cpuQuota:limits.parent.cpuQuota},slot:{cpuQuota:limits.slot.cpuQuota}}};
     },
     async bases() {
       try{return {delta:1,bases:(await readyBases(bases)).slice(0,BASE_RETENTION).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
@@ -989,6 +1241,8 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     },
     // Called by the fixed warmer; the privileged CLI restricts its source root.
     async warmInstall(source,manifest) {
+      // npm ci below runs as the slot user, so the firewall must be present; checked before any side effect.
+      await requireEgressTable();
       await init();
       const run='warm-'+randomBytes(16).toString('hex'),nonce=randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce),record={run,nonce,...(worker.active?{slot:worker.user}:{})};
@@ -1019,20 +1273,49 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       },record);
       }finally{if(worker.active)await releaseWorker(record);}
     },
-    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
+    // Read-only readiness probe; exposed so the test-seam guarantee (injection only under testRoot) is checkable.
+    async egressReady() {await requireEgressTable();},
+    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot,slotUnits = 1,capabilities,gitBundle}) {
       await init();
+      await requireEgressTable();
       await reap();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
+      if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) throw new Error('Invalid slot units');
       const run='r-'+randomBytes(16).toString('hex');
-      const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(worker.active?{slot:worker.user}:{})};
+      const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(slotUnits > 1 ? {slotUnits} : {}),
+        ...(capabilities?.taskPressure === 1 ? {receiptCapabilities:{taskPressure:1}} : {}),...(worker.active?{slot:worker.user}:{})};
       const prepare=async()=>{
-      if(worker.active)await workerFor(record);
       const container=join(worker.root,run);
       try {
+      if(worker.active)await workerFor(record); // inside the try so a failure releases the reservation
+      // Validate the grant against the worker actually reserved (its own slot limits); the catch
+      // below releases the reservation, so a rejected grant never leaks a worker or a receipt.
+      if (slotUnits > 1 && (!testRoot || testLimits !== undefined)) {
+        const {limits,warnings} = testRoot ? {limits:testLimits,warnings:[]} : await readLimits();
+        if (warnings.length) throw new Error('Unreadable elastic limits');
+        elasticRunLimits(limits,Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1] ?? 1),slotUnits);
+      }
       await mkdir(container,{mode:0o755}); // exclusive server-generated name
       const work=join(container,'work');
       await mkdir(work,{mode:0o755});
       await handoff(worker,work);
+      // git-bundle transport (R593): advertised only while repo.git is not writable by slot users (S4).
+      const bundleReady=await mirrorReadOnlyForSlots(join(bases,'repo.git'));
+      // The prerequisite the Mac may use for an incremental bundle: this mirror's own main tip.
+      let bundleBase;
+      const mainStamp=bundleReady?await readMainFetchStamp(bases,{clock}):undefined;
+      if(bundleReady) try {
+        const mirror=join(bases,'repo.git'),args=['-c','safe.directory='+mirror,'--git-dir',mirror,'rev-parse','--verify','refs/remotes/origin/main^{commit}'];
+        const env={PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
+        const tip=await execute('git',args,{cwd:bases,env});
+        const text=String(tip.stdout??'').trim();
+        if(tip.code===0&&/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(text))bundleBase=text;
+      } catch { /* no base: the Mac sends a full bundle */ }
+      if(gitBundle===true&&bundleReady) {
+        const bundleDir=join(container,'bundle');
+        await mkdir(bundleDir,{mode:0o755});
+        await handoff(worker,bundleDir);
+      }
       if (siblings === true) {
         const sibling = join(container,'frontierui');
         await mkdir(sibling,{mode:0o755});
@@ -1045,7 +1328,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         await pinBase(run,baseSha);
         await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
       });
-      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
+      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(bundleReady?{gitBundle:1,...(bundleBase?{gitBundleBase:bundleBase}:{}),...(mainStamp!==undefined&&mainStamp.sha===bundleBase?{gitBundleMainAgeMs:mainStamp.ageMs}:{})}:{}),...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
       }catch(error){
         await rm(container,{recursive:true,force:true});
         await rm(statePath(run,'prepared'),{force:true});
@@ -1064,12 +1347,16 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       try {
       if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
+      await requireEgressTable();
       return await exclusiveWorker(async (executeCommand,selected) => {
       const resources={memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8};
+      let tasks = {};
       const unmeasured=new Set();
       const command=async(...args)=>{
         const value=await executeCommand(...args);
         resources.slotCpus=value.slotCpus??resources.slotCpus;
+        const note = taskPressureNote(value.usage?.processCount,value.tasksMax);
+        if (note.tasksNear && (!tasks.tasksNear || note.processCount > tasks.processCount)) tasks = note;
         for(const key of ['memoryPeakBytes','cpuUsec','oomKills']) {
           const n=value.usage?.[key];
           if(!Number.isSafeInteger(n)||n<0) {
@@ -1141,11 +1428,13 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
       }
       if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
-      if(request.argv[2]==='check:standards'||request.env.DIFF_COVERAGE_BASE!==undefined) {
+      if(request.argv[2]==='check:standards'||request.env.DIFF_COVERAGE_BASE!==undefined||request.bundle!==undefined) {
         if(!request.manifest.git)throw new Error('Missing Git evidence');
         if(request.env.DIFF_COVERAGE_BASE!==request.manifest.git.diffCoverageBase)throw new Error('Coverage base mismatch');
         try {
+          if(request.bundle!==undefined&&!validBundleEvidence(request.bundle))throw new Error('Invalid bundle evidence');
           await materializeWorktree({work,root:bases,baseSha:request.baseSha,head:request.manifest.git.head,manifest:request.manifest,manifestDigest:request.manifestDigest,
+            ...(request.bundle!==undefined?{bundle:{...request.bundle,file:join(container,'bundle','git.bundle')}}:{}),
             ...(testRoot&&testGitExec?{exec:testGitExec}:{})});
           await handoff(worker,join(work,'.git'),{recursive:true,workerParent:true});
         } catch(error) {throw Object.assign(error,{code:error.code==='diff-coverage-base-unavailable'?error.code:'git-head-unavailable'});}
@@ -1187,9 +1476,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
-      const {slot:reservedSlot,...receiptState}=prepared;
-      const receipt={...receiptState,resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      const receipt=createRunReceipt(prepared,{resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code},tasks);
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
+      if (tasks.tasksNear) process.stderr.write('forge-exec-run: '+tasks.tasksNote+'\n');
       await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed});
       if(telemetryError)throw telemetryError;
       return result;
@@ -1202,6 +1491,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
           const reason=['git-head-unavailable','diff-coverage-base-unavailable'].includes(error.code) ? error.code
             : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
           if(reason==='git-head-unavailable')process.stderr.write(`forge-exec-run: ${reason}: ${String(error.cause?.message??error.message).replace(/[\x00-\x1f\x7f-\x9f]/g,'')}\n`);
+          if(error.code==='egress-table-absent')process.stderr.write('forge-exec-run: egress-table-absent\n');
           await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
         }
         throw error;
@@ -1211,6 +1501,18 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       let phase='running',record;
       try{record=await state(request,phase);}catch{record=await state(request,'prepared');}
       return withWorkerWriter(writerName(record),async()=>{
+      if(request.cancel===true) {
+        const worker=await workerFor(record,request);
+        if(!worker.active)throw new Error('Cancellation requires a numbered worker; operator must stop the reserved UID');
+        // Do not bypass executing: ask the supervisor to reap its UID, then
+        // let the active controller settle before any filesystem cleanup.
+        await writeFile(statePath(request.run,'cancel'),'',{flag:'wx',mode:0o600}).catch(error=>{if(error.code!=='EEXIST')throw error;});
+        const deadline=process.hrtime.bigint()+45000000000n;
+        while(await lstat(join(worker.active,'executing')).catch(error=>{if(error.code!=='ENOENT')throw error;})) {
+          if(process.hrtime.bigint()>=deadline)throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');
+          await new Promise(resolve=>setTimeout(resolve,50));
+        }
+      }
       let finishingWorker,settled=true;
       try {
       // Only the protected state is evidence; receipt-like files in work are data.
@@ -1228,7 +1530,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(worker.active){
         // Includes cancelled rsync and children left before task execution.
         settled=false;
-        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'});
+        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
         if(reaped.code!==0)throw new Error('Worker cleanup unconfirmed');
         settled=true;
       }
@@ -1250,13 +1552,22 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await rm(join(bases,'active',request.run),{force:true});
       await rm(statePath(request.run,'base'),{force:true});
       if(worker.active){await rmdir(join(worker.active,'executing'));finishingWorker=undefined;await releaseWorker(record);}
+      await rm(statePath(request.run,'cancel'),{force:true});
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? null;
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
       }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
       });
     },
+  };
+}
+// The CLI's failure mapping, exported so tests can pin what the Mac sees (exit 254, stderr, forge-busy stdout).
+export function cliFailure(subcommand,error) {
+  return {
+    stdout:subcommand==='prepare'&&error.code==='forge-busy'?JSON.stringify({reason:'forge-busy'})+'\n':'',
+    stderr:'forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n',
+    exitCode:254,
   };
 }
 const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
@@ -1274,7 +1585,7 @@ if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) 
     let input='';
     process.stdin.setEncoding('utf8');
     if(process.argv[2]!=='telemetry')for await(const chunk of process.stdin) {input+=chunk; if(Buffer.byteLength(input)>LIMIT) throw new Error('Request limit exceeded');}
-    const request=process.argv[2]==='telemetry'?undefined:JSON.parse(input);
+    const request=process.argv[2]==='telemetry'?await readTelemetryRequest(process.stdin):JSON.parse(input);
     if(process.argv[2]==='warm-install' && (!request||!/^\/srv\/forge-base\/[a-f0-9]{40}(?:[a-f0-9]{24})?\.tmp\/tree$/.test(request.source)))throw new Error('Invalid warm source');
     const runner=createRunner();
     const result=process.argv[2]==='warm-install'?await runner.warmInstall(request.source,request.manifest):await runner[process.argv[2]](request);
@@ -1282,8 +1593,9 @@ if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) 
     else process.stdout.write(JSON.stringify(result)+'\n');
     }
   } catch(error) {
-    if(process.argv[2]==='prepare'&&error.code==='forge-busy')process.stdout.write(JSON.stringify({reason:'forge-busy'})+'\n');
-    process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;
+    const failure=cliFailure(process.argv[2],error);
+    if(failure.stdout)process.stdout.write(failure.stdout);
+    process.stderr.write(failure.stderr); process.exitCode=failure.exitCode;
   }
   })();
 }

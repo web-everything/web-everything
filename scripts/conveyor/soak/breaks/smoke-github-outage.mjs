@@ -103,6 +103,10 @@ export default {
           WE_DAEMON_SMOKE_RETRY_BACKOFF_MS: '10',
           WE_DAEMON_SMOKE_TRANSIENT_RETRIES: '1',
           WE_SMOKE_GH_ENV_PROBE: '1',
+          // Preserve both retry ladders: each list attempt also retries a 5xx in gh-throttle.
+          // Across three repos and three dispatch passes, shortening only the outer sleep still exceeds 90s.
+          WE_GH_JSON_RETRY_BACKOFF_MS: '5',
+          WE_GH_LIST_BACKOFF_MS: '5,5',
         });
         return {};
       },

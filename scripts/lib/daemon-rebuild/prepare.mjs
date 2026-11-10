@@ -4,7 +4,7 @@
 
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
+  alertsFilePath, readRebuildState, writeRebuildState, readReadyCandidate,
 } from './state.mjs';
 import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -16,6 +16,8 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
   pruneLandedBacklogSidecars,
@@ -25,6 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
@@ -38,6 +41,33 @@ export function readOverlayEventLog(root, env) {
     const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
     return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
   } catch { return []; }
+}
+
+/** Record pr-merged drop evidence without changing drop policy. Unknown proof fails closed. */
+export function prMergedDropEvidence({ git, ref, mainSha }) {
+  let tip = null;
+  const evidence = { contentInMain: false, cleanMerges: false };
+  try {
+    const tipRev = `refs/remotes/origin/${ref}^{commit}`;
+    const resolved = git(['rev-parse', '--verify', '--quiet', tipRev]);
+    const value = typeof resolved?.stdout === 'string' ? resolved.stdout.trim() : '';
+    if (resolved?.status !== 0 || !/^[a-f0-9]{40}$/.test(value)) return { tip, evidence };
+    tip = value;
+    if (!/^[a-f0-9]{40}$/.test(mainSha)) return { tip, evidence };
+    const proof = carriedBeyondMain({
+      ref, mainRef: mainSha,
+      git: (args) => {
+        // Reuse the resolved tip so the evidence and event describe the same observation.
+        const result = args[0] === 'rev-parse' && args[3] === tipRev ? resolved : git(args);
+        return { code: result?.status, stdout: result?.stdout };
+      },
+    });
+    if (proof.ok === true) {
+      evidence.contentInMain = proof.contentInMain === true;
+      evidence.cleanMerges = proof.cleanMerges === true;
+    }
+  } catch { /* Keep the drop, but never claim unreadable evidence proves graduation. */ }
+  return { tip, evidence };
 }
 
 /** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
@@ -273,6 +303,11 @@ export async function prepareRebuild({
     alert('head-unresolved');
     return terminal({ moved: false, reason: 'head-unresolved' });
   }
+  // Drops the ready candidate; a forced one that will never be adopted also closes its rollback watch (see dropReadyCandidate).
+  const dropReady = (reason, keepSha = null) => dropReadyCandidate({
+    root, env: stEnv, keepSha, reason,
+    emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
+  });
 
   // ── Step 2: fetch ────────────────────────────────────────────────────────────────────────────────────
   // A corrupt overlay file reads as an empty list. Building on that would quietly rebuild onto main alone and
@@ -304,7 +339,7 @@ export async function prepareRebuild({
   if (cloneRepair.quarantinedTo) {
     for (const k of ['adopted', 'held', 'rejected', 'inProgress', 'unverified', 'quarantine', 'building', 'smokePassed']) state[k] = null;
     writeState();
-    clearReadyCandidate(root, stEnv);
+    await dropReady('clone-recloned'); // the whole checkout was replaced: no forced build can still be head
     return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
   }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
@@ -444,8 +479,9 @@ export async function prepareRebuild({
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
+      const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
       removeOverlay(root, d.ref, { env, why: d.reason });
-      appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
+      appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
       alert('overlay-conflict-dropped', {
@@ -481,7 +517,7 @@ export async function prepareRebuild({
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
     }
-    clearReadyCandidate(root, stEnv); // current already — nothing a passed-but-unadopted build could add
+    await dropReady('up-to-date', plan.finalSha); // current already — nothing a passed-but-unadopted build could add
     return terminal({ moved: false, reason: 'up-to-date', plan });
   }
 
@@ -535,9 +571,21 @@ export async function prepareRebuild({
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
+        forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
       if (!m.adopt) {
-        clearReadyCandidate(root, stEnv);
+        // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
+        // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
+        // as head keeps its watch.
+        // …except an UNREADABLE watch: that may be a transient read failure, and dropping would throw the operator's build away while
+        // the abort (which cannot read the file either) leaves the watch behind. Not adopting is already the fail-closed part, so the
+        // record is kept and retried every tick; it is bounded by the ready record's own max age, which drops it as 'expired'.
+        if (m.reason === 'forced-watch-unreadable') {
+          alert('forced-watch-unreadable', { target: ready.adopt.finalSha, message: 'the forced build is NOT adopted while its rollback watch cannot be read; its ready record is kept and retried' });
+          return terminal({ moved: false, reason: 'forced-watch-unreadable', plan });
+        }
+        await dropReady(m.reason, prevHead);
         reportDiscardedCandidate({
           ready, match: m, alert,
           needsYou: ({ kind, ...detail }) => {
@@ -550,7 +598,7 @@ export async function prepareRebuild({
       } else {
         const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
         if (colliding.length > 0) {
-          clearReadyCandidate(root, stEnv);
+          await dropReady('untracked-collision');
           alert('untracked-collision', { paths: colliding });
           return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
         }
@@ -589,13 +637,23 @@ export async function prepareRebuild({
   // not re-smoked on every main move: it would cost up to three full smokes per move and every one would fail
   // the same way. Until its backoff expires the clone stays on its last-good build (and keeps dispatching —
   // `main-staleness.mjs#assertMainNotStale`), whatever the new inputs are.
-  if (state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
+  // R508: an operator force-adopt request that names EXACTLY this candidate (same sha) must reach a fresh smoke, so it can be
+  // consumed there, even when this candidate is held by a sticky rejection or the harness-broken backoff. A request for any
+  // other build never lifts a rejection (`forceRequestFor` is the one sha matcher). While a force watch is open / unreadable or a
+  // rollback is owed, a second force is refused (smoke.mjs `force-adopt-refused`); lifting the gate then would re-smoke this
+  // candidate on every tick for nothing, so the rejection stands until the watch ends. If such a refusal DOES happen (the blocker
+  // appeared during the smoke), smoke.mjs consumes the request and writes the sticky rejection, so it never stays pending.
+  const forceBypass = !forceBlockedReason(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
+  if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
+    alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
+  }
+  if (!forceBypass && state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
     const retryAtMs = Date.parse(state.rejected.retryAt || '');
     if (Number.isFinite(retryAtMs) && nowMs() < retryAtMs) {
       return terminal({ moved: false, reason: 'smoke-harness-broken-backoff', plan });
     }
   }
-  if (state.rejected?.inputsKey === plan.inputsKey) {
+  if (!forceBypass && state.rejected?.inputsKey === plan.inputsKey) {
     // An external-only rejection (only gh/network checks failed) is never permanent: once its backoff expires
     // the same inputs are smoked again, instead of sticking until main or an overlay moves.
     const retryAtMs = Date.parse(state.rejected.retryAt || '');
@@ -637,6 +695,32 @@ export async function prepareRebuild({
     const d = skipCheck(changedFiles);
     if (d?.skip) {
       if (readyOnly) return mutationDue('skip-unrelated-adopt');
+      // R508: an open force watch for the build this successor replaces needs nothing from this path: the watch follows HEAD onto ANY
+      // successor on its next tick, keeping its rollback target (daemon-force-adopt.mjs, the single watch-transition rule), so an
+      // unsmoked adoption can neither erase it nor depend on a carry write that could fail.
+      let guardUndeclared = false; // true: the unverified status could not be passed on, so this successor is built and smoked instead
+      // R508: a force-adopted build is never a trusted smoke baseline (`forceUnverifiedTrees`, see smoke.mjs `changedSince`). This unsmoked
+      // successor inherits that status BEFORE it is adopted, or a docs-only hop would launder it and the next incremental smoke would
+      // skip the checks the force-adopted build failed. Fail closed: if it cannot be recorded, build and smoke the successor instead.
+      if (!guardUndeclared) {
+        try {
+          const trees = Array.isArray(state.forceUnverifiedTrees) ? state.forceUnverifiedTrees : [];
+          if (trees.length) {
+            const fromTree = verifyRev(git, `${prevHead}^{tree}`);
+            if (!fromTree || trees.includes(fromTree)) {
+              const toTree = verifyRev(git, `${plan.finalSha}^{tree}`);
+              if (!toTree) throw new Error('successor tree unresolvable');
+              state.forceUnverifiedTrees = [toTree, ...trees.filter((t) => t !== toTree)].slice(0, 5);
+              writeState();
+            }
+          }
+        } catch {
+          guardUndeclared = true;
+        }
+      }
+      if (guardUndeclared) {
+        log?.error?.(`daemon-rebuild: NOT skipping rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — the force-unverified status of ${String(prevHead).slice(0, 9)} could not be passed on to it; building and smoking it instead`);
+      } else {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
         root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
@@ -647,6 +731,7 @@ export async function prepareRebuild({
         result: { ...finResult, ...(finResult.adopted ? { reason: 'skipped-unrelated', skippedSmoke: true } : {}) },
         alerts: [...alertsList, ...finAlerts],
       };
+      }
     }
   }
 

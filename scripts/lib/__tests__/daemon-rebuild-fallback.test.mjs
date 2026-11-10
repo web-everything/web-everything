@@ -30,6 +30,12 @@ import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
+// Same precedent as daemon-rebuild.test.mjs:43. Every case here drives real `git` through rebuildClone (about 40 git
+// calls per rebuild: worktree add/remove/prune/list, rev-parse, merge-base), measured at 2-4s per case at load ~30 and
+// 7-12s at load ~70, so the 5s default timed out on a loaded CI shard (main red @ 4535653df). Cached fixtures and
+// splitting the slowest case did not help (rebuildClone itself is the cost). 60s stays a hang guard.
+vi.setConfig({ testTimeout: 60_000 });
+
 // ── fixture helpers — copied from daemon-rebuild.test.mjs (never imported from it) ──────────────────────────
 
 const tempDirs = [];

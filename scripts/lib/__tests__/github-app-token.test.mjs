@@ -12,6 +12,9 @@ import {
   getInstallationInfo,
 } from '../github-app-token.mjs';
 
+const FAKE_PEM_PATH = '/fake/path/key.pem';
+const fakePemReader = () => vi.fn(() => 'fake-pem-contents');
+
 // A fixture keypair, generated once for this test file — NOT a real GitHub App's key, never written to disk.
 const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const PEM = privateKey.export({ type: 'pkcs1', format: 'pem' });
@@ -104,8 +107,8 @@ describe('mintInstallationToken — IO shell over injected fakes (no real fs, no
   const okArgs = () => ({
     appId: '5037855',
     installationId: '163880042',
-    privateKeyPath: '/fake/path/key.pem',
-    readKey: vi.fn(() => 'fake-pem-contents'),
+    privateKeyPath: FAKE_PEM_PATH,
+    readKey: fakePemReader(),
     buildJwt: vi.fn(() => 'fake.jwt.token'),
   });
 
@@ -166,8 +169,8 @@ describe('getInstallationInfo — IO shell over injected fakes (no real fs, no r
   const okArgs = () => ({
     appId: '5037855',
     installationId: '163880042',
-    privateKeyPath: '/fake/path/key.pem',
-    readKey: vi.fn(() => 'fake-pem-contents'),
+    privateKeyPath: FAKE_PEM_PATH,
+    readKey: fakePemReader(),
     buildJwt: vi.fn(() => 'fake.jwt.token'),
   });
 

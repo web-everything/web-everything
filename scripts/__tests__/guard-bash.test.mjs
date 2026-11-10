@@ -3114,7 +3114,7 @@ describe('guard-bash — a delivery agent may never run the mechanical lifecycle
       'npm run test:unit -- scripts/operations/__tests__/deliver-item-wrapper.test.mjs', // xpnhz4o: a BARE full suite is denied for every session
       'npm run test:unit -- scripts/operations/__tests__/deliver-item-wrapper.test.mjs',
       'npm run check:standards',
-      'node --test scripts/operations/__tests__/deliver-item-wrapper.test.mjs',
+      'node scripts/readiness/heavy-admission.mjs run -- node --test scripts/operations/__tests__/deliver-item-wrapper.test.mjs',
       'git status',
       'git diff',
       'git add scripts/operations/deliver-item-wrapper.mjs',
@@ -3188,7 +3188,7 @@ describe.each([
     expect(String(reason(cmd, { dispatchKind: 'build' }) ?? '')).not.toMatch(whoRe);
   });
   it('does NOT over-block ordinary read/test/git commands', () => {
-    const ordinary = ['git status', 'git diff', 'git add scripts/x.mjs', 'node --test scripts/x.test.mjs', 'gh issue view 1'];
+    const ordinary = ['git status', 'git diff', 'git add scripts/x.mjs', 'node scripts/readiness/heavy-admission.mjs run -- node --test scripts/x.test.mjs', 'gh issue view 1'];
     if (kind !== 'scope-authoring') ordinary.push('git commit -m "x"');
     for (const cmd of ordinary) expect(reason(cmd, { dispatchKind: kind }), cmd).toBeNull();
   });

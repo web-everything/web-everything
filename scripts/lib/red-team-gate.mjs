@@ -1,3 +1,4 @@
+import { FINDING_CLASSES, allClasses, classAction, readFindingClassPolicy } from './finding-class-policy.mjs';
 /**
  * @file scripts/lib/red-team-gate.mjs
  * @description CONFIRMED POST-ACCEPT RED-TEAM BREAKS GO BACK TO THE FIXER (card x1b8hlo, operator go 2026-10-10).
@@ -27,7 +28,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { isHumanOperatorComment } from './operator-identity.mjs';
+import { isHumanOperatorComment, isRulingComment, judgePolicyOnce } from './operator-identity.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
@@ -49,6 +50,10 @@ export function redTeamMarker(pr, rev) {
 
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
+// Any line that LOOKS like a finding (leading whitespace, any case, loose punctuation). Used only to key the result
+// digest, never to decide what blocks: a line the strict FINDING_RE skips still changes the digest.
+// Include repeated/mixed Markdown emphasis; a closing underscore is a word character, so also allow it at the boundary.
+const FINDING_SHAPED_RE = /^\s*\d+\s*[.)]\s*\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
 // Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
 // name too: only used to SUPERSEDE a ruling, where reading more holds more.
@@ -66,7 +71,9 @@ export function parseRedTeamComment(body) {
   const m = MARKER_RE.exec(text);
   if (!m) return null;
   const findings = [];
+  const shapedLines = [];
   for (const line of text.split('\n')) {
+    if (FINDING_SHAPED_RE.test(line) && !FINDING_RE.test(line)) shapedLines.push(line.trim());
     const f = FINDING_RE.exec(line);
     if (f) {
       const [path, ln] = f[5] ? (/^(.*?):(\d+)$/.exec(f[5])?.slice(1) ?? [f[5], null]) : [null, null];
@@ -79,10 +86,22 @@ export function parseRedTeamComment(body) {
       });
       continue;
     }
+    if (line === '   - Security class: security-reachable-today' && findings.length)
+      findings.at(-1).securityReachableToday = true;
+    const also = /^ {3}- Also class: ([a-z-]+(?:, [a-z-]+)*)$/.exec(line);
+    if (also && findings.length) findings.at(-1).alsoClasses = also[1].split(', ').filter(c => FINDING_CLASSES.includes(c));
+    const classification = /^ {3}- Class: (.*?) → (?:fix-now|defer-card)(?: \(basis: (.*)\))?$/.exec(line);
+    if (classification && findings.length) {
+      findings.at(-1).findingClass = classification[1].trim();
+      if (classification[2] !== undefined) findings.at(-1).classBasis = classification[2].trim();
+    }
     const s = SUB_RE.exec(line);
     if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
   }
-  return { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
+  const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
+  // Non-enumerable: it only keys the digest and must not change the parsed shape callers compare or serialise.
+  Object.defineProperty(parsed, 'shapedLines', { value: shapedLines, enumerable: false });
+  return parsed;
 }
 
 /**
@@ -93,8 +112,16 @@ export function parseRedTeamComment(body) {
 const RESULT_ID_FIELDS = ['index', 'confirmed', 'recheckOutcome', 'category', 'impact', 'file', 'line', 'summary', 'scenario', 'recheck'];
 export function redTeamResultId(parsed) {
   if (!parsed) return null;
-  const findings = (parsed.findings ?? []).map(f => RESULT_ID_FIELDS.map(k => f?.[k] ?? null));
-  return createHash('sha256').update(JSON.stringify(['v1', findings])).digest('hex').slice(0, 16);
+  const security = (parsed.findings ?? []).some(f => f?.securityReachableToday === true);
+  const classified = security || (parsed.findings ?? []).some(f => f?.findingClass != null);
+  const also = (parsed.findings ?? []).some(f => f?.alsoClasses?.length);
+  const fields = classified ? [...RESULT_ID_FIELDS, 'findingClass', 'classBasis', ...(security ? ['securityReachableToday'] : []), ...(also ? ['alsoClasses'] : [])] : RESULT_ID_FIELDS;
+  const findings = (parsed.findings ?? []).map(f => fields.map(k => f?.[k] ?? null));
+  // A finding-shaped line the strict parser skipped (indented, other case, malformed) also keys the result, so adding
+  // one re-keys it and voids every record for the old id (fail closed). A result with none keeps its v1 id, so existing
+  // records, operator rulings included, keep applying to results nobody has tampered with.
+  const extra = Array.isArray(parsed.shapedLines) ? parsed.shapedLines : [];
+  return createHash('sha256').update(JSON.stringify(classified ? ['v3', findings, extra] : extra.length ? ['v2', findings, extra] : ['v1', findings])).digest('hex').slice(0, 16);
 }
 
 /**
@@ -142,7 +169,8 @@ export function resolveConfirmedBreaks({ file = {}, env = {} } = {}) {
 export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTINGS_FILE } = {}) {
   let file = {};
   try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = {}; }
-  return resolveConfirmedBreaks({ file, env });
+  const resolved = resolveConfirmedBreaks({ file, env });
+  return { ...resolved, value: { ...resolved.value, findingClasses: readFindingClassPolicy({ env }) } };
 }
 
 /** Repo-reading and card-only controls share the standard/platform/tool/env cascade. */
@@ -241,13 +269,31 @@ export function breakClass(f) {
 }
 
 /**
+ * The carded findings that ONLY class deferral authorized: ordinary confirmedBreaks policy (every class fix-now)
+ * would not have carded them. The gate records these indices (`class=` on its marker) so a later read revokes
+ * exactly those cards when the deferral is revoked, and never an ordinary-policy card. PURE.
+ */
+export function classOnlyCards(cards, setting = CONFIRMED_BREAKS_DEFAULTS) {
+  return (cards ?? []).filter(f => (f.findingClass || f.securityReachableToday)
+    && !planRedTeamActions({ findings: [f] }, { ...setting,
+      findingClasses: Object.fromEntries((allClasses(f).length ? allClasses(f) : [f.findingClass]).map(c => [c, 'fix-now'])) }).card.includes(f));
+}
+
+/**
  * What to do with one parsed comment under the setting. PURE.
  * @returns {{sendBack:object[], card:object[], advisory:object[]}}
  */
 export function planRedTeamActions(parsed, setting = CONFIRMED_BREAKS_DEFAULTS) {
   const out = { sendBack: [], card: [], advisory: [] };
+  const findingClasses = setting.findingClasses ?? readFindingClassPolicy();
   for (const f of parsed?.findings ?? []) {
-    const action = setting[breakClass(f)] ?? CONFIRMED_BREAK_ACTIONS.ADVISORY;
+    const base = setting[breakClass(f)] ?? CONFIRMED_BREAK_ACTIONS.ADVISORY;
+    const deferred = classAction(f, findingClasses) === 'defer-card';
+    // Class deferral cards only what the re-check confirmed; an unconfirmed finding is never carded by class, and
+    // deferral can only soften its send-back to advisory.
+    const action = !deferred ? base
+      : breakClass(f) !== 'unconfirmed' ? CONFIRMED_BREAK_ACTIONS.CARD
+        : base === CONFIRMED_BREAK_ACTIONS.SEND_BACK ? CONFIRMED_BREAK_ACTIONS.ADVISORY : base;
     if (action === CONFIRMED_BREAK_ACTIONS.SEND_BACK) out.sendBack.push(f);
     else if (action === CONFIRMED_BREAK_ACTIONS.CARD) out.card.push(f);
     else out.advisory.push(f);
@@ -269,25 +315,28 @@ export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 
 
 /** `result` names the decided result ({@link redTeamResultId}). `grantIds` records the send-back step's grant
  * snapshot, not its POST time. Older records omit these fields. */
-export function redTeamGateMarker(pr, rev, outcome, result = null, grantIds = null) {
-  return `${RED_TEAM_GATE_MARKER} pr=${Number(pr)} rev=${String(rev).toLowerCase()} outcome=${outcome}${result ? ` result=${result}` : ''}${grantIds ? ` grants=${grantIds.join(',') || 'none'}` : ''} -->`;
+export function redTeamGateMarker(pr, rev, outcome, result = null, grantIds = null, classCards = null) {
+  const cls = [...new Set((classCards ?? []).map(Number).filter(n => Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
+  return `${RED_TEAM_GATE_MARKER} pr=${Number(pr)} rev=${String(rev).toLowerCase()} outcome=${outcome}${result ? ` result=${result}` : ''}${grantIds ? ` grants=${grantIds.join(',') || 'none'}` : ''}${cls.length ? ` class=${cls.join(',')}` : ''} -->`;
 }
 
 /** PURE: parse the anchored gate marker, shared by gate reads and verdict carry. `grants=` takes any number of ids:
  * the writer records every grant it read, so a count bound here would make a valid record unreadable (fail-open). */
 export function parseRedTeamGateMarker(body) {
-  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))?(?: grants=(none|[0-9a-f]{16}(?:,[0-9a-f]{16})*))? -->/.exec(String(body ?? '').trimStart());
-  return m ? { pr: Number(m[1]), rev: m[2], outcome: m[3], ...(m[4] ? { result: m[4] } : {}),
-    ...(m[5] ? { grantIds: m[5] === 'none' ? [] : m[5].split(',') } : {}) } : null;
+  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))?(?: grants=(none|[0-9a-f]{16}(?:,[0-9a-f]{16})*))?(?: class=([1-9]\d*(?:,[1-9]\d*)*))?(?: actor=([^\s]+))? -->/.exec(String(body ?? '').trimStart());
+  return m ? { pr: Number(m[1]), rev: m[2], outcome: m[3], ...(m[4] ? { result: m[4] } : {}), ...(m[7] ? { actor: m[7] } : {}),
+    ...(m[5] ? { grantIds: m[5] === 'none' ? [] : m[5].split(',') } : {}),
+    ...(m[6] ? { classCards: m[6].split(',').map(Number) } : {}) } : null;
 }
 
 /** Every outcome the gate recorded for this head (trusted authors only). PURE. */
 export function gateOutcomesForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   const found = new Set();
+  const policy = judgePolicyOnce();
   for (const c of Array.isArray(comments) ? comments : []) {
     const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-    if (m && m.pr === Number(pr) && m.rev === live && isTrustedMarkerAuthor(c)) found.add(m.outcome);
+    if (m && m.pr === Number(pr) && m.rev === live && isTrustedMarkerAuthor(c) && (m.actor === undefined || isRulingComment(c, policy))) found.add(m.outcome);
   }
   return found;
 }
@@ -434,8 +483,14 @@ function threadRecords(comments) {
   // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
   // `at` is the comment's position in the WHOLE thread, so it compares directly with an operator grant's index
   // ({@link roundExtensionGrants}); grant snapshots additionally retain stable identities across thread edits.
+  // `ruling` (is this record a ruling a gate reader honours) is decided ONCE per record, with one judge-policy read
+  // for the whole pass (#6494 F2); every reader below uses it instead of re-deciding per comment.
+  const policy = judgePolicyOnce();
+  const rec = (c, at, from) => ({ c, at, ...(from !== undefined ? { from } : {}), ruling: isRulingComment(c, policy) });
   return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
     if (!isTrustedMarkerAuthor(c)) return [];
+    const gate = parseRedTeamGateMarker(c?.body);
+    if (gate?.actor !== undefined && !isRulingComment(c, policy)) return [];
     const body = typeof c === 'string' ? c : c?.body;
     const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
     const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
@@ -446,9 +501,9 @@ function threadRecords(comments) {
     if (!advisory || advisory.rev !== carried.toSha || !lines.slice(0, k).every(line => {
       const gate = parseRedTeamGateMarker(line);
       return gate?.rev === carried.toSha && gate.pr === advisory.pr;
-    })) return [{ c, at }];
+    })) return [rec(c, at)];
     const parts = [...lines.slice(0, k), advisoryBody];
-    return [{ c, at }, ...parts.map(part => ({ c: { ...c, body: part }, at, from: carried.fromSha }))];
+    return [rec(c, at), ...parts.map(part => rec({ ...c, body: part }, at, carried.fromSha))];
   });
 }
 
@@ -482,7 +537,8 @@ function gateRecordsFor(records, pr, sha, hit) {
   const id = redTeamResultId(hit.parsed);
   return records.flatMap(r => {
     const gate = parseRedTeamGateMarker(recordBody(r));
-    if (gate?.pr !== Number(pr) || gate.rev !== sha) return [];
+    if (gate?.pr !== Number(pr) || gate.rev !== sha || (gate.actor !== undefined && !r.ruling)) return [];
+    if (gate.actor !== undefined && gateActionLines(recordBody(r)).some(line => !['send-back', 'held'].includes(line.action))) return [];
     const decides = gate.result ? gate.result === id
       : threadOrder(r, hit) > 0 || (r.from != null && hit.from != null && r.at === hit.at);
     return decides ? [{ ...r, gate }] : [];
@@ -529,6 +585,7 @@ const HOLDING_OUTCOMES = Object.freeze([GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.S
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
  * Returns the validated ceremony record, or false. PURE.
  */
+const reviewedShaOf = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)].map(m => m[1].toLowerCase()).at(-1) ?? null;
 function operatorRuled(records, pr, head, index) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
@@ -551,13 +608,17 @@ function operatorRuled(records, pr, head, index) {
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it.
+    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it. (One of an unrelated
+    // head already ended the clearance in the shared parser, so this function returned false above.)
     // Scan the whole thread: accepts before or after a carry must survive its historical truncation.
     // The marker may name a head abbreviated (7–40 hex, any case), as its builder and parser allow: a prefix match supersedes.
     const reviewed = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)]
       .some(([, s]) => [...rulingHeads].some(h => h.startsWith(s.toLowerCase())));
-    const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
-      && reviewed(recordBody(r)));
+    const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && reviewed(recordBody(r))
+      // R706: a restamp is a plain accept unless it is a PROVEN carrier, which only the thread up to it can show
+      // (it cites the original human comment); a single comment alone never proves it.
+      && !(parseLatestHumanClearedSha([r.c]) !== null
+        || (r.c && parseLatestHumanClearedSha(trusted.filter(x => !x.from && x.at <= r.at).map(x => x.c)) === reviewedShaOf(recordBody(r)))));
     if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
       !holds(r) || cleared.at > r.at)) return cleared;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
@@ -594,14 +655,20 @@ const AUTOMATION_RELEASE_OUTCOMES = new Set([GATE_OUTCOMES.SENT_BACK, GATE_OUTCO
 function gateActionLines(body) {
   const lines = String(body ?? '').replace(/\r\n/g, '\n').trimStart().split('\n');
   const found = [];
-  for (let i = lines[1]?.startsWith('**Red-team gate** ') ? 2 : 1; i < lines.length && lines[i].startsWith('- '); i++) {
+  let start = 1;
+  const attribution = /^Ruled by acting judge \(R10\), not the operator(?: \(judge:r10\))?$/;
+  if (attribution.test(lines[start] ?? '')) start++;
+  if (lines[start]?.startsWith('**Red-team gate** ')) start++;
+  if (attribution.test(lines[start] ?? '')) start++;
+  for (let i = start; i < lines.length && lines[i].startsWith('- '); i++) {
     const hit = GATE_ACTION_LINES.map(([action, re]) => [action, re.exec(lines[i])]).find(([, m]) => m);
     if (hit) found.push({ action: hit[0], indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [] });
   }
   return found;
 }
 
-/** Shared live-head disposition reader. Recorded per-finding actions override today's policy.
+/** Shared live-head disposition reader. Recorded per-finding actions override today's policy,
+ * except automatic class-only cards whose live class deferral has been revoked.
  * Without a recorded action, policy send-back candidates still block admission while the gate acts: a missing gate
  * record keeps holding. Older round-cap records omit indices: all remaining send-back candidates belong to the operator.
  * Every gate decision (per-finding actions, the send-back outcome, the round-cap hand-over) applies only to the result
@@ -615,9 +682,12 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const result = latestResult(records, pr, live)?.parsed ?? null;
-  const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
+  const effectiveSetting = setting ?? readConfirmedBreaks({ env }).value;
+  const findingClasses = effectiveSetting.findingClasses ?? readFindingClassPolicy({ env });
+  const plan = planRedTeamActions(result, { ...effectiveSetting, findingClasses });
   const anyState = (operatorRulings ?? readOperatorRulings({ env }).value).anyState === true;
   const actions = new Map();
+  const classCarded = new Set(); // indices whose recorded automatic card was authorized by class deferral alone
   const rulings = [];
   const ordinaryHolds = new Map();
   const grants = gateRoundGrants(comments, pr, repo, standingRuling);
@@ -631,7 +701,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     const gates = gateRecordsFor(rs, pr, sha, hit);
     if (first) liveGates = gates;
     const { supersededCaps } = resolveSendBackStep(gates, grants);
-    const own = new Map();
+    const own = new Map(), ownClass = new Set();
     for (const r of gates) {
       for (const line of gateActionLines(recordBody(r))) {
         const { indices } = line;
@@ -662,19 +732,22 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           if (operatorRelease && (!first || r.from || (anyState && r.gate.result !== want))) continue;
           // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
           if (action === 'held' && own.get(index) === 'send-back' && supersededCaps.has(r)) continue;
-          if ((action === 'held' || action === 'send-back') && !(block && action === 'send-back' && isHumanOperatorComment(r.c))) {
+          if ((action === 'held' || action === 'send-back') && !(block && action === 'send-back' && r.ruling)) {
             ordinaryHolds.set(index, Math.max(ordinaryHolds.get(index) ?? -1, r.at));
           }
-          if (RELEASING_ACTIONS.has(action) || (block && action === 'send-back' && isHumanOperatorComment(r.c))) {
+          if (RELEASING_ACTIONS.has(action) || (block && action === 'send-back' && r.ruling)) {
             rulings.push({ kind: action === 'send-back' ? 'block' : action === 'card' ? 'card' : 'not-real',
-              source: operatorRelease || (block && isHumanOperatorComment(r.c)) ? 'operator' : 'automatic',
+              source: operatorRelease || (block && r.ruling) ? 'operator' : 'automatic',
               keys: [index], at: r.at, action });
           }
           own.set(index, action);
+          // Only the gate's own automatic card record can name a class-only card; an operator card never does.
+          if (action === 'card' && !operatorRelease && r.gate.classCards?.includes(index)) ownClass.add(index);
+          else ownClass.delete(index);
         }
       }
     }
-    for (const [index, action] of own) if (!actions.has(index)) actions.set(index, action);
+    for (const [index, action] of own) if (!actions.has(index)) { actions.set(index, action); if (ownClass.has(index)) classCarded.add(index); }
     if (!hit.from) break;
     rs = rs.filter(r => r.at < hit.at);
     sha = hit.from;
@@ -686,14 +759,19 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const dispositions = new Map(), findingRulings = new Map();
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
-    const recorded = actions.get(f.index);
+    const classDeferred = classAction(f, findingClasses) === 'defer-card';
+    // Only a card the gate recorded as class-authorized (`class=` on its marker) is revoked with the deferral;
+    // an ordinary-policy card keeps its recorded action even if confirmedBreaks later changes.
+    const revokedClassCard = !classDeferred && classCarded.has(f.index);
+    const recorded = revokedClassCard && actions.get(f.index) === 'card' ? null : actions.get(f.index);
     // Two raced gate runs can record both send-back and round-cap for one result; the cap wins (sendBackStepOutcome).
     const action = (recorded === 'send-back' && outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : recorded)
       ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)
         ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
     // Indexed gate holds retire older releases; legacy unindexed holds are only
     // fallback evidence. Operator blocks remain live across ordinary gate holds.
-    const evidence = rulings.filter(r => r.kind === 'block' || r.at > (ordinaryHolds.get(f.index) ?? -1));
+    const evidence = rulings.filter(r => !(revokedClassCard && r.kind === 'card' && r.source === 'automatic'))
+      .filter(r => r.kind === 'block' || r.at > (ordinaryHolds.get(f.index) ?? -1));
     // operatorRuled validates the ceremony, carry chain, cap handover and later
     // accept/hold invalidations. A ceremony clears only held actions; a standing
     // send-back still belongs to the fixer even when the ceremony is live.
@@ -704,6 +782,8 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     const disposition = resolveDisposition(f.index, evidence);
     dispositions.set(f.index, disposition);
     findingRulings.set(f.index, evidence);
+    // Class deferral exempts automatic holds, but cannot release an explicit operator block.
+    if (classDeferred && disposition.state !== 'held') continue;
     const effectiveAction = disposition.state === 'held'
       ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back'
       : disposition.state === 'open' ? action : null;

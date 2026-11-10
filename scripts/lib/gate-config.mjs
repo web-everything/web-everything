@@ -109,6 +109,11 @@ const { extractAnchors } = createRequire(import.meta.url)('./rules-loader.cjs');
  * fail-closed direction is human, never committee.
  */
 export const TRUST_CHAIN = [
+  ...['card-ledger-trust.json', 'card-ledger-legacy-identities.json'].map(file => ({
+    role: file === 'card-ledger-trust.json' ? 'card-ledger-trust' : 'card-ledger-legacy-identities',
+    file, tier: 'policy', leash: 'spec', homes: [`scripts/settings/${file}`],
+    desc: 'Reviewed card-ledger provenance and identity exceptions (#6121)',
+  })),
   {
     role: 'delivery-policy-config',
     file: 'webeverything.config.json',

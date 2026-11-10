@@ -1,0 +1,15 @@
+---
+layout: base.njk
+title: Resolved backlog
+permalink: /backlog/resolved/
+---
+
+<section class="intro">
+    <h1>Resolved backlog</h1>
+    <p><a href="/backlog/">Back to current backlog</a></p>
+</section>
+
+{% set resolvedView = true %}
+{% include "backlog-tracked.njk" %}
+
+<script src="/assets/js/home-display.js"></script>

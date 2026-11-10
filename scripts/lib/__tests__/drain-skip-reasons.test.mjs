@@ -6,6 +6,15 @@ import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReas
 import { cardGroupHold } from '../card-group.mjs';
 
 describe('drain skip reasons (card 122 slice 1)', () => {
+  it('6222: a ready PR the enqueue held names the real enqueue outcome, not ready-not-reached; no outcome keeps ready-not-reached', () => {
+    const verdicts = [{ num: 201, repo: null, decision: 'merge' }, { num: 202, repo: null, decision: 'merge' }];
+    const rows = buildSkipReasons({
+      verdicts,
+      enqueueOutcomes: [{ num: 201, repo: null, outcome: 'not-enqueued', kind: 'mq-same-head-failed', reason: 'mq-same-head-failed: #201 head abc - failed_checks' }],
+    });
+    expect(rows.map((r) => [r.num, r.kind, r.source])).toEqual([[201, 'mq-same-head-failed', 'enqueueOutcomes'], [202, 'ready-not-reached', 'unaccounted']]);
+    expect(rows[0].reason).toContain('failed_checks');
+  });
   it('a pass with 3 ready PRs, 1 landed and 2 skipped for different reasons, lists both reasons', () => {
     const verdicts = [
       { num: 101, repo: null, decision: 'merge' },

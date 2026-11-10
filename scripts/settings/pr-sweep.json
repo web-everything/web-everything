@@ -8,6 +8,8 @@
     "stalledAfterMinutes": 45,
     "sessionActiveWithinMinutes": 30,
     "dispatchDiagnosis": false,
+    "alertBackoffMinutes": [30, 60, 120, 240],
+    "deadlineMinutes": { "label": 45, "await-review": 90, "await-red-team": 60, "fix": 120, "rebase": 90, "wait-on": 120, "close into card": 45 },
     "repos": ["web-everything/web-everything", "plateauapp/plateau-app"]
   }
 }

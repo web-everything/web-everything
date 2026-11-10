@@ -3,7 +3,10 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, GATE_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
+import { GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -129,6 +132,22 @@ describe('feed', () => {
     expect(cleared.lines[0]).toMatch(/^NEEDS-YOU-CLEARED /);
     expect(parseFeedLine(cleared.lines[0])).toMatchObject({ kind: 'cleared', was: 'needs-you', head: 'abc', pr: 12 });
     expect(diffFeed(first.openKeys, [{ ...item, head: 'def' }], at).lines).toHaveLength(2);
+  });
+  it('dedupes two stalled events while needs-you and red-team-undecided have distinct keys on the same PR/head', () => {
+    const stalled = { ...item, kind: 'stalled' };
+    const undecided = { ...item, kind: 'red-team-undecided' };
+    const first = diffFeed([], [stalled, stalled, item, undecided], at);
+    expect(first.openKeys).toEqual([
+      'owner/repo#12@abc:stalled', 'owner/repo#12@abc:needs-you', 'owner/repo#12@abc:red-team-undecided',
+    ]);
+    expect(first.lines).toHaveLength(3);
+    expect(diffFeed(first.openKeys, [stalled, stalled, item, undecided], at).lines).toEqual([]);
+  });
+  it.each(['red-team-undecided', 'confirmed-break-owed-send-back'])('clears report kind %s by absence while retaining event-only stalled keys', kind => {
+    const first = diffFeed([], [{ ...item, kind }, { ...item, kind: 'stalled' }], at);
+    const cleared = diffFeed(first.openKeys, [], at, { clearKinds: REPORT_KINDS, alsoClear: GATE_KINDS });
+    expect(cleared.openKeys).toEqual(['owner/repo#12@abc:stalled']);
+    expect(cleared.lines.map(parseFeedLine)).toEqual([expect.objectContaining({ kind: 'cleared', was: kind })]);
   });
   it('maps real queue row shapes and incomplete flag', () => {
     const row = { repo: item.repo, number: 12, head: 'abc' };
@@ -325,23 +344,282 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
   const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
   const items = () => itemsFromReport(report);
+  const bare = ({ command, pick, ...rest }) => rest; // reclassified items drop the approve/merge instruction
+  const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false, impact = 'broken', count = 1 } = {}) => {
+    const body = renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok',
+      foldedVerdict: broken ? 'changes' : 'accepted', findings: broken ? Array.from({ length: count }, (_, index) => ({ summary: 'confirmed break',
+        category: 'edge-case', impactIfUnfixed: impact, file: 'scripts/x.mjs', line: 3 + index,
+        confirmedByRecheck: true, recheckReason: 'real' })) : [] });
+    return [
+      { user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
+      { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+        body: redTeamGateMarker(pr, rev, outcome, redTeamResultId(parseRedTeamComment(body))) },
+    ];
+  };
+  const expectUndecided = (kept, pr = 5768) => {
+    const row = kept.find(i => i.pr === pr);
+    expect(row.kind).toBe('red-team-undecided');
+    expect(row.reason).toMatch(/red team.*no result.*live head/i);
+    expect(row.reason).not.toContain('all gates pass');
+    return row;
+  };
 
+  it.each([GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.ROUND_CAP])('#6239: clear labels cannot hide a confirmed break with %s on the live head', async outcome => {
+    const r = { ready: [{ repo, number: 6239, title: 'confirmed break', head: 'stale' }] };
+    const original = itemsFromReport(r);
+    const { kept, held } = await gateReadyItems(original, r, {
+      gh: gate({ headRefOid: head, labels: [] }, [...gateComments({ pr: 6239, outcome, broken: true }),
+        // The operator reply clears humanReviewHold, but is no explicit gate pass.
+        { user: { login: 'chalbert' }, body: 'Please continue', created_at: '2026-10-10T02:06:00Z' }]), log: () => {},
+    });
+    expect(held).toEqual([]);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toEqual({ ...bare(original[0]), head, kind: 'confirmed-break-owed-send-back', reason: expect.any(String) });
+    expect(kept[0].reason).toMatch(/confirmed red-team break.*owed.*send-back/i);
+    expect(kept[0].reason).not.toContain('all gates pass');
+  });
+  const rulingCases = [GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.ROUND_CAP].flatMap(outcome =>
+    ['ready', 'needsYourMerge'].flatMap(section => ['card', 'not-real', 'clear-human', 'block'].map(ruling => [outcome, section, ruling])));
+  it.each(rulingCases)('operator ruling after %s restores %s approval for %s only when the finding is settled', async (outcome, section, ruling) => {
+    // Sent-back releases require the shared reader's explicit any-state opt-in; cap releases use its default.
+    vi.stubEnv('WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE', String(outcome === GATE_OUTCOMES.SENT_BACK));
+    const r = { ready: [], [section]: [{ repo, number: 5768, title: 't', command: 'human merge', pick: 'pick 5768' }] };
+    const [res, record] = gateComments({ outcome, broken: true });
+    const id = redTeamResultId(parseRedTeamComment(res.body));
+    const lines = {
+      card: '- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).',
+      'not-real': '- 1 finding(s) left advisory (#1).',
+      block: '- 1 confirmed break(s) sent back to the fixer (#1).',
+    };
+    const clearance = { user: { login: 'chalbert', type: 'User' }, created_at: '2026-10-10T02:07:00Z',
+      body: ['✅ review — `review:human` cleared via the sanctioned path', '',
+        'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+        buildReviewedShaMarker(head), buildClearedHumanMarker('chalbert')].join('\n') };
+    const decision = { user: { login: 'chalbert', type: 'User' }, created_at: '2026-10-10T02:06:00Z',
+      body: `${redTeamGateMarker(5768, head, `operator-${ruling}`, id)}\n${lines[ruling]}` };
+    const comments = [res, record, ...(ruling === 'clear-human' ? [clearance] : [decision])];
+    // A block continues to win even over a later clear-human ceremony.
+    if (ruling === 'block') comments.push(clearance);
+    const original = itemsFromReport(r)[0];
+    const { kept, held } = await gateReadyItems([original], r, {
+      gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {}, fixClaimLive: () => false,
+    });
+    expect(held).toEqual([]);
+    if (ruling === 'block' || (ruling === 'clear-human' && outcome === GATE_OUTCOMES.SENT_BACK)) {
+      expect(kept[0]).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+      expect(kept[0]).not.toHaveProperty('command');
+      expect(kept[0]).not.toHaveProperty('pick');
+    } else {
+      expect(kept).toEqual([{ ...original, head }]);
+      expect(kept[0].command ?? kept[0].pick).toBeTruthy();
+    }
+  });
+  it.each([[[1]], [[1, 2]]])('operator card covering %j releases approval only after every confirmed finding is settled', async indices => {
+    vi.stubEnv('WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE', 'false');
+    const r = { ready: [{ repo, number: 5768, title: 'two breaks' }] };
+    const [res, record] = gateComments({ outcome: GATE_OUTCOMES.ROUND_CAP, broken: true, count: 2 });
+    const decision = { user: { login: 'chalbert', type: 'User' }, created_at: '2026-10-10T02:06:00Z',
+      body: `${redTeamGateMarker(5768, head, 'operator-card', redTeamResultId(parseRedTeamComment(res.body)))}\n` +
+        `- ${indices.length} finding(s) carded by the operator to \`we:backlog/follow-up.md\` (${indices.map(i => `#${i}`).join(', ')}).` };
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, {
+      gh: gate({ headRefOid: head, labels: [] }, [res, record, decision]), log: () => {}, fixClaimLive: () => false,
+    });
+    expect(kept[0].kind).toBe(indices.length === 2 ? 'needs-you' : 'confirmed-break-owed-send-back');
+  });
+  it.each([
+    ['no record', () => []],
+    ['an older head only', () => gateComments({ rev: '2'.repeat(40) })],
+    ['a gate record without a result', () => gateComments().slice(1)],
+    ['an untrusted pass record', () => gateComments().map(c => ({ ...c, user: { login: 'mallory' } }))],
+  ])('keeps red-team-undecided for clear labels with %s', async (_name, comments) => {
+    const { kept, held } = await gateReadyItems(items(), report, {
+      gh: gate({ headRefOid: head, labels: [] }, comments()), log: () => {},
+    });
+    expect(held).toEqual([]);
+    expect(kept).toHaveLength(2);
+    expect(expectUndecided(kept)).toEqual({ ...bare(items()[0]), head, kind: 'red-team-undecided', reason: expect.any(String) });
+    expect(kept.find(i => i.pr === 9)).toMatchObject({ kind: 'red-team-undecided' });
+  });
+
+  it.each(['broken', 'degraded'])('a confirmed %s break with no gate record yet still blocks all gates pass', async impact => {
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+      gateComments({ broken: true, impact }).slice(0, 1)), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+  });
+  it('an incomplete re-check (unverifiable finding) is red-team-undecided, never all gates pass', async () => {
+    const comments = gateComments().slice(0, 1).map(c => ({ ...c, body: c.body.replace(/\n$/, '') +
+      '\n\n1. [unverifiable] (edge-case, broken) `scripts/x.mjs:3` — could not be re-checked\n' }));
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
+    expectUndecided(kept);
+  });
+  it.each([
+    ['a marker-only comment', c => c.body.split('\n')[0]],
+    ['a confirmed finding the parser cannot read', c => c.body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ')],
+  ])('%s is red-team-undecided, never all gates pass', async (_n, mutate) => {
+    const comments = gateComments({ broken: true }).slice(0, 1).map(c => ({ ...c, body: mutate(c) }));
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
+  it('an open confirmed-break alert survives the PR leaving the queue (absence is not resolution)', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#5768@${head}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [], notReady: [{ repo: 'r', number: 5768, head, title: 't' }] }),
+      gh: async () => '[[]]', settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+    expect(result.lines.join('\n')).not.toContain('NEEDS-YOU-CLEARED');
+  });
+  it.each(['ready', 'needsYourMerge'].flatMap(section => ['live pass', 'newer-head confirmed verdict'].map(verdict => [section, verdict])))(
+    'runOnce retires a persisted confirmed-break alert for %s on a %s', async (section, verdict) => {
+      const path = join(temp(), 'needs-you-events.jsonl');
+      const newer = verdict === 'newer-head confirmed verdict', live = newer ? 'b'.repeat(40) : head;
+      const key = `${repo}#5768@${head}:confirmed-break-owed-send-back`;
+      const unrelated = `${repo}#99@${head}:confirmed-break-owed-send-back`;
+      writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key, unrelated] }));
+      const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+      const r = { ready: [], [section]: [{ repo, number: 5768, head, title: 't', command: 'human merge' }] };
+      const result = await runOnce({ exec: async () => JSON.stringify(r),
+        gh: gate({ headRefOid: live, labels: [] }, gateComments({ rev: live, broken: newer })),
+        settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+      const nextKey = `${repo}#5768@${live}:${newer ? 'confirmed-break-owed-send-back' : 'needs-you'}`;
+      expect(result.openKeys).toEqual(expect.arrayContaining([nextKey, unrelated]));
+      expect(result.openKeys).not.toContain(key);
+      expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual(result.openKeys);
+      expect(result.lines.filter(line => line.startsWith('NEEDS-YOU-CLEARED ')).map(parseFeedLine)).toEqual([
+        expect.objectContaining({ repo, pr: 5768, head, kind: 'cleared', was: 'confirmed-break-owed-send-back' }),
+      ]);
+      const published = result.lines.filter(line => line.startsWith('NEEDS-YOU ')).map(parseFeedLine);
+      expect(published).toEqual([expect.objectContaining({ pr: 5768, head: live,
+        kind: newer ? 'confirmed-break-owed-send-back' : 'needs-you' })]);
+      if (!newer) expect(published[0].command ?? published[0].pick).toBeTruthy();
+    });
+  it('a malformed confirmed finding inside a carried-verdict wrapper is not a clean pass', async () => {
+    const [res] = gateComments({ broken: true }), bad = res.body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ');
+    const from = 'c'.repeat(40), carried = `<!-- review-verdict-carried from=${from} to=${head} patch-id=${'d'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${bad}`;
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [{ ...res, body: carried }]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
+  it('a needs-your-merge row (never live-read) cannot retire an open confirmed-break alert', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#9@${head}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [], needsYourMerge: [{ repo: 'r', number: 9, head, title: 't' }] }),
+      gh: async () => '[[]]', settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+  });
+  it('an untrusted marker-only comment cannot suppress a trusted clean result', async () => {
+    const comments = [...gateComments().slice(0, 1), { user: { login: 'mallory' }, body: gateComments().at(0).body.split('\n')[0], created_at: '2026-10-10T03:00:00Z' }];
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+  });
+  it.each([['indented', m => '  ' + m], ['uppercase', m => m.toUpperCase()]])('a %s marker-only comment is not a clean pass', async (_n, shape) => {
+    const [res] = gateComments({ broken: true }), marker = res.body.split('\n')[0];
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [{ ...res, body: shape(marker) }]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
+  it('a live read with no labels field is red-team-undecided, never all gates pass', async () => {
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head }, gateComments()), log: () => {} });
+    expectUndecided(kept);
+  });
+  it('an automatic card-queued record does not settle a confirmed degraded break', async () => {
+    const [res, ...rest] = gateComments({ broken: true, impact: 'degraded', outcome: GATE_OUTCOMES.CARD_QUEUED });
+    const card = { ...rest[0], body: rest[0].body + '\n**Red-team gate**\n- 1 finding(s) filed as a follow-up card (#1).' };
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [res, card]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).toBe('confirmed-break-owed-send-back');
+  });
+  it.each([
+    ['missing closing space', body => body.replace(/ -->/, '-->')],
+    ['missing closer', body => body.replace(/ -->/, '')],
+    ['unknown scope', body => body.replace(/ pr=\d+ rev=[^ ]+ -->/, ' -->')],
+  ])('a trusted live result marker the shared parser cannot read (%s) is never a clean pass', async (_shape, mutate) => {
+    const [res] = gateComments({ broken: true }), clean = gateComments().slice(0, 1);
+    const bad = { ...res, created_at: '2026-10-10T03:00:00Z', body: mutate(res.body) };
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [...clean, bad]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
+  it('a clean result on the live head alerts without any gate record', async () => {
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+      gateComments().slice(0, 1)), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+  });
+  it('a confirmed break on an older head is ignored when the live head is clear', async () => {
+    const old = gateComments({ rev: '2'.repeat(40), broken: true });
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+      [...old, ...gateComments({ outcome: GATE_OUTCOMES.NOTHING_TO_SEND })]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+  });
+  it.each([
+    ['missing closing space', body => body.replace(' -->', '-->')],
+    ['missing closer', body => body.replace(' -->', '')],
+    ['unreadable finding', body => body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ')],
+  ].flatMap(([shape, mutate]) => ['stale head', 'another PR'].map(scope => [shape, scope, mutate])))(
+    'a malformed historical result (%s, %s) cannot veto a clean live-head result', async (_shape, scope, mutate) => {
+      const [old] = gateComments({ rev: scope === 'stale head' ? '2'.repeat(40) : head,
+        pr: scope === 'another PR' ? 99 : 5768, broken: true });
+      const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+        [{ ...old, body: mutate(old.body) }, ...gateComments()]), log: () => {} });
+      expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+    });
+  it('REPORT_KINDS is unchanged for other producers: gate kinds only clear through alsoClear', () => {
+    expect(REPORT_KINDS.has('red-team-undecided')).toBe(false);
+    expect(REPORT_KINDS.has('confirmed-break-owed-send-back')).toBe(false);
+    expect(GATE_KINDS.has('confirmed-break-owed-send-back')).toBe(true);
+  });
+  it('a stale report head cannot clear an open confirmed-break alert when evidence is unreadable', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#5768@${'b'.repeat(40)}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [{ repo: 'r', number: 5768, head, title: 't' }] }),
+      gh: async () => { throw new Error('rate limited'); }, settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+  });
   it('drops a ready item whose live PR is red-team:blocked + review:changes, and says why', async () => {
     const gh = gate({ headRefOid: head, labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }, []);
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
-    expect(kept.map((i) => i.pr)).toEqual([9]);
+    expect([...kept]).toEqual([]); // the needs-your-merge row #9 is held back by the same live labels
     expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head', 'it was sent back (review:changes)']));
   });
-  it('keeps a ready item whose live PR is clean, and never judges needs-your-merge rows', async () => {
-    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, []);
+  it('keeps needs-you all gates pass only with a result and no-send-back record on the live head, and needs-your-merge rows pass the same live gate', async () => {
+    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, gateComments());
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
     expect(held).toEqual([]);
+    expect(kept[0]).toEqual({ ...items()[0], head });
+    expect(kept[0].reason).toContain('all gates pass');
+    expect(kept[1]).toMatchObject({ pr: 9, kind: 'red-team-undecided' }); // no result for #9 in this thread
   });
-  it('keeps the item (never suppresses an alert) when the live PR cannot be read, and logs it', async () => {
+  it('needs-your-merge rows pass the same live red-team gate: a confirmed break blocks the approval alert', async () => {
+    const r = { needsYourMerge: [{ repo, number: 6239, title: 'm' }], ready: [] };
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] },
+      gateComments({ pr: 6239, broken: true, impact: 'degraded' }).slice(0, 1)), log: () => {} });
+    expect(kept[0]).toMatchObject({ pr: 6239, kind: 'confirmed-break-owed-send-back' });
+    expect(kept[0].reason).not.toMatch(/approved|all gates pass/);
+  });
+  it('a needs-your-merge row with a clean live head keeps its merge wording', async () => {
+    const r = { needsYourMerge: [{ repo, number: 9, title: 'm' }], ready: [] };
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] }, gateComments({ pr: 9 })), log: () => {} });
+    expect(kept[0]).toEqual({ ...itemsFromReport(r)[0], head });
+  });
+  it('a confirmed break is classified before the human-review hold: red-team:blocked does not hide the alert', async () => {
+    const r = { needsYourMerge: [{ repo, number: 6239, title: 'm' }], ready: [] };
+    const { kept, held } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] },
+      gateComments({ pr: 6239, broken: true, impact: 'degraded' }).slice(0, 1)), log: () => {} });
+    expect(held).toEqual([]);
+    expect(kept[0]).toMatchObject({ pr: 6239, kind: 'confirmed-break-owed-send-back' });
+  });
+  it.each([['confirmed', () => gateComments({ pr: 6239, broken: true }).slice(0, 1)], ['undecided', () => []]])('a %s reclassified item drops the merge command and pick', async (_n, comments) => {
+    const r = { needsYourMerge: [{ repo, number: 6239, title: 'm', command: 'land-human-only', pick: 'merge it' }], ready: [] };
+    expect(itemsFromReport(r)[0].command ?? itemsFromReport(r)[0].pick).toBeTruthy();
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] }, comments()), log: () => {} });
+    expect(kept[0].kind).not.toBe('needs-you');
+    expect(kept[0]).not.toHaveProperty('command');
+    expect(kept[0]).not.toHaveProperty('pick');
+  });
+  it('keeps red-team-undecided when the live PR cannot be read, and logs it', async () => {
     const logs = [];
     const { kept } = await gateReadyItems(items(), report, { gh: async () => { throw new Error('rate limited'); }, log: (l) => logs.push(l) });
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(expectUndecided(kept)).toEqual({ ...bare(items()[0]), kind: 'red-team-undecided', reason: expect.any(String) });
     expect(logs.join()).toMatch(/live gate unreadable, keeping: rate limited/);
   });
   it('runOnce applies the gate by default and logs what it held back', async () => {
@@ -353,37 +631,74 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(result.openKeys).toEqual([]);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('r#5768 held back from your review: the red team blocked the live head'));
   });
+  it('unreadable live evidence keeps an open confirmed-break alert open instead of clearing it', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#5768@${head}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const gh = async () => { throw new Error('rate limited'); };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [{ repo: 'r', number: 5768, head, title: 't' }] }), gh, settings,
+      env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+    expect(result.lines.join('\n')).not.toContain('NEEDS-YOU-CLEARED');
+  });
   it('publishes the head it CHECKED, not a stale one from the report or a later lookup', async () => {
     const stale = [{ repo, number: 5768, head: 'stale' }];
     const r2 = { ready: stale };
-    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, gateComments()), log: () => {} });
     expect(kept[0].head).toBe(head);
   });
   it('the real fix-claim lease overrides the comment heuristic (expired lease = not claimed; live lease = claimed)', async () => {
     const created_at = new Date(Date.now() - 600000).toISOString();
     const body = '🔒 conveyor fix-begin — fix claim held';
-    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }, ...gateComments()]]) : JSON.stringify({ headRefOid: head, labels: [] }));
     const live = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => true });
     expect(live.held[0].reasons).toEqual(['a fix claim is open']);
     const expired = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => false });
     expect(expired.held).toEqual([]);
+    expect(expired.kept[0]).toEqual({ ...items()[0], head });
   });
-  it('a pass-wide deadline keeps (never drops) the items it could not judge in time', async () => {
+  it('a pass-wide deadline keeps red-team-undecided for items it could not judge in time', async () => {
     const logs = [];
-    const gh = async () => JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
+    const gh = vi.fn(async () => JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] }));
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: (l) => logs.push(l), deadlineMs: -1 });
     expect(held).toEqual([]);
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(expectUndecided(kept)).toEqual({ ...bare(items()[0]), kind: 'red-team-undecided', reason: expect.any(String) });
+    expect(gh).not.toHaveBeenCalled();
     expect(logs.join()).toMatch(/gate deadline/);
+  });
+  it('still holds a blocked PR when the deadline expires during the live read (evidence already arrived)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(at));
+    const logs = [];
+    const gh = async (_f, args) => {
+      if (args[0] !== 'api') return JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
+      vi.setSystemTime(new Date(Date.parse(at) + 1000));
+      return JSON.stringify([gateComments()]);
+    };
+    const { kept, held } = await gateReadyItems(items(), report, { gh, deadlineMs: 1000, log: l => logs.push(l) });
+    expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head']));
+    expect(kept.filter(i => i.pr === items()[0].pr)).toEqual([]);
   });
   it('keeps the incomplete flag the diff uses', async () => {
     const withFlag = Object.assign(items(), { incomplete: true });
-    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, gateComments()), log: () => {} });
     expect(kept.incomplete).toBe(true);
   });
 });
 
 describe('stall sweep coexistence', () => {
+  it('an open stalled item does not suppress a new gate verdict (red-team-undecided) for the same head', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const head = 'a'.repeat(40), repo = 'web-everything/web-everything';
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const gh = async (_f, args) => (args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: head, labels: [] }));
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [{ repo, number: 5, head }] }), gh, settings,
+      env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'true' }, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.lines).toHaveLength(1);
+    expect(replay({ path })[0]).toMatchObject({ pr: 5, kind: 'red-team-undecided' });
+  });
   it.each([
     { WE_PR_STALL_SWEEP_MODE: 'off' },
     { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'false' },
