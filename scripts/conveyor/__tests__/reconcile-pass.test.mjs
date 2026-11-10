@@ -1614,6 +1614,22 @@ describe('readTimeoutEvidence — authoritative cancelled check suites (#4651)',
     expect(readTimeoutEvidence(pr, { repo, exec })).toEqual({ eligible: false, reason: 'timeout-evidence:no-primary-failed-checks' });
   });
 
+  it('a red aggregate test hidden by a superseded failed shard stays incomplete-failure-inventory (not review-hold-only)', () => {
+    const json = JSON.stringify;
+    const exec = vi.fn((_c, [, path]) => {
+      if (/\/pulls\/7$/.test(path)) return json({ head: { sha: head }, base: { sha: 'b' }, state: 'open', changed_files: 1 });
+      if (/pulls\/7\/files/.test(path)) return json([{ filename: 'a.ts' }]);
+      if (/check-runs/.test(path)) return json({ total_count: 3, check_runs: [
+        { id: 1, name: 'test-shard (1)', status: 'completed', conclusion: 'failure', details_url: url(50, 1), check_suite: { id: 5 } },
+        { id: 2, name: 'test-shard (1)', status: 'completed', conclusion: 'success', details_url: url(51, 2), check_suite: { id: 6 } },
+        { id: 3, name: 'test', status: 'completed', conclusion: 'failure', details_url: url(52, 3), check_suite: { id: 6 } },
+      ] });
+      if (/\/status$/.test(path)) return json({ total_count: 0 });
+      throw new Error(`unexpected ${path}`);
+    });
+    expect(readTimeoutEvidence(pr, { repo, exec })).toEqual({ eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory' });
+  });
+
   it('reruns only run 200 when its newer suite is cancelled despite the older suite having a higher green check-run id', () => {
     const exec = execFor(20, 10);
     const evidence = readTimeoutEvidence(pr, { repo, exec });
