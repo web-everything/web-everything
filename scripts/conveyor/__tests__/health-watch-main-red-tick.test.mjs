@@ -1,6 +1,7 @@
 /** Exercise the actual tick gate with host IO fenced, so each excluded flag is tested independently. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tick } from '../health-watch.mjs';
+import { probeForgeFallbackForWatch } from '../forge-down-probe.mjs';
 import { probeAndOwnMainCi } from '../main-ci-red-io.mjs';
 import { runMainRedAlert } from '../health-watch-main-red.mjs';
 
@@ -44,6 +45,10 @@ vi.mock('../review-tmp-health.mjs', () => ({ sweepReviewTmp: vi.fn(), probeDiskS
 vi.mock('../../lib/quiet-hours-io.mjs', async original => ({ ...await original(), flushDigest: vi.fn() }));
 vi.mock('../../lib/ledger-readiness-daily.mjs', async original => ({ ...await original(), runDailyReadinessCheck: vi.fn() }));
 
+vi.mock('../forge-down-probe.mjs', async original => ({
+  ...await original(), probeForgeFallbackForWatch: vi.fn(),
+}));
+
 const NOW = '2026-10-27T12:00:00.000Z';
 const probe = { runs: [{ headSha: 'a'.repeat(40), status: 'completed', conclusion: 'success' }], tip: null };
 const baseFlags = { now: NOW, 'no-diagnose': true, 'no-investigate': true, 'no-file': true, 'no-notify': true };
@@ -51,6 +56,7 @@ const deps = { smells: [], collectGh: () => ({ probes: {}, errors: {} }), collec
 
 beforeEach(() => {
   vi.clearAllMocks();
+  probeForgeFallbackForWatch.mockReturnValue({breach:false});
   io.files.clear();
   io.files.set('/isolated-health/config.json', JSON.stringify({
     tmpSweepEnabled: false, claudeJobsArchiveEnabled: false,
@@ -93,4 +99,11 @@ describe('tick — main-red alert publication gate', () => {
       probe, dir: '/isolated-health', now: Date.parse(NOW), config: expect.any(Object),
     });
   });
+});
+
+it('publishes FORGE-FALLBACK in the real watch section alongside FORGE-DOWN', async () => {
+  probeForgeFallbackForWatch.mockReturnValue({breach:true,summary:'remote full x2 in the last 15 min; top detail: fixture.test.mjs'});
+  const summary=await tick({...baseFlags,'dry-run':true},deps);
+  expect(summary.section).toContain('FORGE-FALLBACK remote full x2 in the last 15 min; top detail: fixture.test.mjs');
+  expect(summary.section.some(line=>line.startsWith('FORGE-DOWN '))).toBe(true);
 });

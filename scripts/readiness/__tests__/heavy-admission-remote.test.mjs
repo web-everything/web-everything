@@ -24,7 +24,8 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
-  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
+  forgeFallbackMinutes:15,forgeDownMinutes:15,forgeDownShare:0.3,forgeDownMinRuns:5,
+  maxConcurrent:8, backoffMs:600000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
 const testRoots=[];
 afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true,force:true});});
 const healthyRead=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
@@ -417,6 +418,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls[1][0]).toContain(reason);
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+    expect(JSON.parse(readFileSync(join(f.lockRoot,'..','remote','health.json'),'utf8')).failures).toBe(1);
   });
 
   it.each(['not-started','cancelled'].flatMap(mode=>
@@ -517,6 +519,7 @@ describe('runWithRemoteDecision', () => {
       expect(await runWithRemoteDecision(f)).toEqual({ handled: true, exitCode: 124 });
       expect(f.remoteExec).toHaveBeenCalledTimes(1);
       expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+    expect(JSON.parse(readFileSync(join(f.lockRoot,'..','remote','health.json'),'utf8')).failures).toBe(1);
     });
   });
 
@@ -580,6 +583,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls[1][0]).toContain('injected transport failure');
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+    expect(JSON.parse(readFileSync(join(f.lockRoot,'..','remote','health.json'),'utf8')).failures).toBe(1);
   });
 
   it('a remoteExec pending until confirmed cancellation times out and falls back to local admission', async () => {
@@ -718,6 +722,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expectLines(f.log, 2, 'remote');
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+    expect(JSON.parse(readFileSync(join(f.lockRoot,'..','remote','health.json'),'utf8')).failures).toBe(1);
   });
 });
 
