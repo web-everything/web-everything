@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link, chmod} from 'node:fs/promises';
 import {join} from 'node:path';
 import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
@@ -1713,5 +1713,143 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     expect(result.status,result.stderr).toBe(0);
     expect(JSON.parse(await readFile(usage,'utf8')).processCount).toBe(expected);
     if(expected===null)expect(result.stderr).toContain('task-pressure sample unavailable');
+  });
+});
+
+
+describe('self-healing warm-input index', () => {
+  async function warmIndex(fault) {
+    await writeFile(join(work,'package.json'),JSON.stringify({name:'fixture',version:'1.0.0'}));
+    await writeFile(join(work,'package-lock.json'),JSON.stringify({lockfileVersion:3,packages:{}}));
+    Object.assign(request,await snapshotBinding(work),{inputDigest:await digestInput(work),lock:hash(await readFile(join(work,'package-lock.json')))});
+    const paths=Buffer.from(request.manifest.paths,'base64').toString().split('\0').filter(Boolean);
+    const packages=paths.flatMap((path,i)=>path.split('/').at(-1)==='package.json'?[[Buffer.from(path).toString('base64'),request.manifest.hashes[i],request.manifest.executable[i]]]:[]);
+    const signature=hash(JSON.stringify({lock:request.lock,packages,node:process.version,
+      platform:process.platform,arch:process.arch,install:['ci','--include=dev','--ignore-scripts','--no-audit','--no-fund']}));
+    const parent=join(root,'cache',request.lock),source=join(parent,'dev-v5-'+'a'.repeat(64)),index=join(parent,'.warm-inputs-'+signature);
+    await mkdir(parent,{mode:0o700});
+    await writeFile(index,JSON.stringify({profile:'a'.repeat(64),archiveDigest:hash('archive')}),{mode:0o600});
+    if(fault!=='source') {
+      await mkdir(source,{mode:0o700});
+      if(fault!=='sha256')await writeFile(join(source,'sha256'),hash('archive'));
+      if(fault!=='archive')await writeFile(join(source,'dependencies.tar'),fault==='digest'?'corrupt':'archive');
+      if(fault==='permissions')await chmod(source,0o777);
+    }
+    return {index,source};
+  }
+  it.each(['source','sha256','archive'])('self-healing removes stale warm index with missing %s and installs cold', async fault => {
+    const {index}=await warmIndex(fault);
+    expect((await runner.run(request)).code).toBe(3);
+    await expect(stat(index)).rejects.toMatchObject({code:'ENOENT'});
+    expect(await readFile(join(root,'install.log'),'utf8')).not.toContain('--dry-run');
+    expect((await stat(join(root,'cache',request.lock,'dev-v5-'+request.inputDigest,'dependencies.tar'))).isFile()).toBe(true);
+  });
+  it('self-healing keeps warm archive digest mismatch fatal with code 97', async () => {
+    const {index}=await warmIndex('digest');
+    expect(await runner.run(request)).toMatchObject({code:97,stderr:expect.stringMatching(/digest mismatch/)});
+    expect((await stat(index)).isFile()).toBe(true);
+    await expect(stat(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('self-healing keeps non-ENOENT warm source permission refusal fatal with code 97', async () => {
+    const {index}=await warmIndex('permissions');
+    expect((await runner.run(request)).code).toBe(97);
+    expect((await stat(index)).isFile()).toBe(true);
+    await expect(stat(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+});
+
+describe('self-healing install error journal', () => {
+  afterEach(()=>vi.restoreAllMocks());
+  async function failInstall(message) {
+    await writeFile(join(root,'bin','npm'),`#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(message)});process.exit(1);\n`,{mode:0o755});
+    expect((await runner.run(request)).code).toBe(97);
+    return readFile(join(root,'receipts','install-errors.log'),'utf8');
+  }
+  it('self-healing persists install failure with run id and ET timestamp in a private journal', async () => {
+    const log=await failInstall('INJECTED_INSTALL_FAILURE');
+    expect(log.trim().split('\n')).toHaveLength(1);
+    expect(log).toContain(request.run);
+    expect(log).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\n]*(?:-04:00|-05:00)/);
+    expect(log).toContain('INJECTED_INSTALL_FAILURE');
+    expect((await stat(join(root,'receipts','install-errors.log'))).mode&0o777).toBe(0o600);
+  });
+  it('self-healing truncates oversized install failure journal lines to 2KB', async () => {
+    const log=await failInstall('failure '+ '雪'.repeat(4000));
+    expect(Buffer.byteLength(log)).toBeLessThanOrEqual(2048);
+    expect(log).toContain(request.run);
+    expect(log).toContain('failure');
+    expect(log).not.toContain('\ufffd');
+    expect(log.endsWith('\n')).toBe(true);
+  });
+  it('self-healing strips control characters from install failure journal lines', async () => {
+    const log=await failInstall('before\x00\x1b[31m\r\n\t\x7fafter');
+    expect(log.slice(0,-1)).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(log.trim().split('\n')).toHaveLength(1);
+    expect(log).toContain('before');expect(log).toContain('after');
+  });
+  it('self-healing bounds an existing oversized install error journal', async () => {
+    const file=join(root,'receipts','install-errors.log');
+    await writeFile(file,'old failure\n'.repeat(200000),{mode:0o600});
+    const log=await failInstall('NEW_FAILURE');
+    expect(Buffer.byteLength(log)).toBeLessThanOrEqual(1024*1024);
+    expect(log).toContain('NEW_FAILURE');
+  });
+  it('self-healing journal write failure never replaces the install receipt', async () => {
+    await mkdir(join(root,'receipts','install-errors.log'));
+    await failInstall('JOURNAL_UNWRITABLE').catch(error=>{if(error.code!=='EISDIR')throw error;});
+    expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
+  });
+});
+
+describe('self-healing over-ceiling reaper', () => {
+  const now=1800000000000, hour=3600000, pid=424242;
+  let output;
+  beforeEach(()=>{output=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);vi.stubEnv('FORGE_RUN_CEILING_MS','');});
+  afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();});
+  async function fixture({age=7*hour,start='12345',dead=false}={}) {
+    const run='r-'+'e'.repeat(32),slot='forge-exec-1',lock=join(root,'receipts','worker-active-1');
+    const record={v:1,run,nonce:'f'.repeat(32),slot,writerGuard:1};
+    await mkdir(lock,{mode:0o700});await writeFile(join(lock,'reservation.json'),JSON.stringify(record));
+    await writeFile(join(root,'receipts',run+'.running'),JSON.stringify({...record,startedAtMs:now-age,owner:{pid,start:'12345'}}));
+    // Recent mtimes deliberately disagree with the recorded age.
+    const startProbe=vi.fn(async()=>dead?null:start);
+    const kill=vi.fn(async(target,signal)=>{if(signal==='SIGTERM')dead=true;});
+    const reapRunner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',clock:()=>now,
+      testReapProbe:{start:startProbe,group:async()=>pid,uidBusy:async()=>!dead,unitActive:async()=>true},testReapKill:kill});
+    return {run,lock,kill,startProbe,reapRunner};
+  }
+  it('self-healing kills over-ceiling live owner by recorded group and releases lock with one audit line', async () => {
+    const {run,lock,kill,reapRunner}=await fixture();
+    await reapRunner.telemetry();await reapRunner.telemetry();
+    expect(kill.mock.calls).toEqual([[-pid,'SIGTERM']]);
+    await expect(stat(lock)).rejects.toMatchObject({code:'ENOENT'});
+    const audit=await readFile(join(root,'receipts','reap-audit.log'),'utf8');
+    expect(audit.trim().split('\n')).toHaveLength(1);
+    expect(audit).toContain(`reaped worker-active-1 run=${run} reason=over-ceiling age=${7*hour} ceiling=${6*hour}`);
+  });
+  it('self-healing leaves an under-ceiling live owner untouched', async () => {
+    const {lock,kill,reapRunner}=await fixture({age:hour});
+    await reapRunner.telemetry();expect(kill).not.toHaveBeenCalled();expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+  it('self-healing refuses PID start-time mismatch without killing or releasing the lock', async () => {
+    const {lock,kill,reapRunner}=await fixture({start:'different-process'});
+    await reapRunner.telemetry();expect(kill).not.toHaveBeenCalled();expect((await stat(lock)).isDirectory()).toBe(true);
+    expect(output.mock.calls.flat().join('')).toMatch(/(?:identity|start|reuse|mismatch)/i);
+  });
+  it.each([
+    ['999999999',12*hour,'clamped'],['1',10*60000,'clamped'],['invalid',6*hour,'clamped'],['3600000',hour,'env'],['',6*hour,'default'],
+  ])('self-healing resolves ceiling %j to %i with provenance %s once', async (setting,ceiling,source) => {
+    vi.stubEnv('FORGE_RUN_CEILING_MS',setting);
+    const {kill,reapRunner}=await fixture({age:hour/2});
+    await reapRunner.telemetry();await reapRunner.telemetry();
+    const lines=output.mock.calls.flat().join('').split('\n').filter(line=>line.includes('ceiling'));
+    expect(lines).toHaveLength(1);expect(lines[0]).toContain(String(ceiling));expect(lines[0]).toContain(source);
+    if(ceiling>hour/2)expect(kill).not.toHaveBeenCalled();
+  });
+  it('self-healing still reclaims a dead owner without killing', async () => {
+    const {run,lock,kill,reapRunner}=await fixture({dead:true,age:hour});
+    await reapRunner.telemetry();expect(kill).not.toHaveBeenCalled();
+    await expect(stat(lock)).rejects.toMatchObject({code:'ENOENT'});
+    expect(await readFile(join(root,'receipts','reap-audit.log'),'utf8')).toContain(`reaped worker-active-1 run=${run} reason=owner-gone`);
   });
 });
