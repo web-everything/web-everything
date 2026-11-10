@@ -46,12 +46,18 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
 /**
  * The auditor itself: weakening it weakens every later audit. Like REVIEW_AUTH_FLOOR, a test reads every module these
  * entries match and pins each module it imports DIRECTLY onto the floor (PR #6381 judge: audit-verdict.mjs delegates
- * protected-path classification to audit-path.mjs, which was missing).
+ * protected-path classification to audit-path.mjs, which was missing). codex-direct-task.mjs is the launcher
+ * codex-audit-io.mjs spawns to produce the audit report, so it is a root too.
  */
 export const AUDITOR_FLOOR = Object.freeze(['scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*',
-  'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
-/** Modules the auditor imports directly that no other floor entry names (the source-scan test pins each import). */
-const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs']);
+  'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
+  'scripts/codex-direct-task.mjs']);
+/** Modules the auditor imports or launches directly that no other floor entry names (the source-scan test pins each). */
+const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
+  // The audit launcher's imports, and the transcript-check settings its policy reads.
+  'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
+  'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',
+  'scripts/lib/codex-usage-ledger.mjs', 'scripts/lib/codex-model-routing.mjs', 'scripts/lib/codex-task-route.mjs']);
 /** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
 const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/lib/github-app-identity.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',

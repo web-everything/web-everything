@@ -1043,17 +1043,27 @@ describe('R473 structured concurrency evidence', () => {
       });
     // PR #6381 judge: the auditor delegates protected-path classification to audit-path.mjs, which the floor missed. The
     // auditor's roots are AUDITOR_FLOOR itself, expanded to the tracked modules each entry matches, and every module a
-    // root imports directly must be on the floor (the same one-level scan as the review authorization family).
+    // root imports directly must be on the floor (the same one-level scan as the review authorization family). A module
+    // the auditor launches counts as an import (self-review: codex-audit-io.mjs spawns codex-direct-task.mjs through
+    // `new URL('../codex-direct-task.mjs', import.meta.url)`), as does a bare side-effect `import './x.mjs'`.
     const AUDITOR_ROOTS = [...new Set(AUDITOR_FLOOR.flatMap(entry => execFileSync('git', ['ls-files', '-z', '--', `:(glob)${entry}`],
       { cwd: repoRoot, encoding: 'utf8', maxBuffer: 4 << 20 }).split('\0')))]
       .filter(p => /\.m?js$/.test(p) && !/\.test\.m?js$/.test(p) && !p.includes('/__tests__/')).sort();
-    const auditorImports = [...new Set(AUDITOR_ROOTS.flatMap(root => [...readFileSync(`${repoRoot}${root}`, 'utf8')
-      .matchAll(/\bfrom\s*['"](\.\.?\/[^'"\r\n]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"\r\n]+)['"]\s*\)/g)]
-      .map(m => fileURLToPath(new NodeURL(m[1] ?? m[2], new NodeURL(root, `file://${repoRoot}`))).slice(repoRoot.length))))].sort();
+    const AUDITOR_REFERENCE = /\bfrom\s*['"](\.\.?\/[^'"\r\n]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"\r\n]+)['"]\s*\)|\bimport\s*['"](\.\.?\/[^'"\r\n]+)['"]|\bnew\s+(?:Node)?URL\(\s*['"](\.\.?\/[^'"\r\n]+\.m?js)['"]\s*,\s*import\.meta\.url\s*\)/g;
+    const auditorImports = [...new Set(AUDITOR_ROOTS.flatMap(root => [...readFileSync(`${repoRoot}${root}`, 'utf8').matchAll(AUDITOR_REFERENCE)]
+      .map(m => fileURLToPath(new NodeURL(m[1] ?? m[2] ?? m[3] ?? m[4], new NodeURL(root, `file://${repoRoot}`))).slice(repoRoot.length))))].sort();
+    it('the auditor reference scan reads every form: import, re-export, dynamic and side-effect imports, and a launched URL', () => {
+      const forms = ["import { a } from './a.mjs';", "export { b } from '../b.mjs';", "await import('./c.mjs')", "import './d.mjs';",
+        "spawn(fileURLToPath(new NodeURL('../e.mjs', import.meta.url)))", "new URL('./f.mjs', import.meta.url)"].join('\n');
+      expect([...forms.matchAll(AUDITOR_REFERENCE)].map(m => m[1] ?? m[2] ?? m[3] ?? m[4]))
+        .toEqual(['./a.mjs', '../b.mjs', './c.mjs', './d.mjs', '../e.mjs', './f.mjs']);
+    });
     it('the auditor scan is live: its roots cover the verdict engine and its imports include the path classifier', () => {
       expect(AUDITOR_ROOTS).toEqual(expect.arrayContaining(['scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit.mjs',
-        'scripts/operations/codex-audit-io.mjs', 'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs']));
-      expect(auditorImports).toEqual(expect.arrayContaining(['scripts/lib/audit-path.mjs', 'scripts/lib/net-diff-fingerprint.mjs']));
+        'scripts/operations/codex-audit-io.mjs', 'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs',
+        'scripts/codex-direct-task.mjs']));
+      expect(auditorImports).toEqual(expect.arrayContaining(['scripts/lib/audit-path.mjs', 'scripts/lib/net-diff-fingerprint.mjs',
+        'scripts/codex-direct-task.mjs', 'scripts/lib/build-self-review.mjs']));
       expect(auditorImports.filter(p => !existsSync(`${repoRoot}${p}`))).toEqual([]);
     });
     it.each([...new Set([...AUDITOR_ROOTS, ...auditorImports])].sort())(
