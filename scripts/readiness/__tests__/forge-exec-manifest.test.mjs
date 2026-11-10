@@ -37,7 +37,7 @@ describe('credentialContentFinding GitHub Actions references', () => {
   });
 
   it.each([
-    ['PEM block', '-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n', 'pem-header'],
+    ['PEM block', ['-----BEGIN', ' PRIVATE KEY-----'].join('') + '\nfixture\n-----END PRIVATE KEY-----\n', 'pem-header'],
     ['GitHub token', 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8', 'github-token'],
   ])('still refuses a %s elsewhere in a file containing a reference', (_name, content, finding) => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n' + content)).toBe(finding);
