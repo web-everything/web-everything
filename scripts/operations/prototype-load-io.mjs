@@ -203,7 +203,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
   // Audit mode is a scalar: normalize before the cascade can flatten an invalid object into no leaves.
   const auditModeLayer = (layer) => layer?.canonicalAuditMode === undefined ? layer
-    : { ...layer, canonicalAuditMode: layer.canonicalAuditMode === 'warn' ? 'warn' : 'refuse' };
+    : { ...layer, canonicalAuditMode: 'refuse' };
   const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'refuse' },
     platform: auditModeLayer(platform.prefs.prototypeLoad), tool: auditModeLayer(tool) });
   // ruledWeakened is the union of platform and tool layers (arrays are cascade leaves, so the tool layer would replace it).
@@ -403,7 +403,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // R848 2a: a free-text --audit claim is never evidence by itself. It loads only with a canonical NOT WEAKENED record
       // for this exact sha, whatever the configured mode; only ready-record sources keep the configured warn mode.
       const freeText = out.gate.source === 'arguments';
-      const mode = freeText || config.canonicalAuditMode !== 'warn' ? 'refuse' : 'warn';
+      // R855: refuse is the only mode; any configured value (warn, unknown) means refuse.
+      const mode = 'refuse';
       let fetchedMain = false;
       const covers = (base) => { try {
         if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
@@ -439,7 +440,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         console.warn(`WARNING: ruled exception ${out.gate.ruledWeakened.ruling} rests on canonical WEAKENED audit record at ${ownWeakened.at}.`);
       } else
       // A hand-written ready record is a claim too: it never loads over this sha's own canonical WEAKENED record
-      // (only a ruled exception does), even in warn mode.
+      // (only a ruled exception does), in every mode.
       if (!out.canonicalAudit.ok && out.canonicalAudit.reason === 'weakened' && !freeText && !out.gate.ruledWeakened) {
         const own = [...auditRecords].reverse().find((r) => r?.verdict === 'WEAKENED' && String(r.head).toLowerCase() === String(input.sha).toLowerCase());
         if (own) return stop('no-canonical-audit', { detail: 'ready-record-contradicts-canonical-audit', fallback: `The ready record claims NOT WEAKENED but the latest canonical audit record for ${input.sha} (at ${own.at}, base ${own.base}) says WEAKENED. Fix the findings and re-audit, or get an operator ruling (ruledWeakened). Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}.` });
@@ -455,15 +456,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
               : `A free-text --audit claim is not accepted: no canonical NOT WEAKENED record exists for ${input.sha}. ${fallback}` });
         }
         if (out.gate.ruledWeakened) { /* R850 ruled exception rests on the canonical WEAKENED record checked above */ }
-        else if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
-        // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
-        // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.
-        // Fail closed: a record sha that is not a string is never the live head's own record.
-        const carriedGate = out.gate.record && (typeof out.gate.record.sha !== 'string' || out.gate.record.sha.toLowerCase() !== String(input.sha).toLowerCase());
-        if (out.canonicalAudit.reason === 'weakened' && carriedGate && !out.gate.ruledWeakened) {
-          return stop('no-canonical-audit', { detail: 'carried-ready-over-weakened-audit', fallback: `The canonical audit says WEAKENED, and the ready record was carried from ${out.gate.record.sha}. Fix the weakening and re-audit, or get an operator ruling (ruledWeakened). ${fallback}` });
-        }
-        console.warn(`WARNING: canonical audit ${out.canonicalAudit.reason}; proceeding in warn mode. ${fallback}`);
+        else return stop('no-canonical-audit', { fallback });
       }
       stage = 'no-ready';
       requireGit('fetch', 'origin', input.branch);
