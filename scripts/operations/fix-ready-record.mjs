@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Writes ONE fix-ready record for prototype-load. The shape is exactly what readyEvidence() in prototype-load.mjs reads:
 // NOT WEAKENED needs ref + 40-hex sha + tests green; WEAKENED additionally needs auditRuling (R<n>) and a non-empty
-// auditDisclosed array of non-empty strings. A duplicate ref+sha is refused. The append is one atomic write.
+// auditDisclosed array of non-empty strings. A record identical to the latest one for that ref+sha is refused; a different
+// one supersedes it (the reader lets the latest record per sha win). The append is one write under a lock file.
 import fs from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -35,18 +36,68 @@ export function buildReadyRecord({ ref, sha, tests, audit, auditRuling, auditDis
   return { ok: true, record: { ref, sha: sha.toLowerCase(), tests: 'green', audit: 'WEAKENED', auditRuling, auditDisclosed } };
 }
 
-/** Validates, refuses a duplicate ref+sha, appends one line with a single write. */
-export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs } = {}) {
+const LOCK_STALE_MS = 30_000;
+
+/** Reads the ledger text; a missing file is an empty ledger. Returns {text} or {error}. */
+function readLedger(file, fsApi) {
+  try { return { text: String(fsApi.readFileSync(file, 'utf8')) }; }
+  catch (e) { return e?.code === 'ENOENT' ? { text: '' } : { error: `cannot read ${file}: ${e.message}` }; }
+}
+
+/** Takes `<file>.lock` (exclusive create). A lock older than LOCK_STALE_MS is a dead writer's and is taken over. */
+function takeLock(lock, fsApi, now) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { fsApi.closeSync(fsApi.openSync(lock, 'wx')); return true; } catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      let age;
+      try { age = now() - fsApi.statSync(lock).mtimeMs; } catch { continue; }
+      if (age <= LOCK_STALE_MS) return false;
+      try { fsApi.unlinkSync(lock); } catch { /* another writer took it over first: retry the create */ }
+    }
+  }
+  return false;
+}
+
+/** The latest record for ref+sha (the reader's "latest per sha wins" rule), or undefined. */
+function latestFor(text, ref, sha) {
+  return jsonLines(text).filter((r) => r && r.ref === ref && String(r.sha).toLowerCase() === sha).pop();
+}
+
+/** Validates, then appends one record with a single write, under a lock so two writers cannot both pass the check.
+ *  A later record may supersede an earlier one for the same ref+sha (the reader lets the latest win); only a record
+ *  identical to the latest existing one is refused as a duplicate. */
+export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, now = Date.now } = {}) {
   const built = buildReadyRecord(input);
   if (!built.ok) return built;
-  let existing = [];
-  try { existing = jsonLines(fsApi.readFileSync(file, 'utf8')); } catch (e) { if (e?.code !== 'ENOENT') return { ok: false, error: `cannot read ${file}: ${e.message}` }; }
   const { ref, sha } = built.record;
-  if (existing.some((r) => r && r.ref === ref && String(r.sha).toLowerCase() === sha)) return { ok: false, error: `duplicate: a record for ${ref}@${sha} already exists` };
-  fsApi.mkdirSync(dirname(file), { recursive: true });
-  const fd = fsApi.openSync(file, 'a');
-  try { fsApi.writeSync(fd, `${JSON.stringify(built.record)}\n`); } finally { fsApi.closeSync(fd); }
-  return { ok: true, record: built.record, file };
+  const line = JSON.stringify(built.record);
+  const canon = (r) => JSON.stringify(Object.fromEntries(Object.entries(r).sort(([a], [b]) => (a < b ? -1 : 1))));
+  const want = canon(built.record);
+  // Key order and sha case in a hand-written ledger line must not hide an identical record.
+  const isDuplicate = (text) => { const prior = latestFor(text, ref, sha); return !!prior && canon({ ...prior, sha }) === want; };
+  const duplicate = { ok: false, error: `duplicate: an identical latest record for ${ref}@${sha} already exists` };
+  // Fail fast on an unreadable ledger, before touching the filesystem at all.
+  const first = readLedger(file, fsApi);
+  if (first.error) return { ok: false, error: first.error };
+  if (isDuplicate(first.text)) return duplicate;
+  const lock = `${file}.lock`;
+  try {
+    fsApi.mkdirSync(dirname(file), { recursive: true });
+    if (!takeLock(lock, fsApi, now)) return { ok: false, error: `locked: another writer holds ${lock}; retry shortly` };
+  } catch (e) { return { ok: false, error: `cannot lock ${file}: ${e.message}` }; }
+  try {
+    // Re-read under the lock: a writer that finished between the first read and the lock is now visible.
+    const locked = readLedger(file, fsApi);
+    if (locked.error) return { ok: false, error: locked.error };
+    if (isDuplicate(locked.text)) return duplicate;
+    // A hand-edited ledger may lack a final newline; without this the new record would fuse onto the last line.
+    const prefix = locked.text && !locked.text.endsWith('\n') ? '\n' : '';
+    const fd = fsApi.openSync(file, 'a');
+    try { fsApi.writeSync(fd, `${prefix}${line}\n`); } finally { fsApi.closeSync(fd); }
+    return { ok: true, record: built.record, file };
+  } finally {
+    try { fsApi.unlinkSync(lock); } catch { /* best effort: a stale lock expires */ }
+  }
 }
 
 export function parseArgs(argv) {
