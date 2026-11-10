@@ -290,10 +290,11 @@ async function recoveryModeDispatched(run) {
   const input = options(fixture(), {
     abandonStaleRun: vi.fn(() => { events.push('abandon'); return { ok: true }; }),
     planRestartRecovery: vi.fn(key => { events.push(['plan', key]); return { mode: 'resume', abandon: false }; }),
-    dispatchRestart: vi.fn(async args => { events.push(['dispatch', args.redTeamMode]); return { status: 'dispatched', jobPid: 24680 }; }),
+    dispatchRestart: vi.fn(async (args, opts) => { events.push(['dispatch', args.redTeamMode, opts]); return { status: 'dispatched', jobPid: 24680 }; }),
   });
   await run(input);
-  expect(events).toEqual(['abandon', ['plan', { repo: REPO, pr: 11, head: HEAD, env: {} }], ['dispatch', 'resume']]);
+  // The child is dispatched under the same env the plan read, so admission re-plans the same state.
+  expect(events).toEqual(['abandon', ['plan', { repo: REPO, pr: 11, head: HEAD, env: {} }], ['dispatch', 'resume', { env: {} }]]);
   expect(records(input.dir).map(r => r.phase)).toEqual(['pass', 'intent', 'did']);
 }
 // A plan admission would refuse (still abandonable, skip, unknown mode, unreadable) stops before any spawn.

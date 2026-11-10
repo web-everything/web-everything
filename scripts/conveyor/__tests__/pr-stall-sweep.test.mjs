@@ -1084,7 +1084,8 @@ describe('R804 restart-only live acceptance', () => {
       readRedTeamStatus: () => ({ ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old }),
       probe: { host: owner.host, namespace: owner.pidNamespace, isAlive: () => false, readPidStart: () => owner.pidStart } });
     expect(dispatchManualPass).toHaveBeenCalledTimes(1);
-    expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD, redTeamMode: 'fresh' });
+    // Plan, abandonment and the spawned child all share the sweep's env.
+    expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD, redTeamMode: 'fresh' }, { env: {} });
     // It re-plans the abandoned run the way queued admission will, and dispatches that plan's mode.
     expect(readRecoveryWitness).toHaveBeenCalledWith({ repo: REPO, pr: 11, head: HEAD, env: {} });
     expect(planRedTeamRecovery).toHaveBeenCalledTimes(1);

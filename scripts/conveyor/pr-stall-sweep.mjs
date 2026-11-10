@@ -430,7 +430,8 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       } catch (e) {
         throw new Error(`stale red-team recovery not admissible after abandonment (${msg(e)}); operator must inspect`);
       }
-      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead, redTeamMode });
+      // The child is spawned under the same env the plan and abandonment read, so admission re-plans the same state.
+      const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead, redTeamMode }, { env });
       if (result?.error || result?.skipped || result?.ok === false) throw new Error(`restart refused: ${msg(result.error ?? result.skipped ?? 'unsuccessful dispatch')}`);
       if (result?.jobPid === null || result?.launched === false || !(result?.launched === true
         || (Number.isSafeInteger(result?.jobPid) && result.jobPid > 0))) {
