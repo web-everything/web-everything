@@ -1124,7 +1124,7 @@ describe('runRemote', () => {
     expect(result.detail).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     expect(log).toHaveBeenCalledWith('forge install failed: '+result.detail+'\n');
     expect(remoteManifestAPI.forgeFailureTail('a\u200bb\u202ec\u2028d\u0085e')).toBe('a b c d e');
-    for (const secret of ['password=hunter2','Authorization: Bearer abc','token=\n\nshortSecret123','token=\rshortSecret123','password="a\nb\nc\nSECRET"','ghp_'+'A1b2C3d4'.repeat(3),'aB3/dE5+fG7hJ9kL1mN3pQ5rS7tU9vW1xYz','-----BEGIN PRIVATE KEY-----','fetch https://user:pw@registry.example/x','Cookie: a=b','GET /p?sig=abc','abcdefghijklmnopqrstuvwx'])
+    for (const secret of ['password=hunter2','Authorization: Bearer abc','token=\n\nshortSecret123','token=\rshortSecret123','password="a\nb\nc\nSECRET"','ghp_'+'A1b2C3d4'.repeat(3),'aB3/dE5+fG7hJ9kL1mN3pQ5rS7tU9vW1xYz','-----BEGIN PRIVATE KEY-----','pass\u200bword=x','to\nken=y','fetch https://user:pw@registry.example/x','Cookie: a=b','GET /p?sig=abc','abcdefghijklmnopqrstuvwx'])
       expect(remoteManifestAPI.forgeFailureTail('npm ERR! '+secret+'\nmore')).toBe('[withheld: secret-like content]');
   });
 
