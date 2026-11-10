@@ -2,7 +2,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { withBareOrigin, withNarrowClone } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
@@ -118,6 +119,24 @@ describe('prototype-load default dispatch smoke (real worktree)', () => {
       expect(seen).toEqual([{ head: sha, file: true }]);
       expect(worktrees()).toHaveLength(before);
       expect(fs.existsSync(smoke.mock.calls[0][0].tree)).toBe(false);
+    });
+  });
+  it('provisions the checkout node_modules in the smoke tree so its dispatch imports resolve (PR #6610 round 3)', async () => {
+    const productionModules = join(dirname(fileURLToPath(import.meta.url)), '../../..', 'node_modules');
+    const seen = [];
+    const smoke = vi.fn(async ({ tree }) => {
+      const linked = join(tree, 'node_modules');
+      seen.push({ present: fs.existsSync(linked), same: fs.existsSync(linked) && fs.realpathSync(linked) === fs.realpathSync(productionModules),
+        resolves: fs.existsSync(join(linked, 'markdown-it')) });
+      return { ok: true, ran: true };
+    });
+    await smokeFixture(smoke, async ({ load, sha, worktrees }) => {
+      const before = worktrees().length;
+      expect(await load()).toMatchObject({ ok: true, stopReason: null, dispatchSmoke: { ok: true, sha } });
+      expect(seen).toEqual([{ present: true, same: true, resolves: true }]);
+      expect(worktrees()).toHaveLength(before);
+      // Removing the worktree must unlink, never follow, the dependency link.
+      expect(fs.existsSync(join(productionModules, 'markdown-it'))).toBe(true);
     });
   });
   it.each([

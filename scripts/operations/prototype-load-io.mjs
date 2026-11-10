@@ -517,11 +517,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           const tree = join(scratch, 'candidate');
           try {
             requireGit('worktree', 'add', '--detach', tree, input.sha);
+            // The ignored node_modules is not in a fresh worktree; the dispatch path imports markdown-it. Link the
+            // checkout's own, as the combined-test worktree does. Absent here, the smoke itself fails and refuses.
+            if (fs.existsSync(join(repo, 'node_modules'))) fs.symlinkSync(join(repo, 'node_modules'), join(tree, 'node_modules'), 'dir');
             const actual = requireGit('-C', tree, 'rev-parse', 'HEAD');
             if (actual !== input.sha) throw new Error('smoke candidate moved');
             out.dispatchSmoke = { ...await realDispatchSmoke({ tree, env: childEnv }), sha: actual };
           } finally {
             // Cleanup is best-effort: a failing remove must never replace the smoke verdict (a throw here would).
+            // Unlink the dependency link first so removal can never follow it into the checkout's node_modules.
+            try { fs.unlinkSync(join(tree, 'node_modules')); } catch { /* absent or already gone */ }
             git('worktree', 'remove', '--force', tree);
             try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* leftover scratch is only litter */ }
           }
