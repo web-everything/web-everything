@@ -89,15 +89,15 @@ export function runSuite({ cwd, suite, run, maxFailures = 20, timeoutMs = 0 }) {
     // produces no summary line, so it reads as `ran: false` (unproven), and says so by name (`timedOut`).
     // R830 — a plain `npx vitest run <files>` (no `node -e` spawn shim): the Forge client refuses that shape. The ceiling is
     // execFileSync's own `timeout`, so the run stays routable to Forge and the caller's finally still restores the tree.
-    const admitted = admittedArgv(vitest[0], vitest.slice(1));
+    const admitted = admittedArgv(vitest[0], vitest.slice(1), { runCeilingMs: timeoutMs });
     const opts = { cwd, encoding: 'utf8', maxBuffer: RUN_MAX_BUFFER };
-    if (timeoutMs > 0) Object.assign(opts, { timeout: timeoutMs, killSignal: 'SIGKILL' });
-    out = String(run(admitted.file, admitted.args, opts) ?? '');
+        out = String(run(admitted.file, admitted.args, opts) ?? '');
     ok = true;
   } catch (e) {
     exitStatus = e?.status;
     bufferCut = e?.code === 'ENOBUFS';
-    timeoutHit = e?.code === 'ETIMEDOUT';
+    // The wrapper enforces the ceiling from slot grant and reports it as exit 124 (+ its own stderr line).
+    timeoutHit = e?.code === 'ETIMEDOUT' || (timeoutMs > 0 && e?.status === 124 && /exceeded \d+ms and was stopped/.test(String(e?.stderr ?? '')));
     // Non-zero exit is the NORMAL path for a red suite — the output is on the error, and it is the output
     // that decides `ran`.
     //

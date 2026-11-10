@@ -2441,6 +2441,7 @@ export async function runUnderAdmission({
   kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
+  runCeilingMs = 0,
 }) {
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
@@ -2463,14 +2464,18 @@ export async function runUnderAdmission({
     log(`heavy-command admission: acquired slot-${admission.slot} after waiting ${admission.waitedMs}ms (cap=${cap}).\n`);
   }
   let exitCode = 0;
+  let execOptsTimeout = 0;
   try {
     // x1ds37v — a single-test debug run (`files`) is bounded to fit under the 10-minute Bash cap.
     const execOpts = { cwd, stdio: 'inherit', env: childEnv };
     if (runKind === 'files') execOpts.timeout = resolveFastRunTimeoutMs(env);
+    // The caller's RUN ceiling starts at slot grant (queue wait is already over), unlike an exec timeout around the wrapper.
+    if (runCeilingMs > 0) Object.assign(execOpts, { timeout: runCeilingMs, killSignal: 'SIGKILL' });
+    execOptsTimeout = execOpts.timeout ?? 0;
     exec(command, execOpts);
   } catch (e) {
     exitCode = childExitCode(e);
-    if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: single-test run exceeded ${resolveFastRunTimeoutMs(env)}ms and was stopped.\n`); }
+    if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: run exceeded ${execOptsTimeout}ms and was stopped.\n`); }
   } finally {
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
   }
@@ -2484,8 +2489,9 @@ export async function runUnderAdmission({
  * `e.status` keeps working unchanged. Pass it as `execFileSync(r.file, r.args, opts)`.
  * @returns {{ file:string, args:string[] }}
  */
-export function admittedArgv(file, args = []) {
-  return { file: process.execPath, args: [HEAVY_ADMISSION_CLI, 'run', '--', file, ...args] };
+export function admittedArgv(file, args = [], { runCeilingMs = 0 } = {}) {
+  const ceiling = Number.isFinite(runCeilingMs) && runCeilingMs > 0 ? [`--run-ceiling-ms=${Math.floor(runCeilingMs)}`] : [];
+  return { file: process.execPath, args: [HEAVY_ADMISSION_CLI, 'run', ...ceiling, '--', file, ...args] };
 }
 
 /** The shell command line that runs a shell command string through the `run` wrapper (as `sh -c <cmd>`, so
@@ -2645,6 +2651,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
+    const runCeilingMs = /^\d+$/.test(String(flags['run-ceiling-ms'] ?? '')) ? Number(flags['run-ceiling-ms']) : 0;
     // xhlriy2: the hard give-up ceiling (default 120 minutes); `--timeout-ms` is kept as a legacy fallback.
     const ceilingMs = flags['ceiling-ms'] != null ? Number(flags['ceiling-ms'])
       : flags['timeout-ms'] != null ? Number(flags['timeout-ms'])
@@ -2710,7 +2717,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
         onDecision: decision => { reportLocalExecution ||= decision.remote; },
-        timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
+        timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : (runCeilingMs > 0 ? runCeilingMs : ceilingMs),
       });
       if (result.handled) {
         if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyCommandKind(command, process.env),
@@ -2745,7 +2752,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         }
       }
     }
-    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, ...(forceLocal ? { location: 'local' } : {}) };
+    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
