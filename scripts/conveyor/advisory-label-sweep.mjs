@@ -197,6 +197,10 @@ export function sweepAdvisoryLabels({
           publication.publishStatus = published.status;
           if (['retry', 'failed'].includes(published.status)) log(`red-team publication #${pr.number}: ${published.status}`);
           if (published.status === 'posted') comments = provider.readComments(resolvedRepo, pr.number);
+          // The publish just wrote the status (a seal, a hold): plan from what is stored NOW, not the pre-publish snapshot (PR #6622).
+          if (published.status !== 'skipped') {
+            try { evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid }); } catch { /* the planner re-reads the stored seal itself */ }
+          }
         } catch (e) {
           publication.publishError = String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 300);
           log(`red-team publication #${pr.number}: ${publication.publishError}`);

@@ -5,7 +5,7 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { renderRedTeamComment, redTeamCommentPosted as markerPosted, priorRedTeamRow } from '../operations/review-extra-seats.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { redTeamMarker, parseRedTeamComment, redTeamForHead } from './red-team-gate.mjs';
+import { redTeamMarker, parseRedTeamComment, sealedBreakKeys, redTeamBreaksAgree } from './red-team-gate.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
@@ -53,6 +53,14 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       throw Error('red-team publication status identity mismatch');
     }
     if (!needsPublish(status)) return { status: 'skipped' };
+    // The stored evidence's confirmed breaks, sealed into the status: the single authority every disposition reader holds on.
+    let sealDirty = false;
+    const seal = findings => {
+      const keys = sealedBreakKeys(findings);
+      // No confirmed break and no earlier seal: nothing to authorize, nothing to record.
+      if (!keys.length && status.sealedBreaks === undefined) return;
+      if (JSON.stringify(status.sealedBreaks ?? null) !== JSON.stringify(keys)) { status = { ...status, sealedBreaks: keys }; sealDirty = true; }
+    };
     const holdLegacy = () => {
       // Its own flag: an earlier publish-failed alert must not silence this one (they name different problems).
       if (!status.legacyHoldPublished) {
@@ -60,7 +68,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
           reason: 'Legacy red-team evidence is unreadable or conflicts with the posted comment; operator review required.' });
         status = { ...status, legacyHoldPublished: true };
         writeStatus(status);
-      }
+      } else if (sealDirty) writeStatus(status);
       return { status: 'held' };
     };
     const legacy = status.result === 'ran';
@@ -82,32 +90,13 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     };
     const renderInput = res => ({ ...res, pr, rev: head, findings: res.findings.map(f => ({ ...f,
       confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true })) });
-    // Which confirmed breaks a body shows, as an order-free list; location-less fallbacks null the location.
-    // Every field the gate reads to pick an outcome is in the key (impact, class, extra classes, security flag),
-    // so a posted comment with a downgraded impact or class never "agrees" with the stored break.
-    const confirmedKeys = parsed => parsed.findings.filter(f => f.confirmed)
-      .map(f => JSON.stringify([f.category, f.file, f.line, f.summary, f.impact ?? null, f.findingClass ?? null,
-        [...(f.alsoClasses ?? [])].sort(), f.securityReachableToday === true])).sort();
-    // Every rendering the publisher could have posted for this evidence (full, then the scrub fallbacks).
-    const sameConfirmedBreaks = (postedParsed, res) => {
-      const want = JSON.stringify(confirmedKeys(postedParsed));
-      const input = renderInput(res);
-      return [() => renderFull(input), () => renderMinimal(input), () => renderMinimal({ ...input, omitLocation: true })]
-        .some(render => {
-          try {
-            const keys = confirmedKeys(parseRedTeamComment(render()) ?? { findings: [] });
-            // A lossy rendering (one that drops a confirmed break) proves nothing: two empty lists would "agree".
-            return keys.length === res.confirmedMissCount && JSON.stringify(keys) === want;
-          } catch { return false; }
-        });
-    };
     const escalate = () => {
       if (!status.needsYouPublished) {
         publishNeedsYou({ kind: 'red-team-publish-failed', pr, repo, head,
           reason: 'Red-team result publication failed twice; operator publication required.' });
         status = { ...status, needsYouPublished: true };
         writeStatus(status);
-      }
+      } else if (sealDirty) writeStatus(status);
       return { status: 'failed' };
     };
     const failedAttempt = () => {
@@ -128,16 +117,19 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
         // The posted comment stays authoritative: an unreadable row cannot contradict it, so no alert.
         let recovered;
         try { recovered = recoverLegacy(); } catch { return { status: 'skipped' }; }
-        // A readable row must show the SAME confirmed breaks as the posted comment (not just as many), or the gate would clear a guess.
-        const live = redTeamForHead(comments, pr, head);
-        conflict = !live || !sameConfirmedBreaks(live, recovered);
+        // The readable row is sealed as the authority; the shared hold decision compares WHOLE normalized lists (not counts,
+        // not a marker), so the posted comment can only add holds.
+        seal(recovered.findings);
+        // Here an empty seal against a comment that shows a break is a conflict too (the operator hears of every difference).
+        conflict = !redTeamBreaksAgree({ comments, pr, head, breaks: status.sealedBreaks ?? [] }).agree;
         if (!conflict) {
           // The posted comment now agrees with the stored evidence: lift a hold an earlier pass recorded.
           if (status.legacyHoldPublished) {
             const { legacyHoldPublished: _lifted, ...rest } = status;
             status = rest;
-            writeStatus(status);
+            sealDirty = true;
           }
+          if (sealDirty) writeStatus(status);
           return { status: 'skipped' };
         }
       }
@@ -147,6 +139,8 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     if (legacy) {
       try { result = recoverLegacy(); } catch { return holdLegacy(); }
     }
+    // Sealed before any post, so a crash or a failed post leaves the hold in place for every reader.
+    if (Array.isArray(result?.findings)) seal(result.findings);
     if (status.publishAttempts >= 2) return escalate();
     try {
       if (!Array.isArray(result.findings)) throw Error('red-team findings unreadable');

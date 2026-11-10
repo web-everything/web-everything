@@ -260,13 +260,14 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       const state = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo);
       // The shared disposition (red-team-gate) decides what still holds on the live head; no private marker parser.
-      const disposition = state.result === null ? null
-        : readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: ALERT_BREAK_POLICY });
+      // Read even with no result in the thread: the sealed stored evidence can hold a head the thread shows nothing for (PR #6622).
+      const disposition = readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: ALERT_BREAK_POLICY });
       // Only an operator's own card / not-real / clear ruling settles a confirmed break: the gate's automatic card record
       // is written before the card job succeeds, so it is no proof (nor is a policy that leaves degraded to a card).
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
       const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.source === 'operator' && r.kind !== 'block');
-      const owed = (state.result?.findings ?? []).some(f => f.confirmed && !settled(f));
+      // Index 0 is the shared hold on stored evidence the thread does not show in full: no operator ruling settles it.
+      const owed = (state.result?.findings ?? []).some(f => f.confirmed && !settled(f)) || open.has(0);
       // A confirmed break is classified before the hold: a hold (blocked, sent back) must not hide the alert.
       if (reasons.length && !owed) { held.push({ item, reasons }); return; }
       if (owed) {

@@ -166,12 +166,12 @@ describe('legacy bare-string red-team publication', () => {
     expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
     expect(io.publishNeedsYou).not.toHaveBeenCalled();
   });
-  it('skips quietly when the posted comment is the scrub-fallback rendering of the same break', () => {
+  it('holds when the posted comment is the scrub-fallback rendering: its text differs from the stored break', () => {
     const minimal = renderMinimalRedTeamComment({ pr: 42, rev: head, findings: [confirmedFinding] });
     const io = harness(legacy(), { readSeatRow: changesRow,
       listComments: () => [{ author: { login: 'web-everything' }, body: minimal }] });
-    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
-    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
   });
   const twoRow = () => seatRow({ foldedVerdict: 'changes', confirmedMissCount: 2, findings: [confirmedFinding,
     { ...confirmedFinding, summary: 'Second confirmed defect', file: 'scripts/y.mjs', line: 99 }] });
@@ -181,18 +181,18 @@ describe('legacy bare-string red-team publication', () => {
       listComments: () => [{ author: { login: 'web-everything' }, body: fullBody([b, a]) }] });
     expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
     expect(io.postComment).not.toHaveBeenCalled();
-    expect(io.writeStatus).not.toHaveBeenCalled();
+    expect(io.writeStatus).toHaveBeenCalledTimes(1); // the stored breaks are sealed; nothing else is recorded
+    expect(io.status.sealedBreaks).toHaveLength(2);
     expect(io.publishNeedsYou).not.toHaveBeenCalled();
   });
-  it('skips for the location-free fallback rendering of the same break', () => {
+  it('holds for the location-free fallback rendering: the stored break has a location the comment dropped', () => {
     const body = renderMinimalRedTeamComment({ pr: 42, rev: head, findings: [confirmedFinding], omitLocation: true });
     expect(parseRedTeamComment(body).findings[0]).toMatchObject({ confirmed: true, file: null });
     const io = harness(legacy(), { readSeatRow: changesRow,
       listComments: () => [{ author: { login: 'web-everything' }, body }] });
-    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
     expect(io.postComment).not.toHaveBeenCalled();
-    expect(io.writeStatus).not.toHaveBeenCalled();
-    expect(io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
   });
   it('holds when an existing clear comment matches a lossy rendering of a confirmed break', () => {
     // A blank file makes every rendering drop the break, so both sides parse to "no findings".
@@ -245,7 +245,9 @@ describe('legacy bare-string red-team publication', () => {
     expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
     expect(io.postComment).not.toHaveBeenCalled();
     expect(io.publishNeedsYou).not.toHaveBeenCalled();
-    expect(io.writeStatus).not.toHaveBeenCalled();
+    expect(io.writeStatus).toHaveBeenCalledTimes(1); // only the seal is persisted
+    expect(io.status.sealedBreaks).toHaveLength(1);
+    expect(io.status.legacyHoldPublished).toBeUndefined();
   });
   it.each([
     ['seat row missing', () => null],
