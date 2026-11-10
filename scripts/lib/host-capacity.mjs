@@ -65,7 +65,7 @@ export function loadCapacitySettings({ env = process.env, readFile = readFileSyn
 function readHistory({ root, env, readFile = readFileSync }) {
   try {
     const text = readFile(resourcePaths(root ?? resolveCoordinationRoot({ env })).history, 'utf8');
-    return text.trim() ? text.trim().split('\n').map(line => JSON.parse(line)) : [];
+    return text.trim() ? text.trim().split('\n').map(line => { try { return JSON.parse(line); } catch { return null; } }) : [];
   } catch (error) {
     throw Error('unreadable sampler history');
   }
@@ -110,13 +110,17 @@ export function readCapacity({ settings, env = process.env, root,
     if (!Number.isFinite(at)) throw Error('invalid clock');
     const rows = history({ root, env, readFile });
     if (!Array.isArray(rows)) throw Error('invalid sampler history');
-    const parsed = rows.map(row => {
-      const time = Date.parse(row?.sampledAt);
-      const idle = row?.cpu?.idlePct;
-      if (!Number.isFinite(time) || time > at || !validIdle(idle)) throw Error('invalid sampler reading');
-      return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
-    });
-    const window = parsed.filter(row => row.time >= at - settings.windowSec * 1000);
+    // Filter to the window FIRST (unparsable timestamps cannot be placed, so they are dropped);
+    // only rows inside the window are validated. An invalid in-window row still holds admission.
+    const since = at - settings.windowSec * 1000;
+    const parsed = rows.map(row => ({ row, time: Date.parse(row?.sampledAt) }))
+      .filter(({ time }) => Number.isFinite(time) && time >= since || time > at)
+      .map(({ row, time }) => {
+        const idle = row?.cpu?.idlePct;
+        if (time > at || !validIdle(idle)) throw Error('invalid sampler reading');
+        return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
+      });
+    const window = parsed;
     const newest = window.at(-1);
     if (window.length < 3
       || window.some((row, index) => index > 0 && row.time <= window[index - 1].time)
