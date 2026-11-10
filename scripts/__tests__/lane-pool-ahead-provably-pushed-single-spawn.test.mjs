@@ -112,7 +112,10 @@ describe('aheadIsProvablyPushed containment semantics unchanged (#2920)', () => 
 
 describe('aheadIsProvablyPushed spawn cost does not scale with remote-head count (#2920)', () => {
   it('one acquire pass stays well under the remote-head count in total git spawns', () => {
-    const N_HEADS = 20;
+    // Must stay above acquire's constant per-pick cost (fetch/ls-remote/status/rev-list plus the ~4-spawn
+    // history-readability probe, R794) so the `< N_HEADS` ceiling still separates "constant" from "one
+    // spawn per remote head" — the old fan-out would add N_HEADS spawns on top of that constant.
+    const N_HEADS = 40;
     const provision = runPool(['provision', '--count=1', ...poolArgs()]);
     expect(provision.code).toBe(0);
     const lane = join(poolRoot, 'singlespawn', 'lane-1');

@@ -34,9 +34,10 @@
  * IMPURE by construction (`git`, `fs`), which is why every one of those is a parameter.
  */
 import { retryTransientGit } from './git-fetch-retry.mjs';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, closeSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 
 /**
  * The env every git call INSIDE the transport worktree runs with (live 2026-10-09 06:52 ET: the review daemon's
@@ -268,6 +269,8 @@ export function stageOnTransportBranch({
   // The ONE full ref this transport may push, e.g. `refs/heads/ops/review-requests`. Checked BEFORE any git call
   // (so a refused ref fetches, checks out and writes nothing) and the push then names that full ref.
   allowRef = null,
+  sign = null,
+  readMaxBytes = null,
 } = {}) {
   if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
   assertPushRef(branch, allowRef);
@@ -275,6 +278,14 @@ export function stageOnTransportBranch({
 
   run = withGitError(run);
   const wt = join(board, '.operations', 'transport', `wt-${now()}`);
+  const fileRead = readMaxBytes !== null && read === readExisting
+    ? abs => readBoundedTransportFile(abs, readMaxBytes, { root: wt }) : read;
+  const fileWrite = readMaxBytes !== null && write === writeFileSync
+    ? (abs, content) => writeRegularTransportFile(abs, content, wt) : write;
+  const fileMkdir = readMaxBytes !== null && mkdir === mkdirSync ? (path, options) => {
+    assertTransportParents(join(path, '.transport-parent-check'), wt);
+    mkdir(path, options);
+  } : mkdir;
   mkdir(dirname(wt), { recursive: true });
   // EVERY call with `cwd: wt` goes through this: it can only ever act on the worktree, never the board above it.
   const wtEnv = worktreeGitEnv(wt);
@@ -297,7 +308,7 @@ export function stageOnTransportBranch({
       run(['worktree', 'add', '--force', '--no-checkout', '--detach', wt, 'HEAD'], { cwd: board });
       runWt(['symbolic-ref', 'HEAD', `refs/heads/${branch}`]);
       runWt(['read-tree', '--empty']);
-      return writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
+      return writeCommitPush({ run, runWt, mkdir: fileMkdir, write: fileWrite, read: fileRead, wt, files, message, branch, created, assertReady, board, allowRef, sign });
     }
     // AN EXPLICIT REFSPEC, never a bare `fetch origin <branch>` (#3264). The bare form writes `FETCH_HEAD` and
     // creates `refs/remotes/origin/<branch>` only when the CLONE'S CONFIGURED refspec covers it — true of a full
@@ -312,7 +323,7 @@ export function stageOnTransportBranch({
     // Stay detached: the 2026-10-09/10-11 stranded branch holder must never wedge a new writer.
     // Concurrent writers also need independent HEADs; the remote arbitrates their non-forced pushes.
 
-    return writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
+    return writeCommitPush({ run, runWt, mkdir: fileMkdir, write: fileWrite, read: fileRead, wt, files, message, branch, created, assertReady, board, allowRef, sign });
   } finally {
     // Remove this run's directory, then prune its registration. A killed run misses finally entirely;
     // the next writer's best-effort sweep handles its stale worktree without discarding unpushed work.
@@ -325,7 +336,7 @@ export function stageOnTransportBranch({
 }
 
 /** The tail both starts share: the caller's check, the writes, and the commit + push (never a force). */
-function writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef }) {
+function writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef, sign }) {
   // The caller's check gets a runner that keeps the worktree guard on its `cwd: wt` calls (and leaves others alone).
   const guarded = (args, opts = {}) => (opts.cwd === wt ? runWt(args, opts) : run(args, opts));
   if (assertReady) assertReady({ run: guarded, wt, board, branch, created });
@@ -336,14 +347,20 @@ function writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, b
     // `content` may be a function of the file's CURRENT bytes on the freshly fetched tip (`null` when absent):
     // an APPEND is only correct if it is computed against the tip the push will race, so it must be computed
     // here, inside the worktree, and again on every retry (#3255).
-    write(abs, typeof file.content === 'function' ? file.content({ existing: read(abs) }) : file.content);
+    write(abs, typeof file.content === 'function' ? file.content({ existing: read(abs), wt }) : file.content);
     runWt(['add', '--', file.path]);
   }
 
   const staged = runWt(['diff', '--cached', '--name-only']).trim();
   if (!staged) return { paths: files.map((f) => f.path), pushed: false, reason: 'identical content already staged' };
 
-  runWt(['commit', '--quiet', '-m', message]);
+  if (sign) {
+    if (!sign.keyPath) throw new Error('transport signing keyPath required');
+    runWt(['-c', 'gpg.format=ssh', '-c', 'gpg.ssh.program=ssh-keygen', '-c', `user.signingkey=${sign.keyPath}`, 'commit', '-S', '--quiet', '-m', message]);
+    const commit = runWt(['rev-parse', 'HEAD']).trim();
+    const allowedSigners = sign.allowedSigners || (sign.verify ? [] : [publicSigningIdentity(sign.keyPath)]);
+    (sign.verify || verifySignedTransportCommit)({ run: guarded, cwd: wt, commit, allowedSigners });
+  } else runWt(['commit', '--quiet', '-m', message]);
   // A FULL refname: on a created branch the remote has no `<branch>` for a short name to resolve against.
   runWt(['push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`]);
   return { paths: files.map((f) => f.path), pushed: true, ...(created ? { created: true } : {}) };
@@ -434,5 +451,88 @@ function coalescedReadFetch({ board, branch, run, now, env, log, fresh = false }
 }
 
 function defaultGit(args, opts) {
+  if (args.includes('verify-commit')) {
+    const r = spawnSync('git', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 1048576, ...opts });
+    if (r.error || r.status !== 0) throw new Error('commit signature verification failed');
+    return r.stdout + r.stderr;
+  }
   return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+}
+
+function assertTransportParents(path, root) {
+  const parts = relative(resolve(root), resolve(path)).split(sep);
+  if (!parts.length || parts.some(p => p === '..' || p === '') || resolve(path) === resolve(root)) throw new Error('ledger path escapes transport worktree; repair transport tree');
+  let parent = resolve(root);
+  for (const part of ['', ...parts.slice(0, -1)]) {
+    parent = join(parent, part);
+    try {
+      if (!lstatSync(parent).isDirectory()) throw new Error('ledger parent is not a regular directory; repair transport tree');
+    } catch (e) { if (e.code === 'ENOENT') return; throw e; }
+  }
+}
+
+/** Open without following the final directory entry; validate before any read/truncate. */
+function openRegularTransportFile(path, flags, { open = openSync, close = closeSync } = {}) {
+  const fd = open(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error('ledger path is not a regular file; repair transport tree');
+    return fd;
+  } catch (e) { close(fd); throw e; }
+}
+
+function writeRegularTransportFile(path, content, root) {
+  assertTransportParents(path, root);
+  const fd = openRegularTransportFile(path, constants.O_WRONLY | constants.O_CREAT);
+  try { ftruncateSync(fd, 0); writeFileSync(fd, content); }
+  finally { closeSync(fd); }
+}
+
+/** Read at most cap + one sentinel byte, including freshly fetched writer worktrees. */
+export function readBoundedTransportFile(path, maxBytes, { open = openSync, read = readSync, close = closeSync, root } = {}) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024) throw new Error('invalid transport byte cap');
+  let fd;
+  try {
+    if (root) assertTransportParents(path, root);
+    fd = openRegularTransportFile(path, constants.O_RDONLY, { open, close });
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let used = 0;
+    while (used < buffer.length) {
+      const n = read(fd, buffer, used, buffer.length - used, null);
+      if (!n) break;
+      used += n;
+    }
+    if (used > maxBytes) throw new Error('card ledger exceeds read cap; advance reviewed checkpoint or raise readMaxBytes');
+    return buffer.subarray(0, used).toString('utf8');
+  } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  finally { if (fd !== undefined) close(fd); }
+}
+
+export function publicSigningIdentity(keyPath, exec = execFileSync) {
+  // OpenSSH may retain the private key's comment in -y output; publish only algorithm + blob.
+  const key = String(exec('ssh-keygen', ['-y', '-f', keyPath], { encoding: 'utf8', maxBuffer: 16384, timeout: 10000 })).trim().split(/\s+/).slice(0, 2).join(' ');
+  const fingerprint = String(exec('ssh-keygen', ['-lf', '-', '-E', 'sha256'], { input: key, encoding: 'utf8', maxBuffer: 16384, timeout: 10000 })).split(/\s+/)[1];
+  if (!/^SHA256:[A-Za-z0-9+/]+$/.test(fingerprint)) throw new Error('invalid signing fingerprint');
+  return { key, fingerprint };
+}
+
+/** No ambient keyring/signers file can authorize a commit. All temp material is removed. */
+export function verifySignedTransportCommit({ run, cwd, commit, allowedSigners }) {
+  if (!/^[a-f0-9]{40}$/.test(commit) || !allowedSigners?.length) throw new Error('missing trusted commit signer');
+  const temp = mkdtempSync(join(tmpdir(), 'card-ledger-verify-'));
+  try {
+    const path = join(temp, 'allowed_signers');
+    writeFileSync(path, allowedSigners.map(s => `drain ${s.key}\n`).join(''), { mode: 0o600 });
+    const home = join(temp, 'gnupg'); mkdirSync(home, { mode: 0o700 });
+    const args = ['-c', 'gpg.format=ssh', '-c', 'gpg.ssh.program=ssh-keygen', '-c', `gpg.ssh.allowedSignersFile=${path}`, 'verify-commit', '--raw', commit];
+    const opts = { cwd, env: { ...laneGitEnv(cwd), GNUPGHOME: home }, maxBuffer: 65536, timeout: 10000 };
+    // verify-commit writes its good-signature diagnostic to stderr.
+    const output = run ? String(run(args, opts)) : (() => {
+      const r = spawnSync('git', args, { timeout: 30000, maxBuffer: 1048576, ...opts, encoding: 'utf8' });
+      if (r.error || r.status !== 0) throw new Error('commit signature verification failed');
+      return r.stdout + r.stderr;
+    })();
+    const signer = allowedSigners.find(s => output.split(/\s+/).includes(s.fingerprint));
+    if (!signer) throw new Error('commit signature has no trusted signer fingerprint');
+    return signer.fingerprint;
+  } finally { rmSync(temp, { recursive: true, force: true }); }
 }
