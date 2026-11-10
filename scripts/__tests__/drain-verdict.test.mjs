@@ -23,7 +23,9 @@ const refuse = (v, lookup = live(), opts = {}) => {
   expect(result.reason.trim()).not.toBe('');
 };
 const row = { num: 7, repo: 'o/r', headSha };
-const base = () => ({ ok: true, dryRun: true, heldCoupleMembers: 0, toMerge: [], skipped: [], parked: [], skipReasons: [] });
+// Mirrors the real dry-run JSON: `merged`/`failed` are always present (and empty) on a dry-run.
+const base = () => ({ ok: true, dryRun: true, heldCoupleMembers: 0, toMerge: [], skipped: [], parked: [], skipReasons: [],
+  merged: [], failed: [] });
 
 describe('T1: strict v2 shape and forged verdict refusals', () => {
   it('builds exactly the v2 contract and verifies a valid verdict', () => {
@@ -151,6 +153,10 @@ describe('T3: result mapping preserves local fallback', () => {
     ['local', 'humanRequired', { ...base(), parked: [{ ...row, humanRequired: true, reasons: ['workflow hold'] }] }],
     ['local', 'checks pending', { ...base(), skipped: [{ ...row, reason: 'checks pending' }],
       skipReasons: [{ ...row, kind: 'checks-pending', reason: 'checks pending' }] }],
+    // A held merge candidate is a definite "run the local drain" answer, not unreadable evidence: it must
+    // still produce a verdict, or every scheduled run fails while a stacked/blocked PR is labelled.
+    ['local', 'deferred candidate', { ...base(), toMerge: [row], deferred: [{ ...row, reason: 'blocked-by' }] }],
+    ['local', 'skip-reasoned candidate', { ...base(), toMerge: [row], skipReasons: [{ ...row, kind: 'blocked-by', reason: 'blocked-by #1' }] }],
   ])('maps %s for %s and round-trips through build/verify', (decision, _name, result) => {
     const mapped = resultToVerdictInputs(result, structuredClone(ctx));
     expect(mapped).toMatchObject({ ...ctx, headSha, decision });
@@ -159,14 +165,14 @@ describe('T3: result mapping preserves local fallback', () => {
   it.each([
     ['failed result', { ...base(), ok: false }], ['not dry-run', { ...base(), dryRun: false }],
     ['failed repo', { ...base(), failedRepos: [{ repo: 'o/r' }] }],
-    ...['toMerge', 'skipped', 'parked', 'skipReasons'].map(key => {
+    ...['toMerge', 'skipped', 'parked', 'skipReasons', 'merged', 'failed'].map(key => {
       const value = { ...base(), toMerge: [row] }; delete value[key]; return [`missing ${key}`, value];
     }),
+    ['a landed merge in a dry-run', { ...base(), toMerge: [row], merged: [{ num: 9, repo: 'o/r' }] }],
+    ['a failed merge in a dry-run', { ...base(), skipped: [row], failed: [{ num: 9, repo: 'o/r' }] }],
     ['null headSha', { ...base(), toMerge: [{ ...row, headSha: null }] }],
     ['contradictory rows', { ...base(), toMerge: [row], skipped: [row] }],
     ['ambiguous headSha', { ...base(), skipped: [row], parked: [{ ...row, headSha: movedSha }] }],
-    ['deferred candidate', { ...base(), toMerge: [row], deferred: [{ ...row, reason: 'blocked-by' }] }],
-    ['skip-reasoned candidate', { ...base(), toMerge: [row], skipReasons: [{ ...row, kind: 'blocked-by', reason: 'blocked-by #1' }] }],
     ['target absent', base()], ['other target', { ...base(), toMerge: [{ ...row, num: 8 }] }],
   ])('refuses %s with an explicit local drain fallback', (_name, result) => {
     expect(() => resultToVerdictInputs(result, ctx)).toThrow(/local drain/);
@@ -177,7 +183,7 @@ describe('T3: result mapping preserves local fallback', () => {
 // merge candidate. Feed the REAL producer's output so the mapping is tested against what the child prints.
 describe('T3b: real dry-run skip-reason producer output', () => {
   const target = { num: 7, repo: null, headSha, decision: 'merge' };
-  const dryRun = (produced, extra = {}) => ({ ...base(), toMerge: [row], merged: [], failed: [],
+  const dryRun = (produced, extra = {}) => ({ ...base(), toMerge: [row],
     skipReasons: buildSkipReasons({ verdicts: [target], ...produced }), ...extra });
 
   it('a lone ready candidate of a dry-run (nothing landed) still maps to enqueue', () => {
@@ -188,10 +194,19 @@ describe('T3b: real dry-run skip-reason producer output', () => {
     expect(verify(build(mapped), live(), { now })).toEqual({ ok: true });
   });
   it.each([
-    ['a couple partner pending (also unaccounted)', () => ({ ...base(), toMerge: [row], merged: [], failed: [],
+    ['a couple partner pending (also unaccounted)', () => ({ ...base(), toMerge: [row],
       skipReasons: buildSkipReasons({ verdicts: [{ ...target, item: 'x1' }, { num: 8, repo: null, decision: 'merge', item: 'x1' }] }) })],
+    // Defensive pin: a real dry-run leaves enqueueOutcomes empty, but a hold row must never read as enqueue.
     ['a real enqueue hold', () => dryRun({ enqueueOutcomes: [{ num: 7, repo: null, outcome: 'not-enqueued', kind: 'batching-deferred', reason: 'held' }] })],
     ['ready-not-reached from a named source', () => ({ ...dryRun({}), skipReasons: [{ ...row, kind: 'ready-not-reached', reason: 'r', source: 'deferred' }] })],
+    ['a blocked-by deferral from the real plan', () => dryRun({ deferred: [{ num: 7, repo: null, waitOn: ['#3'] }] },
+      { deferred: [{ ...row, waitOn: ['#3'] }] })],
+  ])('never enqueues %s: it maps to local', (_name, make) => {
+    const mapped = resultToVerdictInputs(make(), structuredClone(ctx));
+    expect(mapped).toMatchObject({ ...ctx, headSha, decision: 'local' });
+    expect(verify(build(mapped), live(), { now })).toEqual({ ok: true });
+  });
+  it.each([
     ['ready-not-reached beside a landed merge', () => dryRun({}, { merged: [{ num: 9, repo: 'o/r' }] })],
     ['ready-not-reached beside a failed merge', () => dryRun({}, { failed: [{ num: 9, repo: 'o/r' }] })],
     ['ready-not-reached with no merged list', () => { const r = dryRun({}); delete r.merged; return r; }],

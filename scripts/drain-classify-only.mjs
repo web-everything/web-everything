@@ -13,9 +13,11 @@ export function resultToVerdictInputs(result, ctx) {
       (result.failedRepos !== undefined && (!Array.isArray(result.failedRepos) || result.failedRepos.length))) {
     throw new Error('incomplete dry-run; run the local drain');
   }
-  for (const key of ['toMerge', 'skipped', 'parked', 'skipReasons']) {
+  for (const key of ['toMerge', 'skipped', 'parked', 'skipReasons', 'merged', 'failed']) {
     if (!Array.isArray(result[key])) throw new Error(`missing ${key}; run the local drain`);
   }
+  // A dry-run lands and fails nothing; anything else is not the evidence this mapping understands.
+  if (result.merged.length || result.failed.length) throw new Error('incomplete dry-run; run the local drain');
   if (result.deferred !== undefined && !Array.isArray(result.deferred)) throw new Error('invalid deferred; run the local drain');
   // Couple evidence may be an aggregate (heldCoupleMembers), a result list (coupleHeld /
   // coupleSplit), or nested candidate metadata. Conservatively refuse even unscoped signals.
@@ -42,22 +44,18 @@ export function resultToVerdictInputs(result, ctx) {
   const heads = new Set(rows.map(r => r.headSha));
   if (heads.size !== 1 || !/^[a-f0-9]{40}$/i.test(rows[0].headSha ?? '')) throw new Error('ambiguous headSha/repo; run the local drain');
   if (merge.length && (merge.length !== 1 || skipped.length || parked.length)) throw new Error('contradictory classification; run the local drain');
-  // toMerge is captured before dependency planning: deferred candidates are not admitted.
-  // A dry-run merges nothing, so the real producer (drain-skip-reasons.mjs#buildSkipReasons) gives EVERY
-  // still-ready merge candidate a `ready-not-reached` row from its `unaccounted` fallback. That bucket keeps
-  // only the first row per PR, so this row means no real hold claimed the PR. Exempt exactly that row, only
-  // for a pass that provably landed and failed nothing; every other kind (partner-pending included) refuses.
-  const nothingLanded = Array.isArray(result.merged) && !result.merged.length &&
-    Array.isArray(result.failed) && !result.failed.length;
-  const dryRunArtefact = row => nothingLanded && row?.kind === 'ready-not-reached' && row.source === 'unaccounted';
-  if (merge.length && ((result.deferred || []).some(matches) ||
-      result.skipReasons.some(row => matches(row) && !dryRunArtefact(row)))) {
-    throw new Error('toMerge candidate deferred or skip-reasoned; run the local drain');
-  }
+  // toMerge is captured before dependency planning: a deferred candidate is never admitted (it maps to local).
+  // A dry-run merges nothing (checked above), so the real producer (drain-skip-reasons.mjs#buildSkipReasons)
+  // gives EVERY still-ready merge candidate a `ready-not-reached` row from its `unaccounted` fallback. That
+  // producer keeps only the first row per PR, so this row means no hold the dry-run itself computes claimed
+  // the PR; live-only holds stay the local drain's to re-check. Every other row (partner-pending included)
+  // is a hold. A held candidate is a definite `local` answer, never a refusal: a refusal writes no verdict.
+  const dryRunArtefact = row => row?.kind === 'ready-not-reached' && row.source === 'unaccounted';
+  const held = (result.deferred || []).some(matches) || result.skipReasons.some(row => matches(row) && !dryRunArtefact(row));
   // --dry-run --json skips planCoupleCascadeStep and cannot detect separated couples:
   // enqueue is only a hint; the local drain must re-check couple-whole before admission.
   return { repo: ctx.repo, pr: ctx.pr, headSha: rows[0].headSha, mainSha: ctx.mainSha,
-    computedAt: ctx.computedAt, provenance: ctx.provenance, decision: merge.length ? 'enqueue' : 'local' };
+    computedAt: ctx.computedAt, provenance: ctx.provenance, decision: merge.length && !held ? 'enqueue' : 'local' };
 }
 
 function assertSafeEnv(env) {
