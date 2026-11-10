@@ -142,6 +142,7 @@ function options(dir, patch = {}) {
     readRedTeamStatus: ({ pr: number }) => ({ repo: REPO, pr: number, head: HEAD, status: 'running',
       host: 'fixture-host', pidNamespace: 'fixture-ns', pid: 12345, pidStart: 'original-owner', startedAt: OLD }),
     probe: { host: 'fixture-host', namespace: 'fixture-ns', isAlive: () => false, readPidStart: () => 'original-owner' },
+    abandonStaleRun: vi.fn(() => ({ ok: true })),
     dispatchRestart: vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 })), ...patch };
 }
 
@@ -256,6 +257,32 @@ async function executeBudget(run, cap) {
   expect(input.dispatchRestart).not.toHaveBeenCalled();
   expect(records(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', action: 'restart-red-team', held: expect.stringMatching(/cap/) }));
 }
+// The red-team job's queued admission refuses a dead owner's running status unless it was abandoned first, so the
+// sweep abandons it after durable intent and before dispatch, for exactly the assessed head.
+async function abandonBeforeDispatch(run) {
+  const dir = fixture();
+  const events = [];
+  const input = options(dir, {
+    abandonStaleRun: vi.fn(key => { events.push(['abandon', key, records(dir).map(r => r.phase)]); return { ok: true }; }),
+    dispatchRestart: vi.fn(async () => { events.push(['dispatch']); return { status: 'dispatched', jobPid: 24680 }; }),
+  });
+  await run(input);
+  expect(events).toEqual([['abandon', { repo: REPO, pr: 11, head: HEAD, env: {} }, ['pass', 'intent']], ['dispatch']]);
+  expect(records(dir).map(r => r.phase)).toEqual(['pass', 'intent', 'did']);
+}
+async function abandonRefusalStops(run, refusal = { ok: false }) {
+  const input = options(fixture(), {
+    read: () => ({ now: NOW, prs: [pr(11), pr(12)], liveJobs: [], unreadable: [], stalledAfterMinutes: 45 }),
+    abandonStaleRun: vi.fn(() => { if (refusal instanceof Error) throw refusal; return refusal; }),
+  });
+  const out = await run(input);
+  expect(input.abandonStaleRun).toHaveBeenCalledTimes(1);
+  expect(input.dispatchRestart).not.toHaveBeenCalled();
+  expect(out.incomplete).toBe(true);
+  expect(records(input.dir).filter(r => r.action === 'restart-red-team').map(r => [r.pr, r.phase]))
+    .toEqual([[11, 'intent'], [11, 'error']]);
+  expect(records(input.dir).find(r => r.phase === 'error').error).toMatch(/abandon.*operator/);
+}
 async function stopAfterError(run) {
   const input = options(fixture(), {
     read: () => ({ now: NOW, prs: [pr(11), pr(12)], liveJobs: [], unreadable: [], stalledAfterMinutes: 45 }),
@@ -288,6 +315,10 @@ const guarantees = [
   ...['maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'maxRedTeamRestartsPerHead']
     .map(cap => [`execute-time ${cap} rechecks evidence added after planning`, run => executeBudget(run, cap), ...reread]),
   ['first dispatch error stops subsequent planned heads', stopAfterError, 'break; // No retry or subsequent dispatch after any error.', ''],
+  ['a dead owner is abandoned after intent and before dispatch', abandonBeforeDispatch,
+    'const abandoned = await abandonStaleRun({ repo: i.repo, pr: i.pr, head: i.head, env });', 'const abandoned = { ok: true };'],
+  ['a refused abandonment stops the pass without dispatch', run => abandonRefusalStops(run),
+    "if (abandoned?.ok !== true) throw new Error('stale red-team abandonment refused; operator must inspect');", ''],
   ['standard shadow default never executes', shadowDefault,
     "i.action === 'restart-red-team' && cfg.actionModes?.['restart-red-team'] === 'on'", "i.action === 'restart-red-team'"],
 ];
@@ -324,6 +355,11 @@ describe('live restart execution guarantees', () => {
   it.each(['throw', 'malformed'])('a %s execute-time head read stops later candidates', async failure => {
     await headReadStops(runStallSweep, failure);
   });
+
+  it.each([['a throw', new Error('status claim busy')], ['no result', undefined], ['a non-true ok', { ok: 'yes' }]])(
+    'an abandonment that returns %s stops the pass without dispatch', async (_name, refusal) => {
+      await abandonRefusalStops(runStallSweep, refusal);
+    });
 
   it('global off overrides the explicit live action', async () => {
     const input = options(fixture());

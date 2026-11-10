@@ -181,7 +181,9 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 })).headRefOid,
   readRedTeamStatus = defaultReadRedTeamStatus,
   readStatusAt = ({ repo, pr, head, env }) => statSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`)).mtimeMs,
-  probe, judge = judgeRound, dir, log = console.error, force = false, dispatchRestart = dispatchManualPass } = {}) {
+  probe, judge = judgeRound, dir, log = console.error, force = false, dispatchRestart = dispatchManualPass,
+  // Loaded lazily so importers of the sweep keep a light module closure.
+  abandonStaleRun = async key => (await import('../lib/review-red-team-on-skip.mjs')).abandonStaleRedTeamRun(key) } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
   const cfg = s.value;
   // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
@@ -402,6 +404,10 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       }
       i.expectedHead = i.head;
       record({ ...i, ts, phase: 'intent', mode: cfg.mode });
+      // The job's queued admission refuses a dead owner's still-running status unless it was abandoned first, the same
+      // abandon-then-dispatch order the shared stale recovery uses. A refusal spends nothing more and stops the pass.
+      const abandoned = await abandonStaleRun({ repo: i.repo, pr: i.pr, head: i.head, env });
+      if (abandoned?.ok !== true) throw new Error('stale red-team abandonment refused; operator must inspect');
       const result = await dispatchRestart({ daemon: 'red-team', repo: i.repo, pr: i.pr, reason: i.reason, expectedHead: i.expectedHead });
       if (result?.error || result?.skipped || result?.ok === false) throw new Error(`restart refused: ${msg(result.error ?? result.skipped ?? 'unsuccessful dispatch')}`);
       if (result?.jobPid === null || result?.launched === false || !(result?.launched === true

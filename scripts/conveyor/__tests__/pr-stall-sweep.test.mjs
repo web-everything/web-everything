@@ -16,9 +16,13 @@ import { runPrSweepJob } from '../pr-sweep-job.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
 import { sidecarsOf, replay, runOnce, unacknowledged } from '../../operations/needs-you-feed.mjs';
 import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
+import { abandonStaleRedTeamRun } from '../../lib/review-red-team-on-skip.mjs';
 
 // Keep the future default live-dispatch path hermetic as well as the injected seam.
 vi.mock('../../operations/manual-daemon-pass-io.mjs', () => ({ dispatchManualPass: vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 })) }));
+// The default abandonment seam is the shared stale-run abandonment; keep it hermetic but observable.
+vi.mock('../../lib/review-red-team-on-skip.mjs', async importOriginal => ({ ...await importOriginal(),
+  abandonStaleRedTeamRun: vi.fn(() => ({ ok: true })) }));
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -884,7 +888,10 @@ describe('R804 restart-only live acceptance', () => {
       dispatchRestart, ...options });
     return { out, dir, dispatchRestart, calls };
   };
-  afterEach(() => { vi.restoreAllMocks(); vi.mocked(dispatchManualPass).mockClear(); });
+  afterEach(() => {
+    vi.restoreAllMocks(); vi.mocked(dispatchManualPass).mockClear();
+    vi.mocked(abandonStaleRedTeamRun).mockClear().mockImplementation(() => ({ ok: true }));
+  });
 
   it.each([
     ['replacement owner', { pid: 54321 }],
@@ -1071,6 +1078,10 @@ describe('R804 restart-only live acceptance', () => {
       probe: { host: owner.host, namespace: owner.pidNamespace, isAlive: () => false, readPidStart: () => owner.pidStart } });
     expect(dispatchManualPass).toHaveBeenCalledTimes(1);
     expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD });
+    // The default seam abandons the dead owner's run through the shared recovery helper first, as recovery does.
+    expect(abandonStaleRedTeamRun).toHaveBeenCalledWith({ repo: REPO, pr: 11, head: HEAD, env: {} });
+    expect(vi.mocked(abandonStaleRedTeamRun).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(dispatchManualPass).mock.invocationCallOrder[0]);
   });
   it.each([true, null])('R804 ownerAlive=%s cannot dispatch a restart', async alive => {
     const { out, dir, dispatchRestart } = await run({ alive });
