@@ -75,7 +75,8 @@ import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.m
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync, readFileSync } from 'node:fs';
-import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
+import { readSettings } from '../../scripts/lib/settings-files.mjs';
+import { cascadePolicy, platformPreference, resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
 import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
@@ -121,6 +122,7 @@ export const RECONCILE_FIX_DISPATCH_LEASE_KEY = '<conveyor:reconcile-fix-dispatc
 /** Matches runner.mjs's own tick cadence (DEFAULT_TICK_INTERVAL_MS) — this pass ran at that rate as one of
  *  runner.mjs's mechanical passes; standing alone, there is no reason to run it faster or slower. */
 export const DEFAULT_INTERVAL_MS = 120_000;
+export const FIX_LIGHT_INTERVAL_MS = 300_000;
 
 // ── PURE CORE (no IO — every effect is injected; unit-tested directly) ─────────────────────────────────────
 
@@ -162,6 +164,52 @@ export async function runDaemonLoop({
     await sleep(intervalMs);
     tick += 1;
   }
+}
+
+/** Fixed-cadence opportunities: an unfinished tick owns the slot; missed opportunities are discarded.
+ * Drain the active tick on exit so its callbacks cannot outlive the loop/lease cleanup. */
+export async function runFixLightLoop({ tickOnce, sleep, heartbeat = () => true,
+  intervalMs = FIX_LIGHT_INTERVAL_MS, onTick = () => {}, onTickError = () => {}, maxTicks,
+}) {
+  if (typeof tickOnce !== 'function') throw new TypeError('runFixLightLoop requires a tickOnce effect');
+  let active = null;
+  let leaseAlive = true;
+  let opportunity = 0;
+  try {
+    return await runDaemonLoop({ sleep, intervalMs, maxTicks,
+      heartbeat: async () => leaseAlive && (leaseAlive = await heartbeat()),
+      tickOnce: async () => {
+        if (!leaseAlive || !(leaseAlive = await heartbeat()) || active) return;
+        const tick = opportunity++;
+        active = Promise.resolve().then(tickOnce)
+          .then(result => onTick(result, tick), error => onTickError(error, tick))
+          .finally(() => { active = null; });
+        // Observe callback failures as well, without leaving an unhandled rejection.
+        active.catch(() => {});
+      },
+      onTickError,
+    });
+  } finally { await active; }
+}
+
+/** Invalid explicit switches disable dispatch; removing the override restores the standard. */
+export function resolveFixLightLoopSetting({ env = process.env, platform, tool = readSettings()?.fixDispatch } = {}) {
+  const parse = value => value === undefined ? undefined : value === true;
+  const resolved = cascadePolicy('fixDispatch', { lightLoop: parse(tool?.lightLoop) }, {
+    standard: { lightLoop: true },
+    platform: { lightLoop: parse((platform ?? platformPreference('fixDispatch', { env }))?.lightLoop) }, env,
+    envValues: { lightLoop: env.WE_FIX_LIGHT_LOOP === undefined ? undefined
+      : ['on', 'true', '1'].includes(String(env.WE_FIX_LIGHT_LOOP).trim().toLowerCase()) },
+    valid: { lightLoop: value => typeof value === 'boolean' },
+  });
+  return { value: resolved.value.lightLoop, source: resolved.sources.lightLoop };
+}
+
+/** Kept separate from main so the escape hatch is exercised without starting a daemon. */
+export function startFixLightLoop({ env, platform, tool, log = console, loop = runFixLightLoop, ...effects } = {}) {
+  const setting = resolveFixLightLoopSetting({ env, platform, tool });
+  log.error(`fix-light: enabled=${setting.value} (source: ${setting.source})`);
+  return setting.value ? loop(effects) : Promise.resolve({ ticks: 0, stoppedReason: 'disabled' });
 }
 
 /** The repos this daemon watches each tick — mirrors we:skills-src/conveyor/review-daemon.mjs's own
@@ -983,7 +1031,7 @@ const fixPassRotation = {};
  */
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
-  authGateOverride,
+  authGateOverride, fixOnly = false,
   fixSettings = resolveFixSettings(),
   // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
   readPrs,
@@ -1022,6 +1070,8 @@ export async function runTickAllRepos({
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  const emptyResult = () => ({ repos: repos.map(repo => ({ repo, result: { dispatched: [], refusals: [] } })),
+    dispatched: [], refusals: [], reconcileRefusals: [], notes: [], comments: [], autoGrants: [] });
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
@@ -1069,14 +1119,14 @@ export async function runTickAllRepos({
   // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
   // xn025gx (R4 push-wake-cadence): with all three fixDispatch push-on-green settings off (loop seconds 0, the two switches off) this is exactly the pass above; with the fast loop
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
-  const awaitVerify = await timedAsync('await-verify', async () => (awaitVerifyTick ? awaitVerifyTick({ allowResume: !authGate.paused })
+  const awaitVerify = fixOnly ? emptyResult() : await timedAsync('await-verify', async () => (awaitVerifyTick ? awaitVerifyTick({ allowResume: !authGate.paused })
     : (realTick ? buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] })));
   // card xiqtf7w — before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
   // stand-down now, so this tick's fix/ci-heal halves (and the review daemon) already read it as stood down.
   // No Claude session is spawned, so the auth gate never pauses it.
-  const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
+  const supersede = fixOnly ? emptyResult() : timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
     : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] })));
-  const rulingStandDown = await timedAsync('ruling-stand-down', async () => {
+  const rulingStandDown = fixOnly ? emptyResult() : await timedAsync('ruling-stand-down', async () => {
     const setting = resolveReviewSettings().rulingResolvesStandDown;
     const settingSource = resolveReviewSettingSource('rulingResolvesStandDown');
     if (!repos.includes(CONSTELLATION_REPOS.we.slug) || (anyTickInjected && !rulingStandDownTick)) {
@@ -1098,7 +1148,7 @@ export async function runTickAllRepos({
   // every repo's fix and CI-heal dispatch, so each dispatch in the pass sees the demand of the ones before it.
   // Only read when a real tick runs (an injected test tick never needs it) AND dispatch is not paused (card
   // x5kagse — no reason to read live queue capacity for a pass that is about to dispatch nothing at all).
-  const queueAdmission = (authGate.paused || (fixTick && ciHealTick)) ? null : createQueueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT }));
+  const queueAdmission = (authGate.paused || (fixTick && (fixOnly || ciHealTick))) ? null : createQueueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT }));
   // ONE throttle per pass shared by fix + ci-heal: live fix/ci-heal cap and host-load gate (defer-only).
   // xn025gx (R2 fix-slot-count): a session parked on verify gives its slot back; a decided resume keeps one. Setting off →
   // the same live-claim list as before.
@@ -1171,10 +1221,8 @@ export async function runTickAllRepos({
       process.stderr.write(`reconcile-fix-dispatch-daemon: skipped ${step} — empty work list (no candidates in shared PR discovery)\n`);
     }
   }
-  const emptyResult = () => ({ repos: repos.map(repo => ({ repo, result: { dispatched: [], refusals: [] } })),
-    dispatched: [], refusals: [], reconcileRefusals: [], notes: [], comments: [], autoGrants: [] });
   const stepTimed = (step, fn) => {
-    if (skippedSteps.includes(step)) { phaseMs[step] = 0; return emptyResult(); }
+    if ((fixOnly && step !== 'fix') || skippedSteps.includes(step)) { phaseMs[step] = 0; return emptyResult(); }
     return timed(step, fn);
   };
   // Pass-local plan reuse for the two phases routed through sharedTick (ci-heal and notes are wired below).
@@ -1203,10 +1251,13 @@ export async function runTickAllRepos({
   };
   // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
   const orphanGuard = await timedAsync('orphan-guard', async () => {
-    if (stuckFixerTick || !realTick || !orphanGuardTick) return { rows: [] };
+    if ((!fixOnly && (stuckFixerTick || !realTick)) || !orphanGuardTick) return { rows: [] };
     try { return await orphanGuardTick({ env: process.env, nowMs: now() }) ?? { rows: [] }; }
     catch (e) { return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] }; }
   });
+  // Light passes must observe labels/comments changed by the guard, rather than
+  // dispatching from discovery captured before an orphan was escalated or re-armed.
+  if (fixOnly && orphanGuard.rows?.length) snapshots.clear();
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
@@ -1214,7 +1265,7 @@ export async function runTickAllRepos({
   planCache?.markTouched(fix);
   // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
   // The hooks cannot interrupt in-flight work or bound discovery/endFix/release IO.
-  const stuckFixers = await timedAsync('stuck-fixers', async () => {
+  const stuckFixers = fixOnly ? emptyResult() : await timedAsync('stuck-fixers', async () => {
     const start = now();
     const overBudget = () => {
       if (now() - start > budgets['stuck-fixers'].budgetMs) budgets['stuck-fixers'].hit = true;
@@ -1237,12 +1288,12 @@ export async function runTickAllRepos({
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
-  const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
+  const ciHeal = fixOnly ? emptyResult() : await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
     : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }),
       ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
   ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
   planCache?.markTouched(ciHeal);
-  if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
+  if (dispatchThrottle && !fixOnly) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
   planCache?.markTouched(hungCi);
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
@@ -1264,7 +1315,7 @@ export async function runTickAllRepos({
   planCache?.markTouched(promoteDraft);
   // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
   // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
-  const notes = timed('notes', () => runReconcileNotesAllRepos({
+  const notes = fixOnly ? emptyResult() : timed('notes', () => runReconcileNotesAllRepos({
     repos, ...(planCache ? { reconcile: planCache.reconcile } : {}),
     ...(notesTick ? { tick: notesTick } : planCache ? { tick: (o) => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
   }));
@@ -1695,12 +1746,40 @@ async function main() {
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
   awaitLoop.start();
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
-  const { stoppedReason } = await runDaemonLoop(
+  let loopsStopped = false;
+  let wakeLight;
+  const stopLightSleep = new Promise(resolve => { wakeLight = resolve; });
+  const lightEffects = withGithubAppAuth(withFixDispatchClaimRefresh({
+    tickOnce: () => runTickAllRepos({ fixOnly: true, tagDispatchStatus: defaultTagDispatchStatus }),
+    sleep: async ms => {
+      let timer;
+      try { await Promise.race([new Promise(resolve => { timer = setTimeout(resolve, ms); }), stopLightSleep]); }
+      finally { clearTimeout(timer); }
+    },
+    heartbeat: () => {
+      if (loopsStopped) return false;
+      const alive = heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
+      if (!alive) { loopsStopped = true; wakeLight(); }
+      return alive;
+    },
+    onTick: result => console.error(`fix-light: pass ${result?.passMs ?? '?'}ms; dispatched=${result?.dispatched?.length ?? 0}`),
+    onTickError: error => console.error(`fix-light: pass failed: ${String(error?.message ?? error).split('\n')[0]}`),
+  }), FIX_DISPATCH_APP_AUTH_OPTS);
+  const lightLoop = startFixLightLoop(lightEffects);
+  // Observe errors immediately even while a full pass is still running.
+  lightLoop.catch(error => { loopsStopped = true; wakeLight(); console.error(`fix-light: loop failed: ${error.message}`); });
+  let stoppedReason;
+  try {
+    ({ stoppedReason } = await runDaemonLoop(
     withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner })), FIX_DISPATCH_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), fixDaemonPrEventsOptions()),
-  );
-  exits.loopEnded(stoppedReason);
+  ));
+  } finally {
+    loopsStopped = true;
+    wakeLight();
+    try { await lightLoop; } finally { exits.loopEnded(stoppedReason); }
+  }
 }
 
 /** The fix daemon's pr-events options: with webhook waking on, a local hand-off still wakes it first. */

@@ -13,6 +13,7 @@ import { runReconcileCiHealDispatch } from '../../../scripts/operations/ci-heal-
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
+  runFixLightLoop, FIX_LIGHT_INTERVAL_MS, startFixLightLoop, resolveFixLightLoopSetting,
   runDaemonLoop, buildCliDaemonEffects, realSleep, RECONCILE_FIX_DISPATCH_LEASE_KEY, DEFAULT_INTERVAL_MS,
   runReconcileFixDispatchAllRepos, FIX_DISPATCH_DAEMON_REPOS, hasStaleMainRefusal,
   runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, createReconcilePlanCache, readPlanFingerprints, readPlanClaims, formatRefusalLine,
@@ -2464,5 +2465,232 @@ describe('fix pass budgets', () => {
       budgets: { 'ci-heal': { budgetMs: 1000, hit: true } },
     })).toEqual(['pass-timing phase=fix ms=20 budgetMs=none budgetHit=false',
       'pass-timing phase=ci-heal ms=1001 budgetMs=1000 budgetHit=true']);
+  });
+});
+
+
+describe('fix-only dispatch and independent light loop', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const fixture = () => ({
+    repos: [CONSTELLATION_REPOS.we.slug],
+    authGateOverride: vi.fn(() => ({ paused: false, reason: null })),
+    fixTick: vi.fn(() => ({ dispatched: [{ pr: 42, agentId: 'agent-42' }], refusals: [] })),
+    ciHealTick: vi.fn(async () => ({ dispatched: [], refusals: [] })),
+    hungCiTick: vi.fn(noopHungCiTick), mainRedRebaseTick: vi.fn(noopMainRedRebaseTick),
+    missingRunTick: vi.fn(noopMissingRunTick), promoteDraftTick: vi.fn(noopPromoteDraftTick),
+    notesTick: vi.fn(noopNotesTick), supersedeTick: vi.fn(() => ({ holds: [] })),
+    stuckFixerTick: vi.fn(() => ({ rows: [] })), awaitVerifyTick: vi.fn(() => ({ rows: [] })),
+    rulingStandDownTick: vi.fn(() => ({ rows: [] })), orphanGuardTick: vi.fn(() => ({ rows: [] })),
+    tagDispatchStatus: vi.fn(async () => ({ changed: true })),
+  });
+
+  it('fixOnly runs fix once, tags its dispatch and skips every heavy phase', async () => {
+    const opts = fixture();
+    const out = await runTickAllRepos({ ...opts, fixOnly: true });
+    expect(opts.fixTick).toHaveBeenCalledTimes(1);
+    expect(opts.authGateOverride).toHaveBeenCalledTimes(1);
+    expect(opts.orphanGuardTick).toHaveBeenCalledTimes(1);
+    for (const [name, tick] of Object.entries(opts)) {
+      if (name.endsWith('Tick') && !['fixTick', 'orphanGuardTick'].includes(name)) expect(tick, name).not.toHaveBeenCalled();
+    }
+    expect(opts.tagDispatchStatus).toHaveBeenCalledWith({ pr: 42, repo: opts.repos[0] });
+    expect(out.dispatched).toHaveLength(1);
+    for (const name of ['ciHeal', 'hungCi', 'mainRedRebase', 'missingRun', 'promoteDraft',
+      'awaitVerify', 'stuckFixers', 'supersede', 'rulingStandDown']) {
+      expect(out[name].dispatched, name).toEqual([]);
+    }
+    expect(out.notes).toEqual([]);
+    expect(out.noteComments).toEqual([]);
+  });
+
+  it.each([false, true])('fixOnly escalates a capped orphan before fix and makes zero executor calls (snapshot=%s)', async skipEmptySteps => {
+    const { FIX_BEGIN_MARKER, FIX_END_MARKER } = await import('../../../scripts/conveyor/fix-procedure.mjs');
+    const { CHANGES_VERDICT_PREFIX, ORPHAN_GUARD_MARKER, runOrphanFixRoundPass } = orphanFixRound;
+    const comment = (createdAt, body) => ({ createdAt, body, author: { login: 'web-everything' } });
+    const pr = {
+      number: 42, headRefName: 'lane/capped-orphan', headRefOid: 'a'.repeat(40),
+      baseRefName: 'main', isDraft: false, body: '', mergeStateStatus: 'CLEAN',
+      labels: [{ name: 'review:changes' }], statusCheckRollup: [], files: [],
+      comments: [
+        comment('2026-10-10T10:00:00Z', CHANGES_VERDICT_PREFIX),
+        comment('2026-10-10T11:00:00Z', `${ORPHAN_GUARD_MARKER} re-dispatched`),
+        comment('2026-10-10T12:00:00Z', `${ORPHAN_GUARD_MARKER} re-dispatched`),
+        comment('2026-10-10T13:00:00Z', FIX_BEGIN_MARKER),
+        comment('2026-10-10T13:30:00Z', FIX_END_MARKER),
+      ],
+    };
+    const opts = fixture();
+    const repo = opts.repos[0];
+    const order = [];
+    const executor = vi.fn(() => ({ pr: 42, agentId: 'unexpected-agent' }));
+    const readPrs = vi.fn(() => [structuredClone(pr)]);
+    const escalate = vi.fn(async () => {
+      order.push('escalate');
+      pr.labels.push({ name: 'review:human' });
+      return { ok: true };
+    });
+    const orphanGuardTick = vi.fn(options => runOrphanFixRoundPass({ ...options, env: {},
+      repos: [{ key: 'we', slug: repo }], listBounced: readPrs,
+      readComments: () => pr.comments, isOwned: () => false, escalate,
+      redispatch: executor, rearm: vi.fn(), postComment: vi.fn(),
+    }));
+    const fixTick = vi.fn(options => {
+      order.push('fix');
+      const rows = (options.readPrs ?? readPrs)();
+      return { dispatched: rows.some(row => row.labels.some(label => label.name === 'review:human'))
+        ? [] : [executor()], refusals: [] };
+    });
+    const out = await runTickAllRepos({ ...opts, fixOnly: true, orphanGuardTick, fixTick,
+      readPrs, fixSettings: { skipEmptySteps }, now: () => Date.parse('2026-10-10T16:00:00Z') });
+    expect(orphanGuardTick).toHaveBeenCalledTimes(1);
+    expect(escalate).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['escalate', 'fix']);
+    expect(executor).not.toHaveBeenCalled();
+    expect(out.dispatched).toEqual([]);
+    expect(opts.tagDispatchStatus).not.toHaveBeenCalled();
+  });
+
+  it('fixOnly retains production host admission, throttle, borrow gate and executor route', async () => {
+    const baseline = vi.spyOn(heavyAdmission, 'resolveLiveQueueBaseline').mockReturnValue({ bypassed: 'fixture' });
+    const throttle = { tryAdmit: () => ({ admit: true }) };
+    vi.spyOn(resourceGate, 'createResourceFixThrottle').mockReturnValue(throttle);
+    const fix = vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockReturnValue({ dispatched: [], refusals: [] });
+    const opts = fixture();
+    await runTickAllRepos({ ...opts, fixOnly: true, fixTick: undefined });
+    expect(baseline).toHaveBeenCalledTimes(1);
+    expect(fix).toHaveBeenCalledWith(expect.objectContaining({
+      queueAdmission: expect.any(Object), dispatchThrottle: throttle,
+      borrowGate: expect.any(Object), fixExecutorRoute: expect.any(Function),
+    }));
+    expect(opts.ciHealTick).not.toHaveBeenCalled();
+  });
+
+  it('default full pass still calls all injected phases', async () => {
+    const opts = fixture();
+    await runTickAllRepos(opts);
+    for (const [name, tick] of Object.entries(opts)) {
+      if (name.endsWith('Tick') && name !== 'orphanGuardTick') expect(tick, name).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('fixOnly fails closed when the auth gate pauses dispatch', async () => {
+    const opts = fixture();
+    const out = await runTickAllRepos({ ...opts, fixOnly: true,
+      authGateOverride: () => ({ paused: true, reason: 'auth unavailable' }) });
+    expect(opts.fixTick).not.toHaveBeenCalled();
+    expect(opts.tagDispatchStatus).not.toHaveBeenCalled();
+    expect(out.authPaused).toBe(true);
+    expect(out.dispatched).toEqual([]);
+  });
+
+  it('defaults to 300000ms and skips overlapping opportunities without queuing them', async () => {
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    const tickOnce = vi.fn(() => pending);
+    const onTick = vi.fn();
+    const sleep = vi.fn(async () => { expect(tickOnce).toHaveBeenCalledTimes(1); });
+    const heartbeat = vi.fn(() => {
+      if (heartbeat.mock.calls.length === 6) release({ passMs: 900000 });
+      return true;
+    });
+    const out = await runFixLightLoop({ tickOnce, sleep, heartbeat, onTick, maxTicks: 3 });
+    expect(FIX_LIGHT_INTERVAL_MS).toBe(300000);
+    expect(sleep.mock.calls).toEqual([[300000], [300000]]);
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+    expect(onTick).toHaveBeenCalledTimes(1);
+    expect(out.stoppedReason).toBe('max-ticks');
+  });
+
+  it('reports a failed light tick and admits the next opportunity', async () => {
+    const onTickError = vi.fn();
+    const tickOnce = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue({});
+    await runFixLightLoop({ tickOnce, onTickError,
+      sleep: () => new Promise(resolve => setImmediate(resolve)), maxTicks: 2 });
+    expect(tickOnce).toHaveBeenCalledTimes(2);
+    expect(onTickError).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for an active tick before completing after lease loss', async () => {
+    let releaseTick;
+    const pendingTick = new Promise(resolve => { releaseTick = resolve; });
+    let reportLeaseLoss;
+    const leaseLost = new Promise(resolve => { reportLeaseLoss = resolve; });
+    const tickOnce = vi.fn(() => pendingTick);
+    const onTick = vi.fn();
+    const heartbeat = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockImplementation(() => { reportLeaseLoss(); return false; });
+    const sleep = vi.fn();
+    let settled = false;
+    const loop = runFixLightLoop({ tickOnce, sleep, heartbeat, onTick })
+      .finally(() => { settled = true; });
+    try {
+      await leaseLost;
+      // Let loop completion and its promise callbacks run if draining is removed.
+      await new Promise(resolve => setImmediate(resolve));
+      expect(tickOnce).toHaveBeenCalledTimes(1);
+      expect(settled).toBe(false);
+      expect(onTick).not.toHaveBeenCalled();
+      expect(sleep).not.toHaveBeenCalled();
+    } finally {
+      releaseTick({ passMs: 123 });
+      await loop;
+    }
+    expect(onTick).toHaveBeenCalledTimes(1);
+    expect(onTick).toHaveBeenCalledWith({ passMs: 123 }, 0);
+    expect(settled).toBe(true);
+    expect(await loop).toEqual({ ticks: 1, stoppedReason: 'lease-lost' });
+  });
+
+  it('never starts a light tick after lease loss', async () => {
+    const tickOnce = vi.fn();
+    const out = await runFixLightLoop({ tickOnce, sleep: vi.fn(), heartbeat: () => false });
+    expect(tickOnce).not.toHaveBeenCalled();
+    expect(out.stoppedReason).toBe('lease-lost');
+  });
+
+  it('two concurrent fix-only passes and a full pass share one atomic dispatch claim', async () => {
+    const { acquireFixDispatchClaim } = await import('../../../scripts/conveyor/fix-dispatch-claim.mjs');
+    const claimRoot = mkdtempSync(join(tmpdir(), 'fix-light-claims-'));
+    const dispatch = vi.fn();
+    try {
+      const passes = [true, true, false].map((fixOnly, index) => {
+        const opts = fixture();
+        return runTickAllRepos({ ...opts, fixOnly, fixTick: ({ repo }) => {
+          const claim = acquireFixDispatchClaim({ repo, pr: 42, kind: 'fix',
+            owner: `dispatcher-${index}`, lockRoot: claimRoot });
+          if (!claim.ok) return { dispatched: [], refusals: [{ pr: 42, kind: 'held' }] };
+          dispatch();
+          return { dispatched: [{ pr: 42, agentId: 'agent-42' }], refusals: [] };
+        } });
+      });
+      const results = await Promise.all(passes);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(results.flatMap(r => r.dispatched)).toHaveLength(1);
+    } finally { rmSync(claimRoot, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    [{}, true, 'standard'], [{ WE_FIX_LIGHT_LOOP: 'off' }, false, 'env'],
+    [{ WE_FIX_LIGHT_LOOP: 'typo' }, false, 'env'],
+    [{ WE_FIX_LIGHT_LOOP: 'on' }, true, 'env'],
+  ])('logs the effective light setting and source: %j', async (env, value, source) => {
+    const log = { error: vi.fn() };
+    const loop = vi.fn(async () => ({}));
+    await startFixLightLoop({ env, platform: {}, tool: {}, log, loop });
+    expect(loop).toHaveBeenCalledTimes(value ? 1 : 0);
+    expect(log.error).toHaveBeenCalledWith(`fix-light: enabled=${value} (source: ${source})`);
+  });
+
+  it('resolves standard, platform, tool and environment precedence', () => {
+    expect(resolveFixLightLoopSetting({ env: {}, platform: { lightLoop: 'typo' }, tool: {} }))
+      .toEqual({ value: false, source: 'platform' });
+    expect(resolveFixLightLoopSetting({ env: { WE_FIX_LIGHT_LOOP: 'off' },
+      platform: { lightLoop: true }, tool: { lightLoop: true } }))
+      .toEqual({ value: false, source: 'env' });
+    expect(resolveFixLightLoopSetting({ env: {}, platform: { lightLoop: false }, tool: {} }))
+      .toEqual({ value: false, source: 'platform' });
+    expect(resolveFixLightLoopSetting({ env: {}, platform: { lightLoop: false }, tool: { lightLoop: true } }))
+      .toEqual({ value: true, source: 'tool' });
   });
 });
