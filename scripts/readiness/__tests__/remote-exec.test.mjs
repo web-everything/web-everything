@@ -334,15 +334,16 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
     });
     writeFileSync(join(f.bin, 'npm'), '#!/bin/bash\nif [ "$1" = ci ]; then echo INJECTED_INSTALL_FAILURE >&2; exit 1; fi\necho COMMAND_RAN\n', { mode: 0o755 });
     const log = vi.fn();
-    expect(await runRemoteCli({ ...f, log })).toBe(124);
+    // R817: a verified install-phase code-97 receipt is a finished result, so the run reruns locally.
+    expect(await runRemoteCli({ ...f, log })).toBe(7);
     expect(f.runs).toHaveLength(1);
     expect(f.runs[0].status).toBe(97);
     expect(f.runs[0].stderr).toContain('INJECTED_INSTALL_FAILURE');
     expect(f.runs[0].stdout).not.toContain('COMMAND_RAN');
     expect(receiptPresence).toEqual([false, false, false]);
     if(source === 'stale remote') expect(readFileSync(join(f.root,runId,'.exit-code'),'utf8')).toBe('97\n');
-    expect(f.local).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('forge-install-failed'));
     expect(callsOf(f.exec).find((call) => call.file === 'rsync').input).not.toContain('.exit-code');
     expect(existsSync(join(f.root, 'runs', f.serverRun))).toBe(false);
   });
@@ -419,10 +420,10 @@ console.log('RESOLVED ' + versions.join(','));
     const inputDigest = await digestInput(cwd, files);
     writeFileSync(join(f.root, 'cache', hash, 'dev-v5-'+inputDigest, 'dependencies.tar'), 'corrupt archive');
     const log = vi.fn();
-    expect(await runRemoteCli({ ...f, log })).toBe(124);
-    expect(f.local).not.toHaveBeenCalled();
+    expect(await runRemoteCli({ ...f, log })).toBe(7);
+    expect(f.local).toHaveBeenCalled();
     expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('forge-install-failed'));
     expect(existsSync(join(f.root, 'runs', f.serverRun))).toBe(false);
   }, 120000);
 
@@ -489,12 +490,12 @@ console.log('RESOLVED ' + versions.join(','));
     for (const state of ['warm', 'cold']) {
       if (state === 'cold') rmSync(join(f.root, 'cache'), { recursive: true, force: true });
       const log = vi.fn();
-      expect(await runRemoteCli({ ...f, log }), state).toBe(124);
-      expect(f.local).not.toHaveBeenCalled();
+      expect(await runRemoteCli({ ...f, log }), state).toBe(7);
+      expect(f.local).toHaveBeenCalled();
       expect(f.runs.at(-1).status, f.runs.at(-1).stderr).toBe(97);
       expect(f.runs.at(-1).stderr).toContain('npm ci');
       expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('forge-install-failed'));
     }
   }, 120000);
 });
@@ -2012,13 +2013,13 @@ describe('receipt field binding', () => {
     // exceptions, so a failing positive control inside one could be swallowed.
     expectValidReceipt(baseline);
   });
-  it('rejects install-phase evidence even with matching status', async () => {
+  it('treats install-phase evidence with the matching 97 sentinel as a finished not-started result (R817)', async () => {
     let baseline;
     expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>{
       baseline = {...v};
       return JSON.stringify({...v,phase:'install'});
     }})))
-      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+      .toEqual({mode:'not-started',terminated:true,reason:'forge-install-failed'});
     expectValidReceipt(baseline);
   });
 });

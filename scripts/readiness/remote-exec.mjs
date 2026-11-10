@@ -1357,7 +1357,11 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code))) {
         return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
-      if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(!result || !verifyReceipt(text,expected,result.code)) {
+        // R817: a fully verified install/supervisor failure receipt proves the run never reached the tests.
+        const failure=result&&forgeFailureReason(text,expected,result.code);
+        return failure?{mode:'not-started',terminated:true,reason:failure}:{mode:'unconfirmed',reason:'ambiguous-result'};
+      }
       if (argv[2] === 'check:standards') {
         observeStandards(result.stdout ?? '', 'stdout');
         observeStandards(result.stderr ?? '', 'stderr');
@@ -1377,7 +1381,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   }
 }
 
-export function verifyReceipt(text, expected, code) {
+export function verifyReceipt(text, expected, code, failurePhase = false) {
   try {
     const receipt=JSON.parse(text);
     const taskFields=['processCount','tasksMax','tasksNear','tasksNote'];
@@ -1397,8 +1401,14 @@ export function verifyReceipt(text, expected, code) {
         && Number.isSafeInteger(receipt.resources.slotCpus)&&receipt.resources.slotCpus>=1))
       && (!Object.hasOwn(receipt,'timings') || (!!receipt.timings && Object.keys(receipt.timings).sort().join(',')==='installMs,runMs' && [receipt.timings.installMs,receipt.timings.runMs].every(ms=>Number.isSafeInteger(ms)&&ms>=0)))
       && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)
-      && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
+      && (failurePhase ? (receipt.phase==='install'&&code===97)||(receipt.phase==='supervisor'&&code===254) : receipt.phase==='test'&&Number.isInteger(code)&&code>=0&&code<255) && receipt.code===code;
   } catch {return false;}
+}
+
+/** R817: the launcher's sentinel codes (install 97, supervisor 254) under the SAME integrity checks as a test receipt; only the phase allow-list widens. */
+function forgeFailureReason(text, expected, code) {
+  if(!verifyReceipt(text,expected,code,true)) return null;
+  return code===97?'forge-install-failed':'forge-supervisor-failed';
 }
 
 /** Explicit remote CLI request; the shared decision contract owns safe local admission. */
