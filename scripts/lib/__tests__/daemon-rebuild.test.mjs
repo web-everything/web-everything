@@ -404,15 +404,14 @@ describe('overlay conflict resolution', () => {
       expect(cachedEdge(f)).toBe(false);
     });
 
-    it('stops edge discovery for the run when a cached edge cannot be deleted', async () => {
+    it('refuses rebuild when a cached edge cannot be deleted', async () => {
       const f = conflictFixture();
       seeded(f);
       const run = failing((args) => args[0] === 'update-ref' && args[1] === '-d' && args[2].includes('/edge/'));
-      await rebuildClone({
+      expect(await rebuildClone({
         root: f.cloneDir, env: f.env, run, runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS,
-      });
-      // no ls-remote/fetch is attempted on top of a ref we could not clear. (Residual, by design: a ref that
-      // survives a failed delete is still adopted only while its tip equals the operator-recorded sha.)
+      })).toMatchObject({ moved: false, reason: 'fetch-failed' });
+      // No discovery or adoption may trust a ref we could not clear.
       expect(run.mock.calls.some(([args]) => args[0] === 'ls-remote' || args[0] === 'fetch' && args.some((a) => a.startsWith('+refs/heads/edge/')))).toBe(false);
     });
 

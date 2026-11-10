@@ -3,8 +3,10 @@ import { withSelfSync, safePoint } from '../daemon-self-sync.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { readRebuildState, rebuildStatePath, readReadyCandidate, writeRebuildState, readyCandidatePath, writeReadyCandidate } from '../daemon-rebuild/state.mjs';
-import { addOverlay, removeOverlay, recordEdgeResolution } from '../daemon-overlays.mjs';
+import { addOverlay, removeOverlay, recordEdgeResolution, overlayFilePath } from '../daemon-overlays.mjs';
 import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
+import { fetchMainAndOverlays } from '../daemon-rebuild/edge-fetch.mjs';
+import { dryRunRebuild, previewOverlayConflict } from '../daemon-rebuild/preview.mjs';
 import { fixture } from './helpers/safe-point-fixture.mjs';
 const fixtures = [];
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
@@ -376,4 +378,61 @@ it('read reacquisition accepts intact historical rebuild state without quarantin
   }, { readState: readRebuildState });
   expect(await w.tickOnce()).toBe('continued'); expect(tail).toHaveBeenCalledTimes(1);
   expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
+});
+
+it.each(['fetch', 'PR-read'].flatMap((when) => ['removed', 'added', 'corrupt', 'approval-changed'].map((change) => ({ when, change }))))(
+  'adoptReadyOnly refuses a registry $change during $when', async ({ when, change }) => {
+    const f = fixture(); fixtures.push(f);
+    addOverlay(f.root, { ref: 'A', pr: 123 }, { env: f.env }); f.record();
+    const mutate = vi.fn(() => {
+      if (change === 'removed') removeOverlay(f.root, 'B', { env: f.env });
+      else if (change === 'added') addOverlay(f.root, { ref: 'C' }, { env: f.env });
+      else if (change === 'corrupt') writeFileSync(overlayFilePath(f.root, f.env), '{');
+      else recordEdgeResolution(f.root, 'A', { sha: f.head, by: 'test' }, { env: f.env });
+    });
+    const run = vi.fn((args, opts) => {
+      const result = f.run(args, opts);
+      if (when === 'fetch' && args[0] === 'fetch' && !mutate.mock.calls.length) mutate();
+      return result;
+    });
+    let entered, release;
+    const waiting = new Promise((resolve) => { release = resolve; });
+    const started = new Promise((resolve) => { entered = resolve; });
+    const prState = vi.fn(async () => { entered(); await waiting; return 'OPEN'; });
+    const log = { error: vi.fn() };
+    const pending = rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true, run,
+      prState, emitEvent: vi.fn(), log });
+    if (when === 'PR-read') { await started; mutate(); }
+    release();
+    expect(await pending).toMatchObject({ moved: false, reason: 'overlay-registry-changed' });
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+    expect(readReadyCandidate(f.root, f.env)).toEqual(f.ready);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('overlay-registry-changed'));
+  },
+);
+it.each(['status', 'throws'])('failed cached-edge deletion (%s) fails discovery and refuses safe-point adoption and previews', async (failure) => {
+  const f = fixture(); fixtures.push(f);
+  f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '1';
+  const a = f.plan.applied[0]; a.edgeSha = a.sha; a.resolvedVia = 'edge-ref';
+  recordEdgeResolution(f.root, 'A', { sha: a.sha, by: 'test' }, { env: f.env });
+  f.git('update-ref', 'refs/remotes/origin/edge/A', a.sha); f.record();
+  // No remote edge exists; only the stale local ref matches the ready record.
+  const run = vi.fn((args, opts) => {
+    if (args[0] === 'update-ref' && args[1] === '-d' && args[2].includes('/edge/')) {
+      if (failure === 'throws') throw new Error('locked ref');
+      return { status: 1, stdout: '', stderr: 'locked ref' };
+    }
+    return f.run(args, opts);
+  });
+  expect(fetchMainAndOverlays({ git: (args) => run(args), overlays: [{ ref: 'A' }] }))
+    .toMatchObject({ ok: false, reason: 'fetch-failed' });
+  expect(await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true, run,
+    emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: false, reason: 'fetch-failed' });
+  expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+  expect(readReadyCandidate(f.root, f.env)).toEqual(f.ready);
+  expect(await dryRunRebuild({ root: f.root, env: f.env, run })).toMatchObject({ plan: { ok: false, reason: 'fetch-failed' }, wouldDo: 'refuse' });
+  expect(await previewOverlayConflict({ root: f.root, env: f.env, run, ref: 'C' })).toMatchObject({ ok: false, reason: 'fetch-failed' });
 });
