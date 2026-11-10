@@ -425,6 +425,36 @@ describe('the label sink', () => {
       expect(createFileRunStore().list()).toEqual([]);
     });
 
+    // #6661 send-back item 1 — the DEFAULT recovery store, with no executor handle (`ctx.readRun` absent). The
+    // executor tests above recover through `ctx.readRun`, so they would stay green if the default regressed to
+    // `sharedRunsDir`; this one fails then, because the staged run lives only under OPERATION_RUNS_DIR.
+    it('without an executor handle, the default store is the OPERATION_RUNS_DIR one, not the shared folder', async () => {
+      expect(sharedRunsDir()).not.toBe(runsDir);
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      const { declaration, registry } = stagedRecord();
+      const id = 'run-restore-default-store';
+      const gate = async () => ({ allowed: true, headSha: payload.reviewedHead });
+      const historical = `review-set-label.mjs failed and its outcome is UNKNOWN: --body-file=${payload.bodyFile} is unreadable (ENOENT: no such file or directory)`;
+      await runOperationCli({
+        declaration, registry, store: createFileRunStore(), judge: async () => ({}), argv: [], newRunId: () => id,
+        sinks: { ...createReviewPrSinks({ root, publishGate: gate }), [REVIEW_EFFECTS.LABEL]: async () => { throw new Error(historical); } },
+      });
+      expect(createFileRunStore(runsDir).read(id)?.id).toBe(id);
+      expect(createFileRunStore(sharedDir).list()).toEqual([]);
+      const bodyPath = reviewBodyPath({ root, runId: id, bodyFile: payload.bodyFile });
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      expect(existsSync(bodyPath)).toBe(false);
+      const runNode = vi.fn(argv => {
+        expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice('--body-file='.length), 'utf8')).toBe('# staged verdict');
+        return '{"ok":true}';
+      });
+      // No `runStore` override and no `ctx.readRun`: only the sink's own default can find the run.
+      const sinks = createReviewPrSinks({ root, publishGate: gate, runNode });
+      await sinks[REVIEW_EFFECTS.LABEL](payload, { key: 'record:0', runId: id, type: REVIEW_EFFECTS.LABEL });
+      expect(runNode).toHaveBeenCalledTimes(1);
+      expect(readFileSync(bodyPath, 'utf8')).toBe('# staged verdict');
+    });
+
     it('the real review-set-label CLI refuses an unreadable body before any gh call, in a form recovery recognises', () => {
       const bin = mkdtempSync(join(tmpdir(), 'review-pr-io-gh-'));
       const log = join(bin, 'gh.log');
