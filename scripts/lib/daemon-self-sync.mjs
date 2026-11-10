@@ -1,5 +1,12 @@
 /**
  * @file scripts/lib/daemon-self-sync.mjs
+ * Shared clones elect a heartbeat-backed rebuild owner; siblings keep read-locked ticks and HEAD restarts.
+ * Overlay requests persist counted retries; success or bounded failure acknowledges their observed ID
+ * without deleting newer publications. All siblings keep adoption-yield accounting and ordinary lock fairness.
+ * Stale requests retry with alerts bounded to 15 minutes; corrupt requests and unreadable ledgers stay pending.
+ * Success or the persisted failure budget concludes requests, with an operator-visible abandonment alert.
+ * Finished readonly jobs hand deferred mutations to one owner adopt-only pass before new work is queued.
+ * Atomic handled IDs survive restarts; failed mutations release the attempt guard for next-tick retry.
  * @description xv6fciw (narrow slice of decision #3681) — keep a daemon's DEDICATED clone on `origin/main`
  *   without a human re-syncing it, and restart the daemon onto new code between ticks.
  *
@@ -119,21 +126,25 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
+import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
 import { readReadyCandidate } from './daemon-rebuild/state.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
   acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter, withWriteLock,
+  resolveCloneOwnership, withCloneOwnership, readRebuildRequest, recordRebuildRequestResult,
 } from './daemon-clone-lock.mjs';
 import { basename, dirname, join, resolve } from 'node:path';
-import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
+import fs, { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
   BUILT_IN_BACKGROUND_BUILD_SETTINGS, makeTickProgressStore, readCloneIdentity,
 } from './daemon-background-build.mjs';
-import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-rebuild/rebuild-job.mjs';
+import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND, RESULT_SUFFIX } from './daemon-rebuild/rebuild-job.mjs';
 import { createJobStore } from './daemon-jobs-runtime.mjs';
+import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
 import { maybeMaintainClone, cloneHasRebuildJob, runMaintenanceGit, maintenanceGitDir, cloneGitIsBusy } from './clone-maintenance.mjs';
@@ -653,6 +664,47 @@ export function listRebuildJobIds(root, env = process.env, { store = createJobSt
   ].filter((id) => typeof id === 'string' && id);
 }
 
+/** Latest finished job's full .result, not the lossy finishedJobs summary returned after job queuing.
+ * Unknown history or unreadable latest evidence never falls back to an older mutation result. */
+export function readLatestRebuildJobResult(root, env = process.env, { store = createJobStore(rebuildJobsDir(root, env)) } = {}) {
+  try {
+    const { records, corrupt } = store.list();
+    if (corrupt?.length) return null;
+    const finished = records.filter((r) => r?.job?.kind === REBUILD_JOB_KIND.kind && TERMINAL_JOB_STATUSES.includes(r.job.status));
+    if (finished.some((r) => !Number.isFinite(Date.parse(r.job.finishedAt)))) return null;
+    finished.sort((a, b) => Date.parse(b.job.finishedAt) - Date.parse(a.job.finishedAt));
+    const latest = finished[0];
+    if (!latest || typeof latest.id !== 'string' || !latest.id || basename(latest.id) !== latest.id
+      || latest.id === '.' || latest.id === '..' || latest.id.includes('\\')) return null;
+    const result = JSON.parse(fs.readFileSync(join(store.dir, `${latest.id}${RESULT_SUFFIX}`), 'utf8'));
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+    return { id: latest.id, status: latest.job.status, finishedAt: latest.job.finishedAt, result };
+  } catch { return null; }
+}
+
+// Kept across wrappers: completed mutations stay deduplicated even if the marker is unwritable.
+// The promise also makes a concurrent tick wait for the attempt before it can queue its next job.
+const mutationDueAttempts = new Map();
+function mutationDuePath(root, env) { return join(daemonStateDir(env), `${cloneKey(root)}.mutation-due.json`); }
+function readHandledMutations(path) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(path, 'utf8'));
+    if (!Array.isArray(saved?.handledJobIds) || saved.handledJobIds.some((id) => typeof id !== 'string' || !id)) return new Set();
+    return new Set(saved.handledJobIds);
+  } catch { return new Set(); } // unreadable evidence is unhandled, never permission to suppress a repair
+}
+function writeHandledMutations(path, ids) {
+  // Merge again after the async repair so another completed job in this process is not forgotten.
+  const handledJobIds = [...new Set([...readHandledMutations(path), ...ids])];
+  fs.mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify({ handledJobIds })}\n`, 'utf8');
+    fs.renameSync(tmp, path);
+  } finally { fs.rmSync(tmp, { force: true }); }
+}
+const mutationLogValue = (value) => String(value).replace(/[\u0000-\u001f\u007f]/g, '');
+
 /**
  * A rebuild JOB that ended `failed` because its rebuild child crashed after it started ("rebuild child exited N with
  * no JSON result"). It RAN on the checkout, so — parity with the retired builder, whose record counted a rebuild that
@@ -705,6 +757,9 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
 }
 
 /**
+ * Single-owner clone coordination gates every rebuild path, refreshes the owner heartbeat each tick,
+ * and consumes overlay rebuild requests only after movement or an up-to-date conclusion.
+ *
  * Wrap a daemon's `runDaemonLoop` effects so each tick first self-syncs the clone. When new commits arrive,
  * `onRestart` runs in place of the tick (the caller releases its lease and exits); otherwise the tick runs.
  *
@@ -767,7 +822,9 @@ export function withSelfSync(effects, {
   // `recloneMarker` are IO (injectable); they default to the real files only when `rebuild` is the real one, so a
   // test never writes real daemon state.
   // `rebuildJobIds`: the clone's shared rebuild job ids (see listRebuildJobIds) — IO, real only when `realIo`.
+  // `readLatestRebuildJobResult`: injectable full result reader for the owner-only deferred-mutation handoff.
   background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity, rebuildJobIds,
+  readLatestRebuildJobResult: readLatestJobOpt,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
@@ -783,11 +840,50 @@ export function withSelfSync(effects, {
   const rebuildFn = rebuildOpt ?? ((o = {}) => rebuildClone({
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
+  let tickOwnership = null;
+  let lastOwnershipReason = null;
+  let lastOwnerStaleAlertAt = -Infinity;
+  const lastRequestAlerts = new Map(); // one ID/timestamp per alert kind, bounded across publications
+  const alertRequest = (kind, request) => {
+    const previous = lastRequestAlerts.get(kind);
+    if (previous?.id === request.id && (kind !== 'rebuild-request-stale' || now() - previous.at < 15 * 60_000)) return;
+    lastRequestAlerts.set(kind, { id: request.id, at: now() });
+    const detail = kind === 'rebuild-request-abandoned' ? 'failure budget exhausted; republish after resolving the rebuild failure'
+      : kind === 'rebuild-request-stale' ? 'request is stale; owner continues retrying within the failure budget'
+      : kind === 'rebuild-request-corrupt' ? 'corrupt request stays pending until its rebuild concludes'
+      : 'failure ledger unavailable; request remains pending until its evidence is repaired';
+    log.error?.(`daemon-self-sync: ALERT ${kind} — ${detail}`);
+    try { progress?.alert?.(kind, { id: request.id, clone: basename(root) }, now()); } catch { /* best-effort alert */ }
+  };
+  const requestCallbacks = () => ({
+    onStale: (request) => alertRequest('rebuild-request-stale', request),
+    onAbandoned: (request) => alertRequest('rebuild-request-abandoned', request),
+    onCorrupt: (request) => alertRequest('rebuild-request-corrupt', request),
+    onUnreadable: (request) => alertRequest('rebuild-request-failures-unreadable', request),
+  });
+  const readOwnerRequest = () => readRebuildRequest(root, { ...cloneLockOpts(), env, nowMs: now(), ...requestCallbacks() });
   const rebuild = async (...args) => {
-    const result = await rebuildFn(...args);
-    if (result?.moved && result.adopted && (maintainObjects || realIo)) {
-      await maintainObjectsUnderWriteLock({ root, log, env, maintainObjects, hasMaintenanceRebuildJob });
+    if (tickOwnership && !tickOwnership.owner) return { moved: false, reason: 'clone-non-owner' };
+    const request = readOwnerRequest();
+    const record = (success) => {
+      if (!request) return;
+      recordRebuildRequestResult(root, { ...cloneLockOpts(), env, nowMs: now(), id: request.id,
+        success, ...requestCallbacks() });
+    };
+    let result;
+    try {
+      result = await withCloneOwnership(root, tickOwnership, async () => {
+        const rebuilt = await rebuildFn(...args);
+        if (rebuilt?.moved && rebuilt.adopted && (maintainObjects || realIo)) {
+          await maintainObjectsUnderWriteLock({ root, log, env, maintainObjects, hasMaintenanceRebuildJob });
+        }
+        return rebuilt;
+      }, cloneLockOpts());
     }
+    catch (error) { record(false); throw error; }
+    if (result?.moved || result?.reason === 'up-to-date') record(true);
+    else if (result?.reason !== 'reader-wait-timeout' && (result?.failed === true || result?.status === 'failed'
+      || FAILURE_REASONS.has(String(result?.reason).split(':', 1)[0]))) record(false);
     return result;
   };
   const bg = background === undefined
@@ -798,6 +894,51 @@ export function withSelfSync(effects, {
   const progress = tickProgress ?? (realIo ? makeTickProgressStore({ root, entry: entries?.[0], env }) : null);
   const marker = recloneMarker ?? (realIo ? makeRecloneMarkerStore({ root, env, log }) : memoryRecloneMarkerStore());
   const listJobIds = rebuildJobIds ?? (realIo ? () => listRebuildJobIds(root, env) : () => []);
+  // Injected rebuilds opt into job IO explicitly, keeping existing hermetic callers off real stores.
+  const readLatestJob = readLatestJobOpt ?? (realIo ? readLatestRebuildJobResult : () => null);
+  const handleMutationDue = async () => {
+    if (!tickOwnership?.owner || !rebuildAsJob) return;
+    let job;
+    try { job = await readLatestJob(root, env); } catch { return; }
+    if (!job || typeof job.id !== 'string' || !job.id.trim() || !TERMINAL_JOB_STATUSES.includes(job.status)
+      || !Number.isFinite(Date.parse(job.finishedAt)) || job.result?.reason !== 'readonly-job-mutation-due'
+      || typeof job.result.mutation !== 'string' || !job.result.mutation.trim()) return;
+    const key = JSON.stringify([cloneKey(root), job.id]);
+    const previous = mutationDueAttempts.get(key);
+    if (previous) { await previous; return; }
+    let complete;
+    const pending = new Promise((resolve) => { complete = resolve; });
+    mutationDueAttempts.set(key, pending); // Deduplicate concurrent attempts, release failed attempts for the next tick.
+    let succeeded = false;
+    try {
+      const path = mutationDuePath(root, env);
+      const handled = readHandledMutations(path);
+      if (handled.has(job.id)) return;
+      const id = mutationLogValue(job.id), mutation = mutationLogValue(job.result.mutation);
+      log.error?.(`daemon-self-sync: readonly job ${id} deferred mutation ${mutation}; running it on the owning tick`);
+      try {
+        const result = await rebuild({ asJob: false, adoptOnly: true });
+        if (resultReportsReclone(result)) noteReclone('clone-recloned');
+        if (!result?.moved && !['up-to-date', 'needs-build', 'clone-recloned', 'ready-adopted'].includes(result?.reason)) {
+          throw new Error(`refused: ${result?.reason ?? 'no-result'}`);
+        }
+        succeeded = true;
+        handled.add(job.id);
+        try { writeHandledMutations(path, handled); }
+        catch (error) {
+          log.error?.(`daemon-self-sync: readonly job ${id} handled state unavailable (${error.code ?? 'write-failed'}); this process will not retry it`);
+        }
+      } catch (error) {
+        const detail = mutationLogValue(error?.message ?? error);
+        log.error?.(`daemon-self-sync: readonly job ${id} deferred mutation ${mutation} failed: ${detail}; continuing normal discovery`);
+        try { progress?.alert?.('readonly-job-mutation-failed', { id: job.id, mutation: job.result.mutation, error: detail }, now()); }
+        catch { /* alert delivery cannot create a second mutation attempt */ }
+      }
+    } finally {
+      if (!succeeded) mutationDueAttempts.delete(key);
+      complete();
+    }
+  };
   const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
   const syncOpts = () => ({ root, ...(timeoutMs != null ? { timeoutMs } : {}) });
@@ -868,7 +1009,7 @@ export function withSelfSync(effects, {
         log.error?.(`daemon-self-sync: switched to a new version ${cur.id} (${rebuildResult.head}) — restarting onto the new code (card 89)`);
         return onRestart(rebuildResult);
       }
-    } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date') {
+    } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date' && rebuildResult.reason !== 'clone-non-owner') {
       log.error?.(`daemon-self-sync: version rebuild did not switch (${rebuildResult.reason}) — ticking on the current version`);
     }
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -983,10 +1124,27 @@ export function withSelfSync(effects, {
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
-      if (resolvedPocBranch) {
-        const r = await syncPoc({ root, base, pocBranch: resolvedPocBranch, env, log,
+      const ownershipNowMs = now();
+      tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: ownershipNowMs, ...cloneLockOpts() });
+      if (tickOwnership.reason !== lastOwnershipReason) {
+        lastOwnershipReason = tickOwnership.reason;
+        log.error?.(`daemon-self-sync: clone ownership=${tickOwnership.reason}; rebuild=${tickOwnership.owner}`);
+      }
+      if (tickOwnership.reason === 'owner-stale-elected' && typeof progress?.alert === 'function'
+        && ownershipNowMs - lastOwnerStaleAlertAt >= 15 * 60_000) {
+        // Count attempts too: an unavailable alert sink must not turn every tick into an alert storm.
+        lastOwnerStaleAlertAt = ownershipNowMs;
+        try {
+          progress.alert('clone-owner-stale', { clone: basename(root), entry: basename(String(entries?.[0] || '')),
+            reason: tickOwnership.reason }, ownershipNowMs);
+        } catch { /* alert delivery never freezes the elected rebuild owner */ }
+      }
+      if (tickOwnership.owner) readOwnerRequest();
+      if (resolvedPocBranch && tickOwnership.owner) {
+        const r = await withCloneOwnership(root, tickOwnership, () => syncPoc({ root, base, pocBranch: resolvedPocBranch, env, log,
           hasMaintenanceRebuildJob, ...(maintainObjects ? { maintainObjects } : {}),
-          ...(timeoutMs != null ? { timeoutMs } : {}) });
+          ...(timeoutMs != null ? { timeoutMs } : {}) }), cloneLockOpts());
+
         if (r.merged) {
           const partial = r.reason === 'merged-partial';
           log.error?.(
@@ -1013,6 +1171,9 @@ export function withSelfSync(effects, {
       if (vctx) return versionedTick(args);
 
       // ---- DEFAULT (non-POC) path — full clone rebuild (#4044 Module E, see file header) ----
+
+      // A readonly job cannot repair its clone; hand that work to the owner before queuing another job.
+      await handleMutationDue();
 
       // Only count candidates already smoke-passed at tick entry, still based on this clone's HEAD.
       // This is a tick-boundary policy: it never interrupts a running tick or changes the clone lock.
@@ -1061,7 +1222,7 @@ export function withSelfSync(effects, {
           log.error?.(`daemon-self-sync: rebuilt the clone onto ${rebuildResult.head} — restarting onto the new code (#4044)`);
           return onRestart(rebuildResult);
         }
-      } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date') {
+      } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date' && rebuildResult.reason !== 'clone-non-owner') {
         // Said once per reason (and per job), not every tick: a job in flight answers `rebuild-job-running` for the
         // whole smoke.
         const key = `${rebuildResult.reason}:${rebuildResult.job?.id ?? ''}`;
@@ -1091,7 +1252,7 @@ export function withSelfSync(effects, {
 
       // Idle boundary: adoption has finished and this tick does not yet hold a READ slot.
       // Tests with an injected rebuild opt in to maintenance explicitly, avoiding real clone/state IO.
-      if (maintain || realIo) {
+      if (tickOwnership.owner && (maintain || realIo)) {
         try {
           if (!/^rebuild-job-(started|running)$/.test(String(rebuildResult?.reason))
             && await hasMaintenanceRebuildJob() === false) {
