@@ -83,8 +83,11 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     const renderInput = res => ({ ...res, pr, rev: head, findings: res.findings.map(f => ({ ...f,
       confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true })) });
     // Which confirmed breaks a body shows, as an order-free list; location-less fallbacks null the location.
+    // Every field the gate reads to pick an outcome is in the key (impact, class, extra classes, security flag),
+    // so a posted comment with a downgraded impact or class never "agrees" with the stored break.
     const confirmedKeys = parsed => parsed.findings.filter(f => f.confirmed)
-      .map(f => JSON.stringify([f.category, f.file, f.line, f.summary])).sort();
+      .map(f => JSON.stringify([f.category, f.file, f.line, f.summary, f.impact ?? null, f.findingClass ?? null,
+        [...(f.alsoClasses ?? [])].sort(), f.securityReachableToday === true])).sort();
     // Every rendering the publisher could have posted for this evidence (full, then the scrub fallbacks).
     const sameConfirmedBreaks = (postedParsed, res) => {
       const want = JSON.stringify(confirmedKeys(postedParsed));

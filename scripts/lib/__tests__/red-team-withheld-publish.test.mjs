@@ -132,6 +132,34 @@ describe('legacy bare-string red-team publication', () => {
       expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
     }
   });
+  describe('a posted comment cannot downgrade the stored break\'s gate outcome', () => {
+    const rich = { ...confirmedFinding, impactIfUnfixed: 'broken', findingClass: 'security-reachable-today',
+      classBasis: 'reproduced', alsoClasses: ['live-reproduced'], securityReachableToday: true };
+    const richRow = () => seatRow({ foldedVerdict: 'changes', confirmedMissCount: 1, findings: [rich] });
+    const run = postedFinding => {
+      const io = harness(legacy(), { readSeatRow: richRow,
+        listComments: () => [{ author: { login: 'web-everything' }, body: fullBody([postedFinding]) }] });
+      return { io, out: publishStoredRedTeamResult(io) };
+    };
+    it('skips quietly when impact, class, extra classes and security flag all agree', () => {
+      const { io, out } = run(rich);
+      expect(out).toEqual({ status: 'skipped' });
+      expect(io.publishNeedsYou).not.toHaveBeenCalled();
+    });
+    it.each([
+      ['impact downgraded', { impactIfUnfixed: 'cosmetic' }],
+      ['class downgraded', { findingClass: 'coverage-or-style', alsoClasses: [], securityReachableToday: false }],
+      ['class dropped', { findingClass: undefined, classBasis: undefined }],
+      ['extra classes dropped', { alsoClasses: [] }],
+      ['security flag dropped', { securityReachableToday: false }],
+    ])('holds and alerts when the posted comment has %s', (_name, change) => {
+      const { io, out } = run({ ...rich, ...change });
+      expect(out).toEqual({ status: 'held' });
+      expect(io.postComment).not.toHaveBeenCalled();
+      expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+      expect(io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ kind: 'red-team-legacy-ran-unreadable' }));
+    });
+  });
   it('skips quietly when the posted comment is the full rendering of the recovered break', () => {
     const io = harness(legacy(), { readSeatRow: changesRow,
       listComments: () => [{ author: { login: 'web-everything' }, body: fullBody() }] });
