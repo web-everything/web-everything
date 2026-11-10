@@ -1410,8 +1410,8 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
 
 /** R817: bounded (500 chars), control-free, token-masked tail of the Forge run stderr, safe to print and attach. */
 export function forgeFailureTail(stderr) {
-  // Secrets are masked per raw line (to end of line) BEFORE control characters are flattened, so a value can never straddle a newline.
-  return String(stderr??'').replace(/(?:authorization|auth|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|credential)s?\b["']?\s*[=:][^\r\n]*/gi,'[masked]')
+  // Secrets are masked per raw line (to end of line, plus the next line for a value wrapped onto it) BEFORE control characters are flattened, so a value can never straddle a newline.
+  return String(stderr??'').replace(/(?:authorization|auth|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|credential)s?\b["']?\s*[=:][^\r\n]*(?:\r?\n[^\r\n]*)?/gi,'[masked]')
     .replace(/[\x00-\x1f\x7f-\x9f]+/g,' ')
     .replace(/\b(?:Bearer|Basic)\s+\S+/gi,'[masked]')
     .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{4,}|\b[A-Za-z0-9+_=-]{24,}/g,'[masked]')
