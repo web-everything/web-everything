@@ -12,6 +12,7 @@ const facts = () => ({ head, author: { login: 'web-everything[bot]', type: 'Bot'
   baseEntry: { type: 'blob', mode: '100644' }, headEntry: { type: 'blob', mode: '100644' },
   content: JSON.stringify({ _doc: 'Seconds', unit: { [testPath]: 450 }, soak: { [testPath]: 1 } }),
   baseContent: JSON.stringify({ unit: { [testPath]: 450 }, soak: { [testPath]: 1 } }),
+  rollup: { headOid: head, commitOid: head, state: 'SUCCESS' },
   existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, appId: GITHUB_ACTIONS_APP_ID, conclusion: 'SUCCESS', status: 'completed', id: 1 })) });
 
 describe('mechanical clearance', () => {
@@ -72,55 +73,30 @@ describe('mechanical clearance', () => {
   fail('oversized base requires normal review', 'read-error', f => f.baseContent = ' '.repeat(4 * 1024 * 1024 + 1));
   for (const conclusion of ['FAILURE', 'PENDING', 'CANCELLED', 'NEUTRAL', 'SKIPPED', null]) fail(`required check ${conclusion}`, 'checks', f => f.checks[0].conclusion = conclusion);
   fail('missing required check', 'checks', f => f.checks.pop());
-  fail('nonrequired failure', 'checks', f => f.checks.push({ name: 'other', conclusion: 'TIMED_OUT' }));
-  it('uses latest required run', () => { const f = facts(); f.checks.push({ name: 'test', appId: GITHUB_ACTIONS_APP_ID, conclusion: 'PENDING', id: 2 }); expect(validateMechanicalClearance(f).rule).toBe('checks'); });
-  it('successful rerun supersedes an old failed run', () => { const f = facts(); f.checks.unshift({ name: 'test', appId: GITHUB_ACTIONS_APP_ID, conclusion: 'FAILURE', id: 0 }); expect(validateMechanicalClearance(f).cleared).toBe(true); });
-  it('higher-id queued rerun without timestamps supersedes an older success', () => {
-    const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
-    f.checks.push({ ...f.checks[0], id: 2, started_at: null, status: 'queued', conclusion: null });
-    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+  for (const state of ['FAILURE', 'PENDING', 'ERROR', 'EXPECTED', null, undefined]) {
+    fail(`rollup ${state} refuses even with required checks green`, 'checks', f => f.rollup.state = state);
+  }
+  fail('masked failing job in another workflow', 'checks', f => {
+    f.rollup.state = 'FAILURE';
+    f.checks.push({ ...f.checks[0], conclusion: 'FAILURE', id: 0 });
   });
-  it.each([undefined, null, '', 'invalid'])('ambiguous rerun with id %s and no timestamps fails closed in either input order', id => {
-    for (const reverse of [false, true]) {
-      const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
-      f.checks.push({ ...f.checks[0], id, started_at: null, status: 'queued', conclusion: null });
-      if (reverse) f.checks.reverse();
-      expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
-    }
-  });
-  it('higher-id success supersedes an older failure even with an earlier timestamp', () => {
-    const f = facts(); f.checks[0].started_at = '2026-11-10T11:00:00Z';
-    f.checks.push({ ...f.checks[0], id: 0, started_at: '2026-11-10T12:00:00Z', conclusion: 'FAILURE' });
+  for (const field of ['headOid', 'commitOid']) {
+    fail(`rollup ${field} differs from head`, 'checks', f => f.rollup[field] = 'b'.repeat(40));
+    fail(`rollup missing ${field}`, 'checks', f => delete f.rollup[field]);
+  }
+  fail('missing rollup', 'checks', f => delete f.rollup);
+  fail('required success without completion evidence', 'checks', f => delete f.checks[0].status);
+  it('rollup SUCCESS and required checks present clears before ready-to-merge', () => {
+    const f = facts(); f.mergeStateStatus = 'BLOCKED';
     expect(validateMechanicalClearance(f).cleared).toBe(true);
   });
-  it('unresolved ambiguous failure prevents clearance in all three-run permutations', () => {
-    for (const order of [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]) {
-      const f = facts();
-      const runs = [
-        { ...f.checks[0], id: undefined, started_at: '2026-11-10T13:00:00Z', conclusion: 'FAILURE' },
-        { ...f.checks[0], id: 1, started_at: '2026-11-10T11:00:00Z', conclusion: 'FAILURE' },
-        { ...f.checks[0], id: 2, started_at: '2026-11-10T12:00:00Z' },
-      ];
-      f.checks.splice(0, 1, ...order.map(index => runs[index]));
-      expect(validateMechanicalClearance(f), `run order: ${order}`).toMatchObject({ cleared: false, rule: 'checks' });
-    }
-  });
-  it('equal ids use timestamps to select the newer run', () => {
-    const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
-    f.checks.push({ ...f.checks[0], started_at: '2026-11-10T11:00:00Z', conclusion: 'FAILURE' });
+  it('matches rollup head and commit case insensitively', () => {
+    const f = facts(); f.rollup.headOid = f.rollup.commitOid = head.toUpperCase();
     expect(validateMechanicalClearance(f).cleared).toBe(true);
   });
-  it.each([undefined, 'invalid'])('equal ids with unknown timestamp %s prefer failure', started_at => {
-    const f = facts(); f.checks[0].started_at = '2026-11-10T12:00:00Z';
-    f.checks.push({ ...f.checks[0], started_at, conclusion: 'FAILURE' });
-    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
-  });
-  fail('another app newer success cannot mask a failed Actions check', 'checks', f => {
-    f.checks[0].conclusion = 'FAILURE';
-    f.checks.push({ ...f.checks[0], appId: 42, id: 99, conclusion: 'SUCCESS' });
-  });
-  fail('same-name failure from another app cannot be masked by Actions success', 'checks', f => {
-    f.checks.push({ ...f.checks[0], appId: 42, id: 0, conclusion: 'FAILURE' });
+  it('successful rerun supersedes an old failed run through the GitHub rollup', () => {
+    const f = facts(); f.checks.unshift({ ...f.checks[0], conclusion: 'FAILURE', id: 0 });
+    expect(validateMechanicalClearance(f).cleared).toBe(true);
   });
   fail('required check only from another app', 'checks', f => f.checks[0].appId = 42);
   fail('required check missing app id', 'checks', f => delete f.checks[0].appId);
@@ -140,7 +116,9 @@ const io = ({ moved = false, broken = null, truncated = false, mutate = (_url, v
     const url = args[1];
     if (url === broken) throw Error('unreadable');
     let value;
-    if (url.endsWith('/pulls/1')) value = { user: facts().author, commits: 1, head: { sha: moved && pulls++ ? 'b'.repeat(40) : head }, base: { ref: 'main', sha: 'b'.repeat(40) } };
+    if (url === 'graphql') value = { data: { repository: { pullRequest: { headRefOid: head,
+      commits: { nodes: [{ commit: { oid: head, statusCheckRollup: { state: 'SUCCESS' } } }] } } } } };
+    else if (url.endsWith('/pulls/1')) value = { user: facts().author, commits: 1, head: { sha: moved && pulls++ ? 'b'.repeat(40) : head }, base: { ref: 'main', sha: 'b'.repeat(40) } };
     else if (url.includes('/pulls/1/commits')) value = facts().commits;
     else if (url.includes('/compare/')) value = { files: truncated ? Array(300).fill(facts().files[0]) : facts().files };
     else if (url.includes('/git/trees/')) {
@@ -152,7 +130,6 @@ const io = ({ moved = false, broken = null, truncated = false, mutate = (_url, v
     else if (url.includes('/check-runs')) value = { total_count: 5, check_runs: REQUIRED_MECHANICAL_CHECKS.map((name, index) => ({
       name, app: { id: GITHUB_ACTIONS_APP_ID }, id: index + 1, head_sha: head, status: 'completed', conclusion: 'success', started_at: '2026-11-10T12:00:00Z',
     })) };
-    else if (url.includes('/statuses')) value = [];
     else throw Error(`unexpected request ${url}`);
     return JSON.stringify(mutate(url, value));
   };
@@ -166,12 +143,35 @@ describe('IO closes on incomplete evidence', () => {
         check_runs: value.check_runs.map((check, index) => index === 0 ? { ...check, conclusion } : check) } : value;
       expect(validateMechanicalClearance(read({ mutate }))).toMatchObject({ cleared: false, rule: 'checks' });
     });
-    it(`refuses a nonrequired REST check-run with lowercase ${conclusion}`, () => {
-      const mutate = (url, value) => url.includes('/check-runs') ? { ...value, total_count: value.total_count + 1,
-        check_runs: [...value.check_runs, { name: 'other', id: 6, status: 'completed', conclusion }] } : value;
-      expect(validateMechanicalClearance(read({ mutate }))).toMatchObject({ cleared: false, rule: 'checks' });
-    });
   }
+  it('reads the exact head rollup in one GraphQL query', () => {
+    const calls = []; const reader = io();
+    const f = readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: (file, args) => {
+      if (args[1] === 'graphql') calls.push(args);
+      return reader(file, args);
+    } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain('-F');
+    expect(calls[0]).toContain('num=1');
+    expect(f.rollup).toEqual(facts().rollup);
+  });
+  it('unreadable rollup fails closed', () => expect(validateMechanicalClearance(read({ broken: 'graphql' })).rule).toBe('read-error'));
+  for (const [name, change] of [
+    ['missing head', pr => delete pr.headRefOid],
+    ['invalid head', pr => pr.headRefOid = 'invalid'],
+    ['missing commit', pr => pr.commits.nodes = []],
+    ['missing commit oid', pr => delete pr.commits.nodes[0].commit.oid],
+    ['missing statusCheckRollup', pr => pr.commits.nodes[0].commit.statusCheckRollup = null],
+    ['missing state', pr => delete pr.commits.nodes[0].commit.statusCheckRollup.state],
+    ['null state', pr => pr.commits.nodes[0].commit.statusCheckRollup.state = null],
+  ]) it(`unreadable rollup: ${name}`, () => {
+    const f = read({ mutate: (url, value) => {
+      if (url === 'graphql') change(value.data.repository.pullRequest);
+      return value;
+    } });
+    expect(f.readError).toBe(true);
+    expect(validateMechanicalClearance(f).rule).toBe('read-error');
+  });
   it('reads the pinned base blob into baseContent', () => expect(read().baseContent).toBe(facts().baseContent));
   for (const endpoint of ['base-blob', 'blob']) for (const [name, change] of [
     ['oversized', v => ({ ...v, size: 4 * 1024 * 1024 + 1 })],
@@ -193,7 +193,7 @@ describe('IO closes on incomplete evidence', () => {
   it('any API failure', () => expect(validateMechanicalClearance(read({ broken: 'repos/owner/repo/pulls/1' })).rule).toBe('read-error'));
   for (const suffix of ['pulls/1/commits?per_page=100&page=1', `compare/${'b'.repeat(40)}...${head}?per_page=100&page=1`,
     `git/trees/${head}`, 'git/trees/scripts-tree', 'git/trees/ci-tree', 'git/blobs/blob', 'git/blobs/base-blob',
-    `commits/${head}/check-runs?filter=all&per_page=100&page=1`, `commits/${head}/statuses?per_page=100&page=1`]) {
+    `commits/${head}/check-runs?filter=all&per_page=100&page=1`]) {
     it(`read failure at ${suffix}`, () => expect(validateMechanicalClearance(read({ broken: `repos/owner/repo/${suffix}` })).rule).toBe('read-error'));
   }
   for (const [name, mutate] of [
@@ -202,8 +202,8 @@ describe('IO closes on incomplete evidence', () => {
     ['incomplete check count', (url, v) => url.includes('check-runs') ? { ...v, total_count: 6 } : v],
     ['oversized blob', (url, v) => url.includes('/blobs/') ? { ...v, size: 4 * 1024 * 1024 + 1 } : v],
     ['truncated blob', (url, v) => url.includes('/blobs/') ? { ...v, content: '' } : v],
-    ['unreadable status list', (url, v) => url.includes('/statuses') ? {} : v],
-    ['page ceiling retains normal review', (url, v) => url.includes('/statuses') ? Array(100).fill({ context: 'other', state: 'success' }) : v],
+    ['unreadable check list', (url, v) => url.includes('/check-runs') ? {} : v],
+    ['page ceiling retains normal review', (url, v) => url.includes('/check-runs') ? { total_count: 2001, check_runs: Array(100).fill({}) } : v],
   ]) it(name, () => expect(validateMechanicalClearance(read({ mutate })).rule).toBe('read-error'));
   it('reads every commit page', () => {
     const mutate = (url, v) => url.endsWith('/pulls/1') ? { ...v, commits: 101 }
@@ -250,51 +250,6 @@ describe('durable record', () => {
     let body; const f = facts(); f.author.type = 'User';
     recordMechanicalClearance({ repo: 'owner/repo', num: 1, result: validateMechanicalClearance(f), readComments: () => [], post: text => { body = text; } });
     expect(body).toContain('author: FAIL'); expect(body).toContain('keys: NOT EVALUATED');
-  });
-});
-
-describe('independent check kinds', () => {
-  it('a newer success status cannot hide a failed required check-run', () => {
-    const f = facts(); f.checks[0].conclusion = 'FAILURE';
-    f.checks.push({ kind: 'status', name: 'test', conclusion: 'SUCCESS', id: 99 });
-    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
-  });
-  it('required success without completion evidence fails closed', () => {
-    const f = facts(); delete f.checks[0].status;
-    expect(validateMechanicalClearance(f).rule).toBe('checks');
-  });
-  it('a status alone cannot satisfy a required check', () => {
-    const f = facts(); f.checks[0].kind = 'status';
-    expect(validateMechanicalClearance(f).rule).toBe('checks');
-  });
-  for (const kind of ['check-run', 'status']) for (const conclusion of ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'PENDING', 'UNKNOWN', 'action_required', 'startup_failure', 'STALE', 'future_conclusion', null]) {
-    it(`refuses latest nonrequired ${kind} ${conclusion}`, () => {
-      const f = facts(); f.checks.push({ kind, name: 'other', conclusion, status: 'completed' });
-      expect(validateMechanicalClearance(f).rule).toBe('checks');
-    });
-  }
-  it.each(['NEUTRAL', 'SKIPPED'])('allows nonrequired completed %s check-runs but refuses statuses', conclusion => {
-    const f = facts(); const check = { kind: 'check-run', name: 'other', conclusion, status: 'completed' };
-    f.checks.push(check);
-    expect(validateMechanicalClearance(f).cleared).toBe(true);
-    check.kind = 'status';
-    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
-  });
-  it.each(['queued', 'in_progress', 'waiting', 'pending', 'requested', undefined])('refuses nonrequired success without completed status: %s', status => {
-    const f = facts(); f.checks.push({ name: 'other', conclusion: 'SUCCESS', status });
-    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
-  });
-  it('allows a nonrequired successful commit status', () => {
-    const f = facts(); f.checks.push({ kind: 'status', name: 'other', conclusion: 'SUCCESS' });
-    expect(validateMechanicalClearance(f).cleared).toBe(true);
-  });
-  it('tags REST evidence so a newer status cannot hide a check failure', () => {
-    const f = readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: io({ mutate: (url, v) =>
-      url.includes('/check-runs') ? { ...v, check_runs: v.check_runs.map(c => c.name === 'test' ? { ...c, conclusion: 'failure' } : c) }
-        : url.includes('/statuses') ? [{ context: 'test', state: 'success', id: 99, created_at: '2026-11-11T12:00:00Z' }] : v }) });
-    expect(f.checks[0]).toMatchObject({ kind: 'check-run', appId: GITHUB_ACTIONS_APP_ID });
-    expect(f.checks.at(-1)).toMatchObject({ kind: 'status', appId: null });
-    expect(validateMechanicalClearance(f).rule).toBe('checks');
   });
 });
 

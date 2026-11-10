@@ -59,36 +59,18 @@ export function validateMechanicalClearance(facts = {}) {
   if (keys.length > 20000) return fail('schema', 'Timing key bound exceeded; use normal review of the full PR.');
   const existing = new Set(facts.existingFiles);
   if (!keys.every(key => testPath(key) && existing.has(key))) return fail('keys', 'Every timing key must identify an existing regular test file at the head.');
-  const latest = new Map();
-  for (const check of facts.checks) {
-    if (!check || typeof check.name !== 'string') return fail('checks', 'Unreadable check result.');
-    // REST uses lowercase conclusions; rollup fixtures and status contexts may use uppercase.
-    const normalized = { ...check, conclusion: typeof check.conclusion === 'string' ? check.conclusion.toUpperCase() : null };
-    const id = /^(?:0|[1-9]\d*)$/.test(String(check.id)) && Number.isSafeInteger(Number(check.id)) ? Number(check.id) : NaN;
-    const rank = [id, Date.parse(check.started_at ?? check.created_at ?? '')];
-    const kind = check.kind ?? 'check-run';
-    if (!['check-run', 'status'].includes(kind)) return fail('checks', 'Unreadable check kind.');
-    const key = JSON.stringify([kind, check.appId ?? null, check.name]);
-    const previous = latest.get(key) ?? [];
-    const compare = candidate => {
-      for (let i = 0; i < rank.length; i++) {
-        if (!Number.isFinite(rank[i]) || !Number.isFinite(candidate.rank[i])) return 0;
-        if (rank[i] !== candidate.rank[i]) return rank[i] > candidate.rank[i] ? 1 : -1;
-      }
-      return 0;
-    };
-    // Retain every ambiguous candidate until a certainly newer run supersedes it.
-    if (!previous.some(candidate => compare(candidate) < 0)) {
-      latest.set(key, [...previous.filter(candidate => compare(candidate) === 0), { check: normalized, rank }]);
-    }
+  // Do not require mergeStateStatus: it is BLOCKED before ready-to-merge exists here,
+  // which would deadlock label minting. The drain's classifyPr requires CLEAN/UNSTABLE at merge time.
+  const rollup = facts.rollup;
+  if (rollup?.state !== 'SUCCESS' || typeof rollup.commitOid !== 'string' || typeof rollup.headOid !== 'string'
+    || rollup.commitOid.toLowerCase() !== head.toLowerCase() || rollup.headOid.toLowerCase() !== head.toLowerCase()) {
+    return fail('checks', 'GitHub roll-up must succeed for the exact head; use normal review.');
   }
-  if ([...latest.values()].flat().some(({ check }) => check.kind === 'status'
-    ? check.conclusion !== 'SUCCESS'
-    : check.status !== 'completed' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion))) return fail('checks', 'A latest head check or status failed or is incomplete; use normal review.');
-  if (!REQUIRED_MECHANICAL_CHECKS.every(name => {
-    return latest.get(JSON.stringify(['check-run', GITHUB_ACTIONS_APP_ID, name]))
-      ?.every(({ check }) => check.conclusion === 'SUCCESS' && check.status === 'completed');
-  })) return fail('checks', 'Required head checks must all have a latest successful completed GitHub Actions run.');
+  if (!REQUIRED_MECHANICAL_CHECKS.every(name => facts.checks.some(check => check?.name === name
+    && check.appId === GITHUB_ACTIONS_APP_ID && check.status === 'completed'
+    && typeof check.conclusion === 'string' && check.conclusion.toUpperCase() === 'SUCCESS'))) {
+    return fail('checks', 'Required head checks must all have a successful completed GitHub Actions run.');
+  }
   return { cleared: true, rule: null, reasons: [], head };
 }
 
@@ -100,10 +82,11 @@ export function readMechanicalClearanceFacts({ repo, num, exec = execFileSyncThr
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[1-9]\d*$/.test(String(num))) throw Error('invalid repository or PR');
     const live = createMqLiveReader(exec);
     let calls = 0;
-    const api = path => {
+    const request = args => {
       if (++calls > 128) throw Error('read budget exceeded');
-      return JSON.parse(live('gh', ['api', `repos/${repo}/${path}`], { ...OPTIONS, cwd }));
+      return JSON.parse(live('gh', ['api', ...args], { ...OPTIONS, cwd }));
     };
+    const api = path => request([`repos/${repo}/${path}`]);
     const pr = api(`pulls/${num}`);
     facts.head = pr?.head?.sha;
     if (!/^[a-f0-9]{40}$/i.test(facts.head) || !/^[a-f0-9]{40}$/i.test(pr?.base?.sha) || pr.base.ref !== 'main') throw Error('unreadable head or main base');
@@ -175,11 +158,16 @@ export function readMechanicalClearanceFacts({ repo, num, exec = execFileSyncThr
         return ['100644', '100755'].includes(match[1]) && match[2] === 'blob' ? match[3] : null;
       }).filter(path => path !== null);
     }
+    const [owner, name] = repo.split('/');
+    const query = `query($owner:String!,$name:String!,$num:Int!){repository(owner:$owner,name:$name){pullRequest(number:$num){headRefOid commits(last:1){nodes{commit{oid statusCheckRollup{state}}}}}}}`;
+    const result = request(['graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `num=${num}`]);
+    const pullRequest = result?.data?.repository?.pullRequest;
+    const commit = pullRequest?.commits?.nodes?.[0]?.commit;
+    facts.rollup = { headOid: pullRequest?.headRefOid, commitOid: commit?.oid, state: commit?.statusCheckRollup?.state };
+    if (result.errors || !/^[a-f0-9]{40}$/i.test(facts.rollup.headOid) || !/^[a-f0-9]{40}$/i.test(facts.rollup.commitOid)
+      || typeof facts.rollup.state !== 'string' || !facts.rollup.state) throw Error('unreadable roll-up');
     facts.checks = pages(`commits/${facts.head}/check-runs?filter=all`, 'check_runs', 'total_count')
-      .map(check => ({ ...check, kind: 'check-run', appId: check.app?.id ?? null }));
-    const statuses = pages(`commits/${facts.head}/statuses`);
-    facts.checks.push(...statuses.map(status => ({ kind: 'status', appId: null, name: status.context, id: status.id, created_at: status.created_at,
-      conclusion: ({ success: 'SUCCESS', failure: 'FAILURE', error: 'FAILURE', pending: 'PENDING' })[status.state] ?? 'UNKNOWN' })));
+      .map(check => ({ ...check, appId: check.app?.id ?? null }));
     if (api(`pulls/${num}`)?.head?.sha !== facts.head) throw Error('head moved');
   } catch {
     facts.readError = true;
