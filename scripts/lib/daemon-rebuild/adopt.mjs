@@ -33,7 +33,8 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
  * @param {{ready:object|null, plan:object, prevHead:string, treeOf:(sha:string)=>string|null,
  *   stillWanted:(ref:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
  *   overlayTip?:(ref:string)=>string|null, registered?:(ref:string)=>boolean, allowFallback?:boolean,
- *   rejected?:object|null, nowMs:number, maxAgeMs:number, requireVerified?:boolean, forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
+ *   rejected?:object|null, nowMs:number, maxAgeMs:number, requireVerified?:boolean, requireLivePreservation?:boolean,
+ *   forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
  *   `registered`: still on the overlay list after this tick's own edits (defaults to `stillWanted`); `allowFallback: false`
  *   (a mainOnly rebuild) refuses any fallback; `forcedWatch` (R508): the state of the rollback watch a FORCED record needs
  *   (default `'missing'`, so a forced record is never adopted without proof of its watch).
@@ -42,7 +43,7 @@ export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
-  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', requireVerified = false,
+  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', requireVerified = false, requireLivePreservation = false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -63,6 +64,12 @@ export function matchReadyCandidate({
     if (watch !== 'ok') return { adopt: null, reason: watch === 'unreadable' ? 'forced-watch-unreadable' : watch === 'owed' ? 'forced-watch-owed' : 'forced-watch-missing' };
   }
   const carriesOnlyWanted = (ready.adopt.applied || []).every((a) => stillWanted(a.ref));
+  // Safe points have no freshly planned SHA: validate the locked live set before any exact/fallback shortcut.
+  if (requireLivePreservation) {
+    if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+    if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
+    if (!matchLiveOverlays().adopt) return { adopt: null, reason: 'overlay-set-changed' };
+  }
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
@@ -89,27 +96,31 @@ export function matchReadyCandidate({
   }
   if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
-  // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.
-  // Each one's applied sha must be carried by ancestry or proven graduated into the record's own build.
-  // Unknown live set (`liveApplied` not given) refuses: fail closed.
-  if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
-  // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
-  // not count — Codex audit).
-  // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
-  // Separately, an overlay this tick's plan removed as `pr-merged`/`in-main` (`removedForMain`) is safe only
-  // with independent content proof. Current main containing an overlay alone never satisfies either path.
-  const retired = [];
-  const omitted = liveApplied.filter((a) => {
-    if (!a?.ref) return false;
-    if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
-    if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
-    if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
-    return true;
-  });
-  if (omitted.length > 0) {
-    return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
+  return matchLiveOverlays();
+
+  function matchLiveOverlays() {
+    // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.
+    // Each one's applied sha must be carried by ancestry or proven graduated into the record's own build.
+    // Unknown live set (`liveApplied` not given) refuses: fail closed.
+    if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
+    // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
+    // not count — Codex audit).
+    // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
+    // Separately, an overlay this tick's plan removed as `pr-merged`/`in-main` (`removedForMain`) is safe only
+    // with independent content proof. Current main containing an overlay alone never satisfies either path.
+    const retired = [];
+    const omitted = liveApplied.filter((a) => {
+      if (!a?.ref) return false;
+      if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
+      if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
+      if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+      return true;
+    });
+    if (omitted.length > 0) {
+      return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
+    }
+    return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
   }
-  return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
 // R790: one-time ruled weakening for this exact legacy drop; content/driver and time proof still apply.

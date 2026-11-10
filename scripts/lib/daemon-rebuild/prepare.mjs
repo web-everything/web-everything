@@ -80,6 +80,24 @@ export function contentContainedInBuild(git, sha, build) {
   return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
 }
 
+// The overlays a build applies, read from its own rebuild-committed `daemon-rebuild: merge overlay <ref>` records on
+// its first-parent line above main ({ref, sha}), plus the recorded adopted set when it is that build. Unreadable
+// history returns undefined (the superseded rule then refuses: fail closed).
+function liveOverlaysOf(git, state, head, mainSha) {
+  if (!head || !mainSha) return undefined;
+  const log = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', head, '--not', mainSha]);
+  if (log.status !== 0) return undefined;
+  const live = [];
+  for (const l of String(log.stdout ?? '').split('\n').filter(Boolean)) {
+    const [parents, committer, ...rest] = l.split('\t');
+    const ps = String(parents ?? '').split(' ');
+    const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) /);
+    if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length)) live.push({ ref: hit[1], sha: ps[1] });
+  }
+  if (state.adopted?.head === head) for (const a of state.adopted.applied ?? []) if (a?.ref && a.sha) live.push({ ref: a.ref, sha: a.sha });
+  return live;
+}
+
 /**
  * Phase 1 (LOCKED, fast — no smoke, no `reset --hard`): recovery, safety, fetch, `planRebuild`, overlay-list
  * edits, and the up-to-date/still-rejected/untracked-collision short-circuits — everything the old single-phase
@@ -489,25 +507,6 @@ export async function prepareRebuild({
       });
     }
   }
-
-  // The overlays a build applies, read from its own rebuild-committed `daemon-rebuild: merge overlay <ref>` records on
-  // its first-parent line above main ({ref, sha}), plus the recorded adopted set when it is that build. Unreadable
-  // history returns undefined (the superseded rule then refuses: fail closed).
-  function liveOverlaysOf(head, mainSha) {
-    if (!head || !mainSha) return undefined;
-    const log = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', head, '--not', mainSha]);
-    if (log.status !== 0) return undefined;
-    const live = [];
-    for (const l of String(log.stdout ?? '').split('\n').filter(Boolean)) {
-      const [parents, committer, ...rest] = l.split('\t');
-      const ps = String(parents ?? '').split(' ');
-      const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) /);
-      if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length)) live.push({ ref: hit[1], sha: ps[1] });
-    }
-    if (state.adopted?.head === head) for (const a of state.adopted.applied ?? []) if (a?.ref && a.sha) live.push({ ref: a.ref, sha: a.sha });
-    return live;
-  }
-
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
   if (plan.upToDate) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
@@ -523,7 +522,7 @@ export async function prepareRebuild({
 
   const readyResult = await adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, readyOnly,
     mainOnly, overlaysBefore, plan, prevHead, state, unsafe, alert, terminal, dropReady, writeState, nowMs,
-    liveOverlaysOf, alertsList });
+    liveOverlaysOf: (head, mainSha) => liveOverlaysOf(git, state, head, mainSha), alertsList });
   if (readyResult) return readyResult;
   // x5wbsbc — a BROKEN SMOKE HARNESS (every candidate, the last-good build included, fails the same checks) is
   // not re-smoked on every main move: it would cost up to three full smokes per move and every one would fail
@@ -684,6 +683,7 @@ async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, 
         plan,
         prevHead,
         requireVerified: adoptReadyOnly,
+        requireLivePreservation: adoptReadyOnly,
         treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
         stillWanted: (ref) => wantedRefs.has(ref) || (!mainOnly && (ready.adopt.applied || []).some((a) => a.ref === ref && overlayGraduated({
           ref, sha: a.sha, build: ready.adopt.finalSha, registered: (r) => registeredRefs.has(r),
@@ -785,6 +785,10 @@ export async function adoptReadyRebuild({ root, env, log, run, stateOpts, mainOn
   const alertsList = [];
   const alert = (kind, detail) => { alertsList.push({ kind, detail }); log?.error?.(`daemon-rebuild: ${kind} ${JSON.stringify(detail)}`); };
   if (!ready || !prevHead || ready.prevHead !== prevHead) return terminal({ moved: false, reason: !ready ? 'none' : 'other-base' });
+  const headRef = git(['symbolic-ref', '--short', 'HEAD']);
+  if (headRef.status !== 0 || String(headRef.stdout ?? '').trim() !== 'main') {
+    return terminal({ moved: false, reason: 'not-on-main' });
+  }
   // Re-read CURRENT registry here, under the write lock. Never trust a pre-lock snapshot (R854).
   const registry = readOverlayState(root, { env });
   if (registry.corrupt) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
@@ -797,6 +801,15 @@ export async function adoptReadyRebuild({ root, env, log, run, stateOpts, mainOn
     overlaysBefore: registry.overlays, plan, prevHead, state, unsafe, alert, terminal,
     dropReady: (reason, keepSha = null) => dropReadyCandidate({ root, env: stEnv, keepSha, reason }),
     writeState: () => writeRebuildState(root, state, stEnv), nowMs: now,
-    liveOverlaysOf: () => undefined, alertsList, adoptReadyOnly: true });
+    liveOverlaysOf: (head, mainSha) => {
+      const live = liveOverlaysOf(git, state, head, mainSha);
+      if (!live) return undefined;
+      // Include additions and pulls since the candidate was built, from the locked CURRENT registry.
+      const registered = (mainOnly ? [] : registry.overlays).map((o) => ({
+        ref: o?.ref, sha: o?.ref ? verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) : null,
+      }));
+      if (registered.some((o) => !o.ref || !o.sha)) return undefined;
+      return [...live, ...registered];
+    }, alertsList, adoptReadyOnly: true });
   return result ?? terminal({ moved: false, reason: 'ready-not-adoptable' });
 }

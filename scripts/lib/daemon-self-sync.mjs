@@ -1336,6 +1336,10 @@ export function withSelfSync(effects, {
           acquired = acquireRead(root, { ...cloneLockOpts(), readerKey });
           if (!acquired.ok) throw new SafePointAbort(acquired.reason);
           released = false;
+          if (readState(root, env).quarantine) {
+            say('skipped (quarantine; tick-ended)');
+            throw new SafePointAbort('quarantine');
+          }
           return { adopted: false };
         } };
         let tickResult;

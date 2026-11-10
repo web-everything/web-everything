@@ -1,8 +1,9 @@
 import { it, expect, vi, afterEach } from 'vitest';
 import { withSelfSync, safePoint } from '../daemon-self-sync.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
-import { readReadyCandidate } from '../daemon-rebuild/state.mjs';
-import { removeOverlay } from '../daemon-overlays.mjs';
+import { readReadyCandidate, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { addOverlay, removeOverlay } from '../daemon-overlays.mjs';
+import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
 import { fixture } from './helpers/safe-point-fixture.mjs';
 const fixtures = [];
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
@@ -76,6 +77,21 @@ it('write-lock refusal reacquires the read lock and continues', async () => {
   });
   expect(await w.tickOnce()).toBe('continued'); expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
 });
+it('failed adoption and rollback quarantine aborts after reacquiring the read lock', async () => {
+  const tail = vi.fn();
+  let quarantined = false;
+  const { w, acquire, release, restart } = setup(async (h) => {
+    h.setReady();
+    h.rebuild.mockImplementation(async () => {
+      quarantined = true;
+      return { moved: false, reason: 'adopt-failed' };
+    });
+    await safePoint('fix'); tail();
+  }, { readState: () => ({ quarantine: quarantined ? { prevHead: 'old' } : null }) });
+  expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'safe-point-abort: quarantine' });
+  expect(tail).not.toHaveBeenCalled(); expect(restart).not.toHaveBeenCalled();
+  expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
+});
 it('refused read reacquisition aborts cleanly and never continues unlocked', async () => {
   const tail = vi.fn();
   const { w, release } = setup(async (h) => {
@@ -104,6 +120,45 @@ it('adoptReadyOnly adopts a matching real candidate without fetching, planning o
     run: (args, opts) => { expect(['fetch', 'commit-tree', 'worktree']).not.toContain(args[0]); return f.run(args, opts); },
     emitEvent: vi.fn(), log: { error: vi.fn() } });
   expect(result).toMatchObject({ moved: true, adopted: true, head: f.target }); expect(runSmoke).not.toHaveBeenCalled();
+});
+it.each(['new', 'pulled', 'adopted', 'history', 'unreadable-history', 'missing-tip'])('adoptReadyOnly refuses an omitted %s live overlay', async (change) => {
+  const f = fixture(); fixtures.push(f);
+  const sha = f.git('commit-tree', `${f.head}^{tree}`, '-p', f.plan.applied[0].sha, '-m', 'new overlay tip');
+  if (change === 'new') {
+    f.git('update-ref', 'refs/remotes/origin/C', sha);
+    addOverlay(f.root, { ref: 'C' }, { env: f.env });
+  } else if (change === 'pulled') {
+    f.git('update-ref', 'refs/remotes/origin/A', sha);
+  } else if (change === 'adopted') {
+    writeRebuildState(f.root, { adopted: { head: f.head, applied: [{ ref: 'C', sha }] } }, f.env);
+  } else if (change === 'history') {
+    f.git('update-ref', 'refs/remotes/origin/C', sha);
+    const merge = f.run(['commit-tree', `${f.head}^{tree}`, '-p', f.head, '-p', sha,
+      '-m', 'daemon-rebuild: merge overlay C tip'], { env: { ...f.env, ...REBUILD_IDENTITY_ENV } });
+    expect(merge.status).toBe(0);
+    f.git('reset', '--hard', merge.stdout.trim());
+    f.ready.prevHead = merge.stdout.trim();
+  } else if (change === 'missing-tip') {
+    addOverlay(f.root, { ref: 'C' }, { env: f.env });
+  }
+  f.record();
+  const result = await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true,
+    run: (args, opts) => change === 'unreadable-history' && args[0] === 'log'
+      ? { status: 1, stdout: '' } : f.run(args, opts), emitEvent: vi.fn(), log: { error: vi.fn() } });
+  expect(result).toMatchObject({ moved: false, reason: 'overlay-set-changed' });
+  expect(f.git('rev-parse', 'HEAD')).toBe(f.ready.prevHead);
+  expect(readReadyCandidate(f.root, f.env)).toBeNull();
+});
+it.each(['topic', '--detach'])('adoptReadyOnly refuses HEAD on %s before resetting', async (branch) => {
+  const f = fixture(); fixtures.push(f); f.record();
+  if (branch === '--detach') f.git('checkout', '--detach', f.head);
+  else f.git('checkout', '-b', branch);
+  const run = vi.fn(f.run);
+  const result = await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true, run,
+    emitEvent: vi.fn(), log: { error: vi.fn() } });
+  expect(result).toMatchObject({ moved: false, reason: 'not-on-main' });
+  expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
 });
 it('async contexts keep overlapping withSelfSync instances independent', async () => {
   let unblock; const waiting = new Promise((r) => { unblock = r; });
