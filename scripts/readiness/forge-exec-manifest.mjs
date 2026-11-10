@@ -120,7 +120,7 @@ const textFinding=(text,patternSource=false)=>secretText.find(([pattern,rule])=>
 function codeExpression(value,mode='legacy') {
   let code='';
   // Punctuation padding must not dilute entropy: check the span and each run of word-ish characters.
-  const safeSpan=span=>!opaqueToken(span.replace(/\s/g,''))&&!span.split(/[^A-Za-z0-9_$+=-]+/).some(opaqueToken);
+  const safeSpan=span=>!opaqueToken(span.replace(/\s/g,''))&&!opaqueToken(span.replace(/[^A-Za-z0-9]/g,''))&&!span.split(/[^A-Za-z0-9]+/).some(opaqueToken);
   // Read plain quotes conservatively; escapes and partial strings need a parser.
   const quoteEnd=start=>{
     for(let end=start+1;end<value.length;end++) {

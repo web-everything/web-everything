@@ -123,6 +123,12 @@ describe('credentialContentFinding narrow source exemptions', () => {
   it('punctuation does not dilute a bare token in a test fixture', () => {
     expect(scan('token: ' + token + ','.repeat(100), testPath)).not.toBeNull();
   });
+  it('plus/dash/underscore padded quoted token is still caught', () => {
+    for (const ch of ['+', '-', '_', '=', '$']) {
+      const pad = ch.repeat(128);
+      expect(scan(`token: "${pad}${token}${pad}"`, testPath)).not.toBeNull();
+    }
+  });
   it('padded quoted token in a test fixture is still caught', () => {
     const pad = '!'.repeat(64);
     expect(scan(`token: "${pad}${token}${pad}"`, testPath)).not.toBeNull();
