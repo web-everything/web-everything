@@ -39,9 +39,10 @@ export function pinnedFixture() {
   git(primary, 'worktree', 'add', '-b', 'lane', lane);
   const clone = join(temp, '.guard-main');
   git(temp, 'clone', '--single-branch', '--branch', 'main', primary, clone);
+  writeFileSync(join(clone, '.git/info/exclude'), 'node_modules\n');
   symlinkSync(join(source, 'node_modules'), join(clone, 'node_modules'), 'dir');
   env.WE_GUARD_CLONE = clone;
-  return { primary, lane, clone, temp, env,
+  return { primary, lane, clone, temp, env, git,
     run(cwd, script, event) {
       return spawnSync(process.execPath, [join(clone, 'scripts/hooks/run-pinned-guard.mjs'), script], {
         cwd, env, encoding: 'utf8', input: JSON.stringify(event), maxBuffer: 1024 * 1024,

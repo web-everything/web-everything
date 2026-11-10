@@ -6,9 +6,12 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, rmdirSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 
+const env = { ...process.env };
+for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
+
 function git(...args) {
-  return execFileSync('git', ['rev-parse', ...args], {
-    encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+  return execFileSync('git', ['-c', 'core.fsmonitor=false', ...args], {
+    env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
@@ -39,23 +42,27 @@ try {
   }
   // Freshness is not repository evidence. Pin Git's metadata path so it cannot
   // discover a parent checkout when this clone is damaged or incomplete.
-  execFileSync('git', ['--git-dir', join(clone, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}'], {
-    encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  git('--git-dir', join(clone, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}');
+  if (git('-C', clone, 'status', '--porcelain', '--untracked-files=all')) {
+    throw new Error('guard clone is not pristine; run scripts/hooks/sync-guard-clone.mjs to repair it');
+  }
+  if (git('-C', clone, 'rev-parse', 'HEAD') !== git('-C', clone, 'rev-parse', 'refs/remotes/origin/main')) {
+    throw new Error('guard clone HEAD differs from origin/main; run scripts/hooks/sync-guard-clone.mjs to repair it');
+  }
+  if (process.env.WE_GUARD_ORIGIN !== undefined &&
+      git('-C', clone, 'config', '--get-all', 'remote.origin.url') !== process.env.WE_GUARD_ORIGIN) {
+    throw new Error('guard clone origin differs from WE_GUARD_ORIGIN; restore the expected origin before syncing');
+  }
   let refreshedAt;
   try { refreshedAt = statSync(join(clone, '.git/FETCH_HEAD')).mtimeMs; }
   catch {
-    refreshedAt = Number(execFileSync('git', ['-C', clone, 'show', '-s', '--format=%ct', 'HEAD'], {
-      encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).trim()) * 1000;
+    refreshedAt = Number(git('-C', clone, 'show', '-s', '--format=%ct', 'HEAD')) * 1000;
   }
   if (!Number.isFinite(refreshedAt) || refreshedAt <= 0) throw new Error('cannot determine clone freshness');
   if (Date.now() - refreshedAt > 24 * 60 * 60 * 1000) {
     process.stderr.write('Pinned guard: warning: guard clone is >24h behind; run scripts/hooks/sync-guard-clone.mjs to refresh it.\n');
   }
-  const hookRoot = realpathSync(git('--show-toplevel'));
+  const hookRoot = realpathSync(git('rev-parse', '--show-toplevel'));
   // Publish a private, complete scripts revision before releasing the clone.
   // Sync never traverses these directories, and each invocation retains its
   // revision until the guard exits, including any delayed imports.
@@ -65,7 +72,7 @@ try {
   rmdirSync(lock);
   lock = undefined;
   const child = spawnSync(process.execPath, [join(snapshot, 'scripts', withinScripts), ...args], {
-    stdio: 'inherit', env: { ...process.env, WE_HOOK_ROOT: hookRoot },
+    stdio: 'inherit', env: { ...env, WE_HOOK_ROOT: hookRoot },
   });
   if (child.error) throw child.error;
   process.exitCode = child.status ?? 2;
@@ -74,5 +81,9 @@ try {
   process.exitCode = 2;
 } finally {
   if (lock) rmdirSync(lock);
-  if (snapshot) rmSync(snapshot, { recursive: true, force: true });
+  if (snapshot) {
+    // cpSync preserves read-only directory modes from the synchronized clone.
+    execFileSync('chmod', ['-R', 'u+w', snapshot]);
+    rmSync(snapshot, { recursive: true, force: true });
+  }
 }

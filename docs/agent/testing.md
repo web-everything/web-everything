@@ -4167,3 +4167,11 @@ and clone lanes with replaced lane launchers and guards, proving dedicated-clone
 lane-root propagation and fail-closed denial when clone evidence is missing or incomplete.
 Private scripts revisions and the sync/publication mutex protect delayed imports during
 scheduled reset/clean; their lifetime is the owning guard invocation.
+
+The launcher requires an empty porcelain status (including untracked files), HEAD equal to
+`refs/remotes/origin/main`, and, when `WE_GUARD_ORIGIN` is set, an exact origin URL match.
+All Git calls and the child guard receive an environment with every `GIT_*` variable removed;
+other environment variables survive. Sync removes working-tree write bits after publication
+and restores owner write access before refresh. Permissions discourage edits; launcher checks
+remain mandatory. Launcher/sync tests cover dirty tracked and untracked files, divergent or
+missing main refs, origin mismatches, hostile Git overrides and read-only refresh/late imports.

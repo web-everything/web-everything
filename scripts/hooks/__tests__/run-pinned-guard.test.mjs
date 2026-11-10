@@ -18,7 +18,7 @@ function fixture() {
   const clone = join(f.temp, 'guard clone with spaces'); renameSync(f.clone, clone);
   f.clone = clone; f.env.WE_GUARD_CLONE = clone;
   const probe = `import {readFileSync} from 'node:fs';
-console.log(JSON.stringify({root:process.env.WE_HOOK_ROOT,cwd:process.cwd(),args:process.argv.slice(2),input:readFileSync(0,'utf8')}));
+console.log(JSON.stringify({root:process.env.WE_HOOK_ROOT,cwd:process.cwd(),args:process.argv.slice(2),gitKeys:Object.keys(process.env).filter(key=>key.startsWith('GIT_')),input:readFileSync(0,'utf8')}));
 console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT || 0);`;
   for (const command of commands) {
     const script = command.match(/node "\$launcher" (scripts\/[^ ;]+)/)[1];
@@ -26,6 +26,9 @@ console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT ||
     for (const cwd of [f.primary, f.lane]) writeFileSync(join(cwd, script), 'console.log("UNTRUSTED GUARD");');
   }
   for (const cwd of [f.primary, f.lane]) writeFileSync(join(cwd, 'scripts/hooks/run-pinned-guard.mjs'), 'console.log("UNTRUSTED LAUNCHER");');
+  f.git(clone, 'add', '.');
+  f.git(clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'trusted probes');
+  f.git(clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
   f.launch = (cwd = f.lane, script = 'scripts/guard-bash.mjs', args = []) =>
     spawnSync(process.execPath, [join(clone, 'scripts/hooks/run-pinned-guard.mjs'), script, ...args], {
       cwd, env: f.env, input: 'payload', encoding: 'utf8', maxBuffer: 1024 * 1024,
@@ -39,8 +42,43 @@ describe('dedicated clone guard launcher', () => {
     f.env.WE_HOOK_ROOT = f.primary; f.env.PROBE_EXIT = '7';
     const result = f.launch(nested, 'scripts/guard-bash.mjs', ['--pre', 'space argument']);
     expect(result.status, result.stderr).toBe(7);
-    expect(JSON.parse(result.stdout)).toEqual({root:f.lane,cwd:nested,args:['--pre','space argument'],input:'payload'});
+    expect(JSON.parse(result.stdout)).toEqual({root:f.lane,cwd:nested,args:['--pre','space argument'],gitKeys:[],input:'payload'});
     expect(result.stderr).toBe('guard stderr\n');
+  });
+  it.each(['tracked', 'untracked'])('denies a %s working-tree edit before executing the guard', kind => {
+    const f = fixture();
+    writeFileSync(join(f.clone, kind === 'tracked' ? 'scripts/guard-bash.mjs' : 'unexpected'), 'console.log("TAMPERED");');
+    expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('not pristine')});
+  });
+  it('denies a clean local commit ahead of origin/main', () => {
+    const f = fixture();
+    f.git(f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'local');
+    expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('HEAD differs from origin/main')});
+  });
+  it('denies missing origin/main evidence', () => {
+    const f = fixture(); f.git(f.clone, 'update-ref', '-d', 'refs/remotes/origin/main');
+    expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('denying (exit 2)')});
+  });
+  it('checks the expected origin when configured and denies a missing origin', () => {
+    const f = fixture(); f.env.WE_GUARD_ORIGIN = f.primary;
+    expect(f.launch().status).toBe(0);
+    f.env.WE_GUARD_ORIGIN = f.lane;
+    expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('origin differs')});
+    f.git(f.clone, 'config', '--unset-all', 'remote.origin.url');
+    expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('denying (exit 2)')});
+  });
+  it('clears every inherited GIT_* override for clone checks, hook root and child, preserving other env', () => {
+    const f = fixture();
+    for (const key of ['GIT_DIR', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_FUTURE_OVERRIDE']) {
+      f.env[key] = join(f.temp, 'invalid');
+    }
+    f.env.GIT_WORK_TREE = '/tmp';
+    f.env.GIT_CONFIG_COUNT = 'invalid';
+    f.env.PROBE_EXIT = '7';
+    const result = f.launch();
+    expect(result.status, result.stderr).toBe(7);
+    expect(JSON.parse(result.stdout)).toMatchObject({root:f.lane,gitKeys:[]});
   });
   it('fails closed when the clone is missing even though lane guards exist', () => {
     const f = fixture(); rmSync(f.clone, {recursive:true,force:true});
@@ -101,6 +139,7 @@ describe('dedicated clone guard launcher', () => {
       env:{...f.env,GIT_AUTHOR_DATE:'2000-01-01T00:00:00Z',GIT_COMMITTER_DATE:'2000-01-01T00:00:00Z'},encoding:'utf8',maxBuffer:1024*1024,
     });
     expect(commit.status,commit.stderr).toBe(0);
+    f.git(f.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
     expect(f.launch()).toMatchObject({status:0,stderr:expect.stringContaining('>24h behind')});
   });
 });

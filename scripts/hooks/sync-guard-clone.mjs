@@ -1,6 +1,6 @@
 /** Maintain only the explicitly owned, disposable origin/main guard clone. */
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, realpathSync, rmdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -13,7 +13,7 @@ try {
   // Inherited Git overrides must never redirect a destructive command elsewhere.
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
-  const git = (cwd, ...argv) => execFileSync('git', argv, {
+  const git = (cwd, ...argv) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...argv], {
     cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
@@ -50,10 +50,17 @@ try {
         git(clone, 'symbolic-ref', '--short', 'HEAD') !== 'main') {
       throw new Error('dedicated clone has a different origin or is not tracking main only');
     }
+    execFileSync('chmod', ['-R', 'u+w', clone]);
     git(clone, 'fetch', 'origin', 'main');
     git(clone, 'reset', '--hard', 'origin/main');
     git(clone, 'clean', '-fdx');
   }
+  // Keep metadata writable for Git; discourage working-tree edits. Integrity
+  // checks in the launcher remain the defence against same-user tampering.
+  for (const name of readdirSync(clone)) {
+    if (name !== '.git') execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
+  }
+  chmodSync(clone, lstatSync(clone).mode & ~0o222);
   process.stdout.write('Guard clone synchronized to origin/main.\n');
 } catch (error) {
   process.stderr.write(`Guard clone sync refused/failed: ${error.message}\n`);
