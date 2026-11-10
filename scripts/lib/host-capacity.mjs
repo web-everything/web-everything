@@ -3,6 +3,7 @@
  * No background sampler or cache is created here. Every IO boundary is injectable.
  */
 import { readFileSync } from 'node:fs';
+import childProcess from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import * as os from 'node:os';
@@ -72,10 +73,28 @@ function readHistory({ root, env, readFile = readFileSync }) {
   }
 }
 
+/** Capacity admission requires complete, plausible CPU evidence from every top interval. */
+function readDirectSample() {
+  return readHostSample({ requireTwoIntervals: true, exec: (command, args) => {
+    const text = childProcess.execFileSync(command, args, { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (command === 'top') {
+      const lines = String(text ?? '').split('\n').filter(line => /CPU usage:/.test(line));
+      if (lines.length < 2 || !lines.every(line => {
+        const match = line.match(/^\s*CPU usage:\s*([\d.]+)%\s+user,\s*([\d.]+)%\s+sys,\s*([\d.]+)%\s+idle\s*$/);
+        if (!match) return false;
+        const values = match.slice(1).map(Number);
+        const total = values.reduce((sum, value) => sum + value, 0);
+        return values.every(validIdle) && total >= 98 && total <= 102;
+      })) throw Error('invalid top CPU intervals');
+    }
+    return text;
+  } });
+}
+
 /** Returns measured evidence or an explicit unknown; never substitutes load average for CPU. */
 export function readCapacity({ settings, env = process.env, root,
   history = readHistory, readFile,
-  sample = options => sampleHost({ ...options, read: () => readHostSample({ requireTwoIntervals: true }) }),
+  sample = options => sampleHost({ ...options, read: readDirectSample }),
   memory = options => readHostMemoryReading(options).mb ?? NaN,
   now = Date.now, load = os.loadavg, cores = () => os.cpus().length } = {}) {
   let source = 'unknown'; let idlePct = null; let memFreeGB = null;

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { CLASSES, loadCapacitySettings, readCapacity, admit } from '../host-capacity.mjs';
@@ -10,7 +11,7 @@ const native = vi.hoisted(() => ({ exec: vi.fn() }));
 vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal(), execFileSync: native.exec }));
 vi.mock('../host-sample.mjs', async importOriginal => {
   const original = await importOriginal();
-  return { ...original, readHostSample: options => original.readHostSample({ ...options, exec: native.exec }) };
+  return { ...original, readHostSample: options => original.readHostSample({ ...options, exec: options.exec ?? native.exec }) };
 });
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 afterEach(() => {
@@ -33,6 +34,13 @@ const evidence = (idle = 40, mem = 4096, extra = {}) => readCapacity({ settings,
   history: () => [row(idle, 60), row(idle)], memory: () => mem, load: () => [79], cores: () => 12,
   sample: () => { throw Error('unexpected direct sample'); }, ...extra });
 const decide = (cls, idle, mem) => admit(cls, { settings, read: () => evidence(idle, mem) });
+const mockDirectTop = text => {
+  Object.defineProperty(process, 'platform', { value: 'darwin' });
+  native.exec.mockReset().mockImplementation(command => command === 'top'
+    ? text : 'System-wide memory free percentage: 86%');
+  vi.spyOn(childProcess, 'execFileSync').mockImplementation(native.exec);
+  syncBuiltinESMExports();
+};
 
 describe('class capacity floors', () => {
   for (const cls of CLASSES) {
@@ -67,11 +75,36 @@ describe('class capacity floors', () => {
 });
 
 describe('window and source selection', () => {
+  it.each([
+    '999% user, 999% sys, 98% idle',
+    ...['user', 'sys', 'idle'].flatMap(field => ['999', '-1', 'NaN', 'Infinity', 'bad', ''].map(value =>
+      ['user', 'sys', 'idle'].map(name => `${name === field ? value : name === 'idle' ? '98' : '1'}% ${name}`).join(', '))),
+    '1% user, 98% idle',
+    '1% user, 1% sys, 95.99% idle',
+    '3% user, 3% sys, 96.01% idle',
+  ].flatMap(line => [0, 1, 2].map(index => ({ line, index }))))('invalid top CPU line $line at index $index fails the direct read and holds', ({ line, index }) => {
+    const lines = Array(3).fill('CPU usage: 1% user, 1% sys, 98% idle');
+    lines[index] = `CPU usage: ${line}`;
+    mockDirectTop(lines.join('\n'));
+    const read = () => evidence(40, 4096, { history: () => [], sample: undefined });
+    expect(read()).toMatchObject({ error: 'invalid direct CPU sample', idlePct: null, source: 'direct' });
+    expect(admit('review', { settings, read })).toMatchObject({ admit: false,
+      reason: expect.stringContaining('hold until readable evidence on next tick') });
+  });
+  it.each([
+    ['0% user, 0% sys, 100% idle', 100],
+    ['100% user, 0% sys, 0% idle', 0],
+    ['0% user, 100% sys, 0% idle', 0],
+    ['1% user, 1% sys, 96% idle', 96],
+    ['3% user, 3% sys, 96% idle', 96],
+    ['1.25% user, 1.25% sys, 97.5% idle', 97.5],
+  ])('valid top CPU bounds and total tolerance: %s', (line, idlePct) => {
+    mockDirectTop(`CPU usage: ${line}\n`.repeat(2));
+    expect(evidence(40, 4096, { history: () => [], sample: undefined }))
+      .toMatchObject({ idlePct, source: 'direct', memFreeGB: 4 });
+  });
   it.each([0, 1, 2])('default direct sampling requires two top CPU lines (received %s)', count => {
-    Object.defineProperty(process, 'platform', { value: 'darwin' });
-    native.exec.mockReset().mockImplementation(command => command === 'top'
-      ? 'CPU usage: 1% user, 1% sys, 98% idle\n'.repeat(count)
-      : 'System-wide memory free percentage: 86%');
+    mockDirectTop('CPU usage: 1% user, 1% sys, 98% idle\n'.repeat(count));
     const read = () => evidence(40, 4096, { history: () => [], sample: undefined });
     const reading = read();
     if (count < 2) expect(reading.error).toBe('invalid direct CPU sample');
