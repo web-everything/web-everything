@@ -65,7 +65,7 @@ export function loadCapacitySettings({ env = process.env, readFile = readFileSyn
 function readHistory({ root, env, readFile = readFileSync }) {
   try {
     const text = readFile(resourcePaths(root ?? resolveCoordinationRoot({ env })).history, 'utf8');
-    return text.trim() ? text.trim().split('\n').map(line => { try { return JSON.parse(line); } catch { return null; } }) : [];
+    return text.trim() ? text.trim().split('\n').map(line => JSON.parse(line)) : [];
   } catch (error) {
     throw Error('unreadable sampler history');
   }
@@ -110,17 +110,16 @@ export function readCapacity({ settings, env = process.env, root,
     if (!Number.isFinite(at)) throw Error('invalid clock');
     const rows = history({ root, env, readFile });
     if (!Array.isArray(rows)) throw Error('invalid sampler history');
-    // Filter to the window FIRST; only rows inside it are validated. History is chronological, so a row whose
-    // time cannot be placed is outside the window only if it precedes the first in-window row; otherwise it holds.
+    // Rows with an unplaceable time always hold (their age is unprovable). Placeable rows older than the window
+    // are ignored without validation; every in-window row is validated, and an invalid one holds admission.
     const since = at - settings.windowSec * 1000;
-    const timed = rows.map(row => ({ row, time: Date.parse(row?.sampledAt) }));
-    const first = timed.findIndex(({ time }) => Number.isFinite(time) && time >= since);
-    // Unplaceable rows directly adjoining the window (no placeable older row between) cannot be proven outside it.
-    let start = first;
-    while (start > 0 && !Number.isFinite(timed[start - 1].time)) start -= 1;
-    const parsed = first < 0 ? [] : timed.slice(start).map(({ row, time }) => {
+    const parsed = rows.map(row => {
+      const time = Date.parse(row?.sampledAt);
+      if (!Number.isFinite(time)) throw Error('invalid sampler reading');
+      return { row, time };
+    }).filter(({ time }) => time >= since).map(({ row, time }) => {
       const idle = row?.cpu?.idlePct;
-      if (!Number.isFinite(time) || time > at || !validIdle(idle)) throw Error('invalid sampler reading');
+      if (time > at || !validIdle(idle)) throw Error('invalid sampler reading');
       return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
     });
     const window = parsed;
