@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"]
+scope: ["we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs"]
 dateOpened: "2026-11-09"
 tags: []
 ---
