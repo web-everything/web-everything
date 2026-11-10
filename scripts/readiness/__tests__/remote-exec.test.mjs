@@ -1571,6 +1571,15 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
     expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
   });
+  it('R807: a git-needing test routed remote on an unknown capability cache is refused safely at prepare by a runner without gitBundle',async()=>{
+    const f=fixture(),original=f.exec,body=readFileSync(join(cwd,'a.test.mjs'));
+    writeFileSync(join(cwd,'a.test.mjs'),"import { execFileSync } from 'node:child_process';\nexecFileSync('git', ['ls-files']);\n");
+    try{
+      f.argv=['npx','vitest','run','a.test.mjs'];f.transport='git-bundle';
+      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-runner-too-old'});
+      expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+    }finally{writeFileSync(join(cwd,'a.test.mjs'),body);}
+  });
   it.each([{code:1,stdout:''},{code:0,stdout:''},{code:0,stdout:'invalid-head'}])('refuses standards before prepare when logical HEAD evidence is unavailable: %j',async evidence=>{
     const f=fixture(),original=f.exec;f.argv=['npm','run','check:standards'];
     f.exec=vi.fn(call=>call.file==='git'&&gitArgs(call).join(' ')==='rev-parse HEAD'?evidence:original(call));

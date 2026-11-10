@@ -102,6 +102,14 @@ export function capabilityAdvertisesBundle(record, { host, nowMs, ttlMs = CAPABI
     && Number.isFinite(record.atMs) && nowMs - record.atMs >= 0 && nowMs - record.atMs <= ttlMs;
 }
 
+/** R807: 'no' only for a fresh record of this host saying gitBundle is absent; expired, missing, foreign or future records
+ *  are 'unknown' (prepare re-checks and refuses safely), so an expired cache cannot lock git-needing runs local forever. */
+export function capabilityBundleVerdict(record, { host, nowMs, ttlMs = CAPABILITY_TTL_MS }) {
+  if (capabilityAdvertisesBundle(record, { host, nowMs, ttlMs })) return 'yes';
+  const fresh = !!record && record.host === host && Number.isFinite(record.atMs) && nowMs - record.atMs >= 0 && nowMs - record.atMs <= ttlMs;
+  return fresh && record.gitBundle !== GIT_BUNDLE_CAPABILITY ? 'no' : 'unknown';
+}
+
 const SCAN_BATCH_BYTES = 3 * 1024 * 1024; // below the client's 4 MiB capture limit
 const NUL = 0;
 function splitNul(buffer) {

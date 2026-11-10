@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-08"
-preparedAgainstSha: "d93fa0dc34a5762b5e2480cd7d3c3a1ba4a49df8"
+preparedDate: "2026-11-09"
+preparedAgainstSha: "ca766f14b6c46ca10338b8e974df098bdf309117"
 tags: []
 ---
 
@@ -36,6 +36,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Re-stamp against `c35b3e8037`: premise re-checked, nothing delivered. Only drift since `fae46eeff7` in scope is we:scripts/lane-pool.mjs (REST pulls call now ~we:scripts/lane-pool.mjs:1918–1924, `restPullToPrStateShape` map at :1924) and the reaper's REST map now at ~we:scripts/conveyor/lease-reaper.mjs:1356; acquire-suite config entries still at we:vitest.config.ts:205 and we:vitest.integration.config.ts:80. Scope, size 3 and all Acceptance lines unchanged.
 
 - Re-stamp against `d93fa0dc34`: `git log c35b3e8037..HEAD` over every scoped production file, test suite, break, fixture and both vitest configs is empty; the two planned unit suites still do not exist and no commit delivers the guards. Premise, citations, scope, size 3 and all Acceptance lines unchanged; no body edit beyond this note.
+
+- Re-stamp against `ca766f14b6`: `git log d93fa0dc34..HEAD` over the scoped files shows only we:scripts/lane-pool.mjs changed (release-guard commits from PR #6319, unrelated to acquire). The acquire REST call is still `ghRestGetPaged('repos/{owner}/{repo}/pulls?state=all'…)` mapped by `restPullToPrStateShape` at ~we:scripts/lane-pool.mjs:1930–1936; reaper mapper unchanged; suite config entries at we:vitest.config.ts:205 and we:vitest.integration.config.ts:80 unchanged; the two planned unit suites still do not exist. Premise, scope, size 3 and Acceptance unchanged.
 
 ## Design
 
