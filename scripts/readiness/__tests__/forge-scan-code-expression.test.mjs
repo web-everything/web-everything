@@ -81,6 +81,32 @@ describe('credentialContentFinding test-file code expression residuals', () => {
     expect(scan(`creds: ${value}\n`, testPath)).toBeNull();
   });
 
+  // A paren, a keyword before a paren, or a conditional around a literal is not a call or an arrow: the
+  // literal is still a bare secret. Only an arrow or a call to a non-keyword identifier is a code expression.
+  it.each([
+    ['parenthesized quoted literal', `('${literal}')`],
+    ['parenthesized double-quoted literal', `("${literal}")`],
+    ['parenthesized backtick literal', `(\`${literal}\`)`],
+    ['parenthesized unquoted literal', `(${literal})`],
+    ['padded parenthesized literal', `(  '${literal}'  )`],
+    ['nested parenthesized literal', `(('${literal}'))`],
+    ['return keyword before a paren', `return ('${literal}')`],
+    ['typeof keyword before a paren', `typeof ('${literal}')`],
+    ['await keyword before a paren', `await ('${literal}')`],
+    ['conditional around a literal', `x ? ('${literal}') : y`],
+  ])('flags a test-file credential value that is only a %s', (_name, value) => {
+    expect(scan(`creds: ${value}\n`, 'scripts/lib/example.test.mjs')).toBe('high-entropy-creds');
+    expect(scan(`creds:\n  ${value}\n`, 'scripts/lib/example.test.mjs')).toBe('high-entropy-creds');
+  });
+
+  it.each([
+    ['arrow with parenthesized params', "(a, b) => a + b + 'suffix_value_here'"],
+    ['await of a call', "(await readCredential('fixture')).value_here_long"],
+    ['createHash chain', "createHash('sha256').update(String(p)).digest('hex')"],
+  ])('still skips a genuine test-file code expression: %s', (_name, value) => {
+    expect(scan(`creds: ${value}\n`, 'scripts/lib/example.test.mjs')).toBeNull();
+  });
+
   it('applies the residual to test files only', () => {
     expect(scan(`creds: ${literal}(x)\n`, 'scripts/lib/example.mjs')).toBe('high-entropy-creds');
   });

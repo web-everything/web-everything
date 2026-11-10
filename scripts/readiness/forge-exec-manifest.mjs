@@ -131,8 +131,11 @@ function codeExpression(value) {
     if(!closed)return false;
     code+=' ';
   }
-  return /=>|^\s*\(|[A-Za-z_$][\w$]*\s*\(/.test(code);
+  // Only an arrow or a call to a real identifier is a code expression. A bare paren, or a keyword before a
+  // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
+  return /=>|[A-Za-z_$][\w$]*\s*\(/.test(code.replace(nonCallKeyword,' '));
 }
+const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|case|in|of|instanceof|if|while|for|switch|catch|with|else|do)(?![\w$])/g;
 const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
