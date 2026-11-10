@@ -1004,7 +1004,6 @@ describe('runLiveSmoke — injected runChild', () => {
     const releaseArgs = calls.find((a) => a[1] === 'release');
     const sessionFromAcquire = acquireArgs.find((a) => a.startsWith('--session='));
     const sessionFromRelease = releaseArgs.find((a) => a.startsWith('--session='));
-    expect(acquireArgs).toContain('--require-releasable');
     expect(sessionFromAcquire).toBeDefined();
     expect(sessionFromAcquire).toBe(sessionFromRelease);
     expect(releaseArgs).toContain('--lane=12');

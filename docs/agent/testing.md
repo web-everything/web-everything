@@ -4109,10 +4109,3 @@ job/lock outcomes, including persisted request retention. `daemon-self-sync-muta
 requires failed/refused mutations to remain pending and retry on the next tick; only a completed
 mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.
-
-## Smoke lane release evidence
-
-Daemon smoke acquires with `--require-releasable`: ordinary acquire eligibility can miss
-unpushed work on other local branches. Admission reuses the release evidence read-only,
-restores refused claims before provisioning, and never fetches or salvages a skipped lane.
-The acquire cases in `lane-pool-release-unpushed-guard.test.mjs` pin that preservation.

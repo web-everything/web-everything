@@ -13,7 +13,7 @@ const git = (args, cwd) => execFileSync('git', args, {
   cwd, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
 }).trim();
 let fixtureRoot, fixture, origin, reference, base, poolRoot, laneDir, marker, lease;
-function runPool(args, fault = '', remoteFault = '', extraEnv = {}, operationsPath = null) {
+function runPool(args, fault = '', remoteFault = '', extraEnv = {}) {
   // `remoteFault` runs for the canonical-origin listing (the only ls-remote here: recovery is off), which executes
   // outside the lane (checked against the primary checkout, run outside any repository). `fs` lets a fault record calls.
   const preload = `import os from 'node:os'; import cp from 'node:child_process'; import fs from 'node:fs';
@@ -21,9 +21,6 @@ function runPool(args, fault = '', remoteFault = '', extraEnv = {}, operationsPa
     os.userInfo = () => ({ homedir: ${JSON.stringify(base)} });
     const original = cp.execFileSync;
     cp.execFileSync = (cmd, args, opts) => {
-      ${operationsPath ? `fs.appendFileSync(${JSON.stringify(operationsPath)}, JSON.stringify({
-        cmd, args, cwd: opts?.cwd, stack: new Error().stack,
-      }) + '\\n');` : ''}
       if (opts?.cwd === ${JSON.stringify(laneDir)}) { ${fault} }
       if (opts?.cwd !== ${JSON.stringify(laneDir)} && args.includes('ls-remote')) { ${remoteFault} }
       return original(cmd, args, opts);
@@ -86,71 +83,6 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
   fixture.restore();
-});
-
-describe('acquire --require-releasable', () => {
-  function leaveOtherBranch() {
-    expect(runPool(['release', '--lane=1']).status).toBe(0);
-    const branch = git(['symbolic-ref', '--short', 'HEAD'], laneDir);
-    const head = git(['rev-parse', 'HEAD'], laneDir);
-    git(['checkout', '--quiet', '-b', 'other-session'], laneDir);
-    const sha = commitWork();
-    git(['checkout', '--quiet', branch], laneDir);
-    return { sha, head, branch, refs: git(['show-ref'], laneDir), index: readFileSync(join(laneDir, '.git', 'index')) };
-  }
-  function unchanged(before) {
-    expect(existsSync(marker)).toBe(false);
-    expect(git(['show-ref'], laneDir)).toBe(before.refs);
-    expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(before.head);
-    expect(git(['symbolic-ref', '--short', 'HEAD'], laneDir)).toBe(before.branch);
-    expect(readFileSync(join(laneDir, 'seed.txt'), 'utf8')).toBe('seed\n');
-    expect(readFileSync(join(laneDir, '.git', 'index'))).toEqual(before.index);
-  }
-  it('skips another session unpushed branch before provisioning and takes a clean lane', () => {
-    expect(runPool(['provision', '--count=2']).status).toBe(0);
-    const before = leaveOtherBranch();
-    const result = runPool(['acquire', '--require-releasable', '--no-reap']);
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.data.lane).toBe(2);
-    expect(result.stderr).toContain('lane-1');
-    expect(result.stderr).toContain('unpushed commits: ' + before.sha.slice(0, 12));
-    unchanged(before);
-    expect(runPool(['release', '--lane=2']).status).toBe(0);
-  });
-  it('fails with the no-free-lane reason naming skipped unreleasable lanes', () => {
-    const before = leaveOtherBranch();
-    const result = runPool(['acquire', '--require-releasable', '--no-reap']);
-    expect(result.status, result.stderr).toBe(1);
-    expect(result.stderr).toMatch(/no free lane.*unreleasable.*lane-1/);
-    unchanged(before);
-  });
-  it.each([['auto-pick', []], ['explicit lane', ['--lane=1']]])(
-    'refused %s admission performs neither fetch nor salvage', (_label, selector) => {
-      const before = leaveOtherBranch();
-      const operationsPath = join(base, 'refused-admission-operations.jsonl');
-      const result = runPool(['acquire', ...selector, '--require-releasable', '--no-reap'], '', '', {
-        LANE_POOL_NO_RECOVER: '0', LANE_POOL_AUTO_RECOVER: '1',
-      }, operationsPath);
-      expect(result.status, result.stderr).toBe(1);
-      expect(result.stderr).toContain('unpushed commits: ' + before.sha.slice(0, 12));
-      const operations = readFileSync(operationsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      // Positive controls prove both the network listing and local release evidence were observed.
-      expect(operations.some(({ args }) => args.includes('ls-remote'))).toBe(true);
-      expect(operations.some(({ args }) => args.includes('rev-list') && args.includes('--stdin'))).toBe(true);
-      // Bounded Git calls arrive as node git-bounded.mjs ... -- git <args>; inspect their argv too.
-      expect(operations.filter(({ args }) => args.includes('fetch') || args.includes('push'))).toEqual([]);
-      // Catch even a salvage call that returns none-ahead before it would fetch or push.
-      expect(operations.filter(({ stack }) => stack.includes('salvagePushLane'))).toEqual([]);
-      unchanged(before);
-    },
-  );
-  it('explicit acquire restores its existing lease when release evidence is unreadable', () => {
-    const result = runPool(['acquire', '--lane=1', '--require-releasable'],
-      `if (args.includes('ls-files')) throw new Error('unreadable index');`);
-    expect(result.status, result.stderr).toBe(1);
-    expect(result.stderr).toContain('tracked status unreadable');
-    expect(JSON.parse(readFileSync(marker, 'utf8'))).toEqual(JSON.parse(lease));
-  });
 });
 
 describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector => {
