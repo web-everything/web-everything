@@ -29,9 +29,13 @@ export function validateMechanicalClearance(facts = {}) {
     || facts.commitCount < 1 || facts.commits.length !== facts.commitCount
     || !Array.isArray(facts.files) || facts.files.length >= 300
     || typeof facts.content !== 'string' || Buffer.byteLength(facts.content) > MAX_BYTES
+    || typeof facts.baseContent !== 'string' || Buffer.byteLength(facts.baseContent) > MAX_BYTES
     || !Array.isArray(facts.existingFiles) || !Array.isArray(facts.checks)) {
     return fail('read-error', 'Incomplete or unreadable evidence; use normal review of the full PR.');
   }
+  let baseData;
+  try { baseData = JSON.parse(facts.baseContent); } catch { return fail('read-error', 'Unreadable base timing JSON; use normal review of the full PR.'); }
+  if (!plain(baseData)) return fail('read-error', 'Unreadable base timing schema; use normal review of the full PR.');
   if (facts.author?.login !== 'web-everything[bot]' || facts.author?.type !== 'Bot') return fail('author', 'PR author is not the repository App bot.');
   if (!facts.commits.every(c => IDENTITIES.has(c?.author?.login) && IDENTITIES.has(c?.committer?.login))) return fail('commit-identity', 'Every commit must have linked workflow author and committer identities.');
   if (facts.files.length !== 1 || facts.files[0]?.filename !== TIMINGS_PATH) return fail('diff-scope', 'Net diff must touch only test-timings.json.');
@@ -43,8 +47,10 @@ export function validateMechanicalClearance(facts = {}) {
     || (Object.hasOwn(data, '_doc') && typeof data._doc !== 'string')) return fail('schema', 'Unexpected top-level timing schema.');
   const keys = [];
   for (const group of ['unit', 'soak']) {
-    if (!Object.hasOwn(data, group)) continue;
-    if (!plain(data[group])) return fail('schema', 'Timing groups must be objects.');
+    if (!Object.hasOwn(data, group) || !plain(data[group]) || !Object.keys(data[group]).length) return fail('schema', `Timing group ${group} must be a non-empty plain object.`);
+    const headKeys = Object.keys(data[group]);
+    const baseKeys = plain(baseData[group]) ? Object.keys(baseData[group]) : [];
+    if (headKeys.length < Math.ceil(0.9 * baseKeys.length)) return fail('schema', `Timing group ${group} retains ${headKeys.length}/${baseKeys.length} keys, below 90%; use normal review of the full PR.`);
     for (const [key, value] of Object.entries(data[group])) {
       if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 3600) return fail('schema', 'Durations must be finite seconds between 0 and 3600.');
       keys.push(key);
@@ -146,15 +152,17 @@ export function readMechanicalClearanceFacts({ repo, num, exec = execFileSyncThr
     facts.baseEntry = entryAt(pr.base.sha);
     facts.headEntry = entryAt(facts.head);
     // A non-blob has no readable blob content; retain shape evidence for the policy refusal.
-    if (facts.headEntry.type !== 'blob') facts.content = '{}';
-    else {
-      const blob = api(`git/blobs/${facts.headEntry.sha}`);
+    const readBlob = entry => {
+      if (entry.type !== 'blob') return '{}';
+      const blob = api(`git/blobs/${entry.sha}`);
       if (!Number.isInteger(blob.size) || blob.size > MAX_BYTES || blob.size < 0 || blob.encoding !== 'base64'
         || typeof blob.content !== 'string' || !/^[A-Za-z0-9+/=\r\n]*$/.test(blob.content)) throw Error('unreadable or oversized blob');
       const bytes = Buffer.from(blob.content, 'base64');
       if (bytes.length !== blob.size) throw Error('incomplete blob');
-      facts.content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    }
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    };
+    facts.baseContent = readBlob(facts.baseEntry);
+    facts.content = readBlob(facts.headEntry);
     if (listFiles) facts.existingFiles = listFiles(facts.head);
     else {
       live('git', ['fetch', '--no-tags', '--no-write-fetch-head', `https://github.com/${repo}.git`, facts.head], { ...OPTIONS, cwd });

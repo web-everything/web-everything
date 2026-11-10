@@ -10,7 +10,8 @@ const facts = () => ({ head, author: { login: 'web-everything[bot]', type: 'Bot'
   commits: [{ author: { login: 'github-actions[bot]' }, committer: { login: 'github-actions[bot]' } }],
   files: [{ filename: path, status: 'modified' }],
   baseEntry: { type: 'blob', mode: '100644' }, headEntry: { type: 'blob', mode: '100644' },
-  content: JSON.stringify({ _doc: 'Seconds', unit: { [testPath]: 450 }, soak: {} }),
+  content: JSON.stringify({ _doc: 'Seconds', unit: { [testPath]: 450 }, soak: { [testPath]: 1 } }),
+  baseContent: JSON.stringify({ unit: { [testPath]: 450 }, soak: { [testPath]: 1 } }),
   existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, appId: GITHUB_ACTIONS_APP_ID, conclusion: 'SUCCESS', status: 'completed', id: 1 })) });
 
 describe('mechanical clearance', () => {
@@ -32,11 +33,43 @@ describe('mechanical clearance', () => {
   fail('malformed JSON', 'schema', f => f.content = '{');
   fail('unknown top-level key', 'schema', f => f.content = '{"other":{}}');
   fail('doc must be text', 'schema', f => f.content = '{"_doc":1}');
-  for (const value of ['-1', 'NaN', '"1"', '3601']) fail(`invalid seconds ${value}`, 'schema', f => f.content = `{"unit":{"${testPath}":${value}}}`);
+  for (const value of ['-1', 'NaN', '"1"', '3601']) fail(`invalid seconds ${value}`, 'schema', f => f.content = `{"unit":{"${testPath}":${value}},"soak":{"${testPath}":1}}`);
   for (const key of ['README.md', '../a.test.ts', '/a.test.ts', 'a\\b.test.ts', 'missing.test.ts']) {
-    fail(`invalid or missing test ${key}`, 'keys', f => f.content = JSON.stringify({ unit: { [key]: 1 } }));
+    fail(`invalid or missing test ${key}`, 'keys', f => f.content = JSON.stringify({ unit: { [key]: 1 }, soak: { [testPath]: 1 } }));
   }
-  it('removed keys pass', () => { const f = facts(); f.content = '{"unit":{}}'; f.existingFiles = []; expect(validateMechanicalClearance(f).cleared).toBe(true); });
+  fail('empty document refuses', 'schema', f => f.content = '{}');
+  for (const group of ['unit', 'soak']) {
+    fail(`missing ${group} refuses`, 'schema', f => { const data = JSON.parse(f.content); delete data[group]; f.content = JSON.stringify(data); });
+    for (const value of [{}, [], null, 1]) fail(`invalid or empty ${group} ${JSON.stringify(value)} refuses`, 'schema', f => {
+      const data = JSON.parse(f.content); data[group] = value; f.content = JSON.stringify(data);
+    });
+    it.each([50, 89, 90, 110])(`${group} retains %i of 100 base keys`, count => {
+      const f = facts();
+      const entries = n => Object.fromEntries(Array.from({ length: n }, (_, i) => [`${i}.test.ts`, 1]));
+      f.baseContent = JSON.stringify({ ...JSON.parse(f.baseContent), [group]: entries(100) });
+      f.content = JSON.stringify({ ...JSON.parse(f.content), [group]: entries(count) });
+      f.existingFiles.push(...Object.keys(entries(count)));
+      const result = validateMechanicalClearance(f);
+      if (count >= 90) expect(result.cleared).toBe(true);
+      else {
+        expect(result).toMatchObject({ cleared: false, rule: 'schema' });
+        expect(result.reasons[0]).toContain(`${group} retains ${count}/100`);
+        expect(result.reasons[0]).toContain('normal review');
+      }
+    });
+    it(`${group} rounds the 90% minimum up`, () => {
+      const f = facts(); const data = JSON.parse(f.baseContent); data[group]['removed.test.ts'] = 1;
+      f.baseContent = JSON.stringify(data);
+      expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'schema' });
+    });
+    for (const base of [{}, { [group]: {} }]) it(`non-empty ${group} passes with base ${JSON.stringify(base)}`, () => {
+      const f = facts(); f.baseContent = JSON.stringify(base);
+      expect(validateMechanicalClearance(f).cleared).toBe(true);
+    });
+  }
+  fail('missing base refuses', 'read-error', f => delete f.baseContent);
+  fail('unparsable base refuses', 'read-error', f => f.baseContent = '{');
+  fail('oversized base requires normal review', 'read-error', f => f.baseContent = ' '.repeat(4 * 1024 * 1024 + 1));
   for (const conclusion of ['FAILURE', 'PENDING', 'CANCELLED', 'NEUTRAL', 'SKIPPED', null]) fail(`required check ${conclusion}`, 'checks', f => f.checks[0].conclusion = conclusion);
   fail('missing required check', 'checks', f => f.checks.pop());
   fail('nonrequired failure', 'checks', f => f.checks.push({ name: 'other', conclusion: 'TIMED_OUT' }));
@@ -93,7 +126,7 @@ describe('mechanical clearance', () => {
   fail('required check missing app id', 'checks', f => delete f.checks[0].appId);
   fail('compare cap', 'read-error', f => f.files = Array(300).fill(f.files[0]));
   fail('oversized blob requires normal review', 'read-error', f => f.content = ' '.repeat(4 * 1024 * 1024 + 1));
-  fail('too many timing keys requires normal review', 'schema', f => f.content = JSON.stringify({ unit: Object.fromEntries(Array.from({ length: 20001 }, (_, i) => [`${i}.test.ts`, 1])) }));
+  fail('too many timing keys requires normal review', 'schema', f => f.content = JSON.stringify({ unit: Object.fromEntries(Array.from({ length: 20001 }, (_, i) => [`${i}.test.ts`, 1])), soak: { [testPath]: 1 } }));
   fail('read error', 'read-error', f => f.readError = true);
 });
 
@@ -112,10 +145,10 @@ const io = ({ moved = false, broken = null, truncated = false, mutate = (_url, v
     else if (url.includes('/compare/')) value = { files: truncated ? Array(300).fill(facts().files[0]) : facts().files };
     else if (url.includes('/git/trees/')) {
       const ref = url.split('/').at(-1);
-      value = { truncated: false, tree: ref === 'scripts-tree' ? [{ path: 'ci', type: 'tree', sha: 'ci-tree' }]
-        : ref === 'ci-tree' ? [{ path: 'test-timings.json', type: 'blob', mode: '100644', sha: 'blob' }]
-          : [{ path: 'scripts', type: 'tree', sha: 'scripts-tree' }] };
-    } else if (url.includes('/git/blobs/')) { const content = facts().content; value = { encoding: 'base64', content: Buffer.from(content).toString('base64'), size: Buffer.byteLength(content) }; }
+      value = { truncated: false, tree: ['scripts-tree', 'base-scripts-tree'].includes(ref) ? [{ path: 'ci', type: 'tree', sha: ref.startsWith('base-') ? 'base-ci-tree' : 'ci-tree' }]
+        : ['ci-tree', 'base-ci-tree'].includes(ref) ? [{ path: 'test-timings.json', type: 'blob', mode: '100644', sha: ref === 'base-ci-tree' ? 'base-blob' : 'blob' }]
+          : [{ path: 'scripts', type: 'tree', sha: ref === 'b'.repeat(40) ? 'base-scripts-tree' : 'scripts-tree' }] };
+    } else if (url.includes('/git/blobs/')) { const content = url.endsWith('/base-blob') ? facts().baseContent : facts().content; value = { encoding: 'base64', content: Buffer.from(content).toString('base64'), size: Buffer.byteLength(content) }; }
     else if (url.includes('/check-runs')) value = { total_count: 5, check_runs: REQUIRED_MECHANICAL_CHECKS.map((name, index) => ({
       name, app: { id: GITHUB_ACTIONS_APP_ID }, id: index + 1, head_sha: head, status: 'completed', conclusion: 'success', started_at: '2026-11-10T12:00:00Z',
     })) };
@@ -139,11 +172,27 @@ describe('IO closes on incomplete evidence', () => {
       expect(validateMechanicalClearance(read({ mutate }))).toMatchObject({ cleared: false, rule: 'checks' });
     });
   }
+  it('reads the pinned base blob into baseContent', () => expect(read().baseContent).toBe(facts().baseContent));
+  for (const endpoint of ['base-blob', 'blob']) for (const [name, change] of [
+    ['oversized', v => ({ ...v, size: 4 * 1024 * 1024 + 1 })],
+    ['truncated', v => ({ ...v, content: '' })],
+    ['wrong encoding', v => ({ ...v, encoding: 'utf8' })],
+    ['invalid base64', v => ({ ...v, content: '!' })],
+    ['invalid UTF-8', v => ({ ...v, size: 1, content: '/w==' })],
+  ]) it(`${endpoint} ${name} fails closed`, () => {
+    const f = read({ mutate: (url, v) => url.endsWith(`/blobs/${endpoint}`) ? change(v) : v });
+    expect(f.readError).toBe(true);
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'read-error' });
+  });
+  it('unparsable base blob fails closed', () => {
+    const f = read({ mutate: (url, v) => url.endsWith('/base-blob') ? { ...v, size: 1, content: 'ew==' } : v });
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'read-error' });
+  });
   it('head moved', () => expect(validateMechanicalClearance(read({ moved: true })).rule).toBe('read-error'));
   it('compare truncated', () => expect(validateMechanicalClearance(read({ truncated: true })).rule).toBe('read-error'));
   it('any API failure', () => expect(validateMechanicalClearance(read({ broken: 'repos/owner/repo/pulls/1' })).rule).toBe('read-error'));
   for (const suffix of ['pulls/1/commits?per_page=100&page=1', `compare/${'b'.repeat(40)}...${head}?per_page=100&page=1`,
-    `git/trees/${head}`, 'git/trees/scripts-tree', 'git/trees/ci-tree', 'git/blobs/blob',
+    `git/trees/${head}`, 'git/trees/scripts-tree', 'git/trees/ci-tree', 'git/blobs/blob', 'git/blobs/base-blob',
     `commits/${head}/check-runs?filter=all&per_page=100&page=1`, `commits/${head}/statuses?per_page=100&page=1`]) {
     it(`read failure at ${suffix}`, () => expect(validateMechanicalClearance(read({ broken: `repos/owner/repo/${suffix}` })).rule).toBe('read-error'));
   }
