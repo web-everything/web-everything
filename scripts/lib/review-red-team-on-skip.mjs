@@ -719,7 +719,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     try { posted = publisher({ repo, pr, headSha: head }); }
     catch (error) { posted = { ok: false, reason: safeErrorText(error) }; }
     if (posted?.ok === true) return;
-    const reason = `red-team check not published: ${posted?.reason ?? 'unknown error'}`;
+    // `detail` names a superseding post that did not land (the one fail-open case), so the log never hides it.
+    const reason = `red-team check not published: ${posted?.reason ?? 'unknown error'}${posted?.detail ? ` (${posted.detail})` : ''}`;
     if (readRedTeamGateSource({ env }).value.source !== 'drain-scan') throw Error(reason);
     note(`review-daemon: ${repo}#${pr} ${reason} (redTeamGate.source=drain-scan: settlement continues)`);
   };
