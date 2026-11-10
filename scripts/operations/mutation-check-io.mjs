@@ -97,7 +97,7 @@ export function runSuite({ cwd, suite, run, maxFailures = 20, timeoutMs = 0 }) {
     exitStatus = e?.status;
     bufferCut = e?.code === 'ENOBUFS';
     // The wrapper enforces the ceiling from slot grant and reports it as exit 124 (+ its own stderr line).
-    timeoutHit = e?.code === 'ETIMEDOUT' || (timeoutMs > 0 && e?.status === 124 && /exceeded \d+ms and was stopped/.test(String(e?.stderr ?? '')));
+    timeoutHit = e?.code === 'ETIMEDOUT' || (timeoutMs > 0 && e?.status === 124 && /^(?:⚠ )?(?:heavy-command admission: run exceeded \d+ms and was stopped|heavy-admission: remote failed \(remote-timeout\))/m.test(String(e?.stderr ?? '')));
     // Non-zero exit is the NORMAL path for a red suite — the output is on the error, and it is the output
     // that decides `ran`.
     //

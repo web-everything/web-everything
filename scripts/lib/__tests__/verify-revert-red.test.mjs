@@ -378,6 +378,11 @@ describe('parts', () => {
     expect(seen[0].args).toContain('--run-ceiling-ms=1234');
     expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw wrapperKilled(); }, timeoutMs: 1234 })).toMatchObject({ ran: false, timedOut: true });
     expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw Object.assign(new Error('x'), { status: 124, stdout: '', stderr: 'other' }); }, timeoutMs: 1234 }).timedOut).toBe(false);
+    // The remote path's own timeout line counts; the phrase buried mid-line in other output does not.
+    const remote = Object.assign(new Error('x'), { status: 124, stdout: 'Test Files  1 failed (1)\n', stderr: 'heavy-admission: remote failed (remote-timeout) - remote termination unconfirmed; refusing local rerun (exit 124).\n' });
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw remote; }, timeoutMs: 1234 })).toMatchObject({ ran: false, timedOut: true });
+    const spoof2 = Object.assign(new Error('x'), { status: 124, stdout: 'Tests  1 passed (1)\n', stderr: ' log: run exceeded 7ms and was stopped\n' });
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw spoof2; }, timeoutMs: 1234 }).timedOut).toBe(false);
     expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, opts) => { expect(opts.timeout).toBeUndefined(); expect(_a.join(' ')).not.toContain('run-ceiling'); return 'Test Files  1 passed (1)\n'; } })).toMatchObject({ ran: true, timedOut: false });
   });
 
