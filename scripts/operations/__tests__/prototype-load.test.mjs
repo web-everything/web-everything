@@ -368,10 +368,23 @@ describe('prototype-load ruled-WEAKENED admission', () => {
       expect(mutations(extra, 'add')).toHaveLength(0);
     } finally { warning.mockRestore(); }
   });
+  it('R850: empty/malformed canonical findings and a second base\'s undisclosed finding both refuse the ruling', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const OTHER = 'd'.repeat(40);
+      for (const audits of [
+        [auditRecord({ verdict: 'WEAKENED', findings: [] })],
+        [auditRecord({ verdict: 'WEAKENED', findings }), auditRecord({ verdict: 'WEAKENED', base: OTHER, findings: ['x.mjs:2 other base weakening'] })],
+      ]) {
+        const f = auditedFixture('refuse', { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, auditBaseInMain: TREE, audits: auditLines(audits) });
+        expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'ruled-weakened-findings-mismatch' });
+      }
+    } finally { warning.mockRestore(); }
+  });
   it('R850: a ruled exception with a canonical WEAKENED record loads in the default (refuse) mode', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      const f = auditedFixture(undefined, { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, });
+      const f = auditedFixture(undefined, { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: findings })]), auditBaseInMain: TREE, });
       expect(await f.run()).toMatchObject({ ok: true, registered: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     } finally { warning.mockRestore(); }
   });
@@ -379,7 +392,7 @@ describe('prototype-load ruled-WEAKENED admission', () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const f = auditedFixture('warn', {
-        ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, 
+        ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: findings })]), auditBaseInMain: TREE, 
       });
       expect(await f.run()).toMatchObject({
         ok: true, registered: true, adopted: true, stopReason: null,
@@ -934,7 +947,7 @@ describe('prototype-load', () => {
   it('a ready record plus a ruled-WEAKENED exception still loads (R825/R844 path unchanged)', async () => {
     const entry = { ref: BASE.branch, sha: SHA, ruling: 'R999', findings: ['f1'] };
     const rec = { ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R999', auditDisclosed: ['f1'] };
-    const f = auditedFixture('warn', { ready: auditLines([rec]), audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, settings: { ruledWeakened: [entry] } });
+    const f = auditedFixture('warn', { ready: auditLines([rec]), audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['f1'] })]), auditBaseInMain: TREE, settings: { ruledWeakened: [entry] } });
     const out = await f.run();
     expect(out.gate).toMatchObject({ source: 'ready-record', ruledWeakened: { ruling: 'R999' } });
     expect(out.stopReason).not.toBe('no-canonical-audit');
@@ -2346,10 +2359,10 @@ describe('readyEvidence fingerprint carry (R503)', () => {
   it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
     const ready = auditLines([weak()]);
     const settings = { ruledWeakened: [entry()] };
-    const ok = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    const ok = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: findings })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
-      const out = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint }).run();
+      const out = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: findings })]), auditBaseInMain: TREE, fingerprint }).run();
       expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
     }
   });
@@ -2744,10 +2757,10 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
   it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
     const ready = auditLines([weak()]);
     const settings = { ruledWeakened: [entry()] };
-    const ok = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    const ok = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: findings })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
-      const out = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint }).run();
+      const out = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings: findings })]), auditBaseInMain: TREE, fingerprint }).run();
       expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
     }
   });
