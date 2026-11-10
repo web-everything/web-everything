@@ -296,7 +296,7 @@ describe('remote controls', () => {
     }
     it('forwards non-default stuck thresholds into forge-slots-stuck events and re-signals only after the configured interval expires',async()=>{
       const {f,events}=stuckFixture({stuckMinSlots:3,stuckAgeMs:300000,stuckSignalEveryMs:10000},3);
-      expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+      expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
       const stuck=events.filter(e=>e.detail.reason==='stuck-slots');
       expect(stuck.length).toBeGreaterThanOrEqual(2);
       expect(stuck[0]).toMatchObject({kind:'forge-slots-stuck',daemon:'heavy-admission',
@@ -341,11 +341,11 @@ describe('remote controls', () => {
     const f=fixture();
     f.readTelemetry.mockImplementation(async()=>patch===null?Promise.reject(new Error('offline')):
       {...sample(now-(patch.age??0)),...Object.fromEntries(Object.entries(patch).filter(([key])=>key!=='age'))});
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining(trigger));
     const next={...f,readTelemetry:vi.fn(async()=>sample())};
-    expect(await runWithRemoteDecision(next)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(next)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(next.readTelemetry).not.toHaveBeenCalled();
   });
   it('caches one read across callers for 10 seconds, then rejects a stale sample', async () => {
@@ -419,7 +419,7 @@ describe('remote controls', () => {
       vi.useFakeTimers();vi.setSystemTime(now);
       const next=runWithRemoteDecision({...f,clock:Date.now});
       await vi.advanceTimersByTimeAsync(30000);
-      expect(await next).toEqual({handled:false});
+      expect(await next).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
       expect(f.remoteExec).not.toHaveBeenCalled();
       expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-full'));
       expect(existsSync(join(f.cwd,'remote','slot-0.unconfirmed'))).toBe(true);
@@ -439,7 +439,7 @@ describe('remote controls', () => {
     const marker=join(f.cwd,'remote','slot-0.unconfirmed');
     f.remoteExec.mockImplementation(async()=>{expect(existsSync(marker)).toBe(true);return result;});
     expect(await runWithRemoteDecision(f)).toEqual(result.mode==='remote'?
-      expect.objectContaining({handled:true,exitCode:result.code,remoteResult:expect.objectContaining(result)}):{handled:false});
+      expect.objectContaining({handled:true,exitCode:result.code,remoteResult:expect.objectContaining(result)}):{ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(existsSync(marker)).toBe(false);
     expect(heldSlots({lockRoot:join(f.cwd,'remote'),cap:1})).toHaveLength(0);
   });
@@ -448,7 +448,7 @@ describe('remote controls', () => {
     mkdirSync(remoteRoot);
     // existsSync cannot see a dangling link; exclusive creation must still refuse it.
     symlinkSync(join(f.cwd,'missing-evidence'),join(remoteRoot,'slot-0.unconfirmed'));
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-execution-marker-unwritable'));
     expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(0);
@@ -459,7 +459,7 @@ describe('remote controls', () => {
     for(let i=0;i<3;i++)await runWithRemoteDecision(f);
     const count=f.remoteExec.mock.calls.length;
     expect(count).toBe(3);
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).toHaveBeenCalledTimes(3);
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining(reason));
     f.remoteExec.mockResolvedValue({mode:'remote',code:0});
@@ -475,7 +475,7 @@ describe('remote controls', () => {
     await vi.advanceTimersByTimeAsync(0);
     const second=runWithRemoteDecision(f);
     await vi.advanceTimersByTimeAsync(30000);
-    expect(await second).toEqual({handled:false});
+    expect(await second).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-full'));
     resolve({mode:'remote',code:0});await first;
@@ -510,7 +510,7 @@ describe('remote controls', () => {
       });
       release({mode:'remote',code:0});await first;
       await vi.advanceTimersByTimeAsync(1000);
-      expect(await waiting).toEqual(trigger?{handled:false}:
+      expect(await waiting).toEqual(trigger?{ handled: false, fallbackReason: expect.any(String), fallbackDetail: null }:
         expect.objectContaining({handled:true,exitCode:0,remoteResult:expect.objectContaining({mode:'remote',code:0})}));
       expect(f.readTelemetry).toHaveBeenCalledTimes(waitMs>=10000?2:1);
       expect(f.remoteExec).toHaveBeenCalledTimes(trigger?0:1);
@@ -522,7 +522,7 @@ describe('remote controls', () => {
         expect(state.trigger).toBe(trigger);
         expect(state.backoffUntil).toBeGreaterThan(Date.now());
         // A subsequent caller observes the persisted refusal without another read.
-        expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+        expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
         expect(f.readTelemetry).toHaveBeenCalledTimes(2);
         expect(f.remoteExec).not.toHaveBeenCalled();
       }
@@ -533,7 +533,7 @@ describe('remote controls', () => {
   it('keeps an active backoff when quarantining extra-key persisted evidence', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));
     writeFileSync(join(f.cwd,'remote','health.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:Number.MAX_SAFE_INTEGER,trigger:'copy-failed',lastGoodAt:1}));
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('backoff-copy-failed'));
   });

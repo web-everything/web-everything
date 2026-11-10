@@ -333,7 +333,7 @@ describe('adaptLegacyRemoteResult', () => {
     const adapted = adaptLegacyRemoteResult(legacy);
     expect(adapted).toEqual({ mode: 'not-started', terminated: true, reason });
     expect(legacy).toEqual({ mode: 'fallback', reason });
-    expect(await runWithRemoteDecision(fixture({ result: adapted }))).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(fixture({ result: adapted }))).toEqual({ handled: false, fallbackReason: reason, fallbackDetail: null });
     expect(await runWithRemoteDecision(fixture({ result: legacy }))).toEqual({ handled: true, exitCode: 124 });
   });
 
@@ -356,7 +356,7 @@ describe('adaptLegacyRemoteResult', () => {
   it('uses the adapter in the default remote executor for an ineligible command', async () => {
     const f = fixture({});
     expect(await runWithRemoteDecision({ ...f, argv: ['node', 'ineligible.mjs'], remoteExec: undefined }))
-      .toEqual({ handled: false });
+      .toEqual({ handled: false, fallbackReason: 'command-not-allowed', fallbackDetail: 'node' });
     expectFallback(f.log, 'command-not-allowed');
   });
 });
@@ -424,7 +424,7 @@ describe('runWithRemoteDecision', () => {
   ('records exactly one structured fallback for %s / %s', async (mode, reason) => {
     const f = fixture({result:{mode,terminated:true,reason,detail:'fixture-file.mjs'}});
     const now = Date.now();
-    expect(await runWithRemoteDecision({...f,clock:()=>now})).toEqual({handled:false});
+    expect(await runWithRemoteDecision({...f,clock:()=>now})).toEqual({ handled: false, fallbackReason: reason, fallbackDetail: 'fixture-file.mjs' });
     const lines = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason,
@@ -433,7 +433,7 @@ describe('runWithRemoteDecision', () => {
 
   it('records health refusals without dispatching remotely', async () => {
     const f = fixture();
-    expect(await runWithRemoteDecision({...f,readTelemetry:async()=>null})).toEqual({handled:false});
+    expect(await runWithRemoteDecision({...f,readTelemetry:async()=>null})).toEqual({ handled: false, fallbackReason: 'forge-unreachable', fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(1);
@@ -445,18 +445,18 @@ describe('runWithRemoteDecision', () => {
     mkdirSync(f.lockRoot,{recursive:true});
     const file = join(f.lockRoot,'remote-fallbacks.jsonl');
     writeFileSync(file,'x'.repeat(2*1024*1024));
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'copy-failed', fallbackDetail: 'x'.repeat(20000) });
     expect(statSync(file).size).toBeLessThanOrEqual(1024*1024);
     const last = JSON.parse(readFileSync(file,'utf8').trim().split('\n').at(-1));
     expect(last.detail.length).toBeLessThanOrEqual(4096);
     rmSync(file); mkdirSync(file);
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'copy-failed', fallbackDetail: 'x'.repeat(20000) });
   });
 
   it.each(['not-started', 'cancelled'])('%s with terminated=true falls back to local admission', async (mode) => {
     const reason = 'remote termination confirmed';
     const f = fixture({ result: { mode, terminated: true, reason } });
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: reason, fallbackDetail: null });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expectFallback(f.log, reason);
   });
@@ -467,14 +467,14 @@ describe('runWithRemoteDecision', () => {
     ['x'.repeat(100),'x'.repeat(80)],
   ])('logs the sanitized and bounded refusal detail %j before local admission', async (detail,display) => {
     const f=fixture({result:{mode:'not-started',terminated:true,reason:'unshipped-symlink',detail}});
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'unshipped-symlink', fallbackDetail: detail });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log).toHaveBeenLastCalledWith(`heavy-admission: remote failed (fallback: unshipped-symlink (${display})) - falling back to local admission\n`);
   });
 
   it.each(['ignored-test-file', 'future-client-prelaunch-refusal'])('runs locally for confirmed non-start with arbitrary reason %s', async reason => {
     const f = fixture({result:{mode:'not-started', terminated:true, reason}});
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: reason, fallbackDetail: null });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expectFallback(f.log, reason);
     expect(f.log.mock.calls.some(([line]) => line.includes('exit 124'))).toBe(false);
@@ -500,7 +500,7 @@ describe('runWithRemoteDecision', () => {
       return { mode: 'not-started', terminated: true, reason: 'copy-failed' };
     });
     const outcome = await runWithRemoteDecision({ ...f, clock: () => now, timeoutMs: 2000 });
-    expect(outcome).toEqual({ handled: false });
+    expect(outcome).toEqual({ handled: false, fallbackReason: 'copy-failed', fallbackDetail: null });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(readsAfterExec).toBe(0);
     expect(existsSync(join(remoteRoot, 'slot-0.unconfirmed'))).toBe(false);
@@ -587,7 +587,7 @@ describe('runWithRemoteDecision', () => {
     f.remoteExec.mockImplementation(({ signal }) => new Promise((resolve) => {
       signal.addEventListener('abort', () => resolve({ mode: 'cancelled', terminated: true }), { once: true });
     }));
-    expect(await runWithRemoteDecision({ ...f, timeoutMs: 20 })).toEqual({ handled: false });
+    expect(await runWithRemoteDecision({ ...f, timeoutMs: 20 })).toEqual({ handled: false, fallbackReason: 'remote-timeout', fallbackDetail: null });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expectLines(f.log, 2, 'remote');
     expect(f.log.mock.calls[1][0]).toBe('heavy-admission: remote failed (remote-timeout) - falling back to local admission\n');
@@ -623,7 +623,7 @@ describe('runWithRemoteDecision', () => {
       expect(events).toEqual(['remote started', 'abort requested']);
       expect(local).not.toHaveBeenCalled();
       confirmTermination();
-      expect(await pending).toEqual({ handled: false });
+      expect(await pending).toEqual({ handled: false, fallbackReason: 'remote-timeout', fallbackDetail: null });
       expect(local).toHaveBeenCalledTimes(1);
       expect(events).toEqual(['remote started', 'abort requested', 'remote stopped', 'local started']);
       expect(vi.getTimerCount()).toBe(0);
@@ -789,7 +789,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
     writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: 1 }) + '\n');
     const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'remote-full (30s wait exhausted)', fallbackDetail: null });
     expect(existsSync(marker)).toBe(true);
     expect(f.remoteExec).not.toHaveBeenCalled();
   });
@@ -810,7 +810,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
       return {...telemetry, activeRuns: 1, recent: [{runId: run, startedAtET: telemetry.sampledAtET,
         stageMs: {install: 0, run: 0}, code: failure === 'legacy' ? null : failure}]};
     };
-    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'remote-full (30s wait exhausted)', fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(existsSync(marker)).toBe(true);
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('remote-full (30s wait exhausted)');
@@ -838,7 +838,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
 
   it('keeps the 30s remote-full fallback when the host is not overloaded', async () => {
     const f = await overloadFixture({ overloaded: false });
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'remote-full (30s wait exhausted)', fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('remote-full (30s wait exhausted)');
   });
@@ -846,14 +846,14 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
   it('treats a throwing overload check as not overloaded (today\'s fallback)', async () => {
     const f = await overloadFixture();
     f.hostOverloaded = vi.fn(() => { throw new Error('boom'); });
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'remote-full (30s wait exhausted)', fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
   });
 
   it('never exceeds maxConcurrent: a slot that never frees falls back at the run timeout', async () => {
     const f = await overloadFixture({ freeAtMs: null });
     f.timeoutMs = 120_000;
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('host overloaded; ');
   });
@@ -873,7 +873,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     f.sleep = vi.fn(async () => {
       if (f.log.mock.calls.some(c => /waiting for a remote slot/.test(c[0])) && existsSync(marker)) { rmSync(marker); offset = f.timeoutMs; }
     });
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
   });
 
@@ -882,7 +882,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     let reads = 0;
     const healthy = f.readTelemetry;
     f.readTelemetry = async () => (++reads === 1 ? healthy() : null);
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: 'forge-unreachable', fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.map(c => c[0]).join('')).toMatch(/remote unavailable \((forge-unreachable|backoff)/);
   });

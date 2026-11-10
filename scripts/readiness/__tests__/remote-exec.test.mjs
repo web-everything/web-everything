@@ -750,7 +750,7 @@ describe('standards input parity', () => {
         expect(callsOf(f.exec).filter(isReceipt)).toHaveLength(1);
         return result;
       },
-    })).toEqual({handled:false});
+    })).toEqual({ handled: false, fallbackReason: 'incomplete-standards-inputs', fallbackDetail: null });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
   });
 
@@ -1023,7 +1023,7 @@ describe('runRemote', () => {
       ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
       remoteExec:async () => adaptLegacyRemoteResult(await runRemote(options)),
     });
-    expect(decision).toEqual({handled:false});
+    expect(decision).toEqual({ handled: false, fallbackReason: 'command-not-allowed', fallbackDetail: expect.any(String) });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('command-not-allowed'));
     expect(log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
     expect(stage).not.toHaveBeenCalled();
@@ -1054,7 +1054,7 @@ describe('runRemote', () => {
     expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:join(cwd,'heavy'),log,loadPerCore:()=>0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
       remoteExec:async options=>runRemote({...f,...options}),
-    })).toEqual({handled:false});
+    })).toEqual({ handled: false, fallbackReason: 'git-head-unavailable', fallbackDetail: null });
     expect(log.mock.calls.some(([message])=>message.includes('git-head-unavailable'))).toBe(true);
   });
   it('refuses a Mac HEAD change during snapshot construction before prepare or transport',async()=>{
@@ -1254,7 +1254,7 @@ describe('runRemote', () => {
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
     });
-    expect(result).toEqual({handled:false});
+    expect(result).toEqual({ handled: false, fallbackReason: 'ignored-test-file', fallbackDetail: expect.any(String) });
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
 
@@ -1296,7 +1296,7 @@ describe('runRemote', () => {
       argv:f.argv, cwd, env:f.env, lockRoot:f.lockRoot, log, loadPerCore:() => 0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
-    })).toEqual({handled:false});
+    })).toEqual({ handled: false, fallbackReason: 'unshipped-scan-file', fallbackDetail: expect.any(String) });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('unshipped-scan-file'));
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });

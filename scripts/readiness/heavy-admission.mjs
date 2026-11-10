@@ -54,7 +54,7 @@
  * for a while. v1 does not claim to solve that; it only bounds concurrency and makes the wait OBSERVABLE (the
  * `waiting` intent markers this module writes, which `tick-core.mjs` surfaces as `waiting-for-capacity` notes).
  *
- * A GENERAL-PURPOSE `run` CLI MODE — `node scripts/readiness/heavy-admission.mjs run [--container] -- <cmd…>`
+ * A GENERAL-PURPOSE `run` CLI MODE — `node scripts/readiness/heavy-admission.mjs run [--container] [--local-justification=<text>] -- <cmd…>`
  * wraps `acquire → run <cmd> → release` in one call ({@link runUnderAdmission}), so any caller can opt into
  * this SAME semaphore without hand-rolling the acquire/execute/release sequence itself.
  *
@@ -101,6 +101,10 @@
  * (standard → platform preferences); remote has no env mapping. Their env and
  * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
+ * Settings: heavyAdmission.fullLocalFallback = refuse (default) | justified | allow controls FULL/soak
+ * local execution after a remote fallback. --local-justification=<text> explicitly permits it in refuse or
+ * justified mode, with bounded caller/text audit history. WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK and tool
+ * overrides apply only to private pools; this is not a per-caller setting.
  * Settings: heavyAdmission.remote.clientPath selects an external remote-exec.mjs outside all lane pools.
  * Remove the setting to revert to the bundled client; no environment mapping.
  *
@@ -236,7 +240,7 @@ const REAP_LOG = 'reaped.jsonl';
 
 export const ADMISSION_DEFERRED_EXIT = 75; // EX_TEMPFAIL: re-queue; the command did not run.
 export const ADMISSION_POLICY_STANDARD = Object.freeze({
-  cap: DEFAULT_ADMISSION_CAP, fastSlots: 1, onTimeout: 'defer',
+  cap: DEFAULT_ADMISSION_CAP, fastSlots: 1, onTimeout: 'defer', fullLocalFallback: 'refuse',
   // heavy-run-wait — how long `run` keeps re-trying admission (load gate + slot queue) before exiting 75. 0 = today's
   // behavior (defer at once on host load). Per caller: it only bounds this caller's own wait, never shared capacity.
   runWaitMs: 0,
@@ -268,6 +272,7 @@ const ADMISSION_MAX_SLOTS = 256;
 const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADMISSION_MAX_SLOTS;
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
+  fullLocalFallback: (v) => ['refuse', 'justified', 'allow'].includes(v),
   runWaitMs: (v) => isValidRunWaitMs(v),
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
   'fastScale.minShortWaiters': admissionInt(1),
@@ -297,6 +302,7 @@ const ADMISSION_VALID = {
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
+  fullLocalFallback: 'WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK',
   runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
@@ -306,7 +312,7 @@ const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs']);
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
   if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
-  if (leaf === 'onTimeout' || leaf === 'priority.mode') return s.toLowerCase();
+  if (leaf === 'onTimeout' || leaf === 'fullLocalFallback' || leaf === 'priority.mode') return s.toLowerCase();
   return s === '' ? NaN : Number(s);
 }
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -353,7 +359,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
 }
 
 /**
- * PURE: valid leaves override standard → platform → tool → env. Capacity and priority (everything but onTimeout) of
+ * PURE: valid leaves override standard → platform → tool → env. Host-wide leaves (everything but onTimeout and runWaitMs) of
  * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
  * give two callers of one pool different caps or queue ordering. A private pool (see {@link privateAdmissionPool})
  * keeps both local override layers, except remote.clientPath is always platform-only.
@@ -388,6 +394,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
         if (leaf === 'remote.slotUnitsByKind') { value = {}; sources[leaf] = layer; }
         if (leaf === 'remote.elasticSlots.enabled') { value = false; sources[leaf] = layer; }
+        if (leaf === 'fullLocalFallback') { value = 'refuse'; sources[leaf] = `${layer} (invalid; fail closed)`; }
         if (leaf === 'remote.autoSlotUnits') { value = 1; sources[leaf] = layer; }
       }
     }
@@ -399,7 +406,10 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       } else {
         const v = parseAdmissionEnv(leaf, raw);
         if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
-        else invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
+        else {
+          invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
+          if (leaf === 'fullLocalFallback' && String(raw).trim() !== '') { value = 'refuse'; sources[leaf] = `env ${name} (invalid; fail closed)`; }
+        }
       }
     }
     const keys = leaf.split('.');
@@ -467,7 +477,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
+  const values = ['cap', 'fastSlots', 'onTimeout', 'fullLocalFallback', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
@@ -852,12 +862,18 @@ export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmis
 }
 
 // Diagnostic history is best-effort and bounded, including oversized refusal details.
-function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, clock}) {
+function boundedFallbackText(value) {
+  const text = String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?');
+  return text.length > 4096 ? `${text.slice(0, 4085)}[truncated]` : text;
+}
+function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, clock, outcome, justification, owner, lane}) {
   try {
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
-    const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
+    const bounded = boundedFallbackText;
     const row = {ts:new Date(clock()).toISOString(), reason:bounded(reason),
-      detail:detail == null ? null : bounded(detail), lane:basename(cwd),
+      detail:detail == null ? null : bounded(detail), lane:bounded(lane ?? basename(cwd)),
+      ...(outcome ? { outcome } : {}), ...(justification ? { justification: bounded(justification) } : {}),
+      ...(owner != null ? { owner: bounded(owner) } : {}),
       kind:classifyCommandKind(argv.map(shellQuoteWord).join(' '), env)};
     mkdirSync(lockRoot, {recursive:true});
     const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
@@ -914,10 +930,10 @@ export async function runWithRemoteDecision({
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
-  const localFallback = (reason) => {
-    recordRemoteFallback({lockRoot, reason, cwd, argv, env, clock});
+  const localFallback = (reason, detail = null) => {
+    recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
-    return { handled: false };
+    return { handled: false, fallbackReason: reason, fallbackDetail: detail };
   };
   const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
   const healthy = await health();
@@ -1145,7 +1161,7 @@ export async function runWithRemoteDecision({
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
-  return { handled: false };
+  return { handled: false, fallbackReason: reason, fallbackDetail: detail ?? null };
 }
 
 /** PURE: scale short-job capacity only with enough demand and a fresh, healthy resource snapshot. */
@@ -2641,7 +2657,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
   }
   if (mode === 'run') {
     if (dashDashIdx === -1 || dashDashIdx === argv.length - 1) {
-      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--remote-client=] [--container] [--container-node-modules] -- <command…>\n`);
+      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--remote-client=] [--local-justification=<text>] [--container] [--container-node-modules] -- <command…>\n`);
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
@@ -2712,6 +2728,24 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         onDecision: decision => { reportLocalExecution ||= decision.remote; },
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
+      const kind = classifyCommandKind(command, process.env);
+      if (!result.handled && result.fallbackReason && (kind === 'FULL' || kind === 'soak')) {
+        const mode = policy.settings.fullLocalFallback;
+        process.stderr.write(`heavy-admission: fullLocalFallback=${mode} (${policy.sources.fullLocalFallback ?? 'standard'})\n`);
+        // Only an explicit non-empty CLI argument can justify this particular local run.
+        const justification = typeof flags['local-justification'] === 'string'
+          ? boundedFallbackText(flags['local-justification'].trim()) : '';
+        const outcome = mode === 'allow' ? 'allowed-local' : justification ? 'justified-local' : 'refused-local';
+        recordRemoteFallback({ lockRoot, reason: result.fallbackReason, detail: result.fallbackDetail,
+          cwd: repo, argv: remoteArgv, env: process.env, clock: Date.now, outcome,
+          ...(outcome === 'justified-local' ? { justification } : {}), owner, lane });
+        if (outcome === 'refused-local') {
+          const detail = result.fallbackDetail == null ? '' : ` (${boundedFallbackText(result.fallbackDetail)})`;
+          process.stderr.write(`heavy-admission: FULL run needs Forge; refused locally (reason: ${boundedFallbackText(result.fallbackReason)}${detail}); use --local-justification=<text> to justify a local run\n`);
+          process.exit(ADMISSION_DEFERRED_EXIT);
+        }
+        process.stderr.write(`heavy-admission: ${outcome} owner=${boundedFallbackText(owner)} lane=${boundedFallbackText(lane ?? basename(repo))}${outcome === 'justified-local' ? ` justification=${justification}` : ''}\n`);
+      }
       if (result.handled) {
         if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyCommandKind(command, process.env),
           receiptId: result.remoteResult.receiptId ?? result.remoteResult.run });
@@ -2751,7 +2785,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
   }
-  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [--local] [-- <command…>]\n`);
+  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [--local] [--local-justification=<text>] [-- <command…>]\n`);
   process.exit(3);
 }
 

@@ -353,7 +353,7 @@ describe('remote client override', () => {
     const f = fixture();
     f.policy.settings.remote.clientPath = 'relative/remote-exec.mjs';
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], policy: f.policy, cwd: f.root,
-      ...f.admission, env: {}, log: f.seams.log })).toEqual({ handled: false });
+      ...f.admission, env: {}, log: f.seams.log })).toEqual({ handled: false, fallbackReason: expect.stringMatching(/^remote client override: /), fallbackDetail: null });
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('clientPath must be absolute'));
   });
 
@@ -442,7 +442,7 @@ describe('remote client override', () => {
     f.policy.settings.remote.clientPath = path;
     const importClient = vi.fn();
     expect(resolveRemoteClient({ clientPath: path, laneRoots: f.seams.laneRoots }).reason).toEqual(expect.any(String));
-    expect(await f.run({ importClient })).toEqual({ handled: false });
+    expect(await f.run({ importClient })).toEqual({ handled: false, fallbackReason: expect.stringMatching(/^remote client override: /), fallbackDetail: null });
     expect(importClient).not.toHaveBeenCalled();
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('remote client override ignored ('));
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
@@ -488,7 +488,7 @@ describe('remote client override', () => {
     const importClient = vi.fn();
     expect(resolveRemoteClient({ clientPath: named, laneRoots: f.seams.laneRoots, fs }))
       .toEqual({ reason: 'clientPath is inside a lane pool' });
-    expect(await f.run({ fs, importClient })).toEqual({ handled: false });
+    expect(await f.run({ fs, importClient })).toEqual({ handled: false, fallbackReason: expect.stringMatching(/^remote client override: /), fallbackDetail: null });
     expect(importClient).not.toHaveBeenCalled();
     expect(fs.statSync).not.toHaveBeenCalled();
   });
@@ -508,7 +508,7 @@ describe('remote client override', () => {
     const importClient = vi.fn();
     expect(resolveRemoteClient({ clientPath, laneRoots: f.seams.laneRoots }))
       .toEqual({ reason: 'clientPath is inside a lane pool' });
-    expect(await f.run({ importClient })).toEqual({ handled: false });
+    expect(await f.run({ importClient })).toEqual({ handled: false, fallbackReason: expect.stringMatching(/^remote client override: /), fallbackDetail: null });
     expect(importClient).not.toHaveBeenCalled();
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
   });
@@ -571,7 +571,7 @@ describe('remote client override', () => {
 
   it('adapts forge-unreachable to local fallback after invocation', async () => {
     const f = fixture("export function runRemote() { return { mode: 'fallback', reason: 'forge-unreachable' }; }");
-    expect(await f.run()).toEqual({ handled: false });
+    expect(await f.run()).toEqual({ handled: false, fallbackReason: 'forge-unreachable', fallbackDetail: null });
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('fallback: forge-unreachable'));
   });
 
@@ -957,7 +957,7 @@ describe('remote client override', () => {
       return { runRemote: async () => ({ mode: 'remote', code: 0 }) };
     });
     expect(await f.run({ fs, importClient })).toEqual(kind === 'unreadable'
-      ? { handled: false }
+      ? { handled: false, fallbackReason: expect.stringMatching(/^remote client override: /), fallbackDetail: null }
       : kind === 'selected'
         ? { handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) }
         : { handled: true, exitCode: 124 });

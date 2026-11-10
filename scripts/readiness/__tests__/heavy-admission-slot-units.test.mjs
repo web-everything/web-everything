@@ -40,7 +40,7 @@ describe('R324 elastic remote slot units',()=>{
   it('FULL waits then falls back remote-units-unavailable with fewer than k free',async()=>{
     const f=fixture();
     for(let i=0;i<2;i++)tryAcquireSlot({lockRoot:f.remoteRoot,cap:4,slots:[i],owner:'occupied'+i,nowMs:f.clock(),nowIso:new Date(f.clock()).toISOString()});
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.sleep).toHaveBeenCalled();
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-units-unavailable');
@@ -49,7 +49,7 @@ describe('R324 elastic remote slot units',()=>{
   it('overload extension remains bounded and releases partial elastic reservations',async()=>{
     const f=fixture();f.hostOverloaded=()=>true;f.timeoutMs=35000;
     for(let i=0;i<2;i++)tryAcquireSlot({lockRoot:f.remoteRoot,cap:4,slots:[i],owner:'occupied'+i,nowMs:f.clock(),nowIso:new Date(f.clock()).toISOString()});
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-units-unavailable');
     expect(heldSlots({lockRoot:f.remoteRoot,cap:4})).toHaveLength(2);
@@ -93,7 +93,7 @@ describe('R324 elastic remote slot units',()=>{
   });
   it('unreadable telemetry limits fall back without dispatch or reservations',async()=>{
     const f=fixture();f.telemetry.limits=null;
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
     expect(heldSlots({lockRoot:f.remoteRoot,cap:4})).toHaveLength(0);
@@ -128,7 +128,7 @@ describe('R324 elastic remote slot units',()=>{
         for(let i=0;i<2;i++)releaseOwnedSlot({lockRoot:f.remoteRoot,cap:4,owner:'occupied'+i,fastSlots:0});
       }
     });
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
     expect(heldSlots({lockRoot:f.remoteRoot,cap:4})).toEqual([]);
@@ -141,14 +141,14 @@ describe('R324 elastic remote slot units',()=>{
   });
   it('unreadable slot counts fail closed without remote dispatch',async()=>{
     const f=fixture();f.policy.settings.remote.maxConcurrent=NaN;
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
   });
   it('corrupt slot metadata fails closed without reclaim or dispatch',async()=>{
     const f=fixture(),dir=lockDirFor(f.remoteRoot,'slot-0');
     mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'lock.json'),'broken');
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
   });
@@ -233,10 +233,10 @@ describe('R324 elastic remote slot units',()=>{
   it('a corrupt non-empty lock.json and a future-mtime entryless dir both fail closed',async()=>{
     const corrupt=fixture(),cdir=lockDirFor(corrupt.remoteRoot,'slot-0');
     mkdirSync(cdir,{recursive:true});writeFileSync(join(cdir,'lock.json'),'{not json');
-    expect(await runWithRemoteDecision(corrupt)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(corrupt)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     const future=fixture(),fdir=lockDirFor(future.remoteRoot,'slot-0'),later=new Date(Date.now()+3600000);
     mkdirSync(fdir,{recursive:true});utimesSync(fdir,later,later);
-    expect(await runWithRemoteDecision(future)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(future)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     for(const f of [corrupt,future]){
       expect(f.remoteExec).not.toHaveBeenCalled();
       expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
@@ -245,7 +245,7 @@ describe('R324 elastic remote slot units',()=>{
   it('an entryless slot dir past the crash grace fails closed',async()=>{
     const f=fixture(),dir=lockDirFor(f.remoteRoot,'slot-0'),old=new Date(Date.now()-60000);
     mkdirSync(dir,{recursive:true});utimesSync(dir,old,old);
-    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false, fallbackReason: expect.any(String), fallbackDetail: null });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
   });

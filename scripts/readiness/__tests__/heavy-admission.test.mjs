@@ -2309,3 +2309,111 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     expect(r.stderr).toMatch(/acquired slot-\d after waiting/);
   }, 30_000);
 });
+
+
+describe('FULL local fallback policy', () => {
+  function runFallback({ setting, flags = [], kind = 'FULL', healthFails = false } = {}) {
+    const pool = join(lockRoot, '.lanes');
+    mkdirSync(pool, { recursive: true });
+    const prefs = join(lockRoot, 'preferences.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: {
+      ...(setting === undefined ? {} : { fullLocalFallback: setting }),
+      remote: { enabled: true, mode: 'always' },
+    } }));
+    const command = [process.execPath, '-e', 'process.stdout.write("local-ran")', 'vitest', 'run',
+      ...(kind === 'files' ? ['plain.test.mjs'] : kind === 'soak' ? ['--config', 'vitest.soak.config.ts'] : [])];
+    const script = `
+      import { main } from ${JSON.stringify(pathToFileURL(CLI).href)};
+      import { easternTimestamp } from ${JSON.stringify(pathToFileURL(resolve('scripts/readiness/forge-exec-run.mjs')).href)};
+      await main(${JSON.stringify(['run', '--owner=test-owner', '--lane=test-lane', ...flags, '--', ...command])}, {
+        readTelemetry: async () => ${healthFails ? 'null' : "({ sampledAtET: easternTimestamp(Date.now()), cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] })"},
+        remoteExec: async () => ({ mode: 'not-started', terminated: true, reason: 'fixture-fallback', detail: 'fixture detail' }),
+      });`;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: lockRoot, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+      env: cliEnv(pool, { WE_PLATFORM_PREFERENCES: prefs, VITEST: 'true', WE_TEST_HOST_LOAD1: '0',
+        WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK: '', WE_REMOTE_CLIENT_OVERRIDE: '' }),
+    });
+    const history = join(pool, '.admission', 'heavy', 'remote-fallbacks.jsonl');
+    return { ...child, rows: existsSync(history) ? readFileSync(history, 'utf8').trim().split('\n').map(JSON.parse) : [] };
+  }
+
+  it.each(['FULL', 'soak'])('%s fallback refuses locally by default with exit 75 and an audit row', (kind) => {
+    const r = runFallback({ kind });
+    expect(r.status).toBe(ADMISSION_DEFERRED_EXIT);
+    expect(r.stdout).not.toContain('local-ran');
+    expect(r.stderr).toContain('FULL run needs Forge; refused locally (reason: fixture-fallback (fixture detail))');
+    expect(r.rows.at(-1)).toMatchObject({ outcome: 'refused-local', reason: 'fixture-fallback', detail: 'fixture detail', kind });
+  });
+
+  it('health fallback is also refused and has a null detail', () => {
+    const r = runFallback({ healthFails: true });
+    expect(r.status).toBe(75);
+    expect(r.stdout).not.toContain('local-ran');
+    expect(r.rows.at(-1)).toMatchObject({ outcome: 'refused-local', reason: 'forge-unreachable', detail: null });
+  });
+
+  it.each([undefined, 'justified'])('an explicit justification permits local execution in %s mode and records caller and text', (setting) => {
+    const r = runFallback({ setting, flags: ['--local-justification=operator approved investigation'] });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('local-ran');
+    expect(r.stderr).toContain('operator approved investigation');
+    expect(r.stderr).toContain('test-owner');
+    expect(r.stderr).toContain('test-lane');
+    expect(r.rows.at(-1)).toMatchObject({ outcome: 'justified-local', justification: 'operator approved investigation', owner: 'test-owner', lane: 'test-lane' });
+  });
+
+  it.each([[], ['--local-justification='], ['--local-justification=   '], ['--local-justification']])('justified mode refuses a missing or empty justification (%j)', (flags) => {
+    const r = runFallback({ setting: 'justified', flags });
+    expect(r.status).toBe(75);
+    expect(r.stderr).toContain('--local-justification=<text>');
+    expect(r.rows.at(-1).outcome).toBe('refused-local');
+  });
+
+  it('bounds justification history and strips terminal controls, retaining an explicit truncation cue', () => {
+    const r = runFallback({ flags: ['--local-justification=operator\x1b[31m' + 'x'.repeat(5000)] });
+    expect(r.status).toBe(0);
+    expect(r.rows.at(-1).justification.length).toBeLessThanOrEqual(4096);
+    expect(r.rows.at(-1).justification).toContain('[truncated]');
+    expect(r.stderr).not.toContain('\x1b');
+  });
+
+  it('files keep falling back locally without a justification', () => {
+    const r = runFallback({ kind: 'files' });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('local-ran');
+    expect(r.rows.some(row => row.outcome)).toBe(false);
+  });
+
+  it('allow runs locally and records the outcome', () => {
+    const r = runFallback({ setting: 'allow' });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain('local-ran');
+    expect(r.rows.at(-1).outcome).toBe('allowed-local');
+    expect(r.stderr).toContain('fullLocalFallback=allow (platform)');
+  });
+
+  it('invalid settings are ignored and retain refuse', () => {
+    const r = runFallback({ setting: 'automatic' });
+    expect(r.status).toBe(75);
+    expect(r.rows.at(-1).outcome).toBe('refused-local');
+    expect(r.stderr).toContain('fullLocalFallback=refuse (platform (invalid; fail closed))');
+  });
+
+  it('fails closed to refuse when a fullLocalFallback value is invalid, even over an inherited allow', () => {
+    const priv = resolveAdmissionPolicy({ platform: { fullLocalFallback: 'allow' }, env: { WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK: 'bogus', LANE_POOL_ROOT: '/tmp/private-pool-x' }, checkoutRoot: '/tmp/private-pool-x/lane-1' });
+    expect(priv.settings.fullLocalFallback).toBe('refuse');
+    const bad = resolveAdmissionPolicy({ platform: { fullLocalFallback: 'nope' } });
+    expect(bad.settings.fullLocalFallback).toBe('refuse');
+  });
+  it('resolves fullLocalFallback as a host-wide setting, with private-pool overrides only', () => {
+    const shared = resolveAdmissionPolicy({ tool: { fullLocalFallback: 'allow' }, env: { WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK: 'justified' } });
+    expect(shared.settings.fullLocalFallback).toBe('refuse');
+    expect(shared.ignored).toHaveLength(2);
+    const env = { LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK: 'justified' };
+    const priv = resolveAdmissionPolicy({ platform: { fullLocalFallback: 'refuse' }, tool: { fullLocalFallback: 'allow' }, env });
+    expect(priv.settings.fullLocalFallback).toBe('justified');
+    expect(priv.sources.fullLocalFallback).toBe('env WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK');
+    expect(formatAdmissionPolicy(priv)).toContain('fullLocalFallback=justified (env WE_HEAVY_ADMISSION_FULL_LOCAL_FALLBACK)');
+  });
+});
