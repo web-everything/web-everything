@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'node:fs';
-import { tmpdir, homedir } from 'node:os';
+import { tmpdir, homedir, userInfo } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
   orchestratorDelegateReason,
@@ -4031,5 +4031,61 @@ describe('orchestrator foreground delegation', () => {
     expect(invoke({ agent_id: 'delegated-agent' })).not.toMatch(/orchestrator session/);
     expect(invoke({}, { WE_CONVEYOR_WORKER: '1' })).not.toMatch(/orchestrator session/);
     expect(invoke({}, { WE_ORCHESTRATOR_SESSION: '0' })).not.toMatch(/orchestrator session/);
+  });
+});
+
+// #5062: no filesystem writes here — commands are data passed to the real pure guard.
+const judgeModule = '../lib/' + 'judge-trusted-paths.mjs';
+describe('#5062 lane sessions cannot forge trusted judge inputs', () => {
+  const fixedRoot = join(userInfo().homedir, 'workspace/.operations/coordination');
+  const targets = [join(fixedRoot, 'judge-switches.json'),
+    join(fixedRoot, 'judge-verdicts', '250.json'), join(fixedRoot, 'judge-dispatch', '250.json')];
+  const lane = '/ws/.lanes/web-everything/lane-7';
+  const contexts = [
+    ['lane cwd', { cwd: lane, agentSession: false }],
+    ['agent outside lane', { cwd: '/ws/scratch', agentSession: true }],
+  ];
+  const mutations = [
+    ['redirect', target => `echo forged > '${target}'`],
+    ['append', target => `echo forged >> '${target}'`],
+    ['tee', target => `echo forged | tee '${target}'`],
+    ['move', target => `mv scratch.json '${target}'`],
+    ['delete', target => `rm -f '${target}'`],
+    ['truncate', target => `truncate -s 0 '${target}'`],
+    ['node write', target => `node -e "require('node:fs').writeFileSync('${target}', 'forged')"`],
+  ];
+  for (const [session, ctx] of contexts) {
+    for (const target of targets) {
+      it.each(mutations)(`${session} denies %s to ${target.split('/').slice(-2).join('/')}`, (_verb, command) => {
+        const denial = decide(command(target), ctx);
+        expect(denial, 'trusted judge input write was allowed').not.toBeNull();
+        expect(denial).toMatch(/judge|trusted/i);
+      });
+      it(`${session} permits a read of ${target.split('/').slice(-2).join('/')}`, () => {
+        expect(decide(`cat '${target}'`, ctx)).toBeNull();
+      });
+    }
+    it.each(['on', 'off', 'wait 4'])(`${session} denies judge-switch write verb %s`, (verb) => {
+      const denial = decide(`node scripts/conveyor/judge-switch.mjs ${verb}`, ctx);
+      expect(denial, 'judge-switch mutation was allowed').not.toBeNull();
+      expect(denial).toMatch(/judge|trusted/i);
+    });
+    it(`${session} allows judge-switch status`, () => {
+      expect(decide('node scripts/conveyor/judge-switch.mjs status', ctx)).toBeNull();
+    });
+  }
+  it('guards fixed account-home paths even when WE_COORDINATION_ROOT points elsewhere', async () => {
+    const { userInfo } = await import('node:os');
+    const { JUDGE_DISPATCH_DIR, JUDGE_VERDICTS_DIR, JUDGE_SWITCHES_PATH, JUDGE_TRUSTED_PATHS } = await import(/* @vite-ignore */ judgeModule);
+    expect(fixedRoot).toBe(join(userInfo().homedir, 'workspace/.operations/coordination'));
+    expect(JUDGE_DISPATCH_DIR).toBe(join(fixedRoot, 'judge-dispatch'));
+    expect(JUDGE_VERDICTS_DIR).toBe(join(fixedRoot, 'judge-verdicts'));
+    expect(JUDGE_SWITCHES_PATH).toBe(targets[0]);
+    expect(new Set(JUDGE_TRUSTED_PATHS)).toEqual(new Set([JUDGE_DISPATCH_DIR, JUDGE_VERDICTS_DIR, JUDGE_SWITCHES_PATH]));
+    for (const target of targets) expect(decide(`echo forged > '${target}'`, { cwd: lane, agentSession: true,
+      env: { WE_COORDINATION_ROOT: '/ws/forged' } })).toMatch(/judge|trusted/i);
+  });
+  it('dispatcher cwd outside a lane is not an agent session', () => {
+    expect(decide(`echo record > '${targets[2]}'`, { cwd: '/ws/daemon', agentSession: false })).toBeNull();
   });
 });

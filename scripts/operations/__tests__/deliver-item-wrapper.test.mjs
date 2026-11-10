@@ -51,13 +51,21 @@ vi.mock('node:child_process', async (importOriginal) => {
   const mocked = { ...actual, execFileSync: vi.fn() };
   return { ...mocked, default: mocked };
 });
+const judgeBindingFs = vi.hoisted(() => ({ source: null, destination: null }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal();
   const readFileSync = vi.fn((path, ...rest) => {
     if (String(path).includes('delivery-agent-brief-v2.md')) return 'Build item {{ITEM_SPEC_PATH_BASENAME}}.';
     return actual.readFileSync(path, ...rest);
   });
-  const mocked = { ...actual, readFileSync, rmSync: vi.fn(actual.rmSync) };
+  const mapJudgePath = value => typeof value === 'string' && judgeBindingFs.source
+    && (value === judgeBindingFs.source || value.startsWith(judgeBindingFs.source + '/'))
+    ? judgeBindingFs.destination + value.slice(judgeBindingFs.source.length) : value;
+  const judgeFs = Object.fromEntries(['mkdirSync', 'writeFileSync', 'existsSync', 'readdirSync', 'statSync',
+    'openSync', 'unlinkSync'].map(name => [name, (first, ...rest) => actual[name](mapJudgePath(first), ...rest)]));
+  judgeFs.renameSync = (from, to) => actual.renameSync(mapJudgePath(from), mapJudgePath(to));
+  const mocked = { ...actual, ...judgeFs,
+    readFileSync: (first, ...rest) => readFileSync(mapJudgePath(first), ...rest), rmSync: vi.fn(actual.rmSync) };
   return { ...mocked, default: mocked };
 });
 // #4349 finding #7 — a way to inject a throw AFTER the root span's own `ok()` close, i.e. after a terminal
@@ -4372,6 +4380,81 @@ describe('deliverItem (#4349 — settles its run-store effect + releases/holds t
     // PR-observed retirement owns this, not the wrapper racing ahead of it.
     expect(listBuildDispatchClaims().map((c) => c.meta.num)).toEqual(['9003']);
     expect(listBuildDispatchHolds()).toEqual([]);
+  });
+
+  it('#5062 opening the PR writes a fixed-home, PR-number-bound record from executed dispatch provenance', async () => {
+    const { userInfo } = await import('node:os');
+    const fs = await vi.importActual('node:fs');
+    const bindingDir = join(coordRoot, 'actual-fixed-home');
+    judgeBindingFs.source = join(userInfo().homedir, 'workspace/.operations/coordination/judge-dispatch');
+    judgeBindingFs.destination = bindingDir;
+    onTestFinished(() => { judgeBindingFs.source = null; judgeBindingFs.destination = null; });
+    const seeded = seedInFlightRun('dispatch-lane-5062');
+    const trusted = seeded.read('dispatch-lane-5062');
+    trusted.effects[0].dispatch = { executor: 'codex', criteriaRecommendation: 'claude', sessionId: 'uuid-fixed' };
+    seeded.write(trusted);
+    const laneBase = 'a'.repeat(40);
+    acquireBuildDispatchClaim({ num: '9003', scope: [] });
+    findItem.mockReturnValue({ num: '9003', slug: 'pr-thing', specPath: 'backlog/9003-pr-thing.md', scope: [] });
+    tryReadDeliveryReport.mockReturnValue({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'], reason: 'did it' });
+    execFileSync.mockImplementation((cmd, args = []) => {
+      const a = args || [];
+      if (cmd === 'node' && a[0] === 'scripts/lane-pool.mjs' && a[1] === 'acquire') return '';
+      if (cmd === 'node' && a[0] === 'scripts/lane-pool.mjs' && a[1] === 'status') {
+        return JSON.stringify({ repo: 'web-everything', root: '/pool', lanes: [{ lane: 7, path: lane, exists: true }] });
+      }
+      if (cmd === 'node' && a[0] === 'scripts/verify-lane.mjs') return '{}';
+      if (cmd === 'node' && a[0] === 'scripts/operations/run.mjs' && a[1] === 'claim') return '{}';
+      if (cmd === 'node' && a[0] === 'scripts/operations/run.mjs' && a[1] === 'verify') {
+        return JSON.stringify({
+          runId: 'run-1', op: 'verify', stopped: 'complete', applied: [],
+          verdict: { ok: true, cwd: lane, suite: 'run', passed: 2, failed: 0, unrun: 0, checks: [], blocking: [] },
+        });
+      }
+      if (cmd === 'node' && a[0] === 'scripts/converge-cli.mjs' && a[1] === 'init') {
+        return JSON.stringify({ action: 'land', round: 1, roundCap: 5, verdict: 'land', dismissed: [] });
+      }
+      if (cmd === 'git' && a.includes('rev-parse')) return laneBase + '\n';
+      if (cmd === 'git' && a.includes('remote')) return 'https://github.com/example/web-everything.git\n';
+      if (cmd === 'git') return '';
+      if (cmd === 'node' && String(a[0]).endsWith('scripts/operations/run.mjs') && a[1] === 'open-pr') {
+        return openPrEnvelope({ outcome: 'opened', pr: 9876, url: 'https://example/pr/9876' });
+      }
+      throw new Error(`unexpected execFileSync(${cmd}, ${JSON.stringify(a)})`);
+    });
+
+    const result = await deliverItem(
+      {
+        item: '9003', lane: 7, scope: [], sessionSlug: 'conveyor-9003', attemptTag: '',
+        runId: 'dispatch-lane-5062', effectKey: 'dispatch:0:0',
+      },
+      { spawn: vi.fn(), vendor: 'codex' },
+      { newSessionId: () => 'uuid-fixed' },
+    );
+
+    expect(result.result).toContain('PR #9876');
+    // No access to the operator's real home: only fs paths under the fixed
+    // judge-dispatch location are redirected; WE_COORDINATION_ROOT remains a decoy.
+    expect(existsSync(bindingDir), 'wrapper never wrote a dispatch binding').toBe(true);
+    function records(dir) {
+      return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+        const file = join(dir, entry.name);
+        return entry.isDirectory() ? records(file) : [JSON.parse(fs.readFileSync(file, 'utf8'))];
+      });
+    }
+    const bindings = records(bindingDir);
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({ prNumber: 9876, baseSha: laneBase, executedProvider: 'codex' });
+    expect(bindings[0].repo).toEqual(expect.stringMatching(/^[^/]+\/[^/]+$/));
+    expect(bindings[0].headRef).toMatch(/^lane\//);
+    expect(Number.isFinite(Date.parse(bindings[0].startedAt))).toBe(true);
+    expect(Date.parse(bindings[0].finishedAt)).toBeGreaterThanOrEqual(Date.parse(bindings[0].startedAt));
+    expect(existsSync(join(coordRoot, 'judge-dispatch'))).toBe(false);
+    // The lane reset base must also survive in the run store; a later lookup
+    // cannot recover it from a reused ref or author-editable commit text.
+    const settled = seeded.read('dispatch-lane-5062').effects[0];
+    expect(settled.dispatch.baseSha).toBe(laneBase);
+    expect(settled.dispatch.executor).toBe('codex');
   });
 
   it('a `blocked-on-infra` PR-open (#4348-open-pr-retry — a GitHub rate limit AFTER the lane ref is already '

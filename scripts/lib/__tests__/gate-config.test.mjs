@@ -428,3 +428,40 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
 it.each(['card-ledger-trust.json', 'card-ledger-legacy-identities.json'])('ledger root %s requires human policy review', file => {
   expect(TRUST_CHAIN.find(m => m.file === file)).toMatchObject({ tier: 'policy', leash: 'spec', homes: [`scripts/settings/${file}`] });
 });
+
+// #5062: preserve all roster pins above; this adds the judge's stricter human-only leash.
+describe('#5062 judge protected classes', () => {
+  it.each([
+    ['merge/approval', 'scripts/review-set-label.mjs'],
+    ['merge workflow', '.github/workflows/new-gate.yml'],
+    ['cloud label applier', 'scripts/apply-review-request.mjs'],
+    ['gate checker', 'scripts/check-review-gate.mjs'],
+    ['request collector', 'scripts/collect-review-requests.mjs'],
+    ['future judge module', 'scripts/future/judge-new.mjs'],
+    ['future judge test', 'scripts/future/__tests__/judge-new.test.mjs'],
+    ['credentials', 'scripts/lib/github-app-token.mjs'],
+    ['env', 'config/.env.production'],
+    ['secret basename', 'config/service-secret.json'],
+    ['security hook', 'scripts/guard-new.mjs'],
+    ['settings', '.claude/settings.json'],
+    ['git hook', '.githooks/pre-push'],
+  ])('JUDGE_PROTECTED covers %s: %s', async (_class, path) => {
+    const config = await import('../gate-config.mjs');
+    expect(config.JUDGE_PROTECTED, 'missing judge leash export').toBeDefined();
+    expect(config.JUDGE_PROTECTED.some(re => re.test(path))).toBe(true);
+  });
+  it.each(['docs/agent/platform-decisions.md', 'docs/agent/future-statute.md',
+    'docs/agent/platform-decisions/new-ruling.md'])(
+    'RATIFICATION_PROTECTED covers %s', async (path) => {
+      const config = await import('../gate-config.mjs');
+      expect(config.RATIFICATION_PROTECTED, 'missing ratification leash export').toBeDefined();
+      expect(config.RATIFICATION_PROTECTED.some(re => re.test(path))).toBe(true);
+    });
+  it.each(['backlog/9000-story.md', 'src/_data/blocks.json', 'reports/token-notes.md'])(
+    'ordinary content is outside deterministic path protection: %s', async (path) => {
+      const config = await import('../gate-config.mjs');
+      expect(config.JUDGE_PROTECTED).toBeDefined();
+      expect(config.RATIFICATION_PROTECTED).toBeDefined();
+      expect([...config.JUDGE_PROTECTED, ...config.RATIFICATION_PROTECTED].some(re => re.test(path))).toBe(false);
+    });
+});

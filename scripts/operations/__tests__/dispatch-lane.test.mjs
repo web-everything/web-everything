@@ -3982,3 +3982,28 @@ describe('grouped dispatch payload and prepare brief', () => {
     expect(shapeDispatchRead(raw, { num: '3037' }).prompt).toBe('Prepare 3037. ');
   });
 });
+
+// #5062: the recommendation is not the executed provider. Preserve the identity
+// in the durable effect record so the wrapper can bind it when the PR number exists.
+describe('#5062 trusted dispatch identity', () => {
+  it('persists the actual executor and author session, independent of the recommended provider', async () => {
+    const { run } = runTo();
+    const store = createMemoryRunStore();
+    const effect = run.effects[0];
+    effect.payload.routing = { ...effect.payload.routing, routed: 'claude' };
+    const sinks = createDispatchSinks({
+      root: PRIMARY, reserveLane: () => ({ reserved: false }),
+      mintSessionId: () => 'author-session-5062',
+      sessionCwdFor: () => PRIMARY, ensureSessionCwd: value => value,
+      grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
+      provider: async request => { request.reportExecutor('codex'); return 'pid:5062'; },
+    });
+    const { run: applied } = await applyPendingEffects(run, { sinks, store });
+    const persisted = store.read(applied.id).effects[0];
+    expect(persisted.dispatch.executor).toBe('codex');
+    expect(persisted.dispatch.criteriaRecommendation).toBe('claude');
+    // Red today: no author session is retained with the provider provenance.
+    expect(persisted.dispatch.sessionId).toBe('author-session-5062');
+    expect(persisted.startedAt).toEqual(expect.any(String));
+  });
+});

@@ -521,3 +521,42 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
     expect(existsSync(path.join(dir, 'live.json'))).toBe(true);
   });
 });
+
+// #5062: exercise the actual hook event boundary; no Edit/Write is performed.
+const judgeModule = '../lib/' + 'judge-trusted-paths.mjs';
+describe('#5062 trusted judge inputs are read-only to lane agents', () => {
+  async function targets() {
+    const { userInfo } = await import('node:os');
+    const fixed = path.join(userInfo().homedir, 'workspace/.operations/coordination');
+    return [path.join(fixed, 'judge-switches.json'), path.join(fixed, 'judge-verdicts/250.json'),
+      path.join(fixed, 'judge-dispatch/250.json')];
+  }
+  function invoke(tool_name, file_path) {
+    return spawnSync(process.execPath, [path.join(here, '../guard-lane.mjs')], {
+      input: JSON.stringify({ tool_name, tool_input: { file_path },
+        cwd: '/ws/.lanes/web-everything/lane-7', session_id: 'author-session' }),
+      encoding: 'utf8', maxBuffer: 1024 * 1024,
+      env: { ...process.env, LANE_GUARD_OFF: '0', CLAUDE_CODE_SESSION_ID: 'author-session',
+        WE_COORDINATION_ROOT: path.join(tmpdir(), 'forged-coordination') },
+    });
+  }
+  it.each(['Edit', 'Write'])('%s cannot mutate any of the three fixed trusted locations', async (tool) => {
+    for (const target of await targets()) {
+      const result = invoke(tool, target);
+      expect(result.status, target).toBe(2);
+      expect(result.stderr).toMatch(/judge|trusted/i);
+    }
+  });
+  it('Read remains allowed for each trusted location', async () => {
+    for (const target of await targets()) {
+      const result = invoke('Read', target);
+      expect(result.status, target).toBe(0);
+    }
+  });
+  it('the hook protects the shared exported path list', async () => {
+    const { JUDGE_SWITCHES_PATH, JUDGE_VERDICTS_DIR, JUDGE_DISPATCH_DIR, JUDGE_TRUSTED_PATHS } = await import(/* @vite-ignore */ judgeModule);
+    const expected = await targets();
+    expect([JUDGE_SWITCHES_PATH, path.join(JUDGE_VERDICTS_DIR, '250.json'), path.join(JUDGE_DISPATCH_DIR, '250.json')]).toEqual(expected);
+    expect(new Set(JUDGE_TRUSTED_PATHS)).toEqual(new Set([JUDGE_SWITCHES_PATH, JUDGE_VERDICTS_DIR, JUDGE_DISPATCH_DIR]));
+  });
+});

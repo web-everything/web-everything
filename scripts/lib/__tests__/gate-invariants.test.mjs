@@ -913,3 +913,103 @@ describe('INVARIANT 18 — the review-hold sweep never flags a send-back the par
     }
   });
 });
+
+// #5062: exceptions are explicit and reviewable, never a blanket __tests__ exemption.
+const JUDGE_PROTECTED_EXEMPT = Object.freeze({
+  'scripts/lib/__tests__/gate-config.test.mjs': 'Roster examples; the invariant suite pins the judge leash.',
+  'scripts/__tests__/guard-bash.test.mjs': 'General shell-guard examples; runtime hook is protected.',
+  'scripts/__tests__/guard-lane.test.mjs': 'General lane-guard examples; runtime hook is protected.',
+  'scripts/operations/__tests__/dispatch-lane.test.mjs': 'Dispatch examples; executor and identity modules are protected.',
+  'scripts/operations/__tests__/deliver-item-wrapper.test.mjs': 'Delivery examples; binding writer is protected.',
+  'scripts/__tests__/review-set-label.test.mjs': 'General label examples; label authority is protected.',
+  'scripts/lib/__tests__/verdict-ledger.test.mjs': 'Ledger examples; ledger writer is protected.',
+  'scripts/lib/__tests__/finding-bounce.test.mjs': 'Bounce examples; finding identity source is protected.',
+  'scripts/conveyor/__tests__/stand-down-answer.test.mjs': 'Arbiter examples; answer authority is protected.',
+  'skills-src/conveyor/__tests__/runner.test.mjs': 'Conveyor examples; runner authority is protected.',
+});
+
+const judgeModule = '../' + 'judge-trusted-paths.mjs';
+describe('#5062 judge leash cannot omit authority', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
+  async function filesUnder(dir) {
+    const { readdirSync } = await import('node:fs');
+    function walk(rel) {
+      return readdirSync(join(root, rel), { withFileTypes: true }).flatMap(entry => {
+        const path = `${rel}/${entry.name}`;
+        return entry.isDirectory() ? walk(path) : [path];
+      });
+    }
+    return walk(dir);
+  }
+  async function protectedMatcher() {
+    const config = await import('../gate-config.mjs');
+    expect(config.JUDGE_PROTECTED, 'judge leash missing').toBeDefined();
+    expect(config.RATIFICATION_PROTECTED, 'ratification leash missing').toBeDefined();
+    return path => [...config.JUDGE_PROTECTED, ...config.RATIFICATION_PROTECTED].some(re => re.test(path));
+  }
+  it('covers every TRUST_CHAIN member at any home, not only its currently shipped directory', async () => {
+    const matches = await protectedMatcher();
+    for (const member of TRUST_CHAIN) {
+      expect(matches(`scripts/other/${member.file}`), member.file).toBe(true);
+    }
+  });
+  it('covers every STATUTE_PATHS entry; dropping the statute group breaks this pin', async () => {
+    const { STATUTE_PATHS } = await import('../gate-config.mjs');
+    const samples = ['docs/agent/platform-decisions.md', 'docs/agent/future-statute.md'];
+    const matches = await protectedMatcher();
+    for (const pattern of STATUTE_PATHS) {
+      const sample = samples.find(path => pattern.test(path));
+      expect(sample, `add a concrete witness for ${pattern}`).toBeDefined();
+      expect(matches(sample), sample).toBe(true);
+    }
+    expect(matches('docs/agent/platform-decisions/future-ruling.md')).toBe(true);
+  });
+  it('covers every shipped workflow and any future workflow', async () => {
+    const matches = await protectedMatcher();
+    for (const path of [...await filesUnder('.github/workflows'), '.github/workflows/future-gate.yml']) {
+      expect(matches(path), path).toBe(true);
+    }
+  });
+  it('covers every shipped judge-* script/test plus future names by pattern', async () => {
+    const matches = await protectedMatcher();
+    const files = (await filesUnder('scripts')).filter(path => /\/judge-[^/]+$/.test(path));
+    expect(files.length).toBeGreaterThan(0);
+    for (const path of [...files, 'scripts/new/judge-future.mjs', 'scripts/new/__tests__/judge-future.test.mjs']) {
+      expect(matches(path), path).toBe(true);
+    }
+  });
+  it('covers every scope path of every child of epic 5060, or names a reasoned exception', async () => {
+    const { default: yaml } = await import('js-yaml');
+    const matches = await protectedMatcher();
+    let cards = 0;
+    for (const path of await filesUnder('backlog')) {
+      if (!path.endsWith('.md')) continue;
+      const frontmatter = readFileSync(join(root, path), 'utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      if (!frontmatter) continue;
+      const data = yaml.safeLoad(frontmatter[1]);
+      if (String(data.parent) !== '5060') continue;
+      cards++;
+      expect(Array.isArray(data.scope), path).toBe(true);
+      for (const scoped of data.scope) {
+        expect(scoped.startsWith('we:'), `classify foreign scope explicitly: ${scoped}`).toBe(true);
+        const target = scoped.replace(/^we:/, '');
+        expect(matches(target) || Boolean(JUDGE_PROTECTED_EXEMPT[target]), `${path}: ${target}`).toBe(true);
+      }
+    }
+    expect(cards).toBeGreaterThanOrEqual(6);
+    for (const reason of Object.values(JUDGE_PROTECTED_EXEMPT)) expect(reason.length).toBeGreaterThan(20);
+  });
+  it('the decision core is itself policy tier', () => {
+    expect(TRUST_CHAIN.find(member => member.file === 'judge-clearance.mjs')).toMatchObject({ tier: 'policy' });
+  });
+  it('only judge-trusted-paths owns fixed coordination input locations', async () => {
+    const { JUDGE_DISPATCH_DIR, JUDGE_VERDICTS_DIR, JUDGE_SWITCHES_PATH } = await import(/* @vite-ignore */ judgeModule);
+    expect(new Set([JUDGE_DISPATCH_DIR, JUDGE_VERDICTS_DIR, JUDGE_SWITCHES_PATH]).size).toBe(3);
+    const paths = await filesUnder('scripts');
+    for (const path of paths.filter(p => p.endsWith('.mjs') && !p.includes('/__tests__/') && p !== 'scripts/lib/judge-trusted-paths.mjs')) {
+      const source = readFileSync(join(root, path), 'utf8');
+      // Imports of the exported constants are fine; re-declaring a trusted location is not.
+      expect(source, path).not.toMatch(/['"`]([^'"`]*judge-dispatch|[^'"`]*judge-verdicts|[^'"`]*judge-switches\.json)['"`]/);
+    }
+  });
+});
