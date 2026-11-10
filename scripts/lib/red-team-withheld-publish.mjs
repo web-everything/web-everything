@@ -3,15 +3,16 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
-import { renderRedTeamComment, redTeamCommentPosted as markerPosted } from '../operations/review-extra-seats.mjs';
-import { redTeamMarker } from './red-team-gate.mjs';
+import { renderRedTeamComment, redTeamCommentPosted as markerPosted, priorRedTeamRow } from '../operations/review-extra-seats.mjs';
+import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { redTeamMarker, parseRedTeamComment, redTeamForHead } from './red-team-gate.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 
 export function needsPublish(status) {
-  return status?.status === 'finished' && status.result?.status === 'ran'
-    && ['withheld', 'error'].includes(status.result.comment);
+  return status?.status === 'finished' && (status.result === 'ran'
+    || (status.result?.status === 'ran' && ['withheld', 'error'].includes(status.result.comment)));
 }
 
 /** Only fixed text plus scrubbed, single-line category/location fields; keep the gate's exact grammar. */
@@ -36,6 +37,8 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
   redTeamCommentPosted = markerPosted, scrub = scrubPublish,
   statusDir = redTeamStatusDir(), withLock = withFileLock,
   readStatus = path => JSON.parse(readFileSync(path, 'utf8')),
+  readSeatRow = ({ repo, pr, head }) => priorRedTeamRow(
+    readStore({ path: resolveScorecardStorePath(process.env), strict: true }).records, pr, head, repo),
   writeStatus,
   publishNeedsYou = publishAttention, now = () => new Date().toISOString(),
 } = {}) {
@@ -50,6 +53,54 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       throw Error('red-team publication status identity mismatch');
     }
     if (!needsPublish(status)) return { status: 'skipped' };
+    const holdLegacy = () => {
+      // Its own flag: an earlier publish-failed alert must not silence this one (they name different problems).
+      if (!status.legacyHoldPublished) {
+        publishNeedsYou({ kind: 'red-team-legacy-ran-unreadable', pr, repo, head,
+          reason: 'Legacy red-team evidence is unreadable or conflicts with the posted comment; operator review required.' });
+        status = { ...status, legacyHoldPublished: true };
+        writeStatus(status);
+      }
+      return { status: 'held' };
+    };
+    const legacy = status.result === 'ran';
+    let result = status.result;
+    // Throws unless the exact-head seat row is complete and self-consistent.
+    const recoverLegacy = () => {
+      const row = readSeatRow({ repo, pr, head });
+      if (!row || row.rev !== head || !Array.isArray(row.findings)
+        || !['accept', 'changes', 'needs-human'].includes(row.foldedVerdict)
+        || !Number.isInteger(row.confirmedMissCount) || row.confirmedMissCount < 0
+        || row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck === true).length
+        || (row.foldedVerdict !== 'accept' && row.confirmedMissCount === 0)) {
+        throw Error('invalid legacy red-team evidence');
+      }
+      return { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
+        callId: row.callId, foldedVerdict: row.foldedVerdict, confirmedMissCount: row.confirmedMissCount,
+        recheckStatus: row.recheckStatus,
+        findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true })) };
+    };
+    const renderInput = res => ({ ...res, pr, rev: head, findings: res.findings.map(f => ({ ...f,
+      confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true })) });
+    // Which confirmed breaks a body shows, as an order-free list; location-less fallbacks null the location.
+    // Every field the gate reads to pick an outcome is in the key (impact, class, extra classes, security flag),
+    // so a posted comment with a downgraded impact or class never "agrees" with the stored break.
+    const confirmedKeys = parsed => parsed.findings.filter(f => f.confirmed)
+      .map(f => JSON.stringify([f.category, f.file, f.line, f.summary, f.impact ?? null, f.findingClass ?? null,
+        [...(f.alsoClasses ?? [])].sort(), f.securityReachableToday === true])).sort();
+    // Every rendering the publisher could have posted for this evidence (full, then the scrub fallbacks).
+    const sameConfirmedBreaks = (postedParsed, res) => {
+      const want = JSON.stringify(confirmedKeys(postedParsed));
+      const input = renderInput(res);
+      return [() => renderFull(input), () => renderMinimal(input), () => renderMinimal({ ...input, omitLocation: true })]
+        .some(render => {
+          try {
+            const keys = confirmedKeys(parseRedTeamComment(render()) ?? { findings: [] });
+            // A lossy rendering (one that drops a confirmed break) proves nothing: two empty lists would "agree".
+            return keys.length === res.confirmedMissCount && JSON.stringify(keys) === want;
+          } catch { return false; }
+        });
+    };
     const escalate = () => {
       if (!status.needsYouPublished) {
         publishNeedsYou({ kind: 'red-team-publish-failed', pr, repo, head,
@@ -68,25 +119,51 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       return status.publishAttempts >= 2 ? escalate() : { status: 'retry' };
     };
     const provider = (!listComments || !postComment) ? createGhProvider() : null;
+    let conflict = false;
     try {
       const comments = listComments ? listComments() : provider.readComments(repo, pr);
       if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
-      if (redTeamCommentPosted(comments, pr, head)) return { status: 'skipped' };
+      if (redTeamCommentPosted(comments, pr, head)) {
+        if (!legacy) return { status: 'skipped' };
+        // The posted comment stays authoritative: an unreadable row cannot contradict it, so no alert.
+        let recovered;
+        try { recovered = recoverLegacy(); } catch { return { status: 'skipped' }; }
+        // A readable row must show the SAME confirmed breaks as the posted comment (not just as many), or the gate would clear a guess.
+        const live = redTeamForHead(comments, pr, head);
+        conflict = !live || !sameConfirmedBreaks(live, recovered);
+        if (!conflict) {
+          // The posted comment now agrees with the stored evidence: lift a hold an earlier pass recorded.
+          if (status.legacyHoldPublished) {
+            const { legacyHoldPublished: _lifted, ...rest } = status;
+            status = rest;
+            writeStatus(status);
+          }
+          return { status: 'skipped' };
+        }
+      }
     } catch { return failedAttempt(); }
+    // Outside the try: a failing alert write must not be counted as a publish attempt.
+    if (conflict) return holdLegacy();
+    if (legacy) {
+      try { result = recoverLegacy(); } catch { return holdLegacy(); }
+    }
     if (status.publishAttempts >= 2) return escalate();
     try {
-      if (!Array.isArray(status.result.findings)) throw Error('red-team findings unreadable');
-      const findings = status.result.findings.map(f => ({ ...f,
-        confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true }));
-      const input = { ...status.result, pr, rev: head, findings };
+      if (!Array.isArray(result.findings)) throw Error('red-team findings unreadable');
+      const input = renderInput(result);
       let body = renderFull(input);
       if (scrub(body).length) body = renderMinimal(input);
       if (scrub(body).length) body = renderMinimal({ ...input, omitLocation: true });
       if (scrub(body).length) throw Error('red-team minimal comment failed secret scrub');
+      // A rendered body must still show every confirmed break to the gate, or clear would be guessed.
+      if (legacy && parseRedTeamComment(body).findings.filter(f => f.confirmed).length !== result.confirmedMissCount) {
+        throw Error('red-team legacy comment drops confirmed findings');
+      }
       if (postComment) postComment({ repo, pr, body });
       else provider.postComment(repo, pr, body);
     } catch { return failedAttempt(); }
-    writeStatus({ ...status, publishedAt: now(), result: { ...status.result, comment: 'posted' } });
+    const { legacyHoldPublished: _posted, ...kept } = status;
+    writeStatus({ ...kept, publishedAt: now(), result: { ...result, comment: 'posted' } });
     return { status: 'posted' };
   });
 }
