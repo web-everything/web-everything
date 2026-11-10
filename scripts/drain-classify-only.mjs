@@ -43,7 +43,15 @@ export function resultToVerdictInputs(result, ctx) {
   if (heads.size !== 1 || !/^[a-f0-9]{40}$/i.test(rows[0].headSha ?? '')) throw new Error('ambiguous headSha/repo; run the local drain');
   if (merge.length && (merge.length !== 1 || skipped.length || parked.length)) throw new Error('contradictory classification; run the local drain');
   // toMerge is captured before dependency planning: deferred candidates are not admitted.
-  if (merge.length && ((result.deferred || []).some(matches) || result.skipReasons.some(matches))) {
+  // A dry-run merges nothing, so the real producer (drain-skip-reasons.mjs#buildSkipReasons) gives EVERY
+  // still-ready merge candidate a `ready-not-reached` row from its `unaccounted` fallback. That bucket keeps
+  // only the first row per PR, so this row means no real hold claimed the PR. Exempt exactly that row, only
+  // for a pass that provably landed and failed nothing; every other kind (partner-pending included) refuses.
+  const nothingLanded = Array.isArray(result.merged) && !result.merged.length &&
+    Array.isArray(result.failed) && !result.failed.length;
+  const dryRunArtefact = row => nothingLanded && row?.kind === 'ready-not-reached' && row.source === 'unaccounted';
+  if (merge.length && ((result.deferred || []).some(matches) ||
+      result.skipReasons.some(row => matches(row) && !dryRunArtefact(row)))) {
     throw new Error('toMerge candidate deferred or skip-reasoned; run the local drain');
   }
   // --dry-run --json skips planCoupleCascadeStep and cannot detect separated couples:

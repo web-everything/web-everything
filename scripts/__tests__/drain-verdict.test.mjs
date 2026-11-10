@@ -5,6 +5,7 @@ import yaml from 'js-yaml';
 import { SCHEMA, LOCAL_ONLY, build, verify, auditWorkflow } from '../lib/drain-verdict.mjs';
 import { DRAIN_GATES } from '../lib/merge-gate-inventory.mjs';
 import { resultToVerdictInputs, runCli } from '../drain-classify-only.mjs';
+import { buildSkipReasons } from '../lib/drain-skip-reasons.mjs';
 
 const computedAt = '2026-11-09T12:00:00.000Z';
 const now = Date.parse(computedAt);
@@ -169,6 +170,34 @@ describe('T3: result mapping preserves local fallback', () => {
     ['target absent', base()], ['other target', { ...base(), toMerge: [{ ...row, num: 8 }] }],
   ])('refuses %s with an explicit local drain fallback', (_name, result) => {
     expect(() => resultToVerdictInputs(result, ctx)).toThrow(/local drain/);
+  });
+});
+
+// The fixtures above hand-write skipReasons; the real drain dry-run always emits a row for an unmerged
+// merge candidate. Feed the REAL producer's output so the mapping is tested against what the child prints.
+describe('T3b: real dry-run skip-reason producer output', () => {
+  const target = { num: 7, repo: null, headSha, decision: 'merge' };
+  const dryRun = (produced, extra = {}) => ({ ...base(), toMerge: [row], merged: [], failed: [],
+    skipReasons: buildSkipReasons({ verdicts: [target], ...produced }), ...extra });
+
+  it('a lone ready candidate of a dry-run (nothing landed) still maps to enqueue', () => {
+    const result = dryRun({});
+    expect(result.skipReasons).toEqual([expect.objectContaining({ num: 7, kind: 'ready-not-reached', source: 'unaccounted' })]);
+    const mapped = resultToVerdictInputs(result, structuredClone(ctx));
+    expect(mapped).toMatchObject({ ...ctx, headSha, decision: 'enqueue' });
+    expect(verify(build(mapped), live(), { now })).toEqual({ ok: true });
+  });
+  it.each([
+    ['a couple partner pending (also unaccounted)', () => ({ ...base(), toMerge: [row], merged: [], failed: [],
+      skipReasons: buildSkipReasons({ verdicts: [{ ...target, item: 'x1' }, { num: 8, repo: null, decision: 'merge', item: 'x1' }] }) })],
+    ['a real enqueue hold', () => dryRun({ enqueueOutcomes: [{ num: 7, repo: null, outcome: 'not-enqueued', kind: 'batching-deferred', reason: 'held' }] })],
+    ['ready-not-reached from a named source', () => ({ ...dryRun({}), skipReasons: [{ ...row, kind: 'ready-not-reached', reason: 'r', source: 'deferred' }] })],
+    ['ready-not-reached beside a landed merge', () => dryRun({}, { merged: [{ num: 9, repo: 'o/r' }] })],
+    ['ready-not-reached beside a failed merge', () => dryRun({}, { failed: [{ num: 9, repo: 'o/r' }] })],
+    ['ready-not-reached with no merged list', () => { const r = dryRun({}); delete r.merged; return r; }],
+    ['ready-not-reached with no failed list', () => { const r = dryRun({}); delete r.failed; return r; }],
+  ])('still refuses %s', (_name, make) => {
+    expect(() => resultToVerdictInputs(make(), ctx)).toThrow(/local drain/);
   });
 });
 
