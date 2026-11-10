@@ -125,7 +125,9 @@ const FLOOR_SETTINGS = Object.freeze([
   // Read by card-number-ledger.mjs (landed on main since).
   'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
   // Read by a floor module (landed on main since).
-  'scripts/settings/daemon-tasks.json']);
+  'scripts/settings/daemon-tasks.json',
+  // Read by the fix dispatch daemon, a lock user (landed on main since).
+  'scripts/settings/fix-pass-budget.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
  * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
@@ -185,7 +187,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // Landed on main since: the daemons page renderer (an exclusive create).
   'scripts/operations/daemons-render-io.mjs',
   // Landed on main since (PR #6381, CI run 42791408190): the held-card filer (an exclusive create and a lock file name).
-  'scripts/operations/file-held-cards.mjs']);
+  'scripts/operations/file-held-cards.mjs',
+  // Landed on main since: the judge kill-switch store (an exclusive `wx` create).
+  'scripts/lib/judge-switches.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
@@ -254,7 +258,9 @@ export const LOCK_USERS = Object.freeze([
   'scripts/lib/drain-facts-source.mjs', 'scripts/lib/merge-queue-hook.mjs', 'scripts/lib/pr-size-admission.mjs',
   'scripts/lib/renamed-pr-refresh.mjs', 'scripts/operations/operator-notify-cli.mjs',
   // Landed on main since: the daemon self-sync lock user.
-  'scripts/lib/daemon-self-sync.mjs']);
+  'scripts/lib/daemon-self-sync.mjs',
+  // Landed on main since: the PR stall reset (takes withFileLock from atomic-json-file.mjs).
+  'scripts/conveyor/pr-stall-reset.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
