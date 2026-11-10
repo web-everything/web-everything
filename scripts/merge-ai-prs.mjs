@@ -228,6 +228,9 @@ import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetti
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
+import { decideMechanicalClearance, recordMechanicalClearance } from './lib/mechanical-clearance.mjs';
+
+const mechanicalClearanceMemo = new Map(); // R861: one validation and refusal log per repository/PR/head/process.
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
@@ -2862,7 +2865,7 @@ export { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing };
  *  listing is the overlap-yield planner's ONLY source for a same-based/non-draft/changed-file read on an open PR
  *  that is NOT itself `ready-to-merge` (a label-scoped candidate listing never sees it at all — #4308 Data). The
  *  measured cost of widening it is exactly Task 5's "warm and cold caches" number (this PR's own body). */
-export const CONTEXT_LIST_FIELDS = 'number,title,body,labels,statusCheckRollup,headRefName,headRefOid,baseRefName,isDraft,files';
+export const CONTEXT_LIST_FIELDS = 'number,title,body,labels,statusCheckRollup,headRefName,headRefOid,baseRefName,isDraft,files,author';
 
 /** #4108 (converge round 2) — the candidate listing's OWN fields, unwidened. Used verbatim when RECONCILE is
  *  off (a bare `/merge`/`/finish`/`/pr` sweep — no repo's context is ever collected that pass, #xc7p3q9 B3), so
@@ -3036,12 +3039,15 @@ export function shouldLabelOnGreen(pr, opts = {}) {
  * @param {{requiredCheck?:string, label?:string, allowPendingReview?:boolean}} [o]
  * @returns {{label:boolean, reason:(null|'held')}}
  */
-export function labelOnGreenVerdict(pr, { requiredCheck = 'test', label = 'ready-to-merge', allowPendingReview = false } = {}) {
+export function labelOnGreenVerdict(pr, { requiredCheck = 'test', label = 'ready-to-merge', allowPendingReview = false, mechanicalClearance = null } = {}) {
   if (!label || hasLabel(pr, label)) return { label: false, reason: null };   // already labelled (or no label configured) → nothing to do
   // Only the producer's own AI PRs are auto-labelled — never a human orphan — EXCEPT a human-cleared parked PR
   // (review:accepted): the human clear IS the certification, so mint ready-to-merge on green even when the
   // AI-trailer heuristic reads non-AI (e.g. the drain's own `drain: rebase …` commit stranded it). #2196/#2326
-  if (!isAiGeneratedPr(pr) && !hasLabel(pr, REVIEW_LABELS.accepted)) return { label: false, reason: null };
+  const mechanicallyCertified = mechanicalClearance?.cleared === true
+    && typeof mechanicalClearance.head === 'string' && mechanicalClearance.head.length > 0
+    && typeof pr?.headRefOid === 'string' && mechanicalClearance.head.toLowerCase() === pr.headRefOid.toLowerCase();
+  if (!isAiGeneratedPr(pr) && !hasLabel(pr, REVIEW_LABELS.accepted) && !mechanicallyCertified) return { label: false, reason: null };
   if (!isRequiredCheckGreen(pr, requiredCheck)) return { label: false, reason: null };
   // #2832 — a held PR (review:pending/review:changes/review:human, uncleared by review:accepted) must NEVER be
   // auto-stamped ready-to-merge: a hold and a go-ahead are contradictory. Refusing HERE is what keeps the
@@ -5246,9 +5252,26 @@ async function runCli() {
       // named PR would never enter the `--label`-scoped candidate set and the ratified #2423 valve would be dead.
       const reliefAllowsPending = (escalationRelief.prs || []).includes(Number(p.number))
         || (!!escalationRelief.passWide && !!label);
+      let mechanicalClearance = null;
+      if (!hasLabel(p, label) && ['web-everything[bot]', 'app/web-everything'].includes(p.author?.login)) {
+        const slug = memoRepo(repo);
+        const key = `${slug}::${p.number}::${p.headRefOid}`;
+        if (!mechanicalClearanceMemo.has(key)) {
+          const result = decideMechanicalClearance({ repo: slug, num: p.number });
+          mechanicalClearanceMemo.set(key, result);
+          if (!result.cleared) process.stderr.write(`mechanical-clearance: #${p.number} refused (${result.rule}); normal review required\n`);
+        }
+        const result = mechanicalClearanceMemo.get(key);
+        if (result.cleared) {
+          try {
+            if (!DRY_RUN) recordMechanicalClearance({ repo: slug, num: p.number, result });
+            mechanicalClearance = result;
+          } catch { /* No durable receipt: retain normal review and retry recording on the next reconcile. */ }
+        }
+      }
       const greenVerdict = hasLabel(p, label)
         ? { label: false, reason: null }
-        : labelOnGreenVerdict(withCommits, { requiredCheck: REQUIRED, label, allowPendingReview: reliefAllowsPending });
+        : labelOnGreenVerdict(withCommits, { requiredCheck: REQUIRED, label, allowPendingReview: reliefAllowsPending, mechanicalClearance });
       if (greenVerdict.label) {
         if (DRY_RUN) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would label "${label}" (required check green, was unlabelled)\n`); }
         else {
