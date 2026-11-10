@@ -183,6 +183,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    never end the turn while a task is running.
    6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
    \`node ${shellQuoteWord(CODEX_AUDIT_CLI)} --base=origin/main --head=<40-hex sha of your lane HEAD>\`, run with the lane as the working directory.
+   This is the ONLY audit prototype-load trusts (it writes the canonical record; a free-text \`--audit\` claim is refused): never an ad-hoc Codex audit.
    Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
    If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.
    Then open exactly one PR:

@@ -399,7 +399,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-canonical-audit';
       let auditRecords = [];
       try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }
-      const mode = config.canonicalAuditMode === 'warn' ? 'warn' : 'refuse';
+      // R848 2a: a free-text --audit claim is never evidence by itself. It loads only with a canonical NOT WEAKENED record
+      // for this exact sha, whatever the configured mode; only ready-record sources keep the configured warn mode.
+      const freeText = out.gate.source === 'arguments';
+      const mode = freeText || config.canonicalAuditMode !== 'warn' ? 'refuse' : 'warn';
       let fetchedMain = false;
       const covers = (base) => { try {
         if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
@@ -409,6 +412,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp) };
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
+        if (freeText) {
+          const rec = out.canonicalAudit.reason === 'weakened' ? [...auditRecords].reverse().find((r) => r?.verdict === 'WEAKENED' && String(r.head).toLowerCase() === String(input.sha).toLowerCase()) : null;
+          const named = rec ? ` (audit record at ${rec.at} base ${rec.base})` : '';
+          return stop('no-canonical-audit', { detail: out.canonicalAudit.reason === 'weakened' ? 'free-text-contradicts-canonical-audit' : 'free-text-audit-not-canonical',
+            fallback: out.canonicalAudit.reason === 'weakened'
+              ? `The --audit claim NOT WEAKENED contradicts the latest canonical audit record for ${input.sha}${named}, which says WEAKENED. Fix the findings and re-audit. ${fallback}`
+              : `A free-text --audit claim is not accepted: no canonical NOT WEAKENED record exists for ${input.sha}. ${fallback}` });
+        }
         if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
         // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
         // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.

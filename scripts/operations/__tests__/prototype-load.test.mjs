@@ -868,7 +868,30 @@ describe('prototype-load', () => {
     const f = fixture({ ready }); expect((await f.run()).stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(0); expect(f.records[0].stopReason).toBe('no-ready');
   });
   it('accepts explicit tests-run and NOT WEAKENED pair', async () => {
-    const f = fixture({ ready: '' }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(true);
+    const f = auditedFixture('refuse', { ready: '', auditBaseInMain: TREE, audits: auditLines([auditRecord()]) }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(true);
+  });
+  // R848 2a: free-text --audit is never evidence by itself, whatever the configured mode.
+  it.each(['warn', 'refuse', undefined])('refuses a free-text NOT WEAKENED claim with no canonical record (mode %s)', async (mode) => {
+    const f = auditedFixture(mode, { ready: '', audits: '' });
+    const out = await f.run({ testsRun: 'test-1', audit: 'NOT WEAKENED' });
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', detail: 'free-text-audit-not-canonical', canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(mutations(f, 'register')).toEqual([]);
+  });
+  it.each(['warn', 'refuse'])('refuses a free-text NOT WEAKENED claim that contradicts the latest canonical WEAKENED record, naming it (mode %s)', async (mode) => {
+    const f = auditedFixture(mode, { ready: '', audits: auditLines([auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })]) });
+    const out = await f.run({ testsRun: 'test-1', audit: 'NOT WEAKENED' });
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', detail: 'free-text-contradicts-canonical-audit', canonicalAudit: { reason: 'weakened' } });
+    expect(out.fallback).toContain('2026-10-21T12:00:00Z');
+    expect(out.fallback).toContain('contradicts');
+  });
+  it('a ready record plus a ruled-WEAKENED exception still loads (R825/R844 path unchanged)', async () => {
+    const entry = { ref: BASE.branch, sha: SHA, ruling: 'R999', findings: ['f1'] };
+    const rec = { ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R999', auditDisclosed: ['f1'] };
+    const f = auditedFixture('warn', { ready: auditLines([rec]), audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, settings: { ruledWeakened: [entry] } });
+    const out = await f.run();
+    expect(out.gate).toMatchObject({ source: 'ready-record', ruledWeakened: { ruling: 'R999' } });
+    expect(out.stopReason).not.toBe('no-canonical-audit');
   });
   it('refuses a branch tip mismatch before main checks', async () => {
     const f = fixture({ tip: TREE }); const r = await f.run(); expect(r.gate.reason).toBe('sha-not-branch-tip'); expect(r.stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(2);
@@ -2013,7 +2036,7 @@ describe('prototype-load', () => {
     const declaration = prototypeLoadOperation(); expect(declaration.name).toBe('prototype-load'); expect(declaration.verdictFrom).toBe('assess');
   });
   it('derived CLI and engine await the transaction and publish its JSON verdict', async () => {
-    const f = fixture({ ready: '' });
+    const f = auditedFixture('refuse', { ready: '', auditBaseInMain: TREE, audits: auditLines([auditRecord()]) });
     const declaration = prototypeLoadOperation();
     const argv = [`--branch=${BASE.branch}`, `--sha=${SHA}`, '--daemon=control', '--tests-run=case-1', '--audit=NOT WEAKENED', '--dry-run', '--json'];
     const parsed = parseOperationArgv(declaration, argv);
@@ -2615,7 +2638,7 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
     const oldAudit = () => auditRecord({ head: OLD, fingerprint: FP });
     it('the --tests-run/--audit arguments path never runs the fingerprint read or its fetch', async () => {
       const fingerprint = vi.fn(() => FP);
-      const f = auditedFixture('warn', { ready: auditLines([green()]), fingerprint });
+      const f = auditedFixture('warn', { ready: auditLines([green()]), audits: auditLines([auditRecord()]), auditBaseInMain: TREE, fingerprint });
       const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
       expect(out.gate).toMatchObject({ source: 'arguments' });
       expect(fingerprint).not.toHaveBeenCalled();
