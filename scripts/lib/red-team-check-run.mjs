@@ -82,12 +82,16 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
   return { ok: true, reason: 'red-team check run succeeded on head' };
 }
 
-export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false } = {}) {
+/** Title prefix of every run the policy-clear writer posts, so it can tell its own runs from a round's. Only runs
+ * from the configured app are ever read, so no other author can forge it. */
+export const POLICY_CLEAR_TITLE_PREFIX = 'Policy-clear: ';
+
+export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false } = {}) {
   const finished = status === 'finished';
   const clear = finished && hold === null && sendBack === false;
   return { name: 'red-team', head_sha: headSha, external_id: prIdentity(repo, pr), status: finished ? 'completed' : 'in_progress',
     ...(finished ? { conclusion: clear ? 'success' : 'failure' } : {}),
-    output: { title: clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress',
+    output: { title: `${policyClear ? POLICY_CLEAR_TITLE_PREFIX : ''}${clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress'}`,
       summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000) } };
 }
 
@@ -113,17 +117,85 @@ function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSyn
  * already shows a result. It first reads the head and posts only when this PR has NO red-team check run there: an
  * existing success needs nothing, and any other run (in progress, failed, unreadable) belongs to a real round and
  * is never overridden. Any refusal or failed post returns `ok:false`; the caller posts no comment and retries.
+ *
+ * Verify after write, ordered by id (#6535 round 10, operator send-back). The newest check-run id is the single
+ * authority, and a round can start between any read and any write. Every run this writer posts carries
+ * {@link POLICY_CLEAR_TITLE_PREFIX}, so each read splits this PR's runs into round runs and its own. The newest ROUND
+ * run decides what the head must show: none or a completed success → `success`; in progress → `in_progress`; a
+ * failure → `failure`. The writer then makes the newest run show exactly that:
+ * - before posting: if the newest run already shows it, nothing is posted (`success`: ok; otherwise a round owns
+ *   the head: ok:false). If one of its OWN runs is newest and shows something else (an unverified success over a
+ *   round that started meanwhile, or an orphan yield with no round behind it), it corrects it. So a retry after a
+ *   lost POST response, a crash between write and verify, or a failed yield never trusts an unverified success.
+ * - after posting the success: it re-reads. If a round run appeared that is not a completed success, it posts a
+ *   superseding run mirroring that round (in_progress, or failure), so the round stays authoritative, and returns
+ *   `{ok:false, reason:'policy-clear yielded to a concurrent round'}`; the caller posts no comment and retries.
+ *   A failed re-read does the same with an in_progress run (fail closed). A later retry over its own orphan yield,
+ *   with no round run behind it, posts the success again, so a yield never strands a head.
+ * No lock and no sleep. Residual (disclosed on #6535): a round's FINAL run landing between the re-read and the
+ * superseding post is masked by the mirror. A retry corrects it, but once that round has posted its result comment
+ * the on-skip row stops retrying, so the head can stay held until an operator republishes. It fails closed (never a
+ * false success). PR-A #6606's per-identity publish lock, shared by every writer, closes this window.
  */
+export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round';
 export function publishRedTeamPolicyClearCheck(options = {}) {
   return withRedTeamCheckLock(options, () => publishRedTeamPolicyClearCheckUnlocked(options));
 }
 
 function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
-  const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
-  if (fact.ok === true) return { ok: true, reason: 'red-team check already clear on head' };
-  if (fact.reason !== 'no red-team check run on head') return failure(`policy-clear check not posted: ${fact.reason}`);
-  return postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh,
-    payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false }) });
+  const before = readPolicyClearView({ repo, pr, headSha, appId, gh });
+  if (before.ok !== true) return failure(`policy-clear check not posted: ${before.reason}`);
+  if (before.current === before.desired) return before.desired === 'success'
+    ? { ok: true, reason: 'red-team check already clear on head' }
+    : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
+  if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, state: before.desired });
+  const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh,
+    payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
+  if (posted.ok !== true) return posted;
+  const after = readPolicyClearView({ repo, pr, headSha, appId, gh });
+  if (after.ok !== true) return supersede({ repo, pr, headSha, gh, state: 'in_progress',
+    detail: `re-read after publication failed (${after.reason})` });
+  if (after.desired === 'success' && after.current === 'success') return posted;
+  // No round run requires anything else, but its success is not the newest run (a lagging read, or another
+  // policy-clear writer's run on top): post nothing, never an in_progress a clean head does not need; the retry
+  // re-reads and posts the success again only if it is still not newest.
+  if (after.desired === 'success') return failure(`policy-clear unverified: newest run shows ${after.current}, not its success; retry`);
+  if (after.current === after.desired) return { ...failure(POLICY_CLEAR_YIELDED), detail: 'a newer round run is authoritative' };
+  return supersede({ repo, pr, headSha, gh, state: after.desired });
+}
+
+const runState = run => run.status !== 'completed' ? 'in_progress' : run.conclusion === 'success' ? 'success' : 'failure';
+const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
+
+/** Post a policy-clear run that mirrors the round's state, so the round (never this writer's success) is newest. */
+function supersede({ repo, pr, headSha, gh, state, detail }) {
+  const yielded = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, payload: redTeamCheckRunPayload({ repo, pr, headSha,
+    status: state === 'failure' ? 'finished' : 'in_progress', hold: `${POLICY_CLEAR_YIELDED}${detail ? `: ${detail}` : ''}`,
+    sendBack: state === 'failure', policyClear: true }) });
+  return { ...failure(POLICY_CLEAR_YIELDED),
+    detail: [detail, yielded.ok === true ? `superseding ${state} posted` : `superseding ${state} not posted (${yielded.reason})`].filter(Boolean).join('; ') };
+}
+
+/** One bounded read of this PR's runs on the head: the newest run's state and the state the newest round run requires.
+ * Whole-head refusals (unreadable, truncated, another PR only, unordered ids, bad identity) are kept from the gate's
+ * own evaluator. */
+function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
+  if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
+  if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
+  let data;
+  try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions)); }
+  catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
+  if (!Array.isArray(data?.check_runs) || data.check_runs.length > 100 || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
+    return failure('red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history');
+  const fact = evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: data.check_runs });
+  if (fact.ok !== true && !/^(no red-team check run on head|red-team check run in progress or incomplete|red-team check run failed \(.*\))$/.test(fact.reason))
+    return fact;
+  const identity = prIdentity(repo, pr);
+  const runs = data.check_runs.filter(run => run?.name === 'red-team' && run.external_id === identity
+    && typeof run.head_sha === 'string' && run.head_sha.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(appId))
+    .sort((a, b) => Number(b.id) - Number(a.id));
+  const round = runs.find(run => !isPolicyClearRun(run));
+  return { ok: true, current: runs[0] ? runState(runs[0]) : 'none', desired: round ? runState(round) : 'success' };
 }
 
 /** Re-derive a carried/ruling settlement from live gate evidence; never override a live round.

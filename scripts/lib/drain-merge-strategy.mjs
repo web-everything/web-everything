@@ -303,7 +303,9 @@ export function createDrainMergeStrategy({
     let wait = before.redTeamCheckRecovery[key];
     if (wait?.headSha !== head) wait = before.redTeamCheckRecovery[key] = { headSha: head, firstPendingAt: now(),
       attemptedHeads: { ...wait?.attemptedHeads, ...(wait?.attemptedAt != null ? { [wait.headSha]: wait.attemptedAt } : {}) } };
-    const recoverable = unpublished || /no red-team check run on head|in progress|incomplete/.test(reason);
+    // Anchored: an external_id mismatch ("no red-team check run on head for X#N: …") or a truncated history
+    // ("… incomplete at 100-run bound …") is not fixed by a new round, so it never spends the once-per-head request.
+    const recoverable = unpublished || /^(no red-team check run on head|red-team check run in progress or incomplete)$/.test(reason);
     if (recoverable && now() - wait.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000
       && wait.attemptedAt == null && wait.attemptedHeads?.[head] == null && typeof requestRedTeam === 'function') {
       wait.attemptedAt = now();
