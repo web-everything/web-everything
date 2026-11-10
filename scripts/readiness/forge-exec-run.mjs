@@ -746,6 +746,11 @@ export function execute(file,args,{cwd,env,input,inherit=false,detached=false,pa
 // from its environment, nor transports them in requests.
 // R333: leaked reservations/receipts are reaped only on proof the owner is gone.
 const REAP_GRACE_MS = 15*60*1000;
+const RUN_CEILING_DEFAULT_MS = 6*60*60*1000, RUN_CEILING_MAX_MS = 12*60*60*1000;
+async function procGroup(pid) {
+  try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return Number(data.slice(data.lastIndexOf(')')+2).split(' ')[2]);}
+  catch {return undefined;}
+}
 async function procStart(pid) {
   // string = start ticks of a live pid, null = provably no such pid, undefined = cannot tell (fail closed)
   try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return data.slice(data.lastIndexOf(')')+2).split(' ')[19];}
@@ -779,7 +784,7 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testReapProbe, testReapKill, testReapExec, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -900,10 +905,69 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     await atomicJSON(join(receipts,'telemetry.json'),value);
     return value;
   }
-  const reapProbe={start:procStart,uidBusy,unitActive,...testReapProbe};
-  async function reapLog(line) {
+  const reapProbe={start:procStart,group:procGroup,runningStat:lstat,uidBusy,unitActive,...testReapProbe};
+  const reapKill=testRoot&&testReapKill?testReapKill:(pid,signal)=>process.kill(pid,signal);
+  const reapExec=testRoot&&testReapExec?testReapExec:execute;
+  const setting=process.env.FORGE_RUN_CEILING_MS, requested=Number(setting);
+  const ceiling=!setting?RUN_CEILING_DEFAULT_MS:!/^\d+$/.test(setting)||!Number.isFinite(requested)?RUN_CEILING_DEFAULT_MS:Math.min(RUN_CEILING_MAX_MS,Math.max(600000,requested));
+  const ceilingSource=!setting?'default':ceiling===requested?'env':'clamped';
+  let ceilingLogged=false;
+  async function installError(run,error) {
+    // Pin a private regular file; bound both reads (none) and total retained bytes.
+    let fd;
+    try {
+      const prefix=run+' '+easternTimestamp(clock())+' ';
+      const message=(prefix+String(error.message)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'');
+      let line='',bytes=0;
+      for(const char of message){const size=Buffer.byteLength(char);if(bytes+size>2047)break;line+=char;bytes+=size;}
+      fd=await open(join(receipts,'install-errors.log'),constants.O_WRONLY|constants.O_CREAT|constants.O_APPEND|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
+      const st=await fd.stat();
+      if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid))return;
+      const locked=await execute('/usr/bin/python3',['-I','-c','import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'],{passFd:fd.fd});
+      if(locked.code)return;
+      await fd.chmod(0o600);
+      if((await fd.stat()).size+bytes+1>1024*1024)await fd.truncate(0);
+      await fd.writeFile(line+'\n');
+    }catch { /* diagnostics must never replace the install result */ }
+    finally {await fd?.close().catch(()=>{});}
+  }
+  async function stopOverCeiling(record) {
+    const owner=record.owner;
+    if(!owner||!Number.isSafeInteger(owner.pid)||owner.pid<=1||typeof owner.start!=='string'||!owner.start)return false;
+    // Recheck before each signal, including escalation: unknown evidence keeps the
+    // reservation, even if a unit probe would otherwise classify its owner gone.
+    const matches=async()=>{
+      if(await reapProbe.start(owner.pid)===owner.start)return true;
+      process.stderr.write('forge-exec-run: owner identity mismatch or unreadable; keep lock, operator must inspect owner\n');
+      return false;
+    };
+    if(!await matches())return false;
+    if(typeof owner.unit==='string'&&/^forge-exec-run-[a-f0-9]{32}(?![\s\S])/.test(owner.unit)) {
+      const stopped=await reapExec('/usr/bin/systemctl',['stop',owner.unit],{timeoutMs:5000});
+      if(stopped.code!==0||stopped.timedOut)throw new Error('Unit stop unconfirmed; keep lock, operator must inspect owner');
+      if(await reapProbe.start(owner.pid)===null)return true;
+    }
+    for(const signal of ['SIGTERM','SIGKILL']) {
+      // A sudo wrapper may lead the group. Never signal that group: stop the
+      // recorded scope above and signal only the identity-checked owner below.
+      const group=await reapProbe.group(owner.pid);
+      if(group===owner.pid) {
+        if(!await matches())return false;
+        try {await reapKill(-owner.pid,signal);}catch(error){if(error.code!=='ESRCH')throw error;}
+        if(await reapProbe.start(owner.pid)===null)return true;
+      }
+      if(!await matches())return false;
+      try {await reapKill(owner.pid,signal);}catch(error){if(error.code!=='ESRCH')throw error;}
+      if(await reapProbe.start(owner.pid)===null)return true;
+      await new Promise(resolve=>setTimeout(resolve,1000));
+      if(await reapProbe.start(owner.pid)===null)return true;
+    }
+    process.stderr.write('forge-exec-run: owner death unconfirmed; keep lock, operator must inspect owner\n');
+    return false;
+  }
+  async function reapLog(line,auditOnly=false) {
     const text='forge-exec-run: reaped '+line;
-    process.stderr.write(text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
+    if(!auditOnly)process.stderr.write(text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
     await appendFile(join(receipts,'reap-audit.log'),new Date(clock()).toISOString()+' '+text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n',{mode:0o600}).catch(()=>{});
   }
   // Atomic rename to a tombstone, then remove: a path is never half-deleted.
@@ -961,6 +1025,29 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       // Empty, malformed or pre-lease (no writerGuard) reservations stay for operator cleanup, as the pruner does.
       if(!reservation||reservation.writerGuard!==1||reservation.slot!=='forge-exec-'+slotNumber||!runName(reservation.run)||!nonceOK(reservation.nonce))continue;
       const entries=reservation?found.filter(e=>e.run===reservation.run):[];
+      let overAge;
+      if(entries.length===1&&entries[0].phase==='running') {
+        const record=await readRecord(entries[0].file),owner=record?.owner;
+        let startedAtMs=record?.startedAtMs;
+        if(record&&startedAtMs===undefined) {
+          // Legacy running records predate startedAtMs. Only this regular state
+          // file's mtime is age evidence; missing/unreadable evidence keeps the lock.
+          try {
+            const st=await reapProbe.runningStat(entries[0].file);
+            if(!st.isFile()||!Number.isFinite(st.mtimeMs))continue;
+            startedAtMs=st.mtimeMs;
+          }catch {process.stderr.write('forge-exec-run: running age unreadable; keep lock, operator must inspect state\n');continue;}
+        }
+        if(record?.run===reservation.run&&record.nonce===reservation.nonce&&record.slot===reservation.slot
+          &&(record.startedAtMs===undefined?Number.isFinite(startedAtMs):Number.isSafeInteger(startedAtMs))&&startedAtMs>=0&&clock()-startedAtMs>ceiling
+          &&owner&&Number.isSafeInteger(owner.pid)&&owner.pid>1&&typeof owner.start==='string') {
+          const start=await reapProbe.start(owner.pid);
+          if(start!==null) {
+            if(!await stopOverCeiling(record))continue;
+            overAge=clock()-startedAtMs;
+          }
+        }
+      }
       const decide=async()=>{
         if(await keepReceipt(reservation.run))return false;
         if(entries.length>1)return false;
@@ -976,7 +1063,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         if(!await decide())return;
         await tombstone(lockPath);
         if(reservation?.run){await dropRecords(reservation.run);taken.add(reservation.run);}
-        await reapLog(`${lock} run=${reservation?.run??'none'} reason=owner-gone`);
+        await reapLog(`${lock} run=${reservation?.run??'none'} reason=${overAge===undefined?'owner-gone':`over-ceiling age=${overAge} ceiling=${ceiling}`}`,overAge!==undefined);
       }).catch(error=>process.stderr.write('forge-exec-run: reap skipped '+lock+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'));
     }
     // Records whose own reservation is gone can no longer own a run.
@@ -1002,6 +1089,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     }
   }
   async function reap() {
+    if(!ceilingLogged){ceilingLogged=true;process.stderr.write(`forge-exec-run: run ceiling=${ceiling} source=${ceilingSource}\n`);}
     try {await reapLeaked();}
     catch(error) {process.stderr.write('forge-exec-run: reap failed: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');}
   }
@@ -1161,8 +1249,16 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     const record=index?await readPinned(index).then(bytes=>JSON.parse(bytes),error=>{if(error.code!=='ENOENT')throw error;return null;}):null;
     if(!record)return false;
     if(Object.keys(record).sort().join(',')!=='archiveDigest,profile'||!hex(record.profile)||!hex(record.archiveDigest))throw new Error('Invalid warm install evidence');
-    const source=join(parent,'dev-v5-'+record.profile);await directory(parent,true,operator);await directory(source,true,operator);
-    if((await readPinned(join(source,'sha256'))).toString()!==record.archiveDigest||await archiveDigest(join(source,'dependencies.tar'))!==record.archiveDigest)throw new Error('Warm cache digest mismatch');
+    const source=join(parent,'dev-v5-'+record.profile);await directory(parent,true,operator);
+    try {
+      await directory(source,true,operator);
+      if((await readPinned(join(source,'sha256'))).toString()!==record.archiveDigest||await archiveDigest(join(source,'dependencies.tar'))!==record.archiveDigest)throw new Error('Warm cache digest mismatch');
+    } catch(error) {
+      if(error.code!=='ENOENT')throw error;
+      await rm(index,{force:true}).catch(()=>{});
+      process.stderr.write('forge-exec-run: removed stale warm-input index '+signature+'; installing cold\n');
+      return false;
+    }
     if(source!==profile) {
       await mkdir(profile,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e;});await directory(profile,true,operator);
       const target=join(profile,'dependencies.tar');
@@ -1442,7 +1538,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       // Owner evidence for the reaper: this process (pid + start time) outlives no live run.
       const ownerStart=await reapProbe.start(process.pid);
-      if(typeof ownerStart==='string')await atomicJSON(statePath(request.run,'running'),{...prepared,owner:{pid:process.pid,start:ownerStart}});
+      if(typeof ownerStart==='string')await atomicJSON(statePath(request.run,'running'),{...prepared,startedAtMs:clock(),owner:{pid:process.pid,start:ownerStart}});
       let phase='install',result={code:97,stdout:'',stderr:''};
       const installAt=clock();let installMs=0,runMs=0,runAt;
       const startedAtET=easternTimestamp(installAt);
@@ -1473,7 +1569,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         const planned=executionArgv(request.argv).map(a=>a.startsWith('--outputFile.json=')?'--outputFile.json='+join(work,a.slice('--outputFile.json='.length)):a);
         result=await command(planned,work,executionEnv);
         await assertContained(work,request.argv);
-      } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
+      } catch(error) {const code=phase==='install'?97:254; if(phase==='install')await installError(request.run,error); if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
       const receipt=createRunReceipt(prepared,{resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code},tasks);

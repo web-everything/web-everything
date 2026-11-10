@@ -1806,17 +1806,20 @@ describe('self-healing over-ceiling reaper', () => {
   let output;
   beforeEach(()=>{output=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);vi.stubEnv('FORGE_RUN_CEILING_MS','');});
   afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();});
-  async function fixture({age=7*hour,start='12345',dead=false}={}) {
+  async function fixture({age=7*hour,start='12345',dead=false,legacy=false,group=pid,unit,dieOn='SIGTERM',probe={}}={}) {
     const run='r-'+'e'.repeat(32),slot='forge-exec-1',lock=join(root,'receipts','worker-active-1');
     const record={v:1,run,nonce:'f'.repeat(32),slot,writerGuard:1};
     await mkdir(lock,{mode:0o700});await writeFile(join(lock,'reservation.json'),JSON.stringify(record));
-    await writeFile(join(root,'receipts',run+'.running'),JSON.stringify({...record,startedAtMs:now-age,owner:{pid,start:'12345'}}));
+    const running=join(root,'receipts',run+'.running');
+    await writeFile(running,JSON.stringify({...record,...(legacy?{}:{startedAtMs:now-age}),owner:{pid,start:'12345',...(unit===undefined?{}:{unit})}}));
+    if(legacy)await utimes(running,new Date(now-age),new Date(now-age));
     // Recent mtimes deliberately disagree with the recorded age.
     const startProbe=vi.fn(async()=>dead?null:start);
-    const kill=vi.fn(async(target,signal)=>{if(signal==='SIGTERM')dead=true;});
+    const kill=vi.fn(async(target,signal)=>{if(signal===dieOn)dead=true;});
+    const stop=vi.fn(async()=>({code:0}));
     const reapRunner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',clock:()=>now,
-      testReapProbe:{start:startProbe,group:async()=>pid,uidBusy:async()=>!dead,unitActive:async()=>true},testReapKill:kill});
-    return {run,lock,kill,startProbe,reapRunner};
+      testReapProbe:{start:startProbe,group:async()=>group,uidBusy:async()=>!dead,unitActive:async()=>true,...probe},testReapKill:kill,testReapExec:stop});
+    return {run,lock,running,kill,stop,startProbe,reapRunner};
   }
   it('self-healing kills over-ceiling live owner by recorded group and releases lock with one audit line', async () => {
     const {run,lock,kill,reapRunner}=await fixture();
@@ -1830,6 +1833,102 @@ describe('self-healing over-ceiling reaper', () => {
   it('self-healing leaves an under-ceiling live owner untouched', async () => {
     const {lock,kill,reapRunner}=await fixture({age:hour});
     await reapRunner.telemetry();expect(kill).not.toHaveBeenCalled();expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+  it('reaps a legacy running record using its old regular-file mtime with one audit after release', async () => {
+    const unit='forge-exec-run-'+'a'.repeat(32);
+    const {run,lock,kill,stop,reapRunner}=await fixture({legacy:true,group:pid-37,unit});
+    await reapRunner.telemetry();await reapRunner.telemetry();
+    expect(stop.mock.calls).toEqual([['/usr/bin/systemctl',['stop',unit],{timeoutMs:5000}]]);
+    expect(kill.mock.calls).toEqual([[pid,'SIGTERM']]);
+    expect(stop.mock.invocationCallOrder[0]).toBeLessThan(kill.mock.invocationCallOrder[0]);
+    await expect(stat(lock)).rejects.toMatchObject({code:'ENOENT'});
+    const audit=await readFile(join(root,'receipts','reap-audit.log'),'utf8');
+    expect(audit.trim().split('\n')).toHaveLength(1);
+    expect(audit).toContain(`reaped worker-active-1 run=${run} reason=over-ceiling age=${7*hour} ceiling=${6*hour}`);
+  });
+  it('leaves a legacy under-ceiling mtime and lock untouched', async () => {
+    const {lock,running,kill,stop,reapRunner}=await fixture({legacy:true,age:hour});
+    const before=await stat(running);
+    await reapRunner.telemetry();
+    expect(kill).not.toHaveBeenCalled();expect(stop).not.toHaveBeenCalled();
+    expect((await stat(running)).mtimeMs).toBe(before.mtimeMs);
+    expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+  it.each(['unreadable','nonregular'])('keeps the lock when legacy age evidence is %s', async kind => {
+    const runningStat=vi.fn(async()=>{
+      if(kind==='unreadable')throw Object.assign(new Error('denied'),{code:'EACCES'});
+      return {isFile:()=>false,mtimeMs:now-7*hour};
+    });
+    const {lock,kill,stop,reapRunner}=await fixture({legacy:true,probe:{runningStat}});
+    await reapRunner.telemetry();
+    expect(runningStat).toHaveBeenCalled();expect(kill).not.toHaveBeenCalled();expect(stop).not.toHaveBeenCalled();
+    expect((await stat(lock)).isDirectory()).toBe(true);
+    await expect(readFile(join(root,'receipts','reap-audit.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it.each([undefined,'forge-exec-run-*','other-'+'a'.repeat(32),'forge-exec-run-'+'a'.repeat(31),
+    'forge-exec-run-'+'A'.repeat(32),'forge-exec-run-'+'a'.repeat(32)+'\n'])('never passes malformed unit %j to systemctl and kills only the nonleader pid', async unit => {
+    const {lock,kill,stop,reapRunner}=await fixture({group:pid-37,unit});
+    await reapRunner.telemetry();
+    expect(stop).not.toHaveBeenCalled();expect(kill.mock.calls).toEqual([[pid,'SIGTERM']]);
+    await expect(stat(lock)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('escalates only the owner pid after a bounded TERM wait when its group differs', async () => {
+    const {lock,kill,reapRunner}=await fixture({group:pid-37,dieOn:'SIGKILL'});
+    await reapRunner.telemetry();
+    expect(kill.mock.calls).toEqual([[pid,'SIGTERM'],[pid,'SIGKILL']]);
+    await expect(stat(lock)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('refuses unit stop and signals when the owner start time mismatches', async () => {
+    const {lock,kill,stop,reapRunner}=await fixture({group:pid-37,start:'reused',unit:'forge-exec-run-'+'a'.repeat(32)});
+    await reapRunner.telemetry();
+    expect(stop).not.toHaveBeenCalled();expect(kill).not.toHaveBeenCalled();
+    expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+  it('rechecks identity after unit stop and refuses a reused pid', async () => {
+    const {lock,kill,stop,startProbe,reapRunner}=await fixture({group:pid-37,unit:'forge-exec-run-'+'a'.repeat(32)});
+    stop.mockImplementation(async()=>{startProbe.mockResolvedValue('reused');return {code:0};});
+    await reapRunner.telemetry();
+    expect(stop).toHaveBeenCalledTimes(1);expect(kill).not.toHaveBeenCalled();
+    expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+  it('rechecks identity before escalation and keeps the lock on reuse', async () => {
+    const {lock,kill,startProbe,reapRunner}=await fixture({group:pid-37});
+    kill.mockImplementation(async()=>{startProbe.mockResolvedValue('reused');});
+    await reapRunner.telemetry();
+    expect(kill.mock.calls).toEqual([[pid,'SIGTERM']]);
+    expect((await stat(lock)).isDirectory()).toBe(true);
+    await expect(readFile(join(root,'receipts','reap-audit.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('signals the leader pid itself if the group signal leaves it alive', async () => {
+    const {lock,kill,startProbe,reapRunner}=await fixture();
+    kill.mockImplementation(async target=>{if(target===pid)startProbe.mockResolvedValue(null);});
+    // The independent UID scan must also prove the workload gone before release.
+    await reapRunner.telemetry();
+    expect(kill.mock.calls).toEqual([[-pid,'SIGTERM'],[pid,'SIGTERM']]);
+    expect((await stat(lock)).isDirectory()).toBe(true);
+    await expect(readFile(join(root,'receipts','reap-audit.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('does not signal a pid whose identity becomes unreadable after unit stop', async () => {
+    const {lock,kill,stop,startProbe,reapRunner}=await fixture({unit:'forge-exec-run-'+'a'.repeat(32)});
+    stop.mockImplementation(async()=>{startProbe.mockResolvedValue(undefined);return {code:0};});
+    await reapRunner.telemetry();
+    expect(kill).not.toHaveBeenCalled();expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+  it('keeps the lock and emits no reap audit when death remains unconfirmed after KILL', async () => {
+    const {lock,kill,reapRunner}=await fixture({group:pid-37,dieOn:'never'});
+    await reapRunner.telemetry();
+    expect(kill.mock.calls).toEqual([[pid,'SIGTERM'],[pid,'SIGKILL']]);
+    expect((await stat(lock)).isDirectory()).toBe(true);
+    expect(output.mock.calls.flat().join('')).toContain('owner death unconfirmed');
+    await expect(readFile(join(root,'receipts','reap-audit.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('keeps the lock and emits no reap audit when unit stop fails', async () => {
+    const {lock,kill,stop,reapRunner}=await fixture({unit:'forge-exec-run-'+'a'.repeat(32)});
+    stop.mockResolvedValue({code:1});
+    await reapRunner.telemetry();
+    expect(kill).not.toHaveBeenCalled();expect((await stat(lock)).isDirectory()).toBe(true);
+    expect(output.mock.calls.flat().join('')).toContain('operator must inspect owner');
+    await expect(readFile(join(root,'receipts','reap-audit.log'))).rejects.toMatchObject({code:'ENOENT'});
   });
   it('self-healing refuses PID start-time mismatch without killing or releasing the lock', async () => {
     const {lock,kill,reapRunner}=await fixture({start:'different-process'});
