@@ -233,7 +233,7 @@ describe('merge-ai-prs CLI — #4108 one `gh pr list` per repo per pass (RECONCI
   });
 
   const bareSweepListsOncePerRepo = ({ workflowEditHuman, extraFields }) => {
-    const candidateOnlyFields = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels'.split(',');
+    const candidateOnlyFields = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,author'.split(',');
     const r = spawnSync('node', [script, '--this-repo', '--dry-run', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: repoDir,
       encoding: 'utf8',

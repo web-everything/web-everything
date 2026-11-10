@@ -8,7 +8,8 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, buildLiveListingsByRepo, reconcileMechanicalClearance } from '../merge-ai-prs.mjs';
+import { decideMechanicalMergeGuard } from '../lib/mechanical-clearance.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -245,7 +246,8 @@ fs.appendFileSync(process.env.CALL_LOG, JSON.stringify(a) + '\\n');
 const rows = JSON.parse(fs.readFileSync(process.env.ROWS_FILE, 'utf8'));
 let out = [];
 if (a[0] === 'repo') out = 'main';
-else if (a[0] === 'pr' && a[1] === 'view') out = { ...rows.find(r => r.number === Number(a[2])), commits: [] };
+else if (a[0] === 'pr' && a[1] === 'view') out = { ...rows.find(r => r.number === Number(a[2])),
+  commits: [{ oid: 'sha' + a[2], messageBody: 'Co-Authored-By: Claude' }] };
 else if (a[0] === 'api' && a[1] === 'graphql') {
   const q = a.join(' ');
   if (q.includes('dequeuePullRequest')) {
@@ -328,4 +330,114 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
   const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
+});
+
+
+describe('R861 merge-time mechanical clearance', () => {
+  const head = 'a'.repeat(40), next = 'b'.repeat(40);
+  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  const runGuard = (verdicts, decide, memoRepo = repo => repo || 'https://github.com/owner/local') => {
+    const start = source.indexOf('  // R861 — live mechanical merge guard');
+    const end = source.indexOf('  // #2366 — CONCURRENT-LANDER BACKSTOP', start);
+    expect(start).toBeGreaterThan(source.indexOf('verdicts.push(...buildDrainVerdicts'));
+    expect(end).toBeGreaterThan(start);
+    expect(end).toBeLessThan(source.indexOf('  if (!REVIEW_ESCALATION)', start));
+    expect(end).toBeLessThan(source.indexOf('  if (REVIEW_ESCALATION)', start));
+    // Execute the actual unconditional CLI pass with hermetic reads; no GitHub or label writes.
+    new Function('verdicts', 'decideMechanicalClearance', 'decideMechanicalMergeGuard', 'memoRepo',
+      source.slice(start, end))(verdicts, decide, decideMechanicalMergeGuard, memoRepo);
+  };
+  const verdict = (extra = {}, commits = [{ oid: head, messageHeadline: 'refresh timings' }]) =>
+    buildDrainVerdicts({ repos: [null], prsByRepo: new Map([[null, [{ number: 861,
+      author: { login: 'web-everything[bot]' }, title: 'refresh', body: 'Refresh measured test durations.', headRefOid: head, labels: ['ready-to-merge'],
+      statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }],
+      mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', ...extra }]]]),
+      readOf: () => ({ commits }) })[0];
+
+  it('certifies then refuses a later non-timings push with the failing diff-scope rule', () => {
+    const v = verdict();
+    expect(v.decision).toBe('merge');
+    runGuard([v], () => ({ cleared: true, head }));
+    expect(v.decision).toBe('merge');
+    v.listedHeadSha = v.headSha = next;
+    runGuard([v], () => ({ cleared: false, head: next, rule: 'diff-scope' }));
+    expect(v.decision).toBe('skip'); expect(v.reason).toContain('diff-scope');
+  });
+  it.each(['read-error', 'throws', 'missing', 'contradictory read-error'])('refuses unreadable validation: %s', kind => {
+    const v = verdict();
+    runGuard([v], () => {
+      if (kind === 'throws') throw Error('unreadable');
+      return kind === 'missing' ? null : { cleared: kind === 'contradictory read-error', rule: 'read-error', head };
+    });
+    expect(v.decision).toBe('skip'); expect(v.reason).toContain('read-error');
+  });
+  it.each(['listedHeadSha', 'headSha', 'neither'])('refuses mismatched or unknown head: %s', field => {
+    const v = verdict();
+    if (field === 'neither') v.listedHeadSha = v.headSha = null;
+    else v[field] = next;
+    runGuard([v], () => ({ cleared: true, head }));
+    expect(v.decision).toBe('skip'); expect(v.reason).toContain('head');
+  });
+  it('keeps matching clearance, case insensitively, and resolves the local repository slug', () => {
+    const v = verdict(); const decide = vi.fn(() => ({ cleared: true, head: head.toUpperCase() }));
+    runGuard([v], decide);
+    expect(v.decision).toBe('merge');
+    expect(decide).toHaveBeenCalledWith({ repo: 'owner/local', num: 861 });
+  });
+  it('does not read or change AI-generated, review:accepted or already-skipped verdicts', () => {
+    const ai = verdict({}, [{ oid: head, messageBody: 'Co-Authored-By: Claude' }]);
+    const accepted = verdict({ labels: ['ready-to-merge', 'review:accepted'] });
+    const skipped = { ...verdict(), decision: 'skip' };
+    expect(ai.labelOnlyCertified).toBe(false); expect(accepted.labelOnlyCertified).toBe(false);
+    const decide = vi.fn(); runGuard([ai, accepted, skipped], decide);
+    expect(decide).not.toHaveBeenCalled();
+    expect(ai.decision).toBe('merge'); expect(accepted.decision).toBe('merge');
+  });
+  it('guards bot label-only certification and refuses repository read errors', () => {
+    const v = verdict();
+    runGuard([v], vi.fn(), () => { throw Error('repo unavailable'); });
+    expect(v.decision).toBe('skip'); expect(v.reason).toContain('read-error');
+  });
+  it.each(['web-everything[bot]', 'app/web-everything'])('guards label-only bot author %s', login => {
+    const v = verdict({ author: { login } });
+    expect(v.authorLogin).toBe(login);
+    runGuard([v], () => ({ cleared: false, rule: 'diff-scope' }));
+    expect(v.decision).toBe('skip'); expect(v.reason).toContain('diff-scope');
+  });
+  it.each([undefined, null, {}])('refuses failed validation for unknown author %s', author => {
+    const v = verdict({ author });
+    expect(v.authorLogin).toBeNull();
+    runGuard([v], () => ({ cleared: false, rule: 'read-error' }));
+    expect(v.decision).toBe('skip'); expect(v.reason).toContain('read-error');
+  });
+  it('leaves a human ready-to-merge label-only PR unaffected without reading mechanical evidence', () => {
+    const v = verdict({ author: { login: 'human' } });
+    expect(v.authorLogin).toBe('human'); expect(v.labelOnlyCertified).toBe(true);
+    const decide = vi.fn();
+    runGuard([v], decide);
+    expect(decide).not.toHaveBeenCalled(); expect(v.decision).toBe('merge');
+    expect(decideMechanicalMergeGuard(v, { cleared: false, rule: 'read-error' })).toBe(v);
+  });
+  it('runs the read-only guard in DRY_RUN and with reconcile disabled', () => {
+    const v = verdict();
+    runGuard([v], () => ({ cleared: false, rule: 'diff-scope', head }));
+    expect(v.decision).toBe('skip');
+    const pass = source.slice(source.indexOf('  // R861 — live mechanical merge guard'),
+      source.indexOf('  // #2366 — CONCURRENT-LANDER BACKSTOP'));
+    expect(pass).not.toMatch(/DRY_RUN|RECONCILE|execFileSync|recordMechanical|applyCiLifecycle/);
+  });
+  it.each([[false, false], [true, false], [false, true]])('strips with missing commits before lifecycle continue (dryRun=%s, throws=%s)', (dryRun, throws) => {
+    const exec = vi.fn(() => ''), record = vi.fn(), log = vi.fn();
+    const ctx = { commitsByPr: new Map() };
+    const pr = { number: 861, author: { login: 'web-everything[bot]' }, headRefOid: head,
+      labels: ['ready-to-merge'], commits: ctx.commitsByPr.get('cwd::861') };
+    reconcileMechanicalClearance(pr, { repo: 'owner/repo', dryRun, exec, record, log,
+      decide: () => { if (throws) throw Error('unreadable'); return { cleared: false, rule: 'read-error' }; } });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('read-error'));
+    expect(record).not.toHaveBeenCalled();
+    if (dryRun) expect(exec).not.toHaveBeenCalled();
+    else expect(exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['--remove-label', 'ready-to-merge']), expect.anything());
+    const call = source.indexOf('const mechanicalClearance = reconcileMechanicalClearance(withCommits');
+    expect(call).toBeLessThan(source.indexOf('if (p.requiredCheckReadError || commits == null) continue;', call));
+  });
 });

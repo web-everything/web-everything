@@ -169,6 +169,19 @@ export function decideMechanicalClearance(options) {
   return validateMechanicalClearance(readMechanicalClearanceFacts(options));
 }
 
+/** R861: bot/unknown label-only authors need live evidence matching every known merge pin. */
+export function decideMechanicalMergeGuard(v, result) {
+  if (v.decision !== 'merge' || !v.labelOnlyCertified
+    || (v.authorLogin && !['web-everything[bot]', 'app/web-everything'].includes(v.authorLogin))) return v;
+  const pins = [v.listedHeadSha, v.headSha].filter(sha => sha != null && sha !== '');
+  const rule = !result || result.rule === 'read-error' ? 'read-error'
+    : result.cleared !== true ? result.rule || 'read-error'
+    : !pins.length || typeof result.head !== 'string' || !result.head
+      || pins.some(sha => typeof sha !== 'string' || sha.toLowerCase() !== result.head.toLowerCase()) ? 'head' : null;
+  return rule ? { ...v, decision: 'skip',
+    reason: `mechanical-clearance refused (${rule}); normal review of the full PR required` } : v;
+}
+
 /** Only bot PRs without independent AI or human certification depend on mechanical clearance. */
 export function decideMechanicalLabelStrip(pr, result) {
   const eligible = !['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())

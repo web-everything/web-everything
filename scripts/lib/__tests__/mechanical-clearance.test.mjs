@@ -202,3 +202,10 @@ describe('mechanical label decision', () => {
     }
   });
 });
+
+
+it('unknown commit evidence cannot exempt a bot ready label from stripping', () => {
+  expect(decideMechanicalLabelStrip({ state: 'OPEN', author: { login: 'web-everything[bot]' },
+    labels: ['ready-to-merge'], headRefOid: head }, { cleared: false, rule: 'read-error' }))
+    .toEqual({ strip: true, rule: 'read-error' });
+});

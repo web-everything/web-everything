@@ -228,7 +228,7 @@ import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetti
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
-import { decideMechanicalClearance, recordMechanicalClearance, decideMechanicalLabelStrip } from './lib/mechanical-clearance.mjs';
+import { decideMechanicalClearance, recordMechanicalClearance, decideMechanicalLabelStrip, decideMechanicalMergeGuard } from './lib/mechanical-clearance.mjs';
 
 const mechanicalClearanceRefusals = new Set(); // Only stderr refusals are memoized; evidence is live every pass.
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
@@ -2169,6 +2169,8 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       const read = (typeof readOf === 'function' ? readOf(repo, p.number) : null) || {};
       p.commits = read.commits || [];
       const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
+      v.authorLogin = p.author?.login ?? null;
+      v.labelOnlyCertified = !isAiGeneratedPr(p) && !hasLabel(p, REVIEW_LABELS.accepted);
       // #2502 — the tip commit's SHA, threaded onto every emitted verdict and, via the `{...v}` spread used to
       // build `remaining`/`plan.ready`/`plan.deferred`, onto each of the six result buckets a caller (the
       // drain-daemon stuck detector) actually reads: toMerge/merged/skipped/parked/deferred/failed — NOT
@@ -2871,7 +2873,7 @@ export const CONTEXT_LIST_FIELDS = 'number,title,body,labels,statusCheckRollup,h
  *  off (a bare `/merge`/`/finish`/`/pr` sweep — no repo's context is ever collected that pass, #xc7p3q9 B3), so
  *  that path never pays {@link SWEEP_LIST_FIELDS}' extra connection fields (`files` prices a GraphQL page) for a
  *  widening it has no reuse to spend it on. */
-const CANDIDATE_ONLY_FIELDS = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels';
+const CANDIDATE_ONLY_FIELDS = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,author';
 
 /** #4108 — {@link CANDIDATE_ONLY_FIELDS} (the certification inputs {@link CONTEXT_LIST_FIELDS} doesn't need)
  *  UNION'd with {@link CONTEXT_LIST_FIELDS}. `sweepOnce`'s per-repo candidate listing (`listOne`) requests this
@@ -3065,10 +3067,11 @@ export function reconcileMechanicalClearance(pr, { repo, dryRun = false,
   if (!['web-everything[bot]', 'app/web-everything'].includes(pr?.author?.login)
     || ['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())) return null;
   const labelled = hasLabel(pr, READY_TO_MERGE_LABEL);
-  // Missing authorship evidence cannot establish that this label depends on mechanical clearance.
-  if (labelled && (!Array.isArray(pr.commits) || pr.commits.length === 0)) return null;
   if (labelled && !decideMechanicalLabelStrip(pr, null).strip) return null;
-  const result = decide({ repo, num: pr.number }); // Never cache a result, including for the same head.
+  let result;
+  try { result = decide({ repo, num: pr.number }); } // Never cache, even for the same head.
+  catch { /* Unreadable evidence revokes label-only authority. */ }
+  if (!result || result.rule === 'read-error') result = { cleared: false, rule: 'read-error' };
   const strip = decideMechanicalLabelStrip(pr, result);
   if (strip.strip) {
     const ok = dryRun || applyCiLifecycleLabelPlan({ repo, pr: pr.number, exec,
@@ -4982,7 +4985,7 @@ async function runCli() {
   const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
       const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo),
-        ...(fields ? ['--json', fields.join(',')] : ['--json', 'number,title,body,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'])],
+        ...(fields ? ['--json', fields.join(',')] : ['--json', 'number,title,body,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup,author,reviewDecision,labels,commits'])],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
       if (!data || (!fields && data.number !== num)) return null;
@@ -5271,10 +5274,10 @@ async function runCli() {
     for (const p of open) {
       // #2417 — reuse the commits read `collectOpenPrContext` already fanned out + cached this pass (was a
       // serial per-PR `gh pr view --json commits` here — the #2421 double-read, now collapsed). A PR missing
-      // from the map (its context read failed) is skipped, same as the old per-PR fetch-error `continue`.
+      // from the map still revokes stale mechanical clearance; lifecycle updates need complete context.
       const commits = ctx.commitsByPr?.get(`${repo || 'cwd'}::${p.number}`);
-      const withCommits = { ...p, commits: commits ?? p.commits };
-      const mechanicalClearance = reconcileMechanicalClearance(withCommits, { repo: memoRepo(repo), dryRun: DRY_RUN });
+      const withCommits = { ...p, commits: commits ?? [] };
+      const mechanicalClearance = reconcileMechanicalClearance(withCommits, { repo: memoRepo(repo).replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$/, ''), dryRun: DRY_RUN });
       if (p.requiredCheckReadError || commits == null) continue; // Lifecycle reconciliation still needs complete context.
       let touched = false;
       // ── The legacy #2216 branch: green-but-unlabelled → ready-to-merge (label lander's collection signal),
@@ -6009,6 +6012,18 @@ async function runCli() {
     }
   }
   __t.add('rebaseDropManifest', __t.mark() - __rebaseDropT0);
+
+  // R861 — live mechanical merge guard, independent of reconcile, escalation and dry-run.
+  for (const v of verdicts) {
+    if (v.decision !== 'merge' || !v.labelOnlyCertified
+      || (v.authorLogin && !['web-everything[bot]', 'app/web-everything'].includes(v.authorLogin))) continue;
+    let result;
+    try {
+      const repo = memoRepo(v.repo).replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$/, '');
+      result = decideMechanicalClearance({ repo, num: v.num });
+    } catch { result = { cleared: false, rule: 'read-error' }; }
+    Object.assign(v, decideMechanicalMergeGuard(v, result));
+  }
 
   // #2366 — CONCURRENT-LANDER BACKSTOP. The bare `/merge` orphan sweep never runs the `REVIEW_ESCALATION` pass
   // below (that pass is `--label`-gated), so without this it would happily merge a PR a label-scoped `/drain`

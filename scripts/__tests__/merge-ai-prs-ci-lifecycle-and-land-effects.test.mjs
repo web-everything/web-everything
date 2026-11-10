@@ -1523,17 +1523,17 @@ describe('live mechanical reconcile', () => {
     reconcileMechanicalClearance(p, h.options); expect(h.writes).toHaveLength(1);
     expect(h.reads).toHaveLength(2);
   });
-  it('preserves an AI-coauthored bot PR label when the commit-context read fails', () => {
+  it('strips an AI-coauthored bot PR label when the commit-context read fails outside DRY_RUN', () => {
     const ai = pr({ labels: [{ name: 'ready-to-merge' }], commits: [claudeCommit()] });
     expect(isAiGeneratedPr(ai)).toBe(true);
     for (const commits of [undefined, null, []]) {
       const h = harness([{ cleared: false, head, rule: 'diff-scope' }]);
-      // A failed context read leaves the listing without usable commit evidence.
+      // R861: unreadable commit evidence revokes mechanical label authority (fail closed).
       const listing = { ...ai, commits };
       reconcileMechanicalClearance(listing, h.options);
-      expect(h.writes).toHaveLength(0);
-      expect(h.reads).toHaveLength(0);
-      expect(listing.labels).toEqual([{ name: 'ready-to-merge' }]);
+      expect(h.writes).toHaveLength(1);
+      expect(h.writes[0][1]).toEqual(['pr', 'edit', '861', '--repo', 'owner/repo', '--remove-label', 'ready-to-merge']);
+      expect(h.reads).toHaveLength(1);
     }
   });
   it('never strips AI-generated or review:accepted labels', () => {
