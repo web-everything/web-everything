@@ -310,11 +310,75 @@ describe('portable feed IO and settings', () => {
     expect(order).toEqual(['abandon', 'replan', 'dispatch']);
     expect(dispatchManualPass.mock.calls[0][0]).toMatchObject({ daemon: 'red-team', redTeamMode: 'resume', expectedHead: pr().headRefOid });
   });
-  it('fix adapter restricts the existing daemon planner to one PR and uses the repo key', async () => {
+  const queueBaseline = { slots: 1, backlogMinutes: 0, maxWaitMinutes: 30 };
+  const comment = (id, body = 'fixture comment') => ({ node_id: `IC_${id}`, body, user: { login: 'web-everything' } });
+  function commentGh(comments = [], totalCount = comments.length) {
+    return vi.fn(args => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount } } } } });
+      const page = Number(args[1]?.match(/&page=(\d+)$/)?.[1]);
+      if (!page) throw Error('unexpected GitHub call');
+      return JSON.stringify(comments.slice((page - 1) * 100, page * 100));
+    });
+  }
+  function fixAdapters(overrides = {}) {
+    return { resolveLiveQueueBaseline: vi.fn(() => queueBaseline),
+      buildFixThrottle: vi.fn(() => ({ tryAdmit: vi.fn(() => ({ admit: false, kind: 'fix-cap' })) })),
+      readGhText: commentGh(), ...overrides };
+  }
+  it('fix adapter restricts the existing daemon planner to one PR and forwards active queue and daemon throttle gates', async () => {
     const reconcileFixDispatch = vi.fn(() => ({ dispatched: [{ pr: 863 }] }));
-    const { io } = await localIo({ reconcileFixDispatch });
+    const adapters = fixAdapters({ reconcileFixDispatch,
+      resolveLiveQueueBaseline: vi.fn(() => ({ ...queueBaseline, backlogMinutes: 60 })) });
+    const { io, dir } = await localIo(adapters);
     expect((await io.execute({ pr: pr(), action: 'fix-dispatch' })).ok).toBe(true);
-    const input = reconcileFixDispatch.mock.calls[0][0]; expect(input.repo).toBe('we'); expect(input.readPrs()).toEqual([pr()]);
+    const input = reconcileFixDispatch.mock.calls[0][0];
+    expect(input.repo).toBe('we'); expect(input.readPrs()).toEqual([{ ...pr(), comments: [] }]);
+    expect(adapters.resolveLiveQueueBaseline).toHaveBeenCalledWith({ checkoutRoot: dir, env: expect.objectContaining({ GH_REPO: pr().repo }) });
+    expect(adapters.buildFixThrottle).toHaveBeenCalledWith({ env: expect.objectContaining({ GH_REPO: pr().repo }) });
+    expect(input.queueAdmission.active).toBe(true);
+    expect(input.queueAdmission.tryAdmit('fix')).toMatchObject({ admit: false });
+    expect(input.dispatchThrottle).toBe(adapters.buildFixThrottle.mock.results[0].value);
+    expect(input.dispatchThrottle.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap' });
+  });
+  it.each(['baseline throws', 'baseline missing', 'baseline bypassed', 'baseline malformed', 'throttle throws', 'throttle missing'])
+  ('fix adapter holds when admission cannot be built: %s', async failure => {
+    const reconcileFixDispatch = vi.fn(), adapters = fixAdapters({ reconcileFixDispatch });
+    if (failure === 'baseline throws') adapters.resolveLiveQueueBaseline = () => { throw Error('unreadable'); };
+    if (failure === 'baseline missing') adapters.resolveLiveQueueBaseline = () => null;
+    if (failure === 'baseline bypassed') adapters.resolveLiveQueueBaseline = () => ({ ...queueBaseline, bypassed: 'error' });
+    if (failure === 'baseline malformed') adapters.resolveLiveQueueBaseline = () => ({});
+    if (failure === 'throttle throws') adapters.buildFixThrottle = () => { throw Error('unreadable'); };
+    if (failure === 'throttle missing') adapters.buildFixThrottle = () => null;
+    const { io } = await localIo(adapters);
+    expect(await io.execute({ pr: pr(), action: 'fix-dispatch' })).toMatchObject({ ok: false,
+      reason: expect.stringMatching(/admission unavailable; operator must inspect/) });
+    expect(reconcileFixDispatch).not.toHaveBeenCalled(); expect(adapters.readGhText).not.toHaveBeenCalled();
+  });
+  it('fix adapter includes the complete validated thread, including markers beyond the first page', async () => {
+    const comments = Array.from({ length: 101 }, (_, i) => comment(i));
+    comments[100].body = '<!-- stand-down -->';
+    const reconcileFixDispatch = vi.fn(() => ({ dispatched: [] })), readGhText = commentGh(comments);
+    const { io } = await localIo(fixAdapters({ reconcileFixDispatch, readGhText }));
+    await io.execute({ pr: pr(), action: 'fix-dispatch' });
+    const snapshot = reconcileFixDispatch.mock.calls[0][0].readPrs()[0];
+    expect(snapshot.comments).toHaveLength(101);
+    expect(snapshot.comments[100]).toMatchObject({ id: 'IC_100', body: comments[100].body, author: { login: 'web-everything' } });
+    expect(readGhText).toHaveBeenCalledTimes(3);
+    expect(readGhText.mock.calls[0][0][1]).toBe(`repos/${pr().repo}/issues/863/comments?per_page=100&page=1`);
+    expect(readGhText.mock.calls[2][0]).toContain('graphql');
+  });
+  it.each(['read fails', 'count mismatch', 'missing author', 'page cap'])
+  ('fix adapter holds incomplete comments with full-thread operator fallback: %s', async failure => {
+    const reconcileFixDispatch = vi.fn();
+    let readGhText = commentGh([comment(1)], 2);
+    if (failure === 'read fails') readGhText = vi.fn(() => { throw Error('unreadable'); });
+    if (failure === 'missing author') readGhText = commentGh([{ ...comment(1), user: {} }]);
+    if (failure === 'page cap') readGhText = commentGh(Array.from({ length: 1000 }, (_, i) => comment(i)));
+    const { io } = await localIo(fixAdapters({ reconcileFixDispatch, readGhText }));
+    expect(await io.execute({ pr: pr(), action: 'fix-dispatch' })).toMatchObject({ ok: false,
+      reason: expect.stringMatching(/comments unavailable; operator must inspect full thread/) });
+    expect(reconcileFixDispatch).not.toHaveBeenCalled();
+    if (failure === 'page cap') expect(readGhText).toHaveBeenCalledTimes(10);
   });
   it('stale-base gate and optional validator use injected existing entry points', async () => {
     const staleBaseGate = vi.fn(() => ({ held: true, reason: 'stale-base refresh first: refreshed onto main, CI re-runs before any fixer' }));

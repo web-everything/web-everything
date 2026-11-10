@@ -250,8 +250,30 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
       if (action.action === 'validate-data-refresh') return adapters.validateDataRefresh({ ...input, expectedHead: pr.headRefOid });
       if (action.action === 'fix-dispatch') {
         const { runReconcileFixDispatch } = await import('./reconcile-fix-dispatch.mjs');
+        let queueAdmission, dispatchThrottle, comments;
+        try {
+          const { createQueueBudget } = await import('../readiness/heavy-queue-projection.mjs');
+          const resolveBaseline = adapters.resolveLiveQueueBaseline
+            ?? (await import('../readiness/heavy-admission.mjs')).resolveLiveQueueBaseline;
+          queueAdmission = createQueueBudget(await resolveBaseline({ checkoutRoot: root, env }));
+          if (!queueAdmission.active) throw Error('heavy queue admission unavailable');
+          const buildThrottle = adapters.buildFixThrottle
+            ?? (await import('../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs')).buildFixThrottle;
+          dispatchThrottle = await buildThrottle({ env });
+          if (typeof dispatchThrottle?.tryAdmit !== 'function') throw Error('fix throttle unavailable');
+        } catch {
+          return { ok: false, reason: 'fix admission unavailable; operator must inspect queue and host admission before retrying' };
+        }
+        try {
+          const { readCompletePrComments } = await import('./pr-comments-complete.mjs');
+          // Pagination and the independent count proof share this tick's GitHub/time budget.
+          comments = readCompletePrComments(pr.number, { repo: pr.repo, gh: readGh });
+        } catch {
+          return { ok: false, reason: 'complete PR comments unavailable; operator must inspect full thread before retrying' };
+        }
         // Same planner, scope/capacity/claim gates and dispatcher as the daemon, restricted to ONE PR.
-        const result = (adapters.reconcileFixDispatch ?? runReconcileFixDispatch)({ repo: repoKey, root, readPrs: () => [pr], dryRun: false });
+        const result = (adapters.reconcileFixDispatch ?? runReconcileFixDispatch)({ repo: repoKey, root,
+          readPrs: () => [{ ...pr, comments }], queueAdmission, dispatchThrottle, dryRun: false });
         return { ok: result.dispatched?.some(d => Number(d.pr ?? d.prNumber) === pr.number) === true,
           reason: 'fix daemon planner refused or did not prove a dispatch' };
       }

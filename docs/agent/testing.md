@@ -4109,3 +4109,17 @@ job/lock outcomes, including persisted request retention. `daemon-self-sync-muta
 requires failed/refused mutations to remain pending and retry on the next tick; only a completed
 mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.
+
+## Live-owner watch import ordering
+
+`createLiveOwnerWatchIo` loads dispatch and overlay module roots sequentially. These roots share
+circular dependencies: starting them together with `Promise.all` deadlocks vite-node evaluation
+before adapter construction. Keep the portable IO cases in `pr-live-owner-watch.test.mjs` at the
+default timeout; injected dispatchers and lock identity probes keep their exercised IO local.
+
+Stalled living owners escalate to a rate-limited NEEDS-YOU event; activity age never proves death
+or permits claim takeover. The portable IO regressions exercise production evidence, planning,
+and admission for fix/build/review owners, retaining the live/unknown admission hold and checking
+that fresh owners and unknown evidence cannot trigger takeover. The feed-tail regression uses
+more than 2 MiB and spies on the actual read to pin offset, requested length, returned bytes, and
+exclusion of the partial leading record.
