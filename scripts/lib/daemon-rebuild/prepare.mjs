@@ -776,7 +776,7 @@ async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, 
 }
 
 /** Safe-point entry: no recovery, fetch, planning, lease claim or build launch. Caller holds WRITE. */
-export async function adoptReadyRebuild({ root, env, log, run, stateOpts, mainOnly, now }) {
+export async function adoptReadyRebuild({ root, env, log, run, prState, stateOpts, mainOnly, now }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const ready = readReadyCandidate(root, stEnv);
@@ -796,6 +796,21 @@ export async function adoptReadyRebuild({ root, env, log, run, stateOpts, mainOn
   if (state.quarantine || state.inProgress || state.unverified) return terminal({ moved: false, reason: 'quarantined' });
   const unsafe = findUnsafeLocalState({ git, knownInputs: knownInputsOf(state) });
   if (!unsafe.safe) return terminal({ moved: false, reason: unsafe.reason });
+  // A prepared record bypasses planning: recheck its still-registered PRs with the same reader.
+  for (const applied of ready.adopt.applied ?? []) {
+    const overlay = registry.overlays.find((o) => o.ref === applied.ref);
+    if (!overlay) continue; // The locked matcher below checks removal/graduation evidence.
+    const pr = overlay.pr ?? applied.pr;
+    if (pr == null) continue;
+    let prStatus;
+    try { prStatus = await prState(pr); } catch { /* Unknown evidence refuses adoption. */ }
+    if (prStatus !== 'OPEN') {
+      const reason = prStatus === 'MERGED' ? 'pr-merged' : prStatus === 'CLOSED' ? 'pr-closed' : 'pr-state-unknown';
+      dropReadyCandidate({ root, env: stEnv, reason });
+      alert(reason, { ref: applied.ref, pr });
+      return terminal({ moved: false, reason });
+    }
+  }
   const plan = { ...ready.adopt, decisions: [] };
   const result = await adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, mainOnly, now,
     overlaysBefore: registry.overlays, plan, prevHead, state, unsafe, alert, terminal,

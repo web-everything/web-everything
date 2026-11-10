@@ -1,7 +1,8 @@
 import { it, expect, vi, afterEach } from 'vitest';
 import { withSelfSync, safePoint } from '../daemon-self-sync.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
-import { readReadyCandidate, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { readRebuildState, rebuildStatePath, readReadyCandidate, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { addOverlay, removeOverlay } from '../daemon-overlays.mjs';
 import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
 import { fixture } from './helpers/safe-point-fixture.mjs';
@@ -201,4 +202,78 @@ it('adoptReadyOnly without readiness never plans or starts a job', async () => {
     run: (args, opts) => { expect(['fetch', 'commit-tree', 'worktree']).not.toContain(args[0]); return f.run(args, opts); },
     emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: false, reason: 'none' });
   expect(runSmoke).not.toHaveBeenCalled();
+});
+
+it('unreadable HEAD after read reacquisition skips the tick and never executes its tail', async () => {
+  const tail = vi.fn();
+  let head = 'boot';
+  const { w, acquire, release, restart } = setup(async (h) => {
+    h.setReady({ ...h.f.ready, prevHead: head });
+    h.acquire.mockImplementation(() => { head = null; return { ok: true }; });
+    await safePoint('fix'); tail();
+  }, { readHead: () => head });
+  expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'safe-point-abort: head-unreadable' });
+  expect(tail).not.toHaveBeenCalled(); expect(restart).not.toHaveBeenCalled();
+  expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
+});
+it.each(['corrupt', 'unreadable', 'missing', 'null', 'array', 'invalid-quarantine'])(
+  '%s quarantine evidence after read reacquisition skips the tick and never executes its tail', async (kind) => {
+    const tail = vi.fn();
+    const { w, acquire, release, restart } = setup(async (h) => {
+      writeRebuildState(h.f.root, { quarantine: null }, h.f.env);
+      h.setReady();
+      h.acquire.mockImplementation(() => {
+        const file = rebuildStatePath(h.f.root, h.f.env);
+        if (kind === 'missing' || kind === 'unreadable') {
+          rmSync(file);
+          if (kind === 'unreadable') mkdirSync(file); // EISDIR is deterministic even as root.
+        } else {
+          writeFileSync(file, kind === 'corrupt' ? '{' : kind === 'invalid-quarantine' ? '{"quarantine":false}' : kind === 'array' ? '[]' : 'null');
+        }
+        return { ok: true };
+      });
+      await safePoint('fix'); tail();
+    }, { readState: readRebuildState });
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'safe-point-abort: state-unreadable' });
+    expect(tail).not.toHaveBeenCalled(); expect(restart).not.toHaveBeenCalled();
+    expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
+  },
+);
+it.each(['CLOSED', 'MERGED', null, 'UNKNOWN', 'throws'])(
+  'adoptReadyOnly refuses and drops a prepared candidate when a still-registered PR is %s', async (status) => {
+    const f = fixture(); fixtures.push(f); f.record();
+    addOverlay(f.root, { ref: 'A', pr: 123 }, { env: f.env });
+    const prState = vi.fn(async () => {
+      if (status === 'throws') throw new Error('PR unreadable');
+      return status;
+    });
+    const run = vi.fn(f.run);
+    const result = await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true,
+      run, prState, emitEvent: vi.fn(), log: { error: vi.fn() } });
+    expect(result).toMatchObject({ moved: false,
+      reason: status === 'CLOSED' ? 'pr-closed' : status === 'MERGED' ? 'pr-merged' : 'pr-state-unknown' });
+    expect(prState).toHaveBeenCalledTimes(1); expect(prState).toHaveBeenCalledWith(123);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+    expect(readReadyCandidate(f.root, f.env)).toBeNull();
+  },
+);
+it('adoptReadyOnly adopts a still-open PR using the injected normal rebuild PR reader', async () => {
+  const f = fixture(); fixtures.push(f); f.record();
+  addOverlay(f.root, { ref: 'A', pr: 123 }, { env: f.env });
+  const prState = vi.fn(() => 'OPEN');
+  expect(await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true,
+    run: f.run, prState, emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: true, adopted: true });
+  expect(prState).toHaveBeenCalledTimes(1); expect(prState).toHaveBeenCalledWith(123);
+});
+
+it('read reacquisition accepts intact historical rebuild state without quarantine', async () => {
+  const tail = vi.fn();
+  const { w, acquire, release } = setup(async (h) => {
+    writeRebuildState(h.f.root, { adopted: null }, h.f.env);
+    h.setReady();
+    await safePoint('fix'); tail(); return 'continued';
+  }, { readState: readRebuildState });
+  expect(await w.tickOnce()).toBe('continued'); expect(tail).toHaveBeenCalledTimes(1);
+  expect(acquire).toHaveBeenCalledTimes(2); expect(release).toHaveBeenCalledTimes(2);
 });

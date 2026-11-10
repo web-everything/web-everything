@@ -52,16 +52,21 @@ const EMPTY_STATE = Object.freeze({
 });
 
 /**
- * Read the per-clone rebuild state, never throwing — a missing or corrupt file reads as the empty state (fail
- * closed to "nothing adopted, nothing rejected, nothing in progress", never a crash).
+ * Read the per-clone rebuild state. By default, a missing or corrupt file reads as empty state.
+ * Strict reads throw on unreadable/corrupt evidence instead of returning empty state.
  * @param {string} root
  * @param {NodeJS.ProcessEnv} [env]
+ * @param {{strict?:boolean}} [options]
  * @returns {{adopted:object|null, rejected:object|null, inProgress:object|null, quarantine:object|null,
  *   unverified:{head:string, prevHead:string}|null, building:object|null, smokePassed:Array<{key:string, tree:string, passedAt:string}>|null}}
  */
-export function readRebuildState(root, env = process.env) {
+export function readRebuildState(root, env = process.env, { strict = false } = {}) {
   try {
     const parsed = JSON.parse(readFileSync(rebuildStatePath(root, env), 'utf8'));
+    if (strict && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || (parsed.quarantine != null && (typeof parsed.quarantine !== 'object' || Array.isArray(parsed.quarantine))))) {
+      throw new Error('invalid rebuild state');
+    }
     return {
       adopted: parsed?.adopted ?? null,
       rejected: parsed?.rejected ?? null,
@@ -75,7 +80,8 @@ export function readRebuildState(root, env = process.env) {
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
     };
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return { ...EMPTY_STATE };
   }
 }

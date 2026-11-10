@@ -1336,13 +1336,23 @@ export function withSelfSync(effects, {
           acquired = acquireRead(root, { ...cloneLockOpts(), readerKey });
           if (!acquired.ok) throw new SafePointAbort(acquired.reason);
           released = false;
-          if (readState(root, env).quarantine) {
+          let safePointState;
+          try { safePointState = readState(root, env, { strict: true }); }
+          catch {
+            say('skipped (state-unreadable; tick-ended)');
+            throw new SafePointAbort('state-unreadable');
+          }
+          if (safePointState.quarantine) {
             say('skipped (quarantine; tick-ended)');
             throw new SafePointAbort('quarantine');
           }
           if (recloneBlocks()) throw new SafePointAbort('clone-recloned');
           const headNow = readHead(syncOpts());
-          if (bootSha != null && headNow != null && headNow !== bootSha) {
+          if (headNow == null) {
+            say('skipped (head-unreadable; tick-ended)');
+            throw new SafePointAbort('head-unreadable');
+          }
+          if (bootSha != null && headNow !== bootSha) {
             say('skipped (head-moved; tick-ended)');
             throw new SafePointAbort('head-moved');
           }

@@ -181,7 +181,7 @@ async function rebuildCloneInternal({
     // Same finalize wait setting as tick-start adoption, with no starvation escalation.
     const waitMs = lockOpts.waitMs ?? (Number(env?.[FINALIZE_LOCK_WAIT_ENV]) > 0
       ? Number(env[FINALIZE_LOCK_WAIT_ENV]) : DEFAULT_FINALIZE_LOCK_WAIT_MS);
-    const locked = await withWriteLock(root, () => adoptReadyRebuild({ root, env, log, run, stateOpts, mainOnly, now }), {
+    const locked = await withWriteLock(root, () => adoptReadyRebuild({ root, env, log, run, prState, stateOpts, mainOnly, now }), {
       ...(env?.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {}),
       ...lockOpts, now, waitMs, ...(sleep ? { sleep } : {}),
     });
