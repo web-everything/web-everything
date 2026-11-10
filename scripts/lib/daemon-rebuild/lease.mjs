@@ -137,6 +137,9 @@ export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now
   if (!Number.isFinite(startedMs) || nowMs - startedMs > staleMs) return false;
   if (building.host !== hostname()) return true;
   if (building.pid === process.pid) return ACTIVE_BUILD_TOKENS.has(building.token);
+  // R830: an adopt-only tick (the long-lived daemon) takes a transient lease it releases in the same call. It is never
+  // a build, so another process must not honour it while the daemon pid is alive; else a leaked one starves the job.
+  if (building.adoptOnly) return false;
   if (!pidExists(building.pid)) return false;
   // The pid exists, but a REUSED pid belongs to an unrelated process that started after the lease was taken.
   // An unreadable start time fails closed (stays live): only a proven later start counts as dead.
@@ -148,13 +151,14 @@ export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now
  * `plan`, tearing down an abandoned lease's leftover candidate first. Returns the lease, or `null` when a live
  * sibling build already holds it. Mutates `state.building`; the caller writes the state.
  */
-export function claimBuildLease({ state, plan, root, run, env, nowMs, startTimeOf = processStartMs }) {
+export function claimBuildLease({ state, plan, root, run, env, nowMs, adoptOnly = false, startTimeOf = processStartMs }) {
   if (buildLeaseIsLive(state.building, { env, nowMs, startTimeOf })) return null;
   if (state.building?.path && leaseOwnerIsGone(state.building, startTimeOf)) removeCandidate({ root, path: state.building.path, run, env });
   const token = `${process.pid}-${randomBytes(4).toString('hex')}`;
   const lease = {
     token, pid: process.pid, host: hostname(), startedAt: new Date(nowMs).toISOString(),
     target: plan.finalSha, inputsKey: plan.inputsKey, path: candidateWorktreePath(root, env, token),
+    ...(adoptOnly ? { adoptOnly: true } : {}),
   };
   state.building = lease;
   ACTIVE_BUILD_TOKENS.add(token);
@@ -168,6 +172,7 @@ export function claimBuildLease({ state, plan, root, run, env, nowMs, startTimeO
 function leaseOwnerIsGone(building, startTimeOf = processStartMs) {
   if (building.host !== hostname()) return false;
   if (building.pid === process.pid) return !ACTIVE_BUILD_TOKENS.has(building.token);
+  if (building.adoptOnly) return true; // transient adopt-only lease: it never owns a candidate tree
   if (!pidExists(building.pid)) return true;
   return pidReusedSince(building.pid, Date.parse(building.startedAt || ''), startTimeOf);
 }
