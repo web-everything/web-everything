@@ -2746,7 +2746,7 @@ async function cmdAcquire(repo) {
           // Probe before --no-reset's safety check too: otherwise unreadable history is merely refused
           // there and retried on every acquire instead of being persistently quarantined.
           requireReadableLaneHistory(repo, pick);
-          const work = unpushedLaneWork(repo, laneDir(repo, pick), { allowFetch: true });
+          const work = acquireBlockingWork(repo, laneDir(repo, pick));
           if (work.commits !== '') throw new Error(`lane-${pick} holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
@@ -2901,7 +2901,7 @@ async function cmdAcquire(repo) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       if (!targetWasReserved) {
-        const work = unpushedLaneWork(repo, dir, { allowFetch: true });
+        const work = acquireBlockingWork(repo, dir);
         if (work.commits !== '') throw new Error(`lane-${chosen} holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
       }
       provisionClaimedLane(repo, chosen, targetWasReserved);
@@ -3181,6 +3181,24 @@ function unpushedLaneWork(repo, dir, { allowFetch = false } = {}) {
   if (redirect) return { commits: null, why: redirect };
   const io = repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
   return releaseUnprovenCommits(dir, null, { io }, { allowFetch });
+}
+
+/** Acquire's view of unpushed work: the strict preservation evidence minus commits that are patch-equivalent to
+ *  origin/<branch> (squash-merged work is safe to drop, the same relaxation `list --acquirable` applies). Unreadable
+ *  evidence (commits === null) and any genuinely unmatched commit, stash included, still block. */
+function acquireBlockingWork(repo, dir) {
+  const work = unpushedLaneWork(repo, dir, { allowFetch: true });
+  if (!work.commits) return work;
+  const local = releaseLocalWorkTips(dir);
+  if (!local) return work;
+  const real = new Set();
+  for (const tip of local.tips) {
+    const out = releaseEvidenceGit(['rev-list', '--right-only', '--cherry-pick', `origin/${repo.branch}...${tip}`], dir);
+    if (out === null) return work;
+    for (const sha of out.split('\n')) if (sha) real.add(sha);
+  }
+  const left = work.commits.split('\n').filter(sha => sha && real.has(sha));
+  return { ...work, commits: left.join('\n') };
 }
 
 /** Park abandoned commits on the canonical remote before recycling a free lane. An exclusive lease spans
