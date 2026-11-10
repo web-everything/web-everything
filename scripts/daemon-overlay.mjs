@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /**
  * @file scripts/daemon-overlay.mjs
+ * Pinned remove/retire publishes a durable rebuild request for the clone owner; unpinned withdrawals do not.
+ * An absent remove snapshot is a no-op; every mutation carries a concrete registration compare guard.
  * @description Operator/daemon CLI for the per-clone overlay list (`scripts/lib/daemon-overlays.mjs`, Module
  *   B) — docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clause 5: a daemon clone tracks
  *   `main` plus an explicit overlay list kept in a per-clone state file OUTSIDE the clone. This is the
@@ -116,7 +118,7 @@ import {
 } from './lib/daemon-overlays.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
-import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
+import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
@@ -412,6 +414,19 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
   return settled;
 }
 
+/** Register-only removal requires a concrete pre-read snapshot. An absent ref never reaches the
+ * mutation helper, so a registration arriving after that snapshot cannot be removed unguarded. */
+export function removeRegistration({ root, ref, by = null, reason = null, env = process.env, deps = {} }) {
+  const state = (deps.readState ?? readOverlayState)(root, { env });
+  if (state.corrupt) throw new Error('overlay state is corrupt — refusing removal');
+  const entry = state.overlays.find((o) => o.ref === ref);
+  if (!entry) return { removed: false, list: state.overlays };
+  const result = (deps.remove ?? removeOverlay)(root, ref, { env, why: reason || 'operator', expectedOverlay: entry });
+  if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
+  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason }, { env });
+  return result;
+}
+
 /**
  * R310 `retire`: drop `ref` only when (a) its entry still equals `expectedEntry` (the one the caller proved),
  * (b) this process re-proves it retired at `expectedTip`, and (c) its remote tip is still `expectedTip` AFTER the
@@ -454,6 +469,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       return refuse(after === undefined ? 'tip-unreadable-restored' : 'tip-moved-restored', { tipNow: after ?? null });
     }
     clearPending(root, env, ref);
+    if (entry.pinned === true) writeRebuildRequest(root, { by, reason: proof.reason, ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
     appendOverlayEvent(root, { kind: 'auto-retired', ref, pr: entry.pr ?? null, by, reason: proof.reason, tip: expectedTip, evidence: proof.evidence }, { env });
     return { retired: true, refused: null, reason: proof.reason, evidence: proof.evidence, settled, list: readOverlays(root, { env }) };
   });
@@ -933,9 +949,7 @@ async function main() {
     output = { settled: await withAddGuardLock(root, env, () => settlePendingDrops({ root, env, by })), pending: readPendingDrops(root, env), list: readOverlays(root, { env }) };
     if (output.pending.length) process.exitCode = 3;
   } else if (cmd === 'remove') {
-    const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator' });
-    if (removed) appendOverlayEvent(root, { kind: 'removed', ref: flags.ref, by, reason }, { env });
-    output = { removed, list };
+    output = removeRegistration({ root, ref: flags.ref, by, reason, env });
   } else if (cmd === 'approve-edge') {
     // The ONLY way an `origin/edge/<ref>` branch becomes adoptable by a rebuild: record actor + exact tip sha on
     // the registered overlay. A malformed sha, a missing actor or an unregistered ref is a usage error (exit 2).
