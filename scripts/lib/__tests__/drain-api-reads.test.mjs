@@ -350,6 +350,20 @@ describe('R549 round: pinned repo, strict base64, 20 s freeze bound', () => {
       expect(r.transient).toBe(true);
     } finally { vi.useRealTimers(); }
   });
+  it('the freeze read asks the throttle for the reserved priority slot; ordinary sources do not', () => {
+    const seen = [];
+    const exec = (_f, _a, opts) => { seen.push(opts.throttle); throw Object.assign(new Error('stop'), { status: 1 }); };
+    createRestSource({ exec, slug: 'o/r', env: {}, priority: true }).read('json', 'repos/{owner}/{repo}/git/ref/heads/main');
+    createRestSource({ exec, slug: 'o/r', env: {} }).read('json', 'repos/{owner}/{repo}/git/ref/heads/main');
+    expect(seen[0]).toMatchObject({ reservedSlot: true, caller: 'red-main-freeze-read' });
+    expect(seen[1]?.reservedSlot).toBeUndefined();
+  });
+  it('a truly unreadable freeze still holds (fail closed) on the priority path', () => {
+    const rest = routes({ 'git/ref/heads/': http(500) });
+    const r = readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest });
+    expect(r.frozen).toBeUndefined();
+    expect(r.error).toMatch(/unreadable|api-http|branch/);
+  });
   it('a fast freeze read still succeeds inside the shared bound', () => {
     const rest = routes(fileWorld(SHARED_FREEZE_FILE, b64(FREEZE)));
     expect(readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest })).toMatchObject({ frozen: true });

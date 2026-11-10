@@ -3,9 +3,10 @@ bornAs: x5qtv82
 kind: story
 size: 5
 parent: "6122"
-status: open
+status: active
 scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/settings/card-ledger-trust.json", "we:scripts/settings/card-ledger-legacy-identities.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/backlog/card-ledger-checkpoint.mjs", "we:scripts/backlog/card-ledger-signing-key.mjs", "we:scripts/lib/git-transport-branch.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/git-transport-branch.test.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
 dateOpened: "2026-10-13"
+dateStarted: "2026-11-07"
 tags: [backlog, drain, numbering, ledger, shadow]
 ---
 
@@ -47,7 +48,15 @@ Cards numbered at birth (slice 6622) need no row, so this ledger carries only fa
       never removed (that would untrust every row they signed and lock the ledger). Commit dates are set by
       the signer, so no date window is used as revocation: a `revoked` key authenticates only commits at or
       before `checkpoint`, never after.
-    - `checkpoint`: `{ commit, fileSha256 }`, a reviewed point on `ops/card-numbers`. Verification walks only
+    - `checkpoint`: `{ commit, fileSha256, quarantinedLines, quarantinedCommits }`, a reviewed point on
+      `ops/card-numbers`. `quarantinedLines` contains strictly increasing, one-based physical line numbers
+      excluded from the hashed file; valid excluded rows still burn their numbers, subject to trusted-row
+      precedence. `quarantinedCommits` records quarantine decisions accounted for by verification (including
+      commits outside this repo's file history). Both lists survive checkpoint
+      advancement. Legacy checkpoints without these lists remain valid only without quarantine entries;
+      incomplete metadata or a newly quarantined introducer hidden behind a checkpoint refuses reading.
+      Recovery is a reviewed rebuild from an earlier checkpoint (or no checkpoint), with an explicitly
+      increased history budget if needed. Verification walks only
       history after it, and the ledger file at that commit must hash to `fileSha256`; rows at or before it
       are trusted as reviewed. This bounds the history walk as the ledger grows. When the history budget is
       exceeded, or a key leaks, the ledger is unreadable until a reviewed PR advances the checkpoint: a
@@ -197,6 +206,10 @@ Required tests in that same suite:
 - **Capability (Red today)** — `checkpointBoundsHistoryWalk`: verification reads no commit at or before the
   checkpoint; a checkpoint whose `fileSha256` does not match is unreadable; history past the budget after the
   checkpoint is unreadable, and advancing the checkpoint makes it readable.
+- **Capability** — `checkpointPreservesQuarantinedRowsAndBurnedNumbers`: generate, adopt and advance a
+  checkpoint past quarantined evidence; excluded identities stay absent, valid excluded numbers remain
+  burned without raising the allocation floor, and trusted rows keep precedence. Missing or invalid
+  exclusion metadata refuses reading and checkpoint generation.
 - **Capability (Red today)** — `ignoresAmbientSignerTrust`: the forger's key is trusted in the host keyring
   and in a local `gpg.ssh.allowedSignersFile`, but is not in the base trust root; its row is rejected.
 - **Capability (Red today)** — `signedTransportVerifiesBeforePush` (in
