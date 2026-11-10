@@ -31,10 +31,12 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
   const parseEnv = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
   const minimum = minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv);
-  const idle = idleEnv === undefined ? settings?.minConcurrentIdlePct : parseEnv(idleEnv);
+  const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
+  // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
+  const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
   const floor = {
     minConcurrent: Number.isInteger(minimum) && minimum >= 0 ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
-    idlePct: Number.isInteger(idle) && idle >= 0 && idle <= 100 ? idle : 10,
+    idlePct: validIdle(idle) ? idle : 10,
   };
   note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'})`);
   return floor;

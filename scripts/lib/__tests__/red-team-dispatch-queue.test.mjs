@@ -841,3 +841,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     });
   });
 });
+
+describe('red-team queue floor idle override', () => {
+  it('an invalid idle override keeps a valid stricter file threshold instead of loosening to 10', () => {
+    const text = JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 80 } } });
+    for (const bad of ['bad', '', ' ', 'Infinity', '-1', '101', '1.5']) {
+      expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: bad }, file: 'x', readFile: () => text }))
+        .toEqual({ minConcurrent: 2, idlePct: 80 });
+    }
+  });
+});
