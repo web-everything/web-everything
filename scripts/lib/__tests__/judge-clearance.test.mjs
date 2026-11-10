@@ -149,6 +149,7 @@ const protectedPaths = [
   'scripts/review-set-label.mjs', 'scripts/merge-ai-prs.mjs', 'scripts/pr-land.mjs',
   'scripts/operations/record-verdict.mjs', 'scripts/operations/review-dispatch.mjs',
   'scripts/lib/advisory-labels.mjs', 'scripts/lib/verdict-ledger.mjs',
+  'scripts/lib/marker-authorship.mjs',
   '.github/workflows/review-gate.yml', '.github/workflows/apply-review-request.yml',
   '.github/workflows/ci.yml', '.github/workflows/deploy.yml', '.github/workflows/new-gate.yml',
   'scripts/apply-review-request.mjs', 'scripts/check-review-gate.mjs', 'scripts/collect-review-requests.mjs',
@@ -294,6 +295,44 @@ describe('#5062 judge clearance decision', () => {
   it('a forged Codex delegation cannot hide a trusted Anthropic author from the Anthropic judge', () => {
     const input = clean(); input.dispatchRecords[0].executedProvider = 'anthropic';
     refuses(input, 'same-provider');
+  });
+  it.each([
+    ['Claude', 'noreply@anthropic.com', 'codex', 'anthropic'],
+    ['Codex', 'noreply@openai.com', 'anthropic', 'codex'],
+    ['Gemini', 'noreply@google.com', 'anthropic', 'codex'],
+    ['Copilot', 'copilot@github.com', 'codex', 'anthropic'],
+    ['Antigravity', '', 'anthropic', 'codex'],
+  ])('refuses contradictory %s fix identities (email %s; dispatch %s; judge %s)', (name, email, dispatched, judge) => {
+    for (const commit of [
+      { authors: [{ name }] },
+      ...(email ? [{ authors: [{ name: 'Automation', email }] }] : []),
+      { messageBody: `Co-Authored-By: ${name} <${email}>` },
+      { body: `Co-Authored-By: ${name} <${email}>` },
+      ...(email ? [{ messageBody: `Co-Authored-By: Automation <${email}>` }] : []),
+    ]) {
+      const input = clean();
+      input.dispatchRecords[0].executedProvider = dispatched;
+      input.pr.body = `${buildDelegationMarker({ provider: dispatched, model: 'test', taskType: 'other' })}\n${buildAuthorActorMarker(author)}`;
+      input.judge.provider = judge;
+      input.pr.commits = [commit];
+      refuses(input, 'independence-unknown');
+    }
+  });
+  it.each(['codex', 'anthropic'])('allows agreeing commit signals for %s without using them as authority', (provider) => {
+    const input = clean();
+    const name = provider === 'codex' ? 'Codex' : 'Claude';
+    input.dispatchRecords[0].executedProvider = provider;
+    input.pr.body = `${buildDelegationMarker({ provider, model: 'test', taskType: 'other' })}\n${buildAuthorActorMarker(author)}`;
+    input.judge.provider = provider === 'codex' ? 'anthropic' : 'codex';
+    input.pr.commits = [{ authors: [{ name }], messageBody: `Co-Authored-By: ${name} <noreply@example.com>` }];
+    expect(decideJudgeClearance(input).allowed).toBe(true);
+    input.dispatchRecords = [];
+    refuses(input, 'independence-unknown');
+  });
+  it('refuses mixed Claude and Codex signals even when one agrees with the dispatch', () => {
+    const input = clean();
+    input.pr.commits = [{ authors: [{ name: 'Codex' }], messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>' }];
+    refuses(input, 'independence-unknown');
   });
   it.each([[], null, [{ ...record, executedProvider: null }], [{ ...record }, { ...record }]])(
     'absent, unreadable, incomplete or duplicate binding records remain unknown: %j', (dispatchRecords) => {

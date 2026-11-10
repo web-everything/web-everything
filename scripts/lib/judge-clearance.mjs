@@ -13,6 +13,27 @@ export const JUDGE_REFUSALS = Object.freeze([
 const refuse = (refusal, detail = null) => ({ allowed: false, refusal, detail });
 const providerOf = value => ({ claude: 'anthropic', anthropic: 'anthropic', codex: 'openai', openai: 'openai' })[value] ?? null;
 
+// These PR-controlled identities can only veto a binding, never establish one.
+// Other known AI identities retain the human hold even though their providers
+// are not supported as trusted dispatch/judge providers here.
+const COMMIT_PROVIDER_SIGNALS = [
+  ['anthropic', /\bclaude\b|anthropic\.com|noreply@anthropic/i],
+  ['openai', /\bcodex\b|openai\.com/i],
+  ['google', /\bgemini\b|\bantigravity\b|noreply@google\.com/i],
+  ['github', /\bcopilot\b/i],
+];
+function commitContradictsProvider(commit, provider) {
+  // Preserve the existing Claude rubric, including its gh trailer fallback.
+  if (isAiCommit(commit) && provider !== 'anthropic') return true;
+  const identities = (Array.isArray(commit?.authors) ? commit.authors : [])
+    .map(author => `${author?.name ?? ''} <${author?.email ?? ''}>`);
+  for (const body of [commit?.messageBody, commit?.body]) {
+    for (const match of String(body ?? '').matchAll(/^co-authored-by:[ \t]*(.+)$/gim)) identities.push(match[1]);
+  }
+  return identities.some(identity => COMMIT_PROVIDER_SIGNALS.some(([signalProvider, pattern]) =>
+    pattern.test(identity) && signalProvider !== provider));
+}
+
 /** Derive identity from live PR repository/number evidence, never from a branch name. */
 export function deriveRecordBinding({ record, pr, baseShaIsAncestor } = {}) {
   const head = pr?.headRepository?.nameWithOwner;
@@ -89,7 +110,7 @@ export function decideJudgeClearance(input) {
     // PR-controlled evidence can only add doubt. A forged marker cannot conceal a same-provider author.
     if (authorProvider === judgeProvider) return refuse('same-provider');
     if (providerOf(delegation.provider) !== authorProvider
-      || !Array.isArray(pr.commits) || (pr.commits.some(isAiCommit) && authorProvider !== 'anthropic')) return refuse('independence-unknown');
+      || !Array.isArray(pr.commits) || pr.commits.some(commit => commitContradictsProvider(commit, authorProvider))) return refuse('independence-unknown');
     const reviewerActors = (pr.comments ?? []).map(comment => parseClearerActorId([comment]));
     if (input.judge.actorId === actor || reviewerActors.includes(input.judge.actorId)) return refuse('same-actor');
     return { allowed: true, refusal: null, detail: null };

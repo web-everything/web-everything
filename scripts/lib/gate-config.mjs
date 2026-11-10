@@ -635,7 +635,7 @@ export const JUDGE_PROTECTED = Object.freeze([
   /^skills-src\/conveyor\/runner\.mjs$/,
   /^scripts\/(?:review-set-label|pr-land|apply-review-request|check-review-gate|collect-review-requests)\.mjs$/,
   /^scripts\/operations\/(?:record-verdict|review-dispatch|dispatch-lane|dispatch-lane-io|dispatch-provider-registry|deliver-item-wrapper|coordination-root)\.mjs$/,
-  /^scripts\/lib\/(?:advisory-labels|verdict-ledger|codex-judge-spawn|finding-bounce|review-independence|delegation-marker|ai-pr-authorship|dispatch-provider-availability|github-app-token|secret-scrub)\.mjs$/,
+  /^scripts\/lib\/(?:advisory-labels|marker-authorship|verdict-ledger|codex-judge-spawn|finding-bounce|review-independence|delegation-marker|ai-pr-authorship|dispatch-provider-availability|github-app-token|secret-scrub)\.mjs$/,
   /^scripts\/conveyor\/stand-down(?:-answer-core)?\.mjs$/,
   /^scripts\/guard-[^/]+\.mjs$/,
   /^\.claude\/settings\.json$/,

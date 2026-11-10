@@ -437,6 +437,7 @@ describe('#5062 judge protected classes', () => {
     ['cloud label applier', 'scripts/apply-review-request.mjs'],
     ['gate checker', 'scripts/check-review-gate.mjs'],
     ['request collector', 'scripts/collect-review-requests.mjs'],
+    ['trusted advisory authorship', 'scripts/lib/marker-authorship.mjs'],
     ['future judge module', 'scripts/future/judge-new.mjs'],
     ['future judge test', 'scripts/future/__tests__/judge-new.test.mjs'],
     ['credentials', 'scripts/lib/github-app-token.mjs'],
