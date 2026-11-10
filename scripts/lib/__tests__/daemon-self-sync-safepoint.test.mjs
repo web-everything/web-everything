@@ -1,8 +1,8 @@
 import { it, expect, vi, afterEach } from 'vitest';
 import { withSelfSync, safePoint } from '../daemon-self-sync.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { readRebuildState, rebuildStatePath, readReadyCandidate, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
+import { readRebuildState, rebuildStatePath, readReadyCandidate, writeRebuildState, readyCandidatePath, writeReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { addOverlay, removeOverlay } from '../daemon-overlays.mjs';
 import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
 import { fixture } from './helpers/safe-point-fixture.mjs';
@@ -266,6 +266,57 @@ it('adoptReadyOnly adopts a still-open PR using the injected normal rebuild PR r
     run: f.run, prState, emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: true, adopted: true });
   expect(prState).toHaveBeenCalledTimes(1); expect(prState).toHaveBeenCalledWith(123);
 });
+
+it.each(['corrupt', 'unreadable', 'missing', 'null', 'array', 'invalid-quarantine'])(
+  'adoptReadyOnly refuses %s rebuild state before adoption and preserves the evidence', async (kind) => {
+    const f = fixture(); fixtures.push(f); f.record();
+    const file = rebuildStatePath(f.root, f.env);
+    const evidence = kind === 'corrupt' ? '{"quarantine":' : kind === 'invalid-quarantine' ? '{"quarantine":false}' : kind === 'array' ? '[]' : 'null';
+    if (kind === 'missing' || kind === 'unreadable') {
+      rmSync(file);
+      if (kind === 'unreadable') mkdirSync(file);
+    } else writeFileSync(file, evidence);
+    const run = vi.fn(f.run); const prState = vi.fn(() => 'OPEN');
+    expect(await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true,
+      run, prState, emitEvent: vi.fn(), log: { error: vi.fn() } })).toMatchObject({ moved: false, reason: 'state-unreadable' });
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(prState).not.toHaveBeenCalled();
+    expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+    expect(readReadyCandidate(f.root, f.env)).toEqual(f.ready);
+    if (kind === 'unreadable') expect(statSync(file).isDirectory()).toBe(true);
+    else if (kind === 'missing') expect(() => statSync(file)).toThrow();
+    else expect(readFileSync(file, 'utf8')).toBe(evidence);
+  },
+);
+
+it.each(['PR-read', 'finalize', 'missing', 'corrupt'])(
+  'adoptReadyOnly refuses ready-record changes during %s without adopting unchecked overlays', async (when) => {
+    const f = fixture(); fixtures.push(f); f.record();
+    addOverlay(f.root, { ref: 'A', pr: 123 }, { env: f.env });
+    const replacement = structuredClone(f.ready);
+    replacement.adopt.applied.find((a) => a.ref === 'B').pr = 456;
+    const replace = () => {
+      if (when === 'missing') rmSync(readyCandidatePath(f.root, f.env));
+      else if (when === 'corrupt') writeFileSync(readyCandidatePath(f.root, f.env), '{');
+      else expect(writeReadyCandidate(f.root, replacement, f.env)).toBe(true);
+    };
+    const stateBefore = readFileSync(rebuildStatePath(f.root, f.env), 'utf8');
+    const prState = vi.fn(async () => { if (when === 'PR-read') replace(); return 'OPEN'; });
+    const run = vi.fn(f.run);
+    const log = { error: vi.fn((message) => {
+      if (when !== 'PR-read' && message.startsWith('daemon-rebuild: ready-candidate-adopted ')) replace();
+    }) };
+    expect(await rebuildClone({ root: f.root, env: f.env, adoptReadyOnly: true,
+      run, prState, emitEvent: vi.fn(), log })).toMatchObject({ moved: false, reason: 'ready-candidate-changed' });
+    expect(prState.mock.calls).toEqual([[123]]);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+    expect(readFileSync(rebuildStatePath(f.root, f.env), 'utf8')).toBe(stateBefore);
+    if (when === 'missing') expect(() => statSync(readyCandidatePath(f.root, f.env))).toThrow();
+    else if (when === 'corrupt') expect(readFileSync(readyCandidatePath(f.root, f.env), 'utf8')).toBe('{');
+    else expect(readReadyCandidate(f.root, f.env)).toEqual(replacement);
+  },
+);
 
 it('read reacquisition accepts intact historical rebuild state without quarantine', async () => {
   const tail = vi.fn();

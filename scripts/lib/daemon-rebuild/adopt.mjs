@@ -5,8 +5,9 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
+import { isDeepStrictEqual } from 'node:util';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
-import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -289,9 +290,13 @@ export function staleAlertDetail(result, state) {
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
 export async function finalizeRebuild({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, expectedReady,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  // Ready records are written without the clone lock. Never finalize a replacement that bypassed PR checks.
+  if (expectedReady !== undefined && !isDeepStrictEqual(readReadyCandidate(root, stEnv), expectedReady)) {
+    return { moved: false, reason: 'ready-candidate-changed', alerts: [] };
+  }
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];
   const nowMs = () => now();

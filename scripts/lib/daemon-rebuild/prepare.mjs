@@ -651,7 +651,7 @@ export async function prepareRebuild({
 /** Shared ready adoption. Call only while holding the clone WRITE lock. */
 async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, readyOnly = false,
   mainOnly, overlaysBefore, plan, prevHead, state, unsafe, alert, terminal, dropReady, writeState, nowMs,
-  liveOverlaysOf, alertsList, adoptReadyOnly = false }) {
+  liveOverlaysOf, alertsList, adoptReadyOnly = false, ready = readReadyCandidate(root, stEnv) }) {
   const git = makeGit({ run, cwd: root, env });
   const mutationDue = () => terminal({ moved: false, reason: 'readonly-job-mutation-due', mutation: 'ready-candidate-adopt' });
   // fix-rebuild-finalize — a candidate that already PASSED its smoke but could not be adopted (a reader was
@@ -659,7 +659,6 @@ async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, 
   // instead of being thrown away and re-smoked. Checked before the rejection/backoff short-circuits: a passed
   // plain-main fallback answers exactly the inputs the reject-cache would otherwise stop at.
   {
-    const ready = readReadyCandidate(root, stEnv);
     if (ready) {
       if (readyOnly) return mutationDue('ready-candidate-adopt');
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
@@ -746,7 +745,7 @@ async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, 
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
           ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
         });
-        writeState();
+        if (!adoptReadyOnly) writeState();
         const fin = await finalizeRebuild({
           root,
           env,
@@ -757,6 +756,7 @@ async function adoptPreparedReady({ root, env, stEnv, log, run, stateOpts, now, 
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
+          expectedReady: adoptReadyOnly ? ready : undefined,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -792,7 +792,9 @@ export async function adoptReadyRebuild({ root, env, log, run, prState, stateOpt
   // Re-read CURRENT registry here, under the write lock. Never trust a pre-lock snapshot (R854).
   const registry = readOverlayState(root, { env });
   if (registry.corrupt) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
-  const state = readRebuildState(root, stEnv);
+  let state;
+  try { state = readRebuildState(root, stEnv, { strict: true }); }
+  catch { return terminal({ moved: false, reason: 'state-unreadable' }); }
   if (state.quarantine || state.inProgress || state.unverified) return terminal({ moved: false, reason: 'quarantined' });
   const unsafe = findUnsafeLocalState({ git, knownInputs: knownInputsOf(state) });
   if (!unsafe.safe) return terminal({ moved: false, reason: unsafe.reason });
@@ -825,6 +827,6 @@ export async function adoptReadyRebuild({ root, env, log, run, prState, stateOpt
       }));
       if (registered.some((o) => !o.ref || !o.sha)) return undefined;
       return [...live, ...registered];
-    }, alertsList, adoptReadyOnly: true });
+    }, alertsList, adoptReadyOnly: true, ready });
   return result ?? terminal({ moved: false, reason: 'ready-not-adoptable' });
 }

@@ -4127,6 +4127,6 @@ unreadable or changed HEAD, or replaced checkout ends
 the tick without running its tail (restart waits until the next tick). Safe-point exact matches must also pass the normal live-overlay
 preservation check using current registry tips and running-build history; unknown evidence refuses
 adoption. Still-registered overlays in the candidate must also pass a fresh PR-state read using the normal
-rebuild reader: closed/merged PRs drop the candidate, and unknown/unreadable state refuses adoption.
+rebuild reader: closed/merged PRs drop the candidate, and unknown/unreadable state refuses adoption. Adoption strictly reads rebuild state before any write, preserves unreadable/corrupt evidence for operator repair, checks PRs on one ready-record snapshot and refuses a changed/missing record at finalize, retaining it for the next tick.
 A wrong-branch or detached HEAD cannot be reset at a safe point. Pin these guarantees with injected lock/rebuild effects and the focused
 `daemon-self-sync-safepoint`, `daemon-safepoint-wiring` and `rebuild-abort-overlay-removed` tests.
