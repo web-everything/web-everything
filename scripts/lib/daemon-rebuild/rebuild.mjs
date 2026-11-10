@@ -285,6 +285,16 @@ async function rebuildCloneInternal({
   try {
     const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep });
     try {
+      if (!slot.acquired) {
+        try {
+          await withWriteLock(root, () => {
+            const st = readRebuildState(root, stEnv);
+            releaseBuildLease(st, lease);
+            writeRebuildState(root, st, stEnv);
+          }, finalLockOpts);
+        } catch { /* the owner's next call takes an unreleased lease back anyway */ }
+        return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: [] };
+      }
       return await smokeAndAdopt({
         root, env, stEnv, log, run, runSmoke,
         stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,

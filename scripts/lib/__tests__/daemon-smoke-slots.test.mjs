@@ -55,6 +55,8 @@ describe('daemon smoke slots', () => {
 
   it('cap 2 admits two callers, queues the third, and release frees it on the next poll', async () => {
     const a = await acquire(11), b = await acquire(12);
+    expect(a.acquired).toBe(true);
+    expect(b.acquired).toBe(true);
     let admitted = false;
     const c = acquire(13).then(slot => { admitted = true; return slot; });
     await wake();
@@ -66,6 +68,7 @@ describe('daemon smoke slots', () => {
     await wake();
     const third = await c;
     expect(admitted).toBe(true);
+    expect(third.acquired).toBe(true);
     expect(state().holders.map(e => e.pid)).toEqual([12, 13]);
     await b.release(); await third.release();
     expect(state().holders).toEqual([]);
@@ -362,13 +365,14 @@ describe('daemon smoke slots', () => {
       if (time > bound + 2000) throw new Error('queue exceeded bound');
     } });
     expect(time).toBe(bound);
+    expect(slot.acquired).toBe(false);
     const requested = Number(env.WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS ?? value.smokeQueueMaxWaitMs);
     if (Number.isSafeInteger(requested) && requested > bound) {
       expect(log.error).toHaveBeenCalledWith(
         `daemon-live-smoke: smokeQueueMaxWaitMs clamped from ${requested} to ${bound}ms (rebuild lease lifetime minus 2min)`);
     }
     expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smokeQueueMaxWaitMs=${bound} (${source})`);
-    expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smoke-queue-timeout (waited ${bound}ms) — running without a slot (bounded availability trade-off; concurrency cap may be exceeded)`);
+    expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smoke-queue-timeout (waited ${bound}ms) — giving up this attempt`);
     expect(state().waiters).toEqual([]);
     expect(state().holders.map(e => e.pid)).toEqual([11]);
     await slot.release();
@@ -376,7 +380,7 @@ describe('daemon smoke slots', () => {
     await holder.release();
   });
 
-  it.each([false, true])('fails open at the deadline even with a busy state lock (ticket=%s)', async hasTicket => {
+  it.each([false, true])('returns no slot at the deadline with a busy state lock and never exceeds the cap (ticket=%s)', async hasTicket => {
     settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 3001 };
     await acquire(11);
     const lock = join(stateDir, 'smoke-slots.lock');
@@ -392,7 +396,8 @@ describe('daemon smoke slots', () => {
       if (time > 5001) throw new Error('cleanup exceeded queue bound');
     } });
     expect(time).toBe(3001);
-    expect(log.error).toHaveBeenCalledWith('daemon-live-smoke: smoke-queue-timeout (waited 3001ms) — running without a slot (bounded availability trade-off; concurrency cap may be exceeded)');
+    expect(slot.acquired).toBe(false);
+    expect(log.error).toHaveBeenCalledWith('daemon-live-smoke: smoke-queue-timeout (waited 3001ms) — giving up this attempt');
     await slot.release();
     expect(state().holders.map(e => e.pid)).toEqual([11]);
     // An unavailable transaction cannot remove a ticket; later transactions reclaim it.
@@ -486,6 +491,47 @@ describe('daemon smoke slots', () => {
     const slot = await acquireSmokeSlot({ env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir }, log });
     expect(state().holders[0].pid).toBe(process.pid);
     await slot.release();
+  });
+
+  it('rebuild returns smoke-queue-timeout without smoking, releases its lease, and can retry', async () => {
+    settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 3001 };
+    const holder = await acquire(process.pid);
+    const plan = { target: 'next' };
+    const lease = { token: 'timed-out-build' };
+    const persisted = { building: lease };
+    const prepare = { ok: true, value: { plan, prevHead: 'previous', lease, alerts: ['prepare alert'] } };
+    const lock = vi.spyOn(cloneLocks, 'withWriteLock').mockResolvedValueOnce(prepare)
+      .mockImplementation(async (_root, action) => ({ ok: true, value: await action() }));
+    vi.spyOn(rebuildState, 'readReadyCandidate').mockReturnValue(null);
+    vi.spyOn(rebuildState, 'readRebuildState').mockReturnValue(persisted);
+    const write = vi.spyOn(rebuildState, 'writeRebuildState').mockImplementation(() => {});
+    vi.spyOn(leases, 'readRebuildStarvation').mockReturnValue(0);
+    vi.spyOn(leases, 'writeRebuildStarvation').mockImplementation(() => {});
+    vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
+    const runSmoke = vi.fn();
+    const smokeAndAdopt = vi.spyOn(smoke, 'smokeAndAdopt').mockImplementation(async ({ runSmoke }) => runSmoke());
+    let time = 123;
+    const options = { root: stateDir,
+      env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir },
+      log, runSmoke, versions: null, asJob: false, readyOnly: true, emitEvent: vi.fn(),
+      now: () => time, sleep: async ms => { time += ms; },
+    };
+    leases.ACTIVE_BUILD_TOKENS.add(lease.token);
+    expect(await rebuildClone(options)).toEqual({
+      moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: [],
+    });
+    expect(smokeAndAdopt).not.toHaveBeenCalled();
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(persisted.building).toBeNull();
+    expect(write).toHaveBeenCalledWith(stateDir, persisted, options.env);
+    expect(leases.ACTIVE_BUILD_TOKENS.has(lease.token)).toBe(false);
+    expect(state().holders.map(e => e.pid)).toEqual([process.pid]);
+    expect(state().waiters).toEqual([]);
+    await holder.release();
+    lock.mockResolvedValueOnce(prepare);
+    await rebuildClone(options);
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(state().holders).toEqual([]);
   });
 
   it.each([false, true])('rebuild holds a slot throughout smokeAndAdopt and releases in finally (throws=%s)', async throws => {

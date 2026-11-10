@@ -1,8 +1,7 @@
 /**
  * Purpose: cap host-wide daemon rebuild live smokes with persistent FIFO tickets.
- * Queue expiry intentionally fails open: a bounded availability trade-off that lets a rebuild
- * continue after the queue deadline even though the host concurrency cap may be exceeded.
- * Exports: acquireSmokeSlot({env, log, stateDir, pid, isAlive, now, sleep}) → {release()}.
+ * Queue expiry fails closed: give up this attempt so the next rebuild job can retry within the cap.
+ * Exports: acquireSmokeSlot({env, log, stateDir, pid, isAlive, now, sleep}) → {acquired, release()}.
  */
 import fs, { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -69,7 +68,7 @@ function readState(path) {
 
 /** Only the small state transaction holds the mkdir lock; neither waiting nor smoke execution does.
  * Corrupt/unreadable state fails closed. Dead lock owners are reclaimed immediately; missing owners
- * get a 60s grace period. A crash cannot expose a partially written state file. Queue expiry fails open.
+ * get a 60s grace period. A crash cannot expose a partially written state file. Queue expiry fails closed.
  */
 export async function acquireSmokeSlot({
   env = process.env, log = console,
@@ -215,7 +214,7 @@ export async function acquireSmokeSlot({
         }
         return index;
       }, deadline);
-      if (ahead === null) return { release };
+      if (ahead === null) return { acquired: true, release };
       if (ahead !== lastAhead) log.error?.(`daemon-live-smoke: smoke-queued (${ahead} ahead)`);
       lastAhead = ahead;
       await sleep(Math.min(2000, Math.max(0, deadline - now())));
@@ -223,8 +222,8 @@ export async function acquireSmokeSlot({
   } catch (error) {
     if (error === expired) {
       if (ticket !== undefined) await release(now());
-      log.error?.(`daemon-live-smoke: smoke-queue-timeout (waited ${now() - queuedAt}ms) — running without a slot (bounded availability trade-off; concurrency cap may be exceeded)`);
-      return { release: async () => {} };
+      log.error?.(`daemon-live-smoke: smoke-queue-timeout (waited ${now() - queuedAt}ms) — giving up this attempt`);
+      return { acquired: false, release() {} };
     }
     if (ticket !== undefined) await release();
     throw error;
