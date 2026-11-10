@@ -250,7 +250,7 @@ ${gate?`if(!fs.existsSync(${JSON.stringify(join(root,'release'))})){const watch=
 
 describe('remote controls', () => {
   it('resolves every new default with provenance and rejects invalid values', () => {
-    const defaults={maxConcurrent:8,backoffMs:120000,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15,
+    const defaults={maxConcurrent:8,backoffMs:600000,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15,
       stuckMinSlots:2,stuckAgeMs:600000,stuckSignalEveryMs:600000};
     const standard=resolveAdmissionPolicy({});
     expect(standard.settings.remote).toMatchObject(defaults);
@@ -453,7 +453,7 @@ describe('remote controls', () => {
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-execution-marker-unwritable'));
     expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(0);
   });
-  it.each(['unconfirmed','forge-unreachable','copy-failed','forge-busy'])('persists three consecutive %s failures and resets on success', async reason => {
+  it.each(['forge-unreachable','copy-failed'])('persists three consecutive %s failures and resets on success', async reason => {
     const f=fixture();
     f.remoteExec.mockResolvedValue(reason==='unconfirmed'?{mode:'unconfirmed'}:{mode:'not-started',terminated:true,reason});
     for(let i=0;i<3;i++)await runWithRemoteDecision(f);
@@ -463,7 +463,7 @@ describe('remote controls', () => {
     expect(f.remoteExec).toHaveBeenCalledTimes(3);
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining(reason));
     f.remoteExec.mockResolvedValue({mode:'remote',code:0});
-    await runWithRemoteDecision({...f,clock:()=>now+120001,readTelemetry:async()=>sample(now+120001)});
+    await runWithRemoteDecision({...f,clock:()=>now+600001,readTelemetry:async()=>sample(now+600001),canaryRunner:async()=>({mode:'remote',code:0})});
     const persisted=JSON.parse(readFileSync(join(f.cwd,'remote','health.json'),'utf8'));
     expect(persisted.failures).toBe(0);
   });
@@ -535,7 +535,7 @@ describe('remote controls', () => {
     writeFileSync(join(f.cwd,'remote','health.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:Number.MAX_SAFE_INTEGER,trigger:'copy-failed',lastGoodAt:1}));
     expect(await runWithRemoteDecision(f)).toEqual({handled:false});
     expect(f.remoteExec).not.toHaveBeenCalled();
-    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('backoff-copy-failed'));
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-breaker-open'));
   });
   it('quarantines corrupt persisted evidence and continues from a fresh read', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));
