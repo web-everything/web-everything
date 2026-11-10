@@ -54,10 +54,11 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     }
     if (!needsPublish(status)) return { status: 'skipped' };
     const holdLegacy = () => {
-      if (!status.needsYouPublished) {
+      // Its own flag: an earlier publish-failed alert must not silence this one (they name different problems).
+      if (!status.legacyHoldPublished) {
         publishNeedsYou({ kind: 'red-team-legacy-ran-unreadable', pr, repo, head,
           reason: 'Legacy red-team evidence is unreadable or conflicts with the posted comment; operator review required.' });
-        status = { ...status, needsYouPublished: true };
+        status = { ...status, legacyHoldPublished: true };
         writeStatus(status);
       }
       return { status: 'held' };
@@ -76,7 +77,23 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       }
       return { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
         callId: row.callId, foldedVerdict: row.foldedVerdict, confirmedMissCount: row.confirmedMissCount,
+        recheckStatus: row.recheckStatus,
         findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true })) };
+    };
+    const renderInput = res => ({ ...res, pr, rev: head, findings: res.findings.map(f => ({ ...f,
+      confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true })) });
+    // Which confirmed breaks a body shows, as an order-free list; location-less fallbacks null the location.
+    const confirmedKeys = parsed => parsed.findings.filter(f => f.confirmed)
+      .map(f => JSON.stringify([f.category, f.file, f.line, f.summary])).sort();
+    // Every rendering the publisher could have posted for this evidence (full, then the scrub fallbacks).
+    const sameConfirmedBreaks = (postedParsed, res) => {
+      const want = JSON.stringify(confirmedKeys(postedParsed));
+      const input = renderInput(res);
+      return [() => renderFull(input), () => renderMinimal(input), () => renderMinimal({ ...input, omitLocation: true })]
+        .some(render => {
+          try { return JSON.stringify(confirmedKeys(parseRedTeamComment(render()) ?? { findings: [] })) === want; }
+          catch { return false; }
+        });
     };
     const escalate = () => {
       if (!status.needsYouPublished) {
@@ -105,9 +122,9 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
         // The posted comment stays authoritative: an unreadable row cannot contradict it, so no alert.
         let recovered;
         try { recovered = recoverLegacy(); } catch { return { status: 'skipped' }; }
-        // A readable row must agree with the posted comment on confirmed breaks, or the gate would clear a guess.
+        // A readable row must show the SAME confirmed breaks as the posted comment (not just as many), or the gate would clear a guess.
         const live = redTeamForHead(comments, pr, head);
-        conflict = !live || live.findings.filter(f => f.confirmed).length !== recovered.confirmedMissCount;
+        conflict = !live || !sameConfirmedBreaks(live, recovered);
         if (!conflict) return { status: 'skipped' };
       }
     } catch { return failedAttempt(); }
@@ -119,9 +136,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     if (status.publishAttempts >= 2) return escalate();
     try {
       if (!Array.isArray(result.findings)) throw Error('red-team findings unreadable');
-      const findings = result.findings.map(f => ({ ...f,
-        confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true }));
-      const input = { ...result, pr, rev: head, findings };
+      const input = renderInput(result);
       let body = renderFull(input);
       if (scrub(body).length) body = renderMinimal(input);
       if (scrub(body).length) body = renderMinimal({ ...input, omitLocation: true });
