@@ -37,7 +37,7 @@ describe('mechanical clearance', () => {
     fail(`invalid or missing test ${key}`, 'keys', f => f.content = JSON.stringify({ unit: { [key]: 1 } }));
   }
   it('removed keys pass', () => { const f = facts(); f.content = '{"unit":{}}'; f.existingFiles = []; expect(validateMechanicalClearance(f).cleared).toBe(true); });
-  for (const conclusion of ['FAILURE', 'PENDING', 'CANCELLED', null]) fail(`required check ${conclusion}`, 'checks', f => f.checks[0].conclusion = conclusion);
+  for (const conclusion of ['FAILURE', 'PENDING', 'CANCELLED', 'NEUTRAL', 'SKIPPED', null]) fail(`required check ${conclusion}`, 'checks', f => f.checks[0].conclusion = conclusion);
   fail('missing required check', 'checks', f => f.checks.pop());
   fail('nonrequired failure', 'checks', f => f.checks.push({ name: 'other', conclusion: 'TIMED_OUT' }));
   it('uses latest required run', () => { const f = facts(); f.checks.push({ name: 'test', conclusion: 'PENDING', id: 2 }); expect(validateMechanicalClearance(f).rule).toBe('checks'); });
@@ -169,12 +169,27 @@ describe('independent check kinds', () => {
     const f = facts(); f.checks[0].kind = 'status';
     expect(validateMechanicalClearance(f).rule).toBe('checks');
   });
-  for (const kind of ['check-run', 'status']) for (const conclusion of ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'PENDING', 'UNKNOWN']) {
+  for (const kind of ['check-run', 'status']) for (const conclusion of ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'PENDING', 'UNKNOWN', 'action_required', 'startup_failure', 'STALE', 'future_conclusion', null]) {
     it(`refuses latest nonrequired ${kind} ${conclusion}`, () => {
-      const f = facts(); f.checks.push({ kind, name: 'other', conclusion });
+      const f = facts(); f.checks.push({ kind, name: 'other', conclusion, status: 'completed' });
       expect(validateMechanicalClearance(f).rule).toBe('checks');
     });
   }
+  it.each(['NEUTRAL', 'SKIPPED'])('allows nonrequired completed %s check-runs but refuses statuses', conclusion => {
+    const f = facts(); const check = { kind: 'check-run', name: 'other', conclusion, status: 'completed' };
+    f.checks.push(check);
+    expect(validateMechanicalClearance(f).cleared).toBe(true);
+    check.kind = 'status';
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+  });
+  it.each(['queued', 'in_progress', 'waiting', 'pending', 'requested', undefined])('refuses nonrequired success without completed status: %s', status => {
+    const f = facts(); f.checks.push({ name: 'other', conclusion: 'SUCCESS', status });
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+  });
+  it('allows a nonrequired successful commit status', () => {
+    const f = facts(); f.checks.push({ kind: 'status', name: 'other', conclusion: 'SUCCESS' });
+    expect(validateMechanicalClearance(f).cleared).toBe(true);
+  });
   it('tags REST evidence so a newer status cannot hide a check failure', () => {
     const f = readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: io({ mutate: (url, v) =>
       url.includes('/check-runs') ? { ...v, check_runs: v.check_runs.map(c => c.name === 'test' ? { ...c, conclusion: 'failure' } : c) }
@@ -194,8 +209,8 @@ describe('mechanical label decision', () => {
     }
     expect(decideMechanicalLabelStrip(pr, { cleared: true, head }).strip).toBe(false);
   });
-  it('never strips AI-generated, accepted, human, closed or unlabelled PRs', () => {
-    for (const extra of [{ commits: [{ messageBody: 'Co-Authored-By: Claude' }] },
+  it('never strips accepted, human, closed or unlabelled PRs', () => {
+    for (const extra of [
       { labels: [...pr.labels, { name: 'review:accepted' }] }, { author: { login: 'human' } },
       { state: 'CLOSED' }, { labels: [] }]) {
       expect(decideMechanicalLabelStrip({ ...pr, ...extra }, null).strip).toBe(false);

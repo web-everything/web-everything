@@ -223,6 +223,7 @@ describe('round listing freshness at the CLI boundary', () => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
+        author: { login: 'human' },
         headRefName: `lane/${number}`, headRefOid: `sha${number}`, baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
         isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
         labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
@@ -384,14 +385,37 @@ describe('R861 merge-time mechanical clearance', () => {
     expect(v.decision).toBe('merge');
     expect(decide).toHaveBeenCalledWith({ repo: 'owner/local', num: 861 });
   });
-  it('does not read or change AI-generated, review:accepted or already-skipped verdicts', () => {
-    const ai = verdict({}, [{ oid: head, messageBody: 'Co-Authored-By: Claude' }]);
-    const accepted = verdict({ labels: ['ready-to-merge', 'review:accepted'] });
+  it('does not read or change human AI-generated, bot review:accepted or already-skipped verdicts', () => {
+    const commits = [{ oid: head, messageBody: 'Co-Authored-By: Claude' }];
+    const ai = verdict({ author: { login: 'human' } }, commits);
+    const accepted = verdict({ labels: ['ready-to-merge', 'review:accepted'] }, commits);
     const skipped = { ...verdict(), decision: 'skip' };
     expect(ai.labelOnlyCertified).toBe(false); expect(accepted.labelOnlyCertified).toBe(false);
     const decide = vi.fn(); runGuard([ai, accepted, skipped], decide);
     expect(decide).not.toHaveBeenCalled();
     expect(ai.decision).toBe('merge'); expect(accepted.decision).toBe('merge');
+    for (const extra of [{ author: { login: 'human' } }, { labels: ['ready-to-merge', 'review:accepted'] }]) {
+      const decide = vi.fn(), exec = vi.fn();
+      reconcileMechanicalClearance({ number: 861, author: { login: 'web-everything[bot]' },
+        headRefOid: head, labels: ['ready-to-merge'], commits, ...extra }, { repo: 'owner/repo', decide, exec });
+      expect(decide).not.toHaveBeenCalled(); expect(exec).not.toHaveBeenCalled();
+    }
+  });
+  it.each(['web-everything[bot]', 'app/web-everything', null])('AI trailers cannot exempt bot or unknown author %s from the merge guard', login => {
+    const commits = [{ oid: next, messageBody: 'Co-Authored-By: Claude' }, { oid: head, messageBody: 'Co-Authored-By: Claude' }];
+    const author = login ? { login } : undefined;
+    const v = verdict({ author }, commits);
+    expect(v.labelOnlyCertified).toBe(true);
+    const result = { cleared: false, rule: 'diff-scope', head };
+    runGuard([v], () => result);
+    expect(v.decision).toBe('skip'); expect(v.reason).toContain('diff-scope');
+    if (login) {
+      const exec = vi.fn(() => ''), log = vi.fn();
+      reconcileMechanicalClearance({ number: 861, author, headRefOid: head, labels: ['ready-to-merge'], commits },
+        { repo: 'owner/repo', exec, log, decide: () => result });
+      expect(exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['--remove-label', 'ready-to-merge']), expect.anything());
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('diff-scope'));
+    }
   });
   it('guards bot label-only certification and refuses repository read errors', () => {
     const v = verdict();

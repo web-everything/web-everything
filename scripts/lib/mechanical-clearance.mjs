@@ -5,7 +5,7 @@
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { createMqLiveReader } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { isAiGeneratedPr, hasLabel } from './ai-pr-authorship.mjs';
+import { hasLabel } from './ai-pr-authorship.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const REQUIRED_MECHANICAL_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']);
@@ -64,7 +64,9 @@ export function validateMechanicalClearance(facts = {}) {
     const previous = latest.get(key);
     if (!previous || rank[0] > previous.rank[0] || (rank[0] === previous.rank[0] && rank[1] >= previous.rank[1])) latest.set(key, { check: normalized, rank });
   }
-  if ([...latest.values()].some(({ check }) => ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'PENDING', 'UNKNOWN'].includes(check.conclusion) || check.conclusion == null)) return fail('checks', 'A latest head check or status failed or is incomplete; use normal review.');
+  if ([...latest.values()].some(({ check }) => check.kind === 'status'
+    ? check.conclusion !== 'SUCCESS'
+    : check.status !== 'completed' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion))) return fail('checks', 'A latest head check or status failed or is incomplete; use normal review.');
   if (!REQUIRED_MECHANICAL_CHECKS.every(name => {
     const check = latest.get(`check-run:${name}`)?.check;
     return check?.conclusion === 'SUCCESS' && check.status === 'completed';
@@ -182,11 +184,11 @@ export function decideMechanicalMergeGuard(v, result) {
     reason: `mechanical-clearance refused (${rule}); normal review of the full PR required` } : v;
 }
 
-/** Only bot PRs without independent AI or human certification depend on mechanical clearance. */
+/** Bot PRs without accepted review depend on mechanical clearance, regardless of AI trailers. */
 export function decideMechanicalLabelStrip(pr, result) {
   const eligible = !['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())
     && ['web-everything[bot]', 'app/web-everything'].includes(pr?.author?.login)
-    && hasLabel(pr, 'ready-to-merge') && !isAiGeneratedPr(pr) && !hasLabel(pr, 'review:accepted');
+    && hasLabel(pr, 'ready-to-merge') && !hasLabel(pr, 'review:accepted');
   const current = result?.cleared === true && typeof result.head === 'string' && result.head.length > 0
     && typeof pr?.headRefOid === 'string' && result.head.toLowerCase() === pr.headRefOid.toLowerCase();
   return { strip: eligible && !current, rule: result?.rule ?? (current ? null : 'head') };

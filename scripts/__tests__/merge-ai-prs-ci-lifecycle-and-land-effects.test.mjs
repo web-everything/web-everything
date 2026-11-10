@@ -1536,9 +1536,9 @@ describe('live mechanical reconcile', () => {
       expect(h.reads).toHaveLength(1);
     }
   });
-  it('never strips AI-generated or review:accepted labels', () => {
+  it('never strips review:accepted labels (R861: AI trailers no longer exempt a bot PR)', () => {
     const h = harness([]);
-    for (const extra of [{ commits: [claudeCommit()] }, { labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }] }]) {
+    for (const extra of [{ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }] }]) {
       reconcileMechanicalClearance(pr({ labels: [{ name: 'ready-to-merge' }], ...extra }), h.options);
     }
     expect(h.reads).toHaveLength(0); expect(h.writes).toHaveLength(0);
