@@ -1,9 +1,8 @@
 /** Run guards only from the clone containing this launcher at scripts/hooks/run-pinned-guard.mjs.
  * Preserve the operated checkout as WE_HOOK_ROOT; never fetch from a hook.
  */
-import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, rmdirSync, statSync } from 'node:fs';
+import { mkdirSync, realpathSync, rmdirSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,14 +17,13 @@ function git(...args) {
 }
 
 let lock;
-let snapshot;
 try {
   const [script, ...args] = process.argv.slice(2);
   if (!script?.startsWith('scripts/') || script.split('/').includes('..')) {
     throw new Error('expected a relative path inside scripts without ..');
   }
   const launcher = realpathSync(fileURLToPath(import.meta.url));
-  const clone = dirname(dirname(dirname(launcher)));
+  const clone = realpathSync(dirname(dirname(dirname(launcher))));
   if (launcher !== join(clone, 'scripts/hooks/run-pinned-guard.mjs') ||
       realpathSync(git('-C', clone, 'rev-parse', '--show-toplevel')) !== clone) {
     throw new Error('launcher must be located at <clone>/scripts/hooks/run-pinned-guard.mjs');
@@ -79,27 +77,21 @@ try {
     throw new Error(`guard clone is stale: last sync was more than 24h ago (FETCH_HEAD mtime); ${syncHelp}`);
   }
   const hookRoot = realpathSync(git('rev-parse', '--show-toplevel'));
-  // Publish a private, complete scripts revision before releasing the clone.
-  // Sync never traverses these directories, and each invocation retains its
-  // revision until the guard exits, including any delayed imports.
-  snapshot = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'we-guard-revision-'));
-  cpSync(scripts, join(snapshot, 'scripts'), { recursive: true, dereference: true });
-  if (existsSync(join(clone, 'package.json'))) cpSync(join(clone, 'package.json'), join(snapshot, 'package.json'));
-  rmdirSync(lock);
-  lock = undefined;
-  const child = spawnSync(process.execPath, [join(snapshot, 'scripts', withinScripts), ...args], {
+  // Run the canonical entry point in place so Node's module URL and argv[1]
+  // agree, including when HOME or TMPDIR contains symlinked path components.
+  // Retain the clone lock through execution to protect delayed imports from sync.
+  const child = spawnSync(process.execPath, [target, ...args], {
     stdio: 'inherit', env: { ...env, WE_HOOK_ROOT: hookRoot },
   });
   if (child.error) throw child.error;
+  // Fail closed even if a child exits successfully after its entry path changes.
+  if (realpathSync(target) !== target) {
+    throw new Error('guard entry path changed during execution; run scripts/hooks/sync-guard-clone.mjs before retrying');
+  }
   process.exitCode = child.status ?? 2;
 } catch (error) {
   process.stderr.write(`Pinned guard: cannot load dedicated clone guard; denying (exit 2): ${error.message}\n`);
   process.exitCode = 2;
 } finally {
   if (lock) rmdirSync(lock);
-  if (snapshot) {
-    // cpSync preserves read-only directory modes from the synchronized clone.
-    execFileSync('chmod', ['-R', 'u+w', snapshot]);
-    rmSync(snapshot, { recursive: true, force: true });
-  }
 }

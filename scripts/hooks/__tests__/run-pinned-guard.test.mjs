@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +43,72 @@ describe('dedicated clone guard launcher', () => {
     expect(result.status, result.stderr).toBe(7);
     expect(JSON.parse(result.stdout)).toEqual({root:f.lane,cwd:nested,args:['--pre','space argument'],gitKeys:[],input:'payload'});
     expect(result.stderr).toBe('guard stderr\n');
+  });
+  it.each(['clone', 'HOME'])('a real deny-guard still denies through a symlinked %s and TMPDIR', kind => {
+    const f = fixture();
+    const script = 'scripts/guard-monitor-subagent.mjs';
+    copyFileSync(join(repo, script), join(f.clone, script));
+    f.git(f.clone, 'add', '.');
+    f.git(f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'real deny guard');
+    f.git(f.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    // Model /var -> /private/var portably, without relying on host symlinks.
+    const alias = join(f.temp, 'var');
+    symlinkSync(kind === 'HOME' ? f.env.HOME : f.clone, alias, 'dir');
+    const temporary = join(f.temp, 'private/var');
+    mkdirSync(temporary, { recursive: true });
+    f.env.TMPDIR = join(f.temp, 'temporary alias');
+    symlinkSync(temporary, f.env.TMPDIR, 'dir');
+    const payload = { hook_event_name: 'PreToolUse', tool_name: 'Monitor', agent_id: 'subagent' };
+    let result;
+    if (kind === 'HOME') {
+      f.env.HOME = alias;
+      expect(realpathSync(f.env.HOME)).not.toBe(f.env.HOME);
+      const command = commands.find(command => command.includes(script));
+      expect(command).toBeTypeOf('string');
+      result = f.command(f.lane, command, payload);
+    } else {
+      const launcher = join(alias, 'scripts/hooks/run-pinned-guard.mjs');
+      expect(realpathSync(launcher)).not.toBe(launcher);
+      result = spawnSync(process.execPath, [launcher, script], {
+        cwd: f.lane, env: f.env, input: JSON.stringify(payload), encoding: 'utf8', maxBuffer: 1024 * 1024,
+      });
+    }
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' },
+    });
+    expect(result.stderr).toBe('');
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+  });
+  it('runs in place with a canonical argv entry path', () => {
+    const f = fixture();
+    writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), `
+import { fileURLToPath } from 'node:url';
+console.log(JSON.stringify({ entry: fileURLToPath(import.meta.url), argv: process.argv[1] }));
+`);
+    f.git(f.clone, 'add', '.');
+    f.git(f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'entry probe');
+    f.git(f.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const result = f.launch();
+    expect(result.status, result.stderr).toBe(0);
+    const entry = realpathSync(join(f.clone, 'scripts/guard-bash.mjs'));
+    expect(JSON.parse(result.stdout)).toEqual({ entry, argv: entry });
+  });
+  it.each(['symlink', 'missing'])('refuses a successful child whose entry path becomes %s and releases its lock', kind => {
+    const f = fixture();
+    writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), `
+import { unlinkSync, symlinkSync } from 'node:fs';
+unlinkSync(process.argv[1]);
+if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', process.argv[1]);
+`);
+    writeFileSync(join(f.clone, 'scripts/replacement.mjs'), 'process.exitCode = 0;');
+    f.git(f.clone, 'add', '.');
+    f.git(f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'path mutation probe');
+    f.git(f.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const result = f.launch();
+    expect(result).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('denying (exit 2)') });
+    if (kind === 'symlink') expect(result.stderr).toContain('guard entry path changed during execution');
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
   });
   it.each(['tracked', 'untracked'])('denies a %s working-tree edit before executing the guard', kind => {
     const f = fixture();

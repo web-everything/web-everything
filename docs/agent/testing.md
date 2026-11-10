@@ -1323,17 +1323,19 @@ move it aside and rerun sync to create the disposable clone. Never point this at
 checkout; all tracked edits and untracked/ignored files in the owned clone are discarded.
 Use an absolute origin URL/path so the scheduler and interactive invocations agree.
 
-Launcher snapshot publication and sync share a non-reclaiming sibling `.guard-lock`
-directory. Under that mutex the launcher copies the scripts tree and package metadata into
-a private revision under `TMPDIR`, then releases the mutex before running the guard.
-Refreshes can reset/clean the clone while delayed imports continue against that private
-revision; only its owning launcher removes it, after the guard exits. Both commands fail
-closed on lock contention and tell the operator to retry. Inspect an abandoned lock only
-after confirming its owner has stopped; never steal it on a timer. A killed launcher can
-leave a revision directory for operator cleanup after confirming no guard still uses it.
-The named concurrent-refresh regression pauses before a delayed import, removes that
-dependency in origin/main, refreshes twice, and verifies the original import and eventual
-revision cleanup. Keep all coordination event-driven, without sleep/poll loops.
+Launcher execution and sync share a non-reclaiming sibling `.guard-lock` directory.
+The launcher canonicalizes the clone and guard entry path, passes the guard realpath as
+Node's `argv[1]`, and runs in place without a temporary copy. This keeps CLI entry checks
+working through symlinked HOME/TMPDIR paths (including macOS `/var` → `/private/var`).
+It retains the mutex until the guard exits so sync cannot reset/clean delayed imports.
+After the child exits, a changed or unreadable entry realpath fails closed with exit 2;
+repair the clone with `scripts/hooks/sync-guard-clone.mjs` before retrying.
+Both commands fail closed on lock contention and tell the operator to retry. Inspect an
+abandoned lock only after confirming its owner has stopped; never steal it on a timer.
+The named concurrent-sync regression pauses before a delayed import, removes that dependency
+in origin/main, verifies sync refuses while the guard is running, and verifies refresh
+succeeds after the original import finishes and the lock is released. Keep all coordination
+event-driven, without sleep/poll loops.
 
 For macOS scheduling, initialize the clone first, then copy
 `scripts/hooks/com.we.guard-main-sync.plist.template` to

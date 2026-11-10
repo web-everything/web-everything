@@ -24,14 +24,14 @@ function fixture() {
   return {temp,origin,clone,repo,env,git,run, writable() { execFileSync('chmod', ['-R', 'u+w', clone]); }};
 }
 describe('dedicated guard clone synchronization (temporary local origins only)',()=>{
-  it('protects an executing snapshot from concurrent repair and pruning until late imports finish', async () => {
+  it('locks an in-place guard against concurrent sync until late imports finish', async () => {
     const f = fixture();
     mkdirSync(join(f.origin, 'scripts/hooks'), { recursive: true });
     copyFileSync(resolve(dirname(script), 'run-pinned-guard.mjs'), join(f.origin, 'scripts/hooks/run-pinned-guard.mjs'));
     writeFileSync(join(f.origin, 'scripts/late-v1.mjs'), 'export const revision = "original revision";');
     writeFileSync(join(f.origin, 'scripts/delayed.mjs'), `
 import { fileURLToPath } from 'node:url';
-console.log(JSON.stringify({ snapshot: fileURLToPath(import.meta.url) }));
+console.log(JSON.stringify({ entry: fileURLToPath(import.meta.url) }));
 await new Promise(resolve => process.stdin.once('data', resolve));
 const { revision } = await import('./late-v1.mjs');
 console.log(revision);
@@ -49,27 +49,28 @@ console.log(revision);
       closed.then(([code]) => { throw new Error(`guard exited before its next output line (${code})`); }),
     ]);
     let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; });
-    let snapshot;
     try {
       const ready = await nextLine();
-      snapshot = JSON.parse(ready).snapshot;
-      expect(snapshot).not.toContain(f.clone);
-      expect(existsSync(snapshot)).toBe(true);
+      const entry = JSON.parse(ready).entry;
+      expect(entry).toBe(join(f.clone, 'scripts/delayed.mjs'));
+      expect(existsSync(`${f.clone}.guard-lock`)).toBe(true);
       rmSync(join(f.origin, 'scripts/late-v1.mjs'));
       writeFileSync(join(f.origin, 'scripts/late-v2.mjs'), 'export const revision = "new revision";');
       writeFileSync(join(f.origin, 'scripts/delayed.mjs'), 'console.log("new guard");');
       f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'remove original dependency');
       const refresh = f.run();
-      expect(refresh.status, refresh.stderr).toBe(0);
-      expect(existsSync(join(f.clone, 'scripts/late-v1.mjs'))).toBe(false);
-      expect(existsSync(snapshot)).toBe(true);
-      // A second reset/clean must also leave the executing revision alone.
-      expect(f.run().status).toBe(0);
+      expect(refresh).toMatchObject({ status: 2, stderr: expect.stringContaining('retry sync') });
+      expect(existsSync(join(f.clone, 'scripts/late-v1.mjs'))).toBe(true);
+      expect(existsSync(join(f.clone, 'scripts/late-v2.mjs'))).toBe(false);
       const imported = nextLine();
       child.stdin.end('continue');
       expect(await imported).toBe('original revision');
       expect((await closed)[0], stderr).toBe(0);
-      expect(existsSync(snapshot)).toBe(false);
+      expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+      const refreshAfterExit = f.run();
+      expect(refreshAfterExit.status, refreshAfterExit.stderr).toBe(0);
+      expect(existsSync(join(f.clone, 'scripts/late-v1.mjs'))).toBe(false);
+      expect(existsSync(join(f.clone, 'scripts/late-v2.mjs'))).toBe(true);
     } finally {
       if (!child.stdin.writableEnded) child.stdin.end('continue');
       await closed;
