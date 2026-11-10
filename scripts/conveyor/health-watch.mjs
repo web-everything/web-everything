@@ -1665,6 +1665,12 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     writeJsonAtomic(join(dir, 'last-tick.json'), state.lastTick);
     if (overrun) { try { unlinkSync(overrunPath); } catch { /* gone */ } }
   }
+  // R830/R817: FORGE-DOWN / FORGE-FALLBACK also reach the operator monitor through the needs-you feed. The key
+  // carries an hour bucket, so a condition that stays broken is re-announced hourly, never every tick.
+  const forgeFeed = [['forge-down', forgeDownEventLine(probes.forgeDown)], ['forge-fallback', forgeFallbackEventLine(probes.forgeFallback)]];
+  if (!flags['no-notify'] && !flags['dry-run']) for (const [kind, line] of forgeFeed) if (line) {
+    try { feedPublish({ key: `${kind}:${Math.floor(now / 3600000)}`, repo: 'health-watch', kind, pr: 0, head: `${kind}:${Math.floor(now / 3600000)}`, reason: line, title: line, at: new Date(now).toISOString() }); } catch { /* feed failure never fails the tick */ }
+  }
   // The whole summary goes through the scrub too (the last choke point before stdout).
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
