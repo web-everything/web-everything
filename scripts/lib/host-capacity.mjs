@@ -115,7 +115,10 @@ export function readCapacity({ settings, env = process.env, root,
     const since = at - settings.windowSec * 1000;
     const timed = rows.map(row => ({ row, time: Date.parse(row?.sampledAt) }));
     const first = timed.findIndex(({ time }) => Number.isFinite(time) && time >= since);
-    const parsed = first < 0 ? [] : timed.slice(first).map(({ row, time }) => {
+    // Unplaceable rows directly adjoining the window (no placeable older row between) cannot be proven outside it.
+    let start = first;
+    while (start > 0 && !Number.isFinite(timed[start - 1].time)) start -= 1;
+    const parsed = first < 0 ? [] : timed.slice(start).map(({ row, time }) => {
       const idle = row?.cpu?.idlePct;
       if (!Number.isFinite(time) || time > at || !validIdle(idle)) throw Error('invalid sampler reading');
       return { time, idle, freshUntil: Date.parse(row?.freshUntil) };

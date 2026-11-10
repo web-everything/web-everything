@@ -151,7 +151,7 @@ describe('window and source selection', () => {
     expect(admit('review', { settings, read: () => evidence(40, 4096, { history: () => rows }) }).admit).toBe(true);
   });
   it('reads a real file with an old null-idle line and admits from the window', () => {
-    const lines = [JSON.stringify({ ...row(0, 9000), cpu: { idlePct: null } }), '{bad', ...[row(40, 60), row(40, 30), row(40)].map(r => JSON.stringify(r))].join('\n');
+    const lines = ['{bad', JSON.stringify({ ...row(0, 9000), cpu: { idlePct: null } }), ...[row(40, 60), row(40, 30), row(40)].map(r => JSON.stringify(r))].join('\n');
     expect(evidence(40, 4096, { history: undefined, root: '/fixture', readFile: () => lines })).toMatchObject({ idlePct: 40, source: 'resource-sampler' });
   });
   it('an unplaceable row after the first in-window row still holds', () => {
@@ -159,6 +159,10 @@ describe('window and source selection', () => {
     expect(evidence(40, 4096, { history: () => rows })).toMatchObject({ error: 'invalid sampler reading', idlePct: null });
     const lines = [row(40, 60), row(40, 30), row(40)].map(r => JSON.stringify(r)); lines.splice(1, 0, '{bad');
     expect(evidence(40, 4096, { history: undefined, root: '/fixture', readFile: () => lines.join('\n') })).toMatchObject({ error: 'invalid sampler reading' });
+  });
+  it('an unplaceable row directly before the window cannot be proven outside it and holds', () => {
+    const rows = [row(40, 9000), { sampledAt: 'garbage' }, row(40, 60), row(40, 30), row(40)];
+    expect(evidence(40, 4096, { history: () => rows })).toMatchObject({ error: 'invalid sampler reading', idlePct: null });
   });
   it.each([
     ['null idle', { cpu: { idlePct: null } }], ['out-of-range idle', { cpu: { idlePct: 101 } }],
