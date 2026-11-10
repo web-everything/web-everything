@@ -1,4 +1,6 @@
 /** Branch-only queue preparation. Number allocation and reservations share the drain numbering mutex. */
+import { appendCardLedgerRows } from './card-number-ledger.mjs';
+import { resolveCardNumbering } from './policy-cascade.mjs';
 import { isTransientReadFailure } from './drain-api-reads.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
@@ -14,6 +16,11 @@ import { appendDaemonEvent } from './daemon-events.mjs';
 const SETTING = 'scripts/settings/merge-queue-numbering.json';
 const ENV = 'WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE';
 const lines = (value) => Array.isArray(value) ? value : String(value).split(/\r?\n/).filter(Boolean);
+// Path lists come from `git ls-tree/ls-files -z`: line output C-quotes non-ASCII and special-character
+// names, which every backlog regex would then miss. NUL-free text (arrays aside) is a newline list.
+const paths = (value) => Array.isArray(value) ? value
+  : String(value).includes('\0') ? String(value).split('\0').filter(Boolean) : lines(value);
+const LS_BACKLOG = (tree) => ['ls-tree', '-r', '-z', '--name-only', tree, '--', 'backlog/'];
 const cardId = (path) => idFromName(basename(path, '.md'));
 const jitSubject = /^drain: JIT-number (.+) at land \(#2288\)$/;
 /**
@@ -37,12 +44,12 @@ export function trustedDrainSubject(commit, authors) {
   return commit && authors?.has(`${commit.author?.name}\0${commit.author?.email}`)
     && jitSubject.test(commit.subject ?? '') ? commit.subject : null;
 }
-export const hashBacklogFiles = (files) => lines(files).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isHash(cardId(p)));
+export const hashBacklogFiles = (files) => paths(files).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isHash(cardId(p)));
 export const isMergeGroupCiRun = (env = process.env) => env.GITHUB_ACTIONS === 'true' && env.GITHUB_EVENT_NAME === 'merge_group';
 /** Temporary ids are unconditionally refused in merge-group CI, independent of drain settings. */
 export function mergeGroupHashRefusals({ env = process.env, files }) {
   if (!isMergeGroupCiRun(env)) return [];
-  return hashBacklogFiles(files).map((file) => `Backlog file "${file}" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)`);
+  return hashBacklogFiles(files).map((file) => `Backlog file "${shownText(file)}" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)`);
 }
 
 export const BRANCH_NUMBERING_CI_CONTRACT = 'drain-branch-numbering-ci-v1';
@@ -124,7 +131,7 @@ export function logQueueNumbering(setting = resolveQueueNumbering(), log = proce
 }
 
 export function reservationPlan(mainFiles, reservations, isOpen) {
-  const mainIds = new Set(lines(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number));
+  const mainIds = new Set(paths(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number));
   const kept = reservations.filter((r) => !r.nnns.every((n) => mainIds.has(Number(n))) && isOpen(r.repo, r.num) !== false);
   const max = [...mainIds, ...kept.flatMap((r) => r.nnns.map(Number))].reduce((m, n) => Math.max(m, n), 0);
   return { reservations: kept, minNext: max + 1 };
@@ -167,13 +174,23 @@ export function withHooksDisabled(fn) {
 }
 
 const numberingStatePath = () => join(dirname(queueStatePath()), 'drain-merge-queue-numbering.json');
-const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => String(exec('git', args, {
-  cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env, ...hooksDisabledEnv },
-})).trim();
+// A NUL-delimited (-z) path list is returned untrimmed: trim() would strip a leading-whitespace name
+// (sorted first) into a different path. Explicit maxBuffer: the full ls-files list nears Node's 1 MiB default.
+const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => {
+  const out = String(exec('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+    env: { ...process.env, ...env, ...hooksDisabledEnv } }));
+  return args.includes('-z') ? out : out.trim();
+};
+// Card names from a PR branch are untrusted: strip controls, line separators and bidi overrides before logging.
+// C0, DEL and C1 (NEL, CSI), line/paragraph separators, and bidi marks/overrides/isolates.
+const UNSAFE_SHOWN = (n) => n < 0x20 || (n >= 0x7f && n <= 0x9f) || n === 0x2028 || n === 0x2029 || n === 0x061c
+  || n === 0x200e || n === 0x200f || (n >= 0x202a && n <= 0x202e) || (n >= 0x2066 && n <= 0x2069);
+const shownText = (text) => [...String(text)].map((c) => UNSAFE_SHOWN(c.codePointAt(0)) ? ' ' : c).join('');
+const shownPaths = (files) => files.map(shownText).join(', ');
 
 /** Caller holds the numbering mutex and has refreshed origin/main. Unknown PRs retain reservations. */
 export function fallbackMinNext({ cwd = process.cwd(), exec = execFileSync, fs = nodeFs, statePath = numberingStatePath() } = {}) {
-  const files = safeGit(exec, cwd)(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/']);
+  const files = safeGit(exec, cwd)(LS_BACKLOG('origin/main'));
   return reservationPlan(files, readReservations(fs, statePath), () => undefined).minNext;
 }
 
@@ -215,7 +232,7 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
     try {
       const outcome = lock(() => {
         git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-        const files = hashBacklogFiles(git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/']));
+        const files = hashBacklogFiles(git(LS_BACKLOG('origin/main')));
         if (!files.length) return { assigned: [], committed: false, pushed: false, files };
         const minNext = fallbackMinNext({ cwd, exec, fs, statePath });
         temporary = fs.mkdtempSync(join(tmpdir(), 'queue-main-repair-'));
@@ -223,10 +240,10 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
         git(['worktree', 'add', '--detach', worktree, 'origin/main']);
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = number(worktree, { minNext });
-        if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/'], worktree)).length)
+        if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/', '-z'], worktree)).length)
           throw new Error(n.error || 'hash numbering did not commit a complete repair');
         git(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main'], worktree, { MAIN_PUSH_OK: '1' });
-        log.write(`  ⚠ FALLBACK: hash card(s) ${files.join(', ')} on main — numbered and pushed to main so the queue is not blocked\n`);
+        log.write(`  ⚠ FALLBACK: hash card(s) ${shownPaths(files)} on main — numbered and pushed to main so the queue is not blocked\n`);
         return { ...n, pushed: true, files };
       }, { runUnlockedOnContention: false });
       if (outcome.ran === false) throw new Error('numbering mutex refused — retry next pass');
@@ -248,7 +265,10 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
 export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(), isLocal = true,
   isOpen = () => undefined, statePath = numberingStatePath(),
   exec = execFileSync, fs = nodeFs, lock = withNumberingLock, number = numberPendingHashes,
-  now = () => new Date().toISOString() } = {}) {
+  now = () => new Date().toISOString(), shadow, appendLedger = appendCardLedgerRows,
+  env = process.env, log = process.stderr } = {}) {
+  const policy = resolveCardNumbering({ env });
+  shadow ??= policy.value.shadow;
   return withHooksDisabled(() => {
     let temporary, pushedHead;
     const git = safeGit(exec, cwd);
@@ -263,7 +283,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       temporary = fs.mkdtempSync(join(tmpdir(), 'queue-numbering-'));
       const worktree = join(temporary, 'tree');
       git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
-      const tracked = () => lines(git(['ls-files', 'backlog/'], worktree));
+      const tracked = () => paths(git(['ls-files', 'backlog/', '-z'], worktree));
       const files = tracked();
       // A hash-free pinned tree needs no numbering writes. Ordinary tracked symlinks
       // must not block enqueue just because serial mode always requests preparation.
@@ -271,13 +291,13 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       for (const path of files) assertWorktreeCard(worktree, path, fs);
       // Numbering also rewrites references in docs, memory, flows and soak files.
       // Validate the entire tracked tree, including ledger parents, before calling it.
-      for (const path of lines(git(['ls-files'], worktree))) assertWorktreeFile(worktree, path, fs);
+      for (const path of paths(git(['ls-files', '-z'], worktree))) assertWorktreeFile(worktree, path, fs);
       const outcome = lock(() => {
         pinned();
         const state = readReservations(fs, statePath);
         // Refresh the main floor while holding the same mutex as every allocation writer.
         git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-        const plan = reservationPlan(git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/']), state, isOpen);
+        const plan = reservationPlan(git(LS_BACKLOG('origin/main')), state, isOpen);
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = number(worktree, { minNext: plan.minNext });
@@ -294,11 +314,23 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         pinned();
         git(['push', '--no-verify', 'origin', `HEAD:refs/heads/${c.headRef}`], worktree);
         pushedHead = newHead;
+        if (shadow && n.assigned?.length) {
+          try {
+            const name = String(c.repo || 'we').split('/').pop();
+            const repo = name === 'web-everything' ? 'we' : name;
+            appendLedger({ repo, board: cwd, lockHeld: true, ledgerAuth: policy.value.ledgerAuth, env,
+              ...(env.WE_CARD_LEDGER_SIGNING_KEY ? { sign: { keyPath: env.WE_CARD_LEDGER_SIGNING_KEY } } : {}),
+              rows: n.assigned.map(a => ({ id: a.hash, num: Number(a.nnn), pr: Number(c.num), at: now(), by: 'drain', kind: 'shadow' })) });
+          } catch (e) {
+            try { log.write(`  WARNING: shadow card ledger write failed: ${String(e.message || e).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500)}\n`); } catch { /* warning cannot block enqueue */ }
+          }
+        }
         return { action: 'numbered', newHead, assigned: n.assigned || [] };
       }, { runUnlockedOnContention: false });
       if (outcome.ran === false) throw new Error('numbering mutex refused — retry next pass');
       return outcome.result;
-    } catch (e) { return { action: 'skip', reason: `merge-queue: branch numbering refused: ${String(e.message || e)}` }; }
+    // Refusal text can carry raw tracked-path names (guards, fs errors): sanitize once, here, before any log or event.
+    } catch (e) { return { action: 'skip', reason: `merge-queue: branch numbering refused: ${shownText(e.message || e)}` }; }
     finally {
       if (temporary) {
         try {
@@ -345,7 +377,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
     result.skipped.push({ num, reason });
     event('queue-dequeue-skipped', num, { reason });
     if ((reason === 'human-only' || reason === 'human-enqueued') && files.length) {
-      event('needs-you', num, `PR #${num} was queued by a human while its backlog card(s) ${files.join(', ')} are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.`);
+      event('needs-you', num, `PR #${num} was queued by a human while its backlog card(s) ${shownPaths(files)} are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.`);
     }
     log.write(`  ⇠ PR ${num} dequeue skipped: ${reason} — left queued${reason === 'changed-files-unreadable' ? '; retry on next pass' : ''}\n`);
   };
@@ -367,7 +399,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
       if (pr.isCrossRepository) continue;
       try {
         run('git', ['fetch', 'origin', `refs/heads/${pr.headRefName}`]);
-        const files = hashBacklogFiles(run('git', ['ls-tree', '-r', '--name-only', pr.headRefOid, '--', 'backlog/']));
+        const files = hashBacklogFiles(run('git', LS_BACKLOG(pr.headRefOid)));
         if (!files.length) continue;
         let changedFiles;
         try {
@@ -393,8 +425,8 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
         }
         graphql('mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', [`id=${pr.id}`]);
         result.dequeued.push(pr.number);
-        event('queue-dequeued', pr.number, { reason: 'hash-cards-numbering', files });
-        log.write(`  ⇠ PR ${pr.number} DEQUEUED: carries hash card(s) ${files.join(', ')} — numbering on its branch, re-enqueued after CI\n`);
+        event('queue-dequeued', pr.number, { reason: 'hash-cards-numbering', files: files.map(shownText) });
+        log.write(`  ⇠ PR ${pr.number} DEQUEUED: carries hash card(s) ${shownPaths(files)} — numbering on its branch, re-enqueued after CI\n`);
         const out = prepare({ c: { num: pr.number, repo: null, headRef: pr.headRefName, item: null, hasManifest: false }, traceHeadSha: pr.headRefOid, cwd, isLocal: true, isOpen });
         log.write(`  ↻ PR ${pr.number} queue branch preparation: ${out.action}${out.reason ? ` — ${out.reason}` : ''}${out.newHead ? ` → ${out.newHead}` : ''}\n`);
         if (out.action === 'numbered') result.numbered.push(pr.number);
@@ -409,9 +441,9 @@ export function probeQueuedLand(cwd, { exec = execFileSync, log = process.stderr
   const assigned = [];
   try {
     exec('git', ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    const files = hashBacklogFiles(exec('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, encoding: 'utf8' }));
+    const files = hashBacklogFiles(exec('git', LS_BACKLOG('origin/main'), { cwd, encoding: 'utf8' }));
     if (!files.length) return { assigned, committed: false, files };
-    const warning = `hash card(s) ${files.join(', ')} on main after a queued land — not pushed; the merge_group gate should have refused it`;
+    const warning = `hash card(s) ${shownPaths(files)} on main after a queued land — not pushed; the merge_group gate should have refused it`;
     log.write(`  ⚠ WARNING: ${warning}\n`);
     return { assigned, committed: false, files, warning };
   } catch (e) {

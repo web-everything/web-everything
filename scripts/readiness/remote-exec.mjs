@@ -1085,6 +1085,11 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
+/** R807: fail closed. A scan that throws is treated as git-needing, so the run needs an affirmed bundle or falls back local. */
+export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit}){
+  try{return route({argv,cwd}).local===true;}catch{return true;}
+}
+
 async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
@@ -1096,7 +1101,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   const standardsNeedGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
   // git-bundle only: a test file that spawns git also gets a real worktree (otherwise it stays on the git-less snapshot).
   let testNeedsGit=false;
-  if(bundleTransport&&!standardsNeedGit)try{testNeedsGit=routeNeedsGit({argv,cwd}).local===true;}catch{testNeedsGit=false;}
+  if(bundleTransport&&!standardsNeedGit)testNeedsGit=detectTestNeedsGit({argv,cwd});
   const needsGit=standardsNeedGit||testNeedsGit;
   let bundleDirectory;
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
