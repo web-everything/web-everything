@@ -687,11 +687,13 @@ export function sealedBreakKeys(findings) {
   const cls = v => flatText(publishedText(v)).replace(/[(),]/g, ' ').trim();
   return (Array.isArray(findings) ? findings : []).filter(f => f && (f.confirmedByRecheck === true || f.confirmed === true))
     .map(f => {
-      const impact = cls(f.impactIfUnfixed ?? f.impact) || 'impact?';
+      // Exactly the fields the full renderer reads (`impactIfUnfixed`, `failure_scenario`), never an alias it ignores:
+      // an alias would make the publisher's own faithful comment disagree with its seal forever.
+      const impact = cls(f.impactIfUnfixed) || 'impact?';
       return breakKey({ category: flatText(cls(f.category) || 'uncategorised'), impact: impact === 'impact?' ? null : flatText(impact),
         file: f.file ? flatText(publishedText(f.file)).replaceAll('`', "'") : null,
         line: f.file && Number.isInteger(f.line) ? f.line : null, summary: flatText(publishedText(f.summary)),
-        scenario: f.failure_scenario ?? f.scenario ? flatText(publishedText(f.failure_scenario ?? f.scenario)) : null,
+        scenario: f.failure_scenario ? flatText(publishedText(f.failure_scenario)) : null,
         findingClass: FINDING_CLASSES.includes(f.findingClass) ? f.findingClass : null,
         classBasis: FINDING_CLASSES.includes(f.findingClass) && typeof f.classBasis === 'string' ? flatText(publishedText(f.classBasis)) : null,
         alsoClasses: f.findingClass ? validAlsoClasses(f.alsoClasses, f.findingClass) : [],
@@ -719,8 +721,12 @@ export function redTeamHoldDecision({ comments, pr, head, sealed } = {}) {
   if (sealed.unreadable) return { held: true, reason: 'sealed red-team evidence is unreadable' };
   if (sealed.legacyHold === true) return { held: true, reason: 'legacy red-team evidence is unreadable or conflicts with the posted comment' };
   if (!Array.isArray(sealed.breaks) || !sealed.breaks.length) return { held: false, reason: null };
-  const { posted, agree } = redTeamBreaksAgree({ comments, pr, head, breaks: sealed.breaks });
+  const { posted, agree, keys } = redTeamBreaksAgree({ comments, pr, head, breaks: sealed.breaks });
   if (agree) return { held: false, reason: null };
+  // The publisher's OWN scrub-fallback body (sealed with the breaks when it posted one): an exact whole-body match that
+  // still shows every stored break as confirmed (an unknown impact reads as broken), so it never lifts a break.
+  if (posted && Array.isArray(sealed.posted) && sealed.posted.length === sealed.breaks.length
+    && JSON.stringify([...sealed.posted].sort()) === JSON.stringify(keys)) return { held: false, reason: null };
   return { held: true, reason: posted ? 'the posted comment differs from the stored confirmed breaks'
     : 'stored evidence holds a confirmed break and no red-team comment shows it' };
 }
@@ -728,8 +734,9 @@ export function redTeamHoldDecision({ comments, pr, head, sealed } = {}) {
 /** Does the live head's posted red-team comment show EXACTLY these confirmed breaks (whole normalized lists)? PURE. */
 export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
   const parsed = latestResult(indexedRecords(comments), pr, String(head ?? '').toLowerCase())?.parsed ?? null;
-  return { posted: parsed !== null, agree: parsed !== null
-    && JSON.stringify([...(breaks ?? [])].sort()) === JSON.stringify(postedBreakKeys(parsed)) };
+  const keys = parsed === null ? null : postedBreakKeys(parsed);
+  return { posted: parsed !== null, keys, agree: parsed !== null
+    && JSON.stringify([...(breaks ?? [])].sort()) === JSON.stringify(keys) };
 }
 
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy,
@@ -863,12 +870,15 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // A carried result keeps the seal of the head it was carried from (the carry re-keys the comment, not the stored evidence).
   let seal = sealed;
   if (seal === undefined) {
-    seal = readSealedStatus({ repo, pr, head: live, env });
+    // The publisher writes the seal under ITS process env; a caller's partial env (`{}`) must not move the lookup to a
+    // directory with no seal (a missing file reads as "nothing sealed", which would clear). Explicit keys still win.
+    const sealEnv = { ...process.env, ...(env ?? {}) };
+    seal = readSealedStatus({ repo, pr, head: live, env: sealEnv });
     let hit = latestResult(records, pr, live), rs = records;
     for (let hop = 0; seal === null && hit?.from && hop < 8; hop++) {
       const at = hit.at;
       rs = rs.filter(r => r.at < at);
-      seal = readSealedStatus({ repo, pr, head: hit.from, env });
+      seal = readSealedStatus({ repo, pr, head: hit.from, env: sealEnv });
       hit = latestResult(rs, pr, hit.from);
     }
   }

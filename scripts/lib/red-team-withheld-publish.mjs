@@ -5,7 +5,7 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { renderRedTeamComment, redTeamCommentPosted as markerPosted, priorRedTeamRow } from '../operations/review-extra-seats.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { redTeamMarker, parseRedTeamComment, sealedBreakKeys, redTeamBreaksAgree } from './red-team-gate.mjs';
+import { redTeamMarker, parseRedTeamComment, sealedBreakKeys, postedBreakKeys, redTeamBreaksAgree, redTeamHoldDecision } from './red-team-gate.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
@@ -56,10 +56,19 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     // The stored evidence's confirmed breaks, sealed into the status: the single authority every disposition reader holds on.
     let sealDirty = false;
     const seal = findings => {
+      // Stored findings that cannot be read seal as unreadable (every reader holds), never as "no breaks".
+      if (!Array.isArray(findings)) {
+        if (status.sealedBreaks !== 'unreadable') { const { sealedPosted: _p, ...rest } = status; status = { ...rest, sealedBreaks: 'unreadable' }; sealDirty = true; }
+        return;
+      }
       const keys = sealedBreakKeys(findings);
       // No confirmed break and no earlier seal: nothing to authorize, nothing to record.
       if (!keys.length && status.sealedBreaks === undefined) return;
-      if (JSON.stringify(status.sealedBreaks ?? null) !== JSON.stringify(keys)) { status = { ...status, sealedBreaks: keys }; sealDirty = true; }
+      if (JSON.stringify(status.sealedBreaks ?? null) !== JSON.stringify(keys)) {
+        // New breaks invalidate a fallback body sealed for the old ones.
+        const { sealedPosted: _stale, ...rest } = status;
+        status = { ...rest, sealedBreaks: keys }; sealDirty = true;
+      }
     };
     const holdLegacy = () => {
       // Its own flag: an earlier publish-failed alert must not silence this one (they name different problems).
@@ -113,15 +122,25 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
       const comments = listComments ? listComments() : provider.readComments(repo, pr);
       if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
       if (redTeamCommentPosted(comments, pr, head)) {
-        if (!legacy) return { status: 'skipped' };
-        // The posted comment stays authoritative: an unreadable row cannot contradict it, so no alert.
-        let recovered;
-        try { recovered = recoverLegacy(); } catch { return { status: 'skipped' }; }
+        if (!legacy) {
+          // A comment is already up (a crash after the post, or a hand-posted marker): the stored result is still the
+          // authority, so seal it before stepping aside. The shared hold decision compares the comment to it.
+          seal(result?.findings);
+          if (sealDirty) writeStatus(status);
+          return { status: 'skipped' };
+        }
+        // The exact-head seat row is the single authority: when it cannot be read, nothing proves the posted comment
+        // shows its breaks, so the head is held (with an operator alert), never cleared by the comment.
+        let recovered = null;
+        try { recovered = recoverLegacy(); } catch { /* held below */ }
         // The readable row is sealed as the authority; the shared hold decision compares WHOLE normalized lists (not counts,
         // not a marker), so the posted comment can only add holds.
-        seal(recovered.findings);
+        if (recovered) seal(recovered.findings);
         // Here an empty seal against a comment that shows a break is a conflict too (the operator hears of every difference).
-        conflict = !redTeamBreaksAgree({ comments, pr, head, breaks: status.sealedBreaks ?? [] }).agree;
+        // Otherwise the shared hold decision rules (it also accepts this publisher's own sealed scrub-fallback body).
+        const sealedNow = { breaks: status.sealedBreaks ?? [], ...(status.sealedPosted ? { posted: status.sealedPosted } : {}) };
+        conflict = !recovered || !(redTeamBreaksAgree({ comments, pr, head, breaks: sealedNow.breaks }).agree
+          || (sealedNow.breaks.length > 0 && !redTeamHoldDecision({ comments, pr, head, sealed: sealedNow }).held));
         if (!conflict) {
           // The posted comment now agrees with the stored evidence: lift a hold an earlier pass recorded.
           if (status.legacyHoldPublished) {
@@ -139,20 +158,30 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     if (legacy) {
       try { result = recoverLegacy(); } catch { return holdLegacy(); }
     }
-    // Sealed before any post, so a crash or a failed post leaves the hold in place for every reader.
-    if (Array.isArray(result?.findings)) seal(result.findings);
+    // Sealed before any post (unreadable findings seal as unreadable), so a crash or a failed post leaves the hold in place.
+    seal(result?.findings);
     if (status.publishAttempts >= 2) return escalate();
     try {
       if (!Array.isArray(result.findings)) throw Error('red-team findings unreadable');
       const input = renderInput(result);
-      let body = renderFull(input);
+      const full = renderFull(input);
+      let body = full;
       if (scrub(body).length) body = renderMinimal(input);
       if (scrub(body).length) body = renderMinimal({ ...input, omitLocation: true });
       if (scrub(body).length) throw Error('red-team minimal comment failed secret scrub');
       // A rendered body must still show every confirmed break to the gate, or clear would be guessed.
-      if (legacy && parseRedTeamComment(body).findings.filter(f => f.confirmed).length !== result.confirmedMissCount) {
-        throw Error('red-team legacy comment drops confirmed findings');
+      const breaks = sealedBreakKeys(result.findings).length;
+      if (parseRedTeamComment(body).findings.filter(f => f.confirmed).length !== breaks
+        || (legacy && breaks !== result.confirmedMissCount)) {
+        throw Error('red-team comment drops confirmed findings');
       }
+      // A scrub fallback cannot show the sealed fields: seal the exact body posted beside the breaks, so the publisher's
+      // own comment agrees with its seal (the hold decision still demands every break shown as confirmed).
+      if (body !== full && breaks) {
+        const posted = postedBreakKeys(parseRedTeamComment(body));
+        if (JSON.stringify(status.sealedPosted ?? null) !== JSON.stringify(posted)) { status = { ...status, sealedPosted: posted }; sealDirty = true; }
+      }
+      if (sealDirty) { writeStatus(status); sealDirty = false; }
       if (postComment) postComment({ repo, pr, body });
       else provider.postComment(repo, pr, body);
     } catch { return failedAttempt(); }

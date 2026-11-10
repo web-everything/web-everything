@@ -28,10 +28,14 @@ export function sealedFromStatus(status, head) {
   if (!status || typeof status !== 'object') return null;
   if (status.head !== undefined && String(status.head).toLowerCase() !== String(head ?? '').toLowerCase()) return null;
   const seal = status.sealedBreaks;
-  if (seal !== undefined && (!Array.isArray(seal) || seal.some(k => typeof k !== 'string'))) return { unreadable: true };
+  const keyList = v => Array.isArray(v) && v.every(k => typeof k === 'string');
+  if (seal !== undefined && !keyList(seal)) return { unreadable: true };
+  // `sealedPosted`: the publisher's own scrub-fallback body, sealed beside the breaks (see redTeamHoldDecision).
+  const posted = status.sealedPosted;
+  if (posted !== undefined && (seal === undefined || !keyList(posted))) return { unreadable: true };
   const legacyHold = status.legacyHoldPublished === true && status.status === 'finished' && status.result === 'ran';
   if (seal === undefined && !legacyHold) return null;
-  return { breaks: seal ?? [], legacyHold };
+  return { breaks: seal ?? [], legacyHold, ...(posted !== undefined ? { posted } : {}) };
 }
 
 /** The persisted seal for this head: null when nothing is sealed, `{unreadable:true}` when the file cannot be trusted. */

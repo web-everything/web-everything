@@ -412,11 +412,19 @@ export function decodeRecoveryAdmission(value) {
 }
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
+function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
+  // The publisher's status lock (red-team-withheld-publish): its seal and this rewrite never interleave, so neither
+  // drops the other's write (PR #6622). The publisher never takes the retry claim, so the order cannot deadlock.
+  // The publisher holds it across its gh reads and post, so wait longer than the 5s default before reporting busy.
+  return withFileLock(`${path}.lock`, () => writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId },
+    { env, host, namespace, readPidStart }), { timeoutMs: lockTimeoutMs });
+}
+
+function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId }, { env, host, namespace, readPidStart }) {
   // Retry admission survives running/finished rewrites, including lost seat-row appends.
   // A marker left by a failed status write must not wedge this writer: `claimed` below keeps its spend.
   let prior;
@@ -425,7 +433,10 @@ function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retr
     // Without a retry marker, ordinary writers may repair damaged JSON just as before retry admission.
     // Preserve marked evidence for inspection, and propagate filesystem errors even without a marker.
     if (retryMarkerSpent(path) || (!(error instanceof SyntaxError) && error.code !== 'RED_TEAM_STATUS_IDENTITY')) throw error;
-    prior = null;
+    // A damaged file that carried a seal or a legacy hold must not be repaired into "nothing sealed": seal it unreadable.
+    let raw = '';
+    try { raw = String(optionalBytes(path) ?? ''); } catch { raw = '"sealedBreaks"'; }
+    prior = /"(sealedBreaks|sealedPosted|legacyHoldPublished)"/.test(raw) ? { sealedBreaks: 'unreadable' } : null;
   }
   const spent = prior?.retryCount;
   if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
@@ -462,6 +473,7 @@ function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retr
     ...(admissionId ? { admissionId } : {}),
     // The sealed stored breaks and the legacy hold flag survive every rewrite (PR #6622): dropping them lifts the hold.
     ...(prior?.sealedBreaks !== undefined ? { sealedBreaks: prior.sealedBreaks } : {}),
+    ...(prior?.sealedPosted !== undefined ? { sealedPosted: prior.sealedPosted } : {}),
     ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),
     ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });

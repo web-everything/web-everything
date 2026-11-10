@@ -253,12 +253,15 @@ describe('legacy bare-string red-team publication', () => {
     ['seat row missing', () => null],
     ['seat reader throws', () => { throw Error('seat unreadable'); }],
     ['seat row from another head', () => seatRow({ rev: 'b'.repeat(40) })],
-  ])('an already-posted legacy ran with an unreadable row raises no conflict alert: %s', (_name, readSeatRow) => {
+  ])('an already-posted legacy ran with an unreadable row is held with an alert, never cleared by the comment: %s', (_name, readSeatRow) => {
+    // PR #6622 operator send-back item 1: the exact-head seat row is the single authority. With no readable row nothing
+    // proves the posted comment shows its breaks, so the head is held (the comment cannot lift it).
     const io = harness(legacy(), { readSeatRow, listComments: () => posted() });
-    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'held' });
     expect(io.postComment).not.toHaveBeenCalled();
-    expect(io.publishNeedsYou).not.toHaveBeenCalled();
-    expect(io.writeStatus).not.toHaveBeenCalled();
+    expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ kind: 'red-team-legacy-ran-unreadable' }));
+    expect(io.status.legacyHoldPublished).toBe(true);
   });
   it('a forged marker from an untrusted author neither skips nor validates', () => {
     const io = harness(legacy(), { readSeatRow: changesRow, listComments: () => posted('', 'attacker') });

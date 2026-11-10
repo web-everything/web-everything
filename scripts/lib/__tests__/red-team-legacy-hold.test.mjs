@@ -179,9 +179,14 @@ describe('the hold lifts only when the posted comment shows the SAME whole body'
   it('unreadable legacy evidence keeps the flag hold (nothing to compare)', () => {
     store([]);
     writeStatusFile(legacyStatus());
-    expect(publish([clearComment]).out).toEqual({ status: 'skipped' }); // posted comment stays authoritative, no alert
-    expect(publish([]).out).toEqual({ status: 'held' });
+    // The seat row is the authority: unreadable, the posted "no break" comment cannot clear the head (held, alerted).
+    const first = publish([clearComment]);
+    expect(first.out).toEqual({ status: 'held' });
+    expect(first.publishNeedsYou).toHaveBeenCalledTimes(1);
     expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    expect(planRedTeamStatusLabels({ repo, pr: 42, head, labels: ['red-team:clear'], comments: [clearComment], evidence: {} }))
+      .toMatchObject({ add: 'red-team:blocked', remove: ['red-team:clear'] });
+    expect(publish([]).out).toEqual({ status: 'held' });
   });
 });
 
@@ -213,6 +218,77 @@ describe('the sealed status reader fails closed', () => {
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: null }).held).toBe(false);
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: { breaks: [] } }).held).toBe(false);
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: { unreadable: true } }).held).toBe(true);
+  });
+});
+
+describe('every publish path seals, and the publisher\'s own comment always agrees with its seal (self-review round 2)', () => {
+  const withheld = findings => ({ repo, pr: 42, head, status: 'finished',
+    result: { status: 'ran', comment: 'withheld', provider: 'claude', model: 'test-model', recheckStatus: 'ok',
+      foldedVerdict: 'changes', confirmedMissCount: findings.filter(f => f.confirmedByRecheck).length, findings } });
+  it('a non-legacy withheld result with a comment already posted is sealed: a "no break" comment holds', () => {
+    writeStatusFile(withheld([brokenFinding]));
+    expect(publish([clearComment]).out).toEqual({ status: 'skipped' });
+    expect(readStatusFile().sealedBreaks).toHaveLength(1);
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: ['red-team:clear'], comments: [clearComment], evidence: {} }).add)
+      .toBe('red-team:blocked');
+  });
+  it('a non-legacy result whose findings are unreadable seals as unreadable and holds', () => {
+    writeStatusFile({ ...withheld([]), result: { status: 'ran', comment: 'withheld', findings: 'garbled' } });
+    publish([clearComment]);
+    expect(readStatusFile().sealedBreaks).toBe('unreadable');
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('a scrub-fallback (minimal) body the publisher posts agrees with its seal; a different body still holds', () => {
+    // The full body fails the secret scrub (here: a scrub that flags the scenario only the full body shows), so the
+    // publisher falls back to its minimal form.
+    const secretFinding = { ...brokenFinding, failure_scenario: 'replay the token' };
+    writeStatusFile(withheld([secretFinding]));
+    const { out, postComment } = publish([], { scrub: body => (body.includes('replay the token') ? ['credential'] : []) });
+    expect(out).toEqual({ status: 'posted' });
+    const body = postComment.mock.calls[0][0].body;
+    expect(body).toMatch(/summary withheld/);
+    expect(readStatusFile().sealedPosted).toHaveLength(1);
+    const posted = trusted(body);
+    // Not held forever by its own comment: the stored break is shown (confirmed, impact unknown = broken) to the gate.
+    expect(redTeamHoldDecision({ comments: [posted], pr: 42, head, sealed: readSealedStatus({ repo, pr: 42, head, env: process.env }) }).held).toBe(false);
+    // A comment that is neither the full body nor the sealed fallback still holds.
+    expect(redTeamHoldDecision({ comments: [clearComment], pr: 42, head, sealed: readSealedStatus({ repo, pr: 42, head, env: process.env }) }).held).toBe(true);
+  });
+  it('the seal reads only the fields the renderer shows: an `impact`/`scenario` alias cannot make the faithful comment disagree', () => {
+    const aliased = { summary: 'Aliased fields', file: 'scripts/z.mjs', line: 3, category: 'correctness', impact: 'cosmetic',
+      scenario: 'not rendered', confirmedByRecheck: true };
+    writeStatusFile(withheld([aliased]));
+    const { postComment } = publish([]);
+    const posted = trusted(postComment.mock.calls[0][0].body);
+    expect(redTeamHoldDecision({ comments: [posted], pr: 42, head, sealed: readSealedStatus({ repo, pr: 42, head, env: process.env }) }).held).toBe(false);
+  });
+  it('a planner called with a partial env ({}) still finds the seal the publisher wrote under the process env', () => {
+    store([seatRow()]); writeStatusFile(legacyStatus()); publish([clearComment]);
+    expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: {}, labels: ['red-team:clear'], comments: [clearComment], evidence: {} }).add)
+      .toBe('red-team:blocked');
+  });
+  it('a drain rewrite of a damaged status that carried a seal fails closed (unreadable), never "nothing sealed"', () => {
+    store([seatRow()]); writeStatusFile(legacyStatus()); publish([clearComment]);
+    writeFileSync(statusFile(), `${JSON.stringify(readStatusFile()).slice(0, -5)}`); // truncated JSON, still names the seal
+    const loopPayload = { findings: { read: { netBasis: { rev: head } } } };
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'ran' }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toBe('unreadable');
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('the drain writer waits on the publisher\'s status lock (one lock, no interleaved rewrite)', () => {
+    store([seatRow()]); writeStatusFile(legacyStatus());
+    writeFileSync(`${statusFile()}.lock`, `${process.pid}\n`); // the publisher holds it (this live pid)
+    const loopPayload = { findings: { read: { netBasis: { rev: head } } } };
+    const started = Date.now();
+    // While the publisher holds it, the drain waits and then reports busy (retry next tick) without writing.
+    expect(() => recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'ran' },
+      { env: process.env, lockTimeoutMs: 200 })).toThrow(/busy/);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+    expect(readStatusFile()).toEqual(legacyStatus()); // untouched while the lock is held
+    rmSync(`${statusFile()}.lock`, { force: true });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'ran' }, { env: process.env, lockTimeoutMs: 200 });
+    expect(readStatusFile()).toMatchObject({ status: 'finished', result: 'ran' });
   });
 });
 
