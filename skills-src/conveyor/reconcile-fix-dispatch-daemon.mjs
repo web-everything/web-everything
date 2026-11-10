@@ -74,7 +74,10 @@ import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs';
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/conveyor/fix-takeover.mjs';
-import { unlinkSync } from 'node:fs';
+import { unlinkSync, readFileSync } from 'node:fs';
+import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
+import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
+import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
 import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
@@ -901,6 +904,47 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
   };
 }
 
+// R812: settings can narrow these bounds; only code can enlarge the outer limit.
+const FIX_PASS_LIMITS = {
+  stuckFixersMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_STUCK_FIXERS_MS', phase: 'stuck-fixers' },
+  ciHealMs: { defaultMs: 180000, maxMs: 900000, env: 'WE_FIX_BUDGET_CI_HEAL_MS', phase: 'ci-heal' },
+  promoteDraftMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_PROMOTE_DRAFT_MS', phase: 'promote-draft' },
+};
+
+/** `file` accepts a settings path or injected parsed data. Invalid overrides reset to standard,
+ * rather than inheriting a possibly larger lower-layer value. Unreadable files use standard. */
+export function resolveFixPassBudgets({ env = process.env,
+  file = resolve(DAEMON_REPO_ROOT, 'scripts/settings/fix-pass-budget.json'), readFile = readFileSync,
+} = {}) {
+  let raw;
+  try { raw = typeof file === 'string' || file instanceof URL ? JSON.parse(readFile(file, 'utf8')) : file; }
+  catch { raw = null; }
+  const standard = {}, tool = {}, envValues = {};
+  const parse = (v, maxMs, fromEnv = false) => {
+    if (fromEnv && typeof v === 'string' && /^\d+$/.test(v)) v = Number(v);
+    return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
+      ? Math.min(maxMs, Math.max(1000, v)) : null;
+  };
+  for (const [key, rule] of Object.entries(FIX_PASS_LIMITS)) {
+    standard[key] = rule.defaultMs;
+    if (Object.hasOwn(raw?.fixPassBudget ?? {}, key)) {
+      const value = parse(raw.fixPassBudget[key], rule.maxMs);
+      if (value !== null) tool[key] = value;
+    }
+    if (Object.hasOwn(env, rule.env)) {
+      const value = parse(env[rule.env], rule.maxMs, true);
+      if (value === null) delete tool[key];
+      else envValues[key] = value;
+    }
+  }
+  const resolved = resolveCascade({ standard, tool, envValues });
+  return Object.fromEntries(Object.keys(FIX_PASS_LIMITS).map(key => [key,
+    { value: resolved.value[key], source: resolved.sources[key] }]));
+}
+
+// One cursor per bounded repo phase; callers can inject isolated daemon state.
+const fixPassRotation = {};
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
  * daemon's WHOLE per-tick unit of work, composing BOTH halves this daemon now owns — the pre-existing `fix`
@@ -973,15 +1017,42 @@ export async function runTickAllRepos({
   readPlanFingerprint = readPlanFingerprints, readPlanClaimSet = readPlanClaims,
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
+  passBudgets = resolveFixPassBudgets(),
+  budgetRotation = fixPassRotation,
+  // Off under a test run unless injected (the real pass reads GitHub).
+  orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
   const planCache = (reuseReconcilePlan ?? !anyTickInjected)
     ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
+  const budgets = Object.fromEntries(Object.entries(FIX_PASS_LIMITS).map(([key, rule]) =>
+    [rule.phase, { budgetMs: passBudgets[key].value, hit: false, skipped: [] }]));
+  // A generator lets the existing sequential fan-outs yield only BETWEEN complete repo ticks.
+  function* budgetRepos(phase, candidates) {
+    const start = now();
+    const budget = budgets[phase];
+    const cursor = candidates.indexOf(budgetRotation[phase]);
+    const ordered = cursor > 0 ? [...candidates.slice(cursor), ...candidates.slice(0, cursor)] : [...candidates];
+    for (let i = 0; i < ordered.length; i += 1) {
+      if (now() - start > budget.budgetMs) {
+        budget.hit = true;
+        budget.skipped.push(...ordered.slice(i));
+        budgetRotation[phase] = ordered[i];
+        return;
+      }
+      yield ordered[i];
+    }
+    delete budgetRotation[phase];
+  }
   const phaseMs = {};
-  const timed = (name, fn) => { const t = now(); try { return fn(); } finally { phaseMs[name] = now() - t; } };
-  const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { phaseMs[name] = now() - t; } };
+  const finishPhase = (name, start) => {
+    phaseMs[name] = now() - start;
+    if (budgets[name] && phaseMs[name] > budgets[name].budgetMs) budgets[name].hit = true;
+  };
+  const timed = (name, fn) => { const t = now(); try { return fn(); } finally { finishPhase(name, t); } };
+  const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { finishPhase(name, t); } };
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick, shared by both dispatching halves below. Real IO
   // (`planClaudeAuthDispatchGate`'s own `claude agents --json --all` read + health read + cheap probe) runs
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule
@@ -1000,12 +1071,7 @@ export async function runTickAllRepos({
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
   const awaitVerify = await timedAsync('await-verify', async () => (awaitVerifyTick ? awaitVerifyTick({ allowResume: !authGate.paused })
     : (realTick ? buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] })));
-  // card xccgzu5 — SECOND, still before any fresh dispatch: a fixer the watchdog flagged stuck (live 2026-10-08,
-  // ci-heal-4453 idle 1h on a verify for a commit it had already pushed) is stopped and its claims released here,
-  // so THIS tick's ci-heal/fix halves see the PR unowned and re-dispatch it, and its reserved slot frees up.
-  const stuckFixers = await timedAsync('stuck-fixers', async () => (stuckFixerTick ? stuckFixerTick()
-    : (realTick ? runFixerStuckReclaimPass() : { rows: [] })));
-  // card xiqtf7w — THIRD, before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
+  // card xiqtf7w — before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
   // stand-down now, so this tick's fix/ci-heal halves (and the review daemon) already read it as stood down.
   // No Claude session is spawned, so the auth gate never pauses it.
   const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
@@ -1135,17 +1201,46 @@ export async function runTickAllRepos({
     };
     return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile, ...reuseOptions(step, tick) });
   };
+  // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
+  const orphanGuard = await timedAsync('orphan-guard', async () => {
+    if (stuckFixerTick || !realTick || !orphanGuardTick) return { rows: [] };
+    try { return await orphanGuardTick({ env: process.env, nowMs: now() }) ?? { rows: [] }; }
+    catch (e) { return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] }; }
+  });
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   planCache?.markTouched(fix);
+  // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
+  // The hooks cannot interrupt in-flight work or bound discovery/endFix/release IO.
+  const stuckFixers = await timedAsync('stuck-fixers', async () => {
+    const start = now();
+    const overBudget = () => {
+      if (now() - start > budgets['stuck-fixers'].budgetMs) budgets['stuck-fixers'].hit = true;
+      return budgets['stuck-fixers'].hit;
+    };
+    if (stuckFixerTick) return stuckFixerTick();
+    if (!realTick) return { rows: [] };
+    return runFixerStuckReclaimPass({
+      stopSession: options => {
+        if (overBudget()) throw new Error('stuck-fixers pass budget exhausted; retry next tick');
+        return stopSession(options);
+      },
+      orphanPass: null, // ran before fix (orphan-guard phase)
+    });
+  });
+  if (orphanGuard.rows?.length && Array.isArray(stuckFixers?.rows)) {
+    stuckFixers.orphanRounds = orphanGuard;
+    for (const r of orphanGuard.rows) stuckFixers.rows.push({ ...r, kind: 'orphan-fix-round' });
+  }
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }),
+    : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }),
       ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
+  ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
   planCache?.markTouched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
@@ -1164,7 +1259,8 @@ export async function runTickAllRepos({
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
-  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: stepRepos.get('promote-draft'), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
+  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
+  promoteDraft.budgetSkipped = budgets['promote-draft'].skipped;
   planCache?.markTouched(promoteDraft);
   // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
   // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
@@ -1229,6 +1325,7 @@ export async function runTickAllRepos({
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
+    budgets, passBudgetSettings: passBudgets,
     skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
 }
@@ -1424,6 +1521,12 @@ export function formatPassTiming(result) {
   return `pass-timing total ${sec(result.passMs)} — ${parts.join(', ') || 'no phases'}`;
 }
 
+/** Keep the historical total line intact; emit each phase exactly once alongside it. */
+export function formatPassPhaseTiming(result) {
+  return Object.entries(result?.phaseMs ?? {}).filter(([, ms]) => Number.isFinite(ms))
+    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false}`);
+}
+
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
@@ -1459,6 +1562,9 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
       log.error(`reconcile-fix-dispatch-daemon: tick (${repos.map((r) => r.repo).join(', ')}) — dispatched ${dispatched.length}, refused ${refusals.length}`);
       const timing = formatPassTiming(result);
       if (timing) log.error(`reconcile-fix-dispatch-daemon: ${timing}`);
+      for (const line of formatPassPhaseTiming(result)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
+      if (result?.passBudgetSettings) log.error(`reconcile-fix-dispatch-daemon: fix-pass-budget ${Object.entries(result.passBudgetSettings)
+        .map(([key, setting]) => `${key}=${setting.value} source=${setting.source}`).join(', ')}`);
       heapPass += 1;
       logDaemonHeap({ daemon: 'reconcile-fix-dispatch-daemon', pass: heapPass, passMs: result?.passMs, log });
       // card x5kagse (epic #4075/#3383) — logged EVERY tick fix/ci-heal dispatch stays paused, exact wording
