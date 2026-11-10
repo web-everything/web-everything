@@ -2,8 +2,8 @@
 import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
 import * as filesystem from 'node:fs/promises';
-import { constants, mkdirSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve, relative, isAbsolute, win32 } from 'node:path';
+import { constants, mkdirSync, lstatSync, realpathSync, appendFileSync } from 'node:fs';
+import { join, resolve, relative, isAbsolute, win32, basename } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -1130,9 +1130,22 @@ export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit}){
   try{return route({argv,cwd}).local===true;}catch{return true;}
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   let warningCount=0;
-  const reportWarning=(reason,detail)=>{if(warningCount++<20)try{onWarning?.(reason,detail);}catch{ /* advisory only */ }};
+  // The credential-warn log is what a later re-tightening reads: never drop a warning silently. With no callback,
+  // or when the callback throws, append it to remote-fallbacks.jsonl; a failed write is logged, never fatal.
+  const sink=warningSink??((reason,detail)=>import('./heavy-admission.mjs').then(({admissionLockRoot})=>{
+    const root=admissionLockRoot(cwd,env),bound=v=>String(v).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?').slice(0,4096);
+    mkdirSync(root,{recursive:true});
+    appendFileSync(join(root,'remote-fallbacks.jsonl'),JSON.stringify({ts:new Date().toISOString(),reason:bound(reason),detail:bound(detail),lane:basename(cwd),kind:'credential-warn'})+'\n','utf8');
+  }));
+  const reportWarning=(reason,detail)=>{
+    if(warningCount++>=20)return;
+    try {if(onWarning){onWarning(reason,detail);return;}}
+    catch(error) {try{log(`remote-exec: onWarning callback failed (${String(error?.message??error).slice(0,200)}); recording the warning in remote-fallbacks.jsonl\n`);}catch{ /* logging only */ }}
+    try {Promise.resolve(sink(reason,detail)).catch(error=>{try{log(`remote-exec: could not record ${reason}: ${String(error?.message??error).slice(0,200)}\n`);}catch{ /* logging only */ }});}
+    catch(error) {try{log(`remote-exec: could not record ${reason}: ${String(error?.message??error).slice(0,200)}\n`);}catch{ /* logging only */ }}
+  };
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   argv = normalizeRemoteArgv(argv);

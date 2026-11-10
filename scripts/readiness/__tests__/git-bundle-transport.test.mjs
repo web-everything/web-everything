@@ -590,7 +590,7 @@ describe('R857 advisory bundle credential policy',()=>{
       const head=await commit(lane,{[path]:'harmless'},'secret-file name');
       expect(await scanBundleRange({cwd:lane,head,prerequisite:runnerMain,exec})).toMatchObject({finding:'excluded-path'});
     });
-  it.each(['normal','throwing callback','over 20 warnings','rsync flagged file','admission log'])(
+  it.each(['normal','throwing callback','no callback','over 20 warnings','rsync flagged file','admission log'])(
     'runRemote dispatches warning-only history and bounds advisory callbacks: %s',async kind=>{
       const count=kind==='over 20 warnings'?25:1,files={'package-lock.json':'{"lockfileVersion":3,"packages":{}}\n'};
       const rsync=kind==='rsync flagged file';
@@ -616,8 +616,9 @@ describe('R857 advisory bundle credential policy',()=>{
         throw new Error('Unexpected transport call');
       };
       const onWarning=vi.fn(()=>{if(kind==='throwing callback')throw new Error('advisory sink failed');});
+      const warningSink=vi.fn();
       const options={cwd:lane,argv:['npm','run','check:standards'],env:{},transport:rsync?'rsync':'git-bundle',
-        exec:transport,onWarning,log:()=>{}};
+        exec:transport,...(kind==='no callback'?{}:{onWarning}),warningSink,log:()=>{}};
       if(kind==='admission log') {
         const lockRoot=join(root,'heavy');
         const policy=resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',transport:'git-bundle'}}});
@@ -632,7 +633,12 @@ describe('R857 advisory bundle credential policy',()=>{
       if(rsync)expect(request.bundle).toBeUndefined();
       else expect(request.bundle.mode).toBe('incremental');
       expect(actions).toContain('run');
-      if(kind!=='admission log') {
+      if(kind==='no callback'||kind==='throwing callback') {
+        // Never dropped silently: the default sink receives the warning.
+        expect(warningSink).toHaveBeenCalledWith('credential-warn','note-00.md: high-entropy-key');
+      } else expect(warningSink).not.toHaveBeenCalled();
+      if(kind==='no callback')expect(onWarning).not.toHaveBeenCalled();
+      else if(kind!=='admission log') {
         expect(onWarning).toHaveBeenCalledTimes(Math.min(count,20));
         expect(onWarning).toHaveBeenCalledWith('credential-warn',`${rsync?'token-notes.md':'note-00.md'}: high-entropy-key`);
       }
