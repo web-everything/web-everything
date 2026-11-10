@@ -39,7 +39,7 @@ export function parsePrep(text) {
       current = HEADINGS.find((name) => name.toLowerCase() === heading[1].toLowerCase());
       if (!sections.has(current)) sections.set(current, []);
       sections.get(current).push(heading[2]);
-    } else if (/^PREP:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
+    } else if (/^PREP:/i.test(clean) || /^Slot:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
       current = undefined;
     } else if (current) sections.get(current).push(line);
   }
@@ -57,6 +57,26 @@ export function prepVerdict(text) {
   const problems = [!prep.present && 'PREP block absent', prep.missing.length && `missing: ${prep.missing.join(', ')}`,
     prep.empty.length && `empty or placeholder: ${prep.empty.join(', ')}`].filter(Boolean);
   return { ok: false, reason: `Prep required (${problems.join('; ')}). Each heading needs a non-placeholder item of at least 8 non-whitespace characters.\n${FORMAT}`, waived: false };
+}
+
+function quotedOk(value) {
+  const m = value.trim().match(/^(?:"([^"]*)"|“([^”]*)”|'([^']*)'|‘([^’]*)’)/);
+  const inner = m ? m.slice(1).find((x) => x !== undefined) : '';
+  return Boolean(m) && nonTrivial(inner);
+}
+
+/** Validate the placement line in an Agent brief independently of PR preparation. */
+export function slotVerdict(text) {
+  const lines = (typeof text === 'string' ? text : '').split(/\r?\n/);
+  for (const line of lines) {
+    const match = stripMarkdown(line).match(/^Slot:\s*(?:(plan|blocker|operator):\s*|waived\s*[—–-]\s*)(.*)$/i);
+    const value = match ? match[2].replace(/[`"'“”‘’]/g, '') : '';
+    if (match && nonTrivial(value) && (match[1]?.toLowerCase() !== 'operator' || quotedOk(match[2].replace(/`/g, '')))) {
+      const waived = !match[1];
+      return { ok: true, reason: waived ? match[2].trim() : '', waived };
+    }
+  }
+  return { ok: false, reason: 'Slot required (missing, invalid or placeholder placement). Each value needs at least 8 non-whitespace characters.\nSlot: plan:<item>\nOr: Slot: blocker:<what it unblocks>\nOr: Slot: operator:<quoted placement>\nOr: Slot: waived — <reason>', waived: false };
 }
 
 /** Best-effort local audit: logging can never block an operator. */

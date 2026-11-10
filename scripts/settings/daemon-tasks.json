@@ -1,0 +1,589 @@
+{
+  "version": 1,
+  "daemonTasksDescription": "Daemon task table (a verbatim inventory of the live 2026-11-09 laptop values, so a render reproduces today with no behaviour change; tuning any value is a separate decision): source for rendered launchd plists. Paths use {home} and {node} tokens; env holds non-sensitive literals only; hostEnvKeys are names whose values come from the host overlay, never committed.",
+  "tasks": [
+    {
+      "label": "com.plateau.drain-daemon",
+      "program": [
+        "{node}",
+        "{home}/workspace/plateau-drain-daemon/tools/drain-daemon/daemon.mjs"
+      ],
+      "workingDir": "{home}/workspace/plateau-drain-daemon",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "processType": "Standard",
+      "stdout": "{home}/workspace/plateau-app/.drain-daemon/daemon.log",
+      "stderr": "{home}/workspace/plateau-app/.drain-daemon/daemon.log",
+      "env": {
+        "DRAIN_DAEMON_INTERVAL_SEC": "60",
+        "DRAIN_DAEMON_WE_CLONE": "{home}/workspace/.lanes/we-drain-daemon/lane-1",
+        "DRAIN_DAEMON_STATE_ROOT": "{home}/workspace/plateau-app/.drain-daemon",
+        "DRAIN_DAEMON_SELF_SYNC_ROOT": "{home}/workspace/plateau-drain-daemon",
+        "WE_MERGE_QUEUE_SETTINGS_FILE": "{home}/workspace/.operations/coordination/merge-queue-settings.override.json",
+        "DRAIN_DAEMON_MAX_BACKOFF_SEC": "900",
+        "DRAIN_DAEMON_SELF_SYNC": "1",
+        "DRAIN_DAEMON_HEARTBEAT_SEC": "60",
+        "WE_PR_EVENT_FEED_DRAIN": "on",
+        "DRAIN_DAEMON_PASS_TIMEOUT_MIN": "45",
+        "DRAIN_DAEMON_WE_PRIMARY": "{home}/workspace/webeverything"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH",
+        "WE_PR_EVENTS_TOKEN_FILE",
+        "WE_PR_EVENTS_URL"
+      ]
+    },
+    {
+      "label": "com.plateau.wip-publisher-alpha",
+      "program": [
+        "{home}/.config/plateau-app/wip-publish-alpha.sh"
+      ],
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 30,
+      "stdout": "{home}/Library/Logs/plateau-wip-publisher-alpha.log",
+      "stderr": "{home}/Library/Logs/plateau-wip-publisher-alpha.log",
+      "env": {
+        "WE_ROOT": "{home}/workspace/wev-health-watch",
+        "WE_CODE_ROOT": "{home}/workspace/wev-health-watch",
+        "WE_LANE_STATUS_MAX_AGE_MS": "180000",
+        "WIP_LANE_POOL_MAX_AGE_MS": "180000",
+        "WE_STATE_ROOT": "{home}/workspace/webeverything"
+      }
+    },
+    {
+      "label": "com.plateau.wip-publisher",
+      "program": [
+        "/bin/zsh",
+        "-lc",
+        "cd \"$WE_WIP_PUBLISH_HOME/workspace/plateau-app\" && { git pull --ff-only --quiet || echo \"wip-publisher: git pull skipped (offline or local changes) — running the code on disk\"; } && exec npm run --silent wip:publish"
+      ],
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 30,
+      "stdout": "{home}/Library/Logs/plateau-wip-publisher.log",
+      "stderr": "{home}/Library/Logs/plateau-wip-publisher.log",
+      "env": {
+        "WE_WIP_PUBLISH_HOME": "{home}",
+        "WE_CODE_ROOT": "{home}/workspace/wev-health-watch",
+        "WE_ROOT": "{home}/workspace/wev-health-watch",
+        "WE_STATE_ROOT": "{home}/workspace/webeverything"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ]
+    },
+    {
+      "label": "com.we.build-dispatch-daemon",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-control/skills-src/conveyor/build-dispatch-daemon.mjs",
+        "--live",
+        "--self-sync",
+        "--max-concurrent=0",
+        "--max-open-prs=10",
+        "--max-concurrent-external=0"
+      ],
+      "workingDir": "{home}/workspace/wev-control",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/.operations/coordination/build-dispatch-daemon.log",
+      "stderr": "{home}/workspace/.operations/coordination/build-dispatch-daemon.log",
+      "env": {
+        "WE_BUILD_DISPATCH_MODE": "mechanical",
+        "OPERATION_RUNS_DIR": "{home}/workspace/.operations/coordination/build-dispatch-runs",
+        "WE_MAX_CONCURRENT_LANES": "8",
+        "WE_BUILD_DAEMON_MAX_CONCURRENT": "0",
+        "WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW": "12",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
+        "CONVEYOR_STATE_ROOT": "{home}/.claude/daemon-self-sync-state/conveyor-state",
+        "WE_COST_ADMISSION": "on"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ]
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.advisory-label-sweep-we",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=advisory-label-sweep-we"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-we.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-we.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "advisory-label-sweep-we"
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=ci-red-recovery-watch-we"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-we.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-we.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "ci-red-recovery-watch-we"
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.load-flake-reverify",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=load-flake-reverify"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.load-flake-reverify.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.load-flake-reverify.log",
+      "env": {
+        "WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE": "1.25",
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
+        "WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS": "300000",
+        "WE_LOAD_FLAKE_REVERIFY_MODE": "ci"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "load-flake-reverify"
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.merge-orphan-sweep",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-merge-daemon/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=merge-orphan-sweep"
+      ],
+      "workingDir": "{home}/workspace/wev-merge-daemon",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-merge-daemon/.conveyor/pass-daemon.merge-orphan-sweep.log",
+      "stderr": "{home}/workspace/wev-merge-daemon/.conveyor/pass-daemon.merge-orphan-sweep.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "merge-orphan-sweep"
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.pr-merge-watch",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=pr-merge-watch"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/.operations/logs/pr-merge-watch.log",
+      "stderr": "{home}/workspace/.operations/logs/pr-merge-watch.log",
+      "env": {
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
+        "PASS_DAEMON_SELF_SYNC": "1"
+      },
+      "manifestPass": "pr-merge-watch"
+    },
+    {
+      "label": "com.we.fix-dispatch-daemon",
+      "program": [
+        "{node}",
+        "--max-old-space-size=4096",
+        "{home}/workspace/wev-fix-daemon/skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"
+      ],
+      "workingDir": "{home}/workspace/wev-fix-daemon",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "processType": "Standard",
+      "stdout": "{home}/workspace/wev-fix-daemon/.conveyor/fix-dispatch-daemon.log",
+      "stderr": "{home}/workspace/wev-fix-daemon/.conveyor/fix-dispatch-daemon.log",
+      "env": {
+        "WE_PROBATION_LAUNCH": "off",
+        "WE_FIX_DISPATCH_MAX_CONCURRENT": "6",
+        "WE_FIX_PUSH_AFTER_CI": "true",
+        "WE_CI_HEAL_RESERVE": "3",
+        "WE_PR_EVENTS": "1",
+        "WE_FIX_BORROW_BUILD_SLOTS": "off",
+        "WE_WORKER_WRAPPER": "off",
+        "WE_QUEUE_ADMISSION_MAX_WAIT_MINUTES": "45",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH",
+        "WE_PR_EVENTS_TOKEN_FILE",
+        "WE_PR_EVENTS_URL"
+      ]
+    },
+    {
+      "label": "com.we.health-watch",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-health-watch/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=health-watch"
+      ],
+      "workingDir": "{home}/workspace/wev-health-watch",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-health-watch/.conveyor/health-watch.log",
+      "stderr": "{home}/workspace/wev-health-watch/.conveyor/health-watch.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_OVERLAY_MAIN_SYNC": "on",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
+        "CONVEYOR_STATE_ROOT": "{home}/.claude/daemon-self-sync-state/conveyor-state",
+        "HEALTH_WATCH_LOGS_DIR": "{home}/workspace/wev-review-daemon/.conveyor"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "health-watch"
+    },
+    {
+      "label": "com.we.lane-pool-health-watch-frontierui",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=lane-pool-health-watch-frontierui"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/lane-pool-health-watch-frontierui.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/lane-pool-health-watch-frontierui.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "lane-pool-health-watch-frontierui"
+    },
+    {
+      "label": "com.we.lane-pool-health-watch-plateau-app",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=lane-pool-health-watch-plateau-app"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/lane-pool-health-watch-plateau-app.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/lane-pool-health-watch-plateau-app.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "lane-pool-health-watch-plateau-app"
+    },
+    {
+      "label": "com.we.lane-pool-health-watch-we",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=lane-pool-health-watch-we"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/lane-pool-health-watch-we.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/lane-pool-health-watch-we.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
+        "LANE_POOL_TRIM_MAX": "90"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "lane-pool-health-watch-we"
+    },
+    {
+      "label": "com.we.lease-reaper",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=lease-reaper"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/lease-reaper.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/lease-reaper.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "lease-reaper"
+    },
+    {
+      "label": "com.we.parked-pr-conflict-watch-frontierui",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=parked-pr-conflict-watch-frontierui"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/parked-pr-conflict-watch-frontierui.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/parked-pr-conflict-watch-frontierui.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "parked-pr-conflict-watch-frontierui"
+    },
+    {
+      "label": "com.we.parked-pr-conflict-watch-plateau-app",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=parked-pr-conflict-watch-plateau-app"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/parked-pr-conflict-watch-plateau-app.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/parked-pr-conflict-watch-plateau-app.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "parked-pr-conflict-watch-plateau-app"
+    },
+    {
+      "label": "com.we.parked-pr-conflict-watch-we",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=parked-pr-conflict-watch-we"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/parked-pr-conflict-watch-we.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/parked-pr-conflict-watch-we.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "parked-pr-conflict-watch-we"
+    },
+    {
+      "label": "com.we.resource-sampler",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/scripts/conveyor/resource-sampler-daemon.mjs"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/resource-sampler.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/resource-sampler.log",
+      "env": {
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      }
+    },
+    {
+      "label": "com.we.review-daemon",
+      "program": [
+        "{node}",
+        "--max-old-space-size=4608",
+        "{home}/workspace/wev-review-daemon/skills-src/conveyor/review-daemon.mjs"
+      ],
+      "workingDir": "{home}/workspace/wev-review-daemon",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "processType": "Standard",
+      "stdout": "{home}/workspace/wev-review-daemon/.conveyor/review-daemon.log",
+      "stderr": "{home}/workspace/wev-review-daemon/.conveyor/review-daemon.log",
+      "env": {
+        "WE_REVIEW_SEAT_CAP_CODEX": "5000",
+        "WE_REVIEW_START_BEFORE_CI": "true",
+        "REVIEW_PR_ANTIGRAVITY_REVIEW": "0",
+        "WE_REVIEW_EXTRA_SEATS_DAILY_CAP": "5000",
+        "WE_PR_EVENTS": "1",
+        "WE_DAEMON_BACKGROUND_BUILD": "1",
+        "WE_REVIEW_SEAT_CAP_AGY_GEMINI": "0",
+        "WE_WORKER_WRAPPER": "off",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
+        "WE_REVIEW_MAX_LIVE_ROUNDS": "6",
+        "WE_REVIEW_SEAT_CAP_AGY_CLAUDE": "0"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH",
+        "WE_PR_EVENTS_TOKEN_FILE",
+        "WE_PR_EVENTS_URL"
+      ]
+    },
+    {
+      "label": "com.we.verify-daemon",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-control/skills-src/conveyor/verify-daemon.mjs"
+      ],
+      "workingDir": "{home}/workspace/wev-control",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "processType": "Standard",
+      "stdout": "{home}/workspace/.operations/coordination/verify-daemon.log",
+      "stderr": "{home}/workspace/.operations/coordination/verify-daemon.log",
+      "env": {
+        "WE_VERIFY_RELATED": "import-only",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
+        "CONVEYOR_STATE_ROOT": "{home}/.claude/daemon-self-sync-state/conveyor-state",
+        "WE_VERIFY_TEST_TIMEOUT_FACTOR": "3",
+        "WE_VERIFY_STANDARDS": "auto"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ]
+    },
+    {
+      "label": "com.webeverything.claude-otel-collector",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-host-sampler/scripts/operations/claude-otel-collector.mjs",
+        "--port=4318"
+      ],
+      "workingDir": "{home}/workspace/wev-host-sampler",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 60,
+      "stdout": "{home}/Library/Logs/claude-otel-collector.log",
+      "stderr": "{home}/Library/Logs/claude-otel-collector.log",
+      "env": {
+        "OPERATION_CLAUDE_OTEL_DIR": "{home}/workspace/webeverything/.operations/claude-otel"
+      }
+    },
+    {
+      "label": "com.webeverything.host-sampler",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-host-sampler/scripts/operations/host-sampler.mjs",
+        "loop",
+        "--interval=30"
+      ],
+      "workingDir": "{home}/workspace/wev-host-sampler",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 30,
+      "stdout": "{home}/Library/Logs/webeverything/host-sampler.out.log",
+      "stderr": "{home}/Library/Logs/webeverything/host-sampler.err.log"
+    }
+  ]
+}
