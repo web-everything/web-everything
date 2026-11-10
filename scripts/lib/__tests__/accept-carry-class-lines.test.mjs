@@ -87,7 +87,19 @@ describe('gate-prefixed carried advisory after acceptance (PR 6584)', () => {
     `<!-- review-verdict-carried from=${OLD} to=${sha} patch-id=${'b'.repeat(40)} -->`,
     'Review verdict carried across an identical contribution.',
     `<!-- we:red-team-advisory pr=6584 rev=${rev} -->`,
-    '1. [**confirmed**] (degraded-impact, ' + impact + ') — Diagnostic detail missing',
+    "### Post-accept red team \u2014 1 possible break(s), 1 confirmed by Claude's re-check",
+    '',
+    'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
+      + `Head \`${OLD.slice(0, 12)}\` \u00b7 red team codex/gpt-6.1-sol \u00b7 re-check ok \u00b7 recorded verdict \`changes\`.`,
+    '',
+    `1. [**confirmed**] (edge-case, ${impact}) \`scripts/x.mjs:253\` \u2014 Unreachable later effects can block replay`,
+    '   - Class: live-reproduced \u2192 fix-now (basis: probe)',
+    '   - Also class: correctness-in-normal-use',
+    '   - Scenario: a scenario',
+    '   - Re-check: demonstrated break',
+    '   - Files read: scripts/x.mjs',
+    '',
+    "A confirmed break is recorded as a miss for the accepting review and for the builder's model.",
   ].join('\n');
   const later = (text, author = trusted) => latestAcceptRecord([
     { ...trusted, body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->` },

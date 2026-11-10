@@ -86,20 +86,33 @@ function readActiveRules({ repo, read }) {
   });
 }
 
-/** Union of declared required contexts. Incomplete evidence must hold refresh. */
+/** Union of declared required contexts, preserving the required producer identity. */
 export function readRequiredChecks({ repo, read }) {
   const rules = readActiveRules({ repo, read });
   const protection = read(['api', `repos/${repo}/branches/main/protection`]);
   const contexts = protection?.required_status_checks?.contexts;
   if (!Array.isArray(contexts)) throw Error('unreadable required contexts');
-  const names = [...contexts];
-  for (const rule of rules) if (rule.type === 'required_status_checks') {
-    const checks = rule.parameters?.required_status_checks;
-    if (!Array.isArray(checks)) throw Error('unreadable ruleset required checks');
-    names.push(...checks.map(check => check?.context));
+  const checks = [];
+  const add = (name, appId = null) => {
+    if (typeof name !== 'string' || !name.trim()
+      || (appId !== null && appId !== -1 && (!Number.isSafeInteger(appId) || appId <= 0))) {
+      throw Error('unknown required check name or app');
+    }
+    appId = appId === -1 ? null : appId;
+    if (!checks.some(c => c.name === name && c.appId === appId)) checks.push({ name, appId });
+  };
+  contexts.forEach(name => add(name));
+  const protectionChecks = protection.required_status_checks.checks;
+  if (protectionChecks !== undefined) {
+    if (!Array.isArray(protectionChecks)) throw Error('unreadable required check apps');
+    for (const check of protectionChecks) add(check?.context, check?.app_id ?? null);
   }
-  if (names.some(name => typeof name !== 'string' || !name.trim())) throw Error('unknown required check name');
-  return [...new Set(names)];
+  for (const rule of rules) if (rule.type === 'required_status_checks') {
+    const required = rule.parameters?.required_status_checks;
+    if (!Array.isArray(required)) throw Error('unreadable ruleset required checks');
+    for (const check of required) add(check?.context, check?.integration_id ?? null);
+  }
+  return { checks, hasWorkflows: rules.some(rule => rule.type === 'workflows') };
 }
 
 /** A BLOCKED status alone cannot prove checks are the sole blocker. Refuse unknown rules,
@@ -203,19 +216,30 @@ export async function runReadyStuck({ repo, pr, receipt, now, config, read, send
       && now - Date.parse(checkDate(c)) > config.selfHealStaleHours * 3600000)))) return;
     receipt.refreshTriedAt = now; save(); // before the first evidence read, so any refusal is remembered
     if (!await onlyChecksBlock({ repo, pr, read, now })) return;
-    const required = await requiredChecks({ repo, read });
-    if (!Array.isArray(required) || required.some(name => typeof name !== 'string' || !name.trim())) return;
+    const evidence = await requiredChecks({ repo, read });
+    const declared = Array.isArray(evidence) ? evidence : evidence?.checks;
+    if (!Array.isArray(declared)) return;
+    const required = declared.map(c => typeof c === 'string' ? { name: c, appId: null } : c);
+    if (required.some(c => typeof c?.name !== 'string' || !c.name.trim()
+      || (c.appId !== null && (!Number.isSafeInteger(c.appId) || c.appId <= 0)))) return;
     const present = new Set(pr.statusCheckRollup.map(checkName));
     // Missing runs have no check date: use the label time, or the durable observation timer.
-    for (const name of new Set(required)) if (!present.has(name)) {
+    for (const name of new Set(required.map(c => c.name))) if (!present.has(name)) {
       if (!(now - (receipt.readyLabelAt ?? receipt.readyStuckSince) > config.selfHealStaleHours * 3600000)) return;
       checks.push({ name, conclusion: 'MISSING' });
     }
     if (!checks.length) return;
     const main = await readMainChecks({ repo, pr, read });
     const green = Array.isArray(main) ? main : main?.checks;
-    if (!Array.isArray(green) || !checks.every(c => {
-      const matches = green.filter(m => checkName(m) === checkName(c));
+    // Workflow paths cannot be mapped reliably to job names here. Fail closed:
+    // prove EVERY rollup name green on main, and require SUCCESS for all PR checks
+    // beyond the stale failures being refreshed. Otherwise leave the alert for the operator.
+    const workflowChecks = evidence?.hasWorkflows ? pr.statusCheckRollup : [];
+    if (evidence?.hasWorkflows && workflowChecks.some(c => !checks.includes(c) && conclusion(c) !== 'SUCCESS')) return;
+    const needed = [...checks, ...required, ...workflowChecks];
+    if (!Array.isArray(green) || !needed.every(c => {
+      const matches = green.filter(m => checkName(m) === checkName(c)
+        && (c.appId == null || (typeof m.name === 'string' && m.app?.id === c.appId)));
       return matches.length > 0 && matches.every(m => conclusion(m) === 'SUCCESS');
     })) return;
     // Persist the attempt before mutation, including refusals and interrupted calls.

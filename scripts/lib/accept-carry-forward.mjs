@@ -34,7 +34,6 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
-import { informationalProvenance } from './carried-provenance.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
@@ -187,7 +186,7 @@ function isNonBlockingRedTeamGate(text) {
  * The carry writer's envelope (review-job.mjs): the carried marker, its fixed sentence, then optionally a non-blocking
  * advisory re-bound to the carried-to head (its "Head" label keeps the carried-from head). Anything else is a possible hold.
  */
-function isNonBlockingCarriedVerdict(text, comment) {
+function isNonBlockingCarriedVerdict(text, comment, shownHead = null) {
   if (comment === undefined || !isTrustedMarkerAuthor(comment)) return false;
   const carried = parseVerdictCarriedMarker(text);
   if (!carried) return false;
@@ -201,7 +200,7 @@ function isNonBlockingCarriedVerdict(text, comment) {
   if (!rest.startsWith('\n') || !rest.trimStart().startsWith(RED_TEAM_COMMENT_MARKER)) return false;
   rest = rest.trim();
   const parsed = parseRedTeamComment(rest);
-  return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, carried.fromSha.slice(0, 12));
+  return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, shownHead ?? carried.fromSha.slice(0, 12));
 }
 
 // Resolve exactly the gate's live policy. Unknown policy requires a fresh review.
@@ -263,13 +262,20 @@ export function isKnownMachineBody(body, comment = undefined) {
       const gate = parseRedTeamGateMarker(text);
       // The provenance parser also accepts standalone records for the rebase path.
       // Here only the combined carried envelope extends the strict gate shape.
-      if (!gate || !parseVerdictCarriedMarker(text) || !informationalProvenance(text, gate.rev, gate.pr)) return false;
-      const advisoryAt = text.indexOf(RED_TEAM_COMMENT_MARKER);
-      if (advisoryAt < 0) return true;
-      const parsed = parseRedTeamComment(text.slice(advisoryAt));
-      const plan = parsed && liveRedTeamAdvisoryPlan(parsed);
-      // A send-back owed under the live policy is a hold; a card is non-blocking (the gate already recorded card-queued).
-      return !!plan && !plan.sendBack.length;
+      const carried = parseVerdictCarriedMarker(text);
+      if (!gate || gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || !carried || carried.toSha !== gate.rev) return false;
+      // The gate part (a bare marker line, or the strict full gate comment) then the strict carried envelope.
+      const cut = text.indexOf(buildVerdictCarriedMarker(carried));
+      if (cut < 0) return false;
+      const gatePart = text.slice(0, cut).trim();
+      const bare = redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds, gate.classCards);
+      if (gatePart !== bare && !isNonBlockingRedTeamGate(gatePart)) return false;
+      const envelope = text.slice(cut);
+      if (!envelope.includes(RED_TEAM_COMMENT_MARKER)) return false;
+      // Both producer shapes retain the strict finding sequence/completeness checks:
+      // the original displayed head, or the advisory rendered for the current head.
+      return isNonBlockingCarriedVerdict(envelope, comment)
+        || isNonBlockingCarriedVerdict(envelope, comment, gate.rev.slice(0, 12));
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
       const parsed = parseRedTeamComment(text);

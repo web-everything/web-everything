@@ -523,6 +523,52 @@ describe('missing required checks and checks-only rulesets', () => {
     });
     return f;
   }
+  it.each(['FAILURE', 'NEUTRAL', 'MISSING', 'SUCCESS'])(
+    'workflow rule requires successful main evidence for an already-green rollup check: %s', async result => {
+      const f = rulesFixture(['workflows']);
+      f.onlyChecksBlock = undefined; f.readRequiredChecks = undefined;
+      f.readLabelTime.mockReturnValue(date(25));
+      f.pr.statusCheckRollup.push({ name: 'workflow-job', conclusion: 'SUCCESS' });
+      f.readMainChecks.mockReturnValue([
+        { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'SUCCESS' },
+        ...(result === 'MISSING' ? [] : [{ name: 'workflow-job', conclusion: result }]),
+      ]);
+      await runReadyStuck(f);
+      expect(f.refresh).toHaveBeenCalledTimes(result === 'SUCCESS' ? 1 : 0);
+    });
+  it.each(['NEUTRAL', 'SKIPPED'])(
+    'workflow rule holds for a PR check beyond the refresh with %s conclusion', async conclusion => {
+      const f = rulesFixture(['workflows']);
+      f.onlyChecksBlock = undefined; f.readRequiredChecks = undefined;
+      f.readLabelTime.mockReturnValue(date(25));
+      f.pr.statusCheckRollup.push({ name: 'workflow-job', conclusion });
+      f.readMainChecks.mockReturnValue(['test', 'merge-gate', 'workflow-job'].map(name => ({ name, conclusion: 'SUCCESS' })));
+      await runReadyStuck(f);
+      expect(f.refresh).not.toHaveBeenCalled();
+    });
+  it.each([['protection', 88, false], ['protection', null, false], ['protection', 99, true],
+    ['ruleset', 88, false], ['ruleset', null, false], ['ruleset', 99, true]])(
+    'matches %s requirement for app 99 against main producer %s: refresh=%s', async (source, app, allowed) => {
+        const f = rulesFixture([]); const original = f.read;
+        f.readRequiredChecks = undefined;
+        f.readLabelTime.mockReturnValue(date(25));
+        f.read = args => {
+          if (source === 'protection' && args[1].endsWith('/protection')) return {
+            required_status_checks: { contexts: ['test'], checks: [{ context: 'test', app_id: 99 }] },
+          };
+          if (source === 'ruleset' && args[1].endsWith('/rulesets/2')) return { rules: [
+            { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'test', integration_id: 99 }] } },
+          ] };
+          return original(args);
+        };
+        f.readMainChecks.mockReturnValue([
+          app === null ? { context: 'test', state: 'success' } : { name: 'test', conclusion: 'SUCCESS', app: { id: app } },
+          { name: 'merge-gate', conclusion: 'SUCCESS' },
+        ]);
+        await runReadyStuck(f);
+        expect(f.refresh).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    });
+
   it('allows the two active checks/workflow rulesets', () => {
     expect(readChecksOnly(rulesFixture(['deletion', 'non_fast_forward', 'workflows']))).toBe(true);
   });
@@ -557,7 +603,9 @@ describe('missing required checks and checks-only rulesets', () => {
   });
   it('unions branch and active ruleset required contexts', async () => {
     const { readRequiredChecks } = await import('../pass-daemons/pr-ready-stuck.mjs');
-    expect(readRequiredChecks(rulesFixture(['workflows']))).toEqual(['test', 'merge-gate']);
+    expect(readRequiredChecks(rulesFixture(['workflows']))).toEqual({
+      checks: [{ name: 'test', appId: null }, { name: 'merge-gate', appId: null }], hasWorkflows: true,
+    });
   });
   it.each(['ruleset detail', 'required parameters', 'branch contexts'])(
     'holds for unreadable %s in the production required-check reader', async kind => {
@@ -575,7 +623,7 @@ describe('missing required checks and checks-only rulesets', () => {
     const { readRequiredChecks } = await import('../pass-daemons/pr-ready-stuck.mjs');
     const f = rulesFixture([]); const original = f.read;
     f.read = args => args[1].includes('rulesets?') ? [{ enforcement: 'disabled' }] : original(args);
-    expect(readRequiredChecks(f)).toEqual(['test']);
+    expect(readRequiredChecks(f)).toEqual({ checks: [{ name: 'test', appId: null }], hasWorkflows: false });
   });
   it('keeps unfinished checks blocking even when a required name is missing', async () => {
     const f = missingFixture(); f.pr.statusCheckRollup.push({ name: 'test', status: 'IN_PROGRESS' });
