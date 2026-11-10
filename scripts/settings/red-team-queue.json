@@ -1,0 +1,9 @@
+{
+  "$comment": "Red-team queue floor: minimum concurrent starts when CPU idle meets the threshold. WE_RED_TEAM_QUEUE_MIN_CONCURRENT and WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT override these values; minimum concurrency is capped at 4.",
+  "redTeam": {
+    "queue": {
+      "minConcurrent": 2,
+      "minConcurrentIdlePct": 10
+    }
+  }
+}
