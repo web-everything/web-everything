@@ -1709,3 +1709,83 @@ it('holderStartedBy: null for a wrapped worker, the parsed start for any other r
   expect(holderStartedBy({ startedAt: 'nope' }, startedAtMs)).toBeNull();
   expect(holderStartedBy(null, startedAtMs)).toBeNull();
 });
+
+describe('freshAgentStatus — uncached status read at decision time', () => {
+  it('returns the row status for the matching sessionId; unreadable/absent fails closed to null', async () => {
+    const { freshAgentStatus } = await import('../reconcile-pass.mjs');
+    const exec = () => JSON.stringify([{ sessionId: 'a', status: 'busy' }, { sessionId: 'b', status: 'idle' }]);
+    const seen = [];
+    expect(freshAgentStatus({ sessionId: 'b' }, (...a) => { seen.push(a); return exec(); })).toBe('idle');
+    expect(seen[0][0]).toBe('claude');
+    expect(seen[0][1]).toEqual(['agents', '--json']);
+    expect(freshAgentStatus({ sessionId: 'zzz' }, exec)).toBeNull();
+    expect(freshAgentStatus({ sessionId: 'b' }, () => { throw new Error('x'); })).toBeNull();
+  });
+});
+
+describe('makeReconcileIdleFinishedInfoFor — the reconcile-only wiring of the idle-row override (R810)', () => {
+  it('opts in with the 3x hung grace and the injected exec for the fresh read; a busy fresh read keeps the session', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'reconcile-idle-wiring-'));
+    const cwd = '/Users/fixture/workspace/dispatch-1';
+    const sessionId = 'sess-wiring-0001';
+    mkdirSync(join(root, cwd.replaceAll('/', '-')), { recursive: true });
+    vi.stubEnv('CLAUDE_PROJECTS_DIR', root);
+    vi.resetModules();
+    try {
+      const { makeReconcileIdleFinishedInfoFor } = await import('../reconcile-pass.mjs');
+      const now = Date.now();
+      const MIN = 60_000;
+      const write = (minsAgo) => writeFileSync(join(root, cwd.replaceAll('/', '-'), `${sessionId}.jsonl`), `${JSON.stringify({
+        type: 'assistant', timestamp: new Date(now - minsAgo * MIN).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'x' } }] },
+      })}\n`);
+      const execFor = (status) => () => JSON.stringify([{ sessionId, status }]);
+      const row = { cwd, sessionId, status: 'idle' };
+      write(100);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(true);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('busy') })(row, now, 10 * MIN).finished).toBe(false);
+      write(75); // inside 3 x 30 min
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('defaultReadAgents — the production default wires the reconcile-only idle-row override (R810)', () => {
+  it('a listed idle row ending on a dangling call, silent past 3x the hung threshold, is marked idleFinished; a busy fresh read is not', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'reconcile-default-wiring-'));
+    const cwd = '/Users/fixture/workspace/dispatch-2';
+    const sessionId = 'sess-default-0001';
+    mkdirSync(join(root, cwd.replaceAll('/', '-')), { recursive: true });
+    vi.stubEnv('CLAUDE_PROJECTS_DIR', root);
+    vi.resetModules();
+    try {
+      const { defaultReadAgents } = await import('../reconcile-pass.mjs');
+      const now = Date.now();
+      const MIN = 60_000;
+      writeFileSync(join(root, cwd.replaceAll('/', '-'), `${sessionId}.jsonl`), `${JSON.stringify({
+        type: 'assistant', timestamp: new Date(now - 100 * MIN).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'x' } }] },
+      })}\n`);
+      const none = () => null;
+      const read = (freshStatus) => defaultReadAgents({
+        exec: () => JSON.stringify([{ sessionId, cwd, name: 'ci-heal-1', status: freshStatus, state: 'blocked', pid: 1 }]),
+        env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' }, now, hungThresholdMs: 30 * MIN, completionFor: none, hungInfoFor: none, authExpiredInfoFor: none,
+        bgIsolationStallInfoFor: none, listJobs: () => [],
+      });
+      expect(read('idle').find((r) => r.sessionId === sessionId)?.idleFinished).toBe(true);
+      expect(read('busy').find((r) => r.sessionId === sessionId)?.idleFinished).not.toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

@@ -173,7 +173,7 @@ import {
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { routeNeedsGit } from './needs-git-route.mjs';
-import { capabilityAdvertisesBundle, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
+import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
@@ -487,9 +487,13 @@ export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = 
 }
 
 /** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
-export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync }) {
-  try { return capabilityAdvertisesBundle(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
-  catch { return false; }
+export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync, unknownOk = true }) {
+  // R807: 'yes' routes remote; a fresh "no" stays local; unknown (missing/expired/unreadable) routes remote only when the
+  // caller can enforce the affirmation at prepare (the built-in client); an external client override cannot, so it stays local.
+  let verdict;
+  try { verdict = capabilityBundleVerdict(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
+  catch { verdict = 'unknown'; }
+  return verdict === 'yes' || (verdict === 'unknown' && unknownOk);
 }
 export function writeRunnerCapabilities({ root, host, capabilities, clock = Date.now, write = writeFileSync, mkdir = mkdirSync, rename = renameSync }) {
   try {
@@ -704,6 +708,8 @@ export function createRemoteExec({
       (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
   }),
   notice = remoteClientNotice, runOverride = null,
+  // Best-effort persistence deadline; injectable so a loaded host (CI coverage shard) cannot race the audit write in tests.
+  provenanceBudgetMs = 100,
 } = {}) {
   return async (options) => {
     const scope = runOverride != null ? 'run' : 'host';
@@ -738,7 +744,7 @@ export function createRemoteExec({
         }
         if (scope === 'run') { // per-run: never touches the shared host provenance state
           await boundedClientProvenance(() => appendEvent({ kind: 'remote-client-override',
-            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), 100);
+            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), provenanceBudgetMs);
           return;
         }
         await boundedClientProvenance(async (signal) => {
@@ -773,7 +779,7 @@ export function createRemoteExec({
             if (signal.aborted) return;
             await provenanceFs.writeFile(file, JSON.stringify({ ...pair, pathKey }) + '\n', { encoding: 'utf8', signal });
           }
-        }, 100);
+        }, provenanceBudgetMs);
       })().catch(() => {}).finally(() => pendingClientProvenance.delete(provenance));
       pendingClientProvenance.add(provenance);
     }
@@ -790,6 +796,8 @@ export function appendVerifyRemoteReport(env, result) {
 /** R324: old Forge runners omit limits; their operator setting is the bounded fallback. */
 export function resolveRemoteSlotUnits({policy, kind, telemetry, priority = false}) {
   const r = policy.settings.remote;
+  // Only elastic kinds read telemetry; a concurrent health refresh that cached a failed read must not strand the rest.
+  if (!['FULL', 'soak', 'standards'].includes(kind)) return {units: 1, source: 'default'};
   if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0) throw new Error('Unreadable run count');
   // An explicitly unreadable limits report must never turn into the legacy setting fallback.
   let auto = r.autoSlotUnits, source = 'setting';
@@ -893,7 +901,8 @@ export async function runWithRemoteDecision({
     if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
     return overloaded;
   };
-  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock });
+  const externalClient = policy.settings.remote.clientPath != null || remoteClientOverride != null;
+  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock, unknownOk: !externalClient });
   let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
   if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
     && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);

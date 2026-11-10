@@ -1571,11 +1571,15 @@ function probeLaneHistory(dir) {
   // GIT_SHALLOW_FILE=/dev/null: a .git/shallow boundary must not mask a missing ancestor (a shallow lane fails closed here).
   const read = (args, opts = {}) => git(args, dir, { ...opts, env: { ...releaseEvidenceEnv(args), GIT_SHALLOW_FILE: '/dev/null' } });
   read(['rev-list', '--max-count=200', 'HEAD']);
-  const branches = read(['for-each-ref', '--format=%(objectname)', 'refs/heads/']);
-  const stash = read(['for-each-ref', '--format=%(objectname)', 'refs/stash']);
-  const reflog = stash ? read(['reflog', 'show', '--format=%H', 'refs/stash', '--']) : '';
-  const tips = [read(['rev-parse', '--verify', '--quiet', 'HEAD']), branches, stash, reflog]
-    .join('\n').split('\n').filter(Boolean);
+  // One for-each-ref covers branches AND the stash (acquire's auto-pick pays this probe per picked lane, and
+  // the spawn-count ceilings in lane-pool-ahead-provably-pushed-single-spawn / lane-pool-acquire-free-list
+  // bound it). HEAD itself is fed to the batch check by name, so an unborn/unresolvable HEAD reads as
+  // "HEAD missing" (not a commit) and fails closed without a separate rev-parse spawn.
+  const refs = read(['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads/', 'refs/stash'])
+    .split('\n').filter(Boolean).map(line => line.split(' '));
+  const stash = refs.filter(([, name]) => name === 'refs/stash').map(([sha]) => sha);
+  const reflog = stash.length ? read(['reflog', 'show', '--format=%H', 'refs/stash', '--']) : '';
+  const tips = ['HEAD', ...refs.map(([sha]) => sha), ...reflog.split('\n')].filter(Boolean);
   const input = tips.map(sha => `${sha}\n`).join('');
   const opts = { stdio: ['pipe', 'pipe', 'pipe'], input };
   const present = read(['cat-file', '--batch-check=%(objectname) %(objecttype)'], opts).split('\n');
