@@ -1,7 +1,7 @@
 /**
  * Purpose: cap host-wide daemon rebuild live smokes with persistent FIFO tickets.
  * Queue expiry fails closed: give up this attempt so the next rebuild job can retry within the cap.
- * Exports: acquireSmokeSlot({env, log, stateDir, pid, isAlive, now, sleep}) → {acquired, release()}.
+ * Exports: acquireSmokeSlot({env, log, stateDir, pid, isAlive, now, sleep, onWait}) → {acquired, release()}.
  */
 import fs, { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -10,12 +10,10 @@ import { homedir } from 'node:os';
 import { setTimeout } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { DEFAULT_REBUILD_LEASE_STALE_MS } from './daemon-rebuild/lease.mjs';
+import { rebuildLeaseStaleMs } from './daemon-rebuild/lease.mjs';
 
 // Retain only failed releases; a later acquire by this process retries them under the state lock.
 const failedTickets = new Set();
-
-const MAX_QUEUE_WAIT_MS = DEFAULT_REBUILD_LEASE_STALE_MS - 2 * 60_000;
 
 const positive = value => Number.isSafeInteger(value) && value > 0;
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
@@ -69,15 +67,17 @@ function readState(path) {
 /** Only the small state transaction holds the mkdir lock; neither waiting nor smoke execution does.
  * Corrupt/unreadable state fails closed. Dead lock owners are reclaimed immediately; missing owners
  * get a 60s grace period. A crash cannot expose a partially written state file. Queue expiry fails closed.
+ * Optional onWait is awaited outside the slot lock on every occupied queue poll.
  */
 export async function acquireSmokeSlot({
   env = process.env, log = console,
   stateDir = env.WE_DAEMON_SMOKE_STATE_DIR || join(homedir(), '.claude', 'daemon-self-sync-state'),
-  pid = process.pid, isAlive = processAlive, now = Date.now, sleep = setTimeout,
+  pid = process.pid, isAlive = processAlive, now = Date.now, sleep = setTimeout, onWait,
 } = {}) {
   if (!positive(pid)) throw new Error('daemon-live-smoke: invalid slot pid');
   const cap = setting(env, log, 'smokeMaxConcurrent', 'WE_DAEMON_SMOKE_MAX_CONCURRENT', 2);
-  const maxWait = setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 900_000, MAX_QUEUE_WAIT_MS);
+  const maxWait = setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 900_000,
+    Math.max(0, rebuildLeaseStaleMs(env) - 2 * 60_000));
   const queuedAt = now();
   const deadline = queuedAt + maxWait;
   const expired = new Error('smoke queue expired');
@@ -217,6 +217,7 @@ export async function acquireSmokeSlot({
       if (ahead === null) return { acquired: true, release };
       if (ahead !== lastAhead) log.error?.(`daemon-live-smoke: smoke-queued (${ahead} ahead)`);
       lastAhead = ahead;
+      await onWait?.();
       await sleep(Math.min(2000, Math.max(0, deadline - now())));
     }
   } catch (error) {

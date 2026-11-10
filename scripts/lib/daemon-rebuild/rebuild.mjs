@@ -283,7 +283,17 @@ async function rebuildCloneInternal({
 
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
   try {
-    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep });
+    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep,
+      onWait: async () => {
+        const renewed = await withWriteLock(root, () => {
+          const st = readRebuildState(root, stEnv);
+          if (st.building?.token !== lease.token) return;
+          st.building.startedAt = new Date(now()).toISOString();
+          writeRebuildState(root, st, stEnv);
+        }, finalLockOpts);
+        if (!renewed.ok) throw new Error(`daemon-rebuild: could not renew queued build lease (${renewed.reason}) — the next tick retries`);
+      },
+    });
     try {
       if (!slot.acquired) {
         try {
@@ -293,7 +303,7 @@ async function rebuildCloneInternal({
             writeRebuildState(root, st, stEnv);
           }, finalLockOpts);
         } catch { /* the owner's next call takes an unreleased lease back anyway */ }
-        return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: [] };
+        return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
       }
       return await smokeAndAdopt({
         root, env, stEnv, log, run, runSmoke,

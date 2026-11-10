@@ -46,6 +46,33 @@ async function wake() {
 }
 
 describe('daemon smoke slots', () => {
+  it('awaits onWait on every occupied poll, including when queue position is unchanged', async () => {
+    settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 5000 };
+    const holder = await acquire(11);
+    let time = 0;
+    const onWait = vi.fn(async () => {
+      expect(state().waiters.map(e => e.pid)).toEqual([12]);
+    });
+    const slot = await acquire(12, { now: () => time, onWait,
+      sleep: async ms => {
+        expect(onWait).toHaveBeenCalledTimes(time / 2000 + 1);
+        time += ms;
+      } });
+    expect(slot.acquired).toBe(false);
+    expect(onWait).toHaveBeenCalledTimes(3);
+    expect(state().waiters).toEqual([]);
+    await holder.release();
+  });
+
+  it('cleans up its ticket and refuses smoke if onWait throws', async () => {
+    const holder = await acquire(11, { env: { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' } });
+    await expect(acquire(12, { env: { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' },
+      onWait: async () => { throw new Error('renewal failed'); } })).rejects.toThrow('renewal failed');
+    expect(state().waiters).toEqual([]);
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
+    await holder.release();
+  });
+
   it('ships a 15-minute queue default below the rebuild lease safety ceiling', () => {
     settings.value = undefined;
     const shipped = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json'), 'utf8'));
@@ -356,6 +383,11 @@ describe('daemon smoke slots', () => {
     [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '-1' }, 900000, 'default'],
     [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1.5' }, 900000, 'default'],
     [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '9007199254740992' }, 900000, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000' }, 60000, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '120000' }, 0, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '60000' }, 0, 'default'],
+    [{ smokeQueueMaxWaitMs: 5001 }, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000' }, 5001, 'tool'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: 'invalid' }, 900000, 'default'],
   ])('bounds queue residence with setting %j env %j at %sms (%s)', async (value, env, bound, source) => {
     settings.value = { ...value, smokeMaxConcurrent: 1 };
     const holder = await acquire(11);
@@ -493,11 +525,11 @@ describe('daemon smoke slots', () => {
     await slot.release();
   });
 
-  it('rebuild returns smoke-queue-timeout without smoking, releases its lease, and can retry', async () => {
+  it.each([false, true])('rebuild renews only its lease while queued, preserves prep alerts on timeout, releases and retries (takeover=%s)', async takeover => {
     settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 3001 };
     const holder = await acquire(process.pid);
     const plan = { target: 'next' };
-    const lease = { token: 'timed-out-build' };
+    const lease = { token: 'timed-out-build', startedAt: new Date(0).toISOString() };
     const persisted = { building: lease };
     const prepare = { ok: true, value: { plan, prevHead: 'previous', lease, alerts: ['prepare alert'] } };
     const lock = vi.spyOn(cloneLocks, 'withWriteLock').mockResolvedValueOnce(prepare)
@@ -510,19 +542,26 @@ describe('daemon smoke slots', () => {
     vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
     const runSmoke = vi.fn();
     const smokeAndAdopt = vi.spyOn(smoke, 'smokeAndAdopt').mockImplementation(async ({ runSmoke }) => runSmoke());
-    let time = 123;
+    const queuedAt = 179000;
+    let time = queuedAt;
     const options = { root: stateDir,
-      env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir },
+      env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir, WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000' },
       log, runSmoke, versions: null, asJob: false, readyOnly: true, emitEvent: vi.fn(),
-      now: () => time, sleep: async ms => { time += ms; },
+      now: () => time, sleep: async ms => {
+        expect(persisted.building.startedAt).toBe(new Date(takeover && time > queuedAt ? 0 : time).toISOString());
+        if (!takeover) expect(leases.buildLeaseIsLive(persisted.building, { env: options.env, nowMs: time })).toBe(true);
+        expect(write).toHaveBeenCalledWith(stateDir, persisted, options.env);
+        if (takeover) persisted.building = { token: 'successor', startedAt: new Date(0).toISOString() };
+        time += ms;
+      },
     };
     leases.ACTIVE_BUILD_TOKENS.add(lease.token);
     expect(await rebuildClone(options)).toEqual({
-      moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: [],
+      moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: ['prepare alert'],
     });
     expect(smokeAndAdopt).not.toHaveBeenCalled();
     expect(runSmoke).not.toHaveBeenCalled();
-    expect(persisted.building).toBeNull();
+    expect(persisted.building).toEqual(takeover ? { token: 'successor', startedAt: new Date(0).toISOString() } : null);
     expect(write).toHaveBeenCalledWith(stateDir, persisted, options.env);
     expect(leases.ACTIVE_BUILD_TOKENS.has(lease.token)).toBe(false);
     expect(state().holders.map(e => e.pid)).toEqual([process.pid]);
@@ -532,6 +571,34 @@ describe('daemon smoke slots', () => {
     await rebuildClone(options);
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(state().holders).toEqual([]);
+  });
+
+  it('rebuild refuses smoke and cleans up when the queue renewal write lock is unavailable', async () => {
+    settings.value = { smokeMaxConcurrent: 1 };
+    const holder = await acquire(process.pid);
+    const lease = { token: 'renewal-refused' };
+    const persisted = { building: lease };
+    vi.spyOn(cloneLocks, 'withWriteLock')
+      .mockResolvedValueOnce({ ok: true, value: { plan: {}, lease, alerts: [] } })
+      .mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' })
+      .mockImplementation(async (_root, action) => ({ ok: true, value: await action() }));
+    vi.spyOn(rebuildState, 'readReadyCandidate').mockReturnValue(null);
+    vi.spyOn(rebuildState, 'readRebuildState').mockReturnValue(persisted);
+    vi.spyOn(rebuildState, 'writeRebuildState').mockImplementation(() => {});
+    vi.spyOn(leases, 'readRebuildStarvation').mockReturnValue(0);
+    vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
+    const runSmoke = vi.fn();
+    leases.ACTIVE_BUILD_TOKENS.add(lease.token);
+    await expect(rebuildClone({ root: stateDir,
+      env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir },
+      log, runSmoke, versions: null, asJob: false, readyOnly: true, emitEvent: vi.fn(),
+    })).rejects.toThrow('could not renew queued build lease (tick-in-progress) — the next tick retries');
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(persisted.building).toBeNull();
+    expect(leases.ACTIVE_BUILD_TOKENS.has(lease.token)).toBe(false);
+    expect(state().waiters).toEqual([]);
+    expect(state().holders.map(e => e.pid)).toEqual([process.pid]);
+    await holder.release();
   });
 
   it.each([false, true])('rebuild holds a slot throughout smokeAndAdopt and releases in finally (throws=%s)', async throws => {
