@@ -35,7 +35,7 @@ export default {
       writeFileSync(join(lane, 'scripts/guard-bash.mjs'), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(join(lane, 'RAN'))}, '1');\n`);
       const r = spawnSync(process.execPath, [join(lane, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/guard-bash.mjs'], { cwd: lane, encoding: 'utf8', input: '{}' });
       if (existsSync(join(lane, 'RAN'))) violations.push('the lane-owned guard-bash.mjs ran as the hook');
-      if (r.status === 0) violations.push('the launcher accepted a non-guard-clone location (fail-open)');
+      if (r.status !== 2 || !/launcher must be located/.test(r.stderr)) violations.push('the launcher did not refuse a non-guard-clone location with exit 2 (fail-open)');
     } finally { rmSync(lane, { recursive: true, force: true }); }
     return { violations };
   },
