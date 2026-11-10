@@ -4,6 +4,19 @@ import { proveMechanicalMove } from './human-clearance-carry.mjs';
 import { proveReplayEquivalent } from './carry-equivalence.mjs';
 import { proveIdenticalNetPatch } from './identical-net-patch.mjs';
 
+/**
+ * PURE: wrap a git exec so every diff reads submodule pointer changes. Command-line flags override both repository
+ * config and a tracked .gitmodules `ignore=all`, so a proof built on this exec cannot be blinded by either.
+ */
+export function submoduleStrictExec(exec) {
+  return (cmd, args, opts) => {
+    const proofArgs = cmd === 'git' && ['diff', 'diff-tree'].includes(args?.[0])
+      ? [args[0], '--ignore-submodules=none', ...args.slice(1)] : args;
+    return exec(cmd, proofArgs, { ...opts,
+      env: { ...process.env, ...opts?.env, GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'diff.ignoreSubmodules', GIT_CONFIG_VALUE_0: 'none' } });
+  };
+}
 // Every hop contains at least one commit, so the shared commit limit also bounds hops.
 export function proveMixedMechanicalChain({ exec, cwd, fromSha, toSha, mainRef = 'origin/main',
   numberingEnabled = true, netPatchEnabled = true } = {}) {

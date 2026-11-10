@@ -235,3 +235,25 @@ it.each(['numbering', 'net-patch', 'enabled', 'accept'])('refuses acceptance cha
   else expect(result).toBeNull();
   expect(writes).toEqual([]);
 });
+it.each(['config', 'gitmodules'])('refuses the net-patch fallback restamp over a merge-owned submodule pointer change hidden by %s ignore', ignore => {
+  const sub = repo(), r = repo({ cwd: sub.cwd, ignore: ignore === 'gitmodules' });
+  // No numbering commit: only the net-patch fallback could accept this merge-only head move.
+  const next = sub.commit('new submodule revision');
+  r.merge();
+  r.git('update-index', '--cacheinfo', `160000,${next},dependency`);
+  r.git('commit', '--amend', '--no-edit', '-q');
+  const to = r.git('rev-parse', 'HEAD');
+  if (ignore === 'config') r.git('config', 'diff.ignoreSubmodules', 'all');
+  const state = stateFor(r, to), writes = [], calls = [];
+  const exec = (cmd, args, opts) => { calls.push(args); return execFileSync(cmd, args, opts); };
+  const result = restampAfterNumbering({ repo: 'owner/repo', pr: 7474, state, reviews: [], exec, cwd: r.cwd,
+    enabled: true, acceptCarry: 'on', numberingSetting: { value: true, source: 'test' }, netPatchSetting: { value: true, source: 'test' },
+    guardReferrals: () => {}, readLiveState: () => ({ state, reviews: [] }),
+    provider: { postComment: (_repo, _pr, body) => writes.push(body), setLabels: (_repo, _pr, spec) => writes.push(spec) } });
+  expect(result).toMatchObject({ action: 'refused' });
+  expect(writes).toEqual([]);
+  // Every diff the fallback reads is forced to show submodule pointer changes.
+  const diffs = calls.filter(args => ['diff', 'diff-tree'].includes(args[0]));
+  expect(diffs.length).toBeGreaterThan(0);
+  for (const args of diffs) expect(args).toContain('--ignore-submodules=none');
+});

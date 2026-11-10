@@ -12,7 +12,7 @@
  *   Live case #5608: drain numbering also rewrote ids in docs/agent/platform-decisions.md, voiding human clearance.
  */
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
-import { proveMixedMechanicalChain } from './carry-chain.mjs';
+import { proveMixedMechanicalChain, submoduleStrictExec } from './carry-chain.mjs';
 import { isAutomationAuthored } from './marker-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
@@ -662,7 +662,8 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   let proof = numberingOff ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
   if (!proof.ok && netSetting.value) {
     // An alternative proof cannot settle a head the first proof could not read: either retryable miss stays retryable.
-    const net = proveIdenticalNetPatch({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+    // Strict exec: a tracked ignore=all must not hide a submodule pointer change from the patch comparison.
+    const net = proveIdenticalNetPatch({ exec: submoduleStrictExec(exec), cwd, fromSha: plan.from, toSha: plan.to });
     proof = net.ok ? net : { ...net, retryable: Boolean(proof.retryable || net.retryable), reason: `${proof.reason}; net patch: ${net.reason}` };
   }
   if (!proof.ok && !plan.human) {
