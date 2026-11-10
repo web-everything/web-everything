@@ -65,7 +65,7 @@ describe('retryable record effects', () => {
     effects: [{ type: 'review.write-up', status: 'applied' },
       { type: 'review.label-swap', status: 'pending', error: '--body-file=gone is unreadable (ENOENT)', unknownAttempts: 0 },
       { type: 'verdict-ledger.append', status: 'declared' }, { type: 'review.notice', status: 'declared' }] });
-  it.each([0, undefined])('resumes only the pending body-file refusal with unknownAttempts=%s, without a ruling', unknownAttempts => {
+  it.each([0])('resumes only the pending body-file refusal with unknownAttempts=%s, without a ruling', unknownAttempts => {
     const r = saved(); r.effects[1].unknownAttempts = unknownAttempts;
     const row = reviewRunEvidence(r);
     expect(row.retryableRecordEffect).toBe(true);
@@ -76,6 +76,7 @@ describe('retryable record effects', () => {
   });
   it.each([
     ['unknown write', r => { r.effects[1].unknownAttempts = 1; }],
+    ['unknownAttempts absent', r => { delete r.effects[1].unknownAttempts; }],
     ['other pending effect', r => { r.effects[2].status = 'pending'; }],
     ['non-body-file error', r => { r.effects[1].error = 'network timeout'; }],
     ['other pre-write refusal', r => { r.effects[1].error = 'invalid --repo'; }],

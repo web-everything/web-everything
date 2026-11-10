@@ -52,7 +52,7 @@ export function reviewRunEvidence(run) {
     if (!run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'record' && Array.isArray(run.effects)) {
       const outstanding = run.effects.filter(e => !['applied', 'declared'].includes(e?.status));
       retryableRecordEffect = outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
-        && e.status === 'pending' && (e.unknownAttempts === undefined || e.unknownAttempts === 0) && isBodyFileRefusal(e.error));
+        && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
     }
   } catch { /* Unreadable effects cannot prove a safe record retry. */ }
   const head = read?.netBasis?.rev ?? (suspendedReferralEffect ? run.input?.head : undefined);
