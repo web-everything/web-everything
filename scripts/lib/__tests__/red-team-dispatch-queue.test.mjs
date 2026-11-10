@@ -8,6 +8,7 @@ import {
   raiseReviewStartsPerTick,
   loadRedTeamQueueFloor,
   applyRedTeamQueueFloor,
+  raiseReviewStartsPerTick,
   redTeamQueueAdmitCount,
   runWithRedTeamQueue,
 } from '../red-team-dispatch-queue.mjs';
@@ -248,8 +249,8 @@ describe('setting-driven red-team queue floor', () => {
     }
   });
 
-  it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j alone falls back to 10', value => {
-    expect(load(settings(2, value))).toEqual(floor);
+  it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j disables the floor', value => {
+    expect(load(settings(2, value))).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
     expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0 });
   });
 
@@ -880,4 +881,16 @@ describe('idle-only review start allowance', () => {
       expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: value }, readFile, log }).reviewStartsPerTick).toBe(expected);
       expect(log.mock.calls.flat().join(' ')).toContain('env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE');
     });
+});
+
+describe('raiseReviewStartsPerTick guards', () => {
+  const f = { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 3 };
+  it('raises 2 to 3 only while idle, never from 1, never on impossible readings', () => {
+    expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 50 })).toBe(3);
+    expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 5 })).toBe(2);
+    expect(raiseReviewStartsPerTick(1, { floor: f, cpuIdlePct: 50 })).toBe(1);
+    expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 101 })).toBe(2);
+    expect(raiseReviewStartsPerTick(0, { floor: f, cpuIdlePct: 50 })).toBe(0);
+    expect(raiseReviewStartsPerTick(Infinity, { floor: f, cpuIdlePct: 50 })).toBe(Infinity);
+  });
 });

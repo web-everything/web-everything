@@ -38,7 +38,9 @@ export function loadRedTeamQueueFloor({ env = process.env,
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
   const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
   const floor = {
-    minConcurrent: Number.isInteger(minimum) && minimum >= 0 ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
+    // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
+    minConcurrent: (idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
+      ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
     idlePct: validIdle(idle) ? idle : 10,
     reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
   };
@@ -48,11 +50,12 @@ export function loadRedTeamQueueFloor({ env = process.env,
 
 /** Idle capacity may raise a finite admitted allowance; disabled/unknown evidence never raises it. */
 export function raiseReviewStartsPerTick(maxPerTick, { floor, cpuIdlePct } = {}) {
-  if (!Number.isFinite(maxPerTick) || maxPerTick < 1
+  if (!Number.isFinite(maxPerTick) || maxPerTick < 2
     || !(floor?.minConcurrent > 0)
-    || !Number.isFinite(cpuIdlePct) || !(cpuIdlePct >= floor.idlePct)
+    || !Number.isFinite(cpuIdlePct) || cpuIdlePct > 100 || !(cpuIdlePct >= floor.idlePct)
     || !Number.isInteger(floor.reviewStartsPerTick) || floor.reviewStartsPerTick < 0) return maxPerTick;
-  return Math.max(maxPerTick, floor.reviewStartsPerTick);
+  // One extra start at most, and never past the configured cap; a configured limit of 1 stays 1.
+  return Math.max(maxPerTick, Math.min(maxPerTick + 1, floor.reviewStartsPerTick));
 }
 
 /** Raise the per-tick start allowance only within the caller's host ceiling; other bounds stay independent. */
