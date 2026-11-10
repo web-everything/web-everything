@@ -258,9 +258,15 @@ describe('mechanical label decision', () => {
     }
     expect(decideMechanicalLabelStrip(pr, { cleared: true, head }).strip).toBe(false);
   });
-  it('never strips accepted, human, closed or unlabelled PRs', () => {
+  it.each(['web-everything[bot]', 'app/web-everything', undefined])('accepted bot/unknown author %s still needs current clearance', login => {
+    const accepted = { ...pr, author: login ? { login } : undefined, labels: [...pr.labels, { name: 'review:accepted' }] };
+    expect(decideMechanicalLabelStrip(accepted, null).strip).toBe(true);
+    expect(decideMechanicalLabelStrip(accepted, { cleared: false, rule: 'checks', head }).strip).toBe(true);
+    expect(decideMechanicalLabelStrip(accepted, { cleared: true, head }).strip).toBe(false);
+  });
+  it('never strips human, closed or unlabelled PRs', () => {
     for (const extra of [
-      { labels: [...pr.labels, { name: 'review:accepted' }] }, { author: { login: 'human' } },
+      { author: { login: 'human' } },
       { state: 'CLOSED' }, { labels: [] }]) {
       expect(decideMechanicalLabelStrip({ ...pr, ...extra }, null).strip).toBe(false);
     }

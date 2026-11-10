@@ -402,7 +402,7 @@ describe('R861 merge-time mechanical clearance', () => {
     expect(decide).toHaveBeenCalledWith({ repo: 'owner/local', num: 861 });
   });
   it('leaves non-labelOnlyCertified and human verdicts untouched at the final point', () => {
-    for (const v of [verdict({ labels: ['ready-to-merge', 'review:accepted'] }), verdict({ author: { login: 'human' } })]) {
+    for (const v of [verdict({ author: { login: 'human' }, labels: ['ready-to-merge', 'review:accepted'] }), verdict({ author: { login: 'human' } })]) {
       const decide = vi.fn(() => { throw Error('must not read'); });
       expect(runFinalGuard(v, decide).merge).toHaveBeenCalledOnce();
       expect(decide).not.toHaveBeenCalled();
@@ -439,20 +439,43 @@ describe('R861 merge-time mechanical clearance', () => {
     expect(v.decision).toBe('merge');
     expect(decide).toHaveBeenCalledWith({ repo: 'owner/local', num: 861 });
   });
-  it('does not read or change human AI-generated, bot review:accepted or already-skipped verdicts', () => {
+  it('does not read or change human AI-generated, human review:accepted or already-skipped verdicts', () => {
     const commits = [{ oid: head, messageBody: 'Co-Authored-By: Claude' }];
     const ai = verdict({ author: { login: 'human' } }, commits);
-    const accepted = verdict({ labels: ['ready-to-merge', 'review:accepted'] }, commits);
+    const accepted = verdict({ author: { login: 'human' }, labels: ['ready-to-merge', 'review:accepted'] });
     const skipped = { ...verdict(), decision: 'skip' };
     expect(ai.labelOnlyCertified).toBe(false); expect(accepted.labelOnlyCertified).toBe(false);
     const decide = vi.fn(); runGuard([ai, accepted, skipped], decide);
     expect(decide).not.toHaveBeenCalled();
     expect(ai.decision).toBe('merge'); expect(accepted.decision).toBe('merge');
-    for (const extra of [{ author: { login: 'human' } }, { labels: ['ready-to-merge', 'review:accepted'] }]) {
+    for (const extra of [{ author: { login: 'human' } }, { author: { login: 'human' }, labels: ['ready-to-merge', 'review:accepted'] }]) {
       const decide = vi.fn(), exec = vi.fn();
       reconcileMechanicalClearance({ number: 861, author: { login: 'web-everything[bot]' },
         headRefOid: head, labels: ['ready-to-merge'], commits, ...extra }, { repo: 'owner/repo', decide, exec });
       expect(decide).not.toHaveBeenCalled(); expect(exec).not.toHaveBeenCalled();
+    }
+  });
+  it.each(['web-everything[bot]', 'app/web-everything', null])('review:accepted cannot exempt bot or unknown author %s at either merge guard or reconcile', login => {
+    for (const commits of [[{ oid: head, messageHeadline: 'refresh timings' }], [{ oid: head, messageBody: 'Co-Authored-By: Claude' }]]) {
+      const extra = { author: login ? { login } : undefined, labels: ['ready-to-merge', 'review:accepted'] };
+      const failed = { cleared: false, head, rule: 'diff-scope' }, cleared = { cleared: true, head };
+      const v = verdict(extra, commits);
+      expect(v.labelOnlyCertified).toBe(true);
+      runGuard([v], () => failed);
+      expect(v.decision).toBe('skip'); expect(v.reason).toContain('diff-scope');
+      const current = verdict(extra, commits);
+      runGuard([current], () => cleared);
+      expect(current.decision).toBe('merge');
+      expect(runFinalGuard(current, () => cleared).merge).toHaveBeenCalledOnce();
+      const final = runFinalGuard(current, () => failed);
+      expect(final.merge).not.toHaveBeenCalled();
+      expect(final.revalidationAborted[0].reason).toContain('diff-scope');
+      const exec = vi.fn(() => '');
+      const pr = { number: 861, headRefOid: head, commits, ...extra };
+      reconcileMechanicalClearance(pr, { repo: 'owner/repo', exec, log: vi.fn(), decide: () => cleared });
+      expect(exec).not.toHaveBeenCalled();
+      reconcileMechanicalClearance(pr, { repo: 'owner/repo', exec, log: vi.fn(), decide: () => failed });
+      expect(exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['--remove-label', 'ready-to-merge']), expect.anything());
     }
   });
   it.each(['web-everything[bot]', 'app/web-everything', null])('AI trailers cannot exempt bot or unknown author %s from the merge guard', login => {

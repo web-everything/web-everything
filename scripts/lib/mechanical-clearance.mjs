@@ -196,11 +196,11 @@ export function decideMechanicalMergeGuard(v, result) {
     reason: `mechanical-clearance refused (${rule}); normal review of the full PR required` } : v;
 }
 
-/** Bot PRs without accepted review depend on mechanical clearance, regardless of AI trailers. */
+/** Bot/unknown PRs depend on mechanical clearance, regardless of accepted review or AI trailers. */
 export function decideMechanicalLabelStrip(pr, result) {
   const eligible = !['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())
-    && ['web-everything[bot]', 'app/web-everything'].includes(pr?.author?.login)
-    && hasLabel(pr, 'ready-to-merge') && !hasLabel(pr, 'review:accepted');
+    && (!pr?.author?.login || ['web-everything[bot]', 'app/web-everything'].includes(pr.author.login))
+    && hasLabel(pr, 'ready-to-merge');
   const current = result?.cleared === true && typeof result.head === 'string' && result.head.length > 0
     && typeof pr?.headRefOid === 'string' && result.head.toLowerCase() === pr.headRefOid.toLowerCase();
   return { strip: eligible && !current, rule: result?.rule ?? (current ? null : 'head') };

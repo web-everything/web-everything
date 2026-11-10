@@ -2170,8 +2170,8 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       p.commits = read.commits || [];
       const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
       v.authorLogin = p.author?.login ?? null;
-      v.labelOnlyCertified = (!v.authorLogin || ['web-everything[bot]', 'app/web-everything'].includes(v.authorLogin)
-        || !isAiGeneratedPr(p)) && !hasLabel(p, REVIEW_LABELS.accepted);
+      v.labelOnlyCertified = !v.authorLogin || ['web-everything[bot]', 'app/web-everything'].includes(v.authorLogin)
+        || (!isAiGeneratedPr(p) && !hasLabel(p, REVIEW_LABELS.accepted));
       // #2502 — the tip commit's SHA, threaded onto every emitted verdict and, via the `{...v}` spread used to
       // build `remaining`/`plan.ready`/`plan.deferred`, onto each of the six result buckets a caller (the
       // drain-daemon stuck detector) actually reads: toMerge/merged/skipped/parked/deferred/failed — NOT
@@ -3065,7 +3065,7 @@ export function reconcileMechanicalClearance(pr, { repo, dryRun = false,
   refusalLogs = mechanicalClearanceRefusals, decide = decideMechanicalClearance,
   record = recordMechanicalClearance, exec = execFileSync,
   log = line => process.stderr.write(line) } = {}) {
-  if (!['web-everything[bot]', 'app/web-everything'].includes(pr?.author?.login)
+  if ((pr?.author?.login && !['web-everything[bot]', 'app/web-everything'].includes(pr.author.login))
     || ['CLOSED', 'MERGED'].includes(String(pr?.state ?? '').toUpperCase())) return null;
   const labelled = hasLabel(pr, READY_TO_MERGE_LABEL);
   if (labelled && !decideMechanicalLabelStrip(pr, null).strip) return null;

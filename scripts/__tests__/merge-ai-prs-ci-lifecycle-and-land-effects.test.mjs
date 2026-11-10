@@ -1536,12 +1536,14 @@ describe('live mechanical reconcile', () => {
       expect(h.reads).toHaveLength(1);
     }
   });
-  it('never strips review:accepted labels (R861: AI trailers no longer exempt a bot PR)', () => {
-    const h = harness([]);
-    for (const extra of [{ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }] }]) {
-      reconcileMechanicalClearance(pr({ labels: [{ name: 'ready-to-merge' }], ...extra }), h.options);
-    }
-    expect(h.reads).toHaveLength(0); expect(h.writes).toHaveLength(0);
+  it('rechecks review:accepted bot labels, preserving clearance and stripping failed validation', () => {
+    const h = harness([{ cleared: true, head }, { cleared: false, head, rule: 'checks' }]);
+    const p = pr({ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }] });
+    reconcileMechanicalClearance(p, h.options);
+    expect(h.reads).toHaveLength(1); expect(h.writes).toHaveLength(0);
+    reconcileMechanicalClearance(p, h.options);
+    expect(h.reads).toHaveLength(2); expect(h.writes).toHaveLength(1);
+    expect(h.writes[0][1]).toEqual(['pr', 'edit', '861', '--repo', 'owner/repo', '--remove-label', 'ready-to-merge']);
   });
   it('DRY_RUN reads live evidence without label or receipt mutations', () => {
     const h = harness([{ cleared: false, head, rule: 'diff-scope' }, { cleared: true, head }], true);
