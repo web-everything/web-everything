@@ -39,7 +39,7 @@
 import { createHash } from 'node:crypto';
 import { exactCitedPath, findingChangeState, normalizeFinding, earnsRound, isFindingOutstanding,
   requiresMandatoryReferral, MANDATORY_LENSES } from './jury-core.mjs';
-import { FINDING_STATUS_VALUES } from './verdict-ledger.mjs';
+import { FINDING_STATUS_VALUES, FINDING_DISPOSITION_VALUES } from './verdict-ledger.mjs';
 
 /** The statuses, by name (R5). The ledger schema owns the closed set. */
 export const FINDING_STATUSES = Object.freeze({
@@ -229,9 +229,30 @@ export function foldFindingStatuses(rows, { pr, head = '' } = {}) {
   for (const r of Array.isArray(rows) ? rows : []) {
     if (r?.type !== 'finding' || Number(r.pr) !== Number(pr)) continue;
     if (!FINDING_STATUS_VALUES.includes(r.status) || typeof r.findingId !== 'string') continue;
+    // R883 — dispositions (open / not-real) are not a review status: they feed no decision until a later slice.
+    if (FINDING_DISPOSITION_VALUES.includes(r.status)) continue;
     if (current && String(r.headSha ?? '').toLowerCase() === current) continue;
     out.set(r.findingId, { status: r.status, headSha: r.headSha, round: r.round, path: r.path, symbol: r.symbol, defectClass: r.defectClass,
       lines: Array.isArray(r.lines) ? r.lines.filter((n) => Number.isInteger(n) && n > 0) : [] });
+  }
+  return out;
+}
+
+/**
+ * R883 slice 1 — the latest disposition (`open` / `not-real`) per stable finding id for one PR, EXCLUDING rows on
+ * `head`. Read-only for now: nothing in the round rules consults it yet. PURE.
+ * @param {Array<object>} rows - ledger events in append order.
+ * @param {{pr: number, head?: string}} o
+ * @returns {Map<string, {status: string, headSha: string, round: number, source: string}>}
+ */
+export function foldFindingDispositions(rows, { pr, head = '' } = {}) {
+  const out = new Map();
+  const current = String(head ?? '').toLowerCase();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (r?.type !== 'finding' || Number(r.pr) !== Number(pr)) continue;
+    if (!FINDING_DISPOSITION_VALUES.includes(r.status) || typeof r.findingId !== 'string') continue;
+    if (current && String(r.headSha ?? '').toLowerCase() === current) continue;
+    out.set(r.findingId, { status: r.status, headSha: r.headSha, round: r.round, source: typeof r.source === 'string' ? r.source : '' });
   }
   return out;
 }
