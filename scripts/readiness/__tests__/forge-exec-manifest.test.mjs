@@ -123,3 +123,34 @@ describe('credential format byte views', () => {
     expect(credentialContentFinding(path, Buffer.concat([content, Buffer.from([255])]))).toBe('github-token');
   });
 });
+
+
+describe('strict credential regression', () => {
+  it.each([
+    ['prefixed GitHub', 'a' + 'ghp_' + 'a'.repeat(20), 'github-token'],
+    ['prefixed AWS', 'a' + 'AKIA' + 'A'.repeat(16) + 'Z', 'aws-access-key'],
+    ['short sk', 'sk-' + 'a'.repeat(16), 'sk-token'],
+    ['short Slack', 'xoxb-' + 'a'.repeat(8), 'slack-token'],
+    ['bare armor', '-----' + 'BEGIN', 'pem-header'],
+    ['private key prose', 'a private key marker', 'private-key'],
+  ])('blocks %s', (_name, value, finding) => {
+    expect(credentialContentFinding(path, Buffer.from(value))).toBe(finding);
+  });
+  it.each([
+    ['invalid JSON', 'data.json', Buffer.from('{'), 'unparseable-json'],
+    ...['null', '[]', '1', '"public"'].map(value => ['non-object JSON '+value, 'data.json', Buffer.from(value), 'non-object-json']),
+    ...['data.txt', 'data.json'].flatMap(name => [
+      ['invalid UTF-8 '+name, name, Buffer.from([255]), 'unsupported-text-encoding'],
+      ['UTF-16 '+name, name, Buffer.from('public', 'utf16le'), 'unsupported-text-encoding'],
+      ['NUL '+name, name, Buffer.from('public\0'), 'unsupported-text-encoding'],
+    ]),
+  ])('blocks %s', (_name, name, content, finding) => {
+    expect(credentialContentFinding(Buffer.from(name), content)).toBe(finding);
+  });
+  it.each(['key: q8Zr2LmX9vT4pW7kJ1nB5cY3', 'password=short'])(
+    'warns without blocking readable generic evidence %s', value => {
+      const content=Buffer.from(value);
+      expect(credentialContentFinding(path,content)).toBeNull();
+      expect(credentialContentWarning(path,content)).toMatch(/^(high-entropy|secret-assignment)-/);
+    });
+});

@@ -291,3 +291,35 @@ it('R857 refuses an unclassifiable bundle path instead of downgrading unknown ev
     :exec(call);
   await expect(scan(injected,[])).rejects.toMatchObject({code:'bundle-credential-scan-failed'});
 });
+
+
+ describe('strict bundle regression', () => {
+  it.each(['.env', '.env.local', '.netrc', '.npmrc', 'server.pem', 'id_rsa', 'id_rsa.pub',
+    'credentials.txt', 'secret.md', 'token.txt', 'oauth/config.txt', 'id_ed25519'])(
+    'blocks credential-named path %s with clean contents', async path => {
+      write(path, 'public'); commit('add file');
+      expect(await scan()).toMatchObject({finding:'excluded-path'});
+    });
+  it.each([
+    ['note.txt', 'a'+'ghp_'+'a'.repeat(20), 'github-token'],
+    ['note.txt', 'a'+'AKIA'+'A'.repeat(16)+'Z', 'aws-access-key'],
+    ['note.txt', 'sk-'+'a'.repeat(16), 'sk-token'],
+    ['note.txt', '-----'+'BEGIN', 'pem-header'],
+    ['data.json', '{', 'unparseable-json'],
+    ['data.json', '[]', 'non-object-json'],
+    ['note.txt', Buffer.from([255]), 'unsupported-text-encoding'],
+    ['note.txt', 'public\0', 'unsupported-text-encoding'],
+    ['.claude/note.txt', Buffer.from([255]), 'unsupported-text-encoding'],
+    ['.claude/note.txt', '-----'+'BEGIN', 'pem-header'],
+  ])('blocks unsafe content in %s (%s)', async (path, content, finding) => {
+    write(path, content); commit('add content');
+    expect(await scan()).toEqual({path,finding});
+  });
+  it('warns on a private directory only after its readable contents pass blocking checks', async () => {
+    write('.claude/note.txt','password=short'); commit('add readable notes');
+    const warnings=[];
+    expect(await scan(exec,warnings)).toBeNull();
+    expect(warnings).toContainEqual({path:'.claude/note.txt',finding:'excluded-path'});
+    expect(warnings).toContainEqual({path:'.claude/note.txt',finding:'secret-assignment-password'});
+  });
+});
