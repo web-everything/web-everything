@@ -101,8 +101,10 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  *   `{ok:false, reason:'policy-clear yielded to a concurrent round'}`; the caller posts no comment and retries.
  *   A failed re-read does the same with an in_progress run (fail closed). A later retry over its own orphan yield,
  *   with no round run behind it, posts the success again, so a yield never strands a head.
- * No lock and no sleep. Residual: a round run landing between the re-read and the superseding post is masked until
- * the next retry corrects it; merge-gate stays held (never a false success) meanwhile.
+ * No lock and no sleep. Residual (disclosed on #6535): a round's FINAL run landing between the re-read and the
+ * superseding post is masked by the mirror. A retry corrects it, but once that round has posted its result comment
+ * the on-skip row stops retrying, so the head can stay held until an operator republishes. It fails closed (never a
+ * false success). PR-A #6606's per-identity publish lock, shared by every writer, closes this window.
  */
 export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round';
 export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
@@ -119,6 +121,10 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
   if (after.ok !== true) return supersede({ repo, pr, headSha, gh, state: 'in_progress',
     detail: `re-read after publication failed (${after.reason})` });
   if (after.desired === 'success' && after.current === 'success') return posted;
+  // No round run requires anything else, but its success is not the newest run (a lagging read, or another
+  // policy-clear writer's run on top): post nothing, never an in_progress a clean head does not need; the retry
+  // re-reads and posts the success again only if it is still not newest.
+  if (after.desired === 'success') return failure(`policy-clear unverified: newest run shows ${after.current}, not its success; retry`);
   if (after.current === after.desired) return { ...failure(POLICY_CLEAR_YIELDED), detail: 'a newer round run is authoritative' };
   return supersede({ repo, pr, headSha, gh, state: after.desired });
 }

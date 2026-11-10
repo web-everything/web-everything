@@ -66,7 +66,7 @@ describe('red-team check run contract', () => {
     });
     // #6535 round 10 (operator send-back): verify after write. A stateful fake GitHub: POST appends a run with the
     // next id; `onPost` lets a test insert a concurrent round's run at the moment the success is posted.
-    const liveGh = ({ initial = [], onPost = () => {}, failReadAfterPost = false, failPostsAfter = Infinity } = {}) => {
+    const liveGh = ({ initial = [], onPost = () => {}, afterPost = () => {}, failReadAfterPost = false, failPostsAfter = Infinity } = {}) => {
       const runs = [...initial], posts = [];
       let nextId = Math.max(99, ...initial.map(r => r.id)) + 1; // GitHub ids only grow
       const gh = vi.fn((args, options) => {
@@ -75,8 +75,10 @@ describe('red-team check run contract', () => {
           const payload = JSON.parse(options.input);
           posts.push(payload);
           onPost(runs, payload, () => nextId++);
-          runs.push({ ...payload, id: nextId++, app: { id: APP_ID }, conclusion: payload.conclusion ?? null });
-          return JSON.stringify({ id: nextId - 1 });
+          const id = nextId++;
+          runs.push({ ...payload, id, app: { id: APP_ID }, conclusion: payload.conclusion ?? null });
+          afterPost(runs, payload, () => nextId++);
+          return JSON.stringify({ id });
         }
         if (failReadAfterPost && posts.length) throw Error('HTTP 502');
         return JSON.stringify({ total_count: runs.length, check_runs: runs });
@@ -143,6 +145,27 @@ describe('red-team check run contract', () => {
         run({ id: 52, status: 'in_progress', conclusion: null, output: { title: 'Policy-clear: Red team in progress' } })] });
       expect(publish(fake.gh)).toEqual({ ok: true });
       expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs })).toMatchObject({ ok: true });
+    });
+    // Self-review finding C: with no round run requiring otherwise, a success that is not (yet) newest is never
+    // answered with an in_progress post.
+    it('posts nothing more when a lagging re-read does not show its success yet', () => {
+      const posts = [];
+      const gh = vi.fn((args, options) => {
+        if (args.includes('POST')) { posts.push(JSON.parse(options.input)); return '{}'; }
+        return JSON.stringify({ total_count: 0, check_runs: [] });
+      });
+      expect(publish(gh)).toMatchObject({ ok: false, reason: expect.stringContaining('policy-clear unverified: newest run shows none') });
+      expect(posts).toHaveLength(1);
+    });
+    it('posts nothing more when another policy-clear writer\'s yield lands on top (no round needs it)', () => {
+      const fake = liveGh({ afterPost: (runs, payload, id) => { if (payload.conclusion === 'success')
+        runs.push(run({ id: id(), status: 'in_progress', conclusion: null, output: { title: 'Policy-clear: Red team in progress' } })); } });
+      expect(publish(fake.gh)).toMatchObject({ ok: false, reason: expect.stringContaining('policy-clear unverified: newest run shows in_progress') });
+      expect(fake.posts).toHaveLength(1);
+      // The retry re-reads and posts the success again over the stray yield.
+      const retry = liveGh({ initial: fake.runs });
+      expect(publish(retry.gh)).toEqual({ ok: true });
+      expect(newest(retry.runs)).toMatchObject({ status: 'completed', conclusion: 'success' });
     });
     it('the round writers\' payload carries no policy-clear marker', () => {
       expect(api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'in_progress' }).output.title).toBe('Red team in progress');
