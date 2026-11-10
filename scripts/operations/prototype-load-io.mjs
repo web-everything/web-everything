@@ -203,7 +203,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   // Audit mode is a scalar: normalize before the cascade can flatten an invalid object into no leaves.
   const auditModeLayer = (layer) => layer?.canonicalAuditMode === undefined ? layer
     : { ...layer, canonicalAuditMode: layer.canonicalAuditMode === 'warn' ? 'warn' : 'refuse' };
-  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'warn' },
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'refuse' },
     platform: auditModeLayer(platform.prefs.prototypeLoad), tool: auditModeLayer(tool) });
   // ruledWeakened is the union of platform and tool layers (arrays are cascade leaves, so the tool layer would replace it).
   const config = { ...policy.value, ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, (m) => console.warn(m)) };
@@ -414,6 +414,13 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (freeText && out.canonicalAudit.ok && String(out.canonicalAudit.record?.head).toLowerCase() !== String(input.sha).toLowerCase()) {
         out.canonicalAudit = { mode, ok: false, reason: 'no-record' };
       }
+      // R850: a ruledWeakened exception is honoured only when this sha has a canonical WEAKENED audit record (the ruling
+      // refers to a real audit), never on a handwritten ready record alone. Honoured, it proceeds in any mode.
+      const ownWeakened = [...auditRecords].reverse().find((r) => r?.verdict === 'WEAKENED' && String(r.head).toLowerCase() === String(input.sha).toLowerCase());
+      if (out.gate.ruledWeakened) {
+        if (!ownWeakened || out.canonicalAudit.reason !== 'weakened') return stop('no-canonical-audit', { detail: 'ruled-weakened-without-canonical-record', fallback: `A ruledWeakened entry applies only when ${input.sha} has a canonical WEAKENED codex-audit record. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry.` });
+        console.warn(`WARNING: ruled exception ${out.gate.ruledWeakened.ruling} rests on canonical WEAKENED audit record at ${ownWeakened.at}.`);
+      } else
       // A hand-written ready record is a claim too: it never loads over this sha's own canonical WEAKENED record
       // (only a ruled exception does), even in warn mode.
       if (!out.canonicalAudit.ok && out.canonicalAudit.reason === 'weakened' && !freeText && !out.gate.ruledWeakened) {
@@ -430,7 +437,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
               ? `The --audit claim NOT WEAKENED contradicts the latest canonical audit record for ${input.sha}${named}, which says WEAKENED. Fix the findings and re-audit. ${fallback}`
               : `A free-text --audit claim is not accepted: no canonical NOT WEAKENED record exists for ${input.sha}. ${fallback}` });
         }
-        if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
+        if (out.gate.ruledWeakened) { /* R850 ruled exception rests on the canonical WEAKENED record checked above */ }
+        else if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
         // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
         // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.
         // Fail closed: a record sha that is not a string is never the live head's own record.

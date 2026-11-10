@@ -244,7 +244,7 @@ function fixture(options = {}) {
   }
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
-  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, ...options.settings }), now: () => clock,
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, canonicalAuditMode: 'warn', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
   return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
@@ -258,7 +258,7 @@ const auditLines = (records) => records.map(record => JSON.stringify(record)).jo
 function auditedFixture(mode, options = {}) {
   return fixture({ ...options, settings: {
     auditRecordPath: '~/canonical-audits.jsonl',
-    ...(mode === undefined ? {} : { canonicalAuditMode: mode }), ...options.settings,
+    canonicalAuditMode: mode, ...options.settings,
   } });
 }
 
@@ -346,11 +346,28 @@ describe('prototype-load ruled-WEAKENED admission', () => {
   };
   const allowed = { ref: BASE.branch, sha: SHA, ruling: 'R396', findings };
 
+  it('R850: a ruledWeakened entry is refused when the sha has no canonical WEAKENED record (handwritten ready record alone)', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (const audits of ['', auditLines([auditRecord()])]) {
+        const f = auditedFixture('refuse', { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, audits, auditBaseInMain: TREE });
+        expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', detail: 'ruled-weakened-without-canonical-record' });
+        expect(mutations(f, 'add')).toHaveLength(0);
+      }
+    } finally { warning.mockRestore(); }
+  });
+  it('R850: a ruled exception with a canonical WEAKENED record loads in the default (refuse) mode', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture(undefined, { ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, });
+      expect(await f.run()).toMatchObject({ ok: true, registered: true, gate: { ruledWeakened: { ruling: 'R396' } } });
+    } finally { warning.mockRestore(); }
+  });
   it('loads an exact ruled-WEAKENED record and warns with its ruling, head and findings', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const f = auditedFixture('warn', {
-        ready: auditLines([ready]), settings: { ruledWeakened: [allowed] },
+        ready: auditLines([ready]), settings: { ruledWeakened: [allowed] }, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, 
       });
       expect(await f.run()).toMatchObject({
         ok: true, registered: true, adopted: true, stopReason: null,
@@ -382,9 +399,17 @@ describe('prototype-load ruled-WEAKENED admission', () => {
 });
 
 describe('prototype-load canonical audit admission', () => {
-  it('keeps the warn default in the standard cascade layer, not the tool file, so a platform refuse is not overridden', () => {
+  // R850: the shipped default is refuse (standard cascade layer, not the tool file, so a platform setting still cascades).
+  it('keeps the refuse default (R850) in the standard cascade layer, not the tool file', () => {
     const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped).not.toHaveProperty('canonicalAuditMode');
+  });
+  it('R850: the default (absent mode) is refuse: no canonical record stops, even with a green ready record', async () => {
+    for (const opts of [{ audits: '' }, { auditReadError: 'ENOENT' }]) {
+      const f = auditedFixture(undefined, opts);
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse' } });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    }
   });
   it.each(['warn', undefined])('a ready record never loads over its own sha\'s canonical WEAKENED record, even in mode %s (R848 2a)', async (mode) => {
     const f = auditedFixture(mode, { audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]) });
@@ -394,9 +419,7 @@ describe('prototype-load canonical audit admission', () => {
   });
   it.each([
     ['explicit warn', 'warn', [], 'no-record'],
-    ['absent mode', undefined, [], 'no-record'],
     ['unreadable in warn', 'warn', [], 'no-record', 'EACCES'],
-    ['missing file with absent mode', undefined, [], 'no-record', 'ENOENT'],
   ])('%s proceeds with failed canonical evidence and a loud warning line', async (_, mode, records, reason, auditReadError) => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -2311,10 +2334,10 @@ describe('readyEvidence fingerprint carry (R503)', () => {
   it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
     const ready = auditLines([weak()]);
     const settings = { ruledWeakened: [entry()] };
-    const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
+    const ok = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
-      const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
+      const out = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint }).run();
       expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
     }
   });
@@ -2709,10 +2732,10 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
   it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
     const ready = auditLines([weak()]);
     const settings = { ruledWeakened: [entry()] };
-    const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
+    const ok = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
-      const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
+      const out = await auditedFixture('warn', { ready, settings, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint }).run();
       expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
     }
   });
