@@ -1723,6 +1723,7 @@ export function createDispatchSinks({
           // R549: false when the launch output could not be read and `handle` is only the minted session id.
           handleVerified: handle != null && String(handle) !== sessionId,
           executor,
+          sessionId,
           effort: reportedEffort ?? payload?.routing?.effort ?? table?.effort ?? null,
           supervisorModel: reportedModel ?? modelDecision?.model ?? extractModelFlag(extraArgs.map(String)).value,
           workerModel: reportedModel && payload?.routing?.policyRoute

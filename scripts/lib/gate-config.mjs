@@ -109,6 +109,11 @@ const { extractAnchors } = createRequire(import.meta.url)('./rules-loader.cjs');
  * fail-closed direction is human, never committee.
  */
 export const TRUST_CHAIN = [
+  {
+    role: 'judge-clearance', file: 'judge-clearance.mjs', tier: 'policy', leash: 'code',
+    homes: ['scripts/lib/judge-clearance.mjs'],
+    desc: 'Derives the independent judge clearance from the human-owned protected leash (#5062)',
+  },
   ...['card-ledger-trust.json', 'card-ledger-legacy-identities.json'].map(file => ({
     role: file === 'card-ledger-trust.json' ? 'card-ledger-trust' : 'card-ledger-legacy-identities',
     file, tier: 'policy', leash: 'spec', homes: [`scripts/settings/${file}`],
@@ -608,6 +613,37 @@ export function isStatutePath(path) {
   const p = String(path || '');
   return STATUTE_PATHS.some((re) => re.test(p));
 }
+
+/** Human-only judge boundary (#5062). Patterns include future modules and workflows. */
+export const JUDGE_MODULE_PATTERNS = Object.freeze([
+  /^scripts\/(?:.*\/)?judge-[^/]+\.mjs$/,
+]);
+export const RATIFICATION_PROTECTED = Object.freeze([
+  ...STATUTE_PATHS,
+  /^docs\/agent\/platform-decisions\//,
+]);
+export const RULING_MARKERS = Object.freeze(['**Ratified ', '**Operator ruling', 'Operator, verbatim']);
+// GitHub assigns this reserved principal to repository workflows. Those workflows
+// are themselves on the human-only judge leash below. Keep this trust declaration
+// here, alongside that leash, rather than inheriting a workstation's bot settings.
+export const JUDGE_WORKFLOW_LOGINS = Object.freeze(['github-actions[bot]']);
+export const JUDGE_PROTECTED = Object.freeze([
+  ...TRUST_CHAIN.map(({ file }) => new RegExp(`(?:^|/)${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)),
+  ...JUDGE_MODULE_PATTERNS,
+  ...RATIFICATION_PROTECTED,
+  /^\.github\/workflows\//,
+  /^skills-src\/conveyor\/runner\.mjs$/,
+  /^scripts\/(?:review-set-label|pr-land|apply-review-request|check-review-gate|collect-review-requests)\.mjs$/,
+  /^scripts\/operations\/(?:record-verdict|review-dispatch|dispatch-lane|dispatch-lane-io|dispatch-provider-registry|deliver-item-wrapper|coordination-root)\.mjs$/,
+  /^scripts\/lib\/(?:advisory-labels|verdict-ledger|codex-judge-spawn|finding-bounce|review-independence|delegation-marker|ai-pr-authorship|dispatch-provider-availability|github-app-token|secret-scrub)\.mjs$/,
+  /^scripts\/conveyor\/stand-down(?:-answer-core)?\.mjs$/,
+  /^scripts\/guard-[^/]+\.mjs$/,
+  /^\.claude\/settings\.json$/,
+  /^\.githooks(?:\/|$)/,
+  /^scripts\/rust-scan\/src\/secret_scrub\.rs$/,
+  /(?:^|\/)\.[^/]*env[^/]*$/i,
+  /^(?!(?:backlog|reports|src)\/)(?:.*\/)?[^/]*(?:secret|token|credential|password|pem|key)[^/]*$/i,
+]);
 
 /** Trigger 3 — the DECLARATIVE-LEASH path floor (#2771/#2785, pinned permanent by #2840). Named here so
  *  `isPrincipleSurface` reads as the union it is; it is `isPolicySpecPath`, re-exported by the rubric under the

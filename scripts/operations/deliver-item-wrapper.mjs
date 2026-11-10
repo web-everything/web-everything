@@ -143,6 +143,7 @@ import { primaryCheckoutForLanePath, repoProfileForLanePath, deliveryLocusForSco
 // the thin seam, not a new store) and release/hold the build-dispatch claim a finished no-op dispatch used to
 // leave stranded for hours (`we:scripts/conveyor/build-dispatch-claim.mjs`'s own #4349 note).
 import { createFileRunStore, resolveRunsDir } from './run-store.mjs';
+import { JUDGE_DISPATCH_DIR } from '../lib/judge-trusted-paths.mjs';
 import { settleDispatchEffect } from './deliver-item-settle.mjs';
 import { releaseBuildDispatchClaim, placeBuildDispatchHold } from '../conveyor/build-dispatch-claim.mjs';
 
@@ -492,6 +493,25 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     // claim must run with the LANE as cwd (see `claimItem`'s own docblock) or `run.mjs claim` resolves the
     // item onto the shared primary checkout and is refused outright.
     const claimLanePath = resolveLanePath(lane, { run });
+    // Capture the reset base before the author runs. Resumes must retain the original base.
+    // Historical runs without this evidence remain unknown to the judge.
+    if (runId && effectKey && !resume) {
+      try {
+        const store = createFileRunStore();
+        const dispatchRun = store.read(runId);
+        const entry = dispatchRun?.effects?.find(effect => effect.key === effectKey);
+        if (entry) {
+          const baseSha = run('git', ['rev-parse', 'HEAD'], { cwd: implLanePath || claimLanePath }).trim();
+          if (/^[a-f0-9]{40}$/.test(baseSha)) {
+            entry.dispatch = { ...entry.dispatch, baseSha, sessionId: claudeSessionId,
+              startedAt: entry.startedAt || new Date().toISOString() };
+            store.write(dispatchRun);
+          }
+        }
+      } catch {
+        console.error('deliver-item-wrapper: judge provenance unavailable; PR retains human clearance.');
+      }
+    }
     if (!resume) {
       spanAround('item.claim', { attributes: { item: String(item) } }, () => claimItem({ item, sessionSlug, lanePath: claimLanePath }));
     }
@@ -2758,7 +2778,30 @@ export function openPr({ item, attemptTag, lane, park, report, slug, delegation 
   // #3627 bug 13 (real fix) — `run.mjs open-pr --json` prints the FULL run-outcome envelope, never a flat
   // `{pr, url}` object; the actual submit result (the only place `.pr`/`.url` live) is buried at
   // `findings.submit.effects[0].result`. See `extractSubmitResult`'s own docblock for the full story.
-  return extractSubmitResult(JSON.parse(out));
+  const result = extractSubmitResult(JSON.parse(out));
+  if (result.outcome === 'opened' && runId && effectKey) {
+    try {
+      const dispatchRun = createFileRunStore().read(runId);
+      const entry = dispatchRun?.effects?.find(effect => effect.key === effectKey);
+      const provenance = entry?.dispatch;
+      // A recommendation is never an executor. Missing old provenance produces no binding.
+      if (!provenance?.executor || !provenance.sessionId || !/^[a-f0-9]{40}$/.test(provenance.baseSha)
+        || !Number.isFinite(Date.parse(provenance.startedAt))) return result;
+      const remote = runFn('git', ['remote', 'get-url', 'origin'], { cwd: lane }).trim();
+      const repo = remote.match(/(?:github\.com[/:])([^/\s]+\/[^/\s]+?)(?:\.git)?$/)?.[1];
+      if (!repo || !Number.isSafeInteger(result.pr) || result.pr < 1) return result;
+      const record = { repo, prNumber: result.pr, headRef: ref, baseSha: provenance.baseSha,
+        startedAt: provenance.startedAt, finishedAt: new Date().toISOString(),
+        executedProvider: provenance.executor, sessionId: provenance.sessionId };
+      mkdirSync(JUDGE_DISPATCH_DIR, { recursive: true });
+      // Exclusive creation never replaces an earlier PR's provenance, even on a retry.
+      writeFileSync(join(JUDGE_DISPATCH_DIR, `${encodeURIComponent(repo)}-${result.pr}.json`),
+        JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 });
+    } catch {
+      console.error('deliver-item-wrapper: judge binding unavailable; PR retains human clearance.');
+    }
+  }
+  return result;
 }
 
 /**

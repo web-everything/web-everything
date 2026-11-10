@@ -176,6 +176,7 @@ import { resolve, dirname, join } from 'node:path';
 import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedLaneSlug, requiredAssertionSlug } from './lib/lane-lease.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
+import { isJudgeTrustedPath, JUDGE_TRUSTED_ROOT, isolateJudgeInputs } from './lib/judge-trusted-paths.mjs';
 import { classifySession } from './operations/session-role.mjs';
 import { loadOrchestratorSessionSettings, ORCHESTRATOR_DELEGATE_COMMANDS } from './lib/orchestrator-session-settings.mjs';
 // #xpt9fvd — the shared daemon-clone registry `guard-lane.mjs`'s Edit/Write arm also reads, so the two guards
@@ -5152,8 +5153,35 @@ export async function computeFixClaimCtx(cmd, { caller = {}, cwd = process.cwd()
 /** First deny reason across a command's `&&`/`|`/`;`-separated segments, or null. Pure. `ctx` is passed to
  *  each `reason` call (carries `primaryCwd` for the #2302 rule, `staleBehind` for the #2323 rule,
  *  `foreignLiveLease` for the #2367 rule, and `dispatchKind` for the #3105/#3627 dispatched-session rules). */
+/** A lane cannot manufacture the evidence used to clear its own PR (#5062). */
+export function trustedJudgeWriteReason(command, ctx = {}) {
+  if (!ctx.agentSession && !laneRootFromCwd(ctx.cwd)) return null;
+  const denial = 'Trusted judge inputs are read-only to lane agents; use the operator ceremony.';
+  const home = JUDGE_TRUSTED_ROOT.slice(0, -'/workspace/.operations/coordination'.length);
+  for (const segment of splitSegments(command)) {
+    const tokens = shellTokens(segment);
+    const words = tokens.filter(token => !token.op).map(token => token.text);
+    if (words.some(word => /(?:^|\/)judge-switch\.mjs$/.test(word))
+      && words.some(word => /^(?:on|off|wait)$/.test(word))) return denial;
+    // Include literals inside interpreter programs as well as ordinary shell operands.
+    const literals = words.flatMap(word => [...word.matchAll(/(['"])([^\n]*?)\1/g)].map(match => match[2]));
+    const mentions = [...words, ...literals].some(word => {
+      const expanded = word.replace(/^~(?=\/|$)|^\$\{?HOME\}?(?=\/|$)/, home);
+      return isJudgeTrustedPath(expanded, ctx.cwd || '.');
+    });
+    if (!mentions) continue;
+    const writes = tokens.some(token => token.op && />|<>/.test(token.text));
+    // Known reads remain available. Unknown interpreters/commands with a trusted operand refuse.
+    if (writes || /\$\(|`/.test(segment)
+      || !/^(?:cat|head|tail|stat|ls|test|wc)$/.test(words[0] || '')) return denial;
+  }
+  return null;
+}
+
 export function decide(command, ctx = {}) {
   if (!command) return null;
+  const trustedJudge = trustedJudgeWriteReason(command, ctx);
+  if (trustedJudge) return trustedJudge;
   // #2788 review r3 finding 2 — a heredoc BODY is data, not commands. The segment split below treats every
   // newline as a separator, so a body line that happens to contain `>` (`Fix the > thing` in a PR-body
   // heredoc) would be read as a redirect. Drop the bodies first; the OPENER line stays, so
@@ -5335,12 +5363,16 @@ if (IS_CLI) {
   let runInBackground = false;
   let dispatchKind = null;
   let agentSession = false;
+  let callerInLane = false;
   let effectiveCwd = null;
   let daemonRoots = [];
   let hookSessionId = null;
   let orchestratorSettings = {};
+  let toolInput = {};
   try {
     const ev = JSON.parse(readFileSync(0, 'utf8'));
+    toolInput = ev.tool_input || {};
+    callerInLane = !!laneRootFromCwd(ev.cwd || process.cwd());
     cmd = (ev.tool_input || {}).command || '';
     // #2833 finding 3 — the Bash tool's own `run_in_background` param is the primary channel the stall arrives
     // through (the harness detaches the process). Read it so a backgrounded verification run is denied even when
@@ -5389,7 +5421,11 @@ if (IS_CLI) {
     // #2367/#2413 — only pay for the lease read when it could possibly matter: a lane cwd about to run
     // something that LOOKS like a destructive git op. Every other Bash call skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && hasDestructiveLaneOp(cmd)) ({ markedLeaseSlug, contestedHolderSlug, foreignLiveLease } = laneLeaseGuardCtx(cwd, mySessionId));
-  } catch { process.exit(0); }
+  } catch {
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+      permissionDecisionReason: 'Trusted judge isolation could not read the hook context. Use the operator shell outside the lane.' } }));
+    process.exit(0);
+  }
   // fix procedure — only pay for the claim-store read when the command could be a `git push` (a bare one names
   // no lane ref, so the gate cannot key on `lane/`). Loaded lazily so every other Bash call keeps this hook's
   // import graph unchanged; the git reads run only when some claim is live. Fail-OPEN on any error.
@@ -5399,6 +5435,7 @@ if (IS_CLI) {
   }
   const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
   const r = decide(cmd, guardCtx);
+  const needsJudgeIsolation = agentSession || callerInLane || !!laneRootFromCwd(effectiveCwd);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
     // OUTSIDE `decide` (which stays byte-stable for the golden corpus) and wrapped in its own try/catch: an
@@ -5408,6 +5445,15 @@ if (IS_CLI) {
     try { collateral = collateralStepsNotice(cmd, guardCtx); } catch { collateral = ''; }
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Blocked: ' + r + collateral },
+    }));
+  } else if (needsJudgeIsolation) {
+    let isolated = null;
+    try { isolated = isolateJudgeInputs(cmd); } catch { /* unavailable is a refusal */ }
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: isolated
+      ? { hookEventName: 'PreToolUse', updatedInput: { ...toolInput, command: isolated },
+        additionalContext: 'Trusted judge inputs require OS write isolation. If the sandbox cannot start, use the operator shell outside the lane; never retry unsandboxed.' }
+      : { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: 'Trusted judge OS write isolation is unavailable. Use the operator shell outside the lane; do not run this command unsandboxed.' },
     }));
   }
   // WE_MERGE_BREAK_GLASS=1 on a raw gh-merge command is never silent — mirrors `pr-merge-gate.mjs`'s own
@@ -5438,7 +5484,7 @@ if (IS_CLI) {
       // two concatenated JSON documents on one stream, which a strict reader cannot parse — and the deny is
       // the message that matters, so corrupting it to append a nudge is a strictly bad trade. When the
       // command is already denied, the nudge goes to stderr only.
-      if (!r) writeAllSync(1, JSON.stringify({ systemMessage: 'guard-bash: ' + nudge }) + '\n');
+      if (!r && !needsJudgeIsolation) writeAllSync(1, JSON.stringify({ systemMessage: 'guard-bash: ' + nudge }) + '\n');
       process.stderr.write('guard-bash: ' + nudge + '\n');
     }
   } catch { /* never wedge on a nudge-computation fault */ }

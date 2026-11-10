@@ -6,6 +6,11 @@ import { describe, it, expect } from 'vitest';
 import { decideJudgeClearance, deriveRecordBinding, protectedPathsTouched, JUDGE_REFUSALS } from '../judge-clearance.mjs';
 import { buildAuthorActorMarker, buildClearerActorMarker } from '../review-independence.mjs';
 import { buildDelegationMarker } from '../delegation-marker.mjs';
+import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../marker-authorship.mjs';
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repo = 'example/web-everything';
 const head = 'b'.repeat(40);
@@ -38,6 +43,84 @@ function refuses(input, refusal, detail) {
   if (detail !== undefined) expect(result.detail).toEqual(detail);
   return result;
 }
+
+/** Keep the committed fixture intact; these cases supply an actually trusted advisory principal. */
+function trustedClean() {
+  const input = clean();
+  input.pr.comments[0].author.login = AUTOMATION_LOGINS[0];
+  return input;
+}
+
+describe('#5062 trusted-evidence refusal coverage', () => {
+  const modulePath = resolve(dirname(fileURLToPath(import.meta.url)), '../judge-clearance.mjs');
+  const moduleUrl = pathToFileURL(modulePath);
+  const source = readFileSync(modulePath, 'utf8');
+
+  // Native ESM imports exercise the real implementation with precisely one refusal removed.
+  // Everything stays in memory: no checkout edits, temporary modules, or production IO.
+  function withoutGuard(input, guard) {
+    expect(source.split(guard)).toHaveLength(2); // refuse a stale or ambiguous mutation target
+    const mutant = source.replace(guard, 'void 0');
+    const absolute = mutant.replace(/from (['"])(\.[^'"]+)\1/g,
+      (_match, _quote, relative) => `from ${JSON.stringify(new URL(relative, moduleUrl).href)}`);
+    const url = `data:text/javascript;base64,${Buffer.from(absolute).toString('base64')}`;
+    const script = `const { decideJudgeClearance } = await import(process.argv[1]);
+      process.stdout.write(JSON.stringify(decideJudgeClearance(JSON.parse(process.argv[2]))));`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script, url, JSON.stringify(input)], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr.slice(0, 800)).toBe(0);
+    return JSON.parse(result.stdout);
+  }
+
+  it('starts with current-head acceptance by a trusted principal and independent provider/actors', () => {
+    const input = trustedClean();
+    expect(isTrustedMarkerAuthor(input.pr.comments[0])).toBe(true);
+    expect(decideJudgeClearance(input)).toMatchObject({ allowed: true, refusal: null });
+  });
+
+  const cases = [
+    { name: 'protected path', refusal: 'protected-list',
+      guard: "return refuse('protected-list', protectedResult.detail)",
+      change: input => { input.changedPaths = ['scripts/review-set-label.mjs']; } },
+    { name: 'known secret in added documentation', refusal: 'secret-in-diff',
+      guard: "return refuse('secret-in-diff', path)",
+      change: input => { input.addedLines = [{ path: 'docs/guide.md', line: 'sk-' + 'Ab12'.repeat(6) }]; } },
+    { name: 'opaque secret in added data', refusal: 'secret-in-diff',
+      guard: "return refuse('secret-in-diff', path)",
+      change: input => { input.addedLines = [{ path: 'src/_data/example.json', line: 'q7Jz9Bv2Kx4Mp8Nw6R' }]; } },
+    ...['headIsSameRepo', 'repoMatches', 'prNumberMatches', 'baseShaIsAncestor'].map(flag => ({
+      name: `dispatch record binding ${flag}`, refusal: 'independence-unknown',
+      guard: "return refuse('independence-unknown', 'record-mismatch')",
+      change: input => { input.recordBinding[flag] = false; },
+    })),
+    { name: 'same author provider', refusal: 'same-provider',
+      guard: "return refuse('same-provider')",
+      change: input => { input.judge.provider = 'codex'; } },
+    { name: 'same author actor', refusal: 'same-actor',
+      guard: "return refuse('same-actor')",
+      change: input => { input.judge.actorId = author; } },
+    { name: 'same reviewer actor', refusal: 'same-actor',
+      guard: "return refuse('same-actor')",
+      change: input => { input.judge.actorId = 'reviewer-session'; } },
+  ];
+  it.each(cases)('$name refuses with otherwise-valid evidence; deleting its guard loses the refusal', ({ change, refusal, guard }) => {
+    const input = trustedClean();
+    expect(decideJudgeClearance(input)).toMatchObject({ allowed: true, refusal: null });
+    change(input);
+    expect(decideJudgeClearance(input)).toMatchObject({ allowed: false, refusal });
+    // The same named refusal assertion would fail against this implementation mutation.
+    expect(withoutGuard(input, guard)).toMatchObject({ allowed: true, refusal: null });
+  });
+
+  it('rejects an untrusted current-head advisory even when an accepted label is present', () => {
+    const input = trustedClean();
+    input.pr.comments[0].author.login = 'outside-untrusted-account';
+    expect(isTrustedMarkerAuthor(input.pr.comments[0])).toBe(false);
+    refuses(input, 'reviewers-not-accepted');
+  });
+});
 const protectedPaths = [
   'scripts/review-set-label.mjs', 'scripts/merge-ai-prs.mjs', 'scripts/pr-land.mjs',
   'scripts/operations/record-verdict.mjs', 'scripts/operations/review-dispatch.mjs',

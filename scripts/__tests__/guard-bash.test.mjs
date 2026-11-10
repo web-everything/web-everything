@@ -4,7 +4,8 @@
  *   sanctioned `MAIN_PUSH_OK=1` escape passes through. The stdin/JSON I/O is the boundary; `decide` is pure.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, symlinkSync } from 'node:fs';
+import { isolateJudgeInputs, JUDGE_TRUSTED_PATHS } from '../lib/judge-trusted-paths.mjs';
 import { tmpdir, homedir, userInfo } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
@@ -4031,6 +4032,60 @@ describe('orchestrator foreground delegation', () => {
     expect(invoke({ agent_id: 'delegated-agent' })).not.toMatch(/orchestrator session/);
     expect(invoke({}, { WE_CONVEYOR_WORKER: '1' })).not.toMatch(/orchestrator session/);
     expect(invoke({}, { WE_ORCHESTRATOR_SESSION: '0' })).not.toMatch(/orchestrator session/);
+  });
+});
+
+describe('#5062 OS boundary for computed trusted-input writes', () => {
+  const computed = `python3 -c 'from pathlib import Path; (Path.home() / "workspace" / ".operations" / "coordination" / "judge-switches.json").write_text("{}")'`;
+  it.each([computed, `cd / && ${computed}`])('isolates a constructed Python path even after leaving the lane: %s', command => {
+    const output = execFileSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../guard-bash.mjs')], {
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command, timeout: 12345 },
+        cwd: '/ws/.lanes/web-everything/lane-7' }),
+      encoding: 'utf8', maxBuffer: 1024 * 1024,
+      env: { ...process.env, WE_ORCHESTRATOR_SESSION: '0', WE_DISPATCH_KIND: '', WE_POLICY_CASCADE_LOG: '0' },
+    });
+    const result = JSON.parse(output).hookSpecificOutput;
+    if (process.platform === 'darwin') {
+      expect(result.updatedInput).toEqual({ command: isolateJudgeInputs(command), timeout: 12345 });
+      for (const path of JUDGE_TRUSTED_PATHS) expect(result.updatedInput.command).toContain(path);
+      expect(result.permissionDecision).not.toBe('allow'); // preserve the normal permission checks
+    } else {
+      expect(result).toMatchObject({ permissionDecision: 'deny' });
+      expect(result.permissionDecisionReason).toMatch(/operator shell/);
+    }
+  });
+  it('unsupported isolation fails closed with no unsandboxed command', () => {
+    expect(isolateJudgeInputs(computed, { platform: 'unsupported' })).toBeNull();
+    expect(() => isolateJudgeInputs(computed, { platform: 'darwin', paths: [] })).toThrow();
+  });
+  it.skipIf(process.platform !== 'darwin')('native isolation keeps files unchanged for direct, constructed and symlink writes while allowing reads', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'judge-write-isolation-')));
+    try {
+      const coordination = join(root, 'workspace/.operations/coordination');
+      const paths = [join(coordination, 'judge-switches.json'), join(coordination, 'judge-verdicts'), join(coordination, 'judge-dispatch')];
+      mkdirSync(paths[1], { recursive: true });
+      mkdirSync(paths[2], { recursive: true });
+      const files = [paths[0], join(paths[1], '250.json'), join(paths[2], '250.json')];
+      for (const file of files) writeFileSync(file, 'original');
+      const alias = join(root, 'alias.json');
+      symlinkSync(files[0], alias);
+      const quote = value => `'${value.replace(/'/g, `'"'"'`)}'`;
+      const execute = command => execFileSync('/bin/bash', ['-c', isolateJudgeInputs(command, { paths })], {
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, env: { ...process.env, HOME: root },
+      });
+      // A failing sandbox launch cannot masquerade as proof of denied writes.
+      expect(execute(`cat ${quote(files[0])}`)).toBe('original');
+      execute(`printf allowed > ${quote(join(root, 'allowed.txt'))}`);
+      expect(readFileSync(join(root, 'allowed.txt'), 'utf8')).toBe('allowed');
+      for (const command of [
+        ...files.map(file => `printf forged > ${quote(file)}`), computed,
+        `printf forged > ${quote(alias)}`,
+        `mv ${quote(coordination)} ${quote(join(root, 'moved'))}`,
+      ]) {
+        expect(() => execute(command), command).toThrow();
+        for (const file of files) expect(readFileSync(file, 'utf8')).toBe('original');
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

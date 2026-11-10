@@ -92,6 +92,7 @@ import { isForeignOccupancy, laneWorkerSession, isLeaseStale, describeLease } fr
 // belongs to or what its lease says. Importing guard-bash does NOT run its CLI (that block is gated on
 // `process.argv[1]` being guard-bash itself).
 import { laneRootFromCwd, readLaneLease } from './guard-bash.mjs';
+import { isJudgeTrustedPath } from './lib/judge-trusted-paths.mjs';
 // #xpt9fvd — the shared daemon-clone registry `guard-bash.mjs`'s Bash-side arm also reads, so the two guards
 // can never disagree about which paths are a resident daemon's OWN clone (same reuse discipline as the
 // lease pair above).
@@ -233,8 +234,15 @@ export function resolveReal(file) {
 // ── CLI wrapper: stdin event → exit code (only when run directly, not when imported by the test) ──────────
 if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fileURLToPath(import.meta.url))) {
   try {
+    const ev = JSON.parse(readFileSync(0, 'utf8') || '{}');
+    const trustedFile = ev?.tool_input?.file_path;
+    if (trustedFile && ['Edit', 'Write'].includes(ev.tool_name)
+      && (laneRootFromCwd(ev.cwd) || ev.session_id || process.env.CLAUDE_CODE_SESSION_ID)
+      && isJudgeTrustedPath(resolveReal(path.resolve(ev.cwd || process.cwd(), trustedFile)))) {
+      process.stderr.write('guard-lane: Trusted judge inputs are read-only to lane agents; use the operator ceremony.\n');
+      process.exit(2);
+    }
     if (process.env.LANE_GUARD_OFF !== '1') {
-      const ev = JSON.parse(readFileSync(0, 'utf8') || '{}');
       const file = ev?.tool_input?.file_path;
       if (file) {
         // Roots derived from this script's own location so the hook is portable:
