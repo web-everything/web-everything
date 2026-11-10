@@ -4,6 +4,7 @@
 // auditDisclosed array of non-empty strings. A record identical to the latest one for that ref+sha is refused; a different
 // one supersedes it (the reader lets the latest record per sha win). The append is one write under a lock file.
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +23,8 @@ export function readyRecordPath({ env = process.env, settingsFile = join(here, '
 /** Pure: returns {ok:true, record} or {ok:false, error}. */
 export function buildReadyRecord({ ref, sha, tests, audit, auditRuling, auditDisclosed } = {}) {
   if (typeof ref !== 'string' || !ref.trim()) return { ok: false, error: 'ref is required' };
+  // The reader matches ref with ===, so surrounding whitespace would write a record nothing ever finds.
+  if (ref !== ref.trim()) return { ok: false, error: 'ref must not have surrounding whitespace' };
   if (!validSha(sha)) return { ok: false, error: 'sha must be a full 40-hex sha' };
   if (tests !== 'green') return { ok: false, error: 'tests must be green' };
   if (audit === 'NOT WEAKENED') {
@@ -44,23 +47,41 @@ function readLedger(file, fsApi) {
   catch (e) { return e?.code === 'ENOENT' ? { text: '' } : { error: `cannot read ${file}: ${e.message}` }; }
 }
 
-/** Takes `<file>.lock` (exclusive create). A lock older than LOCK_STALE_MS is a dead writer's and is taken over. */
-function takeLock(lock, fsApi, now) {
+/** Takes `<file>.lock` (exclusive create, holding this writer's unique token). A lock older than LOCK_STALE_MS is a
+ *  dead writer's: it is moved aside by an atomic rename (so two takers cannot both remove it), and if the moved file
+ *  turns out to be a fresh lock a third writer just created, it is put back and this writer reports busy. */
+function takeLock(lock, token, fsApi, now) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { fsApi.closeSync(fsApi.openSync(lock, 'wx')); return true; } catch (e) {
+    try { const fd = fsApi.openSync(lock, 'wx'); try { fsApi.writeFileSync(fd, token); } finally { fsApi.closeSync(fd); } return true; } catch (e) {
       if (e?.code !== 'EEXIST') throw e;
       let age;
       try { age = now() - fsApi.statSync(lock).mtimeMs; } catch { continue; }
       if (age <= LOCK_STALE_MS) return false;
-      try { fsApi.unlinkSync(lock); } catch { /* another writer took it over first: retry the create */ }
+      const aside = `${lock}.stale-${token}`;
+      try { fsApi.renameSync(lock, aside); } catch { continue; /* another taker moved it first: retry the create */ }
+      let moved = 0;
+      try { moved = now() - fsApi.statSync(aside).mtimeMs; } catch { /* unreadable: treat as stale */ }
+      if (moved <= LOCK_STALE_MS) { // we moved someone's fresh lock: restore it (link fails if one already exists) and stand down
+        try { fsApi.linkSync(aside, lock); } catch { /* a newer lock exists: theirs wins */ }
+        try { fsApi.unlinkSync(aside); } catch { /* best effort */ }
+        return false;
+      }
+      try { fsApi.unlinkSync(aside); } catch { /* best effort */ }
     }
   }
   return false;
 }
 
+/** Removes the lock only if it still holds this writer's token: a slow writer whose lock was taken over must not
+ *  delete the new holder's lock. */
+function releaseLock(lock, token, fsApi) {
+  try { if (String(fsApi.readFileSync(lock, 'utf8')) === token) fsApi.unlinkSync(lock); } catch { /* best effort: a stale lock expires */ }
+}
+
 /** The latest record for ref+sha (the reader's "latest per sha wins" rule), or undefined. */
 function latestFor(text, ref, sha) {
-  return jsonLines(text).filter((r) => r && r.ref === ref && String(r.sha).toLowerCase() === sha).pop();
+  // Match lines exactly as the reader does: a string, valid sha. A hand-edited line the reader ignores must not count.
+  return jsonLines(text).filter((r) => r && r.ref === ref && typeof r.sha === 'string' && validSha(r.sha) && r.sha.toLowerCase() === sha).pop();
 }
 
 /** Validates, then appends one record with a single write, under a lock so two writers cannot both pass the check.
@@ -81,9 +102,10 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
   if (first.error) return { ok: false, error: first.error };
   if (isDuplicate(first.text)) return duplicate;
   const lock = `${file}.lock`;
+  const token = `${process.pid}-${randomUUID()}`;
   try {
     fsApi.mkdirSync(dirname(file), { recursive: true });
-    if (!takeLock(lock, fsApi, now)) return { ok: false, error: `locked: another writer holds ${lock}; retry shortly` };
+    if (!takeLock(lock, token, fsApi, now)) return { ok: false, error: `locked: another writer holds ${lock}; retry shortly` };
   } catch (e) { return { ok: false, error: `cannot lock ${file}: ${e.message}` }; }
   try {
     // Re-read under the lock: a writer that finished between the first read and the lock is now visible.
@@ -96,7 +118,7 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
     try { fsApi.writeSync(fd, `${prefix}${line}\n`); } finally { fsApi.closeSync(fd); }
     return { ok: true, record: built.record, file };
   } finally {
-    try { fsApi.unlinkSync(lock); } catch { /* best effort: a stale lock expires */ }
+    releaseLock(lock, token, fsApi);
   }
 }
 

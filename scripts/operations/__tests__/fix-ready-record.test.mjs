@@ -21,6 +21,8 @@ describe('fix-ready-record', () => {
   it.each([
     [{ ...base, sha: 'abc', audit: 'NOT WEAKENED' }, /40-hex/],
     [{ ...base, ref: ' ', audit: 'NOT WEAKENED' }, /ref/],
+    [{ ...base, ref: ' lane/x', audit: 'NOT WEAKENED' }, /surrounding whitespace/],
+    [{ ...base, ref: 'lane/x\n', audit: 'NOT WEAKENED' }, /surrounding whitespace/],
     [{ ...base, tests: 'red', audit: 'NOT WEAKENED' }, /green/],
     [{ ...base, audit: 'maybe' }, /audit must be/],
     [{ ...base, audit: 'WEAKENED', auditDisclosed: findings }, /auditRuling/],
@@ -121,9 +123,12 @@ describe('fix-ready-record', () => {
     const fsApi = {
       ...fs,
       // After the first writer's pre-lock read, a second writer runs to completion; the first must then see it.
+      // The ledger does not exist yet, so the first read throws ENOENT; the second writer still runs after it.
       readFileSync: (...args) => {
-        const out = fs.readFileSync(...args);
+        let out; let failure;
+        try { out = fs.readFileSync(...args); } catch (e) { failure = e; }
         if (reads++ === 0) nested = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file });
+        if (failure) throw failure;
         return out;
       },
     };
@@ -132,6 +137,49 @@ describe('fix-ready-record', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/duplicate/);
     expect(jsonLines(readFileSync(file, 'utf8'))).toHaveLength(1);
+    // The duplicate was found only on the re-read under the lock, and the lock was released on that path.
+    expect(existsSync(`${file}.lock`)).toBe(false);
+  });
+  it('does not delete a lock another writer took over while this one was writing', () => {
+    const file = tmp();
+    const fsApi = {
+      ...fs,
+      openSync: (p, flags) => {
+        if (flags === 'a') writeFileSync(`${file}.lock`, 'another-writers-token'); // our lock was taken over mid-write
+        return fs.openSync(p, flags);
+      },
+    };
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi }).ok).toBe(true);
+    expect(readFileSync(`${file}.lock`, 'utf8')).toBe('another-writers-token');
+  });
+  it('does not take a fresh lock that a stale-lock check raced with, and leaves no moved-aside file', () => {
+    const file = tmp();
+    const lock = `${file}.lock`;
+    writeFileSync(lock, 'holder');
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lock, old, old);
+    let statCalls = 0;
+    const fsApi = {
+      ...fs,
+      // The first stat sees a stale lock; by the time it is moved aside, a fresh one has replaced it.
+      statSync: (p) => {
+        const st = fs.statSync(p);
+        if (statCalls++ === 0) { const now = new Date(); utimesSync(p, now, now); return { ...st, mtimeMs: old.getTime() }; }
+        return st;
+      },
+    };
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/locked/);
+    expect(readFileSync(lock, 'utf8')).toBe('holder');
+    expect(existsSync(file)).toBe(false);
+    expect(fs.readdirSync(join(file, '..')).filter((n) => n.includes('.stale-'))).toEqual([]);
+  });
+  it('ignores a ledger line the reader would ignore (non-string sha) when deciding a duplicate', () => {
+    const file = tmp();
+    writeFileSync(file, `${JSON.stringify({ ref, sha: [sha], tests: 'green', audit: 'NOT WEAKENED' })}\n`);
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(true);
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).error).toMatch(/duplicate/);
   });
   it('refuses while another writer holds a fresh lock, and takes over a stale lock', () => {
     const file = tmp();
@@ -146,10 +194,9 @@ describe('fix-ready-record', () => {
     expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(true);
     expect(existsSync(lock)).toBe(false);
   });
-  it('releases the lock after a refused duplicate', () => {
+  it('releases the lock after a successful write', () => {
     const file = tmp();
     expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(true);
-    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(false);
     expect(existsSync(`${file}.lock`)).toBe(false);
   });
   it('passes a NOT WEAKENED record through the reader as ready-record', () => {
