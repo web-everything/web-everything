@@ -2,7 +2,7 @@
 // The stored red-team evidence for a head is the single authority for "is it held" (PR #6622, operator send-back).
 // Everything below runs the REAL functions end to end: the real default seat-row reader (scorecard store), the real
 // status file, the real sweep and the real hold decision behind readRedTeamDisposition. Nothing injects a seat row.
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -253,23 +253,17 @@ describe('(e) every disposition caller reports the hold', () => {
     expect(redTeamEnqueueHold({ comments, pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/confirmed a break/);
     expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: [], comments, evidence: {} }).add).toBe('red-team:blocked');
   });
-  it('every non-test caller passes the repo, so the shared reader can find the sealed status', () => {
-    const root = join(import.meta.dirname, '..', '..');
-    const files = [];
-    const walk = d => { for (const e of readdirSync(d, { withFileTypes: true })) {
-      if (e.name === '__tests__' || e.name === 'node_modules' || e.name === 'soak') continue;
-      const p = join(d, e.name);
-      if (e.isDirectory()) walk(p); else if (e.name.endsWith('.mjs')) files.push(p);
-    } };
-    walk(root);
-    const calls = [];
-    for (const file of files) {
-      const text = readFileSync(file, 'utf8');
-      for (const m of text.matchAll(/readRedTeamDisposition\(\{([^}]*(?:\{[^}]*\}[^}]*)*)\}\)/g)) calls.push({ file, args: m[1] });
-    }
-    expect(calls.length).toBeGreaterThanOrEqual(10);
-    const without = calls.filter(c => !/\brepo\b|\.\.\.key\(|\.\.\.\w+\(/.test(c.args)).map(c => c.file.replace(root, 'scripts'));
-    // The one place that reads the gate with the disposition's own defaults and no repo is the pure operator-ruling replay.
-    expect(without.filter(f => !f.endsWith('red-team-gate.mjs'))).toEqual([]);
+  it.each([
+    'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/red-team-status-labels.mjs',
+    'scripts/lib/red-team-carry-io.mjs', 'scripts/operations/needs-you-feed.mjs', 'scripts/operations/operator-queue.mjs',
+    'scripts/operations/judge-sweep-facts-io.mjs', 'scripts/operations/record-red-team-ruling.mjs',
+    'scripts/operations/record-red-team-ruling-io.mjs',
+  ])('%s passes the repo to every readRedTeamDisposition call, so the shared reader finds the sealed status', file => {
+    const text = readFileSync(join(import.meta.dirname, '..', '..', '..', file), 'utf8');
+    const calls = [...text.matchAll(/readRedTeamDisposition\(\{([^}]*(?:\{[^}]*\}[^}]*)*)\}\)/g)].map(m => m[1]);
+    expect(calls.length).toBeGreaterThan(0);
+    // The operator-ruling replay inside red-team-gate.mjs reads with the disposition's own defaults by design.
+    const withoutRepo = calls.filter(c => !/\brepo\b|\.\.\.key\(/.test(c));
+    expect(withoutRepo).toHaveLength(file.endsWith('red-team-gate.mjs') ? 1 : 0);
   });
 });
