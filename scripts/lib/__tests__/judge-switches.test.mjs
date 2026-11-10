@@ -111,7 +111,7 @@ describe('judge switch store', () => {
 
   it.each(['on', 'off', 'wait'])('%s without a nonblank reason is refused', (verb) => {
     for (const flags of [[], ['--reason='], ['--reason=   '], ['--reason']]) {
-      expect(cli([verb, '--hours=6', ...flags]).code).toBe(2);
+      expect(cli([verb, ...(verb === 'wait' ? ['--hours=6'] : []), ...flags]).code).toBe(2);
     }
     expect(fs.existsSync(path)).toBe(false);
     expect(() => planJudgeSwitchWrite({}, verb, { hours: 6 })).toThrow(/reason/);
