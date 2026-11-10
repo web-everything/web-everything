@@ -101,6 +101,66 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     claims: [], nowMs: NOW, ttlMs: TTL, cap: 2, log: vi.fn(), ...over,
   });
 
+  describe.each(['delivered-previous-ci', 'resume-exhausted'])('unwakeable retirement: %s', reason => {
+    const waiting = () => repair(1, reason === 'delivered-previous-ci'
+      ? { pendingResume: { kind: 'red', delivered: true } }
+      : { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures });
+    const setup = () => {
+      const record = waiting();
+      const h = harness([record], {});
+      h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+      h.io.sessionLive = vi.fn(() => false);
+      h.io.newerVerdictSince = vi.fn(() => true);
+      h.io.clearStoredRecordIf = vi.fn((key, expected) => {
+        expect(h.store.get(key)).toEqual(expected);
+        h.store.delete(key);
+        return { cleared: true };
+      });
+      return { h, record };
+    };
+
+    it('retires a dead session with a newer verdict without excluding, counting or resuming it', async () => {
+      const { h, record } = setup();
+      const log = vi.fn();
+      const out = await runSlots(h, { log });
+      expect(out.cleared).toEqual(['sid-1']);
+      expect(out.excluded).toEqual([]);
+      expect(out.admitted).toEqual([]);
+      expect(out.deferred).toEqual([]);
+      expect(out.rows).toEqual([]);
+      expect(h.calls.resume).toEqual([]);
+      expect(h.store.has('sid-1')).toBe(false);
+      expect(h.io.sessionLive).toHaveBeenCalledWith(record);
+      expect(h.io.newerVerdictSince).toHaveBeenCalledWith(record.repo, record.pr, record.requestedAt);
+      expect(log).toHaveBeenCalledWith('await-verify: retired unwakeable wait sid-1 (pr #1): newer review:changes verdict, session not live');
+    });
+
+    it.each(['live session', 'no newer verdict', 'unknown session', 'unknown verdict', 'missing session port',
+      'missing verdict port', 'session read throws', 'verdict read throws', 'clear refused', 'clear throws', 'missing clear port',
+      'record replaced'])('keeps the wait excluded: %s', async condition => {
+      const { h, record } = setup();
+      if (condition === 'live session') h.io.sessionLive = () => true;
+      if (condition === 'no newer verdict') h.io.newerVerdictSince = () => false;
+      if (condition === 'unknown session') h.io.sessionLive = () => null;
+      if (condition === 'unknown verdict') h.io.newerVerdictSince = () => undefined;
+      if (condition === 'missing session port') delete h.io.sessionLive;
+      if (condition === 'missing verdict port') delete h.io.newerVerdictSince;
+      if (condition === 'session read throws') h.io.sessionLive = () => { throw new Error('unreadable'); };
+      if (condition === 'verdict read throws') h.io.newerVerdictSince = () => { throw new Error('unreadable'); };
+      if (condition === 'clear refused') h.io.clearStoredRecordIf = () => ({ cleared: false });
+      if (condition === 'clear throws') h.io.clearStoredRecordIf = () => { throw new Error('unwritable'); };
+      if (condition === 'missing clear port') delete h.io.clearStoredRecordIf;
+      const replacement = { ...record, requestedAt: new Date(NOW).toISOString() };
+      if (condition === 'record replaced') h.io.newerVerdictSince = () => { h.store.set('sid-1', replacement); return true; };
+      const out = await runSlots(h);
+      expect(out.cleared).toEqual([]);
+      expect(out.excluded).toEqual([{ key: 'sid-1', reason }]);
+      expect(h.store.get('sid-1')).toEqual(condition === 'record replaced' ? replacement : record);
+      expect(h.calls.resume).toEqual([]);
+      expect(out.rows.some(r => r.reason === 'resume-exhausted-excluded')).toBe(reason === 'resume-exhausted');
+    });
+  });
+
   it('admits live resumes behind older delivered-previous-ci and exhausted records without waking either dead record', async () => {
     const dead = [repair(1, { pendingResume: { kind: 'red', delivered: true } }),
       repair(2, { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures })];

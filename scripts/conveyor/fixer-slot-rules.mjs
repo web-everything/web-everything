@@ -125,6 +125,12 @@ export function classifyUnwakeableWait(row) {
   return null;
 }
 
+/** New work may retire an unwakeable wait only with explicit evidence that its session is no longer live. */
+export function shouldRetireUnwakeable({ reason, sessionLive, newerVerdict }) {
+  return (reason === 'delivered-previous-ci' || reason === 'resume-exhausted')
+    && sessionLive === false && newerVerdict === true;
+}
+
 export const STALE_HEAD_GRACE_MS = 60_000;
 
 /** Stale owed keys. PR facts are a Map keyed by record key; unknown facts retain the record.
