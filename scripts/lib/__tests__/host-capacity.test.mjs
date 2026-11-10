@@ -22,7 +22,7 @@ const settings = loadCapacitySettings({ env: {} });
 const now = () => Date.parse('2026-11-10T12:00:00Z');
 const row = (idle, age = 0) => ({ sampledAt: new Date(now() - age * 1000).toISOString(), freshUntil: new Date(now() + 30000).toISOString(), cpu: { idlePct: idle } });
 const evidence = (idle = 40, mem = 4096, extra = {}) => readCapacity({ settings, env: {}, now,
-  history: () => [row(idle, 60), row(idle)], memory: () => mem, load: () => [79], cores: () => 12,
+  history: () => [row(idle, 60), row(idle, 30), row(idle)], memory: () => mem, load: () => [79], cores: () => 12,
   sample: () => { throw Error('unexpected direct sample'); }, ...extra });
 const decide = (cls, idle, mem) => admit(cls, { settings, read: () => evidence(idle, mem) });
 describe('class capacity floors', () => {
@@ -58,6 +58,31 @@ describe('class capacity floors', () => {
 });
 
 describe('window and source selection', () => {
+  it.each([
+    ['two samples one second apart', [row(100, 1), row(0)]],
+    ['two samples spanning half the window', [row(100, 45), row(0)]],
+    ['three samples just below half the window', [row(100, 44.999), row(100, 20), row(100)]],
+    ['duplicate timestamps', [row(100, 60), row(100, 60), row(100)]],
+    ['decreasing timestamps', [row(100, 60), row(100, 10), row(100, 30), row(100)]],
+  ])('%s holds until readable evidence on the next tick', (_name, rows) => {
+    const read = () => evidence(40, 4096, { history: () => rows });
+    expect(read()).toMatchObject({ error: expect.any(String), idlePct: null });
+    expect(admit('review', { settings, read })).toMatchObject({ admit: false,
+      reason: expect.stringContaining('hold until readable evidence on next tick') });
+  });
+  it.each([[90, [45, 20, 0]], [90, [60, 40, 20, 0]], [120, [60, 30, 0]]])(
+    'admits an above-threshold average spanning at least half the %ss window', (windowSec, ages) => {
+      const read = () => evidence(40, 4096, { settings: { ...settings, windowSec },
+        history: () => ages.map((age, index) => row(index === 0 ? 100 : 0, age)) });
+      expect(read()).toMatchObject({ idlePct: 100 / ages.length, source: 'resource-sampler' });
+      expect(admit('review', { settings, read }).admit).toBe(true);
+    });
+  it('holds when the span is below half a configured window', () => {
+    const read = () => evidence(40, 4096, { settings: { ...settings, windowSec: 120 },
+      history: () => [row(100, 59.999), row(100, 30), row(100)] });
+    expect(read().error).toEqual(expect.any(String));
+    expect(admit('review', { settings, read }).admit).toBe(false);
+  });
   it('averages the window so a last-sample spike cannot admit', () => {
     const read = () => evidence(40, 4096, { history: () => [row(100, 100), row(0, 80), row(0, 40), row(25)] });
     expect(read().idlePct).toBeCloseTo(25 / 3);
@@ -74,9 +99,9 @@ describe('window and source selection', () => {
     expect(sample).not.toHaveBeenCalled();
   });
   it.each(['expired', 'missing', 'invalid'])('newest sampler %s freshUntil holds without direct sampling', state => {
-    const rows = [row(100, 10), row(100)];
-    if (state === 'missing') delete rows[1].freshUntil;
-    else rows[1].freshUntil = state === 'expired' ? new Date(now() - 1).toISOString() : 'bad';
+    const rows = [row(100, 60), row(100, 30), row(100)];
+    if (state === 'missing') delete rows[2].freshUntil;
+    else rows[2].freshUntil = state === 'expired' ? new Date(now() - 1).toISOString() : 'bad';
     const sample = vi.fn(() => ({ ok: true, idlePct: 100 }));
     const read = () => evidence(100, 4096, { history: () => rows, sample });
     expect(read().error).toEqual(expect.any(String));
@@ -94,7 +119,7 @@ describe('window and source selection', () => {
     expect(admit('review', { settings: reviewSettings, read }).admit).toBe(false);
   });
   it('accepts freshUntil exactly now but keeps maxFreshSec as an upper bound', () => {
-    const rows = [row(40, 20), row(40, 10)].map(entry => ({ ...entry, freshUntil: new Date(now()).toISOString() }));
+    const rows = [row(40, 60), row(40, 30), row(40, 10)].map(entry => ({ ...entry, freshUntil: new Date(now()).toISOString() }));
     expect(evidence(40, 4096, { history: () => rows })).toMatchObject({ source: 'resource-sampler' });
     const sample = vi.fn(() => ({ ok: true, idlePct: 0 }));
     expect(evidence(40, 4096, { settings: { ...settings, maxFreshSec: 5 }, history: () => rows, sample }))
@@ -117,7 +142,7 @@ describe('window and source selection', () => {
       const read = () => evidence(40, 4096, { history: undefined, root: '/fixture', readFile });
       expect(admit('review', { settings, read }).admit).toBe(false);
     }
-    expect(evidence(40, 4096, { history: undefined, root: '/fixture', readFile: () => [row(20, 60), row(40)].map(JSON.stringify).join('\n') })).toMatchObject({ idlePct: 30, source: 'resource-sampler' });
+    expect(evidence(40, 4096, { history: undefined, root: '/fixture', readFile: () => [row(20, 60), row(30, 30), row(40)].map(JSON.stringify).join('\n') })).toMatchObject({ idlePct: 30, source: 'resource-sampler' });
   });
   it('unreadable display probes cannot veto valid capacity', () => {
     expect(evidence(40, 4096, { load: () => { throw Error('display unavailable'); } }).error).toBeUndefined();
@@ -250,7 +275,7 @@ describe('review wiring and red-team floor', () => {
     const floor = loadRedTeamQueueFloor({ capacitySettings, env: {}, readFile: () => JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 0, reviewStartsPerTickWhileIdle: 3 } } }) });
     expect(floor.idlePct).toBe(30);
     const capacity = { remainingStarts: 1, startsCeiling: 3 };
-    const cpuIdlePct = evidence(40, 4096, { history: () => [row(0, 60), row(40)] }).idlePct;
+    const cpuIdlePct = evidence(40, 4096, { history: () => [row(0, 60), row(20, 30), row(40)] }).idlePct;
     applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct });
     expect(capacity.remainingStarts).toBe(1);
     expect(raiseReviewStartsPerTick(2, { floor, cpuIdlePct })).toBe(2);

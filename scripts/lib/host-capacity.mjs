@@ -117,8 +117,11 @@ export function readCapacity({ settings, env = process.env, root,
       return { time, idle, freshUntil: Date.parse(row?.freshUntil) };
     });
     const window = parsed.filter(row => row.time >= at - settings.windowSec * 1000);
-    const newest = window.reduce((latest, row) => !latest || row.time > latest.time ? row : latest, null);
-    if (window.length < 2 || !Number.isFinite(newest.freshUntil) || at > newest.freshUntil
+    const newest = window.at(-1);
+    if (window.length < 3
+      || window.some((row, index) => index > 0 && row.time <= window[index - 1].time)
+      || newest.time - window[0].time < (settings.windowSec / 2) * 1000
+      || !Number.isFinite(newest.freshUntil) || at > newest.freshUntil
       || at - newest.time > settings.maxFreshSec * 1000) {
       throw Error('missing, stale or short sampler history');
     }
