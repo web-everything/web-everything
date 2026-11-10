@@ -2818,6 +2818,27 @@ describe('refuse-only safety properties P1–P9', () => {
     expect(f.retirePlanner).not.toHaveBeenCalled(); expect(mutations(f, 'add')).toHaveLength(0);
     expect(prototypeLoadOperation().input).toMatchObject({ remove: { type: 'string' }, reason: { type: 'string' } });
   });
+  it.each([
+    ['--branch', { branch: 'lane/new', sha: SHA }], ['--replace', { replace: 'lane/other' }], ['--retire', { retire: true }],
+    ['--force-adopt', { forceAdopt: true }], ['a blank --reason', { reason: '  ' }],
+  ])('P7 --remove is exclusive: %s is refused with bad-input and nothing is removed', async (_, extra) => {
+    const remove = vi.fn(async () => ({ retired: true }));
+    const f = fixture({ list: ['lane/old'], removeRegistration: remove });
+    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', reason: 'withdraw', ...extra })).toMatchObject({ ok: false, stopReason: 'bad-input' });
+    expect(remove).not.toHaveBeenCalled();
+    for (const action of ['add', 'remove', 'replace', 'retire']) expect(mutations(f, action)).toHaveLength(0);
+  });
+  it.each([
+    ['the daemon\'s own pending verdict', { ok: false, pending: true, reason: 'pending', sha: SHA }],
+    ['an ok-shaped observation still marked pending', { ok: true, pending: true, sha: SHA }],
+    ['a pending observation that also reports ran', { ok: true, ran: true, pending: true, sha: SHA }],
+  ])('P6 a pending dispatch-smoke observation refuses admission: %s', async (_, observation) => {
+    const smoke = vi.fn(async () => observation);
+    const f = fixture({ dispatchSmoke: smoke, ownDiff: 'M\0scripts/operations/dispatch-lane.mjs\0', diff: 'M\0scripts/operations/dispatch-lane.mjs\0' });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'dispatch-smoke-failed', dispatchSmoke: observation });
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(mutations(f, 'add')).toHaveLength(0); expect(f.readyWrites).toEqual([]);
+  });
   it('P7 refuses stacked dependents, missing reason and changed-entry/tip removal', async () => {
     const remove = vi.fn(async () => ({ retired: false, refused: 'tip-moved' }));
     const stacked = JSON.stringify({ list: [{ ref: 'lane/old' }, { ref: 'lane/top', stackBases: ['lane/old'] }] });
@@ -2910,6 +2931,39 @@ describe('test check-run evidence bounds (P8)', () => {
 
 // PR #6610 review: stored readiness for other code must not strand an iterated branch, but negative evidence about
 // THIS head (its own sha, or the same net diff) must still refuse.
+// PR #6610 red team: the readiness a successful ruled carry appends names the NEW sha, so the next identical load must
+// still bind that record to the carried canonical audit of the OLD sha (same net diff), not demand a re-audit.
+describe('a ruled carry stays loadable after it appends its own readiness', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const findings = ['disclosed weakening'];
+  const weak = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, tests: 'green', audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings, ...o });
+  const entry = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, ruling: 'R396', findings, ...o });
+  const oldAudit = (o = {}) => auditRecord({ head: OLD, verdict: 'WEAKENED', findings, fingerprint: FP, base: 'e'.repeat(40), ...o });
+  const gateFor = (o = {}) => ({ source: 'ready-record', record: { sha: SHA, fingerprint: FP, ...o }, ruledWeakened: { ruling: 'R396', findings } });
+  const evidence = (audits, gate, liveFp = FP) => prototypeLoad.canonicalAuditEvidence(audits, SHA, () => true, liveFp, { ruledWeakened: gate });
+  it('the second identical load admits: the gate record on the new sha binds to the carried WEAKENED audit', async () => {
+    const audits = auditLines([oldAudit()]);
+    const settings = { ruledWeakened: [entry()] };
+    const first = auditedFixture('warn', { ready: auditLines([weak()]), settings, audits, fingerprint: () => FP });
+    expect(await first.run()).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
+    expect(first.readyWrites).toHaveLength(1);
+    const { path: _path, ...appended } = first.readyWrites[0];
+    expect(appended).toMatchObject({ sha: SHA, fingerprint: FP, audit: 'WEAKENED', auditRuling: 'R396' });
+    const second = auditedFixture('warn', { ready: auditLines([weak(), appended]), settings, audits, fingerprint: () => FP });
+    expect(await second.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R396' } } });
+  });
+  it('binds only on the same net diff, the disclosed findings and a covered base', () => {
+    expect(evidence([oldAudit()], gateFor())).toMatchObject({ ok: true, record: { head: OLD } });
+    expect(evidence([oldAudit()], gateFor({ fingerprint: OTHER_FP }))).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit()], gateFor({ fingerprint: undefined }))).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit({ findings: ['other'] })], gateFor())).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit()], { ...gateFor(), ruledWeakened: undefined })).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit({ fingerprint: OTHER_FP })], gateFor())).toEqual({ ok: false, reason: 'no-record' });
+    expect(evidence([oldAudit()], gateFor(), OTHER_FP)).toEqual({ ok: false, reason: 'no-record' });
+    expect(prototypeLoad.canonicalAuditEvidence([oldAudit()], SHA, () => false, FP, { ruledWeakened: gateFor() })).toEqual({ ok: false, reason: 'weakened' });
+  });
+});
+
 describe('stale readiness never blocks a code-changed head', () => {
   const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
   const rec = (o = {}) => ({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED', ...o });

@@ -526,7 +526,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* leftover scratch is only litter */ }
           }
         }
-        if (out.dispatchSmoke?.ok !== true || out.dispatchSmoke.sha !== input.sha || out.dispatchSmoke.skipped || out.dispatchSmoke.ran === false)
+        if (out.dispatchSmoke?.ok !== true || out.dispatchSmoke.sha !== input.sha || out.dispatchSmoke.skipped || out.dispatchSmoke.pending || out.dispatchSmoke.ran === false)
           return stop('dispatch-smoke-failed', { fallback: 'Run a real dispatch smoke on this SHA; unavailable/pending smoke cannot admit it.' });
       }
       stage = 'check-unverifiable';

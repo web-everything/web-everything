@@ -141,7 +141,10 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const ruled = (record) => {
     const gate = auditOptions.ruledWeakened;
     return gate?.ruledWeakened && record.questionHash === QUESTION_HASH
-      && record.head === lowerSha(gate.record.sha)
+      // The ruled audit is the gate record's own (exact sha), or the carried audit of the same net diff: readiness
+      // appended by an earlier carry names the NEW sha, and must keep binding to the audit it was carried from.
+      && (record.head === lowerSha(gate.record.sha)
+        || (carriesAcross(record.fingerprint, liveFp) && carriesAcross(gate.record.fingerprint, liveFp)))
       && Array.isArray(record.findings)
       && JSON.stringify(record.findings) === JSON.stringify(gate.ruledWeakened.findings)
       && covered(record.base);
