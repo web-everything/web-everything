@@ -36,7 +36,10 @@ function fixture(source = success) {
   const lockRoot = join(root, 'pool', '.admission', 'heavy');
   const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', clientPath } } });
   const seams = { policy, lockRoot, laneRoots: [], readSha: vi.fn(() => 'abc123'),
-    log: vi.fn(), appendEvent: vi.fn(async () => true), notice: { logged: false } };
+    log: vi.fn(), appendEvent: vi.fn(async () => true), notice: { logged: false },
+    // Real-IO provenance must not race the production 100ms deadline on a loaded coverage shard;
+    // the deadline tests below pass the production budget explicitly.
+    provenanceBudgetMs: 5000 };
   // Keep admission health/slot state separate from the provenance IO under test.
   // The default-executor wiring test below exercises their shared production root.
   const admission = { lockRoot: join(root, 'admission', 'heavy'), readTelemetry: healthyRead };
@@ -839,7 +842,7 @@ describe('remote client override', () => {
     let result;
     const pending = runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env: {},
       ...f.admission, policy: f.policy, timeoutMs: 1000, loadPerCore: () => 0, log: f.seams.log,
-      remoteExec: createRemoteExec({ ...f.seams, provenanceFs, ...extra,
+      remoteExec: createRemoteExec({ ...f.seams, provenanceFs, ...extra, provenanceBudgetMs: 100,
         importClient: async () => ({ runRemote }) }),
     }).then((value) => { result = value; return value; });
     await vi.advanceTimersByTimeAsync(0);
@@ -894,7 +897,7 @@ describe('remote client override', () => {
       let release;
       const stalled = vi.fn(() => new Promise((resolve) => { release = resolve; }));
       const provenanceFs = mockProvenanceFs();
-      const extra = { provenanceFs };
+      const extra = { provenanceFs, provenanceBudgetMs: 100 };
       if (operation in provenanceFs) provenanceFs[operation] = stalled;
       else extra[operation] = stalled;
       const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
