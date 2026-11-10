@@ -1109,8 +1109,23 @@ describe('runRemote', () => {
   it.each([['install',97,'forge-install-failed'],['supervisor',254,'forge-supervisor-failed']])(
     'R817: a verified %s-phase code-%i receipt is not-started (%s), never unconfirmed', async (phase, code, reason) => {
       const f = fixture({runCode:code, receipt:(_n, value) => JSON.stringify({...value, phase, code})});
-      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason});
+      expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason,detail:''});
     });
+
+  it('R817: the failure detail is a bounded, control-free, token-masked stderr tail, and is logged', async () => {
+    const stderr = 'x'.repeat(2000)+'\u001b[31mnpm ci failed\u0007 ghp_'+'A1b2C3d4'.repeat(5)+' token=Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEF end';
+    const f = fixture({runCode:97, receipt:(_n, value) => JSON.stringify({...value, phase:'install', code:97})});
+    const original = f.exec; const log = vi.fn();
+    f.exec = vi.fn(async call => { const r = await original(call); return isRun(call) ? {...r, stderr} : r; });
+    const result = await runRemote({...f, log});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-install-failed'});
+    expect(result.detail.length).toBeLessThanOrEqual(500);
+    expect(result.detail).toContain('npm ci failed');
+    expect(result.detail).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(result.detail).not.toMatch(/ghp_|abcdefghijklmnopqrstuvwxyz0123456789/);
+    expect(result.detail).toContain('[masked]');
+    expect(log).toHaveBeenCalledWith('forge install failed: '+result.detail+'\n');
+  });
 
   it.each([
     ['install phase with a non-sentinel code', 'install', 3, 3],
@@ -2019,7 +2034,7 @@ describe('receipt field binding', () => {
       baseline = {...v};
       return JSON.stringify({...v,phase:'install'});
     }})))
-      .toEqual({mode:'not-started',terminated:true,reason:'forge-install-failed'});
+      .toEqual({mode:'not-started',terminated:true,reason:'forge-install-failed',detail:''});
     expectValidReceipt(baseline);
   });
 });

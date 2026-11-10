@@ -1360,7 +1360,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(!result || !verifyReceipt(text,expected,result.code)) {
         // R817: a fully verified install/supervisor failure receipt proves the run never reached the tests.
         const failure=result&&forgeFailureReason(text,expected,result.code);
-        return failure?{mode:'not-started',terminated:true,reason:failure}:{mode:'unconfirmed',reason:'ambiguous-result'};
+        if(!failure) return {mode:'unconfirmed',reason:'ambiguous-result'};
+        const detail=forgeFailureTail(result.stderr);
+        log(`forge install failed: ${detail}\n`);
+        return {mode:'not-started',terminated:true,reason:failure,detail};
       }
       if (argv[2] === 'check:standards') {
         observeStandards(result.stdout ?? '', 'stdout');
@@ -1403,6 +1406,13 @@ export function verifyReceipt(text, expected, code, failurePhase = false) {
       && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)
       && (failurePhase ? (receipt.phase==='install'&&code===97)||(receipt.phase==='supervisor'&&code===254) : receipt.phase==='test'&&Number.isInteger(code)&&code>=0&&code<255) && receipt.code===code;
   } catch {return false;}
+}
+
+/** R817: bounded (500 chars), control-free, token-masked tail of the Forge run stderr, safe to print and attach. */
+export function forgeFailureTail(stderr) {
+  return String(stderr??'').replace(/[\x00-\x1f\x7f-\x9f]+/g,' ')
+    .replace(/\b(?:Bearer\s+)?(?:gh[pousr]_|github_pat_|sk-|xox[a-z]-|npm_|AKIA)[A-Za-z0-9_-]{8,}|\b[A-Za-z0-9+/_=-]{32,}/g,'[masked]')
+    .replace(/\s+/g,' ').trim().slice(-500);
 }
 
 /** R817: the launcher's sentinel codes (install 97, supervisor 254) under the SAME integrity checks as a test receipt; only the phase allow-list widens. */
