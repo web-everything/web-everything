@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readGit } from '../lib/proc-read.mjs';
-import { appendFileSync, writeFileSync, unlinkSync, renameSync, linkSync, readFileSync, readdirSync, realpathSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
+import { appendFileSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { op } from './registry.mjs';
@@ -295,7 +295,11 @@ async function runFileHeldCardsLocked({ source = join(homedir(), 'workspace', '.
       const existing = readFileSync(ledger, 'utf8');
       if (existing && !existing.endsWith('\n')) separator = '\n';
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    appendFileSync(ledger, `${separator}${JSON.stringify(row)}\n`);
+    try { appendFileSync(ledger, `${separator}${JSON.stringify(row)}\n`); } catch (error) {
+      // The card is already filed: name every filed-but-unledgered number so the operator can add the rows.
+      const filed = result.filed.map(filedRow => `${filedRow.card} (${filedRow.tag})`).join(', ');
+      throw new Error(safeLog(`ledger append failed (${error.code ?? error.message}); filed but not ledgered: ${filed}`), { cause: error });
+    }
   }
   return result;
 }
@@ -309,7 +313,10 @@ export async function runFileHeldCards(options = {}) {
   // One lock by canonical ledger path (exists from the first run, even before the ledger does), held through select, filing and append.
   const ids = [createHash('sha256').update(canonical).digest('hex').slice(0, 24)];
   const held = [];
-  const release = () => { for (const lock of held) { try { unlinkSync(lock); } catch { /* already gone */ } } };
+  // Release only a lock that still names this process, so a lock reclaimed and retaken by another run survives.
+  const release = () => { for (const lock of held) {
+    try { if (readFileSync(lock, 'utf8').trim() === String(process.pid)) unlinkSync(lock); } catch { /* already gone */ }
+  } };
   for (const id of ids) {
     const lock = join(tmpdir(), `file-held-cards-${id}.lock`);
     try { acquireLock(lock); held.push(lock); } catch (error) { release(); throw error; }
@@ -317,7 +324,8 @@ export async function runFileHeldCards(options = {}) {
   try { return await runFileHeldCardsLocked(options); } finally { release(); }
 }
 
-const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
+// Only "no such process" proves a dead owner; EPERM and any invalid-pid error stay live (fail closed).
+const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
 
 /** Take the lock file; a lock whose recorded owner is a dead process is reclaimed once. An unreadable or
  *  unparseable owner counts as live (fail closed), and the refusal names the file so an operator can clear it. */
@@ -335,16 +343,18 @@ function acquireLock(lock) {
     if (!Number.isSafeInteger(owner) || owner < 1 || pidAlive(owner)) {
       throw new Error(`another file-held-cards run holds the ledger lock (${lock}${Number.isSafeInteger(owner) ? `, pid ${owner}` : ''}); retry when it finishes, or delete that file if no such run is alive`);
     }
-    // Dead owner: move the file aside atomically, then confirm it was the dead owner's before dropping it.
-    const aside = `${lock}.stale-${process.pid}`;
-    try { renameSync(lock, aside); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    let moved = '';
-    try { moved = readFileSync(aside, 'utf8').trim(); } catch { /* treated as a foreign lock below */ }
-    if (moved === text) { try { unlinkSync(aside); } catch { /* already gone */ } continue; }
-    // We moved a live run's fresh lock: put it back if the slot is still free, and refuse.
-    try { linkSync(aside, lock); } catch { /* another lock already took the slot */ }
-    try { unlinkSync(aside); } catch { /* already gone */ }
-    throw new Error(`another file-held-cards run holds the ledger lock (${lock}); retry when it finishes`);
+    // Dead owner: only one reclaimer at a time (an exclusive guard file), and the lock is re-read under the guard,
+    // so a fresh lock another run just created is never removed. The lock itself is never renamed or moved.
+    const guard = `${lock}.reclaim`;
+    try { writeFileSync(guard, String(process.pid), { flag: 'wx' }); } catch (error) {
+      if (error.code === 'EEXIST') throw new Error(`another file-held-cards run is reclaiming the ledger lock (${guard}); retry when it finishes, or delete that file if no such run is alive`);
+      throw error;
+    }
+    try {
+      let again = null;
+      try { again = readFileSync(lock, 'utf8').trim(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (again === text) unlinkSync(lock);
+    } finally { try { unlinkSync(guard); } catch { /* already gone */ } }
   }
   throw new Error(`could not take the ledger lock (${lock}); retry when other file-held-cards runs finish`);
 }
@@ -388,7 +398,8 @@ export function finishFileHeldCards(outcome, json = false) {
   const result = outcome.run?.effects?.find(entry => entry.type === BATCH_EFFECT)?.result;
   if (!result) return outcome;
   const lines = json ? [JSON.stringify(result)] : Object.entries(result).flatMap(([status, cards]) => cards.map(card =>
-    safeLog(`${status} ${card.tag} ${card.date}: ${card.title} [${card.scope || 'unscoped'}]`)));
+    // A refused card carries no title on purpose (it may hold the secret that got it refused).
+    safeLog(`${status} ${card.tag} ${card.date}: ${card.title ?? '(withheld)'} [${card.scope || 'unscoped'}]`)));
   // A file-item failure must not look like success to automated callers.
   return { ...outcome, lines, ...(result.failed?.length || result.refused?.length ? { code: 1 } : {}) };
 }

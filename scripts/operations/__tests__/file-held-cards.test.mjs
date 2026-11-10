@@ -487,6 +487,8 @@ it('sink dry-run with a refused card returns the plan and the refusal instead of
   const outcome = finishFileHeldCards({ code: 0, run: { effects: [{ type: 'file-held-cards.file', result }] } });
   expect(outcome.code).toBe(1);
   expect(outcome.lines.join('\n')).toContain('planned R2');
+  expect(outcome.lines.join('\n')).toContain('refused R1 2026-11-08: (withheld)');
+  expect(outcome.lines.join('\n')).not.toContain('undefined');
 });
 
 it('sink real run with a refused card throws after ledgering and names the filed card', async () => {
@@ -532,8 +534,42 @@ it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a led
   // The ledger does not exist yet and its directory is read-only, so the first append fails after the first filing.
   chmodSync(temp, 0o555);
   try {
-    await expect(run()).rejects.toThrow(/EACCES/);
+    // The error names the filed-but-unledgered card so the operator can ledger it by hand.
+    await expect(run()).rejects.toThrow(/ledger append failed \(EACCES\); filed but not ledgered: xtest \(R1\)/);
   } finally { chmodSync(temp, 0o755); }
   expect(fileItem).toHaveBeenCalledTimes(1);
   expect(existsSync(ledger)).toBe(false);
+});
+
+it('a reclaim in progress (guard file held) refuses without touching the stale lock', async () => {
+  seed('- [R1] 2026-11-08: Guard probe');
+  const dead = execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  writeFileSync(lockPath(), dead);
+  writeFileSync(`${lockPath()}.reclaim`, '1');
+  try {
+    await expect(run()).rejects.toThrow(`${lockPath()}.reclaim`);
+    expect(readFileSync(lockPath(), 'utf8')).toBe(dead);
+  } finally { rmSync(lockPath(), { force: true }); rmSync(`${lockPath()}.reclaim`, { force: true }); }
+  expect(fileItem).not.toHaveBeenCalled();
+});
+
+it('an out-of-range pid in the lock fails closed instead of being reclaimed', async () => {
+  seed('- [R1] 2026-11-08: Huge pid probe');
+  writeFileSync(lockPath(), '4294967297');
+  try {
+    await expect(run()).rejects.toThrow(lockPath());
+    expect(readFileSync(lockPath(), 'utf8')).toBe('4294967297');
+  } finally { rmSync(lockPath(), { force: true }); }
+});
+
+it('releases only a lock that still names this run, so a retaken lock survives', async () => {
+  seed('- [R1] 2026-11-08: Release probe');
+  fileItem.mockImplementationOnce(async () => {
+    writeFileSync(lockPath(), '1'); // another run now owns the lock path
+    return { code: 0, lines: [JSON.stringify({ verdict: { num: 'xtest', rel: 'backlog/xtest.md' } })] };
+  });
+  try {
+    expect((await run()).filed).toHaveLength(1);
+    expect(readFileSync(lockPath(), 'utf8')).toBe('1');
+  } finally { rmSync(lockPath(), { force: true }); }
 });
