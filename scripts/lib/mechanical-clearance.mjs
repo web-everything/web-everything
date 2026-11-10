@@ -66,9 +66,11 @@ export function validateMechanicalClearance(facts = {}) {
     || rollup.commitOid.toLowerCase() !== head.toLowerCase() || rollup.headOid.toLowerCase() !== head.toLowerCase()) {
     return fail('checks', 'GitHub roll-up must succeed for the exact head; use normal review.');
   }
-  if (!REQUIRED_MECHANICAL_CHECKS.every(name => facts.checks.some(check => check?.name === name
-    && check.appId === GITHUB_ACTIONS_APP_ID && check.status === 'completed'
-    && typeof check.conclusion === 'string' && check.conclusion.toUpperCase() === 'SUCCESS'))) {
+  if (!REQUIRED_MECHANICAL_CHECKS.every(name => {
+    const runs = facts.checks.filter(check => check?.name === name && check.appId === GITHUB_ACTIONS_APP_ID);
+    return runs.length > 0 && runs.every(check => check.status === 'completed'
+      && typeof check.conclusion === 'string' && check.conclusion.toUpperCase() === 'SUCCESS');
+  })) {
     return fail('checks', 'Required head checks must all have a successful completed GitHub Actions run.');
   }
   return { cleared: true, rule: null, reasons: [], head };
@@ -166,7 +168,7 @@ export function readMechanicalClearanceFacts({ repo, num, exec = execFileSyncThr
     facts.rollup = { headOid: pullRequest?.headRefOid, commitOid: commit?.oid, state: commit?.statusCheckRollup?.state };
     if (result.errors || !/^[a-f0-9]{40}$/i.test(facts.rollup.headOid) || !/^[a-f0-9]{40}$/i.test(facts.rollup.commitOid)
       || typeof facts.rollup.state !== 'string' || !facts.rollup.state) throw Error('unreadable roll-up');
-    facts.checks = pages(`commits/${facts.head}/check-runs?filter=all`, 'check_runs', 'total_count')
+    facts.checks = pages(`commits/${facts.head}/check-runs?filter=latest`, 'check_runs', 'total_count')
       .map(check => ({ ...check, appId: check.app?.id ?? null }));
     if (api(`pulls/${num}`)?.head?.sha !== facts.head) throw Error('head moved');
   } catch {

@@ -94,8 +94,16 @@ describe('mechanical clearance', () => {
     const f = facts(); f.rollup.headOid = f.rollup.commitOid = head.toUpperCase();
     expect(validateMechanicalClearance(f).cleared).toBe(true);
   });
-  it('successful rerun supersedes an old failed run through the GitHub rollup', () => {
-    const f = facts(); f.checks.unshift({ ...f.checks[0], conclusion: 'FAILURE', id: 0 });
+  for (const conclusion of ['FAILURE', 'SKIPPED', 'NEUTRAL', 'CANCELLED']) {
+    fail(`duplicate required app run with ${conclusion} refuses despite SUCCESS rollup`, 'checks', f => {
+      f.checks.unshift({ ...f.checks[0], conclusion, id: 0 });
+    });
+  }
+  fail('queued duplicate required app run refuses', 'checks', f => {
+    f.checks.push({ ...f.checks[0], status: 'queued', conclusion: null, id: 2 });
+  });
+  it('duplicate required app runs clear when every occurrence succeeds', () => {
+    const f = facts(); f.checks.push({ ...f.checks[0], id: 2 });
     expect(validateMechanicalClearance(f).cleared).toBe(true);
   });
   fail('required check only from another app', 'checks', f => f.checks[0].appId = 42);
@@ -136,8 +144,29 @@ const io = ({ moved = false, broken = null, truncated = false, mutate = (_url, v
 };
 describe('IO closes on incomplete evidence', () => {
   const read = options => readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: io(options) });
-  it('clears a pinned snapshot with realistic lowercase REST check-run success conclusions', () => expect(validateMechanicalClearance(read()).cleared).toBe(true));
-  for (const conclusion of ['failure', 'cancelled', 'timed_out']) {
+  it('clears latest success from app 15368 with realistic lowercase REST conclusions', () => expect(validateMechanicalClearance(read()).cleared).toBe(true));
+  it('audit: older smoke success cannot mask latest skipped with SUCCESS rollup; requests filter=latest', () => {
+    const calls = [];
+    const reader = io({ mutate: (url, value) => {
+      if (!url.includes('/check-runs')) return value;
+      const older = value.check_runs.find(check => check.name === 'smoke');
+      const latest = { ...older, id: 99, conclusion: 'skipped', started_at: '2026-11-10T13:00:00Z' };
+      const check_runs = value.check_runs.map(check => check.name === 'smoke' ? latest : check);
+      if (!url.includes('filter=latest')) check_runs.unshift(older);
+      return { total_count: check_runs.length, check_runs };
+    } });
+    const f = readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: (file, args) => {
+      calls.push(args.join(' '));
+      return reader(file, args);
+    } });
+    expect(f.rollup.state).toBe('SUCCESS');
+    expect(validateMechanicalClearance(f)).toMatchObject({ cleared: false, rule: 'checks' });
+    expect(calls.filter(call => call.includes('/check-runs'))).toEqual([
+      `api repos/owner/repo/commits/${head}/check-runs?filter=latest&per_page=100&page=1`,
+    ]);
+    expect(calls.some(call => call.includes('filter=all'))).toBe(false);
+  });
+  for (const conclusion of ['failure', 'cancelled', 'timed_out', 'neutral']) {
     it(`refuses a required REST check-run with lowercase ${conclusion}`, () => {
       const mutate = (url, value) => url.includes('/check-runs') ? { ...value,
         check_runs: value.check_runs.map((check, index) => index === 0 ? { ...check, conclusion } : check) } : value;
@@ -193,7 +222,7 @@ describe('IO closes on incomplete evidence', () => {
   it('any API failure', () => expect(validateMechanicalClearance(read({ broken: 'repos/owner/repo/pulls/1' })).rule).toBe('read-error'));
   for (const suffix of ['pulls/1/commits?per_page=100&page=1', `compare/${'b'.repeat(40)}...${head}?per_page=100&page=1`,
     `git/trees/${head}`, 'git/trees/scripts-tree', 'git/trees/ci-tree', 'git/blobs/blob', 'git/blobs/base-blob',
-    `commits/${head}/check-runs?filter=all&per_page=100&page=1`]) {
+    `commits/${head}/check-runs?filter=latest&per_page=100&page=1`]) {
     it(`read failure at ${suffix}`, () => expect(validateMechanicalClearance(read({ broken: `repos/owner/repo/${suffix}` })).rule).toBe('read-error'));
   }
   for (const [name, mutate] of [
