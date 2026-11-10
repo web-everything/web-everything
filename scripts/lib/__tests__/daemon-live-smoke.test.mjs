@@ -1062,6 +1062,26 @@ describe('runLiveSmoke — injected runChild', () => {
     expect(result.pass).toBe(false);
   });
 
+  it('release failure reports bounded UNPUSHED_WORK after deprecation noise', async () => {
+    const reason = '  lane-3: UNPUSHED_WORK — unpushed commits: abc123def456; lane and lease kept.';
+    const runChild = vi.fn(async (_cmd, args) => {
+      if (args[1] === 'acquire') return '{"lane":3}';
+      if (args[1] === 'release') throw Object.assign(new Error('punycode deprecation'), {
+        status: 1, stderr: `punycode deprecation\n${reason}${'x'.repeat(2000)}\n`,
+      });
+      return args[1] === 'list' ? '[]' : '';
+    });
+    const result = await runLiveSmoke({ root: '/x', env: {}, runChild });
+    const row = result.results.find(r => r.name === 'lane-acquire-release');
+    expect(row.ok).toBe(false);
+    expect(row.detail).toContain(reason.trim());
+    expect(row.detail).toContain('(truncated)');
+    expect(row.detail.length).toBeLessThan(1300);
+    const releases = runChild.mock.calls.filter(([, args]) => args[1] === 'release');
+    expect(releases).toHaveLength(1);
+    expect(releases.every(([, args]) => !args.includes('--discard') && !args.includes('--force'))).toBe(true);
+  });
+
   // #4139 — live incident (backlog card 4061, row 1): a stray `lane-999999` reached the REAL shared
   // `~/workspace/.lanes/web-everything` pool from a supposedly-isolated test world. Root cause traced to this
   // exact gap: `checkLanePoolList`/`checkLaneAcquireRelease` never forwarded the `env` passed into

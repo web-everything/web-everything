@@ -397,8 +397,12 @@ const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?
 // listing, a config scrub). Live 2026-11-01: the detail showed "lane-33: reclaiming 127 … safe to drop" for an
 // acquire that actually failed on a lane-hold + busy pool, so the busy-pool classifier never saw "no free lane".
 export const lanePoolFailureLine = (e) => {
-  const reason = String(e?.stderr ?? '').split(/\r?\n/).filter((l) => l.startsWith('✗ ')).pop();
-  return reason && Number.isInteger(e?.status) ? `exited ${e.status}: ${reason.slice(2)}` : firstLine(e);
+  const lines = String(e?.stderr ?? '').split(/\r?\n/);
+  const reason = lines.filter(l => /UNPUSHED_WORK|^✗ /.test(l)).pop();
+  if (!reason) return firstLine(e);
+  const clean = reason.replace(/^✗ /, '').trim().replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+  const bounded = clean.length > 1000 ? `${clean.slice(0, 1000)}… (truncated)` : clean;
+  return Number.isInteger(e?.status) ? `exited ${e.status}: ${bounded}` : bounded;
 };
 
 async function checkLaneAcquireRelease(ctx) {
@@ -461,7 +465,7 @@ async function checkLaneAcquireRelease(ctx) {
     // A stuck release still leaves a REAL lease held against the live pool — surfacing it as a gate failure
     // (never swallowed) is deliberate: a leaked smoke lease is exactly the kind of thing that should block
     // adopting the code that caused it, not just get logged and forgotten.
-    return { ok: false, detail: `acquired lane-${laneNum} but release failed (lease leaked — needs a hand release): ${firstLine(e)}`, lane: laneNum, ...childFailureDiagnostics(e) };
+    return { ok: false, detail: `acquired lane-${laneNum} but release failed (lease may remain — needs a hand release): ${lanePoolFailureLine(e)}`, lane: laneNum, ...childFailureDiagnostics(e) };
   }
 }
 
