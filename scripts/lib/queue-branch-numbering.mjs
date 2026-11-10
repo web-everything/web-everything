@@ -11,6 +11,7 @@ import { numberPendingHashes } from '../lane-drain.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { queueStatePath } from './drain-merge-strategy.mjs';
 import { workflowEditHold } from './merge-queue-enqueue.mjs';
+import { proveHumanOnlyLicense as defaultProveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 
 const SETTING = 'scripts/settings/merge-queue-numbering.json';
@@ -367,7 +368,8 @@ export function finishBranchPreparation(out, { c, revalidationAborted, needsAcce
 
 /** Number only drain-eligible queue entries; alert humans to dequeue held hash cards for branch numbering. */
 export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFileSync, log = process.stderr,
-  prepare = prepareBranchBeforeEnqueue, isOpen, emit = appendDaemonEvent } = {}) {
+  prepare = prepareBranchBeforeEnqueue, isOpen, emit = appendDaemonEvent,
+  proveHumanOnlyLicense = defaultProveHumanOnlyLicense } = {}) {
   const result = { dequeued: [], numbered: [], skipped: [], errors: [] };
   const event = (kind, pr, detail) => {
     try { void Promise.resolve(emit({ kind, pr, daemon: 'drain', detail })).catch(() => {}); }
@@ -410,7 +412,14 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
           continue;
         }
         const hold = workflowEditHold({ files: changedFiles, expectedCount: changedFiles.length });
-        if (hold.hold) {
+        let licensed = false;
+        if (hold.humanOnly) {
+          try {
+            const license = proveHumanOnlyLicense({ repo, pr: pr.number, headSha: pr.headRefOid, cwd, exec });
+            licensed = license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
+          } catch { /* Unreadable approval retains the human-only hold. */ }
+        }
+        if (hold.hold && !licensed) {
           skip(pr.number, hold.humanOnly ? 'human-only' : 'changed-files-unreadable', files);
           continue;
         }
