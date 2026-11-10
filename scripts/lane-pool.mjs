@@ -35,6 +35,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
  *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved] [--discard]   # #2275 hand a leased lane back to the pool (own lease, or --force); refuses unpushed commits or tracked changes unless --discard explicitly accepts their loss; #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
  *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
+ *   node scripts/lane-pool.mjs salvage-unpushed [--dry-run]  # park free lanes’ branch/HEAD/stash tips on origin, verify all SHAs, then reset; never touches live leases
  *   node scripts/lane-pool.mjs trim    [--max=N] [--dry-run] [--json]  # #4025 shrink the pool toward a cap (default per-repo, `LANE_POOL_TRIM_MAX` overridable): deletes HIGHEST-numbered lane dirs first among those with no live (or provably dead) lease, never reserved, nothing uncommitted beyond the scratch allowlist, and every ahead commit provably pushed — a lane with real unpushed/uncommitted work is reported, never removed. Crash-safe (rename to `.trash-<n>` then delete). Wired into `scripts/conveyor/lane-pool-health-watch.mjs`'s periodic pass.
  *   node scripts/lane-pool.mjs map     --lane=N --item=NNN[,NNN…]   # register item(s) → lane page-port (#2139 proxy)
  *   node scripts/lane-pool.mjs unmap   (--item=NNN[,…] | --lane=N | --all)   # drop lane-ports registry entries
@@ -2291,7 +2292,7 @@ function scrubClaimedLaneConfig(dir, reason) {
   return removed.length ? undefined : dietConfig;
 }
 
-function provisionClaimedLane(repo, chosen, targetWasReserved) {
+function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructiveStep = () => {} } = {}) {
   const dir = laneDir(repo, chosen);
   const dietConfig = scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
@@ -2378,7 +2379,9 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     if (held) throw Object.assign(new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`), { laneHoldRefusal: true });
     acquireResetSnapshots.set(chosen, before);
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
+    beforeDestructiveStep();
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
+    beforeDestructiveStep();
     git(['clean', '-fd', '--quiet'], dir);
       return { before, baseRef };
     };
@@ -2743,6 +2746,8 @@ async function cmdAcquire(repo) {
           // Probe before --no-reset's safety check too: otherwise unreadable history is merely refused
           // there and retried on every acquire instead of being persistently quarantined.
           requireReadableLaneHistory(repo, pick);
+          const work = acquireBlockingWork(repo, laneDir(repo, pick));
+          if (work.commits !== '') throw new Error(`lane-${pick} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
           // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
@@ -2895,6 +2900,10 @@ async function cmdAcquire(repo) {
   if (flags.lane !== undefined) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
+      if (!targetWasReserved) {
+        const work = acquireBlockingWork(repo, dir);
+        if (work.commits !== '') throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually`);
+      }
       provisionClaimedLane(repo, chosen, targetWasReserved);
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
@@ -3082,8 +3091,31 @@ function releaseTrackedChanges(dir) {
 // fetched is skipped (`--ignore-missing`); if that leaves commits unproven, one hardened object-only fetch of the origin
 // heads runs (into a private ref namespace it deletes again, never refs/remotes/*) and the check repeats. A failed
 // listing or fetch never releases: it keeps the stricter result.
+function releaseLocalWorkTips(dir) {
+  // A stash holds tracked work too: every stash entry (refs/stash and its reflog) is a tip like any branch.
+  const stashRef = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/stash'], dir);
+  const stashes = stashRef ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : stashRef;
+  if (stashes === null) return null;
+  // The ref itself too: a stash ref with an expired, deleted or never-written reflog lists no entries.
+  // Every local tip is listed explicitly and must have its object: `--ignore-missing` (needed for the unfetched origin
+  // tips below) would otherwise silently drop a branch, HEAD or stash tip whose object the lane deleted, and so prove
+  // nothing about it. for-each-ref still lists a broken ref, so a missing object is caught here and fails closed.
+  // Only HEAD, local branches and the stash are lane work: lane acquire resets the checked-out branch and worktree
+  // only, so a commit held under another namespace (refs/tags/*, refs/salvage/*, refs/work/*) stays in the clone.
+  const localHeads = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/heads/'], dir);
+  const headSha = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
+  if (localHeads === null || !headSha) return null;
+  const tips = [headSha, ...localHeads.split('\n'), ...(stashRef ? stashRef.split('\n') : []),
+    ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  const present = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], dir,
+    { stdio: ['pipe', 'pipe', 'pipe'], input: tips.map(sha => `${sha}\n`).join('') });
+  const presentLines = present === null ? [] : present.split('\n');
+  if (presentLines.length !== tips.length || !presentLines.every(line => / commit$/.test(line))) return null;
+  return { tips: [...new Set(tips)], stashes: [...new Set([...(stashRef ? stashRef.split('\n') : []), ...(stashes ? stashes.split('\n') : [])])] };
+}
+
 const releaseRemoteHeads = new Map();
-function releaseUnprovenCommits(dir, salvage, proof) {
+function releaseUnprovenCommits(dir, salvage, proof, { allowFetch = true } = {}) {
   // On a refusal without remote proof, name the commits local tracking refs do not cover. This is an operator hint
   // for the message only; it never authorizes a release.
   const refused = why => ({ commits: null, why, hint: releaseEvidenceGit(['rev-list', '--max-count=20', 'HEAD', '--branches', '--not',
@@ -3094,31 +3126,15 @@ function releaseUnprovenCommits(dir, salvage, proof) {
     try { heads = proof.io.remoteHeads(); } catch (e) { return refused(msgOf(e)); }
     if (proof.key) releaseRemoteHeads.set(proof.key, heads);
   }
-  // A stash holds tracked work too: every stash entry (refs/stash and its reflog) is a tip like any branch.
-  const stashRef = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/stash'], dir);
-  const stashes = stashRef ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : stashRef;
-  if (stashes === null) return { commits: null };
-  // The ref itself too: a stash ref with an expired, deleted or never-written reflog lists no entries.
-  // Every local tip is listed explicitly and must have its object: `--ignore-missing` (needed for the unfetched origin
-  // tips below) would otherwise silently drop a branch, HEAD or stash tip whose object the lane deleted, and so prove
-  // nothing about it. for-each-ref still lists a broken ref, so a missing object is caught here and fails closed.
-  // Only HEAD, local branches and the stash are lane work: lane acquire resets the checked-out branch and worktree
-  // only, so a commit held under another namespace (refs/tags/*, refs/salvage/*, refs/work/*) stays in the clone.
-  const localHeads = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/heads/'], dir);
-  const headSha = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
-  if (localHeads === null || !headSha) return { commits: null };
-  const tips = [headSha, ...localHeads.split('\n'), ...(stashRef ? stashRef.split('\n') : []),
-    ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
-  const present = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], dir,
-    { stdio: ['pipe', 'pipe', 'pipe'], input: tips.map(sha => `${sha}\n`).join('') });
-  const presentLines = present === null ? [] : present.split('\n');
-  if (presentLines.length !== tips.length || !presentLines.every(line => / commit$/.test(line))) return { commits: null };
+  const local = releaseLocalWorkTips(dir);
+  if (!local) return { commits: null };
+  const { tips } = local;
   const input = [...tips, ...[...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
     .map(line => `${line}\n`).join('');
   const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir,
     { stdio: ['pipe', 'pipe', 'pipe'], input });
   let commits = unproven();
-  if (commits === '') return { commits };
+  if (commits === '' || !allowFetch) return { commits };
   // The verification fetch must never move lane work (PR #6319, R639). Refuse up front on a symbolic tracking ref a
   // fetch could write through, snapshot every local branch, the stash and HEAD around the (object-only) fetch, and
   // refuse naming the ref if anything moved — without recomputing the proof against the changed refs.
@@ -3155,6 +3171,109 @@ function releaseUnprovenCommits(dir, salvage, proof) {
     return { commits, note: `${moved.slice(0, 5).join(', ')}${moved.length > 5 ? ` (+${moved.length - 5} more)` : ''} changed during the verification fetch; inspect the lane manually` };
   }
   return { commits: unproven() };
+}
+
+// Acquire and salvage use the release evidence, including ALL branches, HEAD and stash reflog tips.
+// Acquire may use the release proof's safe object-only fetch when origin advanced beyond the lane's objects.
+// Salvage defaults to read-only evidence so --dry-run never fetches or writes temporary refs.
+function unpushedLaneWork(repo, dir, { allowFetch = false } = {}) {
+  const redirect = releaseGitDirRedirect(dir);
+  if (redirect) return { commits: null, why: redirect };
+  const io = repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
+  return releaseUnprovenCommits(dir, null, { io }, { allowFetch });
+}
+
+/** Acquire's view of unpushed work: the strict preservation evidence minus commits that are patch-equivalent to
+ *  origin/<branch> (squash-merged work is safe to drop, the same relaxation `list --acquirable` applies). Unreadable
+ *  evidence (commits === null) and any genuinely unmatched commit, stash included, still block. */
+function acquireBlockingWork(repo, dir) {
+  const work = unpushedLaneWork(repo, dir, { allowFetch: true });
+  if (!work.commits) return work;
+  const local = releaseLocalWorkTips(dir);
+  if (!local) return work;
+  const real = new Set();
+  for (const tip of local.tips) {
+    const out = releaseEvidenceGit(['rev-list', '--right-only', '--cherry-pick', `origin/${repo.branch}...${tip}`], dir);
+    if (out === null) return work;
+    for (const sha of out.split('\n')) if (sha) real.add(sha);
+  }
+  const left = work.commits.split('\n').filter(sha => sha && real.has(sha));
+  return { ...work, commits: left.join('\n') };
+}
+
+/** Park abandoned commits on the canonical remote before recycling a free lane. An exclusive lease spans
+ *  the evidence read, every push + SHA verification, and the normal acquire reset. No live holder is touched.
+ *  Unknown evidence fails closed: restore/inspect the lane manually, then retry salvage-unpushed. */
+async function salvageUnpushed(repo, { dryRun = false } = {}) {
+  if (flags['no-reset'] || flags.base || flags.force || flags.reserve) throw new Error('salvage-unpushed requires the normal reset (no --no-reset, --base, --force or --reserve)');
+  let failed = false;
+  for (const n of existingLanes(repo)) {
+    const dir = laneDir(repo, n);
+    if (liveLease(dir, Date.now(), ttlMsFromFlags())) continue;
+    let claim = null;
+    try {
+      if (!dryRun) {
+        const session = `salvage-unpushed-${process.pid}-${randomBytes(4).toString('hex')}`;
+        if (!tryClaimLane(dir, session, Date.now(), ttlMsFromFlags())) continue;
+        const acquired = readLease(dir);
+        if (acquired?.session !== session) throw new Error('lease changed before salvage; no reset');
+        claim = acquired;
+        journalLaneEvent(dir, { action: 'salvage-claim', reason: 'exclusive hold for unpushed-work salvage' });
+      }
+      const work = unpushedLaneWork(repo, dir);
+      if (work.commits === null) throw new Error(`incomplete preservation evidence: ${work.why || 'unreadable local refs/objects'}; inspect lane manually`);
+      if (work.commits === '') continue;
+      const local = releaseLocalWorkTips(dir);
+      if (!local) throw new Error('unreadable local tips; inspect lane manually');
+      // Never erase tracked edits that are not represented by a commit or stash.
+      const tracked = releaseTrackedChanges(dir);
+      if (tracked !== '') throw new Error('tracked changes or unreadable worktree evidence; commit/stash work and retry');
+      const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+      const base = `lane/salvage-lane-${n}-${stamp}-parked`;
+      const stashSet = new Set(local.stashes);
+      const refs = local.tips.filter(sha => !stashSet.has(sha)).map((sha, i) => ({ sha, ref: i ? `${base}-tip${i}` : base }));
+      refs.push(...local.stashes.map((sha, i) => ({ sha, ref: `${base}-stash${i}` })));
+      if (dryRun) {
+        log(`salvage-unpushed lane-${n}: would push and verify ${refs.map(({ ref, sha }) => `${ref}=${sha}`).join(', ')}, then reset and clear stash`);
+        continue;
+      }
+      const io = realSalvageIo({ repo, preflightLaneDir: dir });
+      for (const { ref, sha } of refs) {
+        // Refuse known collisions early; the create-only push also closes the race after this inspection.
+        if (io.remoteSha(ref) !== null) throw new Error(`salvage ref already exists: ${ref}; retry next second`);
+        if ((await io.push(dir, ref, sha, { createOnly: true }))?.ok !== true) throw new Error(`push failed: ${ref}`);
+        if (io.remoteSha(ref) !== sha) throw new Error(`remote SHA verification failed: ${ref}`);
+        journalLaneEvent(dir, { action: 'salvage-push', reason: `verified ${ref}=${sha}`, salvagedTo: ref });
+      }
+      const assertSalvageLease = () => {
+        const lease = readLease(dir);
+        if (!sameLease(lease, claim) || isLeaseStale(lease, Date.now(), ttlMsFromFlags())) {
+          throw new Error('lease changed or expired during salvage; no further reset or stash clear');
+        }
+      };
+      assertSalvageLease();
+      const current = releaseLocalWorkTips(dir);
+      if (!current || JSON.stringify(current) !== JSON.stringify(local)) throw new Error('local tips changed during salvage; no reset');
+      journalLaneEvent(dir, { action: 'salvage-verified', reason: `all ${refs.length} remote refs verified before reset`, salvagedTo: base });
+      provisionClaimedLane(repo, n, false, { beforeDestructiveStep: assertSalvageLease });
+      assertSalvageLease();
+      git(['stash', 'clear'], dir);
+      journalLaneEvent(dir, { action: 'salvage-reset', reason: `reset after verified salvage; stash cleared`, salvagedTo: base, headAfter: laneHead(dir) });
+      log(`salvage-unpushed lane-${n}: pushed and verified ${refs.length} ref(s) under ${base}; reset, stash cleared`);
+    } catch (e) {
+      log(`salvage-unpushed lane-${n}: FAILED — ${redactUrlCredentials(msgOf(e)).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}; lane kept, inspect manually`);
+      if (!dryRun) journalLaneEvent(dir, { action: 'salvage-refused', reason: 'salvage failed; inspect lane manually', loud: true });
+      failed = true;
+      process.exitCode = 1;
+    } finally {
+      if (claim) {
+        if (takeMarkerIf(dir, moved => sameLease(moved, claim), n)) {
+          journalLaneEvent(dir, { action: 'salvage-unclaim', reason: 'unpushed-work salvage hold released' });
+        }
+      }
+    }
+  }
+  return !failed;
 }
 
 // A lane-written `.git/commondir` (or a `.git` gitfile / symlink) moves refs, objects and config to another
@@ -5332,6 +5451,7 @@ async function recoverRepoPool(repo, lanes = classifyLaneNames(readdirSync(repo.
   return result;
 }
 async function cmdGc(repo) {
+  const salvage = async () => { try { return await salvageUnpushed(repo, { dryRun: !!flags['dry-run'] }); } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
   const heal = () => { try { healSiblings(repo); } catch (e) { log(`heal-siblings skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); } };
   const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
   const recover = async () => {
@@ -5342,12 +5462,13 @@ async function cmdGc(repo) {
     }
     try { await recoverRepoPool(repo); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   };
-  if (!flags.watch) { heal(); const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
+  if (!flags.watch) { heal(); await salvage(); const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
   const tick = async () => {
     let interval = 60000; // unreadable policy refuses the pass, then retries policy later
     try {
       interval = loadHostOverloadSettings({ log }).settings.lanes.gc.schedule;
       heal();
+      await salvage();
       const result = pass();
       if (result.ran) await recover();
     } catch (e) { log(`gc skipped: ${e.message}`); }
@@ -5363,6 +5484,7 @@ const COMMANDS = {
   // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
   gc: cmdGc,
   'heal-siblings': cmdHealSiblings,
+  'salvage-unpushed': repo => salvageUnpushed(repo, { dryRun: !!flags['dry-run'] }),
   provision: cmdProvision,
   refresh: cmdRefresh,
   status: printStatus,
@@ -5382,12 +5504,13 @@ const COMMANDS = {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
-    'usage: lane-pool.mjs <gc|heal-siblings|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
+    'usage: lane-pool.mjs <gc|heal-siblings|salvage-unpushed|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
       '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
       '  # heal-siblings [--dry-run] (R817): recreate an absent/dangling pool-root frontierui/plateau-app clone and remove only a dangling symlink at <primary>/<name>; gc calls it each pass\n' +
+      '  # salvage-unpushed [--dry-run]: park all abandoned branch/HEAD/stash tips on origin, verify each SHA, then reset; gc calls it each pass\n' +
       '  # gc/acquire auto-recover backed-up lanes; disable with LANE_POOL_AUTO_RECOVER=0 or LANE_POOL_NO_RECOVER=1\n' +
       '  # status --leased-only (#4345): skip git for every unleased lane, keep the full probe only for leased ones\n' +
       '  # acquire (auto-pick, no --lane): on a full pool, grows it by up to --growth-max-new=N new lanes (default 4, env ' +
