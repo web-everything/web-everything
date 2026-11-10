@@ -102,6 +102,30 @@ describe('fix-ready-record', () => {
       expect(existsSync(`${file}.lock`)).toBe(false);
     }
   });
+  it('does not cut back bytes another writer appended while this write was failing', () => {
+    const file = tmp();
+    const other = `${JSON.stringify({ ref: 'lane/other', sha: 'a'.repeat(40), tests: 'green', audit: 'NOT WEAKENED' })}\n`;
+    let calls = 0;
+    const fsApi = {
+      ...fs,
+      writeSync: (fd, buf, off = 0, len = buf.length - off) => {
+        if (calls++ === 0) return fs.writeSync(fd, buf, off, 5);
+        fs.appendFileSync(file, other); // a writer that took over the stale lock appends meanwhile
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      },
+    };
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/NOT cut back/);
+    expect(readFileSync(file, 'utf8').endsWith(other)).toBe(true);
+  });
+  it('refuses a record too large for the adoption matrix reader to keep (it reads only the last 1 MiB)', () => {
+    const file = tmp();
+    const r = writeReadyRecord({ ...base, audit: 'WEAKENED', auditRuling: 'R816', auditDisclosed: ['x'.repeat(70 * 1024)] }, { file });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/limit is 65536/);
+    expect(existsSync(file)).toBe(false);
+  });
   it('keeps both records parseable when the existing file has no trailing newline', () => {
     const file = tmp();
     const first = { ref: 'lane/older', sha: 'a'.repeat(40), tests: 'green', audit: 'NOT WEAKENED' };

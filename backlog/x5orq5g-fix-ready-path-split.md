@@ -19,6 +19,7 @@ The fix-ready ledger has two readers with two path rules: prototype-load reads s
 - [A3] **Must** — `main()` refuses with exit 1, writes nothing and names both files when `WE_FIX_READY_PATH` or `fixReadyPath` points the adoption matrix at a different file (test: "main refuses (exit 1) when an override sends the adoption matrix to a different file").
 - [A4] **Must** — unreadable or malformed adoption-matrix settings fail closed with exit 2 and write nothing (test: "main fails closed (exit 2) when the adoption-matrix settings cannot be read").
 - [A5] **Must** — a write that is short, throws or makes no progress never leaves a torn line: the ledger is cut back to its previous length and the writer reports failure (tests: "finishes a short write…", "refuses and cuts the ledger back when a write fails part-way…").
+- [A6] **Must** — the cut-back never deletes bytes another writer appended (test: "does not cut back bytes another writer appended…"), and a record over 64 KiB is refused because the adoption matrix reader keeps only the last 1 MiB of the ledger (test: "refuses a record too large…").
 
 ## Non-goals
 

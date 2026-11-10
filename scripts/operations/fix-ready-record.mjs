@@ -50,6 +50,7 @@ export function buildReadyRecord({ ref, sha, tests, audit, auditRuling, auditDis
 }
 
 const LOCK_STALE_MS = 30_000;
+const MAX_RECORD_BYTES = 64 * 1024;
 
 /** Reads the ledger text; a missing file is an empty ledger. Returns {text} or {error}. */
 function readLedger(file, fsApi) {
@@ -94,8 +95,8 @@ function releaseLock(lock, token, fsApi) {
 function appendAll(fd, buf, fsApi) {
   let start;
   try { start = fsApi.fstatSync(fd).size; } catch (e) { return { ok: false, error: `write failed: cannot stat ledger: ${e.message}` }; }
+  let off = 0;
   try {
-    let off = 0;
     while (off < buf.length) {
       const n = fsApi.writeSync(fd, buf, off, buf.length - off);
       if (!Number.isInteger(n) || n <= 0) throw new Error(`short write: ${off} of ${buf.length} bytes`);
@@ -104,7 +105,12 @@ function appendAll(fd, buf, fsApi) {
     return { ok: true };
   } catch (e) {
     let cut = 'ledger cut back to its previous length';
-    try { fsApi.ftruncateSync(fd, start); } catch (t) { cut = `ledger NOT cut back: ${t.message}`; }
+    try {
+      // Cut back only our own partial bytes: if the file is longer than start+off, someone else appended after the
+      // lock was taken over, and truncating would delete their data.
+      if (fsApi.fstatSync(fd).size === start + off) fsApi.ftruncateSync(fd, start);
+      else cut = 'ledger NOT cut back: it changed size during the write (another writer appended)';
+    } catch (t) { cut = `ledger NOT cut back: ${t.message}`; }
     return { ok: false, error: `write failed: ${e.message}; ${cut}` };
   }
 }
@@ -123,6 +129,9 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
   if (!built.ok) return built;
   const { ref, sha } = built.record;
   const line = JSON.stringify(built.record);
+  // The adoption matrix reads only the last 1 MiB of the ledger; a record near that size would be written, reported as
+  // success, then cut by the reader's tail slice. Refuse it instead.
+  if (Buffer.byteLength(line) > MAX_RECORD_BYTES) return { ok: false, error: `record is ${Buffer.byteLength(line)} bytes; the limit is ${MAX_RECORD_BYTES} (the reader keeps only the last 1 MiB of the ledger)` };
   const canon = (r) => JSON.stringify(Object.fromEntries(Object.entries(r).sort(([a], [b]) => (a < b ? -1 : 1))));
   const want = canon(built.record);
   // Key order and sha case in a hand-written ledger line must not hide an identical record.
