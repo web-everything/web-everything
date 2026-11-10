@@ -7229,6 +7229,16 @@ async function runCli() {
             requiredCheck: REQUIRED, allowPendingReview: reliefAllowsPendingNow, defaultBranch: defaultBranchOf(c.repo),
             expectedHeadSha: c.listedHeadSha || c.headSha || null,
           });
+          // R861 — repeat clearance at final pre-merge revalidation, against the same merge pin.
+          if (revalidated.decision === 'merge' && c.labelOnlyCertified
+            && (!c.authorLogin || ['web-everything[bot]', 'app/web-everything'].includes(c.authorLogin))) {
+            let result;
+            try {
+              const repo = memoRepo(c.repo).replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$/, '');
+              result = decideMechanicalClearance({ repo, num: c.num });
+            } catch { result = { cleared: false, rule: 'read-error' }; }
+            Object.assign(revalidated, decideMechanicalMergeGuard({ ...c, ...revalidated }, result));
+          }
           if (revalidated.decision !== 'merge') {
             // xvzc4v4 advisory fix — a PR merged out-of-band before its turn (the GitHub UI, another process) can
             // fail revalidation (a MERGED PR is not landable, or the fresh read itself missed); it still needs its

@@ -1,7 +1,7 @@
 /** @file Mechanical refresh admission: injected evidence, never network. */
 import { describe, it, expect } from 'vitest';
 import { validateMechanicalClearance, readMechanicalClearanceFacts, recordMechanicalClearance, decideMechanicalLabelStrip,
-  REQUIRED_MECHANICAL_CHECKS } from '../mechanical-clearance.mjs';
+  REQUIRED_MECHANICAL_CHECKS, GITHUB_ACTIONS_APP_ID } from '../mechanical-clearance.mjs';
 
 const head = 'a'.repeat(40);
 const path = 'scripts/ci/test-timings.json';
@@ -11,7 +11,7 @@ const facts = () => ({ head, author: { login: 'web-everything[bot]', type: 'Bot'
   files: [{ filename: path, status: 'modified' }],
   baseEntry: { type: 'blob', mode: '100644' }, headEntry: { type: 'blob', mode: '100644' },
   content: JSON.stringify({ _doc: 'Seconds', unit: { [testPath]: 450 }, soak: {} }),
-  existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, conclusion: 'SUCCESS', status: 'completed', id: 1 })) });
+  existingFiles: [testPath], checks: REQUIRED_MECHANICAL_CHECKS.map(name => ({ name, appId: GITHUB_ACTIONS_APP_ID, conclusion: 'SUCCESS', status: 'completed', id: 1 })) });
 
 describe('mechanical clearance', () => {
   it('clears the refresh workflow identities and seconds', () => expect(validateMechanicalClearance(facts()).cleared).toBe(true));
@@ -40,8 +40,17 @@ describe('mechanical clearance', () => {
   for (const conclusion of ['FAILURE', 'PENDING', 'CANCELLED', 'NEUTRAL', 'SKIPPED', null]) fail(`required check ${conclusion}`, 'checks', f => f.checks[0].conclusion = conclusion);
   fail('missing required check', 'checks', f => f.checks.pop());
   fail('nonrequired failure', 'checks', f => f.checks.push({ name: 'other', conclusion: 'TIMED_OUT' }));
-  it('uses latest required run', () => { const f = facts(); f.checks.push({ name: 'test', conclusion: 'PENDING', id: 2 }); expect(validateMechanicalClearance(f).rule).toBe('checks'); });
-  it('successful rerun supersedes an old failed run', () => { const f = facts(); f.checks.unshift({ name: 'test', conclusion: 'FAILURE', id: 0 }); expect(validateMechanicalClearance(f).cleared).toBe(true); });
+  it('uses latest required run', () => { const f = facts(); f.checks.push({ name: 'test', appId: GITHUB_ACTIONS_APP_ID, conclusion: 'PENDING', id: 2 }); expect(validateMechanicalClearance(f).rule).toBe('checks'); });
+  it('successful rerun supersedes an old failed run', () => { const f = facts(); f.checks.unshift({ name: 'test', appId: GITHUB_ACTIONS_APP_ID, conclusion: 'FAILURE', id: 0 }); expect(validateMechanicalClearance(f).cleared).toBe(true); });
+  fail('another app newer success cannot mask a failed Actions check', 'checks', f => {
+    f.checks[0].conclusion = 'FAILURE';
+    f.checks.push({ ...f.checks[0], appId: 42, id: 99, conclusion: 'SUCCESS' });
+  });
+  fail('same-name failure from another app cannot be masked by Actions success', 'checks', f => {
+    f.checks.push({ ...f.checks[0], appId: 42, id: 0, conclusion: 'FAILURE' });
+  });
+  fail('required check only from another app', 'checks', f => f.checks[0].appId = 42);
+  fail('required check missing app id', 'checks', f => delete f.checks[0].appId);
   fail('compare cap', 'read-error', f => f.files = Array(300).fill(f.files[0]));
   fail('oversized blob requires normal review', 'read-error', f => f.content = ' '.repeat(4 * 1024 * 1024 + 1));
   fail('too many timing keys requires normal review', 'schema', f => f.content = JSON.stringify({ unit: Object.fromEntries(Array.from({ length: 20001 }, (_, i) => [`${i}.test.ts`, 1])) }));
@@ -68,7 +77,7 @@ const io = ({ moved = false, broken = null, truncated = false, mutate = (_url, v
           : [{ path: 'scripts', type: 'tree', sha: 'scripts-tree' }] };
     } else if (url.includes('/git/blobs/')) { const content = facts().content; value = { encoding: 'base64', content: Buffer.from(content).toString('base64'), size: Buffer.byteLength(content) }; }
     else if (url.includes('/check-runs')) value = { total_count: 5, check_runs: REQUIRED_MECHANICAL_CHECKS.map((name, index) => ({
-      name, id: index + 1, head_sha: head, status: 'completed', conclusion: 'success', started_at: '2026-11-10T12:00:00Z',
+      name, app: { id: GITHUB_ACTIONS_APP_ID }, id: index + 1, head_sha: head, status: 'completed', conclusion: 'success', started_at: '2026-11-10T12:00:00Z',
     })) };
     else if (url.includes('/statuses')) value = [];
     else throw Error(`unexpected request ${url}`);
@@ -194,8 +203,8 @@ describe('independent check kinds', () => {
     const f = readMechanicalClearanceFacts({ repo: 'owner/repo', num: 1, exec: io({ mutate: (url, v) =>
       url.includes('/check-runs') ? { ...v, check_runs: v.check_runs.map(c => c.name === 'test' ? { ...c, conclusion: 'failure' } : c) }
         : url.includes('/statuses') ? [{ context: 'test', state: 'success', id: 99, created_at: '2026-11-11T12:00:00Z' }] : v }) });
-    expect(f.checks[0].kind).toBe('check-run');
-    expect(f.checks.at(-1).kind).toBe('status');
+    expect(f.checks[0]).toMatchObject({ kind: 'check-run', appId: GITHUB_ACTIONS_APP_ID });
+    expect(f.checks.at(-1)).toMatchObject({ kind: 'status', appId: null });
     expect(validateMechanicalClearance(f).rule).toBe('checks');
   });
 });

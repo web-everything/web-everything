@@ -355,6 +355,60 @@ describe('R861 merge-time mechanical clearance', () => {
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', ...extra }]]]),
       readOf: () => ({ commits }) })[0];
 
+  const runFinalGuard = (candidate, decide) => {
+    const start = source.indexOf('          // R861 — repeat clearance at final pre-merge revalidation');
+    const end = source.indexOf('          // card xs1hdl7', start);
+    expect(start).toBeGreaterThan(source.indexOf('const revalidated = await revalidateFresh(c.repo, c.num'));
+    expect(end).toBeLessThan(source.indexOf('const traceHeadSha = revalidated.headSha', start));
+    const merge = vi.fn(), revalidationAborted = [];
+    const revalidated = { decision: 'merge', headSha: head };
+    new Function('candidate', 'revalidated', 'decideMechanicalClearance', 'decideMechanicalMergeGuard',
+      'memoRepo', 'merge', 'revalidationAborted', `
+      const remaining = [candidate], sameCand = (a, b) => a === b;
+      const isPrAlreadyMerged = () => false, noteSplit = () => {}, AS_JSON = true;
+      for (const c of [candidate]) {
+        ${source.slice(start, end)}
+        merge(c);
+      }
+    `)(candidate, revalidated, decide, decideMechanicalMergeGuard, () => 'owner/local', merge, revalidationAborted);
+    return { merge, revalidationAborted, revalidated };
+  };
+  it('refuses final same-head smoke failure after early clearance', () => {
+    const v = verdict();
+    runGuard([v], () => ({ cleared: true, head }));
+    expect(v.decision).toBe('merge');
+    const result = runFinalGuard(v, () => ({ cleared: false, head, rule: 'checks', reasons: ['smoke failed'] }));
+    expect(result.merge).not.toHaveBeenCalled();
+    expect(v.decision).toBe('skip');
+    expect(result.revalidationAborted).toEqual([{ num: 861, repo: v.repo, reason: expect.stringContaining('(checks)') }]);
+  });
+  it.each(['read-error', 'throws', 'missing', 'wrong-head', 'contradictory read-error'])('refuses final unreadable or unpinned clearance: %s', kind => {
+    const v = verdict();
+    runGuard([v], () => ({ cleared: true, head }));
+    const result = runFinalGuard(v, () => {
+      if (kind === 'throws') throw Error('unreadable');
+      if (kind === 'missing') return null;
+      return kind === 'wrong-head' ? { cleared: true, head: next }
+        : { cleared: kind === 'contradictory read-error', head, rule: 'read-error' };
+    });
+    expect(result.merge).not.toHaveBeenCalled();
+    expect(result.revalidationAborted[0].reason).toContain(kind === 'wrong-head' ? '(head)' : '(read-error)');
+  });
+  it('allows final Actions clearance on the same head case insensitively', () => {
+    const v = verdict();
+    runGuard([v], () => ({ cleared: true, head }));
+    const decide = vi.fn(() => ({ cleared: true, head: head.toUpperCase() }));
+    expect(runFinalGuard(v, decide).merge).toHaveBeenCalledOnce();
+    expect(decide).toHaveBeenCalledWith({ repo: 'owner/local', num: 861 });
+  });
+  it('leaves non-labelOnlyCertified and human verdicts untouched at the final point', () => {
+    for (const v of [verdict({ labels: ['ready-to-merge', 'review:accepted'] }), verdict({ author: { login: 'human' } })]) {
+      const decide = vi.fn(() => { throw Error('must not read'); });
+      expect(runFinalGuard(v, decide).merge).toHaveBeenCalledOnce();
+      expect(decide).not.toHaveBeenCalled();
+    }
+  });
+
   it('certifies then refuses a later non-timings push with the failing diff-scope rule', () => {
     const v = verdict();
     expect(v.decision).toBe('merge');

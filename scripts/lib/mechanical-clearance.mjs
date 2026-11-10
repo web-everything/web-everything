@@ -9,6 +9,7 @@ import { hasLabel } from './ai-pr-authorship.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const REQUIRED_MECHANICAL_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']);
+export const GITHUB_ACTIONS_APP_ID = 15368;
 const RULES = ['author', 'commit-identity', 'diff-scope', 'diff-shape', 'schema', 'keys', 'checks'];
 const IDENTITIES = new Set(['web-everything[bot]', 'github-actions[bot]']);
 const TIMINGS_PATH = 'scripts/ci/test-timings.json';
@@ -60,7 +61,7 @@ export function validateMechanicalClearance(facts = {}) {
     const rank = [Date.parse(check.started_at ?? check.created_at ?? '') || 0, Number(check.id) || 0];
     const kind = check.kind ?? 'check-run';
     if (!['check-run', 'status'].includes(kind)) return fail('checks', 'Unreadable check kind.');
-    const key = `${kind}:${check.name}`;
+    const key = JSON.stringify([kind, check.appId ?? null, check.name]);
     const previous = latest.get(key);
     if (!previous || rank[0] > previous.rank[0] || (rank[0] === previous.rank[0] && rank[1] >= previous.rank[1])) latest.set(key, { check: normalized, rank });
   }
@@ -68,9 +69,9 @@ export function validateMechanicalClearance(facts = {}) {
     ? check.conclusion !== 'SUCCESS'
     : check.status !== 'completed' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion))) return fail('checks', 'A latest head check or status failed or is incomplete; use normal review.');
   if (!REQUIRED_MECHANICAL_CHECKS.every(name => {
-    const check = latest.get(`check-run:${name}`)?.check;
+    const check = latest.get(JSON.stringify(['check-run', GITHUB_ACTIONS_APP_ID, name]))?.check;
     return check?.conclusion === 'SUCCESS' && check.status === 'completed';
-  })) return fail('checks', 'Required head checks must all have a latest successful completed run.');
+  })) return fail('checks', 'Required head checks must all have a latest successful completed GitHub Actions run.');
   return { cleared: true, rule: null, reasons: [], head };
 }
 
@@ -156,9 +157,9 @@ export function readMechanicalClearanceFacts({ repo, num, exec = execFileSyncThr
       }).filter(path => path !== null);
     }
     facts.checks = pages(`commits/${facts.head}/check-runs?filter=all`, 'check_runs', 'total_count')
-      .map(check => ({ ...check, kind: 'check-run' }));
+      .map(check => ({ ...check, kind: 'check-run', appId: check.app?.id ?? null }));
     const statuses = pages(`commits/${facts.head}/statuses`);
-    facts.checks.push(...statuses.map(status => ({ kind: 'status', name: status.context, id: status.id, created_at: status.created_at,
+    facts.checks.push(...statuses.map(status => ({ kind: 'status', appId: null, name: status.context, id: status.id, created_at: status.created_at,
       conclusion: ({ success: 'SUCCESS', failure: 'FAILURE', error: 'FAILURE', pending: 'PENDING' })[status.state] ?? 'UNKNOWN' })));
     if (api(`pulls/${num}`)?.head?.sha !== facts.head) throw Error('head moved');
   } catch {
