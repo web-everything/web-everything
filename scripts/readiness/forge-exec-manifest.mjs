@@ -104,6 +104,8 @@ const secretText=[
   [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
   [/xox[bp]-[A-Za-z0-9-]{8,}/,'slack-token'],
 ];
+// Built from parts so this file's own text never spells the marker outside the rule above.
+const PEM_RULE_SPELLING='/'+'-----'+'BEGIN/';
 export const credentialTextFinding=text=>textFinding(text);
 const textFinding=(text,patternSource=false)=>secretText.find(([pattern,rule])=>{
   if(patternSource&&rule==='pem-header')return false;
@@ -154,6 +156,7 @@ function codeExpression(value,mode='legacy') {
       if(value[i]==='$'&&value[i+1]==='{') {
         if(mode!=='source'||!safeSpan(value.slice(staticStart,i)))return false;
         let depth=1;
+        const exprStart=i+2;
         for(i+=2;i<value.length;i++) {
           // Slash syntax could be a regex literal carrying a credential; do not parse it here.
           if(value[i]==='\\'||value[i]==='`'||value[i]==='/')return false;
@@ -161,7 +164,7 @@ function codeExpression(value,mode='legacy') {
           if(value[i]==='{')depth++;
           if(value[i]==='}'&&!--depth)break;
         }
-        if(depth)return false;
+        if(depth||(value.slice(exprStart,i).match(/[\w$]+/g)??[]).some(opaqueToken))return false;
         staticStart=i+1;
       }
     }
@@ -171,7 +174,7 @@ function codeExpression(value,mode='legacy') {
   if(mode==='fixture')return !code.split(/\s+/).some(opaqueToken);
   if(mode==='source') {
     // Whole templates, or identifier/member call chains with non-opaque arguments.
-    if((code.match(/[A-Za-z_$][\w$]*/g)??[]).some(opaqueToken))return false;
+    if((code.match(/[\w$]+/g)??[]).some(opaqueToken))return false;
     return /^\s*`/.test(value)?/^\s*[,;]?\s*$/.test(code)
       :/^\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\([\w$\s.,()[\]?|]*\)(?:\.[A-Za-z_$][\w$]*\s*\([\w$\s.,()[\]?|]*\))*\s*[,;]?\s*$/.test(code);
   }
@@ -217,7 +220,7 @@ export function credentialContentFinding(path,content) {
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
   const patternSource=names.join('/')==='scripts/readiness/forge-exec-manifest.mjs'
-    &&!/^-----BEGIN [A-Z ]+-----\r?\n(?:[A-Za-z0-9+/]+={0,2})\r?$/m.test(text);
+    &&!text.replaceAll(PEM_RULE_SPELLING,'').includes(PEM_RULE_SPELLING.slice(1,-1));
   const raw=textFinding(text,patternSource);
   if(raw)return raw;
   const testSource=isTestFile(path);
