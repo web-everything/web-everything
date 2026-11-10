@@ -841,15 +841,21 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             let rawPr;
             try { rawPr = freshSettlement(row); if (!rawPr) continue; }
             catch { throw Error('evidence changed before settlement'); }
+            let publishFailure = null;
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
               io: { env, log: note,
                 // settleRedTeamSkip reaches this only once it decided policy-clear and the head shows no result.
                 postComment: ({ repo, pr, body }) => {
-                  publishPolicyClearCheck(pr, row.head);
-                  return runGhSync([
-                    'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
-                  ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
+                  // settleRedTeamSkip bounds its reason to 80 chars for the needs-you feed, which would cut a yield's
+                  // `detail` (the one fail-open case) or a comment failure's cause out of the row. Keep the full
+                  // failure text for the row; the feed keeps its bound.
+                  try {
+                    publishPolicyClearCheck(pr, row.head);
+                    return runGhSync([
+                      'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+                    ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
+                  } catch (error) { publishFailure = safeErrorText(error); throw error; }
                 },
                 publishNeedsYou: publishAttention,
               } });
@@ -857,7 +863,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note, provider: holdGuardedProvider(provider, row.head) });
             } else {
               row.action = 'skip';
-              row.why = `clear failed: ${result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
+              row.why = `clear failed: ${publishFailure ? `policy-clear comment failed: ${publishFailure}` : result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
             }
           } catch (error) {
             row.action = 'skip';

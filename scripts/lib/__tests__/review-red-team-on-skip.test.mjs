@@ -466,6 +466,12 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
         publishCheck: vi.fn(() => ({ ok: false, reason: 'policy-clear yielded to a concurrent round', detail: 'superseding in_progress not posted (HTTP 503)' })) });
       expect(runRedTeamOnSkip(yielded).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('superseding in_progress not posted (HTTP 503)') });
       expect(runGhSync).not.toHaveBeenCalled();
+      // The same 80-char feed bound must not cut a comment failure's cause out of the row either.
+      const cause = 'HTTP 502 from the comments endpoint after the check was published; retry owed on this head';
+      runGhSync.mockImplementation(() => { throw Error(cause); });
+      const commentFailed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-4'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: true })) });
+      expect(runRedTeamOnSkip(commentFailed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(cause) });
     } finally {
       runGhSync.mockReset();
       rmSync(dir, { recursive: true, force: true });
