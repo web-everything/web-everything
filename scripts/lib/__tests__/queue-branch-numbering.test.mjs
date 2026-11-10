@@ -1,9 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import * as realFs from 'node:fs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 
+vi.mock('../card-number-ledger.mjs', () => ({ appendCardLedgerRows: vi.fn(() => new Map()) }));
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
 
 describe('queue branch numbering', () => {
@@ -116,6 +117,13 @@ describe('queue branch numbering', () => {
       'Backlog file "backlog/xabc123-foo.md" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)',
     ]);
   });
+  it('mergeGroupRefusalShowsAnUntrustedCardNameOnOneLineWithoutControls', () => {
+    const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group' };
+    const hostile = ['\n', String.fromCodePoint(0x202e), String.fromCodePoint(0x85), String.fromCodePoint(0x9b), String.fromCodePoint(0x2028)];
+    const [message] = mergeGroupHashRefusals({ env, files: [`backlog/xabc123-a${hostile.join('')}b.md`] });
+    expect(message).toContain('Backlog file "backlog/xabc123-a     b.md"');
+    for (const c of hostile) expect(message).not.toContain(c);
+  });
   it('does not refuse hash cards outside merge-group CI', () => {
     for (const env of [{}, { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'merge_group' }]) {
       expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md'] })).toEqual([]);
@@ -199,6 +207,26 @@ describe('queue branch numbering', () => {
     const args = { c: { repo: 'r', num: 4, headRef: 'topic' }, traceHeadSha: 'old', cwd: '/clone', statePath: '/state/reservations.json', exec, fs, number, lock, isOpen: () => true };
     return { args, exec, fs, number, lock };
   }
+  it('shadow preserves renames, pushed head and return value; ledger failure only warns', () => {
+    const run = (shadow, fails = false) => {
+      const x = setup();
+      const append = vi.fn(() => { if (fails) throw new Error('ledger offline'); });
+      const log = { write: vi.fn() };
+      const result = prepareBranchBeforeEnqueue({ ...x.args, shadow, appendLedger: append, log });
+      return { result, numbered: x.number.mock.calls, git: x.exec.mock.calls, append, log };
+    };
+    const off = run(false), on = run(true), failure = run(true, true);
+    for (const x of [on, failure]) {
+      expect(x.result).toEqual(off.result);
+      expect(x.numbered).toEqual(off.numbered);
+      expect(x.git).toEqual(off.git);
+      expect(x.append).toHaveBeenCalledWith(expect.objectContaining({
+        repo: 'r', rows: [expect.objectContaining({ id: 'xabc123', num: 41, kind: 'shadow', pr: 4 })],
+      }));
+    }
+    expect(off.append).not.toHaveBeenCalled();
+    expect(failure.log.write).toHaveBeenCalledWith(expect.stringMatching(/warning.*ledger offline/i));
+  });
   it.each(['card', 'parent'])('refuses a symlinked backlog %s before numbering or writing outside the worktree', kind => {
     const x = setup();
     x.fs.lstatSync = vi.fn(path => ({ isSymbolicLink: () => kind === 'card' ? path.endsWith('.md') : path.endsWith('/backlog'), isFile: () => path.endsWith('.md'), isDirectory: () => !path.endsWith('.md') }));
@@ -452,7 +480,7 @@ it.each([false, true])('permits confined convenience links and refuses escaping 
       if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
       if (args[0] === 'ls-files') {
         const card = existsSync(join(tree, 'backlog/xabc123-card.md')) ? 'backlog/xabc123-card.md' : 'backlog/041-card.md';
-        return args.length === 1 ? `${card}\n.claude/skills` : card;
+        return args.includes('backlog/') ? card : `${card}\n.claude/skills`;
       }
       if (args[0] === 'ls-tree') return 'backlog/040-main.md';
       if (args[0] === 'rev-parse') return 'numbered-head';
@@ -487,14 +515,14 @@ it('returns final for a hash-free tree with external and dangling tracked links 
     symlinkSync(join(root, 'outside'), join(tree, '.claude/skills'));
     symlinkSync('missing.md', join(tree, 'dangling.md'));
     const exec = vi.fn((_cmd, args) => args[0] === 'ls-remote' ? 'head\trefs/heads/lane/example' : args[0] === 'ls-files'
-      ? (args.length === 1 ? 'backlog/041-card.md\n.claude/skills\ndangling.md' : 'backlog/041-card.md') : '');
+      ? (!args.includes('backlog/') ? 'backlog/041-card.md\n.claude/skills\ndangling.md' : 'backlog/041-card.md') : '');
     const unexpected = vi.fn(() => { throw new Error('unexpected numbering IO'); });
     const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example' }, traceHeadSha: 'head', exec,
       fs: { ...realFs, mkdtempSync: () => root, lstatSync: unexpected, writeFileSync: unexpected },
       lock: unexpected, number: unexpected });
     expect(out).toEqual({ action: 'final' });
     expect(unexpected).not.toHaveBeenCalled();
-    expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && args.length === 1))).toBe(false);
+    expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && !args.includes('backlog/')))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -592,7 +620,7 @@ describe('sweepQueuedHashCards', () => {
     } }));
     const exec = vi.fn((cmd, args) => {
       if (cmd === 'gh' && args[3].startsWith('query=query(')) return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes } } } } });
-      if (args[0] === 'ls-tree') return args[3] === 'sha-2' ? 'backlog/012-clean.md' : 'backlog/xabc123-card.md';
+      if (args[0] === 'ls-tree') return args.includes('sha-2') ?'backlog/012-clean.md' : 'backlog/xabc123-card.md';
       if (args[0] === 'diff') return 'src/example.mjs\0backlog/xabc123-card.md\0';
       return '{}';
     });
@@ -731,6 +759,89 @@ it('fallback allocation retains queue reservations above main', () => {
   const exec = vi.fn(() => 'backlog/100-main.md');
   const fs = { readFileSync: () => JSON.stringify({ reservations: [{ repo: null, num: 9, headRef: 'topic', nnns: [101], at: 'now' }] }) };
   expect(fallbackMinNext({ cwd: '/clone', exec, fs, statePath: '/state' })).toBe(102);
+});
+
+it('checksALeadingWhitespaceTrackedPathAsItselfNotItsTrimmedTwin', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-leading-space-'));
+  try {
+    const temporary = join(root, 'temporary');
+    const tree = join(temporary, 'tree');
+    mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(root, 'outside'));
+    writeFileSync(join(tree, 'backlog/xabc123-card.md'), '---\nstatus: open\n---\n');
+    writeFileSync(join(tree, 'x'), 'regular');
+    symlinkSync(join(root, 'outside'), join(tree, ' x'));
+    const number = vi.fn(() => ({ assigned: [], committed: true }));
+    const lock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      // Byte order puts ' x' first in a real `ls-files -z` listing.
+      if (args[0] === 'ls-files') return args.includes('backlog/') ? 'backlog/xabc123-card.md\0' : ' x\0backlog/xabc123-card.md\0x\0';
+      return '';
+    });
+    const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example', num: 1 }, traceHeadSha: 'head', exec,
+      fs: { ...realFs, mkdtempSync: () => temporary }, statePath: join(root, 'reservations.json'), lock, number });
+    // The refusal names ' x' itself (two spaces after the colon), not the regular file 'x'.
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('symlinked tracked path refused:  x') });
+    expect(number).not.toHaveBeenCalled();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('refusalReasonCarryingARawTrackedPathIsSanitizedBeforeItIsLogged', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-refusal-text-'));
+  try {
+    const temporary = join(root, 'temporary');
+    mkdirSync(join(temporary, 'tree', 'backlog'), { recursive: true });
+    const RLO = String.fromCodePoint(0x202e);
+    // Not on disk: the guard's fs error message quotes this raw name.
+    const card = `backlog/xabc123-a\n  ✓ PR 1 numbered${RLO}.md`;
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      if (args[0] === 'ls-files') return `${card}\0`;
+      return '';
+    });
+    const number = vi.fn(), lock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example', num: 1 }, traceHeadSha: 'head', exec,
+      fs: { ...realFs, mkdtempSync: () => temporary }, statePath: join(root, 'reservations.json'), lock, number });
+    expect(out.action).toBe('skip');
+    expect(out.reason).toContain('xabc123-a   ✓ PR 1 numbered .md');
+    expect(out.reason).not.toMatch(new RegExp(`[\n${RLO}]`));
+    expect(number).not.toHaveBeenCalled();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Git C-quotes non-ASCII and special-character paths in line output; every path list must still see them.
+describe('Git-quoted backlog names', () => {
+  const RLO = String.fromCodePoint(0x202e); // bidi override, built at runtime: no literal invisible character
+  const forged = `xdef456-a\nFORGED${RLO}.md`;
+  const special = ['101-café.md', '102-a"b.md', '103-a\tb.md', '104-a\nb.md', 'xabc123-café.md', forged];
+  let root, board;
+  const git = (args, input) => String(execFileSync('git', args, { cwd: board, input, encoding: 'utf8', stdio: 'pipe',
+    env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined,
+      GIT_AUTHOR_NAME: 'drain', GIT_AUTHOR_EMAIL: 'drain@example.test', GIT_COMMITTER_NAME: 'drain', GIT_COMMITTER_EMAIL: 'drain@example.test' } })).trim();
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'queue-quoted-')); board = join(root, 'repo'); mkdirSync(board);
+    git(['init', '-q', '-b', 'main']);
+    const blob = git(['hash-object', '-w', '--stdin'], '');
+    const backlog = git(['mktree', '-z'], special.map(n => `100644 blob ${blob}\t${n}\0`).join(''));
+    const tree = git(['mktree'], `040000 tree ${backlog}\tbacklog\n`);
+    git(['update-ref', 'refs/remotes/origin/main', git(['commit-tree', tree, '-m', 'quoted'])]);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  it('fallbackMinNextCountsGitQuotedNumberedNames', () => {
+    const fs = { readFileSync: () => JSON.stringify({ reservations: [] }) };
+    expect(fallbackMinNext({ cwd: board, fs, statePath: join(root, 'state.json') })).toBe(105);
+  });
+  it('probeQueuedLandSeesAGitQuotedHashCard', () => {
+    const exec = (cmd, args, opts) => args[0] === 'fetch' ? '' : execFileSync(cmd, args, opts);
+    const log = { write: vi.fn() };
+    const result = probeQueuedLand(board, { exec, log });
+    expect(result.files).toEqual(['backlog/xabc123-café.md', `backlog/${forged}`]);
+    // The untrusted name reaches the operator log on one line, without its bidi override.
+    const written = log.write.mock.calls.map(([text]) => text);
+    expect(written.join('')).toContain('xdef456-a FORGED .md');
+    for (const text of written) expect(text.replace(/\n$/, '')).not.toMatch(new RegExp(`[\n${RLO}]`));
+    expect(result.warning).not.toMatch(new RegExp(`[\n${RLO}]`));
+  });
 });
 
 it('probes on every live queue pass and repairs when inline numbering will not run', () => {

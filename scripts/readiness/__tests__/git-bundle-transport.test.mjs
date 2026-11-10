@@ -6,10 +6,12 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { routeNeedsGit } from '../needs-git-route.mjs';
+import { detectTestNeedsGit } from '../remote-exec.mjs';
 import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge, BUNDLE_MAIN_MAX_AGE_CEILING_MS } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
-import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
-import { decideRemote, resolveAdmissionPolicy, readRunnerBundleCapability, writeRunnerCapabilities } from '../heavy-admission.mjs';
+import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, capabilityBundleVerdict, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
+import { runWithRemoteDecision, decideRemote, resolveAdmissionPolicy, readRunnerBundleCapability, writeRunnerCapabilities } from '../heavy-admission.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
 const git = (cwd, ...args) => {
@@ -152,11 +154,62 @@ describe('R593 client and routing', () => {
     it('git-bundle + capability keeps remote', () => expect(decide(mk('git-bundle'), true)).toMatchObject({ remote: true }));
     it('git-bundle without capability stays local', () => expect(decide(mk('git-bundle'), false)).toMatchObject({ remote: false, needsGit: true }));
     it('rsync stays local even with the capability', () => expect(decide(mk('rsync'), true)).toMatchObject({ remote: false, needsGit: true }));
-    it('capability cache round-trips and unreadable means no', () => {
-      const dir = join(root, 'remote'); const clock = () => 5000;
-      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(false);
+    it('capability cache round-trips; missing/unreadable/expired means unknown (go remote, prepare re-checks)', () => {
+      const dir = join(root, 'remote'); let now = 5000; const clock = () => now;
+      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(true);
       writeRunnerCapabilities({ root: dir, host: 'forge', capabilities: { gitBundle: 1 }, clock });
       expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(true);
+      now = 5000 + 61 * 60_000; // expired
+      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(true);
+    });
+    it('a fresh record saying no bundle stays local; another host record is unknown', () => {
+      const dir = join(root, 'remote2'); const clock = () => 5000;
+      writeRunnerCapabilities({ root: dir, host: 'forge', capabilities: {}, clock });
+      expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(false);
+      expect(readRunnerBundleCapability({ root: dir, host: 'other', clock })).toBe(true);
+    });
+    it('R807: unknown capability stays local when an external client override is configured (no affirmation possible)', async () => {
+      const lockRoot = join(root, 'locks'); await fs.mkdir(lockRoot, { recursive: true });
+      const policyFor = (clientPath) => resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 3, clientPath,
+        maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15, transport: 'git-bundle' } } });
+      const run = async (clientPath) => {
+        const decisions = []; const calls = [];
+        await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], policy: policyFor(clientPath), cwd, env: {}, lockRoot, loadPerCore: () => 4,
+          hostOverloaded: () => false, log: () => {}, onDecision: d => decisions.push(d),
+          remoteExec: async (o) => { calls.push(o); return { mode: 'not-started', terminated: true, reason: 'forge-runner-too-old' }; } });
+        return { decisions, calls };
+      };
+      const external = await run('/opt/ext/remote-exec.mjs');
+      expect(external.decisions[0]).toMatchObject({ remote: false, needsGit: true });
+      expect(external.calls).toHaveLength(0);
+      const builtin = await run(null);
+      expect(builtin.decisions[0]).toMatchObject({ remote: true });
+    });
+    it('R807: git-need detection fails closed when the source scan throws', () => {
+      const boom = () => { throw new Error('scan failed'); };
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'x.test.mjs'], cwd, route: boom })).toBe(true);
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], cwd })).toBe(true);
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'pure2.test.mjs'], cwd })).toBe(false);
+    });
+    it('R807: routeNeedsGit fails closed on unreadable files and directory/glob selections', async () => {
+      await fs.mkdir(join(cwd, 'sub'), { recursive: true });
+      const route = (arg) => routeNeedsGit({ argv: ['npx', 'vitest', 'run', arg], cwd });
+      expect(route('missing.test.mjs')).toEqual({ local: false });
+      await fs.writeFile(join(root, 'outside.test.mjs'), 'export {};\n');
+      expect(route('../outside.test.mjs')).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(route('sub')).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(route('sub/**/*.test.mjs')).toMatchObject({ local: true, reason: 'needs-git' });
+      expect(routeNeedsGit({ argv: ['npx', 'vitest', 'run'], cwd })).toEqual({ local: false });
+      await fs.writeFile(join(cwd, 'pure.test.mjs'), 'export {};\n');
+      expect(route('pure.test.mjs')).toEqual({ local: false });
+    });
+    it('verdict is yes/no/unknown', () => {
+      const rec = capabilityRecord({ host: 'forge', capabilities: { gitBundle: 1 }, nowMs: 1000 });
+      expect(capabilityBundleVerdict(rec, { host: 'forge', nowMs: 2000 })).toBe('yes');
+      expect(capabilityBundleVerdict({ ...rec, gitBundle: 0 }, { host: 'forge', nowMs: 2000 })).toBe('no');
+      expect(capabilityBundleVerdict(rec, { host: 'forge', nowMs: 1000 + 61 * 60_000 })).toBe('unknown');
+      expect(capabilityBundleVerdict(null, { host: 'forge', nowMs: 2000 })).toBe('unknown');
+      expect(capabilityBundleVerdict({ ...rec, gitBundle: 0, atMs: 5000 }, { host: 'forge', nowMs: 2000 })).toBe('unknown');
     });
   });
 });
