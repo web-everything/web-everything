@@ -1,6 +1,24 @@
 import {createHash} from 'node:crypto';
+import {readFileSync} from 'node:fs';
 const LIMIT=4*1024*1024;
 const sha=value=>createHash('sha256').update(value).digest('hex');
+// Load once. Missing or malformed review evidence permits no skips.
+const scanAllowlist=(()=>{
+  try {
+    const data=JSON.parse(readFileSync(new URL('./forge-scan-allowlist.json',import.meta.url),'utf8'));
+    if(!Array.isArray(data.entries)||!data.entries.every(entry=>entry
+      &&typeof entry.path==='string'&&typeof entry.rule==='string'
+      &&typeof entry.sha256==='string'&&/^[a-f0-9]{64}$/.test(entry.sha256)))return [];
+    return data.entries;
+  } catch {return [];}
+})();
+const allowedScanHit=(path,rule,span)=>scanAllowlist.some(entry=>entry.rule===rule
+  &&Buffer.from(entry.path).equals(path)&&entry.sha256===sha(span));
+// Pin the complete physical line, excluding its CR/LF separator, including whitespace.
+function scanLine(text,index) {
+  const start=Math.max(text.lastIndexOf('\n',index-1),text.lastIndexOf('\r',index-1))+1;
+  return text.slice(start).split(/[\r\n]/,1)[0];
+}
 // Paths remain bytes throughout inventory, transport, hashing and verification.
 export function pathParts(path) {
   if (!Buffer.isBuffer(path) || !path.length || path[0] === 47 || path.some(b => b === 0 || b === 10 || b === 13))
@@ -172,8 +190,11 @@ export function credentialContentFinding(path,content) {
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
-  const raw=textFinding(text);
-  if(raw)return raw;
+  for(const [pattern,rule] of secretText) {
+    for(const match of text.matchAll(new RegExp(pattern.source,pattern.flags+'g'))) {
+      if(!allowedScanHit(path,rule,scanLine(text,match.index)))return rule;
+    }
+  }
   const testSource=isTestFile(path);
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
@@ -197,7 +218,8 @@ export function credentialContentFinding(path,content) {
       if(!continuation)return `unbounded-continuation-${field}`;
       if(credentialNamed) {
         for(const line of [...continuation,continuation.join('')]) {
-          if(line.length>=20&&entropy(line)>=3.5&&!(testSource&&codeExpression(line)))return `high-entropy-${field}`;
+          if(line.length>=20&&entropy(line)>=3.5&&!(testSource&&codeExpression(line))
+            &&!allowedScanHit(path,`high-entropy-${field}`,line))return `high-entropy-${field}`;
         }
       }
     }
@@ -215,10 +237,15 @@ export function credentialContentFinding(path,content) {
     const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
       &&!(leaf.endsWith('.md')?/["]/:/["'`]/).test(trimmed)&&!trimmed.split(/\s+/).some(opaqueToken)
       &&![...trimmed.matchAll(/(?<![\w])(['`])(.+?)\1(?![\w])/g)].some(([, ,span])=>opaqueToken(span.replace(/\s/g,'')));
-    if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value)))return `high-entropy-${field}`;
+    const span=scanLine(text,match.index+(/^[\r\n\u0085\u2028\u2029]/.test(match[0])?1:0));
+    if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value))) {
+      if(allowedScanHit(path,`high-entropy-${field}`,span))continue;
+      return `high-entropy-${field}`;
+    }
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.
-      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
+      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal)
+        &&!allowedScanHit(path,`secret-assignment-${field}`,span))return `secret-assignment-${field}`;
     }
   }
   return null;
