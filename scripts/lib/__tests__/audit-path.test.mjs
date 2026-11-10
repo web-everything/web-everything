@@ -30,7 +30,7 @@ describe('P1 every past bypass is protected (#6381 rounds 1-15)', () => {
     'diff header --- a/': '--- a/scripts/guard-bash.mjs',
     'git side prefix i/': 'i/scripts/guard-bash.mjs',
     'git side prefix w/': 'w/scripts/guard-bash.mjs',
-    'absolute path': '/home/dev/repo/scripts/guard-bash.mjs',
+    'absolute path': '/opt/checkout/scripts/guard-bash.mjs',
     'line suffix :42': 'scripts/guard-bash.mjs:42',
     'line range :42-50': 'scripts/guard-bash.mjs:42-50',
     'line:col': 'scripts/guard-bash.mjs:42:7',
