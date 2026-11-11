@@ -435,9 +435,12 @@ const resumedResult = result => (typeof result === 'string' ? result : result?.s
 function priorPassFindings(prior, { legacy = false } = {}) {
   const r = prior.result;
   if (r && typeof r === 'object' && r.status === 'ran') return Array.isArray(r.findings) ? r.findings : 'unreadable';
-  if (legacy && r === 'ran' && prior.sealedBreaks === undefined) return 'unreadable';
+  if (legacy && r === 'ran' && prior.sealedBreaks === undefined) return LEGACY_PENDING;
   return undefined;
 }
+
+/** Stored evidence a damaged status file may hold: a seal, a legacy hold, carried findings, or a `ran` result. */
+const DAMAGED_EVIDENCE = /"(sealedBreaks|sealedPosted|legacyHoldPublished|storedFindings)"|"result":\s*"ran"|"result":\s*\{[^{}]*"status":\s*"ran"/;
 
 /** Does a rewritten status present its OWN result as pass evidence (what `sealedFromStatus` reads)? Only a finished `ran`. */
 const presentsOwnEvidence = (status, result) => status === 'finished'
@@ -454,10 +457,17 @@ const presentsOwnEvidence = (status, result) => status === 'finished'
  */
 export function carriedStoredFindings(prior, result, status = 'finished') {
   if (!prior) return undefined;
-  if (!presentsOwnEvidence(status, result)) return priorPassFindings(prior, { legacy: status !== 'finished' }) ?? prior.storedFindings;
-  // The same result keeps what an earlier rewrite carried; a NEW result drops it (the new result is the evidence now).
-  return keepSeal({ ...prior, damaged: false }, result) ? prior.storedFindings : undefined;
+  const carried = !presentsOwnEvidence(status, result)
+    ? priorPassFindings(prior, { legacy: status !== 'finished' }) ?? prior.storedFindings
+    // The same result keeps what an earlier rewrite carried; a NEW result drops it (the new result is the evidence now).
+    : keepSeal({ ...prior, damaged: false }, result) ? prior.storedFindings : undefined;
+  // The legacy carry lasts only while its pass is pending: a finished rewrite (an errored or skipped retry) drops it,
+  // since nothing would ever replace it and the hold would never clear.
+  return status === 'finished' && carried === LEGACY_PENDING ? undefined : carried;
 }
+
+/** The legacy `ran` carry: not a findings list, so every reader holds it as unreadable (`sealedFromStatus`). */
+const LEGACY_PENDING = 'unreadable-pending-pass';
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
 function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
@@ -485,7 +495,8 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
     // `storedFindings`) must not be repaired into "nothing sealed": seal it unreadable.
     let raw = '';
     try { raw = String(optionalBytes(path) ?? ''); } catch { raw = '"sealedBreaks"'; }
-    prior = /"(sealedBreaks|sealedPosted|legacyHoldPublished|storedFindings|findings)"|"ran"/.test(raw) ? { sealedBreaks: 'unreadable', damaged: true } : null;
+    // Keyed on the RESULT's own shape, never a bare `"findings"` (every status carries `loopPayload.findings`).
+    prior = DAMAGED_EVIDENCE.test(raw) ? { sealedBreaks: 'unreadable', damaged: true } : null;
   }
   const spent = prior?.retryCount;
   if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');

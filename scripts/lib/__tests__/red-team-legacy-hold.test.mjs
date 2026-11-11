@@ -540,7 +540,6 @@ describe('the stored result is the authority on every status shape (self-review 
   it.each([
     ['a deduped seat-posted result', () => ({ ...posted([brokenFinding]), comment: 'deduped' }), 'findings'],
     ['a withheld result', () => ({ ...posted([brokenFinding]), comment: 'withheld' }), 'findings'],
-    ['an unsealed bare legacy `ran` result', () => 'ran', 'unreadable'],
   ])('a queued retry that re-sends %s keeps it held, through running and a finished error or skip', (_name, priorResult, kind) => {
     writeStatusFile({ repo, pr: 42, head, status: 'finished', result: priorResult() });
     const expectHeld = () => {
@@ -561,6 +560,28 @@ describe('the stored result is the authority on every status shape (self-review 
     }
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: posted([]) }, { env: process.env });
     expect(readStatusFile().storedFindings).toBeUndefined();
+    expect(heldBy([clearComment]).held).toEqual([]);
+  });
+  // The legacy shape's findings live only in the seat row: held while its retry is pending, but a retry that FINISHES
+  // without a `ran` result (error, skip) drops the carry, or nothing would ever clear the hold (self-review, PR #6622).
+  it.each([[{ status: 'error' }], ['skipped'], ['resumed']])('an unsealed bare legacy `ran` is held while its retry is pending, and a finished %j retry drops the carry', result => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: 'ran' });
+    for (const status of ['queued', 'running']) {
+      recordRedTeamStatus({ repo, pr: 42, loopPayload, status, ...(status === 'queued' ? { result: 'ran' } : {}) }, { env: process.env });
+      expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toEqual({ unreadable: true });
+      expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    }
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result }, { env: process.env });
+    expect(readStatusFile().storedFindings).toBeUndefined();
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expect(readStatusFile().storedFindings).toBeUndefined();
+  });
+  it('a truncated status file with no stored evidence is repaired as nothing stored (no permanent unreadable seal)', () => {
+    const whole = JSON.stringify({ repo, pr: 42, head, loopPayload, status: 'running', result: null });
+    mkdirSync(join(statusFile(), '..'), { recursive: true });
+    writeFileSync(statusFile(), whole.slice(0, -5));
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: posted([]) }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toBeUndefined();
     expect(heldBy([clearComment]).held).toEqual([]);
   });
   it('a truncated status file whose evidence is a seat-posted result is repaired as unreadable, never as nothing stored', () => {
