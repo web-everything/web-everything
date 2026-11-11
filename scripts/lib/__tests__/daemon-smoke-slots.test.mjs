@@ -4,7 +4,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
@@ -309,6 +310,20 @@ describe('daemon smoke slots', () => {
   it('rejects incomplete state instead of resetting live capacity', async () => {
     writeFileSync(join(stateDir, 'smoke-slots.json'), JSON.stringify({ holders: [] }));
     await expect(acquire(11)).rejects.toThrow('invalid smoke slot state');
+  });
+
+  it('rejects duplicated entry ids but still reads legacy entries without an id', async () => {
+    const path = join(stateDir, 'smoke-slots.json');
+    writeFileSync(path, JSON.stringify({ nextTicket: 3,
+      holders: [{ pid: 11, ticket: 1, at: 1, id: 'same' }], waiters: [{ pid: 12, ticket: 2, at: 1, id: 'same' }] }));
+    await expect(acquire(13)).rejects.toThrow('invalid smoke slot entries');
+    writeFileSync(path, JSON.stringify({ nextTicket: 3,
+      holders: [{ pid: 11, ticket: 1, at: 1 }], waiters: [] }));
+    const slot = await acquire(13);
+    expect(slot.acquired).toBe(true);
+    expect(state().holders.map(e => e.pid)).toEqual([11, 13]);
+    await slot.release();
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
   });
 
   it('prunes a holder that dies while a waiter is queued', async () => {

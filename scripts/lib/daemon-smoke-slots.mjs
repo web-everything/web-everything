@@ -76,7 +76,9 @@ function readState(path) {
   }
   const entries = [...state.holders, ...state.waiters];
   if (!entries.every(entry) || entries.some(e => e.ticket >= state.nextTicket)
-    || new Set(entries.map(e => e.ticket)).size !== entries.length) {
+    || new Set(entries.map(e => e.ticket)).size !== entries.length
+    // Release matches by id, so a duplicated id would remove another acquisition's entry too.
+    || new Set(entries.filter(e => e.id !== undefined).map(e => e.id)).size !== entries.filter(e => e.id !== undefined).length) {
     throw new Error('daemon-live-smoke: invalid smoke slot entries; inspect smoke-slots.json before retrying');
   }
   return state;
