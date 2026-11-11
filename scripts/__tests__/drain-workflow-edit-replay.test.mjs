@@ -96,7 +96,7 @@ describe('live workflow-edit replay', () => {
     });
     expect(result).toMatchObject({ action: 'park', applyLabel: 'review:human' });
     expect(calls.find(([, args]) => args[0] === 'diff')).toEqual(['git',
-      ['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/trunk...${fixtures[1].headRefOid}`], '/fixture']);
+      ['diff', '--name-only', '--no-renames', '--no-relative', '-z', '--end-of-options', `refs/remotes/origin/trunk...${fixtures[1].headRefOid}`], '/fixture']);
   });
   it('bare sweep does no acceptance or git calls for complete non-workflow files', () => {
     let calls = 0;
@@ -117,4 +117,34 @@ describe('live workflow-edit replay', () => {
   it('unreadable acceptance still defers without writing a label', () => {
     expect(replay(fixtures[0], { exec: () => { throw new Error('offline'); } })).toMatchObject({ action: 'defer', applyLabel: null });
   });
+});
+
+describe('refreshed PR: stale listing vs net diff', () => {
+  const pr = { number: 6666, headRefOid: '5ab05b337d000000000000000000000000000000', labels: ['ready-to-merge', 'review:accepted'],
+    files: ['.github/workflows/ci.yml', 'backlog/4456-x.md'] };
+  const netExec = (net) => (cmd, args) => cmd === 'gh'
+    ? JSON.stringify({ headRefOid: pr.headRefOid, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }] })
+    : args[0] === 'diff' ? net : '';
+  it('stale listing naming ci.yml does not hold when the net diff has no workflow path', () => {
+    expect(replay(pr, { exec: netExec('backlog/4456-x.md\0') }).action).toBe('merge');
+  });
+  it('a real workflow edit in the net diff still holds, with the head sha in the message', () => {
+    const r = replay(pr, { exec: netExec('.github/workflows/ci.yml\0') });
+    expect(r).toMatchObject({ action: 'park', humanRequired: true });
+    expect(r.reason).toContain('5ab05b337');
+    expect(r.reason).not.toContain('unknown');
+  });
+  it('unreadable net diff keeps the hold (fail closed)', () => {
+    const r = replay(pr, { exec: (cmd, args) => { if (cmd === 'git' && args[0] === 'diff') throw new Error('boom'); return netExec('')(cmd, args); } });
+    expect(r).toMatchObject({ action: 'park', humanRequired: true });
+  });
+  it('empty net diff against a workflow listing keeps the hold', () => {
+    expect(replay(pr, { exec: netExec('') }).action).toBe('park');
+  });
+});
+
+it('unknown default branch keeps the listing hold (no net-diff clearing against a guessed base)', () => {
+  const pr = { number: 6666, headRefOid: '5ab05b337d000000000000000000000000000000', labels: ['ready-to-merge', 'review:accepted'], files: ['.github/workflows/ci.yml'] };
+  const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
+  expect(replay(pr, { defaultBranch: undefined, exec: (cmd) => cmd === 'gh' ? JSON.stringify({ headRefOid: pr.headRefOid, comments }) : '' }).action).toBe('park');
 });
