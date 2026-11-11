@@ -116,6 +116,13 @@ describe('sanctioned wrappers', () => {
     expect(calls[0].slice(0, 3)).toEqual(['/tmp/rs', `${input.repo}#7`, 'moved']);
     expect(f.writeRecord).toHaveBeenCalledTimes(1);
   });
+  it('resume refuses a tampered operator attribution in the stored plan', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    const p = planOperatorControl('refresh', contexts.refresh, input);
+    p.record = { ...p.record, actor: 'intruder' }; p.records = [p.record];
+    await expect(f.sink(p)).rejects.toThrow(/operator plan no longer valid/);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
   it('resume still refuses when the head moved but does not contain main', async () => {
     const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: false }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
     await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/state changed since operator plan/);

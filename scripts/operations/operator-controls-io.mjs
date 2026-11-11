@@ -16,7 +16,7 @@ import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueS
 import { createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { listStoredAwaitVerify, writeStoredAwaitVerify } from '../conveyor/await-verify.mjs';
-import { planOperatorControl, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
+import { planOperatorControl, validateOperatorAttribution, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
 export const CONTROL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const gh = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 });
@@ -201,6 +201,10 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     if (p.op === 'refresh' && controlFingerprint(p.op, before, p.input) !== p.fingerprint
       && before.state === 'OPEN' && !before.crossRepo && before.containsMain && before.head
       && (!p.refreshExpect?.head || before.head !== p.refreshExpect.head)) {
+      // Attribution must still match: the stored record must be exactly what the input's operator, channel and reason produce.
+      const rec = p.record, who = validateOperatorAttribution(p.input);
+      if (!rec || p.records.length !== 1 || JSON.stringify(p.records[0]) !== JSON.stringify(rec) || p.body !== buildOperatorActionComment(rec) || rec.op !== 'refresh'
+        || rec.repo !== p.input.repo || rec.pr !== p.input.pr || rec.actor !== who.actor || rec.channel !== who.channel || rec.reason !== who.reason) throw new Error('operator plan no longer valid');
       await rememberRefresh(refreshStatePath(), `${p.input.repo}#${p.input.pr}`, before.head, { pass: before.requiredCheck ?? null });
       for (const record of p.records) if (!existing.some(r => r.key === record.key)) await putRecord(record);
       return { action: 'apply', resumed: true, keys: p.records.map(r => r.key) };
