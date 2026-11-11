@@ -134,9 +134,12 @@ describe('refreshed PR: stale listing vs net diff', () => {
     expect(r.reason).toContain('5ab05b337');
     expect(r.reason).not.toContain('unknown');
   });
-  it('unreadable net diff fails closed (defer)', () => {
+  it('unreadable net diff keeps the hold (fail closed)', () => {
     const r = replay(pr, { exec: (cmd, args) => { if (cmd === 'git' && args[0] === 'diff') throw new Error('boom'); return netExec('')(cmd, args); } });
-    expect(r.action).toBe('defer');
+    expect(r).toMatchObject({ action: 'park', humanRequired: true });
+  });
+  it('empty net diff against a workflow listing keeps the hold', () => {
+    expect(replay(pr, { exec: netExec('') }).action).toBe('park');
   });
 });
 

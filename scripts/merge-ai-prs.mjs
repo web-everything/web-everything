@@ -921,12 +921,13 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
     const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
       base: readOptions.defaultBranch, cwd: readOptions.cwd ?? process.cwd(),
       exec: readOptions.exec ?? execFileSync });
-    if (read.error) return { action: 'defer', applyLabel: null,
-      reason: `workflow-edit change list unreadable — merge deferred this pass: ${read.error}` };
-    files = read.files;
-    filesComplete = true;
-    workflow = decideDrainWorkflowEditHold({ files, filesComplete,
-      headSha: evidence.headSha || readOptions.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+    // Unreadable or empty net diff never clears: the listing's hold stands (fail closed, same as before this recheck).
+    if (!read.error && read.files.length > 0) {
+      files = read.files;
+      filesComplete = true;
+      workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+        headSha: evidence.headSha || readOptions.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+    }
   }
   if (workflow.defer) return { action: 'defer', applyLabel: null, reason: workflow.reason };
   // A workflow clearance may move over proven numbering or exact tree identity here. General refresh equivalence does not
