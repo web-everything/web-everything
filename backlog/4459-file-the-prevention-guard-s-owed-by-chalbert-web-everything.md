@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-09"
-preparedAgainstSha: "3e0f0948836da9a2240c23631c7d3aedc38c84f4"
+preparedDate: "2026-11-10"
+preparedAgainstSha: "2ffeb8cf605ab244a1bcb88b6ff080abb0b89c16"
 tags: []
 ---
 
@@ -31,8 +31,10 @@ All named tests below are to be added or strengthened in `we:scripts/operations/
 - [A3] Executable — `refuses unknown or incomplete open PR discovery` covers command failure (including page two), invalid JSON, non-array pages, missing/invalid head ref or PR identity, oversized output and pagination exhaustion. Assert `open-pr-check`, no acquisition, complete exec options, and an operator-visible retry/manual-inspection reason. `complete unrelated PR listing permits acquisition` proves only a completed no-match listing proceeds.
 - [A4] Executable — `refreshes an excluded remote tracking ref with an explicit destination` uses real temporary local Git repositories with a restricted fetch mapping and asserts the advanced origin/main commit and dedupe card are visible. Update `refreshes and verifies the ref before grepping it` to pin the destination refspec; cover another origin branch, non-origin refs and fetch failure stopping before grep/acquisition.
 - [A5] Executable — `pins all main read exec guards` compares whole options for fetch, verification, both greps and show, including a conflicting parent prompt environment. Remove cwd, timeout and prompt override separately to prove each mutation fails. The test addition is absent before build; the guards themselves already work and must not be described as newly fixed. Document exhaustion and whole-options conventions in `we:docs/agent/testing.md` alongside links to these regressions; verify the text by review and run `node we:scripts/readiness/heavy-admission.mjs run --wait-ms=60000 -- npm run check:standards`.
+- [A6] Executable — `folds untrusted PR head refs and refuses dash-prefixed origin branches` asserts a PR head ref containing a newline/backtick appears folded in the `open-pr-check` refusal, and that an origin branch starting with `--` is refused before the fetch argv is built (no fetch call); both fail before the build (no folding, no refusal).
 
 ## Progress
+- Step-5 review dispositions (2026-11-10): MVP-breadth, A5-not-red and CLI-injection notes dismissed — breadth is the brief-mandated edge-case/fail-closed set already ratified in prior stamps, A5 is explicitly a mutation-proof of pre-existing guards (stated in its line), and the CLI wrapper takes injected IO per the existing harness; the missing criterion for folding/`--` refusal is fixed as [A6].
 
 - Re-preparation inspected checkout `f2f29efc53968a5f81915c02718717bfe832bb38`; existing preparation stamps are left for the runner. Previous inspection was at `e071391e43da1e5283dc3c24a1dd11cded126d59`. The goal is not already delivered: the loop still falls through to commit after five unsuccessful passes (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:343`, `we:scripts/operations/sweep-orphan-backlog-cards.mjs:474-511`), and acquisition follows dry-run handling without a PR lookup (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:441-452`). The review provenance names `39c76fd99`; current source inspection confirms the gaps remain.
 - **Old premise:** review-time citations pointed to lines 420, 470, 168 and 245 of `we:scripts/operations/sweep-orphan-backlog-cards.mjs`; the fetch guard was described as a missing test. **Corrected premise:** the live sites are cited above; there is already an argv test, but it locks in the branch-only fetch. Tests cover a successful second validation pass and all-survivors-dropped, not exhaustion with survivors remaining (`we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:496-561`). The main-read stub records options but asserts only cwd (`we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:210-235`). A branch-only fetch is not proof of a stale ref under ordinary fetch configuration; the missing guarantee is an explicit remote-tracking destination independent of that configuration.
@@ -43,6 +45,7 @@ All named tests below are to be added or strengthened in `we:scripts/operations/
 - 2026-11-07 re-stamp against `5b2bbedb`: the sweep source and its test are unchanged since `fa7d3c168` (only unrelated `we:docs/agent/testing.md` lane-deps/verify paragraphs landed); the loop still falls through to commit and acquisition still lacks a PR read, so the design above stands.
 - 2026-11-08 re-stamp against `9bce6d7f`: sweep source and test unchanged since `5b2bbedb` (only an unrelated `we:docs/agent/testing.md` referral-review section landed); premise, scope and design stand.
 - 2026-11-09 re-stamp against `3e0f0948`: sweep source and test have no commits since `9bce6d7f`; the exhaustion fall-through (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:474-507`) and acquisition without a PR read (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:441-452`) are unchanged. Premise, scope, design and executable Acceptance stand.
+- 2026-11-10 re-stamp against `2ffeb8cf`: sweep source and test have no commits since `3e0f0948` (only this card's own re-stamp and an unrelated `we:docs/agent/testing.md` edit landed); `runGhSync` (`we:scripts/lib/gh-throttle.mjs`) and `foldUntrusted` (`we:scripts/lib/jury-core.mjs:1684`) still exist. Premise, scope, design and executable Acceptance stand.
 - Preparation used source and test inspection only; implementation, red/green execution and stamps remain for the runner/build stages.
 
 ## Design
