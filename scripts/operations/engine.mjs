@@ -46,7 +46,7 @@
  */
 
 import { defaultRegistry, validateInput } from './registry.mjs';
-import { assertRunRecord, effectKey, newRunRecord, normalizeJudgeTelemetry } from './run-record.mjs';
+import { assertRunRecord, effectKey, hasPermanentGuardRefusalEvidence, newRunRecord, normalizeJudgeTelemetry } from './run-record.mjs';
 
 /** Every state a run can be in. Derived from the record; never stored, so it cannot go stale. */
 export const RUN_STATUSES = Object.freeze(['running', 'awaiting-judge', 'awaiting-confirm', 'awaiting-effect', 'complete']);
@@ -178,6 +178,31 @@ export function unappliedEffects(run, stepIndex = null) {
 }
 
 /**
+ * Does a permanent guard refusal end the step? Only when the first unapplied entry is the refusal and nothing
+ * else attempted is unresolved; `declared` entries after it were never tried and are ignored. `outstanding`
+ * is one step's {@link unappliedEffects}, already in declared order.
+ */
+function refusalSettlesStep(outstanding) {
+  return outstanding.length > 0 && hasPermanentGuardRefusalEvidence(outstanding[0])
+    && outstanding.every((entry) => hasPermanentGuardRefusalEvidence(entry) || entry.status === 'declared');
+}
+
+/**
+ * Can `advance` finish this run's pending EFFECT step with no sink call and no observation (PR #6584)? The one
+ * test the engine settles by and the waker selects by, so the two cannot drift. True when the run is suspended
+ * on an effect step whose entries are ALL applied (a crash after the last write, before `advance` cleared
+ * `pending`) or whose first unapplied entry is a recognized permanent guard refusal. Scoped to the PENDING step:
+ * an entry of any other step says nothing about it.
+ * @param {object} run
+ * @returns {boolean}
+ */
+export function isEffectStepSettleable(run) {
+  if (!run?.pending || run.pending.kind !== 'effect') return false;
+  const outstanding = unappliedEffects(run, run.pending.stepIndex);
+  return outstanding.length === 0 || refusalSettlesStep(outstanding);
+}
+
+/**
  * WHAT AN EFFECT STEP RECORDS (#3082) — the finding a later step reads through `reads: ['findings.<step>']`.
  *
  * Keyed by ORDINAL, not by type. A step may declare the same type twice ("post two comments"), so a
@@ -278,6 +303,12 @@ function resolvePending(run, declaration, resume) {
     }
     const outstanding = unappliedEffects(run, stepIndex);
     if (outstanding.length > 0) {
+      // A guard refusal ends the run only when no other attempted effect is unresolved.
+      // Declared effects may follow the refusal; none may precede it.
+      if (refusalSettlesStep(outstanding)) {
+        return { ...withFinding(run, declaration, stepName, effectFinding(run, stepIndex)),
+          pending: null, cursor: declaration.steps.length, outcome: 'refused' };
+      }
       return run; // still waiting — idempotent no-op, exactly like a judge with no answer yet.
     }
     // THE STEP RECORDS WHAT IT PRODUCED, like every other kind (#3082). Before this an effect step was the
