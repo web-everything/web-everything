@@ -7,8 +7,8 @@
       "unconfirmed": "advisory"
     },
     "operatorRulings": {
-      "$comment": "anyState (default false; opt in with this setting or WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE=true): a human operator's record-red-team-ruling may rule card on any confirmed break of the live head's result (at the cap, sent back, or carded). Default = round-cap-only; pending round extensions remain owned by automation.",
-      "anyState": false
+      "$comment": "anyState (R903, 2026-11-11: true; set false or WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE=false for round-cap-only): a human operator's record-red-team-ruling may rule card on a confirmed break in any state, so non-regression breaks are carded without waiting for the round cap. Automation still cannot rule; pending round extensions remain owned by automation.",
+      "anyState": true
     }
   }
 }

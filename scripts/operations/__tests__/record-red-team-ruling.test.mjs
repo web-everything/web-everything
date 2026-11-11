@@ -537,7 +537,7 @@ describe('automatic card filing with shared durable claims', () => {
     expect(f.cards).toHaveLength(1);
     expect(f.posted[2]).toContain(`outcome=operator-card result=${resultId}`);
     expect(f.posted[2]).toContain('filed as a follow-up card (#1) — landing job');
-    const disposition = operatorRulings => readRedTeamDisposition({ comments: operatorBoundComments(f.comments), repo, pr: PR, head: HEAD,
+    const disposition = (operatorRulings = { anyState: false }) => readRedTeamDisposition({ comments: operatorBoundComments(f.comments), repo, pr: PR, head: HEAD,
       setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, operatorRulings });
     expect(disposition({ anyState: true })).toMatchObject({ sendBack: [], held: [] });
     expect(disposition({ anyState: false }).sendBack.map(f => f.index)).toEqual([1]);
