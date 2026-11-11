@@ -756,4 +756,26 @@ describe('daemon smoke slots', () => {
     expect(state().holders).toEqual([]);
     expect(state().waiters).toEqual([]);
   });
+
+  it.each(['1', '60000', '119999', '120000'])('rebuild runs its smoke with free capacity when the rebuild lease lifetime is %sms (no smoke-queue-timeout)', async stale => {
+    vi.spyOn(cloneLocks, 'withWriteLock').mockResolvedValue({ ok: true,
+      value: { plan: {}, prevHead: 'previous', lease: { token: 'short-lease' } } });
+    vi.spyOn(rebuildState, 'readReadyCandidate').mockReturnValue(null);
+    vi.spyOn(leases, 'readRebuildStarvation').mockReturnValue(0);
+    vi.spyOn(leases, 'writeRebuildStarvation').mockImplementation(() => {});
+    vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
+    const result = { verdict: 'pass' };
+    const runSmoke = vi.fn(async () => result);
+    const smokeAndAdopt = vi.spyOn(smoke, 'smokeAndAdopt').mockImplementation(async ({ runSmoke: capped }) => capped({}));
+    const rebuilding = await rebuildClone({ root: stateDir,
+      env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir, WE_DAEMON_REBUILD_LEASE_STALE_MS: stale },
+      log, runSmoke, versions: null, asJob: false, readyOnly: true, emitEvent: vi.fn(),
+      sleep: async () => { throw new Error('a free slot must not wait'); } });
+    expect(rebuilding).toBe(result);
+    expect(smokeAndAdopt).toHaveBeenCalledTimes(1);
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(log.error).not.toHaveBeenCalledWith(expect.stringContaining('smoke-queue-timeout'));
+    expect(state().holders).toEqual([]);
+    expect(state().waiters).toEqual([]);
+  });
 });
