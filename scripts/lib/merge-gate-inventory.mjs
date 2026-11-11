@@ -41,6 +41,8 @@ export const DRAIN_GATES = Object.freeze([
   { id: 'mergeable', where: 'queue', input: 'github', signals: [], skipKinds: ['unknown-mergeability', 'conflicting'] },
   { id: 'landable-state', where: 'queue', input: 'github', signals: [], skipKinds: ['behind'] },
   { id: 'non-empty-body', where: 'merge-gate', input: 'github', signals: ['hasNonEmptyBody'], skipKinds: ['empty-body'] },
+  { id: 'red-team', where: 'merge-gate', input: 'github', signals: [], skipKinds: [],
+    note: 'latest red-team check from WE_APP_ID on the exact PR head; missing or unreadable evidence holds' },
   { id: 'review-hold-labels', where: 'merge-gate', input: 'github', signals: ['hasUnclearedReviewLabel'], skipKinds: ['review-hold'] },
   { id: 'review-acceptance', where: 'merge-gate', input: 'git', signals: ['decideDrainReviewGate', 'decideReviewGate', 'acceptanceCoversHead', 'decideAcceptCarryForward', 'decideDrainWorkflowEditHold'], skipKinds: ['review-hold'],
     note: 'acceptance covers the live head (reviewed-sha / reviewed-diff / contribution markers), escalation score, human-required, permission change, deviation; a workflow-file edit needs a clear-human ceremony at the exact head (merge-gate: workflowEditHold)' },

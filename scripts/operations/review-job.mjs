@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -97,6 +97,7 @@ import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDea
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
+import { publishRedTeamCheckFromLive, clearLivePublicationHold } from '../lib/red-team-check-run.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
@@ -495,6 +496,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { ok: r.status === 0, reason: String(r.stderr || r.stdout || r.error || `exit ${r.status}`) };
     },
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
+    // The outbox marker outlives a failed attempt, so the on-skip recovery pass retries the carried check (#6606).
+    markCarriedCheckOwed: ({ pr, repo, headSha }) => markCarriedCheckUnpublished({ repo, pr, head: headSha, env }),
+    publishCarriedCheck: ({ pr, repo, headSha }) => {
+      const gh = (args, options) => exec('gh', args, { ...options, cwd: root, env });
+      return publishCarriedCheckDurably({ repo, pr, head: headSha, env,
+        publish: hooks => publishRedTeamCheckFromLive({ pr, repo, headSha, appId: env.WE_APP_ID, env, gh, ...hooks }),
+        clearHold: () => clearLivePublicationHold({ repo, pr, headSha, gh }) });
+    },
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
@@ -1139,8 +1148,20 @@ function runReviewArc({
               const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
                 'Review verdict carried across an identical contribution.',
                 ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');
+              // #6606: mark the check owed BEFORE the comment. Recovery skips a head whose result is on it, so a crash
+              // between the comment and the publication must still leave a marker for the retry to find.
+              try { io.markCarriedCheckOwed?.({ pr: planned.pr, repo: planned.repo, headSha: evidence.headSha }); }
+              catch (error) { io.log(`review-job ${slug}: carried-check retry marker not written (${tail(safeErrorText(error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`); }
               io.postCarryComment({ pr: planned.pr, repo: planned.repo, body });
-              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId };
+              let checkPublished = false;
+              try {
+                const published = io.publishCarriedCheck({ pr: planned.pr, repo: planned.repo, headSha: evidence.headSha });
+                checkPublished = published?.ok === true;
+                if (!checkPublished) io.log(`review-job ${slug}: carried check not published (${tail(safeErrorText(published?.reason ?? 'unknown error').replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`);
+              } catch (error) {
+                io.log(`review-job ${slug}: carried check not published (${tail(safeErrorText(error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`);
+              }
+              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId, checkPublished };
               return result(classified);
             }
           }

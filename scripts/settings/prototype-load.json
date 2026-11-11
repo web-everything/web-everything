@@ -71,6 +71,14 @@
   "loaderCli": "scripts/daemon-overlay.mjs",
   "ruledWeakened": [
     {
+      "ref": "lane/redteam-check-run",
+      "sha": "dc7a0efb1c64862460b26d141815dbaf84c55d36",
+      "ruling": "R787+R773",
+      "findings": [
+        "red-team-check-run.mjs:87 policy-clear publication reads then posts without sharing the round writer's claim, so a concurrent round's in_progress check can be superseded by the policy-clear success (carded follow-up)"
+      ]
+    },
+    {
       "ref": "lane/verify-forge-route",
       "sha": "2b6ac7d67b5e4fc1b7137c6d7e59d202eb45a41b",
       "ruling": "R396",

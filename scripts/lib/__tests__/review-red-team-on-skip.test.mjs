@@ -5,15 +5,19 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip,
+  CARRIED_CHECK_ESCALATION } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
-import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir,
+  readCarriedCheckUnpublished, publishCarriedCheckDurably } from '../drain-red-team-evidence.mjs';
+import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
+  readRedTeamPublicationHoldFact } from '../red-team-check-run.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -446,6 +450,38 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     }
   });
 
+  // PR #6535 round 6: the stored not-owed clear runs no round either; its check precedes its comment.
+  it('publishes the cleared head check before the policy-clear comment; a failed post posts nothing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stored-clear-check-'));
+    const order = [];
+    const o = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+      publishCheck: vi.fn(args => { order.push(['check', args]); return { ok: true }; }) });
+    runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); o.rawPrs[0].comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+      expect(order).toEqual([['check', { repo, pr: storedPr, headSha: storedHead }], ['comment', 'pr']]);
+      runGhSync.mockClear();
+      const failed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-2'), WE_RED_TEAM_GATE_SOURCE: 'both' }, publishCheck: vi.fn(() => ({ ok: false, reason: 'HTTP 502' })) });
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('clear failed') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(failed.syncLabels).not.toHaveBeenCalled();
+      // A yield whose superseding post failed (the one fail-open case) names that detail in the row, never hides it.
+      const yielded = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-3'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: false, reason: 'policy-clear yielded to a concurrent round', detail: 'superseding in_progress not posted (HTTP 503)' })) });
+      expect(runRedTeamOnSkip(yielded).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('superseding in_progress not posted (HTTP 503)') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      // The same 80-char feed bound must not cut a comment failure's cause out of the row either.
+      const cause = 'HTTP 502 from the comments endpoint after the check was published; retry owed on this head';
+      runGhSync.mockImplementation(() => { throw Error(cause); });
+      const commentFailed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-4'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: true })) });
+      expect(runRedTeamOnSkip(commentFailed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(cause) });
+    } finally {
+      runGhSync.mockReset();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['policy-clear', 'already'])('retains clear for settlement outcome %s', outcome => {
     const settle = vi.fn(() => ({ outcome })), o = storedRun({ settle });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
@@ -628,6 +664,25 @@ describe('planRedTeamOnSkip', () => {
     expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [{ body, author: { login: 'web-everything' } }] }], readEvidence }).why)
       .toBe('red-team result already on head');
     expect(readEvidence).not.toHaveBeenCalled();
+  });
+  // A verdict carry posts ONE comment: carried marker, prose, then the re-keyed result. Every "is there a result on
+  // this head" reader must see it as the disposition reader does, or a policy-clear could bury a carried break.
+  const carried = (to, gate = '') => ({ author: { login: 'web-everything' }, created_at: '2026-11-07T12:00:00Z', body: [
+    ...(gate ? [gate] : []), `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${to} patch-id=${'c'.repeat(40)} -->`,
+    'Review verdict carried across an identical contribution.', redTeamMarker(pr, to),
+    '1. [**confirmed**] (edge-case, broken) `x.mjs:1` — carried break'].join('\n') });
+  it('c: a carried result with a confirmed break covers this head (no policy-clear over it)', () => {
+    const readEvidence = vi.fn();
+    expect(redTeamForHead([carried(head)], pr, head)?.findings).toMatchObject([{ confirmed: true, summary: 'carried break' }]);
+    expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carried(head)] }], readEvidence }).why)
+      .toBe('red-team result already on head');
+    expect(readEvidence).not.toHaveBeenCalled();
+  });
+  it('c: a carry envelope that is malformed, untrusted or names another head does not count', () => {
+    const other = 'd'.repeat(40);
+    for (const c of [carried(other), { ...carried(head), author: { login: 'outsider' } },
+      carried(head, `<!-- we:red-team-gate pr=${pr} rev=${other} outcome=sent-back -->`)])
+      expect(redTeamForHead([c], pr, head)).toBeNull();
   });
   it('refuses unreadable comments or evidence instead of assuming no pass', () => {
     expect(decide({ rawPrs: [{ number: pr, headRefOid: head }] }).action).toBe('skip');
@@ -819,6 +874,47 @@ describe('daemon rows without formal reviews', () => {
       expect(o.readReviews).toHaveBeenCalledTimes(1);
       expect(runGhSync).toHaveBeenCalledTimes(1);
       expect(o.proveMove).not.toHaveBeenCalled();
+    } finally { runGhSync.mockReset(); }
+  });
+
+  // PR #6535 round 6: the carry settles the head without a round, so it must publish the head-bound red-team check
+  // merge-gate now requires, BEFORE its result comment (a comment alone makes recovery skip the head for good).
+  it('publishes the carried head check before the result comment; a failed post leaves no comment to retry', () => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0], order = [];
+    o.publishCheck = vi.fn(args => { order.push(['check', args]); return { ok: true }; });
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'both' };
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      expect(order).toEqual([['check', { repo, pr: 5929, headSha: raw.headRefOid }], ['comment', 'pr']]);
+      const failed = daemonOptions(5929);
+      failed.publishCheck = vi.fn(() => ({ ok: false, reason: 'HTTP 502' }));
+      failed.env = o.env;
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('carry failed: red-team check not published: HTTP 502') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(failed.syncLabels).not.toHaveBeenCalled();
+      // No comment landed, so the next pass plans the same carry again.
+      failed.publishCheck = vi.fn(() => ({ ok: true }));
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'carry' });
+    } finally { runGhSync.mockReset(); }
+  });
+
+  it('under the drain-scan rollback the check is still attempted, but its failure does not block the carry', () => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0];
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'drain-scan' };
+    o.publishCheck = vi.fn(() => ({ ok: false, reason: 'no App credentials' }));
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((_args, options) => { raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      // Attempted, so a head settled during the rollback is not stranded when the source switches back.
+      expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr: 5929, headSha: raw.headRefOid });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      const ok = daemonOptions(5929);
+      ok.env = o.env; ok.publishCheck = vi.fn(() => { throw Error('offline'); });
+      expect(runRedTeamOnSkip(ok).rows[0]).toMatchObject({ action: 'carry' });
     } finally { runGhSync.mockReset(); }
   });
 
@@ -1698,6 +1794,34 @@ describe('R100 recovery regressions', () => {
     expect(runGhSync).not.toHaveBeenCalled();
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
+  // A late result read through the shared record split: one carried inside a verdict-carry comment is as late as a
+  // direct one, so it supersedes the proposed source clear too (PR 6606 self-review, same class as the finding).
+  it.each([['after', 3], ['before', 2]])('refuses carry when a trusted CARRIED result on another revision arrives %s the live-head re-stamp', (_, at) => {
+    const o = carryOptions(), other = 'c'.repeat(40);
+    o.rawPrs[0].comments.splice(at, 0, trusted([
+      `<!-- review-verdict-carried from=${'e'.repeat(40)} to=${other} patch-id=${'f'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', redTeamMarker(pr, other),
+      '1. [**confirmed**] (edge-case, broken) `x.mjs:1` — carried break'].join('\n')));
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  // The writer's exact non-blocking carry (a clean advisory re-keyed to the carried-to head) is no acceptance hold, so
+  // only the late-result check sees it; it must read the same record split, like a direct clean late result.
+  it.each([['after', 3], ['before', 2]])('refuses carry when a trusted clean CARRIED result on another revision arrives %s the live-head re-stamp', (_, at) => {
+    const o = carryOptions(), other = 'c'.repeat(40), from = 'e'.repeat(40);
+    const advisory = renderRedTeamComment({ pr, rev: from, provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' })
+      .replace(redTeamMarker(pr, from), redTeamMarker(pr, other));
+    o.rawPrs[0].comments.splice(at, 0, trusted([
+      `<!-- review-verdict-carried from=${from} to=${other} patch-id=${'f'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', advisory].join('\n')));
+    expect(redTeamForHead(o.rawPrs[0].comments, pr, other)?.findings).toEqual([]);
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
   it.each(['untrusted', 'other-pr'])('refuses carry when a late %s result supersedes acceptance under latestAcceptRecord', kind => {
     const o = carryOptions();
     const late = trusted(`${redTeamMarker(kind === 'other-pr' ? pr + 1 : pr, 'c'.repeat(40))}\nRed team blocked`);
@@ -1954,5 +2078,225 @@ describe('R756 independent backlog-only pass', () => {
     vi.mocked(runGhSync).mockClear();
     expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
     expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
+  });
+});
+
+// #6606 red team: a transient verification failure made the carried-check publisher supersede its own success, and
+// recovery then skipped the head for good because the carried result was on it. The outbox marker keeps the head owed
+// until a re-validation confirms the check; the recovery pass retries it from live evidence.
+describe('#6606 carried check recovered after a transient verification failure', () => {
+  const APP = 5037855;
+  const carry = () => ({ author: { login: 'web-everything', type: 'Bot' }, created_at: '2026-11-07T12:00:00Z', body: [
+    `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${head} patch-id=${'c'.repeat(40)} -->`,
+    'Review verdict carried across an identical contribution.',
+    renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }),
+  ].join('\n') });
+  function world({ failReadAt = 2, failCheckPosts = new Set() } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'carried-check-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: join(dir, 'locks') };
+    const checkRuns = [], extraRuns = [], statuses = [];
+    let nextId = 40, reads = 0, checkPosts = 0, statusId = 1;
+    const gh = (args, options) => {
+      if (args.includes('POST') && args[1].includes('/statuses/')) {
+        statuses.unshift({ ...JSON.parse(options.input), id: statusId++, creator: { login: 'web-everything' } });
+        return '{}';
+      }
+      if (args[1].includes('/statuses?')) return JSON.stringify(statuses);
+      if (args[1].includes('/status?')) return JSON.stringify({ total_count: statuses.length, statuses });
+      if (args.includes('POST')) {
+        if (failCheckPosts.has(++checkPosts)) throw Error('check-runs POST timed out');
+        const id = nextId++;
+        checkRuns.push({ ...JSON.parse(options.input), id, app: { id: APP }, completed_at: '2026-11-07T13:00:00Z' });
+        return JSON.stringify({ id });
+      }
+      const all = [...checkRuns, ...extraRuns];
+      return JSON.stringify({ total_count: all.length, check_runs: all });
+    };
+    const publish = vi.fn(({ pr: n, headSha }) => publishCarriedCheckDurably({ repo, pr: n, head: headSha, env,
+      publish: hooks => publishRedTeamCheckFromLive({ repo, pr: n, headSha, appId: APP, env, gh, ...hooks,
+        readLive: () => {
+          if (++reads === failReadAt) throw Error('gh pr view timed out');
+          return { headRefOid: head, labels: [] };
+        },
+        readComments: () => [carry()], readStandingRuling: () => null, holdFn: () => null }),
+      clearHold: () => clearLivePublicationHold({ repo, pr: n, headSha, gh }) }));
+    const owed = () => readCarriedCheckUnpublished({ repo, pr, head, env });
+    const fact = () => evaluateRedTeamCheckFact({ repo, pr, headSha: head, appId: APP, checkRuns: [...checkRuns, ...extraRuns] });
+    const holdFact = () => readRedTeamPublicationHoldFact({ repo, pr, headSha: head, gh });
+    const tick = (over = {}) => runRedTeamOnSkip(runFixture({ env,
+      rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [] }],
+      readCarriedCheck: key => readCarriedCheckUnpublished({ ...key, env }), publishCarriedCheck: publish, ...over }));
+    return { dir, env, checkRuns, extraRuns, statuses, publish, owed, fact, holdFact, tick };
+  }
+
+  it('a retry that succeeds clears the publication hold the failed attempt set (and only that hold)', () => {
+    // Attempt 1: success posted, verification read times out, the failure supersede POST also fails → hold set.
+    const w = world({ failCheckPosts: new Set([2]) });
+    try {
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold posted/) });
+      expect(w.holdFact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(true);
+      expect(w.tick().rows[0]).toMatchObject({ why: 'carried red-team check republished from live evidence' });
+      expect(w.fact()).toMatchObject({ ok: true });
+      expect(w.holdFact()).toMatchObject({ ok: true });
+      expect(w.statuses[0]).toMatchObject({ state: 'success', context: `red-team/publication #${pr}` });
+      expect(w.owed()).toBe(false);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    // A newer hold from a round writer is its owner's: the retry leaves it and the head stays held.
+    const v = world({ failCheckPosts: new Set([2]) });
+    try {
+      v.publish({ pr, headSha: head });
+      v.statuses.unshift({ id: 99, state: 'failure', context: `red-team/publication #${pr}`, description: 'held: finished round publication in progress',
+        creator: { login: 'web-everything' } });
+      expect(v.tick().rows[0]).toMatchObject({ why: 'carried red-team check republished from live evidence' });
+      expect(v.statuses[0]).toMatchObject({ id: 99, state: 'failure' });
+      expect(v.holdFact()).toMatchObject({ ok: false });
+    } finally { rmSync(v.dir, { recursive: true, force: true }); }
+    // Third self-review: an OLDER round-writer hold under the helper's own hold must survive too (a trusted success
+    // would clear every hold beneath it), so nothing is posted and the gate stays held.
+    const u = world({ failCheckPosts: new Set([2]) });
+    try {
+      u.statuses.push({ id: 0, state: 'failure', context: `red-team/publication #${pr}`, description: 'held: started round not confirmed published',
+        creator: { login: 'web-everything' } });
+      u.publish({ pr, headSha: head });
+      expect(u.statuses.map(status => `${status.id}:${status.state}`)).toEqual(['1:failure', '0:failure']);
+      expect(u.tick().rows[0]).toMatchObject({ why: 'carried red-team check republished from live evidence' });
+      expect(u.statuses.filter(status => status.state === 'success')).toEqual([]);
+      expect(u.holdFact()).toMatchObject({ ok: false });
+    } finally { rmSync(u.dir, { recursive: true, force: true }); }
+  });
+
+  it('an older confirmed attempt never removes the marker a newer attempt owns', () => {
+    const w = world();
+    try {
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'older', clearHold: () => ({ ok: true }),
+        // A newer attempt marks the head while this one publishes, and then fails.
+        publish: () => {
+          publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'newer', publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+          return { ok: true };
+        } });
+      expect(out).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(true);
+      // Fourth self-review: when THIS attempt's own mark failed, another id in the marker proves nothing (it may be an
+      // older failed attempt's, with its hold): not ok, nothing cleared, the marker kept.
+      const clearHold = vi.fn(() => ({ ok: true }));
+      const statusDir = redTeamStatusDir(w.env);
+      chmodSync(statusDir, 0o555);
+      let failedMark;
+      try {
+        failedMark = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'this', clearHold,
+          publish: () => ({ ok: true }), lock: fn => fn() });
+      } finally { chmodSync(statusDir, 0o755); }
+      expect(failedMark).toMatchObject({ ok: false, reason: expect.stringMatching(/retry marker not written/) });
+      expect(clearHold).not.toHaveBeenCalled();
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a hold clear that fails keeps the marker so the next retry clears it', () => {
+    const w = world({ failCheckPosts: new Set([2]) });
+    try {
+      w.publish({ pr, headSha: head });
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }),
+        clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared: HTTP 502/) });
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a stale marker under a non-carried result (the carry comment failed; a round ran) is ignored', () => {
+    const w = world();
+    try {
+      publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+      const round = { author: { login: 'web-everything' }, created_at: '2026-11-07T14:00:00Z',
+        body: renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) };
+      const escalate = vi.fn();
+      for (const comments of [[round], [carry(), round]])
+        expect(w.tick({ escalate, rawPrs: [{ number: pr, headRefOid: head, comments, labels: [] }] }).rows[0])
+          .toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(w.publish).not.toHaveBeenCalled();
+      expect(escalate).not.toHaveBeenCalled();
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('the recovery pass republishes the carried check once reads recover, then settles the head', () => {
+    const w = world();
+    try {
+      // The review job's carry attempt: success posted, the verification read times out, the helper supersedes it.
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/timed out/) });
+      expect(w.checkRuns.map(run => run.conclusion)).toEqual(['success', 'failure']);
+      expect(w.fact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(true);
+      // The next recovery tick does not skip the head: it re-validates and republishes.
+      expect(w.tick().rows[0]).toMatchObject({ action: 'publish-carried-check', why: 'carried red-team check republished from live evidence' });
+      expect(w.checkRuns.map(run => run.conclusion)).toEqual(['success', 'failure', 'success']);
+      expect(w.fact()).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+      // Settled: later ticks skip as before and post nothing.
+      expect(w.tick().rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(w.checkRuns).toHaveLength(3);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a round failure newer than the carry still refuses the retry; the head stays owed and retries after the cooldown', () => {
+    const w = world();
+    try {
+      w.publish({ pr, headSha: head });
+      w.extraRuns.push({ name: 'red-team', head_sha: head, external_id: `${repo}#${pr}`, app: { id: APP }, id: 99,
+        status: 'completed', conclusion: 'failure', completed_at: '2026-11-07T14:00:00Z', output: { title: 'Red team held' } });
+      let clock = 2_000_000;
+      const lastDispatch = new Map();
+      const escalate = vi.fn();
+      const first = w.tick({ now: () => clock, lastDispatch, escalate }).rows[0];
+      // A failed retry is escalated with a stable reason (one needs-you item), its cause in the context.
+      expect(first).toMatchObject({ action: 'publish-carried-check', why: CARRIED_CHECK_ESCALATION, escalate: true,
+        escalationContext: expect.stringMatching(/not demonstrably newer/) });
+      expect(escalate).toHaveBeenCalledWith(expect.objectContaining({ pr, head, why: CARRIED_CHECK_ESCALATION }));
+      expect(w.owed()).toBe(true);
+      expect(w.tick({ now: () => clock + 60_000, lastDispatch, escalate }).rows[0])
+        .toMatchObject({ action: 'skip', why: 'carried red-team check unconfirmed; retry cooldown active' });
+      expect(w.publish).toHaveBeenCalledTimes(2);
+      clock += 31 * 60_000;
+      expect(w.tick({ now: () => clock, lastDispatch, escalate }).rows[0]).toMatchObject({ action: 'publish-carried-check' });
+      expect(w.publish).toHaveBeenCalledTimes(3);
+      expect(escalate).toHaveBeenCalledTimes(2);
+      expect(w.fact()).toMatchObject({ ok: false });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a kept red-team:pending label still escalates while a carried check is owed, and nothing is republished', () => {
+    const w = world();
+    try {
+      publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+      const escalate = vi.fn();
+      const row = w.tick({ escalate, rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [{ name: 'red-team:pending' }] }] }).rows[0];
+      expect(row).toMatchObject({ action: 'skip', why: 'red-team result already on head', escalate: true,
+        escalationContext: expect.stringMatching(/red-team:pending is still set/) });
+      expect(escalate).toHaveBeenCalledTimes(1);
+      expect(w.publish).not.toHaveBeenCalled();
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps the marker when the publisher throws, and an unreadable or throwing marker read counts as owed', () => {
+    const w = world();
+    try {
+      expect(publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => { throw Error('HTTP 502'); } }))
+        .toMatchObject({ ok: false, reason: 'HTTP 502' });
+      expect(w.owed()).toBe(true);
+      expect(publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }),
+        clearHold: () => ({ ok: true }) })).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+      expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carry()] }], readCarriedCheck: () => { throw Error('EACCES'); } }))
+        .toMatchObject({ action: 'publish-carried-check' });
+      expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carry()] }], readCarriedCheck: () => false }))
+        .toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      // Dry runs and a missing publisher attempt nothing.
+      publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(w.owed()).toBe(true);
+      expect(w.tick({ dryRun: true }).rows[0]).toMatchObject({ action: 'publish-carried-check', why: 'dry run (carried check)' });
+      expect(w.tick({ publishCarriedCheck: null }).rows[0]).toMatchObject({ why: 'carried check publisher unavailable' });
+      expect(w.publish).not.toHaveBeenCalled();
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
 });

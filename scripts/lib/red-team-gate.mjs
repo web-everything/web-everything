@@ -101,6 +101,12 @@ export function parseRedTeamComment(body) {
   const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
   // Non-enumerable: it only keys the digest and must not change the parsed shape callers compare or serialise.
   Object.defineProperty(parsed, 'shapedLines', { value: shapedLines, enumerable: false });
+  // A marker identifies a review; it does not prove that a review finished. Preserve completion
+  // metadata without changing the serialized findings contract or the result digest.
+  const verdict = /^Advisory only:.* · recorded verdict `(accept|changes|needs-human)`\.$/m.exec(text)?.[1];
+  const completedReview = Boolean(verdict && (findings.length
+    || (verdict === 'accept' && /^The red team tried to break this change and reported nothing\.$/m.test(text))));
+  Object.defineProperty(parsed, 'completedReview', { value: completedReview, enumerable: false });
   return parsed;
 }
 
@@ -126,16 +132,22 @@ export function redTeamResultId(parsed) {
 
 /**
  * The red-team comment for the LIVE head: the newest one a TRUSTED principal wrote whose marker names this PR and
- * exactly this head. A comment on another head is stale (the fixer already pushed) and is ignored. PURE.
+ * exactly this head. A comment on another head is stale (the fixer already pushed) and is ignored. A result carried
+ * inside a verdict-carry comment counts exactly as {@link readRedTeamDisposition} counts it (one record reader), so
+ * no "is there a result" check can miss a carried break and let a policy-clear bury it. PURE.
  */
 export function redTeamForHead(comments, pr, head) {
+  return redTeamResultCommentForHead(comments, pr, head)?.parsed ?? null;
+}
+
+/** The record {@link redTeamForHead} reads: `{ comment, parsed }`, where `comment` keeps the creation time of the
+ * comment that holds the result (the carry comment for a carried result), or null. A result carried inside a
+ * verdict-carry comment also names its source head as `carriedFrom`. PURE. */
+export function redTeamResultCommentForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(live)) return null;
-  const hits = (Array.isArray(comments) ? comments : [])
-    .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
-    .filter((x) => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === live)
-    .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i);
-  return hits.at(-1)?.parsed ?? null;
+  const hit = latestResult(indexedRecords(comments), pr, live);
+  return hit ? { comment: hit.c, parsed: hit.parsed, ...(hit.from !== undefined ? { carriedFrom: hit.from } : {}) } : null;
 }
 
 // ── The setting ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -522,6 +534,33 @@ const indexedRecords = comments => {
     return { ...r, i, ts };
   });
 };
+
+/**
+ * Creation times (ms; NaN when unreadable) of every trusted record holding THIS PR/head's result `resultId`, read
+ * through the same record split as {@link readRedTeamDisposition}, so a result recognised inside a verdict-carry
+ * comment is dated by that carry comment. Untrusted, other-head and other-result records never count. PURE.
+ */
+export function redTeamResultRecordTimes(comments, pr, head, resultId) {
+  const live = String(head ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(live) || !resultId) return [];
+  return threadRecords(comments).flatMap(r => {
+    const parsed = parseRedTeamComment(recordBody(r));
+    return parsed?.pr === Number(pr) && parsed.rev === live && redTeamResultId(parsed) === resultId
+      ? [Date.parse(commentCreatedAt(r.c))] : [];
+  });
+}
+
+/**
+ * Thread position (index into `comments`) of the newest trusted record holding a red-team result for this PR on ANY
+ * head, or -1. Read through the same record split as {@link readRedTeamDisposition}, so a result carried inside a
+ * verdict-carry comment counts at that carry comment. PURE.
+ */
+export function latestRedTeamResultPosition(comments, pr) {
+  return threadRecords(comments).reduce((latest, r) => {
+    const parsed = parseRedTeamComment(recordBody(r));
+    return parsed?.pr === Number(pr) && /^[0-9a-f]{40}$/.test(parsed.rev) ? Math.max(latest, r.at) : latest;
+  }, -1);
+}
 
 /** The newest trusted red-team result for this PR and head among the records, or null. PURE. */
 function latestResult(records, pr, sha) {
