@@ -248,7 +248,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync',
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
-    maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
+    maxConcurrent: 8, localFallback: 'allow', localFallbackTimeoutMs: 1_800_000, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
     elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 600000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
@@ -285,6 +285,8 @@ const ADMISSION_VALID = {
   'remote.mode': (v) => v === 'above-threshold' || v === 'always',
   'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
   'remote.maxConcurrent': admissionInt(1),
+  'remote.localFallback': (v) => v === 'allow' || v === 'off',
+  'remote.localFallbackTimeoutMs': (v) => isValidRunWaitMs(v) && v > 0,
   'remote.elasticSlots.enabled': (v) => typeof v === 'boolean',
   'remote.autoSlotUnits': admissionInt(1),
   'remote.slotUnitsByKind': (v) => admissionObject(v) && Object.keys(v).length <= ADMISSION_MAX_SLOTS
@@ -872,6 +874,13 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
   } catch { /* Observability must never prevent local admission. */ }
 }
 
+/** localFallback=off: reasons the work cannot run on Forge at all, so waiting would only deadlock. They still run locally, logged. */
+const LOCAL_FALLBACK_PERMANENT = new Set(['needs-git', 'command-not-allowed', 'invalid-parameters', 'ignored-test-file', 'requires-git-worktree']);
+/** Credential findings that are scan limitations, not a leaked secret. Any other bundle-credential-hit finding is treated as a live token. */
+const GENERIC_CREDENTIAL_FINDINGS = new Set(['unsupported-text-encoding', 'content-scan-error']);
+const credentialBlocked = (fb) => fb.reason === 'bundle-credential-hit'
+  && !GENERIC_CREDENTIAL_FINDINGS.has(String(fb.detail ?? '').split(': ').pop());
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -885,7 +894,7 @@ function resolveSignalCancelWaitMs(env) {
   return Number.isInteger(n) && n >= 0 ? n : 90000;
 }
 
-export async function runWithRemoteDecision({
+async function runWithRemoteDecisionOnce({
   argv, policy, cwd, env, host = 'forge', clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
   timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
@@ -897,6 +906,7 @@ export async function runWithRemoteDecision({
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  fallbackSink = null,
 }) {
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
@@ -915,13 +925,14 @@ export async function runWithRemoteDecision({
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
-  if (!decision.remote) return { handled: false };
+  if (!decision.remote) { if (decision.needsGit && fallbackSink) fallbackSink.fallback = { reason: 'needs-git', permanent: true }; return { handled: false }; }
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, checkForgeBreaker, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     recordRemoteFallback({lockRoot, reason, cwd, argv, env, clock});
+    if (fallbackSink) fallbackSink.fallback = { reason: String(reason) };
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
@@ -1157,6 +1168,7 @@ export async function runWithRemoteDecision({
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
+  if (fallbackSink) fallbackSink.fallback = { reason: String(reason), detail: detail == null ? null : String(detail) };
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
@@ -2825,4 +2837,39 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main(process.argv.slice(2)).catch((e) => { process.stderr.write(`✗ heavy-admission error: ${String(e && e.stack || e)}\n`); process.exit(1); });
+}
+
+/** Routes a heavy run to Forge. With remote.localFallback=off a Forge-reason fallback WAITS and retries Forge (backoff, hard
+ * timeout, loud failure) instead of running on the Mac; permanent-impossible work still runs locally (logged) and a live
+ * credential hit is blocked (exit 125). Default `allow` is the unchanged single attempt. */
+export async function runWithRemoteDecision(opts) {
+  const remote = opts.policy?.settings?.remote ?? {};
+  if (remote.localFallback !== 'off') return runWithRemoteDecisionOnce(opts);
+  const clock = opts.clock ?? Date.now;
+  const log = opts.log ?? ((line) => process.stderr.write(line));
+  const sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const limit = remote.localFallbackTimeoutMs ?? 1_800_000;
+  const startedAt = clock();
+  for (let attempt = 0; ; attempt++) {
+    const sink = {};
+    const result = await runWithRemoteDecisionOnce({ ...opts, fallbackSink: sink });
+    const fb = sink.fallback;
+    if (result.handled || !fb) return result;
+    if (credentialBlocked(fb)) {
+      log(`heavy-admission: localFallback=off - credential finding BLOCKED (${oneLine(fb.reason)}${fb.detail ? `: ${oneLine(fb.detail)}` : ''}); never shipped to Forge and never run locally (exit 125)\n`);
+      return { handled: true, exitCode: 125 };
+    }
+    if (fb.permanent || LOCAL_FALLBACK_PERMANENT.has(fb.reason)) {
+      log(`heavy-admission: localFallback=off - running locally: cannot run on Forge (${oneLine(fb.reason)})\n`);
+      return result;
+    }
+    const elapsed = clock() - startedAt;
+    if (elapsed >= limit) {
+      log(`heavy-admission: localFallback=off - timed out after ${Math.round(elapsed / 1000)}s waiting for Forge (${oneLine(fb.reason)}); failing loudly, never runs locally (exit 124)\n`);
+      return { handled: true, exitCode: 124 };
+    }
+    const wait = Math.min(5000 * 2 ** Math.min(attempt, 4), 60_000, Math.max(0, limit - elapsed));
+    log(`heavy-admission: localFallback=off - waiting ${Math.round(wait / 1000)}s then retrying Forge (${oneLine(fb.reason)}; attempt ${attempt + 1}, ${Math.round(elapsed / 1000)}s of ${Math.round(limit / 1000)}s)\n`);
+    await sleep(wait);
+  }
 }
