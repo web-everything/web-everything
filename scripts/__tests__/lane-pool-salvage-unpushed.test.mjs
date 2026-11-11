@@ -298,6 +298,27 @@ describe('lane-pool salvage-unpushed', () => {
     expect(git(['rev-parse', 'side'], lane)).toBe(sha);
   });
 
+  it('acquire does not trust a stale tracking ref under a narrowed fetch refspec, nor a detached-HEAD local commit', () => {
+    // A branch deleted on origin leaves a lingering refs/remotes/origin/gone that `fetch --prune` never refreshes once
+    // the refspec is narrowed; a local-only commit reachable from it must still be refused.
+    git(['checkout', '-q', '-b', 'side'], lane);
+    const sha = commit(lane, 'local only, stale tracking ref points at it');
+    git(['update-ref', 'refs/remotes/origin/gone', sha], lane);
+    git(['checkout', '-q', 'main'], lane);
+    git(['config', '--replace-all', 'remote.origin.fetch', '+refs/heads/main:refs/remotes/origin/main'], lane);
+    const narrowed = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--lane=1', '--session=n1', '--json']);
+    expect(narrowed.status).not.toBe(0);
+    expect(git(['rev-parse', 'side'], lane)).toBe(sha);
+    git(['config', '--replace-all', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*'], lane);
+    git(['update-ref', '-d', 'refs/remotes/origin/gone'], lane);
+    git(['branch', '-D', 'side'], lane);
+    git(['checkout', '-q', '--detach'], lane);
+    const detached = commit(lane, 'detached local-only');
+    const refused = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--lane=1', '--session=n2', '--json']);
+    expect(refused.status).not.toBe(0);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(detached);
+  });
+
   it('create-only salvage preserves a competing ref created between inspection and push', () => {
     const ancestor = git(['rev-parse', 'HEAD'], lane);
     const sha = commit(lane, 'descendant eligible for fast-forward');

@@ -3214,25 +3214,20 @@ function acquireBlockingWork(repo, dir) {
  *  (transport-config reads, a bounded `ls-remote`, the verification fetch) ran twice per candidate lane on every
  *  acquire — ~2.5x the git children of main — and timed the sim daemon's smoke acquire out at 90s. By the time the
  *  pre-reset guard runs, acquire's own `fetch --prune` has refreshed those tracking refs, the same evidence the
- *  #2924 re-verify and `rev-list origin/<branch>..HEAD` already trust. Symbolic refs (origin/HEAD) and the
- *  coordination namespace (origin/ops/*) never count as proof, exactly as in the operator hint above; a lane whose
- *  fetch refspec is narrowed simply has fewer tracking refs, so more tips look local-only and take the strict path. */
+ *  #2924 re-verify (`localRemoteShas`, reused here) and `rev-list origin/<branch>..HEAD` already trust. That proof set
+ *  is empty unless the lane has exactly the standard fetch mapping, so a narrowed refspec (whose stale tracking refs
+ *  `fetch --prune` never refreshes) always takes the strict path; symbolic refs and origin/ops/* never count. Like the
+ *  #2924 re-verify it trusts the lane's own `remote.origin` — a lane that repoints it is a residual both share. */
 function laneTipsOnTrackingRefs(dir) {
   const local = releaseLocalWorkTips(dir);
   if (!local) return null;
-  const tracking = releaseEvidenceGit(['for-each-ref', '--format=%(objectname) %(refname) %(symref)', 'refs/remotes/origin/'], dir,
-    { timeout: LOCAL_GIT_TIMEOUT_MS });
-  if (tracking === null) return null;
-  const proofs = [];
-  for (const line of tracking.split('\n')) {
-    if (!line) continue;
-    const [sha, ref, symref] = line.split(' ');
-    if (!/^[a-f0-9]{40,64}$/.test(sha ?? '') || !ref) return null;
-    if (symref || ref === 'refs/remotes/origin/HEAD' || ref.startsWith('refs/remotes/origin/ops/')) continue;
-    proofs.push(sha);
-  }
-  const input = [...local.tips, ...[...new Set(proofs)].map(sha => `^${sha}`)].map(line => `${line}\n`).join('');
-  const unproven = releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir,
+  // The #2924 re-verify's own network-free proof set: empty unless the lane carries EXACTLY the standard fetch mapping
+  // (a narrowed or custom refspec leaves stale `refs/remotes/origin/*` refs `fetch --prune` never refreshes), and it
+  // already leaves out symbolic refs and origin/ops/*. An empty set proves nothing, so every tip is then unproven.
+  const proofs = localRemoteShas(dir);
+  const input = [...local.tips, ...[...proofs].map(sha => `^${sha}`)].map(line => `${line}\n`).join('');
+  // One unproven commit decides the answer; never list a long local-only history.
+  const unproven = releaseEvidenceGit(['rev-list', '--max-count=1', '--ignore-missing', '--stdin'], dir,
     { stdio: ['pipe', 'pipe', 'pipe'], input, timeout: LOCAL_GIT_TIMEOUT_MS });
   return unproven === null ? null : unproven === '';
 }
