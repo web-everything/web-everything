@@ -549,3 +549,40 @@ describe('stale remote slot markers (perf10)', () => {
     expect(names(root)).toEqual(['0']);
   });
 });
+
+// Leaked run-less markers (client died before prepare returned) walled off the cap while Forge was idle: a busy
+// Forge (activeRuns > 0) never proved a run-less marker idle, so only a zero-active sample could release it.
+describe('bounded orphan release of run-less markers', () => {
+  const BOUND = 120 * 60_000, SKEW = 60_000;
+  const withIds = (sampledMs, ids, recent = []) => async () => ({sampledAtET: iso(sampledMs), activeRuns: ids.length, activeRunIds: ids, recent});
+  const make = () => {
+    const root = setup({0: {pid: 111}});
+    return {root, reaper: createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])})};
+  };
+  it('releases a dead-owner run-less marker on a busy Forge once any run it could own is older than the run ceiling', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B]))).toEqual(['slot-0.unconfirmed']);
+    expect(names(root)).toEqual([]);
+  });
+  it('keeps it when the sample is not yet past the run ceiling plus skew after the owner was first seen dead', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW - 1_000, [RUN_B]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it('keeps it when Forge does not list its active run ids (count-only telemetry)', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(tel(1, NOW + BOUND + SKEW + 1_000))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it('keeps it when an unfinished run started inside its possible window is still listed', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [going(RUN_B, NOW + 1_000)]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it('never applies to a live owner', async () => {
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([])});
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+});
