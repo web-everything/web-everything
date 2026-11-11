@@ -6535,7 +6535,8 @@ A D2 card's requirements are enforced independently: a missing card clears only 
 pay-by requirements are waived. The card reader and the clock are code hooks only: a plain value passed for either
 (such as `now: 0`) is never used to clear a card, and a plain number may only move the clock later. Platform and file path lists are unioned, never replaced.
 An invalid or unreadable path list protects every path. An explicitly configured platform-preferences file that
-is missing fails closed like an unreadable one. `allow` from the environment also resolves to `block`. The D2 card
+is missing fails closed like an unreadable one. `allow` from the environment also resolves to `block`, and every
+strictness comparison ranks `allow` with `block`, so an override's `prove` never loosens a chain's `allow`. The D2 card
 reader fetches `origin/main` before reading the card; a failed fetch means no card. A caller of the verdict may only
 tighten these settings (a stricter stage, more protected paths), never relax them. The **prod trigger is the first outside user** of any constellation surface:
 first public npm package publish or first external user/customer on plateau-app. The operator records that level

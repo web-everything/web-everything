@@ -430,9 +430,11 @@ const parseEnv = (key, raw) => {
   if (['requireOnMain', 'requirePayBy'].includes(key)) return raw === 'true' ? true : raw === 'false' ? false : undefined;
   return raw;
 };
-/** Is `candidate` at least as strict as `current`? */
+// The value a setting takes effect as: preExisting mode allow is never trusted and resolves to block.
+const effective = (key, v) => (key === 'preExistingMode' && v === 'allow' ? 'block' : v);
+/** Is `candidate` at least as strict as `current`? Compared as they take effect, so allow ranks with block. */
 function tighter(key, candidate, current) {
-  if (RANKS[key]) return RANKS[key].indexOf(candidate) <= RANKS[key].indexOf(current);
+  if (RANKS[key]) return RANKS[key].indexOf(effective(key, candidate)) <= RANKS[key].indexOf(effective(key, current));
   if (key === 'recheckMax' || key === 'baseRecheckMax') return candidate <= current;
   return candidate === true || current === false;
 }

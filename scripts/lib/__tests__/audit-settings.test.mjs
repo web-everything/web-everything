@@ -192,6 +192,20 @@ describe('audit settings (R528)', () => {
       const bad = { 'delivery-platform-preferences.json': '{"audit":{"recheck":{"max":"x"}}}' };
       expect(fromDisk(prefs('any.json', '{"audit":{}}'), {}, bad).value.recheckMax).toBe(0);
     });
+    it('a chain preExisting mode allow is the floor block, so an override prove cannot loosen it (PR #6381 policy send-back)', () => {
+      // allow resolves to block, so it ranks with block, not below prove: comparing the raw labels let an override's
+      // prove pass as tighter than the chain's allow and relax the effective block to prove.
+      const chainOf = mode => ({ 'delivery-platform-preferences.json': `{"audit":{"preExisting":{"mode":"${mode}"}}}` });
+      const mode = (overrideMode, chainMode) => fromDisk(prefs(`pre-${overrideMode}-${chainMode}.json`,
+        `{"audit":{"preExisting":{"mode":"${overrideMode}"}}}`), {}, chainOf(chainMode)).value.preExistingMode;
+      expect(mode('prove', 'allow')).toBe('block');
+      expect(mode('prove', 'block')).toBe('block');
+      expect(mode('allow', 'prove')).toBe('block');
+      expect(mode('block', 'allow')).toBe('block');
+      // A chain that omits the mode, or sets prove, leaves an override prove in place.
+      expect(mode('prove', 'prove')).toBe('prove');
+      expect(fromDisk(prefs('pre-omit.json', '{"audit":{"preExisting":{"mode":"prove"}}}'), {}).value.preExistingMode).toBe('prove');
+    });
     // PR #6381 judge (R10): a platform key `Audit`, or `audit` with an invisible character, was ignored, so its stricter
     // preferences (releaseStage prod, protected paths) were dropped with no warning. It now fails closed.
     describe('a platform key that only normalises to "audit" fails closed (PR #6381 judge)', () => {
