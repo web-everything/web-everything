@@ -118,3 +118,24 @@ describe('live workflow-edit replay', () => {
     expect(replay(fixtures[0], { exec: () => { throw new Error('offline'); } })).toMatchObject({ action: 'defer', applyLabel: null });
   });
 });
+
+describe('refreshed PR: stale listing vs net diff', () => {
+  const pr = { number: 6666, headRefOid: '5ab05b337d000000000000000000000000000000', labels: ['ready-to-merge', 'review:accepted'],
+    files: ['.github/workflows/ci.yml', 'backlog/4456-x.md'] };
+  const netExec = (net) => (cmd, args) => cmd === 'gh'
+    ? JSON.stringify({ headRefOid: pr.headRefOid, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }] })
+    : args[0] === 'diff' ? net : '';
+  it('stale listing naming ci.yml does not hold when the net diff has no workflow path', () => {
+    expect(replay(pr, { exec: netExec('backlog/4456-x.md\0') }).action).toBe('merge');
+  });
+  it('a real workflow edit in the net diff still holds, with the head sha in the message', () => {
+    const r = replay(pr, { exec: netExec('.github/workflows/ci.yml\0') });
+    expect(r).toMatchObject({ action: 'park', humanRequired: true });
+    expect(r.reason).toContain('5ab05b337');
+    expect(r.reason).not.toContain('unknown');
+  });
+  it('unreadable net diff fails closed (defer)', () => {
+    const r = replay(pr, { exec: (cmd, args) => { if (cmd === 'git' && args[0] === 'diff') throw new Error('boom'); return netExec('')(cmd, args); } });
+    expect(r.action).toBe('defer');
+  });
+});
