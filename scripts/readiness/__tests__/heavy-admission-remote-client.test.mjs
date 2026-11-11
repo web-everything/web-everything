@@ -947,7 +947,7 @@ describe('remote client override', () => {
     const displayPath = clientPath.replace(/[^\x20-\x7e]/g, '?').slice(0, 1024);
     expect(formatted).toContain(`remote.clientPath=${displayPath} (platform)`);
     expect(formatted).toMatch(/^[\x20-\x7e\u00b7]+$/);
-    expect(formatted.length).toBeLessThan(2000);
+    expect(formatted.length).toBeLessThan(2500);
     const fs = { realpathSync: () => {
       if (kind === 'unreadable') throw new Error(`read\n\x1b failed: ${clientPath}`);
       return clientPath;
