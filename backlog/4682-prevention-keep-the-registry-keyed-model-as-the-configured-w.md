@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/probation-launcher.mjs", "we:scripts/lib/__tests__/probation-launcher.test.mjs", "we:scripts/lib/antigravity-run-evidence.mjs", "we:scripts/lib/__tests__/antigravity-run-evidence.test.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/__tests__/review-extra-seats.test.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/__tests__/cli-adapter-evidence.test.mjs", "we:scripts/gemini-direct-task.mjs", "we:scripts/__tests__/gemini-direct-task.test.mjs", "we:scripts/lib/__tests__/model-probation-graduation.test.mjs"]
+scope: ["we:scripts/lib/probation-launcher.mjs", "we:scripts/lib/__tests__/probation-launcher.test.mjs", "we:scripts/lib/antigravity-run-evidence.mjs", "we:scripts/lib/__tests__/antigravity-run-evidence.test.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/__tests__/review-extra-seats.test.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/__tests__/cli-adapter.test.mjs", "we:scripts/operations/__tests__/cli-adapter-evidence.test.mjs", "we:scripts/gemini-direct-task.mjs", "we:scripts/__tests__/gemini-direct-task.test.mjs", "we:scripts/lib/__tests__/model-probation-graduation.test.mjs"]
 dateOpened: "2026-09-30"
 preparedDate: "2026-10-02"
 preparedAgainstSha: "a770bdad0ced4c8304349bd4476eeea4befd0f97"
