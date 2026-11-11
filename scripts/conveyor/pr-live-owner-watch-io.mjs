@@ -20,6 +20,9 @@ function optional(path, fallback) {
     return readFileSync(path, 'utf8');
   } catch (e) { if (e.code === 'ENOENT') return fallback; throw e; }
 }
+/** Recent merged PRs read per tick; a PR created before this window but merged inside it is not seen (disclosed residual). */
+const MERGED_LIST_LIMIT = 100;
+
 /** Actual byte tail; feed files can be large. Never interpret human text as JSONL. */
 export function feedTail(path, { read = readSync } = {}) {
   let fd;
@@ -372,12 +375,14 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
     },
     readGaps: () => optional(join(handoff, 'hook-gaps.jsonl'), '').split('\n').filter(Boolean).map(line => JSON.parse(line)),
     async readSystemEvidence(prs) {
-      // Query the time window explicitly: list order is creation order, not merge order.
-      // An empty result proves no merge in the window, independent of older PR comments/creation dates.
+      // No search-backed listing (#no-label-search): list recent merged PRs plainly and filter by mergedAt
+      // client-side. List order is creation order, so take the newest mergedAt inside the window, not the first row.
       const mergeFloor = now - config.noMergeMinutes * 60_000;
-      const merged = readGh(['pr', 'list', '--repo', repo, '--state', 'merged', '--base', 'main', '--search',
-        `merged:>=${new Date(mergeFloor).toISOString()}`, '--limit', '1', '--json', 'mergedAt']);
-      if (!Array.isArray(merged) || merged.some(p => !Number.isFinite(Date.parse(p.mergedAt)))) throw Error('merge evidence unavailable');
+      const mergedAll = readGh(['pr', 'list', '--repo', repo, '--state', 'merged', '--base', 'main',
+        '--limit', String(MERGED_LIST_LIMIT), '--json', 'mergedAt']);
+      if (!Array.isArray(mergedAll) || mergedAll.some(p => !Number.isFinite(Date.parse(p.mergedAt)))) throw Error('merge evidence unavailable');
+      const merged = mergedAll.filter(p => Date.parse(p.mergedAt) >= mergeFloor)
+        .sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
       const pending = [];
       const roots = clones.daemonCloneRoots(join(home, 'workspace'), { env });
       if (roots.length > 64) throw Error('overlay clone inventory oversized; operator inspection required');
