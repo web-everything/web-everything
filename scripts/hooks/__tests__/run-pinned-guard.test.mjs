@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pinnedFixture } from './pinned-fixture.mjs';
 import { dispatchGuardHooks } from '../../lib/dispatch-bg-isolation.mjs';
+import soakBreak from '../../conveyor/soak/breaks/lane-local-guard-loaded-as-hook.mjs';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const settings = JSON.parse(readFileSync(join(repo, '.claude/settings.json'), 'utf8'));
@@ -300,6 +301,27 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     writeFileSync(join(f.clone, planted), 'console.log("PLANTED");');
     expect(f.git(f.clone, 'status', '--porcelain', '--untracked-files=all')).toBe('');
     expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
+  });
+  // Soak tests run only under the soak config, so the break's event coverage is pinned here.
+  it.each(['Stop', 'SubagentStop'])('the lane-local-guard soak break flags a %s hook reverted to a lane-local guard', async event => {
+    const f = fixture();
+    const tree = join(f.temp, 'soak-tree');
+    const previous = process.env.SOAK_TREE_ROOT;
+    try {
+      const reverted = structuredClone(settings);
+      reverted.hooks[event][0].hooks[0].command = 'node scripts/guard-stop-passive-wait.mjs';
+      mkdirSync(join(tree, '.claude'), { recursive: true });
+      writeFileSync(join(tree, '.claude/settings.json'), JSON.stringify(reverted));
+      mkdirSync(join(tree, 'scripts/hooks'), { recursive: true });
+      copyFileSync(join(repo, 'scripts/hooks/run-pinned-guard.mjs'), join(tree, 'scripts/hooks/run-pinned-guard.mjs'));
+      process.env.SOAK_TREE_ROOT = tree;
+      const { violations } = await soakBreak.run();
+      expect(violations).toContain('hook runs the lane-local script: node scripts/guard-stop-passive-wait.mjs');
+      process.env.SOAK_TREE_ROOT = repo;
+      expect((await soakBreak.run()).violations).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.SOAK_TREE_ROOT; else process.env.SOAK_TREE_ROOT = previous;
+    }
   });
   it('keeps identical copies of the lock helpers in the launcher and sync', () => {
     const source = file => readFileSync(join(repo, file), 'utf8');
