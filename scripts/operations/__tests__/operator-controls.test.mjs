@@ -123,6 +123,12 @@ describe('sanctioned wrappers', () => {
     await expect(f.sink(p)).rejects.toThrow(/operator plan no longer valid/);
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
+  it('resume refuses a forged record key', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    const p = planOperatorControl('refresh', { ...contexts.refresh, now: '2026-11-11' }, input);
+    p.record = { ...p.record, key: 'refresh:x:pr:7:forged@2026-11-11' }; p.records = [p.record]; p.body = buildOperatorActionComment(p.record);
+    await expect(f.sink(p)).rejects.toThrow(/operator plan no longer valid/);
+  });
   it('resume still refuses when the head moved but does not contain main', async () => {
     const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: false }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
     await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/state changed since operator plan/);

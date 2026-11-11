@@ -204,6 +204,10 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
       // Attribution must still match: the stored record must be exactly what the input's operator, channel and reason produce.
       const rec = p.record, who = validateOperatorAttribution(p.input);
       if (!rec || p.records.length !== 1 || JSON.stringify(p.records[0]) !== JSON.stringify(rec) || p.body !== buildOperatorActionComment(rec) || rec.op !== 'refresh'
+        || rec.key !== `refresh:${p.input.repo}:pr:${p.input.pr}:${p.fingerprint}@${rec.at}` || rec.version !== 1 || rec.headRef !== undefined
+        || (p.refreshExpect && (rec.details?.previousHead !== p.refreshExpect.head || rec.details?.main !== p.refreshExpect.main))
+        || rec.details?.headRef !== before.headRef
+        || JSON.stringify(Object.keys(rec).sort()) !== JSON.stringify(['actor', 'at', 'channel', 'details', 'key', 'op', 'pr', 'reason', 'repo', 'version'])
         || rec.repo !== p.input.repo || rec.pr !== p.input.pr || rec.actor !== who.actor || rec.channel !== who.channel || rec.reason !== who.reason) throw new Error('operator plan no longer valid');
       await rememberRefresh(refreshStatePath(), `${p.input.repo}#${p.input.pr}`, before.head, { pass: before.requiredCheck ?? null });
       for (const record of p.records) if (!existing.some(r => r.key === record.key)) await putRecord(record);
