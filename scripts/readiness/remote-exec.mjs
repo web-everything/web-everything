@@ -76,8 +76,25 @@ export function isAllowedCommand(argv) {
   return allowedCommand(argv);
 }
 
+/**
+ * Rewrite two exact, equivalent spellings of a test command to the canonical shape the (unchanged) allowlist accepts:
+ * bare `vitest run|related ...` -> `npx vitest ...`, and `node scripts/check-standards.mjs [--local] [--files=..]`
+ * -> `npm run check:standards -- ...`. Anything else (other args, other scripts, node -e, AI/credentialed commands)
+ * passes through untouched and stays refused by allowedCommand.
+ */
+function canonicalTestArgv(argv) {
+  if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')) return argv;
+  if (argv[0] === 'vitest' && ['run', 'related'].includes(argv[1])) return ['npx', ...argv];
+  if (argv[0] === 'node' && argv[1] === 'scripts/check-standards.mjs' && argv.length > 2
+    && argv.slice(2).every(arg => arg === '--local' || /^--files=[^\x00-\x1f]+$/.test(arg))) {
+    return ['npm', 'run', 'check:standards', '--', ...argv.slice(2)];
+  }
+  return argv;
+}
+
 /** Strip leading ./ from Vitest file arguments without changing execution policy. */
 export function normalizeRemoteArgv(argv) {
+  argv = canonicalTestArgv(argv);
   if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
     || argv[0] !== 'npx' || argv[1] !== 'vitest' || !['run', 'related'].includes(argv[2])) return argv;
   const normalized = argv.slice(0, 3);
