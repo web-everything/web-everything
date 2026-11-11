@@ -284,7 +284,7 @@ describe('daemon smoke slots', () => {
       expect(child.status).toBe(73);
       const temporary = join(lock, fs.readdirSync(lock).find(name => name.endsWith('.state.json')) || 'state.json');
       const replacement = { nextTicket: 3,
-        holders: [...previous.holders, { pid: child.pid, ticket: 2, at: 123 }], waiters: [] };
+        holders: [...previous.holders, { pid: child.pid, ticket: 2, at: 123, id: expect.any(String) }], waiters: [] };
       if (phase === 'after rename') {
         expect(state()).toEqual(replacement);
         expect(fs.existsSync(temporary)).toBe(false);
