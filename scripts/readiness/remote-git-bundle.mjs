@@ -8,6 +8,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { classifyManifestPath, credentialTextFinding, credentialContentFinding } from './forge-exec-manifest.mjs';
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
@@ -118,6 +119,17 @@ function splitNul(buffer) {
   if (start < buffer.length) out.push(buffer.subarray(start));
   return out;
 }
+/** Added lines (without the leading '+', each newline-terminated) of a -U0 diff, from the first hunk header on. */
+function splitLines(raw, startLine) {
+  const out = []; let line = 0, from = 0;
+  for (let i = 0; i <= raw.length; i++) {
+    if (i === raw.length || raw[i] === 10) {
+      if (line >= startLine && raw[from] === 0x2b) out.push(raw.subarray(from + 1, i), Buffer.from('\n'));
+      line++; from = i + 1;
+    }
+  }
+  return out;
+}
 const SIGNATURE_ARMOR = /-----(?:BEGIN|END) (?:PGP SIGNATURE|SSH SIGNATURE|SIGNED MESSAGE)-----/g;
 const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
 
@@ -126,7 +138,11 @@ const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '
  * Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
  * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
  */
-export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
+export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024, bundleScan, env = process.env }) {
+  // R905: 'changed-lines' (default) scans only the ADDED lines of a modified blob in an incremental scan; 'whole-blob' is the off switch.
+  const mode = cascadePolicy('bundleScan', bundleScan, { standard: 'changed-lines', envValues: { '': env.WE_BUNDLE_SCAN || undefined }, valid: v => v === 'changed-lines' || v === 'whole-blob', env }).value;
+  const changedLines = Boolean(prerequisite) && mode !== 'whole-blob';
+  const modified = []; // {label, path, oldSha, newSha}: modified blobs scanned by added lines only
   // The pack carries the RAW stored objects. --no-replace-objects keeps refs/replace/* from showing the scan a clean substitute.
   const git = (args, input) => exec({ file: 'git', args: ['--no-replace-objects', ...args], cwd, ...(input === undefined ? {} : { input }) });
   const range = prerequisite ? `${prerequisite}..${head}` : head;
@@ -234,7 +250,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     const fields = meta.split(' ');
     if (!meta.startsWith(':') || meta.startsWith('::') || fields.length !== 5 || !/^[0-7]{6}$/.test(fields[0].slice(1)) || !/^[0-7]{6}$/.test(fields[1])
       || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(fields[3]) || !/^[ADMT]$/.test(fields[4])) throw bundleError('bundle-credential-scan-failed');
-    const [, newMode, , newSha] = fields;
+    const [, newMode, oldSha, newSha] = fields;
     const path = tokens[++i];
     if (!path) throw bundleError('bundle-credential-scan-failed');
     // A mode-only change can turn public regular-file bytes into a prohibited symlink.
@@ -250,11 +266,44 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     if (excluded) return { path: label, finding: 'excluded-path' };
     // A directory entry carries no blob: its name was scanned and classified above, its files are read under their own paths.
     if (newMode === '040000') continue;
+    if (changedLines && fields[4] === 'M' && /^0{40}(0{24})?$/.test(oldSha) === false) {
+      modified.push({ label, path, oldSha, newSha });
+      if (modified.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+      continue;
+    }
     const paths = blobs.get(newSha) ?? new Map();
     blobs.set(newSha, paths);
     const key = path.toString('latin1');
     if (!paths.has(key)) { paths.set(key, { label, path }); pathCount++; }
     if (blobs.size > maxBlobs || pathCount > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+  }
+  // Modified blobs: the old content already shipped, so only lines this range ADDS are new exposure. A binary or unreadable
+  // diff falls back to the whole blob; a failed diff refuses.
+  const wholeFallback = [];
+  const seenDiff = new Set();
+  for (const m of modified) {
+    const key = `${m.oldSha}\0${m.newSha}\0${m.path.toString('latin1')}`;
+    if (seenDiff.has(key)) continue;
+    seenDiff.add(key);
+    const diff = await git(['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', m.oldSha, m.newSha]);
+    if (diff.code !== 0 || diff.stdout == null) throw bundleError('bundle-credential-scan-failed');
+    const raw = bytes(diff.stdout);
+    if (raw.length > SCAN_BATCH_BYTES) throw bundleError('bundle-credential-scan-too-large');
+    if (raw.includes(0) || /^Binary files /m.test(raw.toString('latin1')) || /^GIT binary patch/m.test(raw.toString('latin1'))) { wholeFallback.push(m); continue; }
+    const hunks = raw.toString('latin1').split('\n');
+    const start = hunks.findIndex(line => line.startsWith('@@'));
+    if (start < 0) { wholeFallback.push(m); continue; } // no hunks (mode-only change): scan whole, fail closed
+    const added = Buffer.concat(splitLines(raw, start));
+    const finding = credentialTextFinding(added.toString('latin1')) ?? credentialTextFinding(added.toString('utf8'));
+    let policy = null;
+    try { policy = credentialContentFinding(m.path, added); } catch { policy = 'content-scan-error'; }
+    const hit = policy ?? finding;
+    if (hit) return { path: m.label, finding: hit };
+  }
+  for (const m of wholeFallback) {
+    const paths = blobs.get(m.newSha) ?? new Map();
+    blobs.set(m.newSha, paths);
+    paths.set(m.path.toString('latin1'), { label: m.label, path: m.path });
   }
   const shas = [...blobs.keys()];
   if (!shas.length) return null;
