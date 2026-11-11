@@ -610,6 +610,27 @@ describe('portable feed IO and settings', () => {
     writeFileSync(path, `${'y'.repeat(2 * 1024 * 1024 + 100)}`);
     expect(feedTail(path)).toEqual([]);
   });
+  it('an unpruned hook-gap log yields only its newest records, flagged partial, instead of holding every pass', async () => {
+    const { dir, io } = await localIo();
+    const handoff = join(dir, 'workspace/.operations/handoff'); mkdirSync(handoff, { recursive: true });
+    const write = (count, pad = '') => writeFileSync(join(handoff, 'hook-gaps.jsonl'),
+      `${Array.from({ length: count }, (_, n) => JSON.stringify({ n, action: `stale label${pad}` })).join('\n')}\n`);
+    write(6000); // over the record cap, under the byte cap
+    let gaps = io.readGaps();
+    expect(gaps).toHaveLength(5000); expect(gaps.truncated).toBe(true); expect([gaps[0].n, gaps.at(-1).n]).toEqual([1000, 5999]);
+    write(6000, 'x'.repeat(400)); // over the 2 MiB byte cap: a whole-file read would throw here
+    gaps = io.readGaps();
+    expect(gaps.length).toBeGreaterThan(0); expect(gaps.length).toBeLessThan(5000);
+    expect(gaps.truncated).toBe(true); expect(gaps.at(-1).n).toBe(5999);
+    write(2);
+    gaps = io.readGaps(); expect(gaps.map(g => g.n)).toEqual([0, 1]); expect(gaps.truncated).toBe(false);
+  });
+  it('a partial hook-gap read still runs the pass and says the self-audit covers the newest records only', async () => {
+    const h = harness(undefined, { readGaps: () => Object.assign([{ gapClass: 'false-positive' }], { truncated: true }) });
+    const result = await h.run();
+    expect(result.held).toEqual([]); expect(h.io.execute).toHaveBeenCalled();
+    expect(result.selfAudit.summary).toMatch(/rules missing for false-positive \(1\) \(newest 1 gap records only; operator may inspect the full hook-gap log\)/);
+  });
   it('a short tail read fails closed instead of dropping the newest records', () => {
     const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir);
     const path = join(dir, 'feed.jsonl'); writeFileSync(path, 'a\nb\n');
@@ -682,23 +703,36 @@ describe('portable feed IO and settings', () => {
     const childPid = Number(readFileSync(pidFile, 'utf8'));
     expect(() => process.kill(childPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
   }, 15_000);
-  it('health child preserves explicit settings-file and platform opt-ins', async () => {
+  it('health child preserves explicit settings-file and platform opt-ins through the production probe and child launch', async () => {
     const { DEFAULT_HEALTH_CONFIG } = await import('../health-watch-core.mjs');
-    const { liveOwnerChildEnv } = await import('../pr-live-owner-watch.mjs');
-    const childConfig = { ...DEFAULT_HEALTH_CONFIG.liveOwnerWatch };
+    const { runBoundedPass, liveOwnerChildEnv } = await import('../pr-live-owner-watch.mjs');
+    const probeDir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-probe-')); dirs.push(probeDir);
+    const envFile = join(probeDir, 'child-env.json'), script = join(probeDir, 'child.cjs');
+    // Stand-in child: records the env the production parent built for it, then answers like a pass.
+    writeFileSync(script, `require('node:fs').writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({
+      config: process.env.WE_LIVE_OWNER_WATCH_CONFIG, now: process.env.WE_LIVE_OWNER_WATCH_NOW })); console.log('{}');`);
+    // A non-default budget, so the test proves the parent's budget (less start-up headroom) is what crosses.
+    const probed = await probeLiveOwnerWatch({ dir: probeDir, now: NOW, config: DEFAULT_HEALTH_CONFIG, remainingMs: 24_000,
+      readCache: () => null, writeCache: () => {}, runPass: options => runBoundedPass({ ...options, script }) });
+    expect(probed).toMatchObject({ cached: false, result: {} });
+    const child = JSON.parse(readFileSync(envFile, 'utf8'));
+    // Only the tick budget crosses: no health default for mode, actEnabled or a threshold reaches the child.
+    expect(JSON.parse(child.config)).toEqual({ tickBudgetMs: 19_000 });
+    expect(child.now).toBe(String(NOW));
+    // Start-up headroom is at most a quarter of a short kill timeout, so a small budget is never zeroed.
+    expect(JSON.parse(liveOwnerChildEnv({ now: NOW, timeoutMs: 2000, env: {} }).WE_LIVE_OWNER_WATCH_CONFIG)).toEqual({ tickBudgetMs: 1500 });
     const childIo = async ({ fileSettings, platform }) => {
       const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-child-')); dirs.push(dir);
       mkdirSync(join(dir, 'scripts/conveyor'), { recursive: true });
       if (fileSettings) writeFileSync(join(dir, 'scripts/conveyor/pr-live-owner-watch.settings.json'), JSON.stringify({ liveOwnerWatch: fileSettings }));
       writeFileSync(join(dir, 'platform.json'), JSON.stringify(platform ?? {}));
-      // The production parent: health defaults → probe cfg → child env (the same helper runBoundedPass uses).
-      const cfg = { ...LIVE_OWNER_DEFAULTS, ...childConfig };
-      const env = liveOwnerChildEnv({ now: NOW, timeoutMs: Math.min(30_000, cfg.tickBudgetMs), env: { GH_REPO: pr().repo,
-        WE_PLATFORM_PREFERENCES_FILE: join(dir, 'platform.json'), WE_POLICY_CASCADE_LOG: '0' } });
+      // The child resolves its policy from exactly the env the production parent handed it.
+      const env = { GH_REPO: pr().repo, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'platform.json'), WE_POLICY_CASCADE_LOG: '0',
+        WE_LIVE_OWNER_WATCH_CONFIG: child.config, WE_LIVE_OWNER_WATCH_NOW: child.now };
       return (await createLiveOwnerWatchIo({ env, home: dir, root: dir, now: NOW })).config;
     };
     expect(await childIo({ fileSettings: { mode: 'on', actEnabled: true, noMergeMinutes: 90 } }))
-      .toMatchObject({ mode: 'on', actEnabled: true, noMergeMinutes: 90, tickBudgetMs: 30_000 });
+      .toMatchObject({ mode: 'on', actEnabled: true, noMergeMinutes: 90, tickBudgetMs: 19_000 });
     expect(await childIo({ platform: { liveOwnerWatch: { mode: 'on', actEnabled: true } } })).toMatchObject({ mode: 'on', actEnabled: true });
     expect(await childIo({})).toMatchObject({ mode: 'shadow', actEnabled: false });
   });

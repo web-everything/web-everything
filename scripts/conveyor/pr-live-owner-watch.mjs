@@ -22,6 +22,10 @@ const keyOf = pr => `${pr.repo}#${pr.number ?? pr.pr}`;
 export const DECISION_WINDOW_MS = HOUR;
 /** Longest notify dedup window; the IO prunes smell state older than this. */
 export const NOTIFY_MAX_WINDOW_MS = 24 * HOUR;
+/** Most recent hook-gap records the self-audit reads; the IO tail-reads the append-only log down to this. */
+export const MAX_HOOK_GAPS = 5000;
+/** Child start-up (Node boot + imports) runs before its own budget clock; leave it this much of the kill timeout. */
+export const CHILD_STARTUP_MARGIN_MS = 5000;
 const recent = (r, now, window = DECISION_WINDOW_MS) => Number.isFinite(millis(r.ts ?? r.at)) && millis(r.ts ?? r.at) > now - window;
 /** PURE. Explicit false (including a zombie) is dead; unknown probes never authorize a takeover. */
 export function processLive(row) {
@@ -150,8 +154,10 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
   try {
     release = await io.acquireRun();
     const gaps = await io.readGaps();
-    if (!Array.isArray(gaps) || gaps.length > 5000) throw Error('hook gaps incomplete or oversized; operator must inspect full input');
+    if (!Array.isArray(gaps) || gaps.length > MAX_HOOK_GAPS) throw Error('hook gaps incomplete or oversized; operator must inspect full input');
     result.selfAudit = selfAudit(gaps);
+    // A tail-read log covers only its newest records: say so, so the summary never reads as the whole history.
+    if (gaps.truncated === true) result.selfAudit.summary += ` (newest ${gaps.length} gap records only; operator may inspect the full hook-gap log)`;
     if (config.actEnabled !== true || result.selfAudit.unruled.length) await notify('SELF-AUDIT', result.selfAudit.summary, {}, NOTIFY_MAX_WINDOW_MS);
     const history = await io.readHistory(), sweep = await io.readSweepHistory();
     if (sweep.complete !== true) throw Error('stall-sweep audit incomplete');
@@ -249,11 +255,14 @@ export async function probeLiveOwnerWatch({ dir, now = Date.now(), config = {}, 
 /**
  * Child env for the bounded pass. Forward only the tick budget the parent's kill timeout enforces: policy
  * (mode, actEnabled) and thresholds resolve in the child's own cascade (settings file → platform → env), so
- * health defaults never override an explicit opt-in or a configured threshold.
+ * health defaults never override an explicit opt-in or a configured threshold. The child's budget clock starts
+ * after Node boot and imports, so it gets the kill timeout minus a start-up margin (at most a quarter of it):
+ * a pass that spends its whole budget still finishes before the SIGKILL, never between intent and did.
  */
 export function liveOwnerChildEnv({ now, timeoutMs, env = process.env }) {
+  const margin = Math.min(CHILD_STARTUP_MARGIN_MS, Math.floor(timeoutMs / 4));
   return { ...env, WE_LIVE_OWNER_WATCH_NOW: String(now),
-    WE_LIVE_OWNER_WATCH_CONFIG: JSON.stringify({ tickBudgetMs: Math.max(1, Math.floor(timeoutMs)) }) };
+    WE_LIVE_OWNER_WATCH_CONFIG: JSON.stringify({ tickBudgetMs: Math.max(1, Math.floor(timeoutMs - margin)) }) };
 }
 /** Runs the pass in a child killed with SIGKILL at the timeout; the child's own gh/git/ps reads carry ≤5s timeouts. */
 export function runBoundedPass({ now, timeoutMs, script = fileURLToPath(import.meta.url) }) {

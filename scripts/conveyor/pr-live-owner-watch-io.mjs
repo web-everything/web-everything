@@ -4,7 +4,7 @@ import { homedir, hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { DECISION_WINDOW_MS, LIVE_OWNER_DEFAULTS, NOTIFY_MAX_WINDOW_MS, processLive } from './pr-live-owner-watch.mjs';
+import { DECISION_WINDOW_MS, LIVE_OWNER_DEFAULTS, MAX_HOOK_GAPS, NOTIFY_MAX_WINDOW_MS, processLive } from './pr-live-owner-watch.mjs';
 import { handoffHome } from '../lib/handoff-path.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
@@ -413,7 +413,13 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
       const { lines } = feed.diffFeed([], [event], now);
       feed.appendLines(path, lines);
     },
-    readGaps: () => optional(join(handoff, 'hook-gaps.jsonl'), '').split('\n').filter(Boolean).map(line => JSON.parse(line)),
+    // Other sessions append to this log and nothing prunes it, so a whole-file read would eventually exceed the
+    // read cap and hold every pass. Read the newest records only, and flag that the audit is partial.
+    readGaps() {
+      const { lines, truncated } = tailRecords(join(handoff, 'hook-gaps.jsonl'));
+      const newest = lines.slice(-MAX_HOOK_GAPS);
+      return Object.assign(newest.map(line => JSON.parse(line)), { truncated: truncated || newest.length < lines.length });
+    },
     readLastMergeAt,
     async readSystemEvidence(prs) {
       const lastMergeAt = readLastMergeAt();
