@@ -137,6 +137,41 @@ describe('credentialContentFinding test-file code expression opaque tokens', () 
     expect(scan(`creds: ${value}\n`, 'scripts/lib/example.test.mjs')).toBeNull();
   });
 
+  // Mid-entropy random tokens (3.5-4.3 bits, under three digits) used to pass the digit/entropy floor inside a call
+  // while the base scan flags them. Word-shape, not entropy alone, now decides.
+  const randomTokens = [
+    ['lowercase', 'zgujkzpaensjbhrujdsb'],
+    ['long lowercase', 'jimbhqopwnjrngzlrsrserrerdokezvd'],
+    ['mixed case', 'jedARwwtWIavtsztvRpH'],
+    ['long mixed case', 'KEVSTmpVAlDVRSqxbeKblyUJFEEAVFTM'],
+    ['hex digest', '06d6155d741c4f151af31625cf5bb176'],
+    ['40-char hex', '818ab8c024cc088a81c018334b0fb3087963fb70'],
+    ['separator-split mixed case', 'jedARwwtWI-avtsztvRpH'],
+  ];
+  it.each(randomTokens)('flags a mid-entropy random token in a test-file call (%s)', (_name, token) => {
+    for (const value of [`f('${token}')`, `f("${token}")`, `f(${token})`, `f(${token}, 1)`, `() => '${token}'`]) {
+      expect(scan(`creds: ${value}\n`, testPath)).toBe('high-entropy-creds');
+      expect(scan(`creds:\n  ${value}\n`, testPath)).toBe('high-entropy-creds');
+    }
+  });
+  it('flags a mid-entropy random token cut into quoted pieces', () => {
+    const [a, b] = ['zgujkzpaen', 'sjbhrujdsb'];
+    expect(scan(`creds: f('${a}', '${b}')\n`, testPath)).toBe('high-entropy-creds');
+    expect(scan(`creds: f('${a}' + '${b}')\n`, testPath)).toBe('high-entropy-creds');
+  });
+  it.each([
+    ['spaced fixture sentence', "f('fixture network failure')"],
+    ['colon-separated fixture id', "f('pass-daemon:ci-queue-watch')"],
+    ['word pieces with a digit suffix', "f('package-lock.json', 'utf8')"],
+    ['snake-case fixture', "f('acceptance_fixture_value')"],
+    ['camelCase fixture literal', "f('readRecoveryCredentialValue')"],
+  ])('still skips a word-like fixture in a test-file call: %s', (_name, value) => {
+    expect(scan(`creds: ${value}\n`, testPath)).toBeNull();
+  });
+  it('keeps the word-shape rule off non-test files (full rule applies)', () => {
+    expect(scan("creds: f('fixture network failure')\n", 'scripts/lib/example.mjs')).toBe('high-entropy-creds');
+  });
+
   it('applies the residual to test files only', () => {
     expect(scan(`creds: ${literal}(x)\n`, 'scripts/lib/example.mjs')).toBe('high-entropy-creds');
   });

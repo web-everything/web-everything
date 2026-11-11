@@ -135,12 +135,12 @@ function codeExpression(raw) {
     }
     if(!closed)return false;
     // A quoted literal that is opaque once whitespace is removed is a secret, whatever it sits beside.
-    if(opaqueLiteral(inner.replace(/\s/g,'')))return false;
+    if(opaqueCode(inner.replace(/\s/g,''),inner))return false;
     pieces.push(inner);
     code+='\u0001';
   }
   // An unquoted opaque token (split at punctuation, so a chained secret piece still counts) keeps the scan.
-  if(code.split(/[^\w$+/=-]+/).some(opaqueLiteral))return false;
+  if(code.split(/[^\w$+/=-]+/).some(token=>opaqueCode(token)))return false;
   // A secret can be cut into short pieces (`'Xk9m...'+'R4tW...'`, `f(a.b)`, `f(x, y)`). The base scan reads the
   // value whole, so read the arguments whole too: drop call names and keywords, put every quoted literal back
   // in place, join what is left and test that. Fails closed: long argument lists with several digits also keep
@@ -149,6 +149,9 @@ function codeExpression(raw) {
   const joined=code.replace(nonCallKeyword,' ').replace(/[A-Za-z_$][\w$]*(?=\s*\()/g,' ')
     .replace(/\u0001/g,()=>pieces[next++]).replace(/[^\w$+/=-]+/g,'');
   if(opaqueLiteral(joined))return false;
+  // Quoted pieces joined without the surrounding code: the word-shape rule applies here, not to `joined`
+  // (which glues identifiers together and would read as one long non-word).
+  if(pieces.length>1&&opaqueCode(pieces.join('').replace(/\s/g,''),pieces.join(' ')))return false;
   // Only an arrow or a call to a real identifier is a code expression. A bare paren, or a keyword before a
   // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
   return /=>|[A-Za-z_$][\w$]*\s*\(/.test(code.replace(nonCallKeyword,' '));
@@ -160,6 +163,25 @@ const opaqueLiteral=token=>{
   const bits=entropy(token);
   return bits>=3.5&&(bits>=4.3||(token.match(/\d/g)??[]).length>=3);
 };
+// The digit/entropy floor above lets a random 20+ char token with few digits (lowercase, mixed-case or hex-like,
+// entropy 3.5-4.3) through, which the base scan flags. So inside a test-file code expression a long token also
+// counts as a secret unless it reads as words: two or more letters-only segments (split at whitespace, `_`, `.`,
+// `-` and camelCase humps), none over 14 letters, none with a 4-consonant run, and at most one without a vowel
+// (`ghp` in `ghp_acceptance_fixture`). Random strings fail this almost always; a rare lowercase-and-separator
+// token that happens to read as words still passes (residual, tracked in the card).
+const wordLike=text=>{
+  const segments=text.split(/[\s_.:-]+|(?<=[a-z])(?=[A-Z])/).filter(Boolean);
+  if(segments.length<2)return false;
+  let vowelless=0;
+  for(const segment of segments) {
+    if(!/^[A-Za-z]{1,14}\d{0,3}$/.test(segment)||/[^aeiou\d]{4}/i.test(segment))return false;
+    if(!/[aeiou]/i.test(segment)&&++vowelless>1)return false;
+  }
+  return true;
+};
+// A hex run is judged by length: 20+ hex chars with digits sit just under the 3.5-bit floor on their own.
+const opaqueCode=(token,words=token)=>opaqueLiteral(token)||/^(?=(?:[a-f]*\d){3})[0-9a-f]{20,}$/i.test(token)
+  ||(token.length>=20&&entropy(token)>=3.5&&!wordLike(words.replace(/[+/=$]+/g,' ')));
 const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|case|in|of|instanceof|if|while|for|switch|catch|with|else|do|new|async|function|class|import|super|this|default|let|const|var|extends|as|satisfies|static|get|set)(?![\w$])/g;
 const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 function entropy(text) {
