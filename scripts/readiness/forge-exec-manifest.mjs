@@ -146,11 +146,13 @@ function codeExpression(raw) {
   // in place, join what is left and test that. Fails closed: long argument lists with several digits also keep
   // the scan.
   let next=0;
-  const joined=code.replace(nonCallKeyword,' ').replace(/[A-Za-z_$][\w$]*(?=\s*\()/g,' ')
-    .replace(/\u0001/g,()=>pieces[next++]).replace(/[^\w$+/=-]+/g,'');
-  if(opaqueLiteral(joined))return false;
-  // Quoted pieces joined without the surrounding code: the word-shape rule applies here, not to `joined`
-  // (which glues identifiers together and would read as one long non-word).
+  const args=code.replace(nonCallKeyword,' ').replace(/[A-Za-z_$][\w$]*(?=\s*\()/g,' ')
+    .replace(/\u0001/g,()=>pieces[next++]);
+  const joined=args.replace(/[^\w$+/=-]+/g,'');
+  // `args` keeps the separators (as spaces) so the word-shape rule reads each piece as its own word: unquoted
+  // pieces cut at `.` or `,` (`f(zgujkzpaen.sjbhrujdsb)`) join into one token the base scan flags.
+  if(opaqueCode(joined,args.replace(/[^\w$+/=-]+/g,' ')))return false;
+  // Quoted pieces joined without the surrounding code (identifiers around them would blur the word shape).
   if(pieces.length>1&&opaqueCode(pieces.join('').replace(/\s/g,''),pieces.join(' ')))return false;
   // Only an arrow or a call to a real identifier is a code expression. A bare paren, or a keyword before a
   // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
@@ -174,8 +176,8 @@ const wordLike=text=>{
   if(segments.length<2)return false;
   let vowelless=0;
   for(const segment of segments) {
-    if(!/^[A-Za-z]{1,14}\d{0,3}$/.test(segment)||/[^aeiou\d]{4}/i.test(segment))return false;
-    if(!/[aeiou]/i.test(segment)&&++vowelless>1)return false;
+    if(!/^(?:[A-Za-z]{1,14}\d{0,3}|\d{1,3})$/.test(segment)||/[^aeiou\d]{4}/i.test(segment))return false;
+    if(segment.length>1&&!/[aeiou]/i.test(segment)&&++vowelless>1)return false;
   }
   return true;
 };

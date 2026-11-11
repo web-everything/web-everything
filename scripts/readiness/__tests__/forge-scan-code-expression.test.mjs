@@ -160,7 +160,18 @@ describe('credentialContentFinding test-file code expression opaque tokens', () 
     expect(scan(`creds: f('${a}' + '${b}')\n`, testPath)).toBe('high-entropy-creds');
   });
   it.each([
+    ['dot-split unquoted pieces', 'f(zgujkzpaen.sjbhrujdsb)'],
+    ['comma-split unquoted pieces', 'f(zgujkzpaen,sjbhrujdsb)'],
+    ['three dot-split unquoted pieces', 'f(zgujkzpaen.sjbhrujdsb.qwrtplkjh)'],
+    ['unquoted pieces around a short identifier', 'f(zgujkzpaen.x.sjbhrujdsb)'],
+  ])('flags unquoted mid-entropy pieces joined across separators: %s', (_name, value) => {
+    expect(scan(`creds: ${value}\n`, testPath)).toBe('high-entropy-creds');
+    expect(scan(`creds: ${value}\n`, 'scripts/lib/example.mjs')).toBe('high-entropy-creds');
+  });
+  it.each([
     ['spaced fixture sentence', "f('fixture network failure')"],
+    ['single-letter parameters', "(a, b) => a + b + 'suffix_value_here'"],
+    ['long identifier arguments', 'someVeryLongFunctionName(argumentNumberOne, argumentNumberTwo)'],
     ['colon-separated fixture id', "f('pass-daemon:ci-queue-watch')"],
     ['word pieces with a digit suffix', "f('package-lock.json', 'utf8')"],
     ['snake-case fixture', "f('acceptance_fixture_value')"],
