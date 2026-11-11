@@ -35,6 +35,9 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
   'scripts/operations/record-verdict*', 'scripts/operations/record-referral-ruling*', 'scripts/operations/land-human-only*',
   'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json', 'scripts/lib/review-escalation.mjs',
   'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/numbering-carry.mjs',
+  // Landed on main since: the mixed numbering+merge chain prover (imported by numbering-carry) and the carried-acceptance
+  // provenance note (imported by rebase-verdict-carry) — direct imports of the review authorization family.
+  'scripts/lib/carry-chain.mjs', 'scripts/lib/carried-provenance.mjs',
   // PR #6381 self-review: the operator's ruling on a confirmed red-team break (twin of record-referral-ruling), the
   // standing ruling and the ruling that answers a stand-down, the ledger backfill of rulings, the human-only enqueue
   // license, the approved-human-surface hold and the verdict hold of a PR's state.
