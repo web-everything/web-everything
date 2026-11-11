@@ -17,7 +17,7 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -25,7 +25,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fingerprintOf, parseStackMarkers, renderStackMarker, stackHoldHeading } from '../../conveyor/review-stack-base.mjs';
 
 import {
-  readLatestFixRange,
+  readLatestFixRange, BODY_FILE_REFUSALS,
   PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks as createSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
@@ -455,29 +455,55 @@ describe('the label sink', () => {
       expect(readFileSync(bodyPath, 'utf8')).toBe('# staged verdict');
     });
 
-    it('the real review-set-label CLI refuses an unreadable body before any gh call, in a form recovery recognises', () => {
+    // Every body-file refusal accepted as replay proof gets a REAL-CLI case here: the CLI must refuse with no gh
+    // call and no file written, or a replay could double-post. The coverage test below fails if a new pattern is
+    // added to BODY_FILE_REFUSALS without a case.
+    const BODY_FILE_CASES = [
+      ['unreadable', () => join(root, 'gone.md')],
+      ['empty', () => { const p = join(root, 'empty.md'); writeFileSync(p, ''); return p; }],
+      ['whitespace-only', () => { const p = join(root, 'blank.md'); writeFileSync(p, '  \n\t\n'); return p; }],
+      // Outside every allowed root (cwd, tmpdir, /tmp): the location check runs before the file is read.
+      ['outside-root', () => '/nonexistent-review-pr-io-6661/verdict.md'],
+    ];
+    const runRealCli = (bodyFile) => {
       const bin = mkdtempSync(join(tmpdir(), 'review-pr-io-gh-'));
       const log = join(bin, 'gh.log');
       writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$@" >> "${log}"\nexit 1\n`, { mode: 0o755 });
-      const missing = join(root, 'gone.md');
+      const before = readdirSync(root).sort();
       let cli;
       let ghCalls = '';
       try {
         cli = spawnSync(process.execPath, [resolve('scripts/review-set-label.mjs'), '7', '--repo=o/n',
-          '--to=accepted', '--actor=operator', `--body-file=${missing}`], {
+          '--to=accepted', '--actor=operator', `--body-file=${bodyFile}`], {
           encoding: 'utf8', cwd: root, timeout: 60_000, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, VITEST: 'true' },
         });
       } finally {
         ghCalls = existsSync(log) ? readFileSync(log, 'utf8') : '';
         rmSync(bin, { recursive: true, force: true });
       }
+      return { cli, ghCalls, before, after: readdirSync(root).sort() };
+    };
+
+    it.each(BODY_FILE_CASES)('the real review-set-label CLI refuses a %s body before any write, in a form recovery recognises', (_name, makeBodyFile) => {
+      const { cli, ghCalls, before, after } = runRealCli(makeBodyFile());
       const diagnostics = `status=${cli.status} stdout=${cli.stdout} stderr=${cli.stderr}`;
       expect(cli.status, diagnostics).toBe(2);
       const error = JSON.parse(cli.stdout.trim().split('\n').pop()).error;
       expect(ghCalls).toBe('');
+      expect(after).toEqual(before);
       expect(isPreWriteRefusal(error)).toBe(true);
       const sinks = createReviewPrSinks({ root });
       expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error: `review-set-label.mjs failed and its outcome is UNKNOWN: ${error}` })).toBe(true);
+    });
+
+    it('every body-file refusal that licenses a replay has a real-CLI no-write case', () => {
+      const covered = new Set();
+      for (const [, makeBodyFile] of BODY_FILE_CASES) {
+        const { cli } = runRealCli(makeBodyFile());
+        const error = JSON.parse(cli.stdout.trim().split('\n').pop()).error;
+        BODY_FILE_REFUSALS.forEach((pattern, i) => { if (pattern.test(error)) covered.add(i); });
+      }
+      expect([...covered].sort()).toEqual(BODY_FILE_REFUSALS.map((_, i) => i));
     });
   });
 

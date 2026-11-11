@@ -798,7 +798,8 @@ export function createReviewPrReader({
  * widens what counts as safe.
  */
 // These argument checks run in the CLI entry point before runReviewLabelCli can mutate anything.
-const BODY_FILE_REFUSALS = Object.freeze([
+// Exported so a test can require one real-CLI no-write case per pattern: each one licenses a replay.
+export const BODY_FILE_REFUSALS = Object.freeze([
   /--body-file=[^\r\n]+ is unreadable \(/,
   /--body-file=[^\r\n]+ is empty — pass the verdict write-up/,
   /--body-file must live under the repo root or a temp dir \(got /,
