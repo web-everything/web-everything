@@ -80,11 +80,11 @@ describe('ci.yml caches beyond the npm download cache', () => {
     }
   });
 
-  it('retains the public Playwright browser cache keyed by browser version', () => {
-    const cache = step('smoke', (s) => s.name === 'Cache Playwright browsers');
-    expect(cache.uses).toBe('actions/cache@v4');
-    expect(paths(cache.with?.path)).toEqual(['~/.cache/ms-playwright']);
-    expect(cache.with.key).toBe('playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}');
+  it('smoke no longer caches Playwright browsers: the pinned container ships them', () => {
+    const steps = jobs.smoke.steps;
+    expect(steps.filter((s) => s.name === 'Cache Playwright browsers')).toHaveLength(0);
+    expect(steps.filter((s) => s.name === 'Install Playwright chromium')).toHaveLength(0);
+    expect(jobs.smoke.container.image).toMatch(/^mcr\.microsoft\.com\/playwright:v\d+\.\d+\.\d+-jammy$/);
   });
 
   it('never suppresses cache failures with continue-on-error', () => {
