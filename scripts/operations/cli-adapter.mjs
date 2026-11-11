@@ -1015,7 +1015,7 @@ function stampFinish(run, stepIndex, clock) {
  *   `stampStart`/`stampFinish` below and `we:scripts/operations/run-record.mjs#withStepStart`.
  * @returns {Promise<{run: object, stopped: string, error: (Error|null), applied: string[], step?: string,
  *   priorConfirm?: ({step: string, value: *}|null), inFlight?: string[]}>}
- *   `stopped` is one of `'complete'`, `'confirm'`, `'stuck'`, `'effect-halted'`, `'effect-in-flight'` or
+ *   `stopped` is one of `'complete'`, `'confirm'`, `'stuck'`, `'effect-halted'`, `'effect-refused'`, `'effect-in-flight'` or
  *   `'step-refused'` — the last one is a declaration fn (a `compute`, `judge`, `confirm` or `effect` step)
  *   throwing deterministically once its answer is already committed to the record (#3063). `step` and
  *   `priorConfirm` ride only on `step-refused`, because that is the one stop `renderOutcome` cannot describe
@@ -1098,7 +1098,16 @@ export async function driveRun({
   for (let turn = 0; turn < maxTurns; turn += 1) {
     const status = runStatus(current, { registry });
 
-    if (status === 'complete') return { run: current, stopped: 'complete', error: null, applied };
+    if (status === 'complete') {
+      // The engine settles permanent refusals too. Preserve that distinction on every drive,
+      // including a terminal resume, without replaying effects or losing this drive's applied prefix.
+      if (current.outcome === 'refused') {
+        const refusal = current.effects.find((entry) => entry.status === 'refused');
+        return { run: current, stopped: 'effect-refused',
+          error: new Error(refusal?.error || 'effect permanently refused'), applied };
+      }
+      return { run: current, stopped: 'complete', error: null, applied };
+    }
 
     if (status === 'awaiting-confirm') {
       // AN UNATTENDED ANSWER, WHEN AND ONLY WHEN THE DECLARATION SAID AN AGENT MAY GIVE ONE. The policy is
@@ -1199,7 +1208,10 @@ export async function driveRun({
       const outcome = await applyPendingEffects(current, { sinks, store, attemptedBy });
       current = outcome.run;
       applied.push(...outcome.applied);
-      if (outcome.error) return { run: current, stopped: 'effect-halted', error: outcome.error, applied };
+      // Permanent guard refusals must reach advance so the engine can settle the run.
+      if (outcome.error && outcome.halted?.status !== 'refused') {
+        return { run: current, stopped: 'effect-halted', error: outcome.error, applied };
+      }
       // PARKED ON A DISPATCH (#3073). An in-flight halt is a SUCCESSFUL stop, not an error: the sink started
       // work that outlives this process, so `error` is null and the halt reports itself through `inFlight`.
       // Without this branch the loop falls through to `advance`, which returns the run UNCHANGED (in-flight
@@ -1419,6 +1431,7 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
   const owner = run.pending?.ownedBy ?? ownedBy ?? null;
   return {
     runId: run.id, op: run.op, stopped, applied,
+    ...(run.outcome != null ? { outcome: run.outcome } : {}),
     // WHICH STEP refused — carried on a `step-refused` stop so a headless caller (the build daemon) can name it
     // instead of reporting "no verdict". Omitted on every other stop, so their payloads stay byte-identical.
     ...(stopped === 'step-refused' && step ? { step: String(step) } : {}),
@@ -1574,6 +1587,19 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
         `${run.effects.filter((e) => e.status === 'applied').length} effect(s) have landed and are recorded as applied.`,
         `resume with: node scripts/operations/run.mjs ${run.op} --resume=${run.id} — it reports the same park `
         + 'until the work reports back, and never re-dispatches.',
+        ...spend,
+        ...ownerLines,
+      ],
+    };
+  }
+  if (stopped === 'effect-refused') {
+    return {
+      code: 1,
+      lines: [
+        `run ${run.id} — REFUSED: ${redactSpawnText(error?.message ?? error)}`,
+        ...run.effects.filter((entry) => entry.status === 'refused' || entry.status === 'failed')
+          .map((entry) => `  ${entry.type} (step ${entry.step}): ${entry.status} — ${redactSpawnText(entry.error ?? 'no failure reason supplied')}`),
+        `${applied.length} effect(s) landed and are recorded as applied; this run is terminal.`,
         ...spend,
         ...ownerLines,
       ],
