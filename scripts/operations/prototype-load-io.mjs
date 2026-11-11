@@ -16,11 +16,14 @@ import { basename, dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
-import { cloneKey } from '../lib/daemon-overlays.mjs';
+import { retireRegistration } from '../daemon-overlay.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
-import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
+import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -195,17 +198,17 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner, fingerprint = null }) {
+  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
-  // Audit mode is a scalar: normalize before the cascade can flatten an invalid object into no leaves.
-  const auditModeLayer = (layer) => layer?.canonicalAuditMode === undefined ? layer
-    : { ...layer, canonicalAuditMode: layer.canonicalAuditMode === 'warn' ? 'warn' : 'refuse' };
-  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'warn' },
-    platform: auditModeLayer(platform.prefs.prototypeLoad), tool: auditModeLayer(tool) });
-  const config = policy.value;
+  // Mode settings have no authority: refuse is the only admission policy.
+  const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}) => layer;
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
+    platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
+  // ruledWeakened is the union of platform and tool layers (arrays are cascade leaves, so the tool layer would replace it).
+  const config = { ...policy.value, ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, (m) => console.warn(m)) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
   // Preserve a stricter caller policy without forwarding overrides that could weaken file policy.
@@ -273,6 +276,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     // R503: the live head's net-diff fingerprint, computed once and only when some evidence for another sha stores one.
     // Any git failure is no carry (null), never a throw.
     let liveFpMemo;
+    let mainFetchAttempted = false, mainFetchOk = false;
+    const fetchMain = () => {
+      if (!mainFetchAttempted) {
+        mainFetchAttempted = true;
+        mainFetchOk = git('fetch', 'origin', 'main').code === 0;
+      }
+      if (!mainFetchOk) throw new Error('origin/main fetch unavailable; retry when main can be read');
+    };
     const liveFingerprint = (evidence) => {
       if (liveFpMemo !== undefined) return liveFpMemo;
       // The record must name another head (audit) or sha (ready record): a headless record can never carry (main #6353).
@@ -281,7 +292,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const same = (v) => typeof v === 'string' && v.toLowerCase() === live;
       if (!evidence.some((r) => r?.fingerprint && (r.head || r.sha) && !same(r.sha) && !same(r.head))) return null;
       try {
-        requireGit('fetch', 'origin', 'main', input.branch);
+        fetchMain();
+        // R503 may be the first reader of a rebased head created on another
+        // checkout. Fetch its objects before fingerprinting; the explicit
+        // tracking refspec also works in single-branch clones. This is read-only
+        // remote access, never registration, retirement or publication.
+        requireGit('fetch', 'origin', `+refs/heads/${input.branch}:refs/remotes/origin/${input.branch}`);
         liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
       } catch { liveFpMemo = null; }
       return liveFpMemo;
@@ -361,6 +377,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (typeof wd !== 'string' || !wd.startsWith('/')) return stop('bad-input', { resolution: 'missing absolute WorkingDirectory' });
         out.clone = wd; out.cloneSource = `plist:${daemon.label}`;
       }
+      if (input.remove && (input.forceAdopt || input.retire || input.replace || input.branch || !input.reason?.trim()))
+        return stop('bad-input', { detail: '--remove requires --reason and no other action' });
       if (input.forceAdopt) {
         // R508: queue ONE operator-ruled adoption of ONE build. `--sha` is the full 40-hex id of the build the rebuild
         // will hold (the `target` in the daemon's held / smoke-rejected state — main plus the applied overlays), NOT a
@@ -370,6 +388,49 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.forceAdopt = req.ok ? { requested: !input.dryRun, dryRun: !!input.dryRun, ruling: req.record.ruling, sha: req.record.sha } : { requested: false, refused: req.reason };
         out.ok = req.ok;
         return req.ok ? out : stop('force-adopt-refused', { forceAdopt: out.forceAdopt });
+      }
+      if (input.remove) {
+        if (!safeRegistrationRef(input.remove) || !input.reason?.trim() || input.branch || input.replace || input.retire)
+          return stop('bad-input', { detail: '--remove requires --reason and no add/replace/retire' });
+        stage = 'remove-refused';
+        const listed = listRows();
+        if (!listed.ok) return stop('remove-refused', { detail: 'unreadable-registry' });
+        if (listed.rows.some((r) => r.stackBases !== undefined && (!Array.isArray(r.stackBases) || !r.stackBases.every(safeRegistrationRef))))
+          return stop('remove-refused', { detail: 'unreadable-stack-evidence' });
+        const targets = listed.rows.filter((r) => r.ref === input.remove);
+        if (targets.length !== 1) return stop('remove-refused', { detail: 'expected-one-registration' });
+        const dependents = listed.rows.filter((r) => r.ref !== input.remove &&
+          (r.stackBases?.includes(input.remove) || Object.values(r.stackVia || {}).flat().includes(input.remove)));
+        if (dependents.length) return stop('remove-refused', { detail: 'stacked-dependents', dependents: dependents.map((r) => r.ref) });
+        requireGit('fetch', 'origin', `+refs/heads/${input.remove}:refs/remotes/origin/${input.remove}`);
+        const tip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${input.remove}^{commit}`);
+        if (!validSha(tip)) return stop('remove-refused', { detail: 'invalid-tip' });
+        if (input.dryRun) { out.ok = true; out.wouldRemove = [input.remove]; return out; }
+        const removeOne = removeRegistration || ((args) => retireRegistration({ ...args, env: childEnv,
+          deps: {
+            // Explicit operator withdrawal uses the existing guarded retirement transaction:
+            // entry identity, durable drop intent and post-drop tip check all stay enforced.
+            prove: () => {
+              const state = readOverlayState(out.clone, { env: childEnv });
+              const stacked = state.overlays.some((r) => r.ref !== input.remove && r.stackBases?.includes(input.remove));
+              if (state.corrupt || stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
+              const current = requireGit('ls-remote', 'origin', `refs/heads/${input.remove}`).split(/\s+/)[0];
+              // stackBases is only a cache. Re-prove ancestry under the add guard so
+              // an uncached or newly registered stack top cannot lose its base.
+              for (const other of state.overlays.filter((r) => r.ref !== input.remove)) {
+                if (!safeRegistrationRef(other.ref)) return { action: 'keep', reason: 'unreadable-stack-evidence' };
+                requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
+                const otherTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${other.ref}^{commit}`);
+                if (!validSha(otherTip) || ancestor(tip, otherTip)) return { action: 'keep', reason: 'stacked-dependents' };
+              }
+              return { action: 'retire', tip: current, reason: input.reason };
+            },
+            tip: (ref) => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0],
+          } }));
+        const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load' });
+        if (data?.retired !== true) return stop('remove-refused', {
+          detail: data?.refused || 'removal-unproved', fallback: 'Retain the entry; resolve changed entry/tip or stacked dependents, then retry --remove.' });
+        out.removed = [input.remove]; out.ok = true; return out;
       }
       if (input.retire) {
         // Retire-only: no candidate, only the registrations proved retired are dropped.
@@ -391,33 +452,64 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
+      let readyFp = null;
       out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,
-        () => liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])]));
-      if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED. Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
-      if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: `No fix-ready record in ${config.readyRecordPath} matches ref=${input.branch} sha=${input.sha}. A record needs the fields {"ref":"${input.branch}","sha":"${input.sha}","tests":"green","audit":"NOT WEAKENED"}; write it after the scoped tests pass and the Codex audit says NOT WEAKENED, or pass --tests-run and --audit="NOT WEAKENED".` });
+        () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])));
+      // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an
+      // earlier load of different code must not strand the branch: the check-run path below writes fresh readiness.
+      const hasReady = readyRecordSpeaksFor(readyRecords, input, readyFp);
+      if (!out.gate && hasReady) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Fix the latest readiness evidence; arguments are labels only.' });
       stage = 'no-canonical-audit';
       let auditRecords = [];
       try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }
-      const mode = config.canonicalAuditMode === 'warn' ? 'warn' : 'refuse';
-      let fetchedMain = false;
       const covers = (base) => { try {
-        if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
+        // Canonical coverage and R503 carry may need this one read-only main fetch.
+        fetchMain();
         return ancestor(base, 'origin/main');
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
-      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp) };
-      if (!out.canonicalAudit.ok) {
-        const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
-        if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
-        // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
-        // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.
-        // Fail closed: a record sha that is not a string is never the live head's own record.
-        const carriedGate = out.gate.record && (typeof out.gate.record.sha !== 'string' || out.gate.record.sha.toLowerCase() !== String(input.sha).toLowerCase());
-        if (out.canonicalAudit.reason === 'weakened' && carriedGate && !out.gate.ruledWeakened) {
-          return stop('no-canonical-audit', { detail: 'carried-ready-over-weakened-audit', fallback: `The canonical audit says WEAKENED, and the ready record was carried from ${out.gate.record.sha}. Fix the weakening and re-audit, or get an operator ruling (ruledWeakened). ${fallback}` });
-        }
-        console.warn(`WARNING: canonical audit ${out.canonicalAudit.reason}; proceeding in warn mode. ${fallback}`);
-      }
+      out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
+        { ruledWeakened: out.gate }) };
+      if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
+        fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
+      if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
+      stage = 'no-ready';
+      // Only an exact-sha successful `test` check-run can produce fresh readiness.
+      // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
+      const readTestCheck = testCheck || (({ sha }) => {
+        const gh = (args) => {
+          try { return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: repo, env: childEnv,
+            encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024, throttle: { caller: 'prototype-load', ...(exec !== execFileSync ? { exec: (ghArgs, ghOpts) => exec('gh', ghArgs, ghOpts) } : {}) } })) }; }
+          catch { return { code: 1, stdout: '' }; }
+        };
+        const origin = resolveOriginRepository({ git: (args) => git(...args), gh });
+        if (!origin.repo) return null;
+        const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
+        if (result.code !== 0) return null;
+        // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
+        const evidence = testCheckEvidence(JSON.parse(result.stdout), sha);
+        if (!evidence) return null;
+        // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
+        const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
+        if (runs.code !== 0) return null;
+        return testWorkflowBound(evidence, JSON.parse(runs.stdout), sha, config.testWorkflowPath) ? evidence : null;
+      });
+      const checkRun = await readTestCheck({ sha: input.sha, branch: input.branch });
+      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success')
+        return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
+      const canonical = out.canonicalAudit.record;
+      // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
+      // becomes this sha's latest readiness. Keep the fingerprint that evidence already stores for this exact sha, or
+      // a later rebase of the same code finds a fingerprintless latest record and cannot carry. Two readable values
+      // that disagree prove nothing, so none is kept (fail closed).
+      const lowerLive = String(input.sha).toLowerCase();
+      const storedFor = (r, key) => (typeof r?.[key] === 'string' && r[key].toLowerCase() === lowerLive && carriesAcross(r.fingerprint, r.fingerprint) ? [r.fingerprint] : []);
+      const stored = [...new Set([...storedFor(canonical, 'head'), ...storedFor(out.gate?.record, 'sha')])];
+      const producedFp = liveFp || (stored.length === 1 ? stored[0] : null);
+      const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: 'green',
+        audit: canonical.verdict, testCheck: checkRun, ...(producedFp ? { fingerprint: producedFp } : {}),
+        ...(out.gate?.ruledWeakened ? { auditRuling: out.gate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
+      out.gate ||= { source: 'canonical-check-run', record: producedReady };
       stage = 'no-ready';
       requireGit('fetch', 'origin', input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
@@ -425,6 +517,33 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'check-unverifiable';
       requireGit('fetch', 'origin', 'main', input.branch);
       const own = changedPaths(requireGit('diff', '--name-status', '-z', `origin/main...${input.sha}`));
+      const dispatchFiles = matchDispatchPaths(own, DISPATCH_PATH_DEFAULTS);
+      if (dispatchFiles.length) {
+        stage = 'dispatch-smoke-failed';
+        if (dispatchSmoke) out.dispatchSmoke = await dispatchSmoke({ sha: input.sha, files: dispatchFiles });
+        else {
+          const scratch = fs.mkdtempSync(join(env.TMPDIR || tmpdir(), 'prototype-dispatch-smoke-'));
+          const tree = join(scratch, 'candidate');
+          try {
+            requireGit('worktree', 'add', '--detach', tree, input.sha);
+            // The ignored node_modules is not in a fresh worktree; the dispatch path imports markdown-it. Link the
+            // checkout's own, as the combined-test worktree does. Absent here, the smoke itself fails and refuses.
+            if (fs.existsSync(join(repo, 'node_modules'))) fs.symlinkSync(join(repo, 'node_modules'), join(tree, 'node_modules'), 'dir');
+            const actual = requireGit('-C', tree, 'rev-parse', 'HEAD');
+            if (actual !== input.sha) throw new Error('smoke candidate moved');
+            out.dispatchSmoke = { ...await realDispatchSmoke({ tree, env: childEnv }), sha: actual };
+          } finally {
+            // Cleanup is best-effort: a failing remove must never replace the smoke verdict (a throw here would).
+            // Unlink the dependency link first so removal can never follow it into the checkout's node_modules.
+            try { fs.unlinkSync(join(tree, 'node_modules')); } catch { /* absent or already gone */ }
+            git('worktree', 'remove', '--force', tree);
+            try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* leftover scratch is only litter */ }
+          }
+        }
+        if (out.dispatchSmoke?.ok !== true || out.dispatchSmoke.sha !== input.sha || out.dispatchSmoke.skipped || out.dispatchSmoke.pending || out.dispatchSmoke.ran === false)
+          return stop('dispatch-smoke-failed', { fallback: 'Run a real dispatch smoke on this SHA; unavailable/pending smoke cannot admit it.' });
+      }
+      stage = 'check-unverifiable';
       const contains = ancestor('origin/main', input.sha);
       out.mainCheck = { contains, own };
       let comparison = input.sha;
@@ -603,6 +722,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }
       }
+      const readyPath = expand(config.readyRecordPath);
+      fs.mkdirSync(dirname(readyPath), { recursive: true });
+      fs.appendFileSync(readyPath, `${JSON.stringify(producedReady)}\n`, 'utf8');
       const finishSwap = (refs) => {
         for (const ref of refs) {
           // The preview predates the real add (which can fetch newer, cleanly merging tips).

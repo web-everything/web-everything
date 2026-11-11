@@ -3427,6 +3427,12 @@ the client and removes each cross-check (d) guard independently, including the w
 check; the same bad inventory must escape only in the mutant. Production files are
 never rewritten by these probes, and a missing mutation target fails the test.
 
+For named Node filesystem imports, fault injection in an in-memory mutation suite must
+load its unchanged control through the same native loader as its mutants. Vitest's
+transformed named imports can retain earlier bindings despite `syncBuiltinESMExports()`.
+`pr-stall-live-safety.test.mjs` pairs each passing control contract with a failing mutant
+assertion, including evidence appended after planning and refusal to persist intent.
+
 Keep direct bound-exec missing-cwd cases and the delta builder's default-cwd case.
 Row 13 configures a side-effecting fsmonitor hook: require its sentinel to stay absent
 and pin `-c core.fsmonitor=false` on every manifest Git command after binding.
@@ -3898,10 +3904,15 @@ clearing as a false-positive proof of detector completeness.
 ## Shard split-retry evidence
 
 `verify-shard-run` retries incomplete inventory once in at most two halves to surface
-failures. The retry never yields PASS: the first TIMEOUT, NOT-RUN, or FAIL half
+failures. The first TIMEOUT, NOT-RUN, or FAIL half
 keeps its status (TIMEOUT/NOT-RUN exit 124). Otherwise, observed failure evidence
-makes the shard FAIL (exit 1). Every other retry
-outcome is UNSETTLED (exit 75), including all halves passing. Retry output and
+makes the shard FAIL (exit 1). The shard settles PASS (exit 0) only when every half
+passes with exit 0, no signal, and complete inventory; the halves together cover
+exactly the shard's files; and every assertion in every reported retry file is
+`passed`, with no observed failure, infrastructure exit, or load deferral.
+Missing assertions and pending/skipped/todo assertions keep it UNSETTLED,
+as do missing or oversized half reports, load deferral, or an unresolved exit 75.
+Every other retry outcome is UNSETTLED (exit 75). Retry output and
 failure details remain visible, and each shard contributes one final result.
 Admission forwards child exit codes, so exit 75 cannot prove the command never ran;
 nonzero exits other than 75 are failure evidence even without inventory, and
@@ -4088,3 +4099,18 @@ The judge facts reader observes the shared run store; hermetic facts fixtures mu
 cascade; judge facts IO tests cover durable per-run alert claims and ruled-finding suppression.
 Alert claims never expire automatically: uncertain publication requires operator inspection
 of `referral-judge-alert-claims` in the shared runs directory, rather than a liveness probe.
+
+
+## Shared clone owner election and deferred-mutation retries
+
+`daemon-clone-single-owner.test.mjs` pins live-key election using stable string ordering,
+reader-clock heartbeat ages with a 30-second future-skew bound, and monotonic persisted epochs.
+Election and rebuild execution share a coordination mutex, independent of the reader/writer
+locks. A live local process retains that fence through a paused event loop; a provably dead
+process permits reclamation. Unknown lock liveness or corrupt/exhausted epochs defer rebuilds;
+the operator must inspect and repair coordination evidence before rebuilding resumes.
+`daemon-rebuild-request-failures.test.mjs` distinguishes explicit rebuild failures from neutral
+job/lock outcomes, including persisted request retention. `daemon-self-sync-mutation-due.test.mjs`
+requires failed/refused mutations to remain pending and retry on the next tick; only a completed
+mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
+`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.

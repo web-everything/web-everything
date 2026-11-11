@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-/** Read-only PR watcher. Durable timers start at observed readiness, never PR age.
+/** PR watcher with a guarded stale-check refresh. Durable timers start at observed readiness, never PR age.
  * Receipts advance only after delivery; interrupted publication may be retried.
  * State lifecycle: unpublished heads retire when superseded; unmerged closes retire
  * polling, retaining delivered identities only for reopening deduplication. Merges
  * compact to a terminal delivery marker. The cursor resets after a complete sweep.
  */
+import { runReadyStuck } from './pr-ready-stuck.mjs';
 import { runMergeWatchSignals } from './pr-merge-watch-signals.mjs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,8 +20,8 @@ import { handoffHome } from '../../operations/handoff-home.mjs';
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sha = v => typeof v === 'string' && /^[a-f0-9]{40}$/i.test(v);
 const minutesValid = v => typeof v === 'number' && Number.isFinite(v) && v >= 0;
-const defaults = { readyNotMergingMinutes: 60, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 };
-const envKeys = ['READY_MINUTES', 'NO_PROGRESS_DRAFT_MINUTES', 'NO_PROGRESS_MINUTES', 'CI_JOB_OVERDUE_FACTOR'];
+const defaults = { readyNotMergingMinutes: 60, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 };
+const envKeys = ['READY_MINUTES', 'NO_PROGRESS_DRAFT_MINUTES', 'NO_PROGRESS_MINUTES', 'CI_JOB_OVERDUE_FACTOR', 'READY_STUCK_MINUTES', 'SELF_HEAL_STALE_HOURS'];
 const thresholdLayer = layer => Object.fromEntries(Object.keys(defaults).map(key =>
   [key, object(layer?.[key]) ? undefined : layer?.[key]]));
 export function resolveMergeWatchSettings({ env = process.env, log = console.error, settingsFiles } = {}) {
@@ -31,7 +32,7 @@ export function resolveMergeWatchSettings({ env = process.env, log = console.err
       const raw = env[`WE_PR_MERGE_WATCH_${envKeys[i]}`];
       return [key, raw?.trim() ? Number(raw) : undefined];
     })),
-    valid: Object.fromEntries(Object.keys(defaults).map(key => [key, v => minutesValid(v) && (key !== 'ciJobOverdueFactor' || v > 0)])),
+    valid: Object.fromEntries(Object.keys(defaults).map(key => [key, v => minutesValid(v) && (key !== 'ciJobOverdueFactor' || v > 0) && (key !== 'readyStuckMinutes' || v <= 1440)])),
   });
   log(formatCascadeSourcesLine('prMergeWatch', result));
   return result.value;
@@ -39,7 +40,7 @@ export function resolveMergeWatchSettings({ env = process.env, log = console.err
 
 export async function runMergeWatch({ repos = [], gh, now = new Date().toISOString(),
   stateDir = join(handoffHome(), 'pr-merge-watch'), settings, emitEvent = appendDaemonEvent,
-  log = console.error, signalLogs } = {}) {
+  log = console.error, signalLogs, readyStuck = {} } = {}) {
   // Load the analysis graph after the shared gate graph has finished evaluating.
   const { atomicJson, readOptionalJson, ghJson, repoFilenameKey } = await import('../../operations/coroner-pr-postmortem.mjs');
   const { defaultListPrComments } = await import('../pr-comments-list.mjs');
@@ -47,7 +48,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
   gh ??= ghJson;
   const config = settings ? { ...defaults, ...settings } : resolveMergeWatchSettings({ log });
   const stamp = Date.parse(now);
-  if (!Number.isFinite(stamp) || Object.entries(config).some(([k, v]) => !minutesValid(v) || (k === 'ciJobOverdueFactor' && v <= 0))) throw Error('invalid merge-watch time/settings');
+  if (!Number.isFinite(stamp) || Object.entries(config).some(([k, v]) => !minutesValid(v) || (k === 'ciJobOverdueFactor' && v <= 0) || (k === 'readyStuckMinutes' && v > 1440))) throw Error('invalid merge-watch time/settings');
   let calls = 0, delivered = 0, incomplete = false, budgetExhausted = false;
   const read = args => {
     if (calls >= 128) { budgetExhausted = true; throw Error('GitHub evidence tick budget exceeded'); }
@@ -84,6 +85,9 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
         !/^[1-9]\d*$/.test(n) || !object(p) || !object(p.heads) || typeof p.merged !== 'boolean'
         || (p.closed !== undefined && typeof p.closed !== 'boolean')
         || Object.entries(p.heads).some(([h, r]) => !sha(h) || !object(r) || typeof r.alerted !== 'boolean'
+          || ['readyStuckAlerted', 'refreshed'].some(k => r[k] !== undefined && typeof r[k] !== 'boolean')
+          || (r.readyStuckSince !== undefined && (!Number.isFinite(r.readyStuckSince) || r.readyStuckSince > stamp))
+          || ['readyLabelAt', 'readyLabelTriedAt', 'refreshTriedAt'].some(k => r[k] !== undefined && (!Number.isFinite(r[k]) || r[k] > stamp))
           || (r.signals !== undefined && (!object(r.signals) || Object.entries(r.signals).some(([k, v]) => !/^(progress|ci:\d+|loop:[a-f0-9]{64})$/.test(k) || v !== true)))
           || !(r.since === null || (Number.isFinite(r.since) && r.since <= stamp))))) throw Error('invalid saved evidence');
       const save = () => atomicJson(file, state);
@@ -144,7 +148,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
                 // Retire polling. Keep only delivered identities if reopening could
                 // otherwise publish a second alert for the same head.
                 tracked.heads = Object.fromEntries(Object.entries(tracked.heads)
-                  .filter(([, receipt]) => receipt.alerted || Object.keys(receipt.signals ?? {}).length));
+                  .filter(([, receipt]) => receipt.alerted || receipt.readyStuckAlerted || receipt.refreshed || Object.keys(receipt.signals ?? {}).length));
                 if (Object.keys(tracked.heads).length) tracked.closed = true;
                 else delete state.prs[number];
               }
@@ -153,7 +157,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
             continue;
           }
           const pr = read(['pr', 'view', String(listed.number), '--repo', repo, '--json',
-            'number,state,isDraft,headRefOid,labels,mergeStateStatus']);
+            'number,state,isDraft,headRefOid,headRefName,labels,mergeStateStatus,statusCheckRollup,reviewDecision']);
           if (pr?.number !== listed.number || pr.state !== 'OPEN' || typeof pr.isDraft !== 'boolean'
             || !sha(pr.headRefOid) || !Array.isArray(pr.labels) || pr.labels.some(l => typeof l?.name !== 'string')
             || typeof pr.mergeStateStatus !== 'string'
@@ -165,7 +169,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
           for (const [head, receipt] of Object.entries(tracked.heads)) if (head !== pr.headRefOid) {
             receipt.since = null;
             // Unpublished superseded heads retire; delivered identities remain for deduplication.
-            if (!receipt.alerted && !Object.keys(receipt.signals ?? {}).length) delete tracked.heads[head];
+            if (!receipt.alerted && !receipt.readyStuckAlerted && !receipt.refreshed && !Object.keys(receipt.signals ?? {}).length) delete tracked.heads[head];
           }
           const receipt = tracked.heads[pr.headRefOid] ??= { since: null, alerted: false };
           const names = pr.labels.map(l => l.name);
@@ -180,6 +184,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
             receipt.alerted = true;
             save();
           }
+          await runReadyStuck({ repo, pr, receipt, now: stamp, config, read, send, save, log, ...readyStuck });
           await runMergeWatchSignals({ repo, pr, receipt, now: stamp, config, read, send, save, failure, signalLogs });
         } catch { failure(); }
         if (budgetExhausted) return defer(repo, number);

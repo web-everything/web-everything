@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/lib/review-core.mjs", "we:scripts/lib/__tests__/review-core.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-06"
-preparedAgainstSha: "1ba8f4835e1a9890308cb8b90055d9d0703b2f0a"
+preparedDate: "2026-11-10"
+preparedAgainstSha: "3047e035293581c275b809e797ac47fee64b75a4"
 tags: []
 ---
 
@@ -87,4 +87,5 @@ No follow-up is required to deliver these guards. A corpus cleanup or promotion 
 - **Current source evidence:** `lintBacklogItemRendering` is at `we:scripts/check-standards-rules.mjs:1385`; its whole-repository caller at `we:scripts/check-standards.mjs:982` prints returned warnings, and its item caller at `we:scripts/check-backlog-item.mjs:100` collects them. `LENS_HUNT_BRIEF` at `we:scripts/lib/review-core.mjs:1971` still registers claim-accuracy only; `buildPanelMandate` at `we:scripts/lib/review-core.mjs:1114` appends the brief at `we:scripts/lib/review-core.mjs:1137`. Existing registry tests dynamically handle lenses without briefs at `we:scripts/lib/__tests__/review-core.test.mjs:1862`, and shared-rule tests are at `we:scripts/lib/__tests__/review-core.test.mjs:1886`. No caller or persisted-state migration is needed: this changes stateless warning output and the default simplicity mandate only.
 - **Evidence fixtures remain:** the oversized procedure starts under Done when at `we:backlog/4297-catch-up-with-main-once-right-before-the-final-gate.md:17`, with stash setup at `we:backlog/4297-catch-up-with-main-once-right-before-the-final-gate.md:31`; comment narration remains at `we:scripts/__tests__/conveyor-brief-main-catchup-policy.test.mjs:36` and `we:scripts/__tests__/conveyor-brief-main-catchup-policy.test.mjs:67`. The acceptance ladder at `we:docs/agent/backlog-workflow.md:317` permits observable/assertable criteria and the doc-only exception at `we:docs/agent/backlog-workflow.md:322`.
 - **Estimate:** retain story size 3 (old 3 → new 3). Expected changes: roughly 100 detector/wiring lines in `we:scripts/check-standards-rules.mjs`, 160 regression lines in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`, 15 brief lines in `we:scripts/lib/review-core.mjs`, and 65 mandate assertions in `we:scripts/lib/__tests__/review-core.test.mjs`; approximately 340 changed lines across the existing four-file scope. No task-only estimatedLoc field is appropriate.
+- **Re-prepare 2026-11-10 — drift refresh:** `we:scripts/check-standards-rules.mjs` changed on main since the last stamp only by two unrelated `LEASH_PIN_SNAPSHOT` entries (near line 4456). Guard anchors still hold: `ACCEPTANCE_HEADING_RE` import at line 27 and uses at 1318/1363, `buildPanelMandate` at `we:scripts/lib/review-core.mjs:1114`, `LENS_HUNT_BRIEF` at `we:scripts/lib/review-core.mjs:1971`. Test files unchanged. Premise, scope, size (3 → 3) and the [A1]–[A5] Executable acceptance lines are unchanged; the guards are still undelivered.
 - **Delivery status:** inspection of the named examples, current lint helpers and hunt-brief registry found the prevention work still outstanding. This preparation changes only this card's body and scope; implementation, test execution, stamping and review remain with the subsequent delivery/runner steps.
