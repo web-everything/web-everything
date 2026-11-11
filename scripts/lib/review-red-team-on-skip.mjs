@@ -388,16 +388,18 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const carriedCheckOwed = () => {
       try { return readCarriedCheck({ repo, pr, head }) !== false; } catch { return true; }
     };
-    const resultOnHead = () => carriedCheckOwed()
-      ? (now - (lastDispatch.get(carriedCheckRetryKey(repo, pr, head)) ?? -Infinity) < setting.retryCooldownMin * 60_000
-        ? skip('carried red-team check unconfirmed; retry cooldown active')
-        : { ...row, action: 'publish-carried-check', why: 'carried red-team check unconfirmed; republishing from live evidence' })
-      : ({ ...skip('red-team result already on head'),
-      ...(Array.isArray(rawPr?.labels) && rawPr.labels.some(label =>
-        (typeof label === 'string' ? label : label?.name) === 'red-team:pending') ? {
+    // A kept red-team:pending label escalates first: the carried-check publisher refuses while it is set, so a retry
+    // could never clear it and would only hide the escalation.
+    const resultOnHead = () => Array.isArray(rawPr?.labels) && rawPr.labels.some(label =>
+      (typeof label === 'string' ? label : label?.name) === 'red-team:pending') ? {
+        ...skip('red-team result already on head'),
         escalate: true,
         escalationContext: 'red-team result already on head but red-team:pending is still set; the drain/job label sync did not settle it',
-      } : {}) });
+      }
+      : !carriedCheckOwed() ? skip('red-team result already on head')
+        : now - (lastDispatch.get(carriedCheckRetryKey(repo, pr, head)) ?? -Infinity) < setting.retryCooldownMin * 60_000
+          ? skip('carried red-team check unconfirmed; retry cooldown active')
+          : { ...row, action: 'publish-carried-check', why: 'carried red-team check unconfirmed; republishing from live evidence' };
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
     const dispatchDecision = decision => {
@@ -614,6 +616,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
 const lastDispatch = new Map();
 /** Cooldown key of a carried-check republish, separate from a round dispatch's key on the same head. */
 const carriedCheckRetryKey = (repo, pr, head) => `${repo}#${pr}@${head}#carried-check`;
+export const CARRIED_CHECK_ESCALATION = 'carried red-team check not confirmed after retry; operator must inspect the head\'s check history';
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
 /** Complete review evidence: at most ten requests and one MiB, never a truncated success. */
@@ -849,8 +852,16 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           let out;
           try { out = publishCarriedCheck({ pr: row.prNumber, headSha: row.head }); }
           catch (error) { out = { ok: false, reason: safeErrorText(error) }; }
-          row.why = out?.ok === true ? 'carried red-team check republished from live evidence'
-            : `carried check not published: ${safeErrorText(out?.reason ?? 'unknown error')}`;
+          if (out?.ok === true) row.why = 'carried red-team check republished from live evidence';
+          else {
+            // The review job's own attempt already failed, so this is at least the second: tell an operator now (the
+            // needs-you item is keyed by the stable reason, so repeated retries do not repeat it). Retries continue
+            // once per cooldown; the cause is logged on every attempt.
+            row.why = CARRIED_CHECK_ESCALATION;
+            row.escalate = true;
+            row.escalationContext = `carried check not published: ${safeErrorText(out?.reason ?? 'unknown error')}`;
+            escalateRow(row);
+          }
         }
       }
       if (row.action === 'carry') {

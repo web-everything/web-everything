@@ -444,7 +444,7 @@ describe('red-team check run contract', () => {
         return { io, check_runs };
       }
       const ownFailure = (id, completed_at = '2026-11-07T13:00:00Z') => run({ id, completed_at,
-        ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...LIVE_FAIL, liveSupersede: true }) });
+        ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...LIVE_FAIL, liveCheck: true }) });
       const fact = runs => api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: runs });
 
       it('a retry with restored reads republishes success over the helper\'s own failure', () => {
@@ -456,15 +456,37 @@ describe('red-team check run contract', () => {
         expect(check_runs.map(r => r.conclusion)).toEqual(['success', 'failure', 'success']);
         expect(fact(check_runs)).toMatchObject({ ok: true });
       });
-      it('the helper\'s supersede is marked as its own, and no round writer\'s payload is', () => {
+      it('the helper\'s success and supersede are both marked as its own, and no round writer\'s payload is', () => {
         const { io, check_runs } = retryFixture();
         publish(io);
-        expect(api.isLiveSupersedeRun(check_runs[1])).toBe(true);
-        expect(api.isLiveSupersedeRun(check_runs[0])).toBe(false);
+        expect(check_runs.map(api.isLiveCheckRun)).toEqual([true, true]);
         for (const payload of [api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: 'break' }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null }),
           api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null, sendBack: true }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'in_progress', hold: null, liveCheck: true }),
           api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: 'x', policyClear: true })])
-          expect(api.isLiveSupersedeRun(payload)).toBe(false);
+          expect(api.isLiveCheckRun(payload)).toBe(false);
+      });
+      // Self-review of this fix: a round's final failure created after the first read but before the success POST gets
+      // a LOWER id than that unverified success. The retry must not treat its own success as evidence over it.
+      it('a retry never lets its own unverified success hide a round failure that raced the first attempt', () => {
+        const { io, check_runs } = retryFixture();
+        const baseGh = io.gh.getMockImplementation();
+        let raced = false;
+        io.gh.mockImplementation((args, options) => {
+          if (args.includes('POST') && !raced) {
+            raced = true;
+            check_runs.push(run({ id: 30, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }));
+          }
+          return baseGh(args, options);
+        });
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        // The after-read refuses (the raced failure is newer than the carry) and supersedes the success.
+        expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/not demonstrably newer|raced publication/) });
+        expect(check_runs.map(r => `${r.id}:${r.conclusion}`)).toEqual(['30:failure', '40:success', '41:failure']);
+        expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/not demonstrably newer/) });
+        expect(check_runs).toHaveLength(3);
+        expect(fact(check_runs)).toMatchObject({ ok: false });
       });
       it.each([
         ['a round failure newer than the carry, after the helper\'s failure', () => [run({ id: 20 }), ownFailure(21),
@@ -473,6 +495,11 @@ describe('red-team check run contract', () => {
           run({ id: 21, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }), ownFailure(22)]],
         ['a round still in progress behind the helper\'s failure', () => [run({ id: 20 }),
           run({ id: 21, status: 'in_progress', conclusion: null }), ownFailure(22)]],
+        ['a round failure newer than the carry, under the helper\'s own success and failure', () => [
+          run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }),
+          run({ id: 21, completed_at: '2026-11-07T13:00:00Z',
+            ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null, liveCheck: true }) }),
+          ownFailure(22)]],
         ['a round-writer failure with the same summary but no supersede marker', () => [run({ id: 20 }), run({ id: 21,
           completed_at: '2026-11-07T13:00:00Z', ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...LIVE_FAIL }) })]],
       ])('still refuses: %s', (_name, build) => {

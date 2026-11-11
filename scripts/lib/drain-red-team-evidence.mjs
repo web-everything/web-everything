@@ -47,15 +47,21 @@ export function readCarriedCheckUnpublished({ repo, pr, head, env = process.env 
   catch (error) { return error.code !== 'ENOENT'; }
 }
 
+/** Record that a carried check is owed on this head. The carry writes it BEFORE its result comment, so a crash between
+ * the comment and the publication still leaves the head owed (recovery skips a head whose result is on it). Throws. */
+export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env }) {
+  const path = carriedCheckOutboxPath({ repo, pr, head }, env);
+  mkdirSync(dirname(path), { recursive: true });
+  writeJsonAtomic(path, { repo, pr: Number(pr), head });
+}
+
 /** Publish a carried check through `publish`, keeping the outbox marker until it is confirmed. A marker that cannot be
  * written does not stop the attempt (a confirmed check needs no retry); its failure is named in the reason. */
 export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
   let markError = null;
-  try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeJsonAtomic(path, { repo, pr: Number(pr), head });
-  } catch (error) { markError = String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 200); }
+  try { markCarriedCheckUnpublished({ repo, pr, head, env }); }
+  catch (error) { markError = String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 200); }
   let result;
   try { result = publish(); }
   catch (error) { result = { ok: false, reason: String(error?.message ?? error) }; }

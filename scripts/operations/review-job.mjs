@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, publishCarriedCheckDurably } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -497,6 +497,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
     // The outbox marker outlives a failed attempt, so the on-skip recovery pass retries the carried check (#6606).
+    markCarriedCheckOwed: ({ pr, repo, headSha }) => markCarriedCheckUnpublished({ repo, pr, head: headSha, env }),
     publishCarriedCheck: ({ pr, repo, headSha }) => publishCarriedCheckDurably({ repo, pr, head: headSha, env,
       publish: () => publishRedTeamCheckFromLive({ pr, repo, headSha,
         appId: env.WE_APP_ID, env, gh: (args, options) => exec('gh', args, { ...options, cwd: root, env }) }) }),
@@ -1134,6 +1135,10 @@ function runReviewArc({
               const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
                 'Review verdict carried across an identical contribution.',
                 ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');
+              // #6606: mark the check owed BEFORE the comment. Recovery skips a head whose result is on it, so a crash
+              // between the comment and the publication must still leave a marker for the retry to find.
+              try { io.markCarriedCheckOwed?.({ pr: planned.pr, repo: planned.repo, headSha: evidence.headSha }); }
+              catch (error) { io.log(`review-job ${slug}: carried-check retry marker not written (${tail(safeErrorText(error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`); }
               io.postCarryComment({ pr: planned.pr, repo: planned.repo, body });
               let checkPublished = false;
               try {

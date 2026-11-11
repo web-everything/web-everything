@@ -11,7 +11,7 @@ function fixture() {
     carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
     readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] }),
     contributionPatchId: () => p, restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),
-    publishCarriedCheck: vi.fn(() => ({ ok: true })),
+    publishCarriedCheck: vi.fn(() => ({ ok: true })), markCarriedCheckOwed: vi.fn(),
     runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ stopped: 'complete', verdict: { verdict: 'accept', loop: { outcome: 'converged' } } }) })),
     runExtraSeats: vi.fn(), runRedTeam: vi.fn(), startSpeculativeRedTeam: vi.fn(), speculativeRedTeamSetting: () => ({ enabled: true }),
   };
@@ -32,6 +32,17 @@ describe('review job rebase carry', () => {
     }));
     expect(io.postCarryComment.mock.invocationCallOrder[0]).toBeLessThan(io.publishCarriedCheck.mock.invocationCallOrder[0]);
     expect(out.checkPublished).toBe(true);
+    // #6606: the retry marker precedes the comment, so a crash between comment and publication leaves the head owed.
+    expect(io.markCarriedCheckOwed).toHaveBeenCalledWith({ pr: 1, repo: 'web-everything/web-everything', headSha: b });
+    expect(io.markCarriedCheckOwed.mock.invocationCallOrder[0]).toBeLessThan(io.postCarryComment.mock.invocationCallOrder[0]);
+  });
+  it('a marker write failure is logged and the carry still comments and publishes', () => {
+    const io = fixture();
+    io.markCarriedCheckOwed.mockImplementation(() => { throw Error('EACCES'); });
+    const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
+    expect(out).toMatchObject({ outcome: 'carried', checkPublished: true });
+    expect(io.log).toHaveBeenCalledWith(expect.stringMatching(/retry marker not written \(.*EACCES/));
+    expect(io.postCarryComment).toHaveBeenCalledTimes(1);
   });
   it.each(['refused', 'throws'])('a %s check publication preserves the carried verdict without throwing', mode => {
     const io = fixture();
@@ -76,6 +87,8 @@ describe('review job carried check outbox wiring', () => {
     try {
       const exec = vi.fn(() => { throw Error('no GitHub in tests'); });
       const io = createReviewJobIo({ root: dir, env, exec });
+      io.markCarriedCheckOwed({ pr: 2, repo: 'web-everything/web-everything', headSha: b });
+      expect(readCarriedCheckUnpublished({ repo: 'web-everything/web-everything', pr: 2, head: b, env })).toBe(true);
       expect(io.publishCarriedCheck({ pr: 1, repo: 'web-everything/web-everything', headSha: b })).toMatchObject({ ok: false });
       expect(readCarriedCheckUnpublished({ repo: 'web-everything/web-everything', pr: 1, head: b, env })).toBe(true);
       expect(readCarriedCheckUnpublished({ repo: 'web-everything/web-everything', pr: 1, head: a, env })).toBe(false);

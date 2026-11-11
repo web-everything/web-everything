@@ -85,19 +85,21 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
 /** Title prefix of every run the policy-clear writer posts, so it can tell its own runs from a round's. Only runs
  * from the configured app are ever read, so no other author can forge it. */
 export const POLICY_CLEAR_TITLE_PREFIX = 'Policy-clear: ';
-/** Title prefix of the failure {@link publishRedTeamCheckFromLive} posts over its OWN success when verification after
- * publication fails. It records a publication failure, not a round's finding: a later re-validation of the same live
- * evidence may replace it. Only runs from the configured app are read, so no other author can forge it. */
-export const LIVE_SUPERSEDE_TITLE_PREFIX = 'Live-check superseded: ';
-export const isLiveSupersedeRun = run => typeof run?.output?.title === 'string'
-  && run.output.title.startsWith(LIVE_SUPERSEDE_TITLE_PREFIX);
+/** Title prefix of every run {@link publishRedTeamCheckFromLive} posts: its success AND the failure it posts over that
+ * success when verification after publication fails. Both are this writer's own publication records, never a round's
+ * evidence: re-validation decides from the newest OTHER run, so neither its unverified success (which may sit over a
+ * round run it did not see) nor its own supersede can decide a retry. Only runs from the configured app are read, so
+ * no other author can forge it. */
+export const LIVE_CHECK_TITLE_PREFIX = 'Live-check: ';
+export const isLiveCheckRun = run => typeof run?.output?.title === 'string'
+  && run.output.title.startsWith(LIVE_CHECK_TITLE_PREFIX);
 
 export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false,
-  liveSupersede = false } = {}) {
+  liveCheck = false } = {}) {
   const finished = status === 'finished';
   const clear = finished && hold === null && sendBack === false;
-  // Only a finished failure can be a live supersede; a success or in-progress run never carries the prefix.
-  const prefix = policyClear ? POLICY_CLEAR_TITLE_PREFIX : liveSupersede && finished && !clear ? LIVE_SUPERSEDE_TITLE_PREFIX : '';
+  // The live helper posts only finished runs; an in-progress run never carries its prefix.
+  const prefix = policyClear ? POLICY_CLEAR_TITLE_PREFIX : liveCheck && finished ? LIVE_CHECK_TITLE_PREFIX : '';
   return { name: 'red-team', head_sha: headSha, external_id: prIdentity(repo, pr), status: finished ? 'completed' : 'in_progress',
     ...(finished ? { conclusion: clear ? 'success' : 'failure' } : {}),
     output: { title: `${prefix}${clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress'}`,
@@ -260,10 +262,10 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
       if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0))
         throw Error('red-team check ordering unreadable; operator must inspect full check history');
       runs.sort((a, b) => b.id - a.id);
-      // This helper's own failure supersedes record that an earlier attempt could not verify its success; they are
-      // not a round's finding. Re-validation below decides from the newest OTHER run, so a transient failure never
-      // blocks its own retry, while a round's newer failure or open run still refuses wherever it sits.
-      const latest = runs.find(run => !isLiveSupersedeRun(run));
+      // This helper's own runs (its success and the failure it posts over an unverified success) are publication
+      // records, not a round's evidence. Re-validation decides from the newest OTHER run: a transient failure never
+      // blocks its own retry, and an unverified success of its own never hides a round's failure or open run.
+      const latest = runs.find(run => !isLiveCheckRun(run));
       if (latest && latest.status !== 'completed') throw Error('red-team check run in progress or incomplete');
       if (latest && latest.conclusion !== 'success') {
         // Parsed dispositions omit comment metadata. Bind the clock evidence to the same trusted
@@ -290,7 +292,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         postedId = JSON.parse(response)?.id;
         if (!Number.isSafeInteger(postedId) || postedId <= 0) throw Error('published check id unreadable');
         return response;
-      }, payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null }) });
+      }, payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, liveCheck: true }) });
     if (!posted.ok) throw Error(posted.reason);
     const after = inspect();
     // Our newer id can hide an intervening round even when ours is the latest visible success.
@@ -303,7 +305,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
     const reason = `live red-team check not clear: ${message(error)}`;
     if (published) {
       const supersede = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh,
-        payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason, liveSupersede: true }) });
+        payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason, liveCheck: true }) });
       if (!supersede.ok) {
         const failures = `${reason}; ${supersede.reason}`;
         const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });

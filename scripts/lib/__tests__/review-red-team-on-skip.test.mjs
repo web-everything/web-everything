@@ -5,7 +5,8 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip,
+  CARRIED_CHECK_ESCALATION } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
@@ -2145,16 +2146,35 @@ describe('#6606 carried check recovered after a transient verification failure',
         status: 'completed', conclusion: 'failure', completed_at: '2026-11-07T14:00:00Z', output: { title: 'Red team held' } });
       let clock = 2_000_000;
       const lastDispatch = new Map();
-      const first = w.tick({ now: () => clock, lastDispatch }).rows[0];
-      expect(first).toMatchObject({ action: 'publish-carried-check', why: expect.stringMatching(/not demonstrably newer/) });
+      const escalate = vi.fn();
+      const first = w.tick({ now: () => clock, lastDispatch, escalate }).rows[0];
+      // A failed retry is escalated with a stable reason (one needs-you item), its cause in the context.
+      expect(first).toMatchObject({ action: 'publish-carried-check', why: CARRIED_CHECK_ESCALATION, escalate: true,
+        escalationContext: expect.stringMatching(/not demonstrably newer/) });
+      expect(escalate).toHaveBeenCalledWith(expect.objectContaining({ pr, head, why: CARRIED_CHECK_ESCALATION }));
       expect(w.owed()).toBe(true);
-      expect(w.tick({ now: () => clock + 60_000, lastDispatch }).rows[0])
+      expect(w.tick({ now: () => clock + 60_000, lastDispatch, escalate }).rows[0])
         .toMatchObject({ action: 'skip', why: 'carried red-team check unconfirmed; retry cooldown active' });
       expect(w.publish).toHaveBeenCalledTimes(2);
       clock += 31 * 60_000;
-      expect(w.tick({ now: () => clock, lastDispatch }).rows[0]).toMatchObject({ action: 'publish-carried-check' });
+      expect(w.tick({ now: () => clock, lastDispatch, escalate }).rows[0]).toMatchObject({ action: 'publish-carried-check' });
       expect(w.publish).toHaveBeenCalledTimes(3);
+      expect(escalate).toHaveBeenCalledTimes(2);
       expect(w.fact()).toMatchObject({ ok: false });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a kept red-team:pending label still escalates while a carried check is owed, and nothing is republished', () => {
+    const w = world();
+    try {
+      publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+      const escalate = vi.fn();
+      const row = w.tick({ escalate, rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [{ name: 'red-team:pending' }] }] }).rows[0];
+      expect(row).toMatchObject({ action: 'skip', why: 'red-team result already on head', escalate: true,
+        escalationContext: expect.stringMatching(/red-team:pending is still set/) });
+      expect(escalate).toHaveBeenCalledTimes(1);
+      expect(w.publish).not.toHaveBeenCalled();
+      expect(w.owed()).toBe(true);
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
 
