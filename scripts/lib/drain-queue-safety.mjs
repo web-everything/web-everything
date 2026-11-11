@@ -142,7 +142,11 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
   if (failedChecksRemovals > 0 && !quarantineRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
-    return hold('failed_checks');
+    // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
+    // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
+    return hold(reenqueuedAfterFailure > 0
+      ? 'failed_checks (re-queued after the failed removal without retry evidence); operator must inspect history and enqueue manually'
+      : 'failed_checks');
   if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
     return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
   if (mergeConflictRemovals > 0 && mergeState !== 'CLEAN')
