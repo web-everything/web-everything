@@ -3,7 +3,7 @@
 // NOT WEAKENED needs ref + 40-hex sha + tests green; WEAKENED additionally needs auditRuling (R<n>) and a non-empty
 // auditDisclosed array of non-empty strings. A record identical to the latest one for that ref+sha is refused; a different
 // one supersedes it (the reader lets the latest record per sha win). Each written record also carries `at` (ISO write
-// time), which the adoption matrix reader requires; `at` is ignored when deciding whether a record is a duplicate. The append is written until complete under a lock file, and cut back if it fails part-way.
+// time), which the adoption matrix reader requires; `at` is ignored when deciding whether a record is a duplicate. The append is written until complete under a lock file; if it fails part-way the ledger is not truncated (that could delete another writer's record), the torn bytes are closed off with a newline so they sit on their own malformed line, and the failure is reported.
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -83,7 +83,17 @@ function readLedger(file, fsApi) {
  *  turns out to be a fresh lock a third writer just created, it is put back and this writer reports busy. */
 function takeLock(lock, token, fsApi, now) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { const fd = fsApi.openSync(lock, 'wx'); try { fsApi.writeFileSync(fd, token); } finally { fsApi.closeSync(fd); } return true; } catch (e) {
+    try {
+      const fd = fsApi.openSync(lock, 'wx');
+      try {
+        try { fsApi.writeFileSync(fd, token); } catch (w) {
+          // A failed token write must not leave an empty lock that blocks every writer until it goes stale.
+          try { fsApi.unlinkSync(lock); } catch { /* best effort */ }
+          throw w;
+        }
+      } finally { fsApi.closeSync(fd); }
+      return true;
+    } catch (e) {
       if (e?.code !== 'EEXIST') throw e;
       let age;
       try { age = now() - fsApi.statSync(lock).mtimeMs; } catch { continue; }
@@ -110,11 +120,10 @@ function releaseLock(lock, token, fsApi) {
 }
 
 /** Writes every byte of `buf` to an append handle. writeSync may accept fewer bytes than asked, so loop on its return
- *  value. If a write throws or makes no progress, cut the file back to its length before this append so a torn line
- *  never stays in the ledger (the reader would otherwise drop or misread it), and report the failure. */
+ *  value. If a write throws or makes no progress, the ledger is NOT truncated (a cut-back is not atomic with another
+ *  writer's append and could delete that writer's record). Instead one newline is appended, best effort, so the torn
+ *  bytes become an isolated malformed line that the JSON-lines readers already drop, and the failure is reported. */
 function appendAll(fd, buf, fsApi) {
-  let start;
-  try { start = fsApi.fstatSync(fd).size; } catch (e) { return { ok: false, error: `write failed: cannot stat ledger: ${e.message}` }; }
   let off = 0;
   try {
     while (off < buf.length) {
@@ -124,14 +133,8 @@ function appendAll(fd, buf, fsApi) {
     }
     return { ok: true };
   } catch (e) {
-    let cut = 'ledger cut back to its previous length';
-    try {
-      // Cut back only our own partial bytes: if the file is longer than start+off, someone else appended after the
-      // lock was taken over, and truncating would delete their data.
-      if (fsApi.fstatSync(fd).size === start + off) fsApi.ftruncateSync(fd, start);
-      else cut = 'ledger NOT cut back: it changed size during the write (another writer appended)';
-    } catch (t) { cut = `ledger NOT cut back: ${t.message}`; }
-    return { ok: false, error: `write failed: ${e.message}; ${cut}` };
+    try { fsApi.writeSync(fd, Buffer.from('\n')); } catch { /* best effort: the next writer also starts a new line if the file lacks a final newline */ }
+    return { ok: false, error: `write failed: ${e.message}; ledger NOT cut back, but the partial line is isolated with a newline (readers skip it)` };
   }
 }
 

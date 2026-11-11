@@ -86,39 +86,67 @@ describe('fix-ready-record', () => {
     expect(r.ok).toBe(true);
     expect(readFileSync(file, 'utf8')).toBe(`${JSON.stringify(r.record)}\n`);
   });
-  it('refuses and cuts the ledger back when a write fails part-way, leaving no torn line', () => {
-    const file = tmp();
-    writeFileSync(file, `${JSON.stringify({ ref: 'lane/old', sha, tests: 'green', audit: 'NOT WEAKENED' })}\n`);
-    const before = readFileSync(file, 'utf8');
-    for (const second of [() => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); }, () => 0]) {
+  it('a write that fails part-way is never truncated: the torn bytes sit on their own line and a later record stays readable', () => {
+    const old = { ref: 'lane/old', sha, tests: 'green', audit: 'NOT WEAKENED', at: '2026-01-01T00:00:00.000Z' };
+    for (const [name, second] of [['throws ENOSPC', () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); }], ['makes no progress (returns 0)', () => 0]]) {
+      const file = tmp();
+      writeFileSync(file, `${JSON.stringify(old)}\n`);
       let calls = 0;
       const fsApi = {
         ...fs,
-        writeSync: (fd, buf, off = 0, len = buf.length - off) => (calls++ === 0 ? fs.writeSync(fd, buf, off, 5) : second()),
+        // 1st call: 5 bytes land; 2nd call: the failure; later calls (the isolating newline) hit the real fs
+        writeSync: (fd, buf, off = 0, len = buf.length - off) => (calls === 0 ? (calls++, fs.writeSync(fd, buf, off, 5)) : calls++ === 1 ? second() : fs.writeSync(fd, buf, off, len)),
       };
       const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
-      expect(r.ok).toBe(false);
+      expect(r.ok, name).toBe(false);
       expect(r.error).toMatch(/write failed|short write/);
-      expect(readFileSync(file, 'utf8')).toBe(before);
+      expect(r.error).toMatch(/NOT cut back/);
       expect(existsSync(`${file}.lock`)).toBe(false);
+      const lines = readFileSync(file, 'utf8').split('\n');
+      expect(lines.slice(0, 3)).toEqual([JSON.stringify(old), '{"ref', '']); // old record, the 5 torn bytes alone, then the newline
+      expect(jsonLines(readFileSync(file, 'utf8'))).toEqual([old]);
+      // the next writer appends cleanly after the isolated torn line; both records parse
+      expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(true);
+      expect(jsonLines(readFileSync(file, 'utf8')).map((x) => x.ref)).toEqual(['lane/old', ref]);
     }
   });
-  it('does not cut back bytes another writer appended while this write was failing', () => {
+  it('keeps a record another writer appended while this write was failing, parsed, with the torn bytes on their own line', () => {
     const file = tmp();
-    const other = `${JSON.stringify({ ref: 'lane/other', sha: 'a'.repeat(40), tests: 'green', audit: 'NOT WEAKENED' })}\n`;
+    const otherInput = { ref: 'lane/other', sha: 'a'.repeat(40), tests: 'green', audit: 'NOT WEAKENED' };
     let calls = 0;
+    let other;
     const fsApi = {
       ...fs,
       writeSync: (fd, buf, off = 0, len = buf.length - off) => {
-        if (calls++ === 0) return fs.writeSync(fd, buf, off, 5);
-        fs.appendFileSync(file, other); // a writer that took over the stale lock appends meanwhile
-        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+        if (calls === 0) { calls++; return fs.writeSync(fd, buf, off, 5); }
+        if (calls++ === 1) {
+          // a real second writer takes over this writer's (by then stale) lock and appends through the real code path
+          other = writeReadyRecord(otherInput, { file, now: () => Date.now() + 120_000 });
+          throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+        }
+        return fs.writeSync(fd, buf, off, len);
       },
     };
     const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/NOT cut back/);
-    expect(readFileSync(file, 'utf8').endsWith(other)).toBe(true);
+    expect(other.ok).toBe(true);
+    const text = readFileSync(file, 'utf8');
+    expect(jsonLines(text)).toEqual([other.record]); // the other record survived and parses
+    expect(text.split('\n').filter((l) => l && !l.startsWith('{"ref":"lane/other"'))).toHaveLength(1); // exactly one torn line
+    expect(text.split('\n')[0]).toHaveLength(5); // the torn bytes are alone on their line
+  });
+  it('removes the lock when the token write fails, so the next writer is not blocked', () => {
+    const file = tmp();
+    let calls = 0;
+    const fsApi = { ...fs, writeFileSync: (...a) => { if (calls++ === 0) throw Object.assign(new Error('no space'), { code: 'ENOSPC' }); return fs.writeFileSync(...a); } };
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/cannot lock .*no space/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(existsSync(file)).toBe(false);
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi }).ok).toBe(true);
+    expect(jsonLines(readFileSync(file, 'utf8'))).toHaveLength(1);
   });
   it('refuses a record too large for the adoption matrix reader to keep (it reads only the last 1 MiB)', () => {
     const file = tmp();
