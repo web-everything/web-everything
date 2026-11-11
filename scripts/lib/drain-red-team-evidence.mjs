@@ -91,7 +91,13 @@ export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, 
     // and the removal. A newer attempt that marked the head since owns the marker and its outcome: leave both.
     const settled = lock(() => {
       const marker = readCarriedCheckMarker(path);
-      if (!marker.exists || (marker.attempt !== null && marker.attempt !== attempt)) return { ok: true };
+      if (!marker.exists) return { ok: true };
+      if (marker.attempt !== null && marker.attempt !== attempt) {
+        // Only a marker this attempt wrote proves a NEWER attempt replaced it. When this attempt's own mark failed, the
+        // marker may be an older failed attempt's (and its hold): neither trust it as newer nor clear it as ours.
+        if (markError) return { ok: false, reason: `carried-check retry marker not written (${markError}): operator must republish` };
+        return { ok: true };
+      }
       // Always ask: clearHold removes only the live helper's own holds, so a hold whose intent was never recorded
       // (beforeHold failed) is cleared too. A failed read or clear keeps the marker for the next retry.
       let cleared;

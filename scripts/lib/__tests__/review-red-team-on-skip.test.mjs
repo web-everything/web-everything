@@ -17,7 +17,7 @@ import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublica
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -2176,6 +2176,19 @@ describe('#6606 carried check recovered after a transient verification failure',
           return { ok: true };
         } });
       expect(out).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(true);
+      // Fourth self-review: when THIS attempt's own mark failed, another id in the marker proves nothing (it may be an
+      // older failed attempt's, with its hold): not ok, nothing cleared, the marker kept.
+      const clearHold = vi.fn(() => ({ ok: true }));
+      const statusDir = redTeamStatusDir(w.env);
+      chmodSync(statusDir, 0o555);
+      let failedMark;
+      try {
+        failedMark = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'this', clearHold,
+          publish: () => ({ ok: true }), lock: fn => fn() });
+      } finally { chmodSync(statusDir, 0o755); }
+      expect(failedMark).toMatchObject({ ok: false, reason: expect.stringMatching(/retry marker not written/) });
+      expect(clearHold).not.toHaveBeenCalled();
       expect(w.owed()).toBe(true);
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
