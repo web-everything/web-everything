@@ -429,8 +429,9 @@ export function planOperatorRuling(read, input) {
  */
 export function withNonRegressionEvidence(read, input) {
   if (input.notWorseThanMain === undefined) return { input, evidence: null };
-  const evidence = String(input.notWorseThanMain).trim();
-  if (!evidence || /[\r\n]/.test(evidence)) throw new Error('--notWorseThanMain must be one non-empty line of evidence');
+  const evidence = String(input.notWorseThanMain);
+  if (!evidence.trim() || /[\r\n]/.test(evidence)) throw new Error('--notWorseThanMain must be one non-empty line of evidence');
+  if (!String(input.reason ?? '').trim()) throw new Error("--reason is required: the operator's words, verbatim");
   if (input.ruling !== 'card') throw new Error('--notWorseThanMain applies only to --ruling=card');
   if (read.cardAllowNonRegression?.value !== 'on') throw new Error('--notWorseThanMain requires the cardRuling.allowNonRegression setting to be on (R903); it is off');
   if ([JUDGE_ACTOR, AUTO_POLICY_ACTOR].includes(String(input.actor ?? '').toLowerCase())) throw new Error('--notWorseThanMain is operator-only');
@@ -451,6 +452,7 @@ export function assertCardFiling(read, input) {
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
   const digest = `Operator card follow-up for ${input.repo}#${input.pr} (head ${read.head}):\n\n`
+    + (input.notWorseThanMain !== undefined ? `Not worse than main (R903): ${input.notWorseThanMain}\n\n` : '')
     + selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${String(f.summary ?? '').replace(/\s+/g, ' ').trim()}`).join('\n');
   const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
   for (const [field, value] of Object.entries({ digest, scope })) {

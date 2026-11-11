@@ -652,7 +652,7 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
       });
 
       describe('R903 non-regression card ruling', () => {
-        const EVIDENCE = 'module absent on main and has no callers';
+        const EVIDENCE = ' module absent  on main and has no callers ';
         const ON = { cardAllowNonRegression: { value: 'on', source: 'platform' } };
         const fixNow = { findingClass: 'correctness-in-normal-use' };
         for (const mode of modes) {
@@ -661,7 +661,8 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
             await h.run();
             expect(h.landRulingCard).toHaveBeenCalledTimes(1);
             // two-step only files the card; the ruling is posted by a later --card call, one-call posts it now
-            if (mode === 'one-call') expect(JSON.stringify(h.written)).toContain(EVIDENCE);
+            if (mode === 'one-call') expect(JSON.stringify(h.written)).toContain(`Not worse than main (R903): ${EVIDENCE}`);
+            else expect(h.filed[0].payload.cardInput.digest).toContain(`Not worse than main (R903): ${EVIDENCE}`);
           });
           it(`${mode}: setting on without evidence keeps the refusal`, async () => {
             const h = await fixture(kind, mode, { findingOver: fixNow, snapshotOver: ON });
@@ -673,6 +674,10 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
             expect(h.landRulingCard).not.toHaveBeenCalled();
           });
         }
+        it('keeps the blank-reason refusal when evidence is present', async () => {
+          const h = await fixture(kind, 'one-call', { findingOver: fixNow, snapshotOver: ON, inputOver: { notWorseThanMain: 'x', reason: ' ' } });
+          await expect(h.run()).rejects.toThrow(/reason/);
+        });
         it('rejects empty or multi-line evidence', async () => {
           for (const bad of ['  ', 'a\nb']) {
             const h = await fixture(kind, 'two-step', { findingOver: fixNow, snapshotOver: ON, inputOver: { notWorseThanMain: bad } });
