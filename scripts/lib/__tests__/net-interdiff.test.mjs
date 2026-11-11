@@ -159,29 +159,30 @@ describe('netInterdiff', () => {
     it('every git call is clamped to the time left in the budget', () => {
       const timeouts = [];
       const spy = (c, a, o) => { timeouts.push(o.timeout); return exec(c, a, o); };
-      expect(netInterdiff({ exec: spy, ...valid(), budgetMs: 5_000 })).not.toBeNull();
+      expect(netInterdiff({ exec: spy, ...valid(), budgetMs: 20_000 })).not.toBeNull();
       expect(timeouts.length).toBeGreaterThan(0);
-      expect(Math.max(...timeouts)).toBeLessThanOrEqual(5_000);
+      expect(Math.max(...timeouts)).toBeLessThanOrEqual(20_000);
     });
     it('the budget runs out AFTER a path was already judged "unchanged" → null, never a partial result', () => {
       let t = 0;
       const calls = [];
-      const tick = (...a) => { calls.push(a); t += 10; return exec(...a); };
+      // Scaled (10 s per call, 55 s budget) so the real git timeout derived from the budget stays generous on a loaded host.
+      const tick = (...a) => { calls.push(a); t += 10_000; return exec(...a); };
       const rawFiles = { 'a.txt': null, 'b.txt': null };
-      expect(netInterdiff({ exec: tick, ...valid(), rawFiles, budgetMs: 55, now: () => t })).toBeNull();
+      expect(netInterdiff({ exec: tick, ...valid(), rawFiles, budgetMs: 55_000, now: () => t })).toBeNull();
       // 2 merge-bases + all 3 calls for a.txt were made, so a.txt had been put in `dropped` before the budget ended.
       expect(calls.length).toBeGreaterThanOrEqual(5);
     });
     it('the budget is also checked after the last path (parsing between git calls counts)', () => {
       let t = 0;
-      const lastCall = (...a) => { const r = exec(...a); if (a[1].includes('diff')) t += 1000; return r; };
-      // Only the diff calls are slow: 2 diffs × 1000 ms for the single path, budget 1500 → exhausted by the final check.
-      expect(netInterdiff({ exec: lastCall, ...valid(), rawFiles: { 'a.txt': null }, budgetMs: 1500, now: () => t })).toBeNull();
+      const lastCall = (...a) => { const r = exec(...a); if (a[1].includes('diff')) t += 100_000; return r; };
+      // Only the diff calls are slow: 2 diffs × 100 s for the single path, budget 150 s → exhausted by the final check.
+      expect(netInterdiff({ exec: lastCall, ...valid(), rawFiles: { 'a.txt': null }, budgetMs: 150_000, now: () => t })).toBeNull();
     });
     it('a fractional clock still gives whole-millisecond timeouts and completes', () => {
       const timeouts = [];
       const spy = (c, a, o) => { timeouts.push(o.timeout); return exec(c, a, o); };
-      const out = netInterdiff({ exec: spy, ...valid(), budgetMs: 4000.5, now: () => 12345.25 });
+      const out = netInterdiff({ exec: spy, ...valid(), budgetMs: 30_000.5, now: () => 12345.25 });
       expect(out).not.toBeNull();
       expect(timeouts.every(Number.isInteger)).toBe(true);
     });
