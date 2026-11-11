@@ -193,6 +193,36 @@ describe('the indeterminate case — an attempt whose outcome is unknown', () =>
     expect(healthy.calls).toEqual([]); // and nothing at all was applied
   });
 
+  it('persists a proven pre-write pending refusal as failed before retrying', async () => {
+    const store = createMemoryRunStore();
+    const run = atEffectStep();
+    run.effects[0].status = 'pending';
+    run.effects[0].error = 'UNKNOWN: --body-file=gone.md is unreadable (ENOENT)';
+    store.write(run);
+    const states = [];
+    const write = store.write;
+    store.write = record => { states.push(record.effects[0].status); return write(record); };
+    const healthy = recordingSinks();
+    healthy.sinks['comment.post'].provablyNotApplied = entry => entry.error === run.effects[0].error;
+    const result = await applyPendingEffects(run, { sinks: healthy.sinks, store });
+    expect(states[0]).toBe('failed');
+    expect(result.run.effects[0].status).toBe('applied');
+    expect(healthy.calls).toHaveLength(2);
+  });
+
+  it.each([false, undefined, 'true'])('refuses unknown pending outcomes when proof returns %s', async proof => {
+    const store = createMemoryRunStore();
+    const run = atEffectStep();
+    run.effects[0].status = 'pending';
+    run.effects[0].error = 'UNKNOWN: connection reset';
+    store.write(run);
+    const healthy = recordingSinks();
+    healthy.sinks['comment.post'].provablyNotApplied = () => proof;
+    await expect(applyPendingEffects(run, { sinks: healthy.sinks, store })).rejects.toThrow(/Resolve it by hand/);
+    expect(healthy.calls).toEqual([]);
+    expect(store.read(run.id).effects[0].status).toBe('pending');
+  });
+
   it('DOES replay an indeterminate effect that declared itself idempotent', async () => {
     const store = createMemoryRunStore();
     // Only the label swap is idempotent in the fixture, so break that one.

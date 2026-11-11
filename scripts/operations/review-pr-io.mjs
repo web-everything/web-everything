@@ -43,7 +43,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, openSync, unlinkSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, closeSync, openSync, unlinkSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -69,7 +69,7 @@ const MANDATORY_LEDGER_SYNC_PASSES = 3;
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
-import { sharedRunsDir } from './run-store.mjs';
+import { createFileRunStore, sharedRunsDir } from './run-store.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -797,7 +797,20 @@ export function createReviewPrReader({
  * unrecognised failure is how a comment gets double-posted. This list only ever narrows the refusal; it never
  * widens what counts as safe.
  */
+// These argument checks run in the CLI entry point before runReviewLabelCli can mutate anything.
+// Exported so a test can require one real-CLI no-write case per pattern: each one licenses a replay.
+// ANCHORED to the start of the CLI's own error text (optionally behind the sink's own UNKNOWN wrapper), so a
+// post-write `gh` stderr line that merely CONTAINS one of these phrases never licenses a replay.
+const BODY_FILE_ANCHOR = '^(?:review-set-label\\.mjs (?:failed|reported an error) and its outcome is UNKNOWN: )?';
+export const BODY_FILE_REFUSALS = Object.freeze([
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is unreadable \\(`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is empty — pass the verdict write-up`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file must live under the repo root or a temp dir \\(got `),
+]);
+const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_REFUSALS.some(p => p.test(text));
+
 const PRE_WRITE_REFUSALS = Object.freeze([
+  ...BODY_FILE_REFUSALS,
   'usage: review-set-label.mjs',
   'invalid --repo',
   'invalid --to',
@@ -837,7 +850,7 @@ function boundedReferral(original, source) {
 /** Is this CLI error text one we can PROVE happened before any write? */
 export function isPreWriteRefusal(text) {
   const s = String(text || '');
-  return PRE_WRITE_REFUSALS.some((p) => s.includes(p));
+  return PRE_WRITE_REFUSALS.some((p) => p instanceof RegExp ? p.test(s) : s.includes(p));
 }
 
 /** Lines around a cited line that count as "the cited code changed" when carrying an operator ruling forward. */
@@ -945,6 +958,9 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
 export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
+  // The SAME store the executor and `run.mjs --resume` use (`resolveRunsDir()`, where `OPERATION_RUNS_DIR` wins);
+  // reading `sharedRunsDir` here would miss every run a daemon job child or a test wrote under that override.
+  runStore = createFileRunStore(),
   referralJudge = judgeSpawn,
   sameGapJudge,
   publishGate = readReviewCiGate,
@@ -1048,7 +1064,7 @@ export function createReviewPrSinks({
     if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
     return state;
   };
-  return {
+  const sinks = {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
       const { recheckCarriedReferrals } = resolveReviewSettings({ env });
@@ -1589,6 +1605,21 @@ export function createReviewPrSinks({
       // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
       // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
+      if (!existsSync(bodyPath)) {
+        try {
+          // The executor's own store first (`ctx.readRun`); the default store only for a caller with no executor.
+          const run = typeof ctx?.readRun === 'function' ? ctx.readRun(ctx.runId) : runStore.read(ctx.runId);
+          const staged = run?.id === ctx.runId && run.effects?.find(entry =>
+            entry.type === REVIEW_EFFECTS.WRITE_UP && entry.status === 'applied'
+            && entry.payload?.bodyFile === payload.bodyFile
+            && typeof entry.payload.body === 'string' && entry.payload.body.trim());
+          if (!staged) throw new Error('no matching applied write-up in this run');
+          mkdirSync(dirname(bodyPath), { recursive: true });
+          writeFileSync(bodyPath, staged.payload.body, 'utf8');
+        } catch (e) {
+          throw notApplied(`review body could not be restored from run ${ctx.runId}: ${e.message}`);
+        }
+      }
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
         String(payload.pr),
@@ -1851,6 +1882,9 @@ export function createReviewPrSinks({
       return { cleared: true };
     },
   };
+  // Only historical body-file argument refusals prove a pending label attempt never wrote.
+  sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
+  return sinks;
 }
 
 /** The `{"error": …}` payload the review CLIs print on a refusal, or `''`. */
