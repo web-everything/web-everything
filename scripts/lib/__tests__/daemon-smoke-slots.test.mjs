@@ -442,8 +442,9 @@ describe('daemon smoke slots', () => {
     [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1.5' }, 900000, 'default'],
     [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '9007199254740992' }, 900000, 'default'],
     [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000' }, 60000, 'default'],
-    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '120000' }, 1000, 'default'],
-    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '60000' }, 1000, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '179999' }, 59999, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '120000' }, 40000, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '60000' }, 20000, 'default'],
     [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '1' }, 1000, 'default'],
     [{ smokeQueueMaxWaitMs: 5001 }, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000' }, 5001, 'tool'],
     [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: 'invalid' }, 900000, 'default'],
@@ -460,7 +461,7 @@ describe('daemon smoke slots', () => {
     const requested = Number(env.WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS ?? value.smokeQueueMaxWaitMs);
     if (Number.isSafeInteger(requested) && requested > bound) {
       expect(log.error).toHaveBeenCalledWith(
-        `daemon-live-smoke: smokeQueueMaxWaitMs clamped from ${requested} to ${bound}ms (rebuild lease lifetime minus 2min)`);
+        `daemon-live-smoke: smokeQueueMaxWaitMs clamped from ${requested} to ${bound}ms (bounded by the rebuild lease lifetime)`);
     }
     expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smokeQueueMaxWaitMs=${bound} (${source})`);
     expect(log.error).toHaveBeenCalledWith(`daemon-live-smoke: smoke-queue-timeout (waited ${bound}ms) — giving up this attempt`);
@@ -477,6 +478,51 @@ describe('daemon smoke slots', () => {
     expect(slot.acquired).toBe(true);
     expect(state().holders.map(e => e.pid)).toEqual([11]);
     expect(log.error).not.toHaveBeenCalledWith(expect.stringContaining('smoke-queue-timeout'));
+    await slot.release();
+  });
+
+  it.each(['60000', '120000'])('takes a free slot when a live writer holds the state lock for 2s with lease lifetime %sms', async stale => {
+    settings.value = { smokeMaxConcurrent: 1 };
+    const lock = join(stateDir, 'smoke-slots.lock');
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'pid'), '91');
+    let time = 0;
+    const slot = await acquire(12, { env: { WE_DAEMON_REBUILD_LEASE_STALE_MS: stale }, now: () => time,
+      sleep: async ms => {
+        time += ms;
+        if (time >= 2000) rmSync(lock, { recursive: true, force: true });
+        if (time > 10000) throw new Error('queue exceeded bound');
+      } });
+    expect(slot.acquired).toBe(true);
+    expect(state().holders.map(e => e.pid)).toEqual([12]);
+    expect(log.error).not.toHaveBeenCalledWith(expect.stringContaining('smoke-queue-timeout'));
+    await slot.release();
+  });
+
+  it('a failed-release cleanup that cannot get the state lock never costs a free slot', async () => {
+    settings.value = { smokeMaxConcurrent: 2, smokeQueueMaxWaitMs: 3001 };
+    let fail = false;
+    const failed = await acquire(11, { isAlive: () => {
+      if (fail) throw new Error('release IO failure');
+      return true;
+    } });
+    fail = true;
+    await failed.release();
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
+    const lock = join(stateDir, 'smoke-slots.lock');
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'pid'), '91');
+    log.error.mockImplementation(message => {
+      // The lock frees only after the cleanup gave up on it: the capacity attempt must still run.
+      if (String(message).includes('stale-ticket cleanup deferred')) rmSync(lock, { recursive: true, force: true });
+    });
+    let time = 0;
+    const slot = await acquire(11, { now: () => time, sleep: async ms => {
+      time += ms;
+      if (time > 6000) throw new Error('queue exceeded bound');
+    } });
+    expect(slot.acquired).toBe(true);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('stale-ticket cleanup deferred'));
     await slot.release();
   });
 

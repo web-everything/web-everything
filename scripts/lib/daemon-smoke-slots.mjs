@@ -18,6 +18,14 @@ const failedTickets = new Set();
 const positive = value => Number.isSafeInteger(value) && value > 0;
 // The queue-wait ceiling never collapses to 0: a short rebuild lease must still allow a capacity check.
 const MIN_QUEUE_WAIT_MS = 1000;
+const LEASE_RUN_RESERVE_MS = 2 * 60_000;
+// Queue residence leaves the smoke run its reserve of the lease: a flat 2min for leases of 3min or more,
+// and two thirds of a shorter lease. The short-lease ceiling scales with the lease (stale/3, continuous at
+// 3min) so it stays well above one 2s poll or a briefly busy state lock, instead of collapsing to a floor.
+function queueWaitCeiling(staleMs) {
+  const ceiling = staleMs >= 1.5 * LEASE_RUN_RESERVE_MS ? staleMs - LEASE_RUN_RESERVE_MS : Math.floor(staleMs / 3);
+  return Math.max(MIN_QUEUE_WAIT_MS, ceiling);
+}
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
 
 function setting(env, log, key, envKey, fallback, ceiling = Infinity) {
@@ -38,7 +46,7 @@ function setting(env, log, key, envKey, fallback, ceiling = Infinity) {
   const source = resolved.sources[''] === 'standard' ? 'default' : resolved.sources[''];
   const value = Math.min(resolved.value, ceiling);
   if (value !== resolved.value) {
-    log.error?.(`daemon-live-smoke: ${key} clamped from ${resolved.value} to ${value}ms (rebuild lease lifetime minus 2min)`);
+    log.error?.(`daemon-live-smoke: ${key} clamped from ${resolved.value} to ${value}ms (bounded by the rebuild lease lifetime)`);
   }
   log.error?.(`daemon-live-smoke: ${key}=${value} (${source})`);
   return value;
@@ -85,7 +93,7 @@ export async function acquireSmokeSlot({
   if (!positive(pid)) throw new Error('daemon-live-smoke: invalid slot pid');
   const cap = setting(env, log, 'smokeMaxConcurrent', 'WE_DAEMON_SMOKE_MAX_CONCURRENT', 2);
   const maxWait = setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 900_000,
-    Math.max(MIN_QUEUE_WAIT_MS, rebuildLeaseStaleMs(env) - 2 * 60_000));
+    queueWaitCeiling(rebuildLeaseStaleMs(env)));
   const queuedAt = now();
   const deadline = queuedAt + maxWait;
   const expired = new Error('smoke queue expired');
@@ -198,11 +206,18 @@ export async function acquireSmokeSlot({
     const pending = [...failedTickets].filter(e => e.path === path && e.pid === pid);
     if (pending.length) {
       const tickets = new Set(pending.map(e => e.ticket));
-      await transaction(state => {
-        state.holders = state.holders.filter(e => e.pid !== pid || !tickets.has(e.ticket));
-        state.waiters = state.waiters.filter(e => e.pid !== pid || !tickets.has(e.ticket));
-      }, deadline);
-      for (const entry of pending) failedTickets.delete(entry);
+      try {
+        await transaction(state => {
+          state.holders = state.holders.filter(e => e.pid !== pid || !tickets.has(e.ticket));
+          state.waiters = state.waiters.filter(e => e.pid !== pid || !tickets.has(e.ticket));
+        }, deadline);
+        for (const entry of pending) failedTickets.delete(entry);
+      } catch (error) {
+        // A cleanup that cannot get the state lock must not cost a free slot: keep the entries for the
+        // next acquire and still make the capacity attempt below.
+        if (error !== expired) throw error;
+        log.error?.('daemon-live-smoke: stale-ticket cleanup deferred (state lock busy) — retrying on the next acquire');
+      }
     }
     for (;;) {
       // Always attempt capacity first; the deadline is only tested after a failed attempt.
