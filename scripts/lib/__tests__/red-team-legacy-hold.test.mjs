@@ -613,14 +613,16 @@ describe('the stored result is the authority on every status shape (self-review 
     expect(readStatusFile().sealedBreaks).toBeUndefined();
     if (finished === 'ran') expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ unsealed: true });
   });
-  it('failed retry preserves an operator-flagged legacy hold (no seal)', () => {
+  // Self-review (round 8): a flagged, UNSEALED legacy `ran` (flag raised over an unreadable failed seat row, no comment)
+  // is exactly what the retry admits. A retry that fails must not leave a hold nothing can clear: the publisher lifts the
+  // flag only on a finished bare `ran`, so the flag counts only there.
+  it.each([['failed'], [{ status: 'error' }]])('a flagged unsealed legacy `ran` whose retry finishes %j is not held forever', finished => {
     writeStatusFile({ ...legacyStatus(), legacyHoldPublished: true });
     expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ unsealed: true, legacyHold: true });
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'queued', result: 'ran' }, { env: process.env });
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
-    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: { status: 'error' } }, { env: process.env });
-    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ legacyHold: true });
-    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: finished }, { env: process.env });
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toBeNull();
   });
   it('failed retry preserves a sealed seat-posted result\'s seal too (the seal, not only the carried findings)', () => {
     writeStatusFile({ repo, pr: 42, head, status: 'finished', result: { ...posted([brokenFinding]), comment: 'withheld' }, sealedBreaks: ['k'] });

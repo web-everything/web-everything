@@ -33,9 +33,11 @@ export function sealedFromStatus(status, head) {
   // `sealedPosted`: the publisher's own scrub-fallback body, sealed beside the breaks (see redTeamHoldDecision).
   const posted = status.sealedPosted;
   if (posted !== undefined && (seal === undefined || !keyList(posted))) return { unreadable: true };
-  // Counted while the flag is stored, whatever the status: a failed or skipped retry must not lift an operator-flagged
-  // hold. The writer drops the flag with the seal when a DIFFERENT `ran` result arrives; the publisher lifts it on resolve.
-  const legacyHold = status.legacyHoldPublished === true;
+  // Counted only on the finished bare `ran` the flag was raised for: the publisher, which alone lifts it, acts only there.
+  // Counted at any other status it would outlive a failed retry with nothing able to clear it. The flag stays stored, so
+  // a later finished bare `ran` re-raises it. (A conflict-raised flag is never retried: the retry guard refuses a head
+  // that already carries a red-team comment.)
+  const legacyHold = status.legacyHoldPublished === true && status.status === 'finished' && status.result === 'ran';
   // A status that still owes publication (same test as the publisher's `needsPublish`) and has no seal yet: nothing has
   // compared the stored evidence with the thread, so no posted comment may clear it. Hold until the publisher seals.
   const owesPublish = status.status === 'finished' && (status.result === 'ran'
