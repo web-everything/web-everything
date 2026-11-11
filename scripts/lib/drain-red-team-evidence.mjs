@@ -1,10 +1,10 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
@@ -49,18 +49,23 @@ export function readCarriedCheckUnpublished({ repo, pr, head, env = process.env 
 
 /** Record that a carried check is owed on this head. The carry writes it BEFORE its result comment, so a crash between
  * the comment and the publication still leaves the head owed (recovery skips a head whose result is on it). Throws. */
-export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env, remoteHold = false }) {
+export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env, remoteHold = false, attempt = null }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
-  // A hold an earlier attempt set stays recorded until a confirmed attempt clears it.
-  writeJsonAtomic(path, { repo, pr: Number(pr), head, remoteHold: remoteHold || carriedCheckRemoteHold(path) });
+  const prior = readCarriedCheckMarker(path);
+  // A hold an earlier attempt set stays recorded until a confirmed attempt clears it; the attempt id names the newest
+  // attempt, so an older confirmed attempt never removes a marker a newer one still owns.
+  writeJsonAtomic(path, { repo, pr: Number(pr), head, remoteHold: remoteHold || prior.remoteHold,
+    attempt: attempt ?? prior.attempt ?? null });
 }
 
-/** Did an earlier attempt (possibly) set the GitHub-visible publication hold? An unreadable marker counts as yes:
+/** The marker's content: `{ exists, remoteHold, attempt }`. An unreadable marker exists and counts as holding:
  * clearing only ever removes the live helper's own hold, so a needless clear costs one read. */
-function carriedCheckRemoteHold(path) {
-  try { return JSON.parse(readFileSync(path, 'utf8'))?.remoteHold === true; }
-  catch (error) { return error.code !== 'ENOENT'; }
+function readCarriedCheckMarker(path) {
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf8'));
+    return { exists: true, remoteHold: data?.remoteHold === true, attempt: typeof data?.attempt === 'string' ? data.attempt : null };
+  } catch (error) { return { exists: error.code !== 'ENOENT', remoteHold: error.code !== 'ENOENT', attempt: null }; }
 }
 
 const safeText = value => String(value?.message ?? value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
@@ -70,26 +75,35 @@ const safeText = value => String(value?.message ?? value).replace(/[\x00-\x1f\x7
  * `hooks.beforeHold` records that the attempt is about to set the GitHub-visible publication hold, so a later
  * confirmed attempt clears it through `clearHold` before the marker goes (#6606: a hold left behind would block the
  * head after the check itself is clear). */
-export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish, clearHold }) {
+export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish, clearHold,
+  lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn), newAttempt = randomUUID }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
+  const attempt = newAttempt();
   let markError = null;
-  try { markCarriedCheckUnpublished({ repo, pr, head, env }); }
+  try { markCarriedCheckUnpublished({ repo, pr, head, env, attempt }); }
   catch (error) { markError = safeText(error).slice(0, 200); }
-  const beforeHold = () => markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true });
+  const beforeHold = () => markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true, attempt });
   let result;
   try { result = publish({ beforeHold }); }
   catch (error) { result = { ok: false, reason: safeText(error) }; }
   if (result?.ok === true) {
-    if (carriedCheckRemoteHold(path)) {
+    // Under the writers' lock, so no other attempt's publication (or its hold) can land between the read, the clear
+    // and the removal. A newer attempt that marked the head since owns the marker and its outcome: leave both.
+    const settled = lock(() => {
+      const marker = readCarriedCheckMarker(path);
+      if (!marker.exists || (marker.attempt !== null && marker.attempt !== attempt)) return { ok: true };
+      // Always ask: clearHold removes only the live helper's own holds, so a hold whose intent was never recorded
+      // (beforeHold failed) is cleared too. A failed read or clear keeps the marker for the next retry.
       let cleared;
       try { cleared = clearHold ? clearHold() : { ok: false, reason: 'no publication hold clearer' }; }
       catch (error) { cleared = { ok: false, reason: safeText(error) }; }
       if (cleared?.ok !== true)
         return { ok: false, reason: `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}` };
-    }
-    try { rmSync(path, { force: true }); }
-    catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
-    return result;
+      try { rmSync(path, { force: true }); }
+      catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
+      return { ok: true };
+    });
+    return settled?.ok === true ? { ...result, ...settled } : { ok: false, reason: String(settled?.reason ?? 'carried-check settlement failed') };
   }
   const reason = String(result?.reason ?? 'unknown error');
   return { ...result, ok: false, reason: markError ? `${reason}; carried-check retry marker not written (${markError}): operator must republish` : reason };

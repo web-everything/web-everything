@@ -2152,6 +2152,32 @@ describe('#6606 carried check recovered after a transient verification failure',
       expect(v.statuses[0]).toMatchObject({ id: 99, state: 'failure' });
       expect(v.holdFact()).toMatchObject({ ok: false });
     } finally { rmSync(v.dir, { recursive: true, force: true }); }
+    // Third self-review: an OLDER round-writer hold under the helper's own hold must survive too (a trusted success
+    // would clear every hold beneath it), so nothing is posted and the gate stays held.
+    const u = world({ failCheckPosts: new Set([2]) });
+    try {
+      u.statuses.push({ id: 0, state: 'failure', context: `red-team/publication #${pr}`, description: 'held: started round not confirmed published',
+        creator: { login: 'web-everything' } });
+      u.publish({ pr, headSha: head });
+      expect(u.statuses.map(status => `${status.id}:${status.state}`)).toEqual(['1:failure', '0:failure']);
+      expect(u.tick().rows[0]).toMatchObject({ why: 'carried red-team check republished from live evidence' });
+      expect(u.statuses.filter(status => status.state === 'success')).toEqual([]);
+      expect(u.holdFact()).toMatchObject({ ok: false });
+    } finally { rmSync(u.dir, { recursive: true, force: true }); }
+  });
+
+  it('an older confirmed attempt never removes the marker a newer attempt owns', () => {
+    const w = world();
+    try {
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'older', clearHold: () => ({ ok: true }),
+        // A newer attempt marks the head while this one publishes, and then fails.
+        publish: () => {
+          publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'newer', publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+          return { ok: true };
+        } });
+      expect(out).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
 
   it('a hold clear that fails keeps the marker so the next retry clears it', () => {
@@ -2245,7 +2271,8 @@ describe('#6606 carried check recovered after a transient verification failure',
       expect(publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => { throw Error('HTTP 502'); } }))
         .toMatchObject({ ok: false, reason: 'HTTP 502' });
       expect(w.owed()).toBe(true);
-      expect(publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }) })).toMatchObject({ ok: true });
+      expect(publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }),
+        clearHold: () => ({ ok: true }) })).toMatchObject({ ok: true });
       expect(w.owed()).toBe(false);
       expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carry()] }], readCarriedCheck: () => { throw Error('EACCES'); } }))
         .toMatchObject({ action: 'publish-carried-check' });

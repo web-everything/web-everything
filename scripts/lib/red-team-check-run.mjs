@@ -381,26 +381,32 @@ export function evaluateRedTeamPublicationHold({ pr, combined, statuses, isTrust
 /** Description prefix of the publication hold {@link publishRedTeamCheckFromLive} sets. */
 const LIVE_HOLD_DESCRIPTION_PREFIX = 'held: live red-team check not clear:';
 
-/** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. Only the
- * NEWEST status on this PR's context is considered, and only if it is that helper's own hold (its description, from a
- * trusted author): a round writer's newer hold is its owner's to clear, so it is left (`cleared:false`, still ok). An
- * unreadable history or a failed clear is not ok, so the caller keeps its retry marker. */
+/** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears
+ * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,
+ * from a trusted author). Any other hold there (a round writer's) is its owner's to clear, so nothing is posted
+ * (`cleared:false`, still ok). An unreadable history or a failed clear is not ok: the caller keeps its retry marker. */
 export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, isTrusted = isTrustedMarkerAuthor } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
-  let newest;
+  const trusted = status => isTrusted({ user: { login: String(status?.creator?.login ?? '') } });
+  // A trusted success clears EVERY hold beneath it (the gate walks newest first and stops there), so the clear is
+  // posted only when every hold above the newest trusted success is the live helper's own. Any other hold in that
+  // range (a round writer's unconfirmed publication) is its owner's to clear: leave all of them.
+  let holds = [];
   try {
     const statuses = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions));
     if (!Array.isArray(statuses) || statuses.some(status => !Number.isSafeInteger(status?.id)))
       throw Error('statuses unreadable');
-    newest = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id)[0];
-    if (!newest && statuses.length >= 100) throw Error('statuses incomplete at 100-status bound');
+    const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
+    const settled = ordered.findIndex(status => status.state === 'success' && trusted(status));
+    if (settled < 0 && statuses.length >= 100) throw Error('statuses incomplete at 100-status bound');
+    holds = (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
-  if (!newest || newest.state === 'success') return { ok: true, cleared: false, reason: 'no publication hold on head' };
-  if (typeof newest.description !== 'string' || !newest.description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX)
-    || !isTrusted({ user: { login: String(newest.creator?.login ?? '') } }))
-    return { ok: true, cleared: false, reason: 'newest publication hold is not the live helper\'s; left to its owner' };
+  if (!holds.length) return { ok: true, cleared: false, reason: 'no publication hold on head' };
+  if (holds.some(status => typeof status.description !== 'string' || !status.description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX)
+    || !trusted(status)))
+    return { ok: true, cleared: false, reason: 'a publication hold that is not the live helper\'s is set; left to its owner' };
   const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh });
   return posted.ok ? { ok: true, cleared: true } : posted;
 }
