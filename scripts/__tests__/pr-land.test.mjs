@@ -60,7 +60,8 @@ describe('#2844 — pr-land stamps the PR author into the body at open', () => {
     // Belt-and-braces on the one thing a pure test cannot see: that the module-scope CREATE_BODY, and the
     // best-effort edit that backfills an already-open PR, are built by the composer rather than around it.
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src).toMatch(/const CREATE_BODY = composePrBody\(BODY\)/);
+    expect(src).toMatch(/(?:const|let) CREATE_BODY = composePrBody\(BODY\)/); // R893: let, reassigned only to append the deferred-to-CI disclosure
+    expect(src.match(/^\s*CREATE_BODY = /gm)).toHaveLength(1);
     expect(src).toMatch(/const updated = composePrBody\(liveBody\)/);
   });
 });

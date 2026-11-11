@@ -5,7 +5,7 @@
  *   Only pr-land's OPEN path (never `land`) accepts it, and ready-to-merge still needs a green CI `test` run.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync as rf } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readVerifyMarker, verifyGateDecision, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
@@ -107,7 +107,7 @@ describe('ready-to-merge needs a green CI test check on the exact sha', () => {
 });
 
 describe('wiring (source pins)', () => {
-  const { readFileSync } = require('node:fs');
+  const readFileSync = (p, e) => rf(p, e);
   it('only pr-land and verify-lane reference the deferred module; the open path refuses land mode', async () => {
     const { execFileSync } = await import('node:child_process');
     const out = execFileSync('git', ['grep', '-l', 'lane-verify-deferred', '--', 'scripts', ':!scripts/__tests__'], { encoding: 'utf8' }).split('\n').filter(Boolean).sort();
