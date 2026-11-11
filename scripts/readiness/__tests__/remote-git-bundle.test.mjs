@@ -261,3 +261,82 @@ describe('logLocalLocation', () => {
     expect(log).not.toHaveBeenCalled();
   });
 });
+
+describe('scanBundleRange changed-lines scan of modified blobs', () => {
+  const seedPublicToken = () => {
+    git(lane, 'checkout', '-q', 'main');
+    write('notes.md', `intro\n${token}\nf1\nf2\nf3\nf4\nf5\nf6\nouter\n`);
+    originMain = commit('public notes with a legacy token line');
+    git(lane, 'update-ref', 'refs/remotes/origin/main', originMain);
+    git(lane, 'checkout', '-q', '-B', 'lane');
+  };
+  const scanWith = (extra = {}) => scanBundleRange({
+    cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: originMain, exec, ...extra,
+  });
+
+  it('does not refuse an unrelated one-line edit to a file whose existing lines trip the scan', async () => {
+    seedPublicToken();
+    write('notes.md', `intro\n${token}\nf1\nf2\nf3\nf4\nf5\nf6\nouter changed\n`);
+    commit('unrelated edit');
+    expect(await scanWith()).toBeNull();
+  });
+
+  it('still refuses a newly added secret line in a modified file', async () => {
+    seedPublicToken();
+    write('notes.md', `intro\n${token}\nouter\n${'ghp_' + 'Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2'}\n`);
+    commit('adds a new secret line');
+    expect(await scanWith()).toMatchObject({ path: 'notes.md', finding: 'github-token' });
+  });
+
+  it('still scans an added file whole', async () => {
+    seedPublicToken();
+    write('added.md', `${token}\n`);
+    commit('adds a file');
+    expect(await scanWith()).toMatchObject({ path: 'added.md', finding: 'github-token' });
+  });
+
+  it('keeps the whole-blob scan when the bundleScan off switch is set', async () => {
+    seedPublicToken();
+    write('notes.md', `intro\n${token}\nf1\nf2\nf3\nf4\nf5\nf6\nouter changed\n`);
+    commit('unrelated edit');
+    expect(await scanWith({ bundleScan: 'whole-blob' })).toMatchObject({ path: 'notes.md', finding: 'github-token' });
+  });
+
+  it('fails closed when the blob diff cannot be read', async () => {
+    seedPublicToken();
+    write('notes.md', `intro\n${token}\nf1\nf2\nf3\nf4\nf5\nf6\nouter changed\n`);
+    commit('unrelated edit');
+    const failing = async (call) => (call.args.includes('diff') ? { code: 128, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) } : exec(call));
+    await expect(scanWith({ exec: failing })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+  });
+
+  it('refuses a value replaced under an existing multi-line secret key', async () => {
+    git(lane, 'checkout', '-q', 'main');
+    write('conf.yml', 'name: app\npassword: |\n  OldPassphraseValue12345xyz\nend: true\n');
+    originMain = commit('public conf');
+    git(lane, 'update-ref', 'refs/remotes/origin/main', originMain);
+    git(lane, 'checkout', '-q', '-B', 'lane');
+    write('conf.yml', 'name: app\npassword: |\n  NewPassphraseValue98765abc\nend: true\n');
+    commit('replace value');
+    expect(await scanWith()).not.toBeNull();
+  });
+
+  it('applies the object-size cap to modified blobs', async () => {
+    seedPublicToken();
+    write('notes.md', `intro\n${token}\nf1\nf2\nf3\nf4\nf5\nf6\nouter changed\n`);
+    commit('unrelated edit');
+    const big = async (call) => {
+      const res = await exec(call);
+      if (!call.args.includes('--batch-check=%(objectname) %(objecttype) %(objectsize)')) return res;
+      return { ...res, stdout: Buffer.from(String(res.stdout).replace(/blob \d+/g, 'blob 4000000')) };
+    };
+    await expect(scanWith({ exec: big })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+  });
+
+  it('scans a binary modified blob whole', async () => {
+    seedPublicToken();
+    write('notes.md', Buffer.concat([Buffer.from(`${token}\n`), Buffer.from([0, 1, 2, 3])]));
+    commit('binary edit');
+    expect(await scanWith()).not.toBeNull();
+  });
+});
