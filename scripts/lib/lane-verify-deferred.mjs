@@ -10,6 +10,7 @@
  */
 import { readFileSync, existsSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { readVerifyMarker } from './lane-verify.mjs';
 
 export const DEFERRED_FILENAME = '.lane-verify-deferred';
 export const DEFERRED_STATUS = 'deferred-to-ci';
@@ -42,6 +43,30 @@ export function readDeferredMarker(gitDir) {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { corrupt: true };
   } catch { return { corrupt: true }; }
+}
+
+/**
+ * The deferred record pr-land's open path may use for EXACTLY `headSha`, or null. PR #6674 red team: a verify the
+ * dispatcher KILLS (queue/gate ceiling) is settled into `.lane-verify` by the dispatcher itself
+ * (recordKilledVerification); the killed child never reaches its terminal hook, so no deferred file is written.
+ * The main marker is the single source of truth for the latest verdict, so read both here:
+ * - a corrupt main marker, or a red/green main marker for this sha, means no deferral (fail closed: a newer verdict
+ *   voids any deferred file left for the same sha);
+ * - otherwise a well-formed deferred file for this exact sha wins;
+ * - otherwise an `infrastructure-failure` main marker for this exact sha with deferrable evidence is turned into
+ *   the same record (no carry-forward to another sha; a legacy `red`-with-signal record never defers).
+ */
+export function readDeferredForSha(gitDir, headSha) {
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return null;
+  const main = readVerifyMarker(gitDir);
+  if (main?.corrupt) return null;
+  const mainForSha = main && main.sha === headSha ? main : null;
+  if (mainForSha && (mainForSha.status === 'red' || mainForSha.status === 'green')) return null;
+  const file = readDeferredMarker(gitDir);
+  if (file && !file.corrupt && file.status === DEFERRED_STATUS && file.sha === headSha) return file;
+  if (mainForSha?.status !== 'infrastructure-failure') return null;
+  return buildDeferredRecord({ sha: headSha, infrastructure: mainForSha.infrastructure, exitCode: mainForSha.exitCode,
+    ...(typeof mainForSha.finishedAt === 'string' ? { recordedAt: mainForSha.finishedAt } : {}) });
 }
 
 export function clearDeferredMarker(gitDir) {

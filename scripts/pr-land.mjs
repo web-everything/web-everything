@@ -130,7 +130,7 @@ import { join } from 'node:path';
 import { pushRefusal, callerIdentity, repoKeyForCheckout } from './conveyor/fix-procedure.mjs'; // fix procedure — refuse a push to a branch another fixer holds the fix claim on
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
-import { deferredToCiDecision, readDeferredMarker, appendDeferredDisclosure, ciTestGreenOnSha } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands
+import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, ciTestGreenOnSha } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
@@ -976,7 +976,7 @@ async function runCli() {
       gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     });
-    const deferredOpen = gate.ok ? { ok: false } : deferredToCiDecision({ gate, deferred: readDeferredMarker(gitDir), headSha: refSha, mode: PLAN.mode });
+    const deferredOpen = gate.ok ? { ok: false } : deferredToCiDecision({ gate, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
     if (deferredOpen.ok) {
       DEFERRED_TO_CI = deferredOpen;
       CREATE_BODY = appendDeferredDisclosure(CREATE_BODY, deferredOpen.disclosure);

@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { readVerifyMarker, verifyGateDecision, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import {
   DEFERRED_FILENAME, buildDeferredRecord, recordTerminalVerifyOutcome, readDeferredMarker,
-  deferredToCiDecision, appendDeferredDisclosure, ciTestGreenOnSha,
+  deferredToCiDecision, appendDeferredDisclosure, ciTestGreenOnSha, readDeferredForSha,
 } from '../lib/lane-verify-deferred.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -117,6 +117,76 @@ describe('ready-to-merge needs a green CI test check on the exact sha', () => {
   ])('refuses %j', (v) => { expect(ciTestGreenOnSha(v, SHA)).toBe(false); });
 });
 
+describe('a dispatcher-killed verify still defers (PR #6674 red team)', () => {
+  // The dispatcher kills verify-lane on a queue/gate ceiling and settles `.lane-verify` itself
+  // (recordKilledVerification); the killed child never runs its terminal hook, so no deferred file exists.
+  let lane; let gitDir;
+  beforeEach(async () => {
+    const { execFileSync } = await import('node:child_process');
+    lane = mkdtempSync(join(tmpdir(), 'deferred-lane-'));
+    execFileSync('git', ['init', '-q', lane]);
+    gitDir = join(lane, '.git');
+  });
+  afterEach(() => { rmSync(lane, { recursive: true, force: true }); });
+  const writeMain = (rec) => writeFileSync(join(gitDir, VERIFY_FILENAME), JSON.stringify(rec));
+  const killed = async (timedOutPhase = 'queue') => {
+    const { recordKilledVerification } = await import('../conveyor/verify-dispatch.mjs');
+    writeMain({ sha: SHA, status: 'running', startedAt: null, finishedAt: null, suites: null, exitCode: null, treeHash: null, runId: 'run-1' });
+    recordKilledVerification(lane, { sha: SHA, runId: 'run-1' }, { status: null, signal: 'SIGKILL', timedOutPhase }, 1000);
+  };
+  // The exact pr-land open path: the finish-guard (require-verified) then the deferred decision.
+  const openDecision = (headSha = SHA, mode = 'park') => {
+    const gate = verifyGateDecision({ record: readVerifyMarker(gitDir), headSha, requireVerified: true });
+    return deferredToCiDecision({ gate, deferred: readDeferredForSha(gitDir, headSha), headSha, mode });
+  };
+
+  it.each(['queue', 'gate'])('a %s-ceiling kill opens with the timeout disclosure', async (phase) => {
+    await killed(phase);
+    expect(readVerifyMarker(gitDir).status).toBe('infrastructure-failure');
+    expect(existsSync(join(gitDir, DEFERRED_FILENAME))).toBe(false);
+    const d = openDecision();
+    expect(d).toMatchObject({ ok: true, reason: 'deferred-to-ci' });
+    expect(d.disclosure).toMatch(/verify-timeout/);
+  });
+  it('still refuses the land mode', async () => {
+    await killed();
+    expect(openDecision(SHA, 'land')).toMatchObject({ ok: false, reason: 'mode-land' });
+  });
+  it('never carries a main-marker infra failure to another sha', async () => {
+    await killed();
+    expect(readDeferredForSha(gitDir, OTHER)).toBeNull();
+    expect(openDecision(OTHER).ok).toBe(false);
+  });
+  it.each([
+    ['red', { sha: SHA, status: 'red', exitCode: 1 }],
+    ['green', { sha: SHA, status: 'green', exitCode: 0 }],
+    ['running', { sha: SHA, status: 'running' }],
+    ['legacy red with a signal', { sha: SHA, status: 'red', exitCode: 137, signal: 'SIGKILL' }],
+    ['infra with an unknown reason', { sha: SHA, status: 'infrastructure-failure', infrastructure: { reason: 'disk-full', detail: 'x' } }],
+    ['infra with no evidence', { sha: SHA, status: 'infrastructure-failure' }],
+  ])('a %s main marker yields no deferred record', (_, rec) => {
+    writeMain(rec);
+    expect(readDeferredForSha(gitDir, SHA)).toBeNull();
+  });
+  it('a corrupt main marker yields no deferred record', () => {
+    writeFileSync(join(gitDir, VERIFY_FILENAME), '{torn');
+    expect(readDeferredForSha(gitDir, SHA)).toBeNull();
+  });
+  it('the deferred file wins only for the exact sha; a stale one falls back to the main marker', async () => {
+    recordTerminalVerifyOutcome(gitDir, infraFinished(OTHER));
+    expect(readDeferredForSha(gitDir, SHA)).toBeNull();
+    await killed();
+    expect(readDeferredForSha(gitDir, SHA)).toMatchObject({ status: 'deferred-to-ci', sha: SHA, reason: 'verify-timeout' });
+    recordTerminalVerifyOutcome(gitDir, infraFinished(SHA));
+    expect(readDeferredForSha(gitDir, SHA)).toMatchObject({ sha: SHA, reason: 'verify-unsettled' });
+  });
+  it('an exact-sha deferred file is ignored once the main marker holds a red verdict for that sha', () => {
+    recordTerminalVerifyOutcome(gitDir, infraFinished(SHA));
+    writeMain({ sha: SHA, status: 'red', exitCode: 1 });
+    expect(readDeferredForSha(gitDir, SHA)).toBeNull();
+  });
+});
+
 describe('wiring (source pins)', () => {
   const readFileSync = (p, e) => rf(p, e);
   it('only pr-land and verify-lane reference the deferred module; the open path refuses land mode', async () => {
@@ -124,5 +194,7 @@ describe('wiring (source pins)', () => {
     const out = execFileSync('git', ['grep', '-l', 'lane-verify-deferred', '--', 'scripts', ':!scripts/__tests__'], { encoding: 'utf8' }).split('\n').filter(Boolean).sort();
     expect(out).toEqual(['scripts/lib/lane-verify-deferred.mjs', 'scripts/pr-land.mjs', 'scripts/verify-lane.mjs'].sort());
     expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/mode: PLAN\.mode/);
+    // PR #6674 red team — pr-land reads the deferred record through the main-marker fallback, never the bare file.
+    expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/deferred: readDeferredForSha\(gitDir, refSha\)/);
   });
 });
