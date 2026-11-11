@@ -2505,7 +2505,7 @@ export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = []
     if (!files) { const read = readFiles({ headSha: r.headSha, base: r.baseRefName }); files = !read?.error && Array.isArray(read?.files) ? read.files : null; if (files) cache.set(key, { files, at: Date.now() }); else cache.delete(key); }
     if (!files) { unreadable = true; return r; } // unreadable: keep every listing, retry next pass
     const listed = new Map((r.files || []).map((f) => [f?.path ?? f, f])); // keep each file's additions/deletions: land order ranks by size
-    return { ...r, files: files.map((path) => (typeof listed.get(path) === 'object' ? listed.get(path) : { path, additions: 0, deletions: 0 })), filesComplete: true };
+    return { ...r, sizeLines: (r.files || []).reduce((n, f) => n + (Number(f?.additions) || 0) + (Number(f?.deletions) || 0), 0), files: files.map((path) => (typeof listed.get(path) === 'object' ? listed.get(path) : { path, additions: 0, deletions: 0 })), filesComplete: true };
   };
   let unreadable = false;
   const netByKey = new Map();

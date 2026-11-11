@@ -84,3 +84,12 @@ describe('refineOverlapRowsToNetDiff audit round 2', () => {
     expect(waits(refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles: () => ({ files: ['other.mjs'] }), cache: new Map() })).get(`${repo}#6679`).yieldTo).toBe(6381);
   });
 });
+
+describe('refined rows keep the listing size for land ranking', () => {
+  it('a dropped big file still counts toward the row size', () => {
+    const rows = rowsFor(ok, ok, ['a.mjs'], ['a.mjs']);
+    rows.openPrRows.find((r) => r.number === 6381).files.push({ path: 'big.txt', additions: 1000, deletions: 0 });
+    const out = refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles: () => ({ files: ['a.mjs'] }), cache: new Map() });
+    expect(out.openPrRows.find((r) => r.number === 6381).sizeLines).toBe(1001);
+  });
+});
