@@ -163,6 +163,9 @@ describe('netInterdiff', () => {
 describe('netInterdiff keeps every real PR change and drops only an identical one', () => {
   const lines40 = () => lines(40);
   const setLine = (text, n, v) => text.split('\n').map((l, i) => (i === n - 1 ? v : l)).join('\n');
+  // Distinct first/last lines anchor the run so git merges main's edit above it without a conflict.
+  const rep = () => `HEAD\n${'same\n'.repeat(40)}TAIL\n`;
+  const insertAfter = (text, n, v) => { const a = text.split('\n'); a.splice(n, 0, v); return a.join('\n'); };
   const start = (name) => { git('checkout', '-q', 'main'); git('checkout', '-q', '-b', name, 'main'); };
   const net = (prior, head, raw = rawOf(prior, head)) => netInterdiff({ exec, priorHead: prior, head, base: 'main', rawFiles: raw });
 
@@ -174,6 +177,8 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
     write('p.txt', lines(20));
     write('q/a.txt', lines(10)); write('q/b.txt', lines(10));
     write('e.txt', lines(5));
+    // Repetitive files: 40 identical lines, so an insertion has the SAME 3-line context at every spot inside the run.
+    write('rep.txt', rep()); write('rep2.txt', rep()); write('rep3.txt', rep());
     commit('main fixtures for the edge-case matrix');
   });
 
@@ -249,6 +254,64 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
     expect(Object.keys(out.files)).toEqual(['c2.txt']);
     // restore main for the next tests (main moved in this one)
     git('checkout', '-q', 'main');
+  });
+
+  it('keeps an insertion that MOVED between two spots with identical 3-line context (repetitive file)', () => {
+    start('repmove');
+    write('rep.txt', insertAfter(rep(), 10, 'PR'));
+    const prior = commit('pr1 inserts inside the run at line 10');
+    write('rep.txt', insertAfter(rep(), 25, 'PR'));
+    const head = commit('pr2 inserts the same line at line 25');
+    expect(Object.keys(net(prior, head).files)).toEqual(['rep.txt']);
+  });
+
+  it('drops a repetitive-file patch that only SHIFTED because main inserted lines above it', () => {
+    start('repshift');
+    write('rep2.txt', insertAfter(rep(), 10, 'PR'));
+    const prior = commit('pr1');
+    git('checkout', '-q', 'main');
+    write('rep2.txt', `MAIN top 1\nMAIN top 2\n${rep()}`);
+    commit('main inserts above the run');
+    git('checkout', '-q', 'repshift');
+    git('merge', '-q', '--no-edit', 'main');
+    const head = git('rev-parse', 'HEAD');
+    const raw = rawOf(prior, head);
+    expect(Object.keys(raw)).toEqual(['rep2.txt']);
+    expect(net(prior, head, raw)).toEqual({ files: {}, dropped: ['rep2.txt'] });
+    // Fail closed: if the main-vs-main diff that explains the shift cannot be read, the file is not dropped, the result is null.
+    const unreadable = (c, a, o) => { if (a.includes('--unified=0')) throw new Error('boom'); return exec(c, a, o); };
+    const notString = (c, a, o) => (a.includes('--unified=0') ? Buffer.from('') : exec(c, a, o));
+    expect(netInterdiff({ exec: unreadable, priorHead: prior, head, base: 'main', rawFiles: raw })).toBeNull();
+    expect(netInterdiff({ exec: notString, priorHead: prior, head, base: 'main', rawFiles: raw })).toBeNull();
+    git('checkout', '-q', 'main');
+  });
+
+  it('keeps a moved insertion in a repetitive file even when main also shifted the file', () => {
+    start('repmoveshift');
+    write('rep3.txt', insertAfter(rep(), 10, 'PR'));
+    const prior = commit('pr1 inserts at line 10');
+    git('checkout', '-q', 'main');
+    write('rep3.txt', `MAIN top 1\nMAIN top 2\n${rep()}`);
+    commit('main inserts above the run');
+    git('checkout', '-q', 'repmoveshift');
+    git('merge', '-q', '--no-edit', 'main');
+    write('rep3.txt', insertAfter(`MAIN top 1\nMAIN top 2\n${rep()}`, 27, 'PR'));
+    const head = commit('pr2 moves the insertion to line 27');
+    expect(Object.keys(net(prior, head).files)).toEqual(['rep3.txt']);
+    git('checkout', '-q', 'main');
+  });
+
+  it('keeps a changed file literally named "__proto__" as an own property of the result', () => {
+    start('proto');
+    write('__proto__', lines(5));
+    const prior = commit('pr1 adds a file named __proto__');
+    write('__proto__', setLine(lines(5), 2, 'PR2'));
+    const head = commit('pr2 edits it');
+    const arr = [2];
+    const out = net(prior, head, Object.fromEntries([['__proto__', arr]]));
+    expect(Object.keys(out.files)).toEqual(['__proto__']);
+    expect(Object.getOwnPropertyDescriptor(out.files, '__proto__')?.value).toBe(arr);
+    expect(Object.getPrototypeOf(out.files)).toBe(Object.prototype);
   });
 
   it('preserves the raw line arrays of kept files (same reference)', () => {
