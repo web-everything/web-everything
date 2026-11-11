@@ -66,7 +66,7 @@ export default {
   id: 'lane-acquire-clean-lane-cheap',
   title: 'acquire of a clean lane runs the full canonical-origin unpushed-work proof twice (89 git calls, ~3x main) and times daemon-soak ticks out at 90s',
   card: 'PR #6647 judge sweep R903 (daemon-soak shards 1,4,6,8 red; epic #4075)',
-  fixedBy: { sha: '(PR #6647 fix-6647)', where: 'lane-pool.mjs laneTipsOnTrackingRefs / assertReadableLaneEvidence / assertNoUnpushedLaneWork', paths: ['scripts/lane-pool.mjs'] },
+  fixedBy: { sha: '4e77ef6e20', where: 'lane-pool.mjs laneTipsOnTrackingRefs / assertReadableLaneEvidence / assertNoUnpushedLaneWork', paths: ['scripts/lane-pool.mjs'] },
   fixPresent(root) {
     try { return readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8').includes('laneTipsOnTrackingRefs'); } catch { return false; }
   },
