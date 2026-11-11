@@ -122,6 +122,18 @@ describe('credentialContentFinding code expressions in test files (R824)', () =>
     const [fn, ctor, field, rest] = ['readRecoveryCredential', 'vi.fn(() => ({', 'token', "'ghp_acceptance_fixture', other: 1})),\n"];
     expect(at('scripts/conveyor/__tests__/missing-run-startup-failure.test.mjs', `${fn}: ${ctor}${field}:${rest}`)).toBeNull();
   });
+  // Object-literal property lists (`GH_TOKEN: 'stale-fixture', PATH: '/bin',`) are code, not one opaque secret.
+  it('does not flag an object-literal property list in a test file', () => {
+    // Token-named fields (GH_TOKEN) still hit the separate secret-assignment rule; that is out of scope here.
+    expect(at(testPath, "        signing_key: 'daemon-ambient-stale', PATH: '/opt/homebrew/bin',\n")).toBeNull();
+    expect(at(testPath, "        key: 'sid-1', reason: 'resume-exhausted-excluded',\n")).toBeNull();
+  });
+  it('still flags an object-literal list that carries an opaque literal or token', () => {
+    expect(at(testPath, `signing_key: '${randomValue}', PATH: '/bin',\n`)).toBe('high-entropy-signing_key');
+    expect(at(testPath, `signing_key: ${randomValue}, PATH: 'x',\n`)).toBe('high-entropy-signing_key');
+    expect(at(testPath, "signing_key: 'k9Xq2Lm7Rt4Vw8Zb', PATH: '/bin',\n")).toBe('high-entropy-signing_key');
+    expect(at('scripts/readiness/some-module.mjs', `signing_key: '${randomValue}', PATH: '/bin',\n`)).toBe('high-entropy-signing_key');
+  });
   it('still flags the same createHash line in a non-test file', () => {
     expect(at('scripts/readiness/some-module.mjs', hashLine)).toBe('high-entropy-pathKey');
   });

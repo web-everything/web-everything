@@ -156,7 +156,12 @@ function codeExpression(raw) {
   if(pieces.length>1&&opaqueCode(pieces.join('').replace(/\s/g,''),pieces.join(' ')))return false;
   // Only an arrow or a call to a real identifier is a code expression. A bare paren, or a keyword before a
   // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
-  return /=>|[A-Za-z_$][\w$]*\s*\(/.test(code.replace(nonCallKeyword,' '));
+  // A comma-separated object-literal property list (`A: 'x', B: 'y'`) is code too; every opaque check above has run.
+  // Short opaque secrets hide here (a bare value under 20 characters passes the base scan), so every word of the list must be short or read as words.
+  const stripped=code.replace(nonCallKeyword,' ');
+  if(/=>|[A-Za-z_$][\w$]*\s*\(/.test(stripped))return true;
+  return /,\s*[A-Za-z_$][\w$]*\s*:/.test(stripped)
+    &&[...pieces,stripped.replace(/\u0001/g,' ')].join(' ').split(/[\s/,:;()[\]{}'"`=+]+/).filter(Boolean).every(word=>word.length<12||wordLike(word));
 }
 // A token inside a test-file code expression counts as a secret when it is long and either digit-bearing or
 // very high entropy. Word-like fixtures and long camelCase identifiers (digit-free, entropy under ~4.1) pass.
