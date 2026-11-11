@@ -119,7 +119,7 @@ describe('smoke dispatch per-pass timeout', () => {
     const runChild = vi.fn(async (_cmd, _args, options) => JSON.stringify([
       { kind: options.env.WE_SMOKE_DRYRUN_ONLY ?? 'review', ok: true, ms: 1 },
     ]));
-    const result = await dispatchCheck({ root: tmpdir(), env: {},
+    const result = await dispatchCheck({ root: tmpdir(), env: { WE_SMOKE_DISPATCH_PASSES: "3" },
       budgets: { dispatchDryRunMs: 9999, dispatchPassMs: 1234 }, runChild });
     expect(result.ok).toBe(true);
     expect(runChild).toHaveBeenCalledTimes(3);
@@ -144,7 +144,7 @@ describe('smoke dispatch per-pass timeout', () => {
       }
       return JSON.stringify([{ kind: 'review', ok: true, ms: 1 }]);
     });
-    const result = await dispatchCheck({ root: tmpdir(), env: {},
+    const result = await dispatchCheck({ root: tmpdir(), env: { WE_SMOKE_DISPATCH_PASSES: "3" },
       budgets: { dispatchDryRunMs: 9999, dispatchPassMs: 1234 }, runChild });
     expect(result.ok).toBe(false);
     expect(result.detail).toContain('reconcile-fix-pass timed out after 1234ms');

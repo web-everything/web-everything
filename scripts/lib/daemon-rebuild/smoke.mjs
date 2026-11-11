@@ -23,7 +23,7 @@ import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './cand
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, resolveSmokeDepth } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -38,9 +38,19 @@ function rejectionDetail(row) {
   };
 }
 
+/** Tag of the current smoke depth: undefined for the full smoke, else which parts the smoke skips. */
+export function smokeDepthTag(env = process.env) {
+  const d = resolveSmokeDepth(env);
+  return d.dispatchPasses === 0 || d.skipReconcileDryRun
+    ? `dispatchPasses=${d.dispatchPasses};skipReconcile=${d.skipReconcileDryRun}` : undefined;
+}
+
 /** Identity of a proven tree and the dependencies of its full smoke. */
-export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon' }) {
-  return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash, cloneKind }));
+export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon', depth }) {
+  // `depth` is set only for a reduced smoke, so a full-depth key (and every proof recorded before the light
+  // default) is unchanged and a reduced proof can never satisfy a full request.
+  return sha256(JSON.stringify(depth ? { tree, lockHash, nodeVersion, harnessHash, cloneKind, depth }
+    : { tree, lockHash, nodeVersion, harnessHash, cloneKind }));
 }
 
 /** Reuse policy and per-leaf provenance through the shared settings cascade. */
@@ -82,7 +92,7 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
     }
     const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
     const harnessHash = sha256(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs')));
-    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind }) };
+    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind, depth: smokeDepthTag() }) };
   } catch {
     return null;
   }
