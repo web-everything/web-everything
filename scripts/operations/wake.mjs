@@ -34,10 +34,10 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { advance, runStatus } from './engine.mjs';
+import { advance, isEffectStepSettleable, runStatus } from './engine.mjs';
 import { applyPendingEffects, resolveInFlight } from './effect-executor.mjs';
 import { observeRun } from './effect-observer.mjs';
-import { hasPermanentGuardRefusalEvidence, withStepFinish, withStepStart } from './run-record.mjs';
+import { withStepFinish, withStepStart } from './run-record.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { resolveOperation } from './run.mjs';
 import { createDispatchObservers, defaultListAgents, listedSessionIds, normalizeHandle } from './dispatch-lane-io.mjs';
@@ -54,17 +54,19 @@ export function isParkedOnDispatch(run) {
 }
 
 /**
- * Is this run still suspended on an effect step with a PERSISTED permanent guard refusal (PR #6584 red-team)?
- * That is the state a crash leaves between `applyPendingEffects` writing `refused` and `advance` clearing
- * `pending`: nothing is in flight and nothing will ever resolve, so neither the observer path nor
- * `isParkedOnDispatch` sees it, yet the engine can settle it `refused` on the next `advance`. Terminal runs
- * (`pending` cleared) never match, so a settled refusal is not picked up — or reported — a second time.
+ * Is this run suspended on an effect step that `advance` can finish with no sink call and no observation
+ * (PR #6584 red-team)? That is the state a crash leaves between a durable write and `advance` clearing
+ * `pending`: a persisted permanent guard refusal, or every effect of the step already `applied` (an observer
+ * answer written by the waker itself, a last sink write, or a `--resolve` close-out). Nothing is in flight and
+ * nothing will ever resolve, so neither the observer path nor `isParkedOnDispatch` sees it. It is the ENGINE's
+ * own test ({@link isEffectStepSettleable}), scoped to the pending step, so the waker can never select a run
+ * `advance` would leave alone. Terminal runs (`pending` cleared) never match, so a settled run is not picked
+ * up — or its refusal reported — a second time.
  * @param {object} run
  * @returns {boolean}
  */
-export function isParkedOnRefusal(run) {
-  return !!(run && run.pending && run.pending.kind === 'effect' && Array.isArray(run.effects)
-    && run.effects.some((e) => hasPermanentGuardRefusalEvidence(e)));
+export function isParkedUnsettled(run) {
+  return isEffectStepSettleable(run);
 }
 
 /**
@@ -122,7 +124,7 @@ export async function wakeRun(run, { observers, store, registry, sinks = {}, now
   // Nothing resolved → nothing to advance past. Say so and stop, rather than spending an `advance` that the
   // engine would return unchanged anyway. EXCEPT a refusal persisted before the run was finalized: no
   // observation will ever arrive for it, so stopping here would leave it awaiting-effect forever.
-  if (!observed.resolved.length && !isParkedOnRefusal(current)) {
+  if (!observed.resolved.length && !isParkedUnsettled(current)) {
     report.status = runStatus(current, { registry });
     return report;
   }
@@ -235,7 +237,7 @@ export async function wakePass({ store, observers, resolveFor, now = new Date(),
   for (const id of ids) {
     let run;
     try { run = store.read(id); } catch (e) { errors.push({ runId: id, error: String(e?.message ?? e) }); continue; }
-    if (!run || !(isParkedOnDispatch(run) || isParkedOnRefusal(run))) continue;
+    if (!run || !(isParkedOnDispatch(run) || isParkedUnsettled(run))) continue;
     parked += 1;
     let bindings;
     try { bindings = resolveFor(run.op); } catch (e) { errors.push({ runId: id, error: String(e?.message ?? e) }); continue; }
