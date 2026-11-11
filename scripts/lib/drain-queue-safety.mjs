@@ -486,7 +486,10 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
     // merge-gate's own red-main-freeze HOLD (caused by main, not by this PR). A real failing job never qualifies.
     const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
     const freezeGate = check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure'
-      && [check.output?.title, check.output?.summary, check.output?.text].some(value => typeof value === 'string' && /red-main-freeze/.test(value));
+      && [check.output?.title, check.output?.summary].some(value => typeof value === 'string' && /^\s*HOLD\s+red-main-freeze\b/m.test(value))
+      // Any test-failure wording anywhere in the output vetoes it: a real failure must never look like the freeze hold.
+      && ![check.output?.title, check.output?.summary, check.output?.text].some(value => typeof value === 'string'
+        && /assert|expected|\bexpect\(|\btests?\b[^\n]*\bfail|✗|×|\bFAIL\b/i.test(value));
     const noLogInfra = failed.every(check => cancelledOnly(check) || freezeGate(check))
       && (failed.every(cancelledOnly) || failed.some(freezeGate));
     let logReason = null;
