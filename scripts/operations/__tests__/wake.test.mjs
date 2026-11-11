@@ -18,7 +18,7 @@ import { createExploreObservers } from '../explore-io.mjs';
 import { advanceWhileRunning, runStatus, startRun } from '../engine.mjs';
 import { applyPendingEffects, inFlight, inFlightEntries, notApplied } from '../effect-executor.mjs';
 import { createEffectObserver, observeRun, planObservations, OBSERVATIONS, SKIPS } from '../effect-observer.mjs';
-import { hoursStuck, isParkedOnDispatch, renderPass, stuckPast, wakePass, wakeRun, STUCK_ESCALATION_HOURS } from '../wake.mjs';
+import { hoursStuck, isParkedOnDispatch, isParkedOnRefusal, renderPass, stuckPast, wakePass, wakeRun, STUCK_ESCALATION_HOURS } from '../wake.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { createRegistry, op } from '../registry.mjs';
 import { confirm as confirmStep, effect, judge as judgeStep } from '../step-kinds.mjs';
@@ -845,6 +845,75 @@ describe('wakeRun settles a permanent guard refusal exactly as driveRun does', (
     await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
     await wakeRun(store.read('run-r'), { observers, store, registry: reg, sinks: sinksFor(guard) });
     expect(guard).toHaveBeenCalledTimes(1);
+  });
+
+  // A REFUSAL PERSISTED BEFORE RUN FINALIZATION (PR #6584 round 2): the process stopped after
+  // `applyPendingEffects` wrote `refused` and before `advance` cleared `pending`. Nothing is in flight and nothing
+  // was observed, so the timer used to skip the record and the run stayed nonterminal indefinitely.
+  describe('a refusal persisted before the run was finalized', () => {
+    const GUARD_OP = 'fx-wake-guard-only';
+    const guardRegistry = () => {
+      const r = createRegistry();
+      r.register(op(GUARD_OP, {
+        input: { pr: { type: 'number', required: true } },
+        go: effect({ reads: ['input.pr'], effects: () => [{ type: 'guard.check', payload: {} }] }),
+      }));
+      return r;
+    };
+
+    async function crashedAfterRefusal(guard) {
+      const reg = guardRegistry();
+      const store = createMemoryRunStore();
+      let run = advanceWhileRunning(startRun({ op: GUARD_OP, id: 'run-g', input: { pr: 7 }, registry: reg }), { registry: reg });
+      store.write(run);
+      // The executor persists `refused`; the process dies before `advance`, so `pending` is still set.
+      run = (await applyPendingEffects(run, { sinks: { 'guard.check': guard }, store })).run;
+      expect(run.effects[0].status).toBe('refused');
+      expect(runStatus(run, { registry: reg })).toBe('awaiting-effect');
+      expect(isParkedOnDispatch(run)).toBe(false);
+      return { run, store, reg };
+    }
+
+    it('wakePass finds it and settles it refused, reporting the refusal once', async () => {
+      const guard = vi.fn(async () => { throw notApplied(REFUSAL); });
+      const { store, reg } = await crashedAfterRefusal(guard);
+      const resolveFor = () => ({ registry: reg, sinks: { 'guard.check': guard } });
+
+      const pass = await wakePass({ store, observers: {}, resolveFor });
+      expect(pass.parked).toBe(1);
+      expect(pass.runs[0].advanced).toBe(true);
+      expect(pass.runs[0].status).toBe('complete');
+      expect(pass.runs[0].errors.map((e) => e.error)).toEqual([REFUSAL]);
+      const saved = store.read('run-g');
+      expect(saved.outcome).toBe('refused');
+      expect(saved.pending).toBeNull();
+
+      // Settled: a later tick neither picks it up again nor repeats the report, and never re-invokes the guard.
+      const again = await wakePass({ store, observers: {}, resolveFor });
+      expect(again.parked).toBe(0);
+      expect(again.runs).toEqual([]);
+      expect(guard).toHaveBeenCalledTimes(1);
+    });
+
+    it('wakeRun settles it directly even though nothing was observed', async () => {
+      const guard = async () => { throw notApplied(REFUSAL); };
+      const { run, store, reg } = await crashedAfterRefusal(guard);
+      const report = await wakeRun(run, { observers: {}, store, registry: reg, sinks: { 'guard.check': guard } });
+      expect(report.advanced).toBe(true);
+      expect(report.status).toBe('complete');
+      expect(store.read('run-g').outcome).toBe('refused');
+    });
+
+    it('a non-permanent failure on an unfinalized run is NOT picked up as a refusal', async () => {
+      const { run } = await crashedAfterRefusal(async () => { throw notApplied(REFUSAL); });
+      // Same shape, but a plain `failed` entry (or a `refused` one with no recognized marker): not the refusal path.
+      const failedRun = { ...run, effects: run.effects.map((e) => ({ ...e, status: 'failed', error: 'transient: try again' })) };
+      expect(isParkedOnRefusal(failedRun)).toBe(false);
+      const unmarked = { ...run, effects: run.effects.map((e) => ({ ...e, error: 'some other refusal' })) };
+      expect(isParkedOnRefusal(unmarked)).toBe(false);
+      // A settled (terminal) refusal is not parked either.
+      expect(isParkedOnRefusal({ ...run, pending: null })).toBe(false);
+    });
   });
 
   it('an ordinary (non-permanent) failure still stops the pass and reports the error, unchanged', async () => {
