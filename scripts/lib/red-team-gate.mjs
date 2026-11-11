@@ -772,13 +772,15 @@ export function redTeamHoldPendingOnly(disposition) {
 }
 
 /**
- * The heads the live head's red-team result was carried from, nearest first (at most 8 hops). The disposition reads
- * their seal for a carried result, and the sweep seals them, from this one list. PURE.
+ * The heads the live head's red-team result was carried from, nearest first: the WHOLE chain, never a hop cap (a cap
+ * dropped the original head's seal on the ninth carry, PR #6622). The disposition reads their seal for a carried result,
+ * and the sweep seals them, from this one list. Each hop keeps only records earlier in the thread than the carry it
+ * followed (`at` is the thread position), so the chain is bounded by the thread length and a cycle terminates. PURE.
  */
 export function redTeamCarrySources({ comments, pr, head } = {}) {
   const out = [];
   let rs = indexedRecords(comments), hit = latestResult(rs, pr, String(head ?? '').toLowerCase());
-  for (let hop = 0; hit?.from && hop < 8; hop++) {
+  while (hit?.from) {
     out.push(hit.from);
     const at = hit.at;
     rs = rs.filter(r => r.at < at);

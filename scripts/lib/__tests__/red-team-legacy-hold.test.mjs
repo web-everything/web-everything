@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { publishStoredRedTeamResult } from '../red-team-withheld-publish.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
-import { readRedTeamDisposition, redTeamHoldDecision, redTeamRulingNeeded, redTeamMarker } from '../red-team-gate.mjs';
+import { readRedTeamDisposition, redTeamCarrySources, redTeamHoldDecision, redTeamRulingNeeded, redTeamMarker } from '../red-team-gate.mjs';
 import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
@@ -422,6 +422,22 @@ describe('the seal survives the rest of the pipeline (self-review round 1)', () 
       '### Post-accept red team — no break found'].join('\n'));
     expect(readSealedStatus({ repo, pr: 42, head: next, env: process.env })).toBeNull(); // the new head has no status of its own
     const d = readRedTeamDisposition({ comments: [clearComment, carried], pr: 42, head: next, repo, env: process.env });
+    expect(d.held.length).toBeGreaterThanOrEqual(1);
+  });
+  // Red-team round 9 (PR #6622): the carry chase stopped after eight hops, so a ninth carry lost the original seal.
+  it.each([8, 9, 20])('a chain of %i carries (no status on any intermediate head) still holds on the original seal', hops => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]);
+    const heads = [head, ...Array.from({ length: hops }, (_, i) => (i + 1).toString(16).padStart(40, 'b'))];
+    const thread = [clearComment, ...heads.slice(1).map((to, i) => ({
+      ...trusted([`<!-- review-verdict-carried from=${heads[i]} to=${to} patch-id=${'c'.repeat(40)} -->`,
+        'Review verdict carried across an identical contribution.', redTeamMarker(42, to),
+        '### Post-accept red team — no break found'].join('\n')),
+      createdAt: new Date(Date.parse('2026-11-10T12:01:00Z') + i * 60000).toISOString() }))];
+    const live = heads.at(-1);
+    expect(redTeamCarrySources({ comments: thread, pr: 42, head: live })).toEqual(heads.slice(0, -1).reverse());
+    const d = readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env });
     expect(d.held.length).toBeGreaterThanOrEqual(1);
   });
   it('the planner reads the persisted seal, not the snapshot it was handed', () => {
