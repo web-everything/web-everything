@@ -72,6 +72,7 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { recordLocalSlotFallback } from './lib/remote-fallback-log.mjs';
 import { recordTerminalVerifyOutcome, clearDeferredMarker } from './lib/lane-verify-deferred.mjs'; // R893 — own file; no other marker reader can see it
 import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
@@ -644,6 +645,7 @@ async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, repo: REPO, kind: routing.kind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
