@@ -658,6 +658,72 @@ describe('sweepQueuedHashCards', () => {
     expect(x.emit).toHaveBeenCalledWith({ kind: 'needs-you', pr: 6003, daemon: 'drain',
       detail: 'PR #6003 was queued by a human while its backlog card(s) backlog/xabc123-card.md are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.' });
   });
+  function workflowSetup({ approvedSha = 'a'.repeat(40), login = 'chalbert', unreadable = false } = {}) {
+    const x = setup();
+    x.nodes.splice(1);
+    x.nodes[0].pullRequest.headRefOid = 'a'.repeat(40);
+    const comments = approvedSha ? [{
+      body: `<!-- reviewed-sha: ${approvedSha} -->\n<!-- cleared-human: operator -->`,
+      author: { login }, id: 'IC_approval', createdAt: '2026-11-10T00:00:00Z',
+    }] : [];
+    const exec = x.exec;
+    x.exec = vi.fn((cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ headRefOid: 'a'.repeat(40), labels: [{ name: 'review:accepted' }] });
+      if (cmd === 'gh' && args.includes('--paginate')) {
+        if (unreadable) throw new Error('comments unreadable');
+        return comments.map(c => [c.body, c.createdAt, c.author.login, c.id, ''].map(
+          field => field.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t'),
+        ).join('\t')).join('\n');
+      }
+      if (cmd === 'gh' && args[3]?.includes('comments{totalCount}')) return JSON.stringify({
+        data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } },
+      });
+      if (cmd === 'git' && args[0] === 'diff') return '.github/workflows/ci.yml\0backlog/xabc123-card.md\0';
+      // An older clearance has no readable successor proof in this fixture.
+      if (cmd === 'git' && args[0] === 'cat-file') throw new Error('approval commit unavailable');
+      return exec(cmd, args, opts);
+    });
+    return x;
+  }
+  it('dequeues workflow edits with a trusted clear-human marker on the current head', () => {
+    const x = workflowSetup();
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1], numbered: [1], skipped: [], errors: [] });
+    expect(x.prepare).toHaveBeenCalledTimes(1);
+    expect(x.exec).toHaveBeenCalledWith('gh', ['pr', 'view', '1', '--repo', x.repo, '--json', 'headRefOid,labels'], expect.any(Object));
+  });
+  it.each([
+    ['older head without successor proof', { approvedSha: 'b'.repeat(40) }],
+    ['no marker', { approvedSha: null }],
+    ['forged marker from an untrusted author', { login: 'outside-contributor' }],
+    ['unreadable comments', { unreadable: true }],
+  ])('keeps workflow edits human-only with %s', (_case, options) => {
+    const x = workflowSetup(options);
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'human-only' }], errors: [] });
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('mutation')))).toBe(false);
+  });
+  it.each(['exact', 'numbering', 'mechanical'])('accepts the licensed %s tier for workflow edits', tier => {
+    const x = workflowSetup();
+    x.proveHumanOnlyLicense = vi.fn(() => ({ licensed: true, tier }));
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1], numbered: [1], skipped: [], errors: [] });
+    expect(x.proveHumanOnlyLicense).toHaveBeenCalledWith({ repo: x.repo, pr: 1, headSha: 'a'.repeat(40), cwd: x.cwd, exec: x.exec });
+  });
+  it.each([
+    ['unlicensed', () => ({ licensed: false, tier: 'exact' })],
+    ['unknown tier', () => ({ licensed: true, tier: 'unknown' })],
+    ['missing evidence', () => undefined],
+    ['throws', () => { throw new Error('license unavailable'); }],
+  ])('keeps workflow edits human-only when license %s', (_case, proveHumanOnlyLicense) => {
+    const x = workflowSetup();
+    expect(sweepQueuedHashCards({ ...x, proveHumanOnlyLicense })).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'human-only' }], errors: [] });
+    expect(x.prepare).not.toHaveBeenCalled();
+  });
+  it('preserves the human-enqueued hold after exact workflow clearance', () => {
+    const x = workflowSetup();
+    x.nodes[0].enqueuer.login = 'human-reviewer';
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'human-enqueued' }], errors: [] });
+    expect(x.prepare).not.toHaveBeenCalled();
+  });
   it('leaves a human-enqueued non-workflow hash PR queued', () => {
     const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer.login = 'human-reviewer';
     expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'human-enqueued' }], errors: [] });

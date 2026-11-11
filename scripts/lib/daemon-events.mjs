@@ -1,5 +1,5 @@
 /** Best-effort coordination events shared by daemon processes.
- * PR watcher kinds: pr-merged, pr-ready-not-merging, pr-looping, pr-no-progress, ci-job-overdue.
+ * PR watcher kinds: pr-merged, pr-ready-not-merging, ready-stuck (detail.needsYou=true; label age and blocker cause), pr-looping, pr-no-progress, ci-job-overdue.
  * Clone maintenance kind: clone-maintenance; detail = { clone, bytesBefore, bytesAfter,
  * freed, durationMs, skipped?, reason? }. Unavailable byte measurements are null.
  * This shared writer deliberately accepts open event kinds. */

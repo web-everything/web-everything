@@ -167,10 +167,13 @@ export function resolveConfirmedBreaks({ file = {}, env = {} } = {}) {
   return { value, source };
 }
 
-/** Read the live setting. Never throws: an unreadable file is the built-in default. */
-export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTINGS_FILE } = {}) {
+/** Read the live setting. By default unreadable files use defaults; strict reads only tolerate ENOENT. */
+export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTINGS_FILE, strict = false } = {}) {
   let file = {};
-  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = {}; }
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch (error) {
+    if (strict && error?.code !== 'ENOENT') throw error;
+    file = {};
+  }
   const resolved = resolveConfirmedBreaks({ file, env });
   return { ...resolved, value: { ...resolved.value, findingClasses: readFindingClassPolicy({ env }) } };
 }

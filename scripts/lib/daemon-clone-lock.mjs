@@ -5,6 +5,10 @@
  *   operator CLIs safely share ONE daemon clone while `daemon-rebuild.mjs` (card 4044) moves it under them.
  *   Ruling: docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle (clauses 2-5).
  *
+ * Single-owner heartbeats and durable rebuild requests coordinate shared clones. Failure counts
+ * survive daemon restarts; stale requests retry until success or bounded abandonment. Acknowledgements
+ * name immutable request IDs, preserving concurrent publications. Unknown reader evidence blocks moves.
+ *
  * WHY a reader/writer lock, not just the per-path lock `scripts/readiness/file-locks.mjs` already has: that
  * module guards individual FILES inside the shared central checkout so two lanes never edit the same path.
  * Here the unit under contention is an entire CLONE'S WORKING TREE moving out from under a running tick — a
@@ -36,9 +40,10 @@
  * compose the reader/writer protocol ourselves.
  */
 
+import { createHash, randomUUID } from 'node:crypto';
 import { hostname, homedir } from 'node:os';
-import { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
-import { join, resolve as resolvePath } from 'node:path';
+import fs, { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
+import { basename, join, resolve as resolvePath } from 'node:path';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -87,6 +92,222 @@ export function cloneLockKey(root) {
 export function cloneLockDirs(root, lockRoot = defaultLockRoot()) {
   const base = join(lockRoot, cloneLockKey(root));
   return { base, writerRoot: join(base, 'writer'), readersRoot: join(base, 'readers'), starvedRoot: join(base, 'starved') };
+}
+
+// Clone coordination sidecars share the lock identity and survive working-tree replacement.
+const OWNER_ENTRIES = Object.freeze({ 'wev-review-daemon': 'review-daemon.mjs' });
+const loggedSettings = new Set();
+function settingLog(key, value, source, log = console) {
+  const message = `daemon-clone-lock: ${key}=${value} (source ${source})`;
+  if (!loggedSettings.has(message)) { loggedSettings.add(message); log.error?.(message); }
+}
+function positiveSetting(key, fallback, env = process.env, integer = false) {
+  const n = Number(env?.[key]);
+  const valid = Number.isFinite(n) && n > 0 && (!integer || Number.isSafeInteger(n));
+  const value = valid ? n : fallback;
+  settingLog(key, value, valid ? 'environment' : 'standard');
+  return value;
+}
+function atomicSidecar(file, record) {
+  mkdirSync(join(file, '..'), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  // Look up native operations at publication time so the hermetic fs guard and fault probes stay live.
+  try { fs.writeFileSync(tmp, `${JSON.stringify(record)}\n`, 'utf8'); fs.renameSync(tmp, file); }
+  finally { rmSync(tmp, { force: true }); }
+}
+function sidecar(root, name, lockRoot) { return join(cloneLockDirs(root, lockRoot).base, name); }
+// Election and rebuild execution share this mutex. A live local process cannot lose the
+// fence during an event-loop pause: reclaim requires observed process death, not wall time.
+// Unknown liveness fails closed; an operator must repair an unreadable coordination lock.
+const ELECTION_KEY = '<clone:ownership>';
+const OWNER_FUTURE_SKEW_MS = 30_000;
+function ownershipGuard(root, lockRoot) {
+  const guardRoot = sidecar(root, 'coordination', lockRoot);
+  const owner = `${defaultOwner()}-${randomUUID()}`;
+  const nowMs = Date.now();
+  const held = reserve(guardRoot, ELECTION_KEY, owner, nowMs, new Date(nowMs).toISOString(),
+    process.pid, defaultProbePidLiveness, Infinity);
+  return held.ok ? () => releaseLockDir(guardRoot, ELECTION_KEY) : null;
+}
+export function touchOwnerHeartbeat(root, { lockRoot, nowMs = Date.now(), key } = {}) {
+  const file = key ? join(sidecar(root, 'owner-candidates', lockRoot),
+    `${createHash('sha256').update(key).digest('hex')}.json`) : sidecar(root, 'owner-heartbeat.json', lockRoot);
+  atomicSidecar(file, { at: nowMs, ...(key ? { key } : {}) });
+}
+function readOwnershipLease(root, lockRoot) {
+  try {
+    const lease = JSON.parse(readFileSync(sidecar(root, 'owner-lease.json', lockRoot), 'utf8'));
+    if (!Number.isSafeInteger(lease.epoch) || lease.epoch < 1 || typeof lease.key !== 'string'
+      || typeof lease.session !== 'string') throw new Error('invalid owner lease');
+    return lease;
+  } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+export function resolveCloneOwnership({ root, entries = [], env = process.env, nowMs = Date.now(), lockRoot } = {}) {
+  const override = typeof env?.WE_DAEMON_CLONE_OWNER_ENTRY === 'string' ? env.WE_DAEMON_CLONE_OWNER_ENTRY.trim() : '';
+  const entry = override || OWNER_ENTRIES[basename(canonicalCloneRoot(root))];
+  settingLog('WE_DAEMON_CLONE_OWNER_ENTRY', entry ?? 'unconfigured', override ? 'environment' : 'standard');
+  if (!entry) return { owner: true, reason: 'owner-unconfigured' };
+  const key = (Array.isArray(entries) ? entries : []).filter(Boolean).map((e) => basename(String(e))).sort()[0];
+  if (!key) return { owner: false, reason: 'owner-key-missing' };
+  const configured = basename(entry);
+  const staleMs = positiveSetting('WE_DAEMON_CLONE_OWNER_STALE_MS', 15 * 60_000, env);
+  const live = (rec) => Number.isFinite(rec?.at) && nowMs - rec.at >= -OWNER_FUTURE_SKEW_MS && nowMs - rec.at < staleMs;
+  let release;
+  try {
+    // Every sibling advertises itself, including while another process holds the fence.
+    touchOwnerHeartbeat(root, { lockRoot, nowMs, key });
+    if (key === configured) touchOwnerHeartbeat(root, { lockRoot, nowMs });
+    release = ownershipGuard(root, lockRoot);
+    if (!release) {
+      // Multiple wrappers in this process may await the same deferred mutation.
+      // Reuse only our own existing token; execution still checks the fence.
+      const current = readOwnershipLease(root, lockRoot);
+      if (current?.key === key && current.session === defaultOwner()) {
+        return { ...current, owner: true, reason: key === configured ? 'owner-entry' : 'owner-stale-elected' };
+      }
+      return { owner: false, reason: 'owner-election-contended' };
+    }
+    const candidates = new Set();
+    const dir = sidecar(root, 'owner-candidates', lockRoot);
+    for (const file of readdirSync(dir)) {
+      let rec;
+      try { rec = JSON.parse(readFileSync(join(dir, file), 'utf8')); } catch { continue; }
+      if (typeof rec?.key === 'string' && live(rec)) candidates.add(rec.key);
+    }
+    try {
+      if (live(JSON.parse(readFileSync(sidecar(root, 'owner-heartbeat.json', lockRoot), 'utf8')))) candidates.add(configured);
+    } catch { /* Missing legacy heartbeat leaves the live-key election in charge. */ }
+    const winner = candidates.has(configured) ? configured : [...candidates].sort()[0];
+    if (winner !== key) return { owner: false, reason: winner === configured ? 'owner-active' : 'owner-election-lost' };
+    const previous = readOwnershipLease(root, lockRoot);
+    const session = defaultOwner();
+    const epoch = previous?.key === key && previous.session === session ? previous.epoch : (previous?.epoch ?? 0) + 1;
+    if (!Number.isSafeInteger(epoch)) throw new Error('owner epoch exhausted');
+    atomicSidecar(sidecar(root, 'owner-lease.json', lockRoot), { key, epoch, session });
+    return { owner: true, reason: key === configured ? 'owner-entry' : 'owner-stale-elected', key, epoch, session };
+  } catch {
+    console.error('daemon-clone-lock: ownership evidence unavailable; rebuild deferred until coordination state is repaired');
+    return { owner: false, reason: 'owner-election-unavailable' };
+  } finally { release?.(); }
+}
+/** Validate the fencing token under the election mutex and retain it throughout the rebuild.
+ * Reader locks remain independent; the rebuild still takes its existing phased write locks. */
+const ownershipExecutions = new Map();
+export async function withCloneOwnership(root, lease, fn, { lockRoot } = {}) {
+  if (lease?.reason === 'owner-unconfigured') return fn();
+  // Wrappers in one process may share a daemon key. Serialize their executions,
+  // then validate each token after the wait, just as for a cross-process contender.
+  const key = cloneLockDirs(root, lockRoot).base;
+  const previous = ownershipExecutions.get(key);
+  let complete;
+  const pending = new Promise((resolve) => { complete = resolve; });
+  ownershipExecutions.set(key, pending);
+  await previous;
+  let release;
+  try {
+    let current;
+    try {
+      release = ownershipGuard(root, lockRoot);
+      if (!release) return { owner: false, moved: false, reason: 'owner-election-contended' };
+      current = readOwnershipLease(root, lockRoot);
+    } catch { return { owner: false, moved: false, reason: 'owner-election-unavailable' }; }
+    if (!lease?.owner || !current || current.epoch !== lease.epoch || current.key !== lease.key || current.session !== lease.session) {
+      return { owner: false, moved: false, reason: 'clone-owner-fenced' };
+    }
+    return await fn();
+  } finally {
+    release?.();
+    if (ownershipExecutions.get(key) === pending) ownershipExecutions.delete(key);
+    complete();
+  }
+}
+export function writeRebuildRequest(root, { by = null, reason, ref, nowMs = Date.now(), lockRoot } = {}) {
+  const rec = { by, reason, ref, at: nowMs, id: randomUUID() };
+  atomicSidecar(sidecar(root, 'rebuild-request.json', lockRoot), rec);
+  return rec;
+}
+export function readRebuildRequest(root, { nowMs = Date.now(), ttlMs, lockRoot, env = process.env, onStale, onAbandoned, onCorrupt, onUnreadable } = {}) {
+  const ttl = ttlMs ?? positiveSetting('WE_DAEMON_REBUILD_REQUEST_TTL_MS', 30 * 60_000, env);
+  const file = sidecar(root, 'rebuild-request.json', lockRoot);
+  let stamp;
+  try { stamp = fs.statSync(file).mtimeMs; }
+  catch (error) { if (error.code === 'ENOENT') return null; }
+  let rec;
+  try { rec = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return null; }
+  const valid = rec && typeof rec.at === 'number' && Number.isFinite(rec.at) && Number.isFinite(ttl) && ttl > 0
+    && typeof rec.reason === 'string' && typeof rec.ref === 'string' && (rec.by === null || typeof rec.by === 'string')
+    && typeof rec.id === 'string' && !!rec.id;
+  if (!valid) rec = { corrupt: true, id: `corrupt:${Number.isFinite(stamp) ? stamp : 'unknown'}` };
+  // An unknown generation cannot be safely suppressed by a previous acknowledgement.
+  if (valid || Number.isFinite(stamp)) {
+    try {
+      const ack = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request-ack.json', lockRoot), 'utf8'));
+      if (ack?.id === rec.id) return null;
+    } catch { /* unknown acknowledgement evidence leaves work visible */ }
+  }
+  const ledger = readRequestFailures(root, lockRoot);
+  if (!ledger) onUnreadable?.(rec);
+  const failures = ledger?.id === rec.id ? ledger.failures : 0;
+  if ((valid || Number.isFinite(stamp)) && ledger && failures >= requestMaxFailures(env)) { onAbandoned?.(rec); return null; }
+  if (rec.corrupt) onCorrupt?.(rec);
+  else if (nowMs - rec.at >= ttl) onStale?.(rec);
+  return rec;
+}
+/** Acknowledge a specific immutable request ID, never unlink the publication path. With no ID, capture
+ * the current ID first (legacy clear API). Publication may race any subsequent operation safely because a
+ * fresh publication always has a fresh ID. Out-of-order acknowledgements can replay work, never lose it.
+ * Keep just one acknowledgement sidecar, so storage stays bounded across repeated publications. */
+export function clearRebuildRequest(root, { lockRoot, id } = {}) {
+  if (id === undefined) {
+    id = readRebuildRequest(root, { lockRoot })?.id;
+  }
+  if (typeof id !== 'string' || !id || !readRequestFailures(root, lockRoot)) return;
+  atomicSidecar(sidecar(root, 'rebuild-request-ack.json', lockRoot), { id });
+}
+// A bounded single-record ledger follows the current publication ID, rather than a daemon/PID.
+function requestMaxFailures(env) { return positiveSetting('WE_DAEMON_REBUILD_REQUEST_MAX_FAILURES', 5, env, true); }
+function readRequestFailures(root, lockRoot) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request-failures.json', lockRoot), 'utf8'));
+    return rec && typeof rec.id === 'string' && rec.id && Number.isSafeInteger(rec.failures) && rec.failures >= 0 ? rec : null;
+  } catch (error) { return error.code === 'ENOENT' ? { id: null, failures: 0 } : null; }
+}
+/** Record one observed attempt. Serializing the ledger prevents lost increments across owner restarts.
+ * Publication stays independent: both ledger and acknowledgement select IDs, so an older completion
+ * cannot charge a newer request or remove its wakeup. Unknown persistence leaves the request pending. */
+export function recordRebuildRequestResult(root, {
+  id, success, lockRoot, env = process.env, nowMs = Date.now(), onAbandoned, onUnreadable,
+} = {}) {
+  if (success !== true && success !== false) return { pending: true };
+  if (typeof id !== 'string' || !id || id === 'corrupt:unknown') return { pending: true };
+  const guardRoot = sidecar(root, 'coordination', lockRoot);
+  const key = '<clone:rebuild-request-update>';
+  const owner = `${defaultOwner()}-${randomUUID()}`;
+  const wallNow = Date.now();
+  let held;
+  try { held = reserve(guardRoot, key, owner, wallNow, new Date(wallNow).toISOString(), process.pid, defaultProbePidLiveness, 1); }
+  catch { return { pending: true }; }
+  if (!held.ok) return { pending: true };
+  try {
+    const ledger = readRequestFailures(root, lockRoot);
+    if (!ledger) { onUnreadable?.({ id }); return { pending: true }; }
+    const request = readRebuildRequest(root, { lockRoot, env, nowMs });
+    if (request?.id !== id) return { pending: !!request }; // replaced or already concluded
+    if (success) {
+      clearRebuildRequest(root, { lockRoot, id });
+      return { cleared: true };
+    }
+    const failures = (ledger.id === id ? ledger.failures : 0) + 1;
+    atomicSidecar(sidecar(root, 'rebuild-request-failures.json', lockRoot), { id, failures });
+    if (failures >= requestMaxFailures(env)) {
+      clearRebuildRequest(root, { lockRoot, id });
+      onAbandoned?.(request);
+      return { cleared: true, failures };
+    }
+    return { pending: true, failures };
+  } catch { return { pending: true }; }
+  finally { releaseLockDir(guardRoot, key); }
 }
 
 // ── reader fairness (live 2026-10-05 20:18-20:37 ET) ─────────────────────────────────────────────────────────
@@ -355,32 +576,29 @@ export function defaultProbePidLiveness(entry) {
  *  provably `dead` — the two-tier floor the file header describes. `null`/missing entries are never live. */
 function entryIsLive(entry, nowMs, leaseMinutes, probe) {
   if (!entry) return false;
+  if (entry.unreadable) return true; // no trustworthy identity or lease evidence to reclaim
   if (isLeaseExpired(entry, nowMs, leaseMinutes)) return false;
   if (probe(entry) === 'dead') return false;
   return true;
 }
 
-/** List every reader entry currently on disk under `readersRoot`. NOT a new lock primitive — `readLockEntry`
- *  only knows how to read ONE already-known path's entry, and readers need to be enumerated (their key is the
- *  owner string, unknown to us up front), so this walks the directory and reuses {@link parseLockEntry} to
- *  interpret each `lock.json` it finds. A missing/unreadable/corrupt entry is skipped, never thrown. */
+/** Unknown reader evidence is a blocker, including the mkdir/write gap. Only a provably absent
+ * readers root or disappeared reader directory means no reader; valid leases retain normal reclamation. */
 function listReaderEntries(readersRoot) {
   let names;
-  try {
-    names = readdirSync(readersRoot);
-  } catch {
-    return [];
+  try { names = fs.readdirSync(readersRoot); }
+  catch (error) {
+    return error.code === 'ENOENT' ? [] : [{ owner: '<unreadable-readers>', unreadable: true, error: error.code ?? 'read-failed' }];
   }
   const out = [];
   for (const name of names) {
-    let text;
-    try {
-      text = readFileSync(join(readersRoot, name, 'lock.json'), 'utf8');
-    } catch {
-      continue;
-    }
-    const entry = parseLockEntry(text);
-    if (entry) out.push(entry);
+    const dir = join(readersRoot, name);
+    let entry;
+    try { entry = parseLockEntry(fs.readFileSync(join(dir, 'lock.json'), 'utf8')); } catch { /* inspect existence below */ }
+    if (entry && Number.isFinite(Date.parse(entry.heartbeatAt))) { out.push(entry); continue; }
+    try { fs.statSync(dir); }
+    catch (error) { if (error.code === 'ENOENT') continue; }
+    out.push({ owner: `<unreadable-reader:${name}>`, unreadable: true });
   }
   return out;
 }
@@ -581,6 +799,7 @@ export async function acquireWrite(root, opts = {}) {
     }
     const blockers = [];
     for (const entry of listReaderEntries(readersRoot)) {
+      if (entry.unreadable) { blockers.push(entry.owner); continue; }
       if (entry.owner === owner) continue;
       if (ignoreOwners.includes(entry.owner)) {
         // An ignored reader still owns its entry, even after lease expiry; only proven death reclaims it.
