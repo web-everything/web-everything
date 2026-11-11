@@ -660,7 +660,8 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
             const h = await fixture(kind, mode, { findingOver: fixNow, snapshotOver: ON, inputOver: { notWorseThanMain: EVIDENCE } });
             await h.run();
             expect(h.landRulingCard).toHaveBeenCalledTimes(1);
-            expect(JSON.stringify(h.written)).toContain(EVIDENCE);
+            // two-step only files the card; the ruling is posted by a later --card call, one-call posts it now
+            if (mode === 'one-call') expect(JSON.stringify(h.written)).toContain(EVIDENCE);
           });
           it(`${mode}: setting on without evidence keeps the refusal`, async () => {
             const h = await fixture(kind, mode, { findingOver: fixNow, snapshotOver: ON });
