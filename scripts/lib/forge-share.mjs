@@ -107,7 +107,7 @@ export function loadForgeShareSettings({ file = DEFAULT_SETTINGS_FILE } = {}) {
  *  parsed row without a valid timestamp, makes the source corrupt, because dropping it could invent a 100% share.
  *  `covered` is true only when the oldest row reaches back to `needFrom`: the writers rotate their logs, so reading
  *  the whole current file never proves the window is complete. */
-function readJsonlTail(file, tsOf, needFrom) {
+export function readJsonlTail(file, tsOf, needFrom) {
   let fd;
   try {
     fd = openSync(file, 'r');
@@ -128,7 +128,7 @@ function readJsonlTail(file, tsOf, needFrom) {
       rows.push(r);
     });
     const oldest = Math.min(...rows.map((r) => Date.parse(tsOf(r))));
-    return { rows, covered: Number.isFinite(oldest) && oldest <= needFrom };
+    return { rows, incomplete: unterminated && text.length > 0, truncated: cutStart, covered: Number.isFinite(oldest) && oldest <= needFrom };
   } catch { return null; } finally { if (fd !== undefined) closeSync(fd); }
 }
 

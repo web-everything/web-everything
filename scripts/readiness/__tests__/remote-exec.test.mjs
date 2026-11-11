@@ -14,7 +14,7 @@ import {
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
-import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
+import { main as admissionMain, adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
 import {materializeWorktree} from '../forge-exec-bases.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
@@ -1978,13 +1978,54 @@ describe('receipt field binding', () => {
     // exceptions, so a failing positive control inside one could be swallowed.
     expectValidReceipt(baseline);
   });
-  it('rejects install-phase evidence even with matching status', async () => {
+  it('accounts verified test-phase exit 97 as completed remote work without opening the admission breaker',async()=>{
+    const receipts=[];
+    const f=fixture({runCode:97,receipt:(_nonce,value)=>{
+      receipts.push(value);return JSON.stringify(value);
+    }});
+    const pool=join(cwd,'pool');mkdirSync(pool);
+    const preferences=join(cwd,'preferences.json');
+    writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always',backoffFailures:1}}}));
+    const exited=new Error('test exit');
+    const exit=vi.spyOn(process,'exit').mockImplementation(()=>{throw exited;});
+    const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+    const oldExitCode=process.exitCode;
+    for(const [key,value] of Object.entries({LANE_POOL_ROOT:pool,WE_PLATFORM_PREFERENCES:preferences,
+      CI:'',WE_HEAVY_ADMISSION:'on',WE_HEAVY_ADMISSION_HELD:'',WE_FORGE_GATE_DISPATCH:'',
+      WE_HEAVY_ADMISSION_CONTAINER:'',WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES:'',
+      WE_VERIFY_REMOTE_REPORT:join(cwd,'verify-report.jsonl')}))vi.stubEnv(key,value);
+    const completed=[];
+    const remoteExec=vi.fn(async()=>{const result=await runRemote(f);completed.push(result);return result;});
+    try {
+      // A second run proves the first test failure did not suppress Forge dispatch.
+      for(let i=0;i<2;i++) {
+        await expect(admissionMain(['run',`--repo=${cwd}`,'--',...argv],{remoteExec})).rejects.toBe(exited);
+        expect(exit).toHaveBeenLastCalledWith(97);
+        expect(JSON.parse(readFileSync(join(pool,'.admission','remote','health.json'),'utf8')))
+          .toMatchObject({failures:0,backoffUntil:0,trigger:''});
+      }
+      expect(remoteExec).toHaveBeenCalledTimes(2);
+      expect(receipts).toHaveLength(2);
+      receipts.forEach(receipt=>{expectValidReceipt(receipt);expect(receipt.code).toBe(97);});
+      completed.forEach(result=>{
+        expect(result).toMatchObject({mode:'remote',code:97});expect(result).not.toHaveProperty('phase');
+      });
+      const heavyRoot=join(pool,'.admission','heavy');
+      const rows=readFileSync(join(heavyRoot,'remote-runs.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows.map(row=>row.receiptId)).toEqual(completed.map(result=>result.run));
+      expect(existsSync(join(heavyRoot,'remote-fallbacks.jsonl'))).toBe(false);
+      expect(f.local).not.toHaveBeenCalled();
+    } finally {
+      process.exitCode=oldExitCode;exit.mockRestore();stderr.mockRestore();vi.unstubAllEnvs();
+    }
+  });
+  it('accepts verified install-97 evidence for infrastructure breaker accounting', async () => {
     let baseline;
     expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>{
       baseline = {...v};
       return JSON.stringify({...v,phase:'install'});
     }})))
-      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result',infraFailure:'install-failed'});
     expectValidReceipt(baseline);
   });
 });
