@@ -53,6 +53,7 @@ import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enq
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { readSharedFreeze, flatText } from './lib/red-main-freeze-shared.mjs';
 import { MAIN_CI_RED_DEFAULTS, isTrustedPrAuthor, mainRedState } from './conveyor/main-ci-red-core.mjs';
+import { markInfraOnlyRuns } from './lib/main-ci-infra-runs.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
@@ -387,6 +388,9 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
     // green) would speak for a commit whose verdict is being redone. Undecided → hold.
     const rerun = runs.find((r) => String(r?.status ?? '').toLowerCase() !== 'completed' && Number(r?.attempt) > 1);
     if (rerun) return { source, error: `main CI run ${rerun.databaseId ?? '?'} is being re-run (attempt ${Number(rerun.attempt)}) — verdict pending` };
+  }
+  if (Array.isArray(runs)) {
+    try { markInfraOnlyRuns(runs, { repo, exec }); } catch { /* unreadable job evidence stays red */ }
   }
   const st = mainRedState(runs);
   if (st.status === 'unknown') return { source, error: `main CI status unknown (${st.reason})` };
