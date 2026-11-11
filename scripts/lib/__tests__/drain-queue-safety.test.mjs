@@ -1462,7 +1462,10 @@ describe('operator ruling needs a human operator author (forged automation recor
     expect(hold({ comments: [...base(), record(bot, 'card-pending', '- 1 finding(s) filed as a follow-up card (#1).')] })).toMatch(/requiring send-back/);
   });
   it('releases for a human-authored operator-card record', () => {
-    expect(hold({ comments: [...base(), record(human, 'operator-card', '- 1 finding(s) filed as a follow-up card (#1).')] })).toBeNull();
+    // Round-cap-only binding (legacy mode): an unbound record releases the capped break. anyState (R903 default)
+    // requires the record to name its result, covered in red-team-gate-operator-rulings.test.mjs.
+    const env = { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' };
+    expect(hold({ env, comments: [...base(), record(human, 'operator-card', '- 1 finding(s) filed as a follow-up card (#1).')] })).toBeNull();
   });
 });
 

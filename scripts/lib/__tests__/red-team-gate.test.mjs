@@ -290,7 +290,10 @@ describe('readRedTeamDisposition: only a human operator releases a break held at
     findings: [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }] }) };
   const capped = { ...automation, body: `${redTeamGateMarker(PR, head, 'round-cap')}\n- 1 confirmed break(s) NOT sent back: review round 5 has reached the round cap (5). The operator rules on them.` };
   const record = (who, outcome, line) => ({ ...who, body: `${redTeamGateMarker(PR, head, outcome)}\n${line}` });
-  const heldBy = (...extra) => readRedTeamDisposition({ comments: [result, capped, ...extra], pr: PR, head, env: {} }).held.length;
+  // Round-cap-only binding (legacy mode): anyState (R903 default) needs records naming their result, covered in
+  // red-team-gate-operator-rulings.test.mjs.
+  const heldBy = (...extra) => readRedTeamDisposition({ comments: [result, capped, ...extra], pr: PR, head,
+    env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' } }).held.length;
   const CARD = '- 1 finding(s) filed as a follow-up card (#1).';
   const ADVISORY = '- 1 finding(s) left advisory (#1).';
 
