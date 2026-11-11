@@ -82,6 +82,9 @@ export const unsafeComponentName = name => /\p{Cc}/u.test(name) || [...name].som
   && !/^(?:[a-z]\p{M}+|\p{Z})$/u.test(char.normalize('NFD')));
 // Credential stores: BLOCK in a bundle, never warn (R857 correction).
 export const credentialDirectory = component => /^\.(?:ssh|gnupg|aws|docker|kube)$/.test(component);
+// A dot-FILE leaf the manifest excludes (.pgpass, .pypirc, .dockercfg, ...): credential stores block in a bundle,
+// as every excluded path did before R857. Only dot DIRECTORIES of ordinary files may downgrade to a warning.
+export const excludedDotFile = component => component.startsWith('.') && !safeDotDirectory.test(component) && !safeDotFile.test(component);
 function excludedComponent(name, leaf, allowCredential = false) {
   // Admit ordinary accented Latin names (e.g. é) but fail closed on remaining
   // non-ASCII forms: no incomplete hand-maintained confusable substitution map.
@@ -138,6 +141,16 @@ const assignmentLine=new RegExp(`(?:^|[${lineBreaks}])([\\t ]*)(?:-[\\t ]+)?["']
 const physicalTail=/[^\r\n]*/y;
 const continuationRe=new RegExp(`[${lineBreaks}]([\\t ]*)([^${lineBreaks}]*)`,'y');
 const maxContinuationLines=256;
+// Double-quoted YAML/JSON escapes (\xNN, \uNNNN, \UNNNNNNNN, an escaped line break) spell a credential the raw bytes
+// never contain. Decoding every backslash sequence over-approximates a parser: it can only add findings.
+const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|(?:\\r\\n|[${lineBreaks}])[\\t ]*|([^]))`,'g');
+const escapeChars={0:'\0',a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
+const decodeEscapes=text=>text.replace(escapeSequence,(all,x,u,U,char)=>{
+  const hex=x??u??U;
+  if(hex){const point=parseInt(hex,16);return point<=0x10ffff?String.fromCodePoint(point):all;}
+  return char===undefined?'':escapeChars[char]??char;
+});
+const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text));
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
 // line that is not. Returns null when more than maxContinuationLines remain (caller blocks).
 function continuationLines(text,from,indent) {
@@ -158,10 +171,12 @@ export function credentialContentFinding(path,content) {
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
+  const escaped=decodedFinding(text);
+  if(escaped)return escaped;
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
-  const finding=assignmentFinding(text,true);
-  return finding?.startsWith('unbounded-continuation-')?finding:null;
+  // Block-only mode returns an unbounded continuation or a credential format split across scalar lines.
+  return assignmentFinding(text,true);
 }
 // Field names are diagnostic data too; never echo a credential-bearing or unbounded name.
 const findingField=field=>textFinding(field)||field.length>80?`field-sha256-${sha(field).slice(0,12)}`:field;
@@ -196,6 +211,11 @@ function assignmentFinding(text,blockOnly=false) {
       // one, singly and joined (a folded scalar can split a secret across short lines).
       continuation=continuationLines(text,match.index+match[0].length+tail.length,indent.length);
       if(!continuation)return `unbounded-continuation-${findingField(field)}`;
+      // A folded, plain or quoted multi-line scalar can split a credential format across lines.
+      if(blockOnly&&continuation.length) {
+        const joined=decodedFinding(literal+continuation.join(''));
+        if(joined)return joined;
+      }
       if(credentialNamed) {
         if(!blockOnly)for(const line of [...continuation,continuation.join('')]) {
           if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${findingField(field)}`;
