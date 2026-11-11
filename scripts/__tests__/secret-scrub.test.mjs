@@ -41,7 +41,7 @@ describe('scrubPublish — rejects a credential in every family it claims', () =
   // for a credential, which is exactly what this repo must never commit. This still trips `xox[baprs]-`.
   reject('a Slack token', slackSynthetic());
   reject('an AWS access key id', `${awsSynthetic()} was in the env`);
-  reject('a Google API key', 'AIzaSyNOTREALsynthetic0000000000000000000');
+  reject('a Google API key', `AIza${'S'}yNOTREALsynthetic0000000000000000000`);
   reject('a JWT', 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJTWU5USEVUSUMifQ.c3ludGhldGlj');
   reject('a URL with inline credentials', 'psql postgres://admin:hunter2Trombone@db.internal/app');
   reject('a labeled credential with a secret-shaped value', 'set password: hunter2Trombone in the env');
