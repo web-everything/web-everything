@@ -282,7 +282,13 @@ describe('pending red-team check before acceptance', () => {
           ...(readComments ? { readComments } : {}),
           ensureLabel: () => writes.push('ensure'), setLabels: () => writes.push('labels') },
       });
-      return { apply: p => sinks[type](p, CTX), post, writes };
+      // A real run applies the write-up (effect 0) before the label swap, and since #6661 the label sink refuses
+      // (notApplied) when that staged body is missing. Stage it through the real write-up sink, as a run would.
+      const apply = async p => {
+        await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: p.bodyFile, body: '# verdict' }, CTX);
+        return sinks[type](p, CTX);
+      };
+      return { apply, post, writes };
     }
     const resultComment = (rev = head, author = { login: 'web-everything' }) =>
       ({ author, body: `${redTeamMarker(7, rev)}\n\nRed team: no confirmed breaks on this head.` });
