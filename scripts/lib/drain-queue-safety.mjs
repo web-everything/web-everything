@@ -489,11 +489,33 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const summaryInfra = check => infraConclusions.has(check.conclusion)
       || [check.output?.title, check.output?.summary].some(value => typeof value === 'string' && runnerLoss.test(value))
         && ![check.output?.title, check.output?.summary, check.output?.text].some(value => typeof value === 'string' && testFailure.test(value));
+    // Infra proof without logs: every failed job was cancelled/never ran, or the only real failure is the
+    // merge-gate's own red-main-freeze HOLD (caused by main, not by this PR). A real failing job never qualifies.
+    const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
+    // The merge-gate's reason is only in its job log: read it once (budgeted) and require the freeze to be the SOLE hold.
+    const gates = failed.filter(check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure');
+    let freezeProven = false;
+    if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
+      try {
+        const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
+        if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
+          budget--;
+          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}/logs`], {
+            encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
+            .slice(-MQ_INFRA_SCAN_BYTES);
+          const holds = log.split('\n').filter(line => /^\S+\s+hold\s{2,}\S+/.test(line));
+          freezeProven = holds.length === 1 && /^\S+\s+hold\s{2,}red-main-freeze\s+main is RED \(freeze:/.test(holds[0]);
+        }
+      } catch { /* unreadable gate log: the hold stays */ }
+    }
+    const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;
     const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
     const logVerdicts = new Map();
     const derived = new Set();
-    if (failed.length > MQ_INFRA_MAX_JOBS) {
+    if (noLogInfra) {
+      // No log reads: the job conclusions themselves are the evidence.
+    } else if (failed.length > MQ_INFRA_MAX_JOBS) {
       logReason = `failed-job count exceeds ${MQ_INFRA_MAX_JOBS}-job limit; operator must inspect failed jobs and enqueue manually`;
     } else {
       for (const check of failed) {
@@ -557,9 +579,9 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const intrinsic = failed.filter(check => !derived.has(check.id));
     const derivedNames = failed.filter(check => derived.has(check.id)).map(check => check.name
       .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' '));
-    if (!intrinsic.length)
+    if (!intrinsic.length && !noLogInfra)
       logReason = 'only derived aggregate failures; operator must inspect failed jobs and enqueue manually';
-    let infra = !logReason && intrinsic.every(check => (!hasAggregateCandidates && summaryInfra(check)) || logVerdicts.get(check.id) === true);
+    let infra = !logReason && (noLogInfra || intrinsic.every(check => (!hasAggregateCandidates && summaryInfra(check)) || logVerdicts.get(check.id) === true));
     const rerun = requestMqReruns({ attempts, repo, exec, scope: rerunScope,
       eligible: !infra && !logReason && !hasAggregateCandidates, dryRun,
       spend: () => { if (budget <= 2) throw new Error('retry evidence budget exhausted'); budget--; } });
