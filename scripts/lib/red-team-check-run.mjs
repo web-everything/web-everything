@@ -134,12 +134,14 @@ function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSyn
  *   with no round run behind it, posts the success again, so a yield never strands a head.
  * No lock and no sleep. Residuals (disclosed on #6535; PR-A #6606's per-identity publish lock, shared by every
  * writer, closes each of them):
- * - FAIL-OPEN window (bounded by the next on-skip pass): between the success POST and a landed superseding run, the
- *   success is the newest run over a round run it did not see. If the supersede POST fails, or the process dies
- *   between the POST and the re-read, merge-gate reads a success until the next pass corrects it (the pre-post
- *   correction above). The same holds when a round run created just before the success is missing from both reads
- *   (read lag). This writer does NOT promise "never a false success"; it promises the success never stays newest
- *   past a pass that can read the head.
+ * - FAIL-OPEN window: between the success POST and a landed superseding run, the success is the newest run over a
+ *   round run it did not see. This writer does NOT promise "never a false success". The bound depends on the case:
+ *   - the supersede POST fails, or the process dies between the POST and the re-read: no result comment is posted,
+ *     so the on-skip row retries and the next pass corrects it (the pre-post correction above);
+ *   - read lag (a round run created just before the success is missing from BOTH reads): the re-read verifies the
+ *     success, the caller posts its result comment, and the on-skip row then skips the head as settled. Nothing
+ *     re-reads it, so the false success stays newest until that round posts its next run. If the round dies first,
+ *     it stays until an operator or a later round republishes.
  * - Fail-closed: a round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
  *   A retry corrects it, but once that round has posted its result comment the on-skip row stops retrying, so the
  *   head can stay held until an operator republishes. Likewise, near the 100-run bound a post can push the head
