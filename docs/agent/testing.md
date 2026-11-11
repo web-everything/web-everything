@@ -1314,8 +1314,11 @@ older than 24 hours fails closed with exit 2, the exact recovery command
 `node <clone>/scripts/hooks/sync-guard-clone.mjs`, and the launchd template path
 `<clone>/scripts/hooks/com.we.guard-main-sync.plist.template`. An old HEAD commit in a
 quiet repository does not make a recently synchronized clone stale. The pristine check
-requires every `git ls-files -v` tag to be `H`, clean `status --porcelain --untracked-files=all`
-and `diff-index --quiet HEAD --`, and HEAD equal to origin/main. Git checks disable
+requires every `git ls-files -v` tag to be `H`, clean
+`status --porcelain --untracked-files=all --ignored` (so a file hidden by `.gitignore` or
+`info/exclude`, such as a planted `node_modules` package, also denies) and
+`diff-index --quiet HEAD --`, and HEAD equal to origin/main. Test fixtures therefore link
+`node_modules` beside the clone, never inside it. Git checks disable
 `core.fsmonitor` and `core.untrackedCache`. Refresh with `node scripts/hooks/sync-guard-clone.mjs`
 from a repo with the intended origin, or pass `--origin=<url>` from any directory.
 
@@ -1346,13 +1349,19 @@ process liveness, never by a timer: a pid that is gone, or that now names a proc
 different `ps -o lstart` start time (pid reuse), is an exited owner. Unknown evidence counts as
 live. Launchers ignore an exited owner's lock (and an old-protocol lock directory); the next
 sync reclaims it and prunes exited leases, and the pristine and freshness checks still guard a
-clone a crashed sync left half-reset. Reclaim is serialised behind `<clone>.guard-lock.reclaim`,
-so a lock moved aside is never one a peer just published; an abandoned reclaim marker (a sync
-killed inside that few-millisecond step) makes sync refuse and name the marker to remove.
-Sync sweeps staging and aside debris left by exited syncs, and ignores entries in
+clone a crashed sync left half-reset. Reclaim is serialised behind `<clone>.guard-lock.reclaim`
+and removes only an existing record judged dead: a lock observed absent is never reclaimed
+(a peer may publish at any moment after that read), and an old-protocol directory is removed
+with `rmdir`, which cannot remove a lock file published meanwhile. An abandoned reclaim marker
+(a sync killed inside that few-millisecond step) makes sync refuse and name the marker to
+remove. Sync sweeps staging and aside debris left by exited syncs, and ignores entries in
 `.guard-readers` that are not `<pid>-<hex>` leases. A launcher killed outright orphans its
 guard, which can then run while a sync resets the clone. `WE_GUARD_LOCK_WAIT_MS` may only
-shorten either wait (tests use it); it can never lengthen it.
+shorten either wait (tests use it); it can never lengthen it. Both waits print their effective
+bound ("waiting up to <ms>ms"), so the cap is tested without waiting it out, and a test keeps
+the launcher's and sync's copies of the lock helpers identical. The soak break
+`lane-local-guard-loaded-as-hook` inspects every security event: `PreToolUse`, `Stop` and
+`SubagentStop`.
 The launcher canonicalizes the clone and guard entry path, passes the guard realpath as
 Node's `argv[1]`, and runs in place without a temporary copy. This keeps CLI entry checks
 working through symlinked HOME/TMPDIR paths (including macOS `/var` → `/private/var`).

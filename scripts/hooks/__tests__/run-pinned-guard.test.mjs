@@ -255,13 +255,66 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     const f = fixture();
     const lock = syncLock(f, process.pid);
     const hook = start(f, ['scripts/guard-bash.mjs']);
-    await hook.stderrIncludes('waiting for guard clone sync');
+    await hook.stderrIncludes('for guard clone sync to finish');
     expect(leases(f)).toEqual([]);
     rmSync(lock);
     hook.child.stdin.end('payload');
     expect(JSON.parse(await hook.line())).toMatchObject({ root: f.lane, input: 'payload' });
     expect(await hook.finish(), hook.stderr).toBe(0);
     expect(leases(f)).toEqual([]);
+  });
+  it.each([
+    ['unset', undefined], ['oversized', '600000'], ['huge', '1e9'], ['invalid', 'soon'], ['negative', '-5'],
+  ])('caps launcher wait overrides at 20 seconds: %s', async (_kind, value) => {
+    const f = fixture();
+    if (value === undefined) delete f.env.WE_GUARD_LOCK_WAIT_MS; else f.env.WE_GUARD_LOCK_WAIT_MS = value;
+    const lock = syncLock(f, process.pid);
+    const hook = start(f, ['scripts/guard-bash.mjs']);
+    await hook.stderrIncludes('for guard clone sync to finish');
+    expect(hook.stderr).toContain('waiting up to 20000ms for guard clone sync');
+    rmSync(lock);
+    hook.child.stdin.end('payload');
+    expect(await hook.finish(), hook.stderr).toBe(0);
+  });
+  it('honours a shorter wait override', () => {
+    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    syncLock(f, process.pid);
+    const result = f.launch();
+    expect(result).toMatchObject({ status: 2, stderr: expect.stringContaining('waiting up to 50ms for guard clone sync') });
+  });
+  it.each(['fails', 'prints junk'])('treats unavailable process-start evidence as live when ps %s', kind => {
+    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    const bin = join(f.temp, 'ps-shim'); mkdirSync(bin);
+    writeFileSync(join(bin, 'ps'), kind === 'fails' ? '#!/bin/sh\nexit 1\n' : '#!/bin/sh\necho "not a date"\n', { mode: 0o755 });
+    f.env.PATH = `${bin}:${f.env.PATH}`;
+    // Live pid with a recorded start that real ps would call a reuse: unknown evidence keeps it live.
+    const lock = syncLock(f, process.pid, 1000);
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('sync is in progress; retry the hook') });
+    expect(existsSync(lock)).toBe(true);
+    expect(leases(f)).toEqual([]);
+  });
+  it.each(['planted', 'node_modules/shadow/index.js'])('denies an ignored file planted in the clone: %s', planted => {
+    const f = fixture();
+    writeFileSync(join(f.clone, '.git/info/exclude'), `${planted.split('/')[0]}\n`);
+    mkdirSync(dirname(join(f.clone, planted)), { recursive: true });
+    writeFileSync(join(f.clone, planted), 'console.log("PLANTED");');
+    expect(f.git(f.clone, 'status', '--porcelain', '--untracked-files=all')).toBe('');
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
+  });
+  it('keeps identical copies of the lock helpers in the launcher and sync', () => {
+    const source = file => readFileSync(join(repo, file), 'utf8');
+    const helper = (text, name) => {
+      const match = new RegExp(`^(?:export )?function ${name}\\([^]*?\\n}\\n`, 'm').exec(text);
+      expect(match, name).not.toBeNull();
+      return match[0].replace(/^export /, '');
+    };
+    const launcher = source('scripts/hooks/run-pinned-guard.mjs');
+    const sync = source('scripts/hooks/sync-guard-clone.mjs');
+    for (const name of ['lockWaitMs', 'pause', 'processStart', 'alive']) {
+      expect(helper(launcher, name), name).toBe(helper(sync, name));
+    }
+    expect(launcher).toContain('const MAX_WAIT_MS = 20_000;');
+    expect(sync).toContain('const MAX_WAIT_MS = 20_000;');
   });
   it('denies after its bounded wait while a live sync holds the lock, leaving the lock and no lease', () => {
     const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';

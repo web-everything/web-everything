@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const GUARD = /scripts\/(guard-[\w-]+|lint-[\w-]+|check-memory|backlog-guard)\.mjs/;
+const SECURITY_EVENTS = ['PreToolUse', 'Stop', 'SubagentStop'];
 
 export default {
   id: 'lane-local-guard-loaded-as-hook',
@@ -18,7 +19,12 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const violations = [];
     const settings = JSON.parse(readFileSync(join(root, '.claude/settings.json'), 'utf8'));
-    for (const group of settings.hooks?.PreToolUse ?? []) {
+    // Every security event is pinned, not only PreToolUse (PostToolUse hooks are advisory).
+    const groups = SECURITY_EVENTS.flatMap((event) => settings.hooks?.[event] ?? []);
+    if (!SECURITY_EVENTS.every((event) => (settings.hooks?.[event] ?? []).length)) {
+      violations.push('a security hook event (PreToolUse, Stop or SubagentStop) has no hooks to inspect');
+    }
+    for (const group of groups) {
       for (const hook of group.hooks ?? []) {
         const cmd = hook.command ?? '';
         if (GUARD.test(cmd) && !cmd.includes('.guard-main/scripts/hooks/run-pinned-guard.mjs')) {

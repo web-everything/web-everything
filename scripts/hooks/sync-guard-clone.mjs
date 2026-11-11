@@ -9,7 +9,8 @@
  */
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -17,7 +18,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 // module loading. lockWaitMs, pause, processStart, alive and readRecord match run-pinned-guard.mjs.
 const MAX_WAIT_MS = 20_000;
 /** WE_GUARD_LOCK_WAIT_MS may only shorten the wait (tests); it can never lengthen it. */
-function lockWaitMs() {
+export function lockWaitMs() {
   const value = Number(process.env.WE_GUARD_LOCK_WAIT_MS);
   return process.env.WE_GUARD_LOCK_WAIT_MS !== undefined && Number.isFinite(value) && value >= 0
     ? Math.min(value, MAX_WAIT_MS) : MAX_WAIT_MS;
@@ -25,7 +26,7 @@ function lockWaitMs() {
 function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 const STARTED = Date.now() - Math.round(process.uptime() * 1000);
 /** A process's start time in ms, or null when ps cannot say. */
-function processStart(pid) {
+export function processStart(pid) {
   try {
     const text = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8', timeout: 5_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
@@ -37,7 +38,7 @@ function processStart(pid) {
 }
 /** Live unless the pid is gone or now belongs to a process that started at another time.
  * Unknown evidence counts as live, so a holder is never stolen from on a guess. */
-function alive(pid, started) {
+export function alive(pid, started) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
   if (!Number.isFinite(started) || started <= 0) return true;
@@ -45,9 +46,9 @@ function alive(pid, started) {
   // ps reports whole seconds; a larger gap is a different process reusing the pid.
   return actual === null || Math.abs(actual - started) < 3_000;
 }
-const LEGACY = Symbol('legacy directory lock');
+export const LEGACY = Symbol('legacy directory lock');
 /** The record text, '' when absent, LEGACY for an old-protocol lock directory (no owner). */
-function readRecord(path) {
+export function readRecord(path) {
   try { return readFileSync(path, 'utf8'); }
   catch (error) {
     if (error.code === 'ENOENT') return '';
@@ -83,9 +84,13 @@ function busyIfLive(lockPath) {
   if (holderAlive(current)) throw new Error('guard clone is busy: another sync is running; retry sync');
   return current;
 }
-/** Move an abandoned lock aside. Reclaimers are serialised, so the lock cannot change hands
- * between the re-read below and the rename: publishers only create an absent path. */
-function reclaim(lockPath, judged, record) {
+/** Remove an abandoned lock. Only an existing record judged dead is ever removed: an absent
+ * lock is left for the caller to publish, because a publisher could create a live lock at any
+ * moment after an absent read. An existing record cannot change hands before the move:
+ * publishers only create an absent path, reclaimers are serialised, and its owner has exited.
+ * `beforeRemove` is a test seam for that window. */
+export function reclaim(lockPath, judged, record, { beforeRemove = () => {} } = {}) {
+  if (!judged) return;
   const mutex = `${lockPath}.reclaim`;
   if (!publish(mutex, record)) {
     if (holderAlive(readRecord(mutex))) throw new Error('guard clone is busy: another sync is reclaiming an abandoned lock; retry sync');
@@ -93,15 +98,28 @@ function reclaim(lockPath, judged, record) {
   }
   try {
     if (readRecord(lockPath) !== judged) return;
+    beforeRemove();
+    if (judged === LEGACY) {
+      // rmdir removes only an empty directory, never a lock file published meanwhile.
+      try { rmdirSync(lockPath); }
+      catch (error) { if (!['ENOENT', 'ENOTDIR', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; }
+      return;
+    }
     const aside = `${lockPath}.stale-${nonce()}`;
     try { renameSync(lockPath, aside); }
     catch (error) { if (error.code === 'ENOENT') return; throw error; }
-    rmSync(aside, { recursive: true, force: true });
+    if (readRecord(aside) !== judged) {
+      // Defensive: put a record that is not the judged one back, never over a newer lock.
+      try { linkSync(aside, lockPath); } catch { /* a newer lock exists; keep it */ }
+      rmSync(aside, { force: true });
+      throw new Error('guard clone is busy: the sync lock changed hands during reclaim; retry sync');
+    }
+    rmSync(aside, { force: true });
   } finally {
     rmSync(mutex, { force: true });
   }
 }
-function acquireLock(lockPath, record) {
+export function acquireLock(lockPath, record) {
   sweepDebris(lockPath);
   for (let attempt = 0; attempt < 3; attempt++) {
     if (publish(lockPath, record)) return;
@@ -111,10 +129,12 @@ function acquireLock(lockPath, record) {
 }
 
 /** Wait for live hook leases to drain, pruning leases of exited processes. */
-function drainLeases(readers) {
+export function drainLeases(readers) {
   mkdirSync(readers, { recursive: true });
   if (!lstatSync(readers).isDirectory()) throw new Error(`${readers} must be a real directory`);
-  const deadline = Date.now() + lockWaitMs();
+  const waitMs = lockWaitMs();
+  const deadline = Date.now() + waitMs;
+  let announced = false;
   for (;;) {
     const live = [];
     for (const name of readdirSync(readers)) {
@@ -132,10 +152,23 @@ function drainLeases(readers) {
     if (Date.now() >= deadline) {
       throw new Error(`${live.length} guard hook(s) still running (leases in ${readers}); retry sync`);
     }
+    if (!announced) {
+      // The effective bound, printed so tests can pin the cap without waiting it out.
+      process.stderr.write(`Guard clone sync: waiting up to ${waitMs}ms for ${live.length} guard hook(s) to finish\n`);
+      announced = true;
+    }
     pause(50);
   }
 }
 
+// Run only as a CLI; tests import the lock helpers above without side effects.
+const invokedAsCli = (() => {
+  try { return realpathSync(process.argv[1] ?? '') === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+})();
+if (invokedAsCli) main();
+
+function main() {
 let lock;
 const owner = `${process.pid} ${STARTED} ${randomBytes(6).toString('hex')}\n`;
 try {
@@ -213,4 +246,5 @@ try {
   // Release only a lock this run still owns; nobody else can replace an existing lock file.
   try { if (lock && readRecord(lock) === owner) rmSync(lock, { force: true }); }
   catch (error) { process.stderr.write(`Guard clone sync could not release its lock: ${error.message}\n`); process.exitCode = 2; }
+}
 }

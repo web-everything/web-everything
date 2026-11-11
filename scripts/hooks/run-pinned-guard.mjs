@@ -97,7 +97,8 @@ try {
   mkdirSync(readers, { recursive: true });
   if (!lstatSync(readers).isDirectory()) throw new Error(`${readers} must be a real directory`);
   const marker = join(readers, `${process.pid}-${randomBytes(6).toString('hex')}`);
-  const deadline = Date.now() + lockWaitMs();
+  const waitMs = lockWaitMs();
+  const deadline = Date.now() + waitMs;
   let announced = false;
   for (;;) {
     if (!syncRunning(lockPath)) {
@@ -113,7 +114,8 @@ try {
       throw new Error('guard clone sync is in progress; retry the hook');
     }
     if (!announced) {
-      process.stderr.write('Pinned guard: waiting for guard clone sync to finish\n');
+      // The effective bound, printed so tests can pin the cap without waiting it out.
+      process.stderr.write(`Pinned guard: waiting up to ${waitMs}ms for guard clone sync to finish\n`);
       announced = true;
     }
     pause(50);
@@ -130,8 +132,10 @@ try {
   git('--git-dir', join(clone, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}');
   const entries = git('-C', clone, 'ls-files', '-v', '-z').split('\0');
   if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
+  // --ignored: a file hidden by .gitignore or info/exclude (e.g. a planted node_modules
+  // package shadowing a bare import) is not part of the pinned revision either.
   if (entries.slice(0, -1).some(entry => !entry.startsWith('H ')) ||
-      git('-C', clone, 'status', '--porcelain', '--untracked-files=all')) {
+      git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')) {
     throw new Error('guard clone is not pristine; run scripts/hooks/sync-guard-clone.mjs to repair it');
   }
   git('-C', clone, 'diff-index', '--quiet', 'HEAD', '--');

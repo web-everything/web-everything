@@ -8,6 +8,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const script = resolve(dirname(fileURLToPath(import.meta.url)), '../sync-guard-clone.mjs');
+const { LEGACY, lockWaitMs, readRecord, reclaim } = await import('../sync-guard-clone.mjs');
 const temps=[];
 afterEach(()=>{for(const temp of temps.splice(0)) { execFileSync('chmod', ['-R', 'u+w', temp]); rmSync(temp,{recursive:true,force:true}); }});
 function fixture() {
@@ -148,6 +149,81 @@ console.log(revision);
     expect(existsSync(reused)).toBe(false);
     expect(readdirSync(readers)).toEqual(['.DS_Store']);
     expect(readdirSync(dirname(f.clone)).filter(name => name.includes('.guard-lock'))).toEqual([]);
+  });
+  it.each([
+    ['unset', undefined], ['oversized', '600000'], ['huge', '1e9'], ['invalid', 'soon'], ['negative', '-5'],
+  ])('caps sync wait overrides at 20 seconds: %s', async (_kind, value) => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    if (value === undefined) delete f.env.WE_GUARD_LOCK_WAIT_MS; else f.env.WE_GUARD_LOCK_WAIT_MS = value;
+    const lease = join(`${f.clone}.guard-readers`, `${process.pid}-feed`);
+    writeFileSync(lease, '');
+    const child = spawn(process.execPath, [script], { cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const closed = once(child, 'close');
+    let stderr = '';
+    await new Promise((resolveWait, reject) => {
+      child.stderr.on('data', chunk => { stderr += chunk; if (stderr.includes('guard hook(s) to finish')) resolveWait(); });
+      closed.then(([code]) => reject(new Error(`sync exited (${code}) before waiting: ${stderr}`)));
+    });
+    expect(stderr).toContain('waiting up to 20000ms for 1 guard hook(s)');
+    rmSync(lease);
+    expect((await closed)[0], stderr).toBe(0);
+  });
+  it('lockWaitMs only ever shortens the 20 second bound', () => {
+    const previous = process.env.WE_GUARD_LOCK_WAIT_MS;
+    try {
+      for (const [value, expected] of [[undefined, 20_000], ['600000', 20_000], ['1e9', 20_000], ['Infinity', 20_000],
+        ['soon', 20_000], ['-5', 20_000], ['', 0], ['0', 0], ['50', 50], ['20000', 20_000]]) {
+        if (value === undefined) delete process.env.WE_GUARD_LOCK_WAIT_MS; else process.env.WE_GUARD_LOCK_WAIT_MS = value;
+        expect(lockWaitMs(), String(value)).toBe(expected);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.WE_GUARD_LOCK_WAIT_MS; else process.env.WE_GUARD_LOCK_WAIT_MS = previous;
+    }
+  });
+  it.each(['fails', 'prints junk'])('treats unavailable process-start evidence as live when ps %s', kind => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const bin = join(f.temp, 'ps-shim'); mkdirSync(bin);
+    writeFileSync(join(bin, 'ps'), kind === 'fails' ? '#!/bin/sh\nexit 1\n' : '#!/bin/sh\necho "not a date"\n', { mode: 0o755 });
+    f.env.PATH = `${bin}:${f.env.PATH}`;
+    f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    f.writable(); writeFileSync(join(f.clone, 'keep'), 'precious');
+    // A live pid whose recorded start real ps would call a reuse: unknown evidence keeps it live.
+    const lease = join(`${f.clone}.guard-readers`, `${process.pid}-beef`);
+    writeFileSync(lease, '1000');
+    expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('guard hook(s) still running') });
+    expect(existsSync(lease)).toBe(true);
+    rmSync(lease);
+    const lock = `${f.clone}.guard-lock`;
+    writeFileSync(lock, `${process.pid} 1000 holder\n`);
+    expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('another sync is running') });
+    expect(readFileSync(lock, 'utf8')).toContain('holder');
+    expect(readFileSync(join(f.clone, 'keep'), 'utf8')).toBe('precious');
+  });
+  it('does not reclaim a lock published after an absent observation', () => {
+    const temp = realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'guard-reclaim-'))); temps.push(temp);
+    const lock = join(temp, 'clone.guard-lock');
+    const live = `${process.pid} 0 live\n`;
+    let published = false;
+    reclaim(lock, '', `${process.pid} 0 reclaimer\n`, { beforeRemove() { writeFileSync(lock, live, { flag: 'wx' }); published = true; } });
+    // An absent observation never reaches the remove step, so a lock published in that window survives.
+    expect(published).toBe(false);
+    writeFileSync(lock, live, { flag: 'wx' });
+    expect(readRecord(lock)).toBe(live);
+    expect(readdirSync(temp)).toEqual(['clone.guard-lock']);
+  });
+  it('removes a legacy lock directory only while it is still an empty directory', () => {
+    const temp = realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'guard-reclaim-'))); temps.push(temp);
+    const lock = join(temp, 'clone.guard-lock');
+    mkdirSync(lock);
+    const live = `${process.pid} 0 live\n`;
+    // A peer replaces the abandoned directory with a live lock file inside the window.
+    reclaim(lock, LEGACY, `${process.pid} 0 reclaimer\n`, { beforeRemove() { rmSync(lock, { recursive: true }); writeFileSync(lock, live, { flag: 'wx' }); } });
+    expect(readRecord(lock)).toBe(live);
+    rmSync(lock);
+    mkdirSync(lock);
+    reclaim(lock, LEGACY, `${process.pid} 0 reclaimer\n`);
+    expect(existsSync(lock)).toBe(false);
+    expect(readdirSync(temp)).toEqual([]);
   });
   it('serialises reclaim: a live reclaimer blocks a second one, which leaves the lock where it is', () => {
     const f = fixture(); expect(f.run().status).toBe(0);

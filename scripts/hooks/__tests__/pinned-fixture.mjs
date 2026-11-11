@@ -46,8 +46,9 @@ export function pinnedFixture({ launcherOnly = false } = {}) {
   mkdirSync(join(env.HOME, 'workspace'), { recursive: true });
   const clone = join(env.HOME, 'workspace/.guard-main');
   git(temp, 'clone', '--single-branch', '--branch', 'main', primary, clone);
-  writeFileSync(join(clone, '.git/info/exclude'), 'node_modules\n');
-  symlinkSync(join(source, 'node_modules'), join(clone, 'node_modules'), 'dir');
+  // Dependencies resolve from the clone's parent: the launcher refuses any untracked or
+  // ignored file inside the clone, so none may be planted there.
+  symlinkSync(join(source, 'node_modules'), join(dirname(clone), 'node_modules'), 'dir');
   writeFileSync(join(clone, '.git/FETCH_HEAD'), '');
   delete env.WE_GUARD_CLONE;
   return { primary, lane, clone, temp, env, git,
