@@ -576,6 +576,36 @@ describe('the stored result is the authority on every status shape (self-review 
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
     expect(readStatusFile().storedFindings).toBeUndefined();
   });
+  // Review round 8 (PR #6622): a SEALED result's confirmed breaks must survive queued/running/error/skip rewrites until a
+  // replacement finished `ran` result supplies evidence. A failed retry dropped the seal of a sealed legacy `ran`.
+  it.each([[{ status: 'error' }], ['skipped'], ['resumed']])('failed retry preserves sealed legacy confirmed breaks (finished %j)', result => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]); // seals the seat row's confirmed break against the conflicting clear comment
+    expect(readStatusFile().sealedBreaks).toHaveLength(1);
+    const expectHeld = () => {
+      expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ breaks: [expect.any(String)] });
+      expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    };
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'queued', result: 'ran' }, { env: process.env });
+    expectHeld();
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expectHeld();
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result }, { env: process.env });
+    expectHeld();
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expectHeld();
+    // Only a replacement finished `ran` result drops the seal (the publisher seals that result itself).
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: posted([]) }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toBeUndefined();
+    expect(heldBy([clearComment]).held).toEqual([]);
+  });
+  it('failed retry preserves a sealed seat-posted result\'s seal too (the seal, not only the carried findings)', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: { ...posted([brokenFinding]), comment: 'withheld' }, sealedBreaks: ['k'] });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: { status: 'error' } }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toEqual(['k']);
+  });
   it('a truncated status file with no stored evidence is repaired as nothing stored (no permanent unreadable seal)', () => {
     const whole = JSON.stringify({ repo, pr: 42, head, loopPayload, status: 'running', result: null });
     mkdirSync(join(statusFile(), '..'), { recursive: true });
