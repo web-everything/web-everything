@@ -250,7 +250,7 @@ ${gate?`if(!fs.existsSync(${JSON.stringify(join(root,'release'))})){const watch=
 
 describe('remote controls', () => {
   it('resolves every new default with provenance and rejects invalid values', () => {
-    const defaults={maxConcurrent:8,backoffMs:120000,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15,
+    const defaults={maxConcurrent:8,backoffMs:600000,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15,
       stuckMinSlots:2,stuckAgeMs:600000,stuckSignalEveryMs:600000};
     const standard=resolveAdmissionPolicy({});
     expect(standard.settings.remote).toMatchObject(defaults);
@@ -463,7 +463,7 @@ describe('remote controls', () => {
     expect(f.remoteExec).toHaveBeenCalledTimes(3);
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining(reason));
     f.remoteExec.mockResolvedValue({mode:'remote',code:0});
-    await runWithRemoteDecision({...f,clock:()=>now+120001,readTelemetry:async()=>sample(now+120001)});
+    await runWithRemoteDecision({...f,clock:()=>now+600001,readTelemetry:async()=>sample(now+600001),canaryRunner:async()=>({mode:'remote',code:0})});
     const persisted=JSON.parse(readFileSync(join(f.cwd,'remote','health.json'),'utf8'));
     expect(persisted.failures).toBe(0);
   });

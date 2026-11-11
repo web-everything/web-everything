@@ -76,6 +76,7 @@ import { SMELLS } from './health-smells/index.mjs';
 import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
+import { probeForgeDownForWatch, forgeDownEventLine, probeForgeFallbackForWatch, forgeFallbackEventLine } from './forge-down-probe.mjs';
 import { probeForgeShareForWatch } from './forge-share-probe.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
@@ -1238,6 +1239,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     ? JSON.parse(readFileSync(flags['heavy-status-file'], 'utf8'))
     : JSON.parse(run(process.execPath, [join(REPO_ROOT, 'scripts/readiness/heavy-admission.mjs'), 'status', '--json'], { timeoutMs: 15_000 }))));
   // R497 — Forge share (settings-driven, never throws: any failure reads as unknown, which the smell alarms on).
+  probes.forgeFallback = probeForgeFallbackForWatch({ repoRoot: REPO_ROOT, now });
+  probes.forgeDown = probeForgeDownForWatch({ repoRoot: REPO_ROOT });
   probes.forgeShare = probeForgeShareForWatch({ repoRoot: REPO_ROOT });
   // `machine-overload`'s own inputs — every tick, cheap, never gh-gated. `--ps-fixture`/`--machine-load-fixture`
   // are the incident-reproduction path: this repo never runs a load generator to test this smell (see that
@@ -1667,7 +1670,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
     plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
-    section: renderHealthSection(state, { now, reportDir }),
+    section: [...renderHealthSection(state, { now, reportDir }), ...[forgeDownEventLine(probes.forgeDown), forgeFallbackEventLine(probes.forgeFallback)].filter(Boolean)],
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
   });
 }
