@@ -90,6 +90,26 @@ describe('deriveRedTeamVerdict: identity and ordering', () => {
   });
 });
 
+describe('known weakness (#8156): a trusted newer same-head result supersedes a confirmed break', () => {
+  // Characterization, not endorsement: latest-result-wins is inherited from readRedTeamDisposition. These tests pin
+  // today's behaviour so reinforcing the fold (card 8156) must change them on purpose.
+  const brokenThread = () => [clean(head, 'web-everything', broken), gate(head, 'sent-back')];
+  it('a newer trusted result with no findings supersedes the break and clears', () => {
+    expect(derive({ comments: brokenThread() })).toBe('held');
+    expect(derive({ comments: [...brokenThread(), clean()] })).toBe('clear');
+  });
+  it('a newer trusted result with malformed findings (header claims a break, no finding lines) supersedes it too', () => {
+    const malformed = { author: { login: 'web-everything' }, body: clean(head, 'web-everything', broken).body.split('\n').slice(0, 4).join('\n') };
+    expect(derive({ comments: [...brokenThread(), malformed] })).toBe('clear');
+  });
+  it('an untrusted newer clean result does not supersede the break (control)', () => {
+    expect(derive({ comments: [...brokenThread(), clean(head, 'attacker')] })).toBe('held');
+  });
+  it('a newer clean result for another PR on the same head does not supersede the break (control)', () => {
+    expect(derive({ comments: [...brokenThread(), clean(head, 'web-everything', [], 9999)] })).toBe('held');
+  });
+});
+
 describe('the drain hold is unchanged when mapped from the verdict', () => {
   const holdVia = (over = {}) => {
     const d = deriveRedTeamVerdictDetail({ comments: [], pr: 5283, head, owed: true, env: {}, ...over });
