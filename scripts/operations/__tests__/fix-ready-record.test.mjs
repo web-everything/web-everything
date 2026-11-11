@@ -523,6 +523,8 @@ describe('fix-ready-record main()', () => {
           for (const tail of ['/', '/.', '/./', '//', '/..', '/sub/..']) expect(canonicalPath(`${dir}/plain.txt${tail}`)).toBeNull();
           expect(canonicalPath(`${dir}/sub/`)).toBeNull(); // even a real directory is not a ledger file
           expect(canonicalPath(`${dir}/./sub//plain`)).toBe(`${dir}/sub/plain`);
+          expect(canonicalPath(`${dir}/plain.txt/./l`)).toBeNull(); // `.` looked up in a regular file: ENOTDIR
+          expect(canonicalPath(`${dir}/missing/./l`)).toBe(`${dir}/missing/l`); // not written yet: the writer creates it
         });
         it('refuses an unopenable name on the writer side too', () => {
           const { dir, settingsFile } = setup();
