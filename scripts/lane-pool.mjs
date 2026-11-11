@@ -2763,7 +2763,7 @@ async function cmdAcquire(repo) {
             if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
           }
           provisionClaimedLane(repo, pick, false, {
-            beforeFetch: () => assertNoUnpushedLaneWork(repo, pick),
+            beforeFetch: () => assertReadableLaneEvidence(repo, pick),
             beforeReset: () => assertNoUnpushedLaneWork(repo, pick),
           }); // auto-pick never targets a reserved lane
           chosen = pick;
@@ -2908,7 +2908,7 @@ async function cmdAcquire(repo) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       provisionClaimedLane(repo, chosen, targetWasReserved, {
-        beforeFetch: () => assertNoUnpushedLaneWork(repo, chosen),
+        beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
         beforeReset: () => assertNoUnpushedLaneWork(repo, chosen),
       });
     } catch (e) {
@@ -3205,6 +3205,15 @@ function acquireBlockingWork(repo, dir) {
   }
   const left = work.commits.split('\n').filter(sha => sha && real.has(sha));
   return { ...work, commits: left.join('\n') };
+}
+
+/** Acquire's pre-fetch step: primes object-only verification and fails closed when the preservation evidence is
+ *  UNREADABLE. Unpushed work found here is deliberately NOT refused yet: the #2924 fresh-fetch re-verify, the hold
+ *  rule and `assertNoUnpushedLaneWork` (pre-reset) all re-read it on post-fetch refs and own the refusal wording. */
+function assertReadableLaneEvidence(repo, chosen) {
+  if (flags.force) return;
+  const work = acquireBlockingWork(repo, laneDir(repo, chosen));
+  if (work.commits === null) throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually (or --force to discard)`);
 }
 
 /** Acquire's pre-reset refusal: all-branches/HEAD/stash tips must be provably on origin (or patch-equivalent).

@@ -115,7 +115,9 @@ describe('aheadIsProvablyPushed spawn cost does not scale with remote-head count
     // Must stay above acquire's constant per-pick cost (fetch/ls-remote/status/rev-list plus the ~4-spawn
     // history-readability probe, R794) so the `< N_HEADS` ceiling still separates "constant" from "one
     // spawn per remote head" — the old fan-out would add N_HEADS spawns on top of that constant.
-    const N_HEADS = 40;
+    // The constant now includes acquire's two full preservation-evidence reads (pre-fetch and pre-reset, ~45 spawns
+    // in all), so N_HEADS sits well above it: the old fan-out would still land at constant + N_HEADS.
+    const N_HEADS = 80;
     const provision = runPool(['provision', '--count=1', ...poolArgs()]);
     expect(provision.code).toBe(0);
     const lane = join(poolRoot, 'singlespawn', 'lane-1');

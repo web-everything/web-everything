@@ -110,15 +110,18 @@ afterEach(() => {
 
 describe('#4122 acquire consumes the free-lane list', () => {
   it('a FRESH list naming a genuinely free lane is used, with far fewer lane git calls than a full scan', () => {
-    provision(10);
+    provision(16);
     writeFreeList({ lanes: [7] });
     resetTrace();
     const r = runPool(['acquire', ...REPO(), '--session=free-list-caller', '--json']);
     expect(r.code, r.err).toBe(0);
     expect(JSON.parse(r.out).lane).toBe(7);
     // The fast path claims + re-verifies ONE lane (a handful of git calls: fetch, dirty/ahead check,
-    // checkout/clean) — nowhere near the ~4 calls-per-lane a 10-lane full scan would cost (40+).
-    expect(laneGitCalls().length).toBeLessThan(15);
+    // checkout/clean) — nowhere near the ~4 calls-per-lane a 16-lane full scan would cost (64+).
+    // Acquire now also reads the lane's full preservation evidence (all branch/HEAD/stash tips) twice — before the
+    // fetch and again before the reset, ~9 lane git calls each — so the fast path costs ~29, a constant per acquired
+    // lane. The pool is sized so the ceiling still separates that constant from a full scan (>= 4 calls per lane).
+    expect(laneGitCalls().length).toBeLessThan(40);
   });
 
   it('a STALE list is never consulted — acquire falls back to the scan and picks the scan\'s lowest free lane', () => {
