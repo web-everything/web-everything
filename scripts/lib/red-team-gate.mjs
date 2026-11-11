@@ -141,12 +141,13 @@ export function redTeamForHead(comments, pr, head) {
 }
 
 /** The record {@link redTeamForHead} reads: `{ comment, parsed }`, where `comment` keeps the creation time of the
- * comment that holds the result (the carry comment for a carried result), or null. PURE. */
+ * comment that holds the result (the carry comment for a carried result), or null. A result carried inside a
+ * verdict-carry comment also names its source head as `carriedFrom`. PURE. */
 export function redTeamResultCommentForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(live)) return null;
   const hit = latestResult(indexedRecords(comments), pr, live);
-  return hit ? { comment: hit.c, parsed: hit.parsed } : null;
+  return hit ? { comment: hit.c, parsed: hit.parsed, ...(hit.from !== undefined ? { carriedFrom: hit.from } : {}) } : null;
 }
 
 // ── The setting ─────────────────────────────────────────────────────────────────────────────────────────────────

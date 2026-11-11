@@ -227,7 +227,7 @@ export function publishRedTeamCheckFromLive(options = {}) {
 
 function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
-  holdFn = redTeamEnqueueHold } = {}) {
+  holdFn = redTeamEnqueueHold, beforeHold } = {}) {
   let published = false;
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
@@ -308,8 +308,12 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason, liveCheck: true }) });
       if (!supersede.ok) {
         const failures = `${reason}; ${supersede.reason}`;
+        // Record the hold intent first (#6606): the caller's retry must clear the hold once a later attempt is
+        // confirmed, even if this process dies right after the post. A failed record never stops the hold itself.
+        let intent = '';
+        try { beforeHold?.(); } catch (error) { intent = `; hold intent not recorded (${message(error)})`; }
         const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
-        return failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}`);
+        return { ...failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}${intent}`), remoteHold: true };
       }
     }
     return failure(reason);
@@ -372,6 +376,33 @@ export function evaluateRedTeamPublicationHold({ pr, combined, statuses, isTrust
   }
   if (statuses.length === 100) return failure('red-team publication hold history incomplete at 100-status bound; operator must inspect commit statuses');
   return { ok: true, reason: 'no trusted red-team publication hold on head' };
+}
+
+/** Description prefix of the publication hold {@link publishRedTeamCheckFromLive} sets. */
+const LIVE_HOLD_DESCRIPTION_PREFIX = 'held: live red-team check not clear:';
+
+/** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. Only the
+ * NEWEST status on this PR's context is considered, and only if it is that helper's own hold (its description, from a
+ * trusted author): a round writer's newer hold is its owner's to clear, so it is left (`cleared:false`, still ok). An
+ * unreadable history or a failed clear is not ok, so the caller keeps its retry marker. */
+export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, isTrusted = isTrustedMarkerAuthor } = {}) {
+  const context = redTeamPublicationContext(pr);
+  if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
+    return failure('invalid red-team publication hold identity (repo, PR number and head required)');
+  let newest;
+  try {
+    const statuses = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions));
+    if (!Array.isArray(statuses) || statuses.some(status => !Number.isSafeInteger(status?.id)))
+      throw Error('statuses unreadable');
+    newest = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id)[0];
+    if (!newest && statuses.length >= 100) throw Error('statuses incomplete at 100-status bound');
+  } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
+  if (!newest || newest.state === 'success') return { ok: true, cleared: false, reason: 'no publication hold on head' };
+  if (typeof newest.description !== 'string' || !newest.description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX)
+    || !isTrusted({ user: { login: String(newest.creator?.login ?? '') } }))
+    return { ok: true, cleared: false, reason: 'newest publication hold is not the live helper\'s; left to its owner' };
+  const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh });
+  return posted.ok ? { ok: true, cleared: true } : posted;
 }
 
 export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted } = {}) {

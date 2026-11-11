@@ -49,25 +49,46 @@ export function readCarriedCheckUnpublished({ repo, pr, head, env = process.env 
 
 /** Record that a carried check is owed on this head. The carry writes it BEFORE its result comment, so a crash between
  * the comment and the publication still leaves the head owed (recovery skips a head whose result is on it). Throws. */
-export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env }) {
+export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env, remoteHold = false }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
-  writeJsonAtomic(path, { repo, pr: Number(pr), head });
+  // A hold an earlier attempt set stays recorded until a confirmed attempt clears it.
+  writeJsonAtomic(path, { repo, pr: Number(pr), head, remoteHold: remoteHold || carriedCheckRemoteHold(path) });
 }
 
-/** Publish a carried check through `publish`, keeping the outbox marker until it is confirmed. A marker that cannot be
- * written does not stop the attempt (a confirmed check needs no retry); its failure is named in the reason. */
-export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish }) {
+/** Did an earlier attempt (possibly) set the GitHub-visible publication hold? An unreadable marker counts as yes:
+ * clearing only ever removes the live helper's own hold, so a needless clear costs one read. */
+function carriedCheckRemoteHold(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8'))?.remoteHold === true; }
+  catch (error) { return error.code !== 'ENOENT'; }
+}
+
+const safeText = value => String(value?.message ?? value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
+
+/** Publish a carried check through `publish(hooks)`, keeping the outbox marker until it is confirmed. A marker that
+ * cannot be written does not stop the attempt (a confirmed check needs no retry); its failure is named in the reason.
+ * `hooks.beforeHold` records that the attempt is about to set the GitHub-visible publication hold, so a later
+ * confirmed attempt clears it through `clearHold` before the marker goes (#6606: a hold left behind would block the
+ * head after the check itself is clear). */
+export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish, clearHold }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
   let markError = null;
   try { markCarriedCheckUnpublished({ repo, pr, head, env }); }
-  catch (error) { markError = String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 200); }
+  catch (error) { markError = safeText(error).slice(0, 200); }
+  const beforeHold = () => markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true });
   let result;
-  try { result = publish(); }
-  catch (error) { result = { ok: false, reason: String(error?.message ?? error) }; }
+  try { result = publish({ beforeHold }); }
+  catch (error) { result = { ok: false, reason: safeText(error) }; }
   if (result?.ok === true) {
+    if (carriedCheckRemoteHold(path)) {
+      let cleared;
+      try { cleared = clearHold ? clearHold() : { ok: false, reason: 'no publication hold clearer' }; }
+      catch (error) { cleared = { ok: false, reason: safeText(error) }; }
+      if (cleared?.ok !== true)
+        return { ok: false, reason: `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}` };
+    }
     try { rmSync(path, { force: true }); }
-    catch (error) { return { ok: true, warning: `carried-check marker not removed (${error?.message ?? error}); next retry re-validates` }; }
+    catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
     return result;
   }
   const reason = String(result?.reason ?? 'unknown error');

@@ -509,6 +509,21 @@ describe('red-team check run contract', () => {
         expect(publish(io)).toMatchObject({ ok: false });
         expect(check_runs).toHaveLength(initial.length);
       });
+      it.each([
+        ['its own trusted hold is cleared', { description: 'held: live red-team check not clear: x', login: 'web-everything' }, true, true],
+        ['an untrusted look-alike hold is left', { description: 'held: live red-team check not clear: x', login: 'outsider' }, true, false],
+        ['a round writer\'s hold is left', { description: 'held: finished round not confirmed published', login: 'web-everything' }, true, false],
+        ['an unreadable history is not ok', null, false, false],
+      ])('clearLivePublicationHold: %s', (_name, newest, ok, cleared) => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (!newest) throw Error('HTTP 502');
+          return JSON.stringify([{ id: 5, state: 'failure', context: 'red-team/publication #7', description: newest.description,
+            creator: { login: newest.login } }, { id: 4, state: 'failure', context: 'red-team/publication #8' }]);
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok, ...(ok ? { cleared } : {}) });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(cleared ? 1 : 0);
+      });
       it('only the helper\'s own failures over an older round failure: the round failure still dates the carry', () => {
         const older = [run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' }), ownFailure(21)];
         const { io } = retryFixture(older);
