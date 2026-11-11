@@ -733,6 +733,15 @@ export function redTeamHoldDecision({ comments, pr, head, sealed } = {}) {
 }
 
 /**
+ * Is every hold in this disposition only "publication pending" (stored evidence not sealed yet, no conflict found)?
+ * Such a head is held, but it is no confirmed break: callers report it as pending, never as a send-back. PURE.
+ */
+export function redTeamHoldPendingOnly(disposition) {
+  const held = disposition?.held ?? [];
+  return !(disposition?.sendBack ?? []).length && held.length > 0 && held.every(f => f.unsealed === true);
+}
+
+/**
  * The heads the live head's red-team result was carried from, nearest first (at most 8 hops). The disposition reads
  * their seal for a carried result, and the sweep seals them, from this one list. PURE.
  */

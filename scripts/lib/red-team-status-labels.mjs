@@ -1,6 +1,6 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
-import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
+import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
@@ -13,7 +13,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // pass never plans clear for a conflict it just recorded.
   const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
   // A hold that is only "publication pending" (stored evidence not sealed yet) is no break: pending, never clear.
-  const pendingOnly = !disposition.sendBack.length && disposition.held.length > 0 && disposition.held.every(f => f.unsealed === true);
+  const pendingOnly = redTeamHoldPendingOnly(disposition);
   const broken = !pendingOnly && (disposition.sendBack.length || disposition.held.length);
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {

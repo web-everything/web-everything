@@ -229,7 +229,10 @@ describe('the sealed status reader fails closed', () => {
     writeStatusFile(status);
     expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ unsealed: true });
     expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
-    expect(redTeamEnqueueHold({ comments: [clearComment], pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/confirmed a break/);
+    // Held, but named as what it is (publication pending), and unknown run evidence keeps its own reason.
+    expect(redTeamEnqueueHold({ comments: [clearComment], pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/not published yet/);
+    expect(redTeamEnqueueHold({ comments: [clearComment], pr: 42, head, repo, ok: false, reason: 'scan-capped', loopPayload: null }))
+      .toMatch(/scan-capped/);
     // Not a break yet (nothing compared), so pending: never clear, and an existing clear label is stripped.
     expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: ['red-team:clear'], comments: [clearComment], evidence: {} }))
       .toEqual({ add: 'red-team:pending', remove: ['red-team:clear'] });
