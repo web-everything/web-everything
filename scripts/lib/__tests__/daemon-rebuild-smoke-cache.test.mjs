@@ -10,7 +10,7 @@ import { rebuildClone, readRebuildState, readyCandidatePath } from '../daemon-re
 import { SMOKE_CHECKS, runLiveSmoke } from '../daemon-live-smoke.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
-import { smokePassKey, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
+import { smokePassKey, smokeDepthTag, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 
@@ -295,12 +295,27 @@ describe('durable smoke pass cache', () => {
     expect(proofs[0].key).toBe(identity(f, head(f)).key);
   });
 
+  it('a reduced-depth proof never satisfies a full-depth request', async () => {
+    const f = makeFixture();
+    const target = advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    vi.stubEnv('WE_SMOKE_DISPATCH_PASSES', '0'); vi.stubEnv('WE_SMOKE_SKIP_RECONCILE_DRY_RUN', '1');
+    const light = identity(f, target);
+    writeRebuildState(f.cloneDir, { smokePassed: [{ tree: light.tree, key: light.key, passedAt: new Date().toISOString() }] }, f.env);
+    vi.stubEnv('WE_SMOKE_DISPATCH_PASSES', '3'); vi.stubEnv('WE_SMOKE_SKIP_RECONCILE_DRY_RUN', '0');
+    expect(identity(f, target).key).not.toBe(light.key);
+    const smoke = vi.fn(async () => PASS);
+    await rebuild(f, smoke);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    vi.unstubAllEnvs();
+  });
+
   it.each(['lockHash', 'nodeVersion', 'harnessHash', 'cloneKind'])('does not reuse a proof with a different %s', async (field) => {
     const f = makeFixture();
     const target = advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
     gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
     const tree = identity(f, target).tree;
-    const parts = { tree, cloneKind: 'clone', lockHash: '', nodeVersion: process.version,
+    const parts = { tree, cloneKind: 'clone', depth: smokeDepthTag(), lockHash: '', nodeVersion: process.version,
       harnessHash: createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs'))).digest('hex') };
     expect(smokePassKey(parts)).toBe(identity(f, target).key);
     writeRebuildState(f.cloneDir, { smokePassed: [{ tree, key: smokePassKey({ ...parts, [field]: 'different' }), passedAt: new Date().toISOString() }] }, f.env);
