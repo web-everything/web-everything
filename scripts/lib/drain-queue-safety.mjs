@@ -422,7 +422,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
 /** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.
  * Incomplete evidence leaves the historical hold in place for operator inspection.
  */
-function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, quarantine, retryPolicy, now = Date.now() }) {
+function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, now = Date.now() }) {
   try {
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
@@ -557,7 +557,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, quara
       logReason = 'only derived aggregate failures; operator must inspect failed jobs and enqueue manually';
     let infra = !logReason && intrinsic.every(check => (!hasAggregateCandidates && summaryInfra(check)) || logVerdicts.get(check.id) === true);
     const rerun = requestMqReruns({ attempts, repo, exec, scope: rerunScope,
-      eligible: !infra && !logReason && !hasAggregateCandidates,
+      eligible: !infra && !logReason && !hasAggregateCandidates, dryRun,
       spend: () => { if (budget <= 2) throw new Error('retry evidence budget exhausted'); budget--; } });
     if (rerun.reason) logReason = rerun.reason;
     if (attempts.reason) infra = false;
@@ -629,7 +629,7 @@ function mqRetryDeclineReason(evidence, holdLine) {
   return 'retry conditions not met';
 }
 
-export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, now = Date.now(),
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, dryRun = false, now = Date.now(),
   // Hermetic under test: the live ops/quarantine branch is only consulted when a test injects a reader.
   quarantine = { readList: process.env.VITEST || process.env.WE_UNDER_TEST ? null : () => readQuarantine() } } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
@@ -646,7 +646,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
         retryEvidence: (retryEvidence = timelineHasFailedChecks(timeline, currentHead)
-          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, quarantine, now,
+          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (!decision.hold && decision.line) log(decision.line);

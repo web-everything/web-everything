@@ -60,9 +60,10 @@ export function inspectMqReruns({ checks, repo, commit, removedAt }) {
 }
 
 /** Injected, argv-only IO; claim before POST so ambiguous failures cannot cause repeated requests. */
-export function requestMqReruns({ attempts, repo, exec, scope = exec, eligible, spend = () => {} }) {
+export function requestMqReruns({ attempts, repo, exec, scope = exec, eligible, dryRun = false, spend = () => {} }) {
   if (!eligible || attempts.confirmed) return { reason: attempts.reason ?? null };
   if (attempts.reason) return { reason: attempts.reason };
+  if (dryRun && attempts.candidates.length) return { reason: 'dry-run: rerun not requested; operator must inspect failed jobs' };
   if (attempts.candidates.length > 10)
     return { reason: 'failed jobs exceed 10-job limit; operator must inspect failed jobs and enqueue manually' };
   if (!attempts.candidates.length) return { reason: null };
