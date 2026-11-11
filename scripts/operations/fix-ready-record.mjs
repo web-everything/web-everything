@@ -35,16 +35,34 @@ export function adoptionReaderPath({ env = process.env, home = env.HOME || homed
  *  directory, as both readers do), then walked one component at a time the way the kernel does: each existing
  *  component is resolved through its symlinks, and `..` steps out of the directory resolved so far (so `link/..` leaves
  *  the symlink's TARGET, not the link's parent; `path.resolve` would wrongly collapse it textually). Components that do
- *  not exist yet (a ledger not written yet) are appended as written. */
+ *  not exist yet (a ledger not written yet) are appended as written.
+ *
+ *  Returns null when the kernel itself would refuse the name, so a spelling that only LOOKS like another file is never
+ *  accepted as it: `..` after a component that does not exist (ENOENT), after a regular file (ENOTDIR) or after a
+ *  dangling symlink; any component below a regular file or a dangling symlink; and any lookup error other than "does
+ *  not exist" (permission, symlink loop, name too long), which is treated as unopenable, never as a missing file. */
 export function canonicalPath(p, fsApi = fs) {
   const abs = isAbsolute(p) ? p : `${process.cwd()}${sep}${p}`;
   let cur = parse(abs).root;
   let exists = true;
+  let dangling = false; // the last component is a symlink whose target is missing: nothing can be looked up below it
   for (const part of abs.slice(cur.length).split(sep)) {
     if (part === '' || part === '.') continue;
-    if (part === '..') { cur = dirname(cur); continue; }
+    if (dangling) return null;
+    if (part === '..') {
+      if (!exists) return null; // the kernel must look up the missing directory before it can step out of it
+      try { if (!fsApi.statSync(cur).isDirectory()) return null; } catch { return null; }
+      cur = dirname(cur);
+      continue;
+    }
     const next = join(cur, part);
-    if (exists) { try { cur = fsApi.realpathSync(next); continue; } catch { exists = false; } }
+    if (exists) {
+      try { cur = fsApi.realpathSync(next); continue; } catch (e) {
+        if (e?.code !== 'ENOENT') return null;
+        exists = false;
+        try { fsApi.lstatSync(next); dangling = true; } catch (l) { if (l?.code !== 'ENOENT') return null; }
+      }
+    }
     cur = next;
   }
   return cur;
@@ -233,7 +251,10 @@ export function main(argv = process.argv.slice(2), deps = {}) {
       file = readyRecordPath({ env, ...(deps.settingsFile ? { settingsFile: deps.settingsFile } : {}) });
       readerPath = adoptionReaderPath({ env, settings: deps.adoptionSettings, settingsFile: deps.adoptionSettingsFile });
     } catch (e) { console.error(`fix-ready-record: cannot resolve the ledger path / adoption-matrix settings: ${e.message}`); return 2; }
-    if (canonicalPath(readerPath) !== canonicalPath(file)) {
+    // A name the filesystem cannot open (null) is never the same file as anything: refuse it like a split.
+    const readerCanon = canonicalPath(readerPath);
+    const writerCanon = canonicalPath(file);
+    if (readerCanon === null || writerCanon === null || readerCanon !== writerCanon) {
       console.error(`fix-ready-record: refused: the adoption matrix reads ${readerPath} (WE_FIX_READY_PATH / fixReadyPath) but this writer would append to ${file} (readyRecordPath); make them the same file`);
       return 1;
     }

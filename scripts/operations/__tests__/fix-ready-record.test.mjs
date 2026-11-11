@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildReadyRecord, writeReadyRecord, readyRecordPath, adoptionReaderPath, parseArgs, main } from '../fix-ready-record.mjs';
+import { buildReadyRecord, writeReadyRecord, readyRecordPath, adoptionReaderPath, canonicalPath, parseArgs, main } from '../fix-ready-record.mjs';
 import { createAdoptionMatrixReader } from '../adoption-matrix-io.mjs';
 import { parseFixReadyLines } from '../adoption-matrix.mjs';
 import { jsonLines, readyEvidence } from '../prototype-load.mjs';
@@ -467,6 +467,53 @@ describe('fix-ready-record main()', () => {
         writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'sub', 'ledger.jsonl') }));
         expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(0);
         expect(jsonLines(readFileSync(join(dir, 'sub', 'ledger.jsonl'), 'utf8'))).toHaveLength(1);
+      });
+      describe('a reader name the filesystem cannot open is never the writer file', () => {
+        // Every one of these collapses (textually) to `<dir>/ledger.jsonl`, the writer's file, but the kernel fails the
+        // lookup (ENOENT / ENOTDIR), so the adoption matrix would read nothing from it.
+        it.each([
+          ['a missing directory before `..`', (dir) => `${dir}/missing/../ledger.jsonl`],
+          ['a missing directory with a nested missing child before `..`', (dir) => `${dir}/missing/deeper/../../ledger.jsonl`],
+          ['a regular file used as a directory before `..`', (dir) => `${dir}/plain.txt/../ledger.jsonl`],
+          ['a dangling symlink before `..`', (dir) => `${dir}/dangling/../ledger.jsonl`],
+          ['a regular file used as a directory before a child', (dir) => `${dir}/plain.txt/child/../../ledger.jsonl`],
+        ])('refuses (exit 1) %s, naming both files, and writes nothing', (_n, spell) => {
+          const { dir, settingsFile, ledger } = setup();
+          const { err } = quiet();
+          writeFileSync(join(dir, 'plain.txt'), 'x');
+          symlinkSync(join(dir, 'gone'), join(dir, 'dangling'));
+          const env = { HOME: dir, WE_FIX_READY_PATH: spell(dir) };
+          expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+          expect(err.mock.calls[0][0]).toMatch(/refused/);
+          expect(err.mock.calls[0][0]).toContain(`adoption matrix reads ${spell(dir)}`);
+          expect(err.mock.calls[0][0]).toContain(`would append to ${ledger}`);
+          expect(existsSync(ledger)).toBe(false);
+          expect(existsSync(join(dir, 'missing'))).toBe(false);
+        });
+        it('refuses an unopenable name on the writer side too', () => {
+          const { dir, settingsFile } = setup();
+          const { err } = quiet();
+          const odd = `${dir}/missing/../ledger.jsonl`;
+          writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: odd }));
+          const env = { HOME: dir, WE_FIX_READY_PATH: join(dir, 'ledger.jsonl') };
+          expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+          expect(err.mock.calls[0][0]).toMatch(/refused/);
+          expect(existsSync(join(dir, 'ledger.jsonl'))).toBe(false);
+        });
+        it('canonicalPath returns null for each unopenable spelling and a path for the openable ones', () => {
+          const { dir } = setup();
+          writeFileSync(join(dir, 'plain.txt'), 'x');
+          expect(canonicalPath(`${dir}/missing/../l`)).toBeNull();
+          expect(canonicalPath(`${dir}/plain.txt/../l`)).toBeNull();
+          expect(canonicalPath(`${dir}/plain.txt/child`)).toBeNull();
+          expect(canonicalPath(`${dir}/sub/../l`)).toBe(`${dir}/l`);
+          expect(canonicalPath(`${dir}/not/yet/written.jsonl`)).toBe(`${dir}/not/yet/written.jsonl`);
+        });
+        it('treats a permission or loop error as unopenable rather than as a missing file', () => {
+          const err = Object.assign(new Error('boom'), { code: 'EACCES' });
+          const fsApi = { realpathSync: () => { throw err; }, lstatSync: () => { throw err; }, statSync: () => { throw err; } };
+          expect(canonicalPath('/a/b', fsApi)).toBeNull();
+        });
       });
       it('still refuses two different files whose names merely look alike', () => {
         const { dir, settingsFile } = setup();
