@@ -100,7 +100,7 @@ describe('fix-ready-record', () => {
       const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
       expect(r.ok, name).toBe(false);
       expect(r.error).toMatch(/write failed|short write/);
-      expect(r.error).toMatch(/NOT cut back/);
+      expect(r.error).toMatch(/NOT cut back, the partial line is isolated with a newline/);
       expect(existsSync(`${file}.lock`)).toBe(false);
       const lines = readFileSync(file, 'utf8').split('\n');
       expect(lines.slice(0, 3)).toEqual([JSON.stringify(old), '{"ref', '']); // old record, the 5 torn bytes alone, then the newline
@@ -109,6 +109,25 @@ describe('fix-ready-record', () => {
       expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(true);
       expect(jsonLines(readFileSync(file, 'utf8')).map((x) => x.ref)).toEqual(['lane/old', ref]);
     }
+  });
+  it('says so when the isolating newline cannot be written either, and still never truncates', () => {
+    const file = tmp();
+    let calls = 0;
+    const fsApi = {
+      ...fs,
+      writeSync: (fd, buf, off = 0, len = buf.length - off) => {
+        if (calls++ === 0) return fs.writeSync(fd, buf, off, 5);
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); // the failure AND the newline both fail
+      },
+    };
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, fsApi });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/NOT cut back, the isolating newline could not be written/);
+    expect(readFileSync(file, 'utf8')).toBe('{"ref'); // unterminated, but nothing was removed
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    // the next writer starts a new line itself, so its record is not fused onto the torn bytes
+    expect(writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file }).ok).toBe(true);
+    expect(jsonLines(readFileSync(file, 'utf8')).map((x) => x.ref)).toEqual([ref]);
   });
   it('keeps a record another writer appended while this write was failing, parsed, with the torn bytes on their own line', () => {
     const file = tmp();

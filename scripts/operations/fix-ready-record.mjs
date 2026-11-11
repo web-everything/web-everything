@@ -3,7 +3,7 @@
 // NOT WEAKENED needs ref + 40-hex sha + tests green; WEAKENED additionally needs auditRuling (R<n>) and a non-empty
 // auditDisclosed array of non-empty strings. A record identical to the latest one for that ref+sha is refused; a different
 // one supersedes it (the reader lets the latest record per sha win). Each written record also carries `at` (ISO write
-// time), which the adoption matrix reader requires; `at` is ignored when deciding whether a record is a duplicate. The append is written until complete under a lock file; if it fails part-way the ledger is not truncated (that could delete another writer's record), the torn bytes are closed off with a newline so they sit on their own malformed line, and the failure is reported.
+// time), which the adoption matrix reader requires; `at` is ignored when deciding whether a record is a duplicate. The append is written until complete under a lock file; if it fails part-way the ledger is not truncated (that could delete another writer's record), the torn bytes are closed off with a newline so they sit on their own malformed line (prototype-load drops it; the adoption matrix notes a malformed line until it leaves its 1 MiB tail), and the failure is reported.
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -122,7 +122,9 @@ function releaseLock(lock, token, fsApi) {
 /** Writes every byte of `buf` to an append handle. writeSync may accept fewer bytes than asked, so loop on its return
  *  value. If a write throws or makes no progress, the ledger is NOT truncated (a cut-back is not atomic with another
  *  writer's append and could delete that writer's record). Instead one newline is appended, best effort, so the torn
- *  bytes become an isolated malformed line that the JSON-lines readers already drop, and the failure is reported. */
+ *  bytes become an isolated malformed line, and the failure is reported (saying whether the newline landed). The
+ *  prototype-load reader's jsonLines() drops that line; the adoption matrix reader counts it as a 'fix-ready log
+ *  malformed' note until it leaves its 1 MiB tail, a known cost of never deleting another writer's data. */
 function appendAll(fd, buf, fsApi) {
   let off = 0;
   try {
@@ -133,8 +135,12 @@ function appendAll(fd, buf, fsApi) {
     }
     return { ok: true };
   } catch (e) {
-    try { fsApi.writeSync(fd, Buffer.from('\n')); } catch { /* best effort: the next writer also starts a new line if the file lacks a final newline */ }
-    return { ok: false, error: `write failed: ${e.message}; ledger NOT cut back, but the partial line is isolated with a newline (readers skip it)` };
+    let isolated = false;
+    try { isolated = fsApi.writeSync(fd, Buffer.from('\n')) === 1; } catch { /* best effort: the next writer also starts a new line if the file lacks a final newline */ }
+    const tail = isolated
+      ? 'the partial line is isolated with a newline (jsonLines drops it; the adoption matrix reports it as a malformed fix-ready line until it leaves the reader\'s 1 MiB tail)'
+      : 'the isolating newline could not be written either, so the partial line stays unterminated until the next writer starts a new line';
+    return { ok: false, error: `write failed: ${e.message}; ledger NOT cut back, ${tail}` };
   }
 }
 
