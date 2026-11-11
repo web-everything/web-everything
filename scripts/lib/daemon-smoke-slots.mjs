@@ -68,7 +68,9 @@ function readState(path) {
     if (error.code === 'ENOENT') return { nextTicket: 1, holders: [], waiters: [] };
     throw error;
   }
-  const entry = value => positive(value?.pid) && positive(value?.ticket) && Number.isFinite(value?.at);
+  // id is optional so state written before per-acquisition ids still reads; when present it must be a string.
+  const entry = value => positive(value?.pid) && positive(value?.ticket) && Number.isFinite(value?.at)
+    && (value.id === undefined || typeof value.id === 'string');
   if (!positive(state?.nextTicket) || !Array.isArray(state?.holders) || !Array.isArray(state?.waiters)) {
     throw new Error('daemon-live-smoke: invalid smoke slot state; inspect smoke-slots.json before retrying');
   }
@@ -163,8 +165,8 @@ export async function acquireSmokeSlot({
         .sort((a, b) => a.ticket - b.ticket);
       const result = update(state);
       const temporary = join(lock, temporaryFile);
-      writeFileSync(temporary, JSON.stringify(state));
-      renameSync(temporary, path);
+      fs.writeFileSync(temporary, JSON.stringify(state));
+      fs.renameSync(temporary, path);
       return result;
     } finally {
       for (const name of [temporaryFile, ownerFile]) {
@@ -176,23 +178,27 @@ export async function acquireSmokeSlot({
     }
   }
 
+  // Ownership is the per-acquisition id, never the ticket number: a ticket whose state write failed is
+  // re-issued to the next acquirer (even in this same process), so cleanup by ticket could erase its entry.
+  const id = randomUUID();
   let ticket;
+  // True once an update may have persisted this acquisition's waiter entry (a failed write can still have landed).
+  let maybePersisted = false;
   let released = false;
-  const failedTicket = { path, pid, ticket: undefined };
+  const failedTicket = { path, pid, id };
   const release = async (until = Infinity) => {
     if (released) return;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         await transaction(state => {
-          state.holders = state.holders.filter(e => e.ticket !== ticket);
-          state.waiters = state.waiters.filter(e => e.ticket !== ticket);
+          state.holders = state.holders.filter(e => e.id !== id);
+          state.waiters = state.waiters.filter(e => e.id !== id);
         }, until);
         released = true;
         failedTickets.delete(failedTicket);
         return;
       } catch (error) {
         if (attempt === 3) {
-          failedTicket.ticket = ticket;
           failedTickets.add(failedTicket);
           // Even a broken logger must not mask a smoke result. The next acquire retries cleanup.
 
@@ -205,11 +211,11 @@ export async function acquireSmokeSlot({
   try {
     const pending = [...failedTickets].filter(e => e.path === path && e.pid === pid);
     if (pending.length) {
-      const tickets = new Set(pending.map(e => e.ticket));
+      const ids = new Set(pending.map(e => e.id));
       try {
         await transaction(state => {
-          state.holders = state.holders.filter(e => e.pid !== pid || !tickets.has(e.ticket));
-          state.waiters = state.waiters.filter(e => e.pid !== pid || !tickets.has(e.ticket));
+          state.holders = state.holders.filter(e => !ids.has(e.id));
+          state.waiters = state.waiters.filter(e => !ids.has(e.id));
         }, deadline);
         for (const entry of pending) failedTickets.delete(entry);
       } catch (error) {
@@ -221,27 +227,30 @@ export async function acquireSmokeSlot({
     }
     for (;;) {
       // Always attempt capacity first; the deadline is only tested after a failed attempt.
-      const priorTicket = ticket;
+      // A ticket is claimed locally only after its transaction committed: if the write fails, nextTicket
+      // was not persisted and the number goes to someone else.
+      let claimed;
       const ahead = await transaction(state => {
-        if (ticket === undefined) {
+        let mine = ticket;
+        if (mine === undefined) {
           if (!positive(state.nextTicket + 1)) throw new Error('daemon-live-smoke: slot tickets exhausted; inspect state before retrying');
-          ticket = state.nextTicket++;
-          state.waiters.push({ pid, ticket, at: now() });
+          mine = state.nextTicket++;
+          state.waiters.push({ pid, ticket: mine, at: now(), id });
         }
-        const index = state.waiters.findIndex(e => e.ticket === ticket);
+        const index = state.waiters.findIndex(e => e.id === id);
         if (index < 0) throw new Error('daemon-live-smoke: own smoke ticket missing');
         // Capacity never permits a later ticket to pass the queue head.
         if (index === 0 && state.holders.length < cap) {
           state.holders.push(...state.waiters.splice(index, 1));
+          claimed = mine; maybePersisted = true;
           return null;
         }
-        if (now() >= deadline) {
-          // Nothing persists when update throws: forget a ticket created in this attempt.
-          ticket = priorTicket;
-          throw expired;
-        }
+        // Nothing persists when update throws: a ticket created in this attempt is simply never claimed.
+        if (now() >= deadline) throw expired;
+        claimed = mine; maybePersisted = true;
         return index;
       }, deadline);
+      ticket = claimed;
       if (ahead === null) return { acquired: true, release };
       if (ahead !== lastAhead) log.error?.(`daemon-live-smoke: smoke-queued (${ahead} ahead)`);
       lastAhead = ahead;
@@ -250,11 +259,11 @@ export async function acquireSmokeSlot({
     }
   } catch (error) {
     if (error === expired) {
-      if (ticket !== undefined) await release(now());
+      if (maybePersisted) await release(now());
       log.error?.(`daemon-live-smoke: smoke-queue-timeout (waited ${now() - queuedAt}ms) — giving up this attempt`);
       return { acquired: false, release() {} };
     }
-    if (ticket !== undefined) await release();
+    if (maybePersisted) await release();
     throw error;
   }
 }

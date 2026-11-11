@@ -4,8 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
@@ -205,7 +204,7 @@ describe('daemon smoke slots', () => {
     writeFileSync(join(stateDir, 'smoke-slots.json'), JSON.stringify({ nextTicket: 3,
       holders: [{ pid: 91, ticket: 1, at: 1 }], waiters: [{ pid: 92, ticket: 2, at: 1 }] }));
     const slot = await acquire(13, { env: { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' }, isAlive: pid => pid === 13 });
-    expect(state().holders).toEqual([{ pid: 13, ticket: 3, at: 123 }]);
+    expect(state().holders).toEqual([{ pid: 13, ticket: 3, at: 123, id: expect.any(String) }]);
     expect(state().waiters).toEqual([]);
     await slot.release();
     await slot.release(); // idempotent
@@ -622,7 +621,7 @@ describe('daemon smoke slots', () => {
       }
     } });
     expect(time).toBe(3001);
-    expect(state().waiters).toEqual([{ pid: 12, ticket: 2, at: 0 }]);
+    expect(state().waiters).toEqual([{ pid: 12, ticket: 2, at: 0, id: expect.any(String) }]);
     rmSync(lock, { recursive: true });
     time = 63_001;
     await holder.release();
@@ -755,5 +754,36 @@ describe('daemon smoke slots', () => {
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(state().holders).toEqual([]);
     expect(state().waiters).toEqual([]);
+  });
+
+  it('cleanup of an uncommitted ticket never removes another same-process acquisition (cap holds)', async () => {
+    const write = fs.writeFileSync;
+    let failed = false;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((path, ...args) => {
+      if (!failed && String(path).endsWith('.state.json')) {
+        failed = true;
+        throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+      }
+      return write(path, ...args);
+    });
+    // Same pid for every caller, started without awaiting: A's transient write failure happens
+    // before B commits the very same ticket number.
+    const a = acquire(process.pid);
+    const b = acquire(process.pid);
+    const outcome = await Promise.allSettled([a, b]);
+    expect(failed).toBe(true);
+    expect(outcome[0].status).toBe('rejected');
+    const slotB = outcome[1].value;
+    expect(slotB.acquired).toBe(true);
+    // B is still counted: A's cleanup did not erase it.
+    expect(state().holders).toHaveLength(1);
+    const c = await acquire(process.pid);
+    expect(c.acquired).toBe(true);
+    expect(state().holders).toHaveLength(2);
+    // Cap 2 is full: a third caller must queue, not acquire.
+    const d = acquire(process.pid, { now: (() => { let t = 123; return () => (t += 1_000_000); })() });
+    expect((await d).acquired).toBe(false);
+    await slotB.release(); await c.release();
+    expect(state().holders).toEqual([]);
   });
 });
