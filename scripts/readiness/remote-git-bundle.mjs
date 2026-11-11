@@ -274,7 +274,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     if (newMode === '040000') continue;
     if (changedLines && fields[4] === 'M' && /^0{40}(0{24})?$/.test(oldSha) === false) {
       modified.push({ label, path, oldSha, newSha });
-      if (modified.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+      pathCount++;
+      if (modified.length > maxBlobs || pathCount > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
       continue;
     }
     const paths = blobs.get(newSha) ?? new Map();
