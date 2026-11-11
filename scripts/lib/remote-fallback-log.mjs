@@ -8,7 +8,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFil
 import { basename, join } from 'node:path';
 
 const MAX_BYTES = 512 * 1024;
-const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f  ]/g, '?').slice(0, 4096);
+const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
 
 export function recordLocalSlotFallback({ lockRoot, reason, repo, kind, now = () => Date.now() } = {}) {
   try {
