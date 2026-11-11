@@ -256,6 +256,22 @@ describe('the sealed status reader fails closed', () => {
     expect(at(live).held[0].unsealed).toBeUndefined();
     expect(labels).toEqual(['red-team:blocked']);
   });
+  it('the sweep seals a carried-from head even when the run-evidence summary returns no status for it', () => {
+    const live = 'b'.repeat(40);
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    const thread = [clearComment, { ...carriedClear(live), createdAt: '2026-11-10T12:05:00Z' }];
+    let labels = [];
+    const view = () => ({ number: 42, state: 'OPEN', labels: labels.map(name => ({ name })), headRefOid: live, comments: thread, reviews: [] });
+    sweepAdvisoryLabels({ repo, listPrs: () => [{ ...view(), labels: [{ name: 'red-team:pending' }] }], readPr: view, log: () => {},
+      // The lossy summary: unknown run evidence, no status (a newer run, a parse cap, a read error).
+      readStatusEvidence: () => ({ ok: false }),
+      provider: { currentRepo: () => repo, readComments: () => thread, postComment: () => { throw Error('never'); }, ensureLabel: () => {},
+        setLabels: (_r, _p, { add, remove }) => { labels = labels.filter(l => !remove.includes(l)); if (add && !labels.includes(add)) labels.push(add); } },
+      listUnpublishedStatuses: () => [], publishStored: input => publishStoredRedTeamResult({ ...input, publishNeedsYou: () => {} }) });
+    expect(readStatusFile().sealedBreaks).toHaveLength(1);
+    expect(labels).toEqual(['red-team:blocked']);
+  });
   it('a carried result from a source with no break: the source seals empty and the carried head is not held', () => {
     const live = 'b'.repeat(40);
     store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);

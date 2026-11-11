@@ -3,6 +3,7 @@ import { RED_TEAM_STATUS_LABELS, syncRedTeamStatusLabels } from '../lib/red-team
 import { readDrainRedTeamEvidence, redTeamStatusDir, settleUnknownEvidenceByComment } from '../lib/drain-red-team-evidence.mjs';
 import { needsPublish, publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
 import { redTeamCarrySources } from '../lib/red-team-gate.mjs';
+import { readSealedStatus } from '../lib/red-team-sealed-status.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
  * @description THE `advisory:*` STALENESS SWEEP — drops `advisory:accepted` / `advisory:changes` from any open PR
@@ -158,6 +159,7 @@ export function defaultListUnpublishedStatuses({ dir = redTeamStatusDir() } = {}
 export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
   publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
+  readSeal = key => readSealedStatus({ ...key, env: process.env }),
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const prs = listPrs({ repo });
@@ -212,9 +214,10 @@ export function sweepAdvisoryLabels({
       if (!dryRun) {
         for (const from of redTeamCarrySources({ comments, pr: pr.number, head: live.headRefOid })) {
           try {
-            const source = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: from }).status;
-            if (!needsPublish(source) || source.head !== from) continue;
-            const sealed = publishStored({ status: source, sealOnly: true,
+            // Pick by the READER's own view of the raw status file (never the run-evidence summary, which can omit a status
+            // that exists): exactly the heads every reader holds as unsealed. The publisher re-reads the file under its lock.
+            if (readSeal({ repo: resolvedRepo, pr: pr.number, head: from })?.unsealed !== true) continue;
+            const sealed = publishStored({ status: { repo: resolvedRepo, pr: pr.number, head: from }, sealOnly: true,
               listComments: () => provider.readComments(resolvedRepo, pr.number),
               postComment: () => { throw Error('a seal-only pass never posts'); } });
             if (sealed.status !== 'skipped') (publication.sourceSeals ??= []).push(`${from.slice(0, 9)}:${sealed.status}`);
