@@ -324,7 +324,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
                 const first = idleStamp(entry.file, entry.key, sampledAt);
                 if (sampledAt - first < idleConfirmMs) continue;
               }
-            } else if (!(evidence.complete || boundedOrphan(evidence, sampledAt, diedBy)) || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
+            } else if (!(evidence.complete || (boundedOrphan(evidence, sampledAt, diedBy) && !maybeSurvivingDescendants(telemetry, entry.at ?? entry.mtimeMs, diedBy))) || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
             // dispatch marker is ever lost, whatever the timing and without any lease or lock.
@@ -358,5 +358,14 @@ function maybeOwnsInflight(telemetry, atMs, diedByMs) {
   return telemetry.recent.some(item => {
     const started = Date.parse(item?.startedAtET);
     return !Number.isInteger(item?.code) && (!Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs + CLOCK_SKEW_MS));
+  });
+}
+
+// 97/254 receipts may leave surviving descendants, so such a receipt inside the window keeps the marker even past the bound.
+function maybeSurvivingDescendants(telemetry, atMs, diedByMs) {
+  return telemetry.recent.some(item => {
+    if (item?.code !== 97 && item?.code !== 254) return false;
+    const started = Date.parse(item?.startedAtET);
+    return !Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs + CLOCK_SKEW_MS);
   });
 }
