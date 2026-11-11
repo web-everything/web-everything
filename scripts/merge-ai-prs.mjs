@@ -898,6 +898,7 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
   let files = readOptions?.files;
   // A listing is trusted only with explicit completeness AND a head it was read at (#6021): an omitted flag or SHA
   // (the files-only shape) is unknown evidence and takes the pinned read below, never a default-trusted listing.
+  let netRead = false;
   let filesComplete = Array.isArray(files) && readOptions?.filesComplete === true
     && typeof readOptions.listedHeadSha === 'string' && !!readOptions.listedHeadSha
     && (!evidence.headSha || readOptions.listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase());
@@ -909,9 +910,25 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
       reason: `workflow-edit change list unreadable — merge deferred this pass: ${read.error}` };
     files = read.files;
     filesComplete = true;
+    netRead = true;
   }
   let workflow = decideDrainWorkflowEditHold({ files, filesComplete,
-    headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+    headSha: evidence.headSha || readOptions?.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+  // A listing that says "hold" may be stale: after a refresh merge GitHub's file list still shows main's content. Confirm
+  // against the NET diff (merge-base...head) at the exact head before parking; unreadable fails closed (defer).
+  if (workflow.hold && !workflow.defer && !netRead && readOptions?.workflowEditSetting !== 'off' && readOptions?.local
+    && typeof readOptions.defaultBranch === 'string' && readOptions.defaultBranch) { // unknown base: keep the listing's hold
+    const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
+      base: readOptions.defaultBranch, cwd: readOptions.cwd ?? process.cwd(),
+      exec: readOptions.exec ?? execFileSync });
+    // Unreadable or empty net diff never clears: the listing's hold stands (fail closed, same as before this recheck).
+    if (!read.error && read.files.length > 0) {
+      files = read.files;
+      filesComplete = true;
+      workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+        headSha: evidence.headSha || readOptions.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+    }
+  }
   if (workflow.defer) return { action: 'defer', applyLabel: null, reason: workflow.reason };
   // A workflow clearance may move over proven numbering or exact tree identity here. General refresh equivalence does not
   // waive the exact-head workflow ceremony. Record the carry before any gate can honour it.
@@ -5991,7 +6008,7 @@ async function runCli() {
     for (const v of verdicts) {
       if (v.decision !== 'merge') continue; // @merge-gate-exempt DOWNGRADE-only backstop (merge→skip); a held PR is already `skip`, so it needs no reviewHeld branch — re-admitting it here could only wrongly merge it
       if (decideDrainWorkflowEditHold({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
-        setting: workflowEditSetting.value }).hold) {
+        headSha: v.listedHeadSha, setting: workflowEditSetting.value }).hold) {
         const gate = decideDrainReviewGate({ labels: v.prLabels, escalate: false }, {
           pr: v.num, repo: v.repo, ...workflowReadOptions(v), workflowOnly: true });
         if (gate.action !== 'merge') {
