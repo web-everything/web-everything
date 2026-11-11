@@ -55,6 +55,7 @@ const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] 
 // Include repeated/mixed Markdown emphasis; a closing underscore is a word character, so also allow it at the boundary.
 const FINDING_SHAPED_RE = /^\s*\d+\s*[.)]\s*\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
+const POLICY_CLEAR_LINE_RE = /^Red team not required on this head: [^\r\n]*\S[^\r\n]*$/;
 // Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
 // name too: only used to SUPERSEDE a ruling, where reading more holds more.
 const REVIEWED_SHA_ANY_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->`, 'gi');
@@ -107,6 +108,14 @@ export function parseRedTeamComment(body) {
   const completedReview = Boolean(verdict && (findings.length
     || (verdict === 'accept' && /^The red team tried to break this change and reported nothing\.$/m.test(text))));
   Object.defineProperty(parsed, 'completedReview', { value: completedReview, enumerable: false });
+  // The skip settlement's policy-clear result (#6606): exactly the canonical marker and one "not required" reason
+  // line, nothing else. It is complete though it records no review verdict, so a carry of it can publish its check.
+  // The same exact shape the carry readers accept (accept-carry-forward, review-red-team-on-skip); any extra line,
+  // finding or non-canonical marker fails closed.
+  const lines = text.split('\n').filter(line => line.trim());
+  const policyClear = !findings.length && !shapedLines.length && /^[0-9a-f]{40}$/.test(parsed.rev) && lines.length === 2
+    && lines[0] === redTeamMarker(parsed.pr, parsed.rev) && POLICY_CLEAR_LINE_RE.test(lines[1]);
+  Object.defineProperty(parsed, 'policyClear', { value: policyClear, enumerable: false });
   return parsed;
 }
 

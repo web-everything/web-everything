@@ -248,7 +248,9 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
       if (!disposition.result) throw Error('no trusted red-team result on live head');
       if (!Array.isArray(disposition.result.shapedLines) || disposition.result.shapedLines.length)
         throw Error('red-team result has malformed or unparsed finding evidence; operator must inspect the full result');
-      if (disposition.result.completedReview !== true || !redTeamResultId(disposition.result))
+      // A completed review, or the canonical policy-clear result a carry re-keys onto this head (#6606).
+      if ((disposition.result.completedReview !== true && disposition.result.policyClear !== true)
+        || !redTeamResultId(disposition.result))
         throw Error('red-team result lacks completed review content; operator must inspect the full result');
       const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
       if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);

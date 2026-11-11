@@ -399,6 +399,56 @@ describe('red-team check run contract', () => {
       expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
     });
 
+    // #6606 red team (round 5): a carried policy-clear result (the skip settlement's marker plus one "not required"
+    // line) carries no review verdict, yet it is a complete result. It must publish its check, or the carried head
+    // stays blocked and every recovery retry refuses the same way. Bodies are built the way the producers build them.
+    describe('carried policy-clear results', () => {
+      const clearBody = (rev = HEAD, reason = 'not owed (stored review)') =>
+        `<!-- we:red-team-advisory pr=7 rev=${rev} -->\n\nRed team not required on this head: ${reason}`;
+      // review-job's carry: carried marker, prose, then the source head's body re-keyed to the carried-to head.
+      const carriedClear = (advisory = clearBody(OLD_HEAD), created_at = '2026-11-07T12:00:00Z') => ({
+        author: { login: 'web-everything', type: 'Bot' }, created_at,
+        body: [`<!-- review-verdict-carried from=${OLD_HEAD} to=${HEAD} patch-id=${'c'.repeat(40)} -->`,
+          'Review verdict carried across an identical contribution.',
+          advisory.replace(`rev=${OLD_HEAD}`, `rev=${HEAD}`)].join('\n') });
+      it.each([
+        ['a carried policy-clear publishes', () => [carriedClear()]],
+        ['a carried card-only policy-clear publishes', () => [carriedClear(clearBody(OLD_HEAD, 'card-only diff (policy redTeam.skipCardOnly)'))]],
+        ['a direct policy-clear on the head publishes', () => [{ ...carriedClear(), body: clearBody() }]],
+      ])('%s, with the real hold reader', async (_, comments) => {
+        const io = fixture();
+        io.holdFn = redTeamEnqueueHold;
+        io.readComments.mockReturnValue(comments());
+        expect(await publish(io)).toMatchObject({ ok: true });
+        expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success']);
+      });
+      it.each([
+        ['extra prose after the reason', `${clearBody(OLD_HEAD)}\nAnd one more line.`],
+        ['an empty reason', clearBody(OLD_HEAD, '')],
+        ['a finding beside the reason', `${clearBody(OLD_HEAD)}\n1. [**confirmed**] (failing-input, broken) \`x.mjs:1\` — breaks`],
+        ['a finding-shaped line beside the reason', `${clearBody(OLD_HEAD)}\n 1. [confirmed] x`],
+        ['the reason line without its prefix', `<!-- we:red-team-advisory pr=7 rev=${OLD_HEAD} -->\n\nnot owed (stored review)`],
+        ['an upper-case marker', clearBody(OLD_HEAD).replace('<!-- we:red-team-advisory', '<!-- WE:RED-TEAM-ADVISORY')],
+      ])('refuses a carried policy-clear with %s', async (_, advisory) => {
+        const io = fixture();
+        io.readComments.mockReturnValue([carriedClear(advisory)]);
+        expect(await publish(io)).toMatchObject({ ok: false });
+        expect(posts(io)).toEqual([]);
+      });
+      it('a carried policy-clear older than the failed check still refuses', async () => {
+        const io = fixture();
+        io.readComments.mockReturnValue([carriedClear(clearBody(OLD_HEAD), '2026-11-07T10:00:00Z')]);
+        expect(await publish(io)).toMatchObject({ ok: false });
+        expect(posts(io)).toEqual([]);
+      });
+      it('a carried policy-clear from an untrusted author refuses', async () => {
+        const io = fixture();
+        io.readComments.mockReturnValue([{ ...carriedClear(), author: { login: 'outsider' } }]);
+        expect(await publish(io)).toMatchObject({ ok: false });
+        expect(posts(io)).toEqual([]);
+      });
+    });
+
     it('a newer carry whose gate line names another head is not a carry and cannot date the live result', async () => {
       const io = fixture();
       const forged = { ...carryComment('2026-11-07T12:00:00Z'),
