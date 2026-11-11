@@ -262,6 +262,26 @@ export function resolveSmokeReadMemo(env = process.env) {
 }
 
 
+/** How deep the rebuild smoke goes: the dispatch dry-run's live passes (0 = the direct calls only, else the three
+ *  live reconcile passes) and whether the reconcile dry-run runs. The daemon boot check is NEVER affected, so a
+ *  daemon that cannot boot is still refused. Layers: standard (full) -> settings `rebuildSmokeDepth` (scripts/settings/
+ *  rebuild-smoke.json) -> env WE_SMOKE_DISPATCH_PASSES (0|3), WE_SMOKE_SKIP_RECONCILE_DRY_RUN (0|1).
+ * @returns {{dispatchPasses:0|3, skipReconcileDryRun:boolean, source:string}} */
+export function resolveSmokeDepth(env = process.env, opts = {}) {
+  try {
+    const tool = 'settings' in opts ? opts.settings : readDeclaredSettings().settings.rebuildSmokeDepth;
+    const p = env?.WE_SMOKE_DISPATCH_PASSES, k = env?.WE_SMOKE_SKIP_RECONCILE_DRY_RUN;
+    const r = cascadePolicy('rebuildSmokeDepth', tool, {
+      env, standard: { dispatchPasses: 3, skipReconcileDryRun: false },
+      envValues: { dispatchPasses: p === '0' ? 0 : p === '3' ? 3 : undefined,
+        skipReconcileDryRun: k === '1' ? true : k === '0' ? false : undefined },
+      valid: { dispatchPasses: (x) => x === 0 || x === 3, skipReconcileDryRun: (x) => typeof x === 'boolean' },
+    });
+    return { dispatchPasses: r.value.dispatchPasses, skipReconcileDryRun: r.value.skipReconcileDryRun,
+      source: r.sources?.dispatchPasses ?? 'standard' };
+  } catch { return { dispatchPasses: 3, skipReconcileDryRun: false, source: 'standard' }; }
+}
+
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
 // #4044: a crashed node child's first stderr line is only the stack LOCATION (`node:internal/modules/cjs/
 // loader:1227`) — the live 08:14 ET smoke-rejected alert carried nothing else, hiding that the gh shim's baked
@@ -517,6 +537,7 @@ async function checkGhPrList({ ghChildEnv, budgets, runChild }) {
 }
 
 async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
+  if (resolveSmokeDepth(env).skipReconcileDryRun) return { ok: true, detail: 'reconcile-pass dry-run skipped by rebuildSmokeDepth (the dispatch dry-run and daemon boot still run)' };
   const failures = [];
   const stderrTails = [];
   const causes = [];
@@ -761,11 +782,13 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
   const ledgerDir = mkdtempSync(join(tmpdir(), 'smoke-fix-loop-'));
   let pass;
   try {
-    const childEnv = { ...env, WE_FIX_LOOP_LEDGER: join(ledgerDir, 'ledger.jsonl') };
+    const depth = resolveSmokeDepth(env);
+    const childEnv = { ...env, WE_FIX_LOOP_LEDGER: join(ledgerDir, 'ledger.jsonl'),
+      WE_SMOKE_DISPATCH_PASSES: depth.dispatchPasses === 0 ? '0' : '3' };
     // Injected spawners must own every dry-run launch unless real workers were deliberately enabled.
     if (!resolveSmokeRealWorker({ env }).allowSentinel) childEnv.WE_WORKER_WRAPPER = 'off';
     // Direct-only callers retain one child and the original brief-fill budget.
-    const passes = env?.WE_SMOKE_DISPATCH_PASSES === '0' ? [null]
+    const passes = depth.dispatchPasses === 0 ? [null]
       : ['reconcile-fix-pass', 'reconcile-ci-heal-pass', 'reconcile-review-pass'];
     for (pass of passes) {
       const out = await runChild('node', ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {
