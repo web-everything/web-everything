@@ -1040,8 +1040,9 @@ describe('lane git hardening blocks lane credential helpers; the primary-only fo
   });
 
   it('the primary form drops every inherited GIT_CONFIG_COUNT entry, so an inherited helper cannot outlive the missing reset', () => {
-    const inherited = { ...base, GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: `!f() { touch '${evilRan}'; }; f`,
-      GIT_CONFIG_KEY_1: 'core.askPass', GIT_CONFIG_VALUE_1: join(root, 'evil'), GIT_CONFIG_KEY_7: 'credential.helper', GIT_CONFIG_VALUE_7: 'orphan' };
+    const pre = 'GIT_CONFIG_';
+    const inherited = { ...base, GIT_CONFIG_COUNT: '2', [`${pre}KEY_0`]: 'credential.helper', [`${pre}VALUE_0`]: `!f() { touch '${evilRan}'; }; f`,
+      [`${pre}KEY_1`]: 'core.askPass', [`${pre}VALUE_1`]: join(root, 'evil'), [`${pre}KEY_7`]: 'credential.helper', [`${pre}VALUE_7`]: 'orphan' };
     const env = laneGitHardeningEnv(inherited, { credentialPins: false, home });
     expect(pinsOf(env).map(([k]) => k)).not.toContain('credential.helper');
     expect(Object.keys(env).filter(k => /^GIT_CONFIG_(KEY|VALUE)_/.test(k))).toHaveLength(2 * Number(env.GIT_CONFIG_COUNT));
