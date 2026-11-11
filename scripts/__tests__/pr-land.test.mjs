@@ -60,7 +60,8 @@ describe('#2844 — pr-land stamps the PR author into the body at open', () => {
     // Belt-and-braces on the one thing a pure test cannot see: that the module-scope CREATE_BODY, and the
     // best-effort edit that backfills an already-open PR, are built by the composer rather than around it.
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src).toMatch(/const CREATE_BODY = composePrBody\(BODY\)/);
+    expect(src).toMatch(/(?:const|let) CREATE_BODY = composePrBody\(BODY\)/); // R893: let, reassigned only to append the deferred-to-CI disclosure
+    expect(src.match(/^\s*CREATE_BODY = /gm)).toHaveLength(1);
     expect(src).toMatch(/const updated = composePrBody\(liveBody\)/);
   });
 });
@@ -492,7 +493,10 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
   const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('#2199: the label is applied only after the green-wait — never eagerly at PR open', () => {
     // applyLabel() must be invoked AFTER the check-wait loop (`labelWhenGreen`), not in the open/3b block.
-    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) applyLabel\(\)/);
+    // R893: the call is now preceded, in the same labelWhenGreen block, by the deferred-to-ci green-CI refusal, so the
+    // label is still applied only after the green-wait AND (for a deferred PR) only after that refusal check passes.
+    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\([^)]*\);[^]*?\n\s*applyLabel\(\);\s*\n\s*\}/);
+    expect(src.match(/^\s*applyLabel\(\);/gm)).toHaveLength(1);
     // the open-only (--no-wait) path emits UNLABELLED
     expect(src).toMatch(/opened UNLABELLED|UNLABELLED — CI not confirmed/);
     // the eager pre-CI add-label call is gone from the open path (applyLabel is a deferred closure)
@@ -737,7 +741,9 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     expect(src).toMatch(/forge\.viewPr\(prNum, 'body'\)/);
     expect(src).toMatch(/forge\.viewPr\(prNum, 'labels'\)/);
     expect(src).toMatch(/forge\.viewPr\(prNum, 'mergeable,mergeStateStatus'\)/);
-    expect(src).toMatch(/forge\.editBody\(prNum, updated\)/);
+    // R893: the live-body backfill edit goes through syncDeferredBody, which itself calls forge.editBody (pinned in
+    // lane-verify-deferred.test.mjs) — the call site must still hand it the forge port, never a bare gh literal.
+    expect(src).toMatch(/syncDeferredBody\(\{ forge, prNum, liveBody, composed: updated, deferred: DEFERRED_TO_CI \}\)/);
     expect(src).toMatch(/forge\.editBody\(prNum, reconciled\.body\)/);
     expect(src).toMatch(/forge\.addLabel\(prNum, LABEL\)/);
     expect(src).toMatch(/forge\.addLabel\(prNum, verdict\.label\)/);
