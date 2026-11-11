@@ -23,10 +23,11 @@ function deadPid() {
   const child = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });
   return Number(child.stdout.trim());
 }
-function syncLock(f, pid) {
+/** A sync lock file `<pid> <start-ms> <nonce>`; with no pid, an old-protocol lock directory. */
+function syncLock(f, pid, started = '') {
   const lock = `${f.clone}.guard-lock`;
-  mkdirSync(lock);
-  if (pid !== undefined) writeFileSync(join(lock, 'owner'), `${pid} test\n`);
+  if (pid === undefined) mkdirSync(lock);
+  else writeFileSync(lock, `${pid} ${started} test\n`);
   return lock;
 }
 const leases = f => { try { return readdirSync(`${f.clone}.guard-readers`); } catch { return []; } };
@@ -224,10 +225,12 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
       expect(codes, hooks.map(hook => hook.stderr).join('\n')).toEqual(editCommands.map(() => 0));
     }
     expect(leases(f)).toEqual([]);
-  });
-  it.each(['dead owner', 'no owner record'])('runs past a sync lock left by a %s, keeping the integrity checks', kind => {
+  }, 30_000);
+  it.each(['dead owner', 'no owner record', 'reused pid'])('runs past a sync lock left by a %s, keeping the integrity checks', kind => {
     const f = fixture();
-    const lock = syncLock(f, kind === 'dead owner' ? deadPid() : undefined);
+    // A reused pid is alive but started long after the recorded owner did.
+    const lock = kind === 'reused pid' ? syncLock(f, process.pid, 1000)
+      : syncLock(f, kind === 'dead owner' ? deadPid() : undefined);
     expect(f.launch()).toMatchObject({ status: 0, stderr: 'guard stderr\n' });
     // Abandoned locks are reclaimed by the next sync, not by hooks.
     expect(existsSync(lock)).toBe(true);
@@ -235,13 +238,26 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
     expect(leases(f)).toEqual([]);
   });
+  it('records its own start time in the lease so a reused pid is told apart', async () => {
+    const f = fixture();
+    writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), `console.log('ready'); process.stdin.resume(); process.stdin.on('end', () => {});`);
+    commitClone(f, 'lease probe');
+    const hook = start(f, ['scripts/guard-bash.mjs']);
+    try {
+      expect(await hook.line()).toBe('ready');
+      const [name] = leases(f);
+      expect(name).toMatch(new RegExp(`^${hook.child.pid}-[0-9a-f]+$`));
+      const started = Number(readFileSync(join(`${f.clone}.guard-readers`, name), 'utf8'));
+      expect(Math.abs(started - Date.now())).toBeLessThan(60_000);
+    } finally { expect(await hook.finish(), hook.stderr).toBe(0); }
+  });
   it('waits for a live sync to release its lock, then runs the guard', async () => {
     const f = fixture();
     const lock = syncLock(f, process.pid);
     const hook = start(f, ['scripts/guard-bash.mjs']);
     await hook.stderrIncludes('waiting for guard clone sync');
     expect(leases(f)).toEqual([]);
-    rmSync(lock, { recursive: true });
+    rmSync(lock);
     hook.child.stdin.end('payload');
     expect(JSON.parse(await hook.line())).toMatchObject({ root: f.lane, input: 'payload' });
     expect(await hook.finish(), hook.stderr).toBe(0);

@@ -1,16 +1,20 @@
 /** Maintain only the explicitly owned, disposable origin/main guard clone.
- * Sync is the only exclusive holder of `<clone>.guard-lock` (an `owner` record names its pid).
- * After taking it, sync waits a bounded time for live hook leases in `<clone>.guard-readers`
- * to drain, and refuses if they do not. Records whose owner process has exited are reclaimed.
+ * Sync is the only exclusive holder of `<clone>.guard-lock`, a file holding
+ * `<pid> <start-ms> <nonce>` and published with one hard link (an atomic create).
+ * It fetches into a private ref BEFORE taking the lock, so the lock covers only the local
+ * update-ref/reset/clean. After taking the lock it waits a bounded time for live hook leases
+ * in `<clone>.guard-readers` to drain, and refuses if they do not. Records whose owner process
+ * has exited (pid gone, or reused by a process with another start time) are reclaimed; reclaim
+ * itself is serialised behind `<clone>.guard-lock.reclaim`, so a moved-aside lock is never live.
  */
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 // Bootstrap uses only built-ins so a concurrent reset cannot rewrite a lock helper during
-// module loading. These three helpers match run-pinned-guard.mjs.
+// module loading. lockWaitMs, pause, processStart, alive and readRecord match run-pinned-guard.mjs.
 const MAX_WAIT_MS = 20_000;
 /** WE_GUARD_LOCK_WAIT_MS may only shorten the wait (tests); it can never lengthen it. */
 function lockWaitMs() {
@@ -19,40 +23,89 @@ function lockWaitMs() {
     ? Math.min(value, MAX_WAIT_MS) : MAX_WAIT_MS;
 }
 function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
-function alive(pid) {
+const STARTED = Date.now() - Math.round(process.uptime() * 1000);
+/** A process's start time in ms, or null when ps cannot say. */
+function processStart(pid) {
+  try {
+    const text = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8', timeout: 5_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
+    }).trim();
+    const time = Date.parse(text);
+    return Number.isFinite(time) ? time : null;
+  } catch { return null; }
+}
+/** Live unless the pid is gone or now belongs to a process that started at another time.
+ * Unknown evidence counts as live, so a holder is never stolen from on a guess. */
+function alive(pid, started) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
+  if (!Number.isFinite(started) || started <= 0) return true;
+  const actual = processStart(pid);
+  // ps reports whole seconds; a larger gap is a different process reusing the pid.
+  return actual === null || Math.abs(actual - started) < 3_000;
+}
+const LEGACY = Symbol('legacy directory lock');
+/** The record text, '' when absent, LEGACY for an old-protocol lock directory (no owner). */
+function readRecord(path) {
+  try { return readFileSync(path, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT') return '';
+    if (error.code === 'EISDIR') return LEGACY;
+    throw error;
+  }
+}
+function holderAlive(record) {
+  if (typeof record !== 'string' || !record) return false;
+  const [pid, started] = record.trim().split(' ').map(Number);
+  return alive(pid, started);
 }
 const nonce = () => `${process.pid}-${randomBytes(6).toString('hex')}`;
-function readOwner(path) {
-  try { return readFileSync(join(path, 'owner'), 'utf8'); }
-  catch (error) { if (error.code === 'ENOENT') return ''; throw error; }
-}
 
-/** Publish the lock with its owner record in one rename; reclaim it only from an exited owner. */
-function acquireLock(lockPath, owner) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const staging = `${lockPath}.new-${nonce()}`;
-    mkdirSync(staging);
-    writeFileSync(join(staging, 'owner'), owner);
-    try { renameSync(staging, lockPath); return; }
-    catch (error) {
-      rmSync(staging, { recursive: true, force: true });
-      if (error.code !== 'EEXIST' && error.code !== 'ENOTEMPTY') throw error;
-    }
-    const current = readOwner(lockPath);
-    if (alive(Number(current.split(' ')[0]))) {
-      throw new Error('guard clone is busy: another sync is running; retry sync');
-    }
-    // Move the abandoned lock aside, then confirm it is still the record judged abandoned.
+/** Create `path` holding `record`, atomically; false when it already exists. */
+function publish(path, record) {
+  const staging = `${path}.new-${nonce()}`;
+  writeFileSync(staging, record, { flag: 'wx' });
+  try { linkSync(staging, path); return true; }
+  catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+  finally { rmSync(staging, { force: true }); }
+}
+/** Remove staging/aside debris left by a sync that crashed mid-publish or mid-reclaim. */
+function sweepDebris(lockPath) {
+  const debris = new RegExp(`^${basename(lockPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.reclaim)?\\.(?:new|stale)-(\\d+)-[0-9a-f]+$`);
+  for (const name of readdirSync(dirname(lockPath))) {
+    const match = debris.exec(name);
+    if (match && !alive(Number(match[1]))) rmSync(join(dirname(lockPath), name), { recursive: true, force: true });
+  }
+}
+function busyIfLive(lockPath) {
+  const current = readRecord(lockPath);
+  if (holderAlive(current)) throw new Error('guard clone is busy: another sync is running; retry sync');
+  return current;
+}
+/** Move an abandoned lock aside. Reclaimers are serialised, so the lock cannot change hands
+ * between the re-read below and the rename: publishers only create an absent path. */
+function reclaim(lockPath, judged, record) {
+  const mutex = `${lockPath}.reclaim`;
+  if (!publish(mutex, record)) {
+    if (holderAlive(readRecord(mutex))) throw new Error('guard clone is busy: another sync is reclaiming an abandoned lock; retry sync');
+    throw new Error(`an abandoned reclaim marker blocks sync; confirm no sync is running, then remove ${mutex}`);
+  }
+  try {
+    if (readRecord(lockPath) !== judged) return;
     const aside = `${lockPath}.stale-${nonce()}`;
     try { renameSync(lockPath, aside); }
-    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (readOwner(aside) !== current) {
-      try { renameSync(aside, lockPath); } catch { /* the new holder keeps its own lock */ }
-      throw new Error('guard clone is busy: the sync lock changed hands; retry sync');
-    }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
     rmSync(aside, { recursive: true, force: true });
+  } finally {
+    rmSync(mutex, { force: true });
+  }
+}
+function acquireLock(lockPath, record) {
+  sweepDebris(lockPath);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (publish(lockPath, record)) return;
+    reclaim(lockPath, busyIfLive(lockPath), record);
   }
   throw new Error('guard clone is busy: the sync lock is contended; retry sync');
 }
@@ -65,10 +118,15 @@ function drainLeases(readers) {
   for (;;) {
     const live = [];
     for (const name of readdirSync(readers)) {
+      // Launchers write only <pid>-<hex> leases; anything else (e.g. .DS_Store) is not a lease.
       const match = /^(\d+)-[0-9a-f]+$/.exec(name);
-      // Unrecognised entries count as live, so sync refuses rather than guessing.
-      if (match && !alive(Number(match[1]))) rmSync(join(readers, name), { force: true });
-      else live.push(name);
+      if (!match) continue;
+      let text;
+      try { text = readFileSync(join(readers, name), 'utf8').trim(); }
+      catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      // A lease still being written has no start time yet; judge it by pid alone.
+      if (alive(Number(match[1]), text ? Number(text) : NaN)) live.push(name);
+      else rmSync(join(readers, name), { force: true });
     }
     if (!live.length) return;
     if (Date.now() >= deadline) {
@@ -79,7 +137,7 @@ function drainLeases(readers) {
 }
 
 let lock;
-let owner;
+const owner = `${process.pid} ${STARTED} ${randomBytes(6).toString('hex')}\n`;
 try {
   const args = process.argv.slice(2);
   if (args.length > 1 || args.some(arg => !arg.startsWith('--origin=') || !arg.slice(9))) {
@@ -98,26 +156,16 @@ try {
   mkdirSync(dirname(clone), { recursive: true });
   if (realpathSync(dirname(clone)) !== dirname(clone)) throw new Error('clone parent must not contain symlinks');
   const lockPath = `${clone}.guard-lock`;
-  owner = `${nonce().replace('-', ' ')}\n`;
-  acquireLock(lockPath, owner);
-  lock = lockPath;
-  drainLeases(`${clone}.guard-readers`);
-  if (!existsSync(clone)) {
-    git(process.cwd(), 'clone', '--single-branch', '--branch', 'main', '--no-tags', '--', origin, clone);
-    git(clone, 'config', '--local', 'we.guardClone', clone);
-    // A fresh clone has no FETCH_HEAD; publish the same sync evidence as refreshes.
-    git(clone, 'fetch', 'origin', 'main');
-    // Main may have advanced between clone and fetch; apply the fetched revision.
-    git(clone, 'reset', '--hard', 'origin/main');
-  } else {
+  const fresh = !existsSync(clone);
+  if (!fresh) {
     if (!lstatSync(clone).isDirectory() || realpathSync(clone) !== clone ||
         !lstatSync(join(clone, '.git')).isDirectory() ||
         realpathSync(git(clone, 'rev-parse', '--show-toplevel')) !== clone) {
       throw new Error('target must be a standalone dedicated clone, without symlinks or worktree indirection');
     }
-    let owner;
-    try { owner = git(clone, 'config', '--local', '--get', 'we.guardClone'); } catch { /* Missing ownership is refused below. */ }
-    if (owner !== clone) {
+    let marker;
+    try { marker = git(clone, 'config', '--local', '--get', 'we.guardClone'); } catch { /* Missing ownership is refused below. */ }
+    if (marker !== clone) {
       throw new Error('target is not an owned dedicated clone; move it aside and rerun sync to create one');
     }
     if (git(clone, 'config', '--get-all', 'remote.origin.url') !== origin ||
@@ -125,8 +173,24 @@ try {
         git(clone, 'symbolic-ref', '--short', 'HEAD') !== 'main') {
       throw new Error('dedicated clone has a different origin or is not tracking main only');
     }
-    execFileSync('chmod', ['-R', 'u+w', clone]);
+    busyIfLive(lockPath);
+    // Fetch without the lock: only a private ref changes (an empty --refmap keeps
+    // origin/main and FETCH_HEAD untouched), so running guards see no difference.
+    git(clone, 'fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', 'origin', '+refs/heads/main:refs/we-guard/incoming');
+  }
+  acquireLock(lockPath, owner);
+  lock = lockPath;
+  drainLeases(`${clone}.guard-readers`);
+  if (fresh) {
+    git(process.cwd(), 'clone', '--single-branch', '--branch', 'main', '--no-tags', '--', origin, clone);
+    git(clone, 'config', '--local', 'we.guardClone', clone);
+    // A fresh clone has no FETCH_HEAD; publish the same sync evidence as refreshes.
     git(clone, 'fetch', 'origin', 'main');
+    // Main may have advanced between clone and fetch; apply the fetched revision.
+    git(clone, 'reset', '--hard', 'origin/main');
+  } else {
+    execFileSync('chmod', ['-R', 'u+w', clone]);
+    git(clone, 'update-ref', 'refs/remotes/origin/main', 'refs/we-guard/incoming');
     git(clone, 'reset', '--hard', 'origin/main');
     git(clone, 'clean', '-fdx');
   }
@@ -137,14 +201,16 @@ try {
   }
   chmodSync(clone, lstatSync(clone).mode & ~0o222);
   // Record every successful sync, including an unchanged origin/main.
+  const fetchHead = join(clone, '.git/FETCH_HEAD');
+  closeSync(openSync(fetchHead, 'a'));
   const syncedAt = new Date();
-  utimesSync(join(clone, '.git/FETCH_HEAD'), syncedAt, syncedAt);
+  utimesSync(fetchHead, syncedAt, syncedAt);
   process.stdout.write('Guard clone synchronized to origin/main.\n');
 } catch (error) {
   process.stderr.write(`Guard clone sync refused/failed: ${error.message}\n`);
   process.exitCode = 2;
 } finally {
-  // Release only a lock this run still owns.
-  try { if (lock && readOwner(lock) === owner) rmSync(lock, { recursive: true, force: true }); }
+  // Release only a lock this run still owns; nobody else can replace an existing lock file.
+  try { if (lock && readRecord(lock) === owner) rmSync(lock, { force: true }); }
   catch (error) { process.stderr.write(`Guard clone sync could not release its lock: ${error.message}\n`); process.exitCode = 2; }
 }

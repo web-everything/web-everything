@@ -1332,17 +1332,26 @@ Use an absolute origin URL/path so the scheduler and interactive invocations agr
 
 Hooks matching one event run in parallel (six share the `Edit|Write` matcher), so launchers
 never exclude each other. Each launcher holds a shared lease, a
-`<clone>.guard-readers/<pid>-<nonce>` file, until its guard exits. Only sync takes the
-exclusive sibling `<clone>.guard-lock`, published in one rename with an `owner` record
-(`<pid> <nonce>`). A launcher that finds a live sync waits up to 20 seconds, then denies with
-"retry the hook". Sync takes its lock before it lists leases, and a launcher re-checks the
-lock after publishing its lease, so sync cannot reset a clone a guard is running from. After
-taking the lock, sync waits up to 20 seconds for live leases to drain, then refuses with
-"retry sync" without fetching, resetting or cleaning. Ownership is judged by process
-liveness, never by a timer: a lock or lease whose owner has exited (a hook killed on timeout
-or by SIGKILL) is ignored by launchers and reclaimed or pruned by the next sync, and the
-pristine and freshness checks still guard a clone a crashed sync left half-reset. Sync
-refuses on unrecognised lease entries rather than guessing. `WE_GUARD_LOCK_WAIT_MS` may only
+`<clone>.guard-readers/<pid>-<nonce>` file holding its start time, until its guard exits.
+Only sync takes the exclusive sibling `<clone>.guard-lock`, a file holding
+`<pid> <start-ms> <nonce>` and published with one hard link, so it exists only once complete.
+Sync fetches into the private ref `refs/we-guard/incoming` (empty `--refmap`, no FETCH_HEAD
+write) before taking the lock, so the lock covers only `update-ref`, `reset` and `clean`. A
+launcher that finds a live sync waits up to 20 seconds, then denies with "retry the hook".
+Sync takes its lock before it lists leases, and a launcher re-checks the lock after publishing
+its lease, so sync cannot reset a clone a guard is running from. After taking the lock, sync
+waits up to 20 seconds for live leases to drain, then refuses with "retry sync" without
+resetting or cleaning; a live sync lock is refused before any fetch. Ownership is judged by
+process liveness, never by a timer: a pid that is gone, or that now names a process with a
+different `ps -o lstart` start time (pid reuse), is an exited owner. Unknown evidence counts as
+live. Launchers ignore an exited owner's lock (and an old-protocol lock directory); the next
+sync reclaims it and prunes exited leases, and the pristine and freshness checks still guard a
+clone a crashed sync left half-reset. Reclaim is serialised behind `<clone>.guard-lock.reclaim`,
+so a lock moved aside is never one a peer just published; an abandoned reclaim marker (a sync
+killed inside that few-millisecond step) makes sync refuse and name the marker to remove.
+Sync sweeps staging and aside debris left by exited syncs, and ignores entries in
+`.guard-readers` that are not `<pid>-<hex>` leases. A launcher killed outright orphans its
+guard, which can then run while a sync resets the clone. `WE_GUARD_LOCK_WAIT_MS` may only
 shorten either wait (tests use it); it can never lengthen it.
 The launcher canonicalizes the clone and guard entry path, passes the guard realpath as
 Node's `argv[1]`, and runs in place without a temporary copy. This keeps CLI entry checks

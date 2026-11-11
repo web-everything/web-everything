@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { hookRoot } from '../../lib/hook-root.mjs';
-import { pinnedFixture } from './pinned-fixture.mjs';
+import { pinnedFixture, removeFixture } from './pinned-fixture.mjs';
 
 let fixture;
 beforeAll(() => { fixture = pinnedFixture(); }, 30_000);
@@ -111,6 +111,25 @@ describe('real guards launched from the dedicated clone', () => {
     expect(result.status, result.stderr).toBe(2);
     expect(result.stderr).toContain('backlog/0200-leak.md');
     expect(result.stderr).toContain('scripts/leak.ts');
+  });
+  it('real guards run from a non-Git scratch cwd against the primary beside the clone', () => {
+    const primary = join(dirname(fixture.clone), 'webeverything');
+    mkdirSync(join(primary, 'scripts'), { recursive: true });
+    fixture.git(primary, 'init', '-q', '-b', 'main');
+    const scratch = join(fixture.temp, 'operations/dispatch/worker');
+    mkdirSync(scratch, { recursive: true });
+    try {
+      const bash = fixture.run(scratch, 'scripts/guard-bash.mjs', {
+        tool_name: 'Bash', cwd: primary, tool_input: { command: 'node scripts/backlog.mjs resolve 2287' },
+      });
+      expect(bash.status, bash.stderr).toBe(0);
+      expect(JSON.parse(bash.stdout).hookSpecificOutput.permissionDecisionReason).toContain('must run in a LANE clone');
+      const lane = fixture.run(scratch, 'scripts/guard-lane.mjs', {
+        tool_name: 'Write', cwd: scratch, tool_input: { file_path: join(primary, 'scripts/example.mjs'), content: '' },
+      });
+      expect(lane.status).toBe(2);
+      expect(lane.stderr).toContain('guard-lane:');
+    } finally { removeFixture(primary); }
   });
   it('overrides inherited roots and canonicalizes a nested symlink cwd', async () => {
     const { symlinkSync } = await import('node:fs');

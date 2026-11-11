@@ -4,7 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFile
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const script = resolve(dirname(fileURLToPath(import.meta.url)), '../sync-guard-clone.mjs');
@@ -103,32 +103,66 @@ console.log(revision);
   it.each(['live sync lock', 'live guard lease'])('refuses a %s without fetching, resetting, cleaning or reclaiming it', kind => {
     const f = fixture(); expect(f.run().status).toBe(0);
     const held = kind === 'live sync lock' ? `${f.clone}.guard-lock` : join(`${f.clone}.guard-readers`, `${process.pid}-feed`);
-    if (kind === 'live sync lock') { mkdirSync(held); writeFileSync(join(held, 'owner'), `${process.pid} other\n`); }
-    else writeFileSync(held, '');
+    writeFileSync(held, kind === 'live sync lock' ? `${process.pid} 0 other\n` : '');
     f.writable();
     writeFileSync(join(f.clone, 'keep'), 'precious');
+    const before = f.git(f.clone, 'rev-parse', 'refs/remotes/origin/main');
+    writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'second');
     const log = gitLog(f);
     f.env.WE_GUARD_LOCK_WAIT_MS = '50';
     expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('retry sync') });
     expect(readFileSync(join(f.clone, 'keep'), 'utf8')).toBe('precious');
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('first');
+    expect(f.git(f.clone, 'rev-parse', 'refs/remotes/origin/main')).toBe(before);
     expect(existsSync(held)).toBe(true);
     if (kind === 'live guard lease') expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
-    const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
-    for (const args of calls) expect(args.filter(arg => ['fetch', 'reset', 'clean', 'clone'].includes(arg)), args.join(' ')).toEqual([]);
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls.length).toBeGreaterThan(0);
+    for (const args of calls) {
+      expect(args.filter(arg => ['reset', 'clean', 'clone', 'update-ref'].includes(arg)), args.join(' ')).toEqual([]);
+      // A live sync is refused before any fetch; behind a live lease only the private ref is fetched.
+      if (args.includes('fetch')) {
+        expect(kind, args.join(' ')).toBe('live guard lease');
+        expect(args).toEqual(expect.arrayContaining(['--refmap=', '--no-write-fetch-head', '+refs/heads/main:refs/we-guard/incoming']));
+      }
+    }
   });
-  it.each(['dead owner', 'no owner record'])('reclaims a sync lock left by a %s and prunes dead guard leases', kind => {
+  it.each(['dead owner', 'no owner record', 'reused pid'])('reclaims a sync lock left by a %s and prunes dead guard leases', kind => {
     const f = fixture(); expect(f.run().status).toBe(0);
-    const lock = `${f.clone}.guard-lock`; mkdirSync(lock);
-    if (kind === 'dead owner') writeFileSync(join(lock, 'owner'), `${deadPid()} crashed\n`);
-    const lease = join(`${f.clone}.guard-readers`, `${deadPid()}-dead`);
-    writeFileSync(lease, '');
+    const lock = `${f.clone}.guard-lock`;
+    if (kind === 'no owner record') mkdirSync(lock);
+    else writeFileSync(lock, kind === 'dead owner' ? `${deadPid()} 0 crashed\n` : `${process.pid} 1000 reused\n`);
+    const readers = `${f.clone}.guard-readers`;
+    const dead = join(readers, `${deadPid()}-dead`);
+    const reused = join(readers, `${process.pid}-beef`);
+    writeFileSync(dead, ''); writeFileSync(reused, '1000');
+    writeFileSync(join(readers, '.DS_Store'), 'not a lease');
+    const debris = join(dirname(f.clone), `${basename(lock)}.new-${deadPid()}-abc`);
+    writeFileSync(debris, 'crashed publish');
     writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'second');
     const result = f.run();
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('second');
     expect(existsSync(lock)).toBe(false);
-    expect(existsSync(lease)).toBe(false);
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(reused)).toBe(false);
+    expect(readdirSync(readers)).toEqual(['.DS_Store']);
     expect(readdirSync(dirname(f.clone)).filter(name => name.includes('.guard-lock'))).toEqual([]);
+  });
+  it('serialises reclaim: a live reclaimer blocks a second one, which leaves the lock where it is', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const lock = `${f.clone}.guard-lock`;
+    writeFileSync(lock, `${deadPid()} 0 crashed\n`);
+    writeFileSync(`${lock}.reclaim`, `${process.pid} 0 reclaiming\n`);
+    expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('another sync is reclaiming') });
+    expect(readFileSync(lock, 'utf8')).toContain('crashed');
+    rmSync(`${lock}.reclaim`);
+    writeFileSync(`${lock}.reclaim`, `${deadPid()} 0 crashed reclaim\n`);
+    const blocked = f.run();
+    expect(blocked).toMatchObject({ status: 2, stderr: expect.stringContaining(`then remove ${lock}.reclaim`) });
+    rmSync(`${lock}.reclaim`);
+    expect(f.run().status).toBe(0);
+    expect(existsSync(lock)).toBe(false);
   });
   it('syncs to HOME/workspace/.guard-main with WE_GUARD_CLONE unset, where the settings launcher looks', () => {
     const f = fixture(); delete f.env.WE_GUARD_CLONE;

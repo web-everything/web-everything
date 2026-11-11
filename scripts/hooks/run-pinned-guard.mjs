@@ -3,10 +3,12 @@
  * Usage: run-pinned-guard.mjs [--stop-hook] scripts/<guard>.mjs [guard arguments...]
  *
  * Locking: hooks run in parallel (six share the Edit|Write matcher), so each launcher takes only a
- * shared lease, a `<clone>.guard-readers/<pid>-<nonce>` file. Only sync takes the exclusive
- * `<clone>.guard-lock`; it waits for live leases to drain before it changes the clone. A launcher
- * waits a bounded time for a live sync. A lock or lease whose owner process has exited is ignored
- * here and reclaimed by the next sync, so a killed process never wedges the hooks.
+ * shared lease, a `<clone>.guard-readers/<pid>-<nonce>` file holding its start time. Only sync
+ * takes the exclusive `<clone>.guard-lock` file; it waits for live leases to drain before it
+ * changes the clone. A launcher waits a bounded time for a live sync. A lock or lease whose owner
+ * process has exited (or whose pid now names a process with another start time) is ignored here
+ * and reclaimed by the next sync, so a killed process never wedges the hooks. The lease names the
+ * launcher's pid: a launcher killed outright orphans its guard, which then runs unprotected.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -17,15 +19,18 @@ import { fileURLToPath } from 'node:url';
 const env = { ...process.env };
 for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
 
+// Git's messages are matched below, so pin them to English; the guard child keeps `env`.
+const gitEnv = { ...env, LC_ALL: 'C', LANGUAGE: 'C' };
 function git(...args) {
   return execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...args], {
-    env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
 
 // Keep this bootstrap self-contained: importing a clone-local lock helper before taking the
-// lease would itself race with reset/clean. sync-guard-clone.mjs carries the same three helpers.
+// lease would itself race with reset/clean. lockWaitMs, pause, processStart, alive and
+// readRecord match sync-guard-clone.mjs.
 const MAX_WAIT_MS = 20_000;
 /** WE_GUARD_LOCK_WAIT_MS may only shorten the wait (tests); it can never lengthen it. */
 function lockWaitMs() {
@@ -34,19 +39,39 @@ function lockWaitMs() {
     ? Math.min(value, MAX_WAIT_MS) : MAX_WAIT_MS;
 }
 function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
-function alive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+const STARTED = Date.now() - Math.round(process.uptime() * 1000);
+/** A process's start time in ms, or null when ps cannot say. */
+function processStart(pid) {
+  try {
+    const text = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8', timeout: 5_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
+    }).trim();
+    const time = Date.parse(text);
+    return Number.isFinite(time) ? time : null;
+  } catch { return null; }
 }
-/** True while a live sync process holds the exclusive lock. No record means no live owner. */
+/** Live unless the pid is gone or now belongs to a process that started at another time.
+ * Unknown evidence counts as live. */
+function alive(pid, started) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
+  if (!Number.isFinite(started) || started <= 0) return true;
+  const actual = processStart(pid);
+  // ps reports whole seconds; a larger gap is a different process reusing the pid.
+  return actual === null || Math.abs(actual - started) < 3_000;
+}
+/** True while a live sync process holds the exclusive lock file. An absent lock, an
+ * old-protocol lock directory (no owner record) or an exited owner is not a running sync. */
 function syncRunning(lockPath) {
-  let owner;
-  try { owner = readFileSync(join(lockPath, 'owner'), 'utf8'); }
+  let record;
+  try { record = readFileSync(lockPath, 'utf8'); }
   catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+    if (error.code === 'ENOENT' || error.code === 'EISDIR') return false;
     throw error;
   }
-  return alive(Number(owner.split(' ')[0]));
+  const [pid, started] = record.trim().split(' ').map(Number);
+  return alive(pid, started);
 }
 
 const argv = process.argv.slice(2);
@@ -76,7 +101,7 @@ try {
   let announced = false;
   for (;;) {
     if (!syncRunning(lockPath)) {
-      writeFileSync(marker, '', { flag: 'wx' });
+      writeFileSync(marker, String(STARTED), { flag: 'wx' });
       lease = marker;
       // Sync takes its lock before it lists leases, so re-checking after publishing ours
       // means either sync sees this lease or this launcher sees sync's lock.
