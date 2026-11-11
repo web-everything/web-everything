@@ -609,6 +609,12 @@ describe('portable feed IO and settings', () => {
     writeFileSync(path, `${'y'.repeat(2 * 1024 * 1024 + 100)}`);
     expect(feedTail(path)).toEqual([]);
   });
+  it('a short tail read fails closed instead of dropping the newest records', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir);
+    const path = join(dir, 'feed.jsonl'); writeFileSync(path, 'a\nb\n');
+    const read = (fd, buffer, offset, length, position) => readSync(fd, buffer, offset, length - 1, position);
+    expect(() => feedTail(path, { read })).toThrow(/short tail read.*operator must inspect full input/);
+  });
   it.each(['review-dispatch', 'red-team-dispatch'])('%s job refuses a head changed after the manual precheck through the production dispatcher', async action => {
     const real = await import('../../operations/review-job.mjs');
     const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');

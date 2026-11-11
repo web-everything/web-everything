@@ -33,6 +33,8 @@ export function tailRecords(path, { read = readSync } = {}) {
     fd = openSync(path, 'r'); const size = statSync(path).size, start = Math.max(0, size - MAX_BYTES);
     const buffer = Buffer.alloc(Math.min(size, MAX_BYTES));
     const count = read(fd, buffer, 0, buffer.length, start);
+    // A short read would silently drop the newest bytes, the ones dedup needs most.
+    if (count !== buffer.length) throw Error('short tail read; operator must inspect full input');
     let text = buffer.subarray(0, count).toString('utf8');
     if (start) { const cut = text.indexOf('\n'); text = cut === -1 ? '' : text.slice(cut + 1); }
     return { lines: text.split('\n').filter(Boolean), truncated: start > 0 };
