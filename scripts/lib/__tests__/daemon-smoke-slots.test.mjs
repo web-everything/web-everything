@@ -275,6 +275,8 @@ describe('daemon smoke slots', () => {
         process.exit(74); // The injected interruption must be reached.
       `, join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-smoke-slots.mjs'), stateDir, phase], {
         encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+        // Host-dependent dependency warning (punycode) is not a crash; any other stderr still fails below.
+        env: { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --disable-warning=DEP0040`.trim() },
       });
       expect(child.error).toBeUndefined();
       expect(child.stderr).toBe('');
