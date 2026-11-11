@@ -261,3 +261,59 @@ describe('logLocalLocation', () => {
     expect(log).not.toHaveBeenCalled();
   });
 });
+
+describe('scanBundleRange changed-lines scan of modified blobs', () => {
+  const seedPublicToken = () => {
+    git(lane, 'checkout', '-q', 'main');
+    write('notes.md', `intro\n${token}\nouter\n`);
+    originMain = commit('public notes with a legacy token line');
+    git(lane, 'update-ref', 'refs/remotes/origin/main', originMain);
+    git(lane, 'checkout', '-q', '-B', 'lane');
+  };
+  const scanWith = (extra = {}) => scanBundleRange({
+    cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: originMain, exec, ...extra,
+  });
+
+  it('does not refuse an unrelated one-line edit to a file whose existing lines trip the scan', async () => {
+    seedPublicToken();
+    write('notes.md', `intro changed\n${token}\nouter\n`);
+    commit('unrelated edit');
+    expect(await scanWith()).toBeNull();
+  });
+
+  it('still refuses a newly added secret line in a modified file', async () => {
+    seedPublicToken();
+    write('notes.md', `intro\n${token}\nouter\n${'ghp_' + 'Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2'}\n`);
+    commit('adds a new secret line');
+    expect(await scanWith()).toMatchObject({ path: 'notes.md', finding: 'github-token' });
+  });
+
+  it('still scans an added file whole', async () => {
+    seedPublicToken();
+    write('added.md', `${token}\n`);
+    commit('adds a file');
+    expect(await scanWith()).toMatchObject({ path: 'added.md', finding: 'github-token' });
+  });
+
+  it('keeps the whole-blob scan when the bundleScan off switch is set', async () => {
+    seedPublicToken();
+    write('notes.md', `intro changed\n${token}\nouter\n`);
+    commit('unrelated edit');
+    expect(await scanWith({ bundleScan: 'whole-blob' })).toMatchObject({ path: 'notes.md', finding: 'github-token' });
+  });
+
+  it('fails closed when the blob diff cannot be read', async () => {
+    seedPublicToken();
+    write('notes.md', `intro changed\n${token}\nouter\n`);
+    commit('unrelated edit');
+    const failing = async (call) => (call.args.includes('diff') ? { code: 128, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) } : exec(call));
+    await expect(scanWith({ exec: failing })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+  });
+
+  it('scans a binary modified blob whole', async () => {
+    seedPublicToken();
+    write('notes.md', Buffer.concat([Buffer.from(`${token}\n`), Buffer.from([0, 1, 2, 3])]));
+    commit('binary edit');
+    expect(await scanWith()).not.toBeNull();
+  });
+});
