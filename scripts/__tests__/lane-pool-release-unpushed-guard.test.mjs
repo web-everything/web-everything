@@ -341,6 +341,74 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(result.stderr).not.toContain(newer.slice(0, 12));
     expect(git(['stash', 'list', '--format=%H'], laneDir).split('\n')).toEqual([newer, older]);
   });
+  // Stale stash entries must not pin a lane: with recovery on, release bundles every stash entry into the backup root
+  // (verified) and proceeds, while a genuine unpushed branch commit still refuses.
+  it('with recovery on, salvages stash entries to a bundle and releases', () => {
+    const stash = text => {
+      writeFileSync(join(laneDir, 'seed.txt'), text);
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+      return git(['rev-parse', 'refs/stash'], laneDir);
+    };
+    const older = stash('older stashed edit\n');
+    const newer = stash('newer stashed edit\n');
+    const result = release([], '', '', RECOVERY_ON);
+    released(result);
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    const record = readFileSync(join(dir, 'stash-bundles.txt'), 'utf8');
+    expect(record).toContain(older);
+    expect(record).toContain(newer);
+    const bundle = record.split('\n')[0].split(' ')[1];
+    expect(spawnSync('git', ['bundle', 'verify', join(dir, bundle)], { cwd: laneDir }).status).toBe(0);
+    expect(git(['stash', 'list', '--format=%H'], laneDir).split('\n')).toEqual([newer, older]);
+  });
+  it.each(['truncated header', 'truncated pack', 'replaced bundle', 'deleted bundle'])(
+    'with recovery on, refuses a recorded stash backup with a %s', damage => {
+      writeFileSync(join(laneDir, 'seed.txt'), 'cached stashed edit\n');
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+      const sha = git(['rev-parse', 'refs/stash'], laneDir);
+      const dir = join(base, 'backups', 'lane-1-preserve');
+      mkdirSync(dir, { recursive: true });
+      const bundle = join(dir, 'cached.bundle');
+      git(['bundle', 'create', bundle, 'refs/stash'], laneDir);
+      const record = `${sha} cached.bundle\n`;
+      writeFileSync(join(dir, 'stash-bundles.txt'), record);
+      if (damage === 'truncated header') writeFileSync(bundle, 'truncated');
+      if (damage === 'truncated pack') {
+        const content = readFileSync(bundle);
+        writeFileSync(bundle, content.subarray(0, content.length - 20));
+        // Header verification alone accepts this; the pack must actually be imported into an empty repository.
+        expect(spawnSync('git', ['bundle', 'verify', bundle], { cwd: laneDir }).status).toBe(0);
+      }
+      if (damage === 'replaced bundle') {
+        git(['bundle', 'create', bundle, 'HEAD'], laneDir);
+        expect(spawnSync('git', ['bundle', 'verify', bundle], { cwd: laneDir }).status).toBe(0);
+      }
+      if (damage === 'deleted bundle') rmSync(bundle);
+      refused(release([], '', '', RECOVERY_ON), sha);
+      expect(readFileSync(join(dir, 'stash-bundles.txt'), 'utf8')).toBe(record);
+      expect(git(['rev-parse', 'refs/stash'], laneDir)).toBe(sha);
+    },
+  );
+  it('with recovery on, revalidates and reuses a recorded stash bundle without recreating it', () => {
+    writeFileSync(join(laneDir, 'seed.txt'), 'cached stashed edit\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    released(release([], '', '', RECOVERY_ON));
+    expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
+    const fault = `if (args[0] === 'bundle' && args[1] === 'create') throw new Error('unexpected rebundle');`;
+    released(release([], fault, '', RECOVERY_ON));
+  });
+  it('with recovery on, still refuses a genuine unpushed commit when a stash is also present', () => {
+    writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    git(['checkout', '--quiet', '-b', 'work/keep'], laneDir);
+    writeFileSync(join(laneDir, 'real.txt'), 'real work\n');
+    git(['add', 'real.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'real'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir);
+    git(['checkout', '--quiet', '--detach', 'origin/main'], laneDir);
+    const result = release([], '', '', RECOVERY_ON);
+    refused(result, sha);
+  });
   it('releases a lane whose HEAD is behind an origin tip it has not fetched yet', () => {
     const other = join(base, 'other');
     git(['clone', '--quiet', origin, other]);
