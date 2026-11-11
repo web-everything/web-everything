@@ -15,6 +15,7 @@ const REF = /^[A-Za-z0-9._/-]+$/;
 const MAX = 64 * 1024 * 1024;
 const MAX_FILES = 2000;
 const TIMEOUT_MS = 60_000;
+const TOTAL_BUDGET_MS = 120_000;
 
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
@@ -127,16 +128,27 @@ function samePatch(exec, a, b, mbPrior, mbHead, path) {
 }
 
 /**
- * @param {{exec: Function, priorHead: string, head: string, base: string, rawFiles: Record<string, number[]|null>}} o
+ * @param {{exec: Function, priorHead: string, head: string, base: string, rawFiles: Record<string, number[]|null>,
+ *   budgetMs?: number, now?: () => number}} o  `budgetMs` is the total time for all git calls (default 120 s); `now` is injectable for tests.
  * @returns {{files: Record<string, number[]|null>, dropped: string[]}|null} null = cannot prove; use the raw range.
  */
-export function netInterdiff({ exec, priorHead, head, base, rawFiles } = {}) {
+export function netInterdiff({ exec: rawExec, priorHead, head, base, rawFiles, budgetMs = TOTAL_BUDGET_MS, now = Date.now } = {}) {
   try {
-    if (typeof exec !== 'function' || !SHA.test(priorHead ?? '') || !SHA.test(head ?? '')) return null;
+    if (typeof rawExec !== 'function' || !SHA.test(priorHead ?? '') || !SHA.test(head ?? '')) return null;
+    if (typeof now !== 'function' || typeof budgetMs !== 'number' || !(budgetMs > 0)) return null;
+    // One deadline for the whole call. Every git call is clamped to the time left, and once none is left the call throws,
+    // so the caller keeps the raw range instead of blocking the review on a slow or stalled git.
+    const deadline = now() + budgetMs;
+    const exec = (cmd, args, opts = {}) => {
+      const left = deadline - now();
+      if (!(left > 0)) throw new Error('interdiff-budget-exhausted');
+      return rawExec(cmd, args, { ...opts, timeout: Math.min(opts.timeout ?? TIMEOUT_MS, left) });
+    };
     if (typeof base !== 'string' || base.startsWith('-') || !REF.test(base)) return null;
     if (!rawFiles || typeof rawFiles !== 'object' || Array.isArray(rawFiles)) return null;
     const entries = Object.entries(rawFiles);
-    // Bound the work (about five git calls per path): over the cap the caller keeps the raw range.
+    // Bound the work (about five git calls per path): over the path cap, or past the total time budget (see `exec`
+    // above), the caller keeps the raw range.
     if (entries.length > MAX_FILES) return null;
     for (const [path] of entries) if (typeof path !== 'string' || !path || path.startsWith('-')) return null;
     // Collected as entries and built with Object.fromEntries: `files[path] = …` would turn a path named `__proto__`

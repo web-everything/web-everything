@@ -144,6 +144,33 @@ describe('netInterdiff', () => {
         const exec3 = (cmd, args) => (args.includes('merge-base') ? `${sha}\n` : args.includes('ls-tree') ? 'a.txt\0' : value);
         expect(netInterdiff({ exec: exec3, ...valid() })).toBeNull();
       });
+    it('a slow exec that uses up the total time budget → null, and no further git call is started', () => {
+      let t = 0;
+      const calls = [];
+      const slow = (...a) => { calls.push(a); t += 40_000; return exec(...a); };
+      const rawFiles = { 'a.txt': null, 'b.txt': null, 'c.txt': null };
+      expect(netInterdiff({ exec: slow, ...valid(), rawFiles, budgetMs: 100_000, now: () => t })).toBeNull();
+      // 2 merge-bases + 1 ls-tree use 120 s of a 100 s budget; the next call is refused before it reaches exec.
+      expect(calls.length).toBe(3);
+      // With enough budget the same input completes.
+      t = 0;
+      expect(netInterdiff({ exec: slow, ...valid(), rawFiles, budgetMs: 100_000_000, now: () => t })).not.toBeNull();
+    });
+    it('every git call is clamped to the time left in the budget', () => {
+      const timeouts = [];
+      const spy = (c, a, o) => { timeouts.push(o.timeout); return exec(c, a, o); };
+      expect(netInterdiff({ exec: spy, ...valid(), budgetMs: 5_000 })).not.toBeNull();
+      expect(timeouts.length).toBeGreaterThan(0);
+      expect(Math.max(...timeouts)).toBeLessThanOrEqual(5_000);
+    });
+    it.each([['zero', 0], ['negative', -1], ['NaN', NaN], ['a string', '9']])('a %s budget → null, git never called', (_n, budgetMs) => {
+      const calls = [];
+      expect(netInterdiff({ exec: (...a) => { calls.push(a); return exec(...a); }, ...valid(), budgetMs })).toBeNull();
+      expect(calls).toEqual([]);
+    });
+    it('non-function now → null', () => {
+      expect(netInterdiff({ exec, ...valid(), now: 5 })).toBeNull();
+    });
     it('non-function exec → null', () => {
       expect(netInterdiff({ exec: 'git', ...valid() })).toBeNull();
     });
@@ -157,6 +184,14 @@ describe('netInterdiff', () => {
       };
       expect(netInterdiff({ exec: exec2, ...valid() })).toBeNull();
     });
+  });
+});
+
+describe('interdiffShadowLine', () => {
+  it('reports a null interdiff as unavailable and a missing raw range as 0', () => {
+    expect(interdiffShadowLine({ pr: 9, raw: { 'a.txt': null, 'b.txt': null }, net: null })).toBe('[net-interdiff] pr=9 raw=2 interdiff=unavailable');
+    expect(interdiffShadowLine({ pr: 9, net: { files: {}, dropped: [] } })).toBe('[net-interdiff] pr=9 raw=0 interdiff=0');
+    expect(interdiffShadowLine()).toBe('[net-interdiff] pr=? raw=0 interdiff=unavailable');
   });
 });
 
