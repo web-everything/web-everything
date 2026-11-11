@@ -1116,8 +1116,9 @@ async function runCli() {
     try {
       const liveBody = forge.viewPr(prNum, 'body').body || '';
       const updated = composePrBody(liveBody);
-      const disclosed = DEFERRED_TO_CI ? appendDeferredDisclosure(updated, DEFERRED_TO_CI.disclosure) : updated; // R893: a rerun records the deferral on an existing PR too
-      if (disclosed !== liveBody) forge.editBody(prNum, disclosed);
+      if (updated !== liveBody) forge.editBody(prNum, updated);
+      // R893: a rerun records the deferral on an existing PR too (idempotent).
+      if (DEFERRED_TO_CI && !updated.includes(DEFERRED_TO_CI.disclosure)) forge.editBody(prNum, appendDeferredDisclosure(updated, DEFERRED_TO_CI.disclosure));
     } catch { /* best-effort — drain ref fallback covers a miss */ }
   }
   if (prNum == null) return ghFailed('could not determine the PR number after create');
