@@ -65,3 +65,22 @@ describe('refineOverlapRowsToNetDiff audit findings', () => {
     expect(waits(refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles, cache: new Map() })).get(`${repo}#6679`).yieldTo).toBe(6381);
   });
 });
+
+describe('refineOverlapRowsToNetDiff audit round 2', () => {
+  it('a cached read expires so a moved base is re-read', () => {
+    vi.useFakeTimers();
+    const readFiles = vi.fn(() => ({ files: ['shared.mjs'] }));
+    const cache = new Map();
+    const rows = rowsFor(ok, ok);
+    refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles, cache });
+    vi.advanceTimersByTime(61_000);
+    refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles, cache });
+    vi.useRealTimers();
+    expect(readFiles).toHaveBeenCalledTimes(4);
+  });
+  it('a row with no head sha keeps every listing', () => {
+    const rows = rowsFor(ok, ok);
+    rows.openPrRows.find((r) => r.number === 6381).headSha = null;
+    expect(waits(refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles: () => ({ files: ['other.mjs'] }), cache: new Map() })).get(`${repo}#6679`).yieldTo).toBe(6381);
+  });
+});

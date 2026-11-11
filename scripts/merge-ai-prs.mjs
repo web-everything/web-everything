@@ -2496,11 +2496,14 @@ const overlapNetDiffCache = new Map();
 export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = [], localSlug = null, readFiles, cache = overlapNetDiffCache } = {}) {
   const paths = (r) => new Set((r.files || []).map((f) => f?.path ?? f));
   const net = (r) => {
-    if (!r.headSha || !r.baseRefName || (r.repo || null) !== (localSlug || null) || typeof readFiles !== 'function') return r;
+    if ((r.repo || null) !== (localSlug || null) || typeof readFiles !== 'function') return r; // other repos keep their listing
+    if (!r.headSha || !r.baseRefName) { unreadable = true; return r; }
     const key = `${r.headSha}@${r.baseRefName}`;
-    if (!cache.has(key)) { const read = readFiles({ headSha: r.headSha, base: r.baseRefName }); cache.set(key, read?.error || !Array.isArray(read?.files) ? null : read.files); }
-    const files = cache.get(key);
-    if (!files) { cache.delete(key); unreadable = true; return r; } // unreadable: keep the listing, retry next pass
+    // The base tip is not in the key, so a cached read expires after a minute (a moved base can change a net diff).
+    const hit = cache.get(key);
+    let files = hit && Date.now() - hit.at < 60_000 ? hit.files : null;
+    if (!files) { const read = readFiles({ headSha: r.headSha, base: r.baseRefName }); files = !read?.error && Array.isArray(read?.files) ? read.files : null; if (files) cache.set(key, { files, at: Date.now() }); else cache.delete(key); }
+    if (!files) { unreadable = true; return r; } // unreadable: keep every listing, retry next pass
     const listed = new Map((r.files || []).map((f) => [f?.path ?? f, f])); // keep each file's additions/deletions: land order ranks by size
     return { ...r, files: files.map((path) => (typeof listed.get(path) === 'object' ? listed.get(path) : { path, additions: 0, deletions: 0 })), filesComplete: true };
   };
