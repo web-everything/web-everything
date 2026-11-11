@@ -579,6 +579,11 @@ describe('bounded orphan release of run-less markers', () => {
     expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [going(RUN_B, NOW + 1_000)]))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
+  it.each([97, 254])('keeps it when a code-%s receipt (surviving descendants possible) started inside its window', async code => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [done(RUN_A, code)].map(r => ({...r, startedAtET: iso(NOW - 1_000)}))))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
   it('never applies to a live owner', async () => {
     const root = setup({0: {pid: 111}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([])});
