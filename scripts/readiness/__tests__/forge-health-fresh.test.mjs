@@ -26,7 +26,7 @@ describe('Forge health freshness',()=>{
     expect(await check(root,readTelemetry)).toEqual({ok:true});
     expect(readTelemetry).toHaveBeenCalledTimes(1);
     expect(readTelemetry).toHaveBeenCalledWith({host:'forge'});
-    expect(load(root)).toEqual(saved(fresh,now));
+    expect(load(root)).toEqual({...saved(fresh,now),infraFailures:0,breakerUntil:0,breakerPhase:''});
   });
 
   it.each([

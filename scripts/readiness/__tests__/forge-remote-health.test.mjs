@@ -22,7 +22,7 @@ describe('malformed Forge health state',()=>{
     expect(await check(root,sample())).toEqual({ok:true});
     expect(invalid(root)).toHaveLength(1);
     const state=JSON.parse(readFileSync(join(root,'health.json'),'utf8'));
-    expect(Object.keys(state).sort()).toEqual(['backoffUntil','failures','lastReadAt','telemetry','trigger','v']);
+    expect(Object.keys(state).sort()).toEqual(['backoffUntil','breakerPhase','breakerUntil','failures','infraFailures','lastReadAt','telemetry','trigger','v']);
     expect(JSON.parse(readFileSync(join(root,invalid(root)[0]),'utf8')).lastGoodAt).toBe(now);
   });
   it('still falls back when telemetry is bad after quarantine',async()=>{
