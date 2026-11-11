@@ -440,6 +440,44 @@ describe('the seal survives the rest of the pipeline (self-review round 1)', () 
     const d = readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env });
     expect(d.held.length).toBeGreaterThanOrEqual(1);
   });
+  // Seals are per head: a stale clean seal on a revisited live head, or on an intermediate head, must not mask the carry
+  // origin's sealed break (round 9 self-review). Every seal on the chain is checked.
+  const writeCleanSeal = h => {
+    const p = sealedStatusPath({ repo, pr: 42, head: h }, process.env);
+    mkdirSync(join(p, '..'), { recursive: true });
+    writeFileSync(p, JSON.stringify({ repo, pr: 42, head: h, status: 'finished', result: 'ran', sealedBreaks: [] }));
+  };
+  const carry = (from, to, minute) => ({ ...trusted([`<!-- review-verdict-carried from=${from} to=${to} patch-id=${'c'.repeat(40)} -->`,
+    'Review verdict carried across an identical contribution.', redTeamMarker(42, to),
+    '### Post-accept red team — no break found'].join('\n')), createdAt: `2026-11-10T12:${String(minute).padStart(2, '0')}:00Z` });
+  it('a force-push back to a head with its own older clean seal still holds on the carry origin\'s sealed break', () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]);
+    const back = 'b'.repeat(40);
+    writeCleanSeal(back);
+    expect(readSealedStatus({ repo, pr: 42, head: back, env: process.env })).toEqual({ breaks: [], legacyHold: false });
+    const d = readRedTeamDisposition({ comments: [clearComment, carry(head, back, 5)], pr: 42, head: back, repo, env: process.env });
+    expect(d.held).toEqual([expect.objectContaining({ index: 0 })]);
+  });
+  it('an intermediate head\'s own clean seal does not mask the carry origin\'s sealed break', () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]);
+    const mid = 'b'.repeat(40), live = 'd'.repeat(40);
+    writeCleanSeal(mid);
+    const thread = [clearComment, carry(head, mid, 5), carry(mid, live, 6)];
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held)
+      .toEqual([expect.objectContaining({ index: 0 })]);
+  });
+  it('clean seals on every head of the chain hold nothing (no false hold)', () => {
+    writeCleanSeal(head);
+    const mid = 'b'.repeat(40), live = 'd'.repeat(40);
+    writeCleanSeal(mid);
+    writeCleanSeal(live);
+    const thread = [clearComment, carry(head, mid, 5), carry(mid, live, 6)];
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held).toEqual([]);
+  });
   it('the planner reads the persisted seal, not the snapshot it was handed', () => {
     store([seatRow()]);
     writeStatusFile(legacyStatus());

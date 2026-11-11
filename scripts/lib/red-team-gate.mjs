@@ -926,19 +926,22 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   }
   // The sealed stored evidence decides the hold (undefined = read this head's persisted seal; no caller reads it itself).
   // A carried result keeps the seal of the head it was carried from (the carry re-keys the comment, not the stored evidence).
-  let seal = sealed;
-  if (seal === undefined) {
+  // Seals are per head, not per result: the live head or an intermediate head can hold an older seal of its own (a
+  // force-push back to an already-reviewed sha). So EVERY seal on the chain is checked and any one that holds, holds;
+  // a nearer clean seal never masks the carry origin's sealed break (PR #6622 round 9 self-review).
+  let seals = [sealed];
+  if (sealed === undefined) {
     // The publisher writes the seal under ITS process env; a caller's partial env (`{}`) must not move the lookup to a
     // directory with no seal (a missing file reads as "nothing sealed", which would clear). Explicit keys still win.
     const sealEnv = { ...process.env, ...(env ?? {}) };
-    seal = readSealedStatus({ repo, pr, head: live, env: sealEnv });
     // The sweep seals these source heads too (seal only), so an unsealed source cannot hold a carried head forever.
-    for (const from of redTeamCarrySources({ comments, pr, head: live })) {
-      if (seal !== null) break;
-      seal = readSealedStatus({ repo, pr, head: from, env: sealEnv });
-    }
+    seals = [live, ...redTeamCarrySources({ comments, pr, head: live })]
+      .map(h => readSealedStatus({ repo, pr, head: h, env: sealEnv }));
   }
-  const hold = redTeamHoldDecision({ comments, pr, head: live, sealed: seal });
+  const holds = seals.map(s => ({ seal: s, ...redTeamHoldDecision({ comments, pr, head: live, sealed: s }) })).filter(h => h.held);
+  // A conflict outranks "publication pending": report the pending-only hold only when no seal holds for a stronger reason.
+  const hold = holds.find(h => h.seal?.unsealed !== true) ?? holds[0] ?? { held: false, reason: null, seal: null };
+  const seal = hold.seal;
   // `unsealed`: the hold is only "publication pending" (no conflict found yet), so alert surfaces can say so.
   const unsealed = hold.held && seal?.unsealed === true && seal.legacyHold !== true && legacyHold !== true;
   if (legacyHold === true || hold.held) held.push({ index: 0, confirmed: true, category: 'legacy-conflict', file: null, line: null,
