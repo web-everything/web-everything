@@ -416,16 +416,18 @@ const sealedResultKey = result => JSON.stringify(result && typeof result === 'ob
 
 /**
  * Does a rewrite keep the prior seal (PR #6622)? Yes when the prior file was damaged (its seal reads unreadable: fail
- * closed), when the rewrite supplies no replacement evidence — anything but a finished `ran` result: queued/running, a
- * resume (the SAME pass's effects), a finished error or skip — or when it carries the SAME result. Only a NEW finished
- * `ran` result drops the seal (the publisher seals that result itself). PURE.
+ * closed), when the rewrite installs no `ran` result — queued/running with none, a resume (the SAME pass's effects), a
+ * finished error or skip — or when it carries the SAME result. A DIFFERENT `ran` result drops the seal at ANY status:
+ * a recovery that queues a new pass's `ran` must not inherit the old pass's seal (the publisher seals the new one). PURE.
  */
-export function keepSeal(prior, result, status = 'finished') {
+export function keepSeal(prior, result) {
   if (!prior) return false;
   if (prior.damaged === true) return true;
-  if (!presentsOwnEvidence(status, result)) return true;
+  if (!isRanResult(result)) return true;
   return sealedResultKey(prior.result) === sealedResultKey(result);
 }
+
+const isRanResult = result => result === 'ran' || (result != null && typeof result === 'object' && result.status === 'ran');
 
 /**
  * The prior pass's own stored findings, when its result is about to be dropped: a `ran` result object's findings
@@ -443,8 +445,7 @@ function priorPassFindings(prior, { legacy = false } = {}) {
 const DAMAGED_EVIDENCE = /"(sealedBreaks|sealedPosted|legacyHoldPublished|storedFindings)"|"result":\s*"ran"|"result":\s*\{[^{}]*"status":\s*"ran"/;
 
 /** Does a rewritten status present its OWN result as pass evidence (what `sealedFromStatus` reads)? Only a finished `ran`. */
-const presentsOwnEvidence = (status, result) => status === 'finished'
-  && (result === 'ran' || (result != null && typeof result === 'object' && result.status === 'ran'));
+const presentsOwnEvidence = (status, result) => status === 'finished' && isRanResult(result);
 
 /**
  * The stored findings a rewrite must carry (PR #6622). The reader takes a result's findings as evidence only from a
@@ -460,7 +461,7 @@ export function carriedStoredFindings(prior, result, status = 'finished') {
   const carried = !presentsOwnEvidence(status, result)
     ? priorPassFindings(prior, { legacy: status !== 'finished' }) ?? prior.storedFindings
     // The same result keeps what an earlier rewrite carried; a NEW result drops it (the new result is the evidence now).
-    : keepSeal({ ...prior, damaged: false }, result, status) ? prior.storedFindings : undefined;
+    : keepSeal({ ...prior, damaged: false }, result) ? prior.storedFindings : undefined;
   // The legacy carry lasts only while its pass is pending: a finished rewrite (an errored or skipped retry) drops it,
   // since nothing would ever replace it and the hold would never clear.
   return status === 'finished' && carried === LEGACY_PENDING ? undefined : carried;
@@ -534,7 +535,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
     // The sealed stored breaks and the legacy hold flag survive a rewrite that keeps the sealed result (a retry or recovery
     // that has no new result yet) (PR #6622): dropping them lifts the hold. A NEW result drops them, so the status reads
     // as unsealed (or as the seat's own findings) until the publisher seals it: a seal never vouches for another result.
-    ...(keepSeal(prior, result, status) ? {
+    ...(keepSeal(prior, result) ? {
       ...(prior?.sealedBreaks !== undefined ? { sealedBreaks: prior.sealedBreaks } : {}),
       ...(prior?.sealedPosted !== undefined ? { sealedPosted: prior.sealedPosted } : {}),
       ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),

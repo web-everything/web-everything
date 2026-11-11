@@ -600,6 +600,28 @@ describe('the stored result is the authority on every status shape (self-review 
     expect(readStatusFile().sealedBreaks).toBeUndefined();
     expect(heldBy([clearComment]).held).toEqual([]);
   });
+  // Self-review (round 8): recovery queues a NEW pass's bare `ran` after a running rewrite; the old pass's seal must not
+  // vouch for it, at queued or once it finishes (as `ran` again via already-ran, or as `resumed`).
+  it.each([['ran'], ['resumed']])('a recovery that queues a new pass\'s `ran` drops the old seal (finished %s)', finished => {
+    writeStatusFile({ ...legacyStatus(), sealedBreaks: [], legacyHoldPublished: true });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toEqual([]);
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'queued', result: 'ran' }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toBeUndefined();
+    expect(readStatusFile().legacyHoldPublished).toBeUndefined();
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: finished }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toBeUndefined();
+    if (finished === 'ran') expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ unsealed: true });
+  });
+  it('failed retry preserves an operator-flagged legacy hold (no seal)', () => {
+    writeStatusFile({ ...legacyStatus(), legacyHoldPublished: true });
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ unsealed: true, legacyHold: true });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'queued', result: 'ran' }, { env: process.env });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: { status: 'error' } }, { env: process.env });
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ legacyHold: true });
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
   it('failed retry preserves a sealed seat-posted result\'s seal too (the seal, not only the carried findings)', () => {
     writeStatusFile({ repo, pr: 42, head, status: 'finished', result: { ...posted([brokenFinding]), comment: 'withheld' }, sealedBreaks: ['k'] });
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });

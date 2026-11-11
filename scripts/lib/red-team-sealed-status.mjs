@@ -33,7 +33,9 @@ export function sealedFromStatus(status, head) {
   // `sealedPosted`: the publisher's own scrub-fallback body, sealed beside the breaks (see redTeamHoldDecision).
   const posted = status.sealedPosted;
   if (posted !== undefined && (seal === undefined || !keyList(posted))) return { unreadable: true };
-  const legacyHold = status.legacyHoldPublished === true && status.status === 'finished' && status.result === 'ran';
+  // Counted while the flag is stored, whatever the status: a failed or skipped retry must not lift an operator-flagged
+  // hold. The writer drops the flag with the seal when a DIFFERENT `ran` result arrives; the publisher lifts it on resolve.
+  const legacyHold = status.legacyHoldPublished === true;
   // A status that still owes publication (same test as the publisher's `needsPublish`) and has no seal yet: nothing has
   // compared the stored evidence with the thread, so no posted comment may clear it. Hold until the publisher seals.
   const owesPublish = status.status === 'finished' && (status.result === 'ran'
