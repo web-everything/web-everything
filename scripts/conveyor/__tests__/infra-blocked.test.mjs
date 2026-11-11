@@ -8,7 +8,7 @@
  *   roundtrip is exercised at the boundary; the live gh/network/pr-land driver is the IO shell (not unit-tested).
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -450,6 +450,20 @@ describe('fs roundtrip — atomic write, tolerant read, idempotent record-IO', (
     })));
     expect(JSON.parse(readFileSync(path, 'utf8'))).toHaveLength(procs * perProc);
   }, 120_000);
+
+  it('withInfraLock waits by SLEEPING, not busy-spinning — a waiter must not burn the CPU the lock holder needs', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ib-fs-'));
+    const path = join(dir, '.conveyor', 'store.json');
+    mkdirSync(join(dir, '.conveyor'), { recursive: true });
+    writeFileSync(`${path}.lock`, String(process.pid)); // a fresh lock another process "holds" for the whole wait
+    const cpu0 = process.cpuUsage();
+    const t0 = Date.now();
+    expect(() => withInfraLock(path, () => 1, { requireLock: true, timeoutMs: 400, staleMs: 60_000 })).toThrow(/could not acquire store lock/);
+    const wallMs = Date.now() - t0;
+    const { user, system } = process.cpuUsage(cpu0);
+    expect(wallMs).toBeGreaterThanOrEqual(400);
+    expect((user + system) / 1000).toBeLessThan(wallMs * 0.5); // a spin loop uses ~100% of one core
+  });
 
   it('mutateInfraStore re-reads the CURRENT on-disk store (no stale snapshot) then applies the transform', () => {
     dir = mkdtempSync(join(tmpdir(), 'ib-fs-'));
