@@ -698,7 +698,7 @@ describe('portable feed IO and settings', () => {
     const { runBoundedPass } = await import('../pr-live-owner-watch.mjs');
     let cache;
     const result = await probeLiveOwnerWatch({ dir, now: NOW, readCache: () => null, writeCache: v => { cache = v; },
-      remainingMs: 5000, runPass: options => runBoundedPass({ ...options, script }) });
+      remainingMs: 7000, runPass: options => runBoundedPass({ ...options, script }) });
     expect(result).toMatchObject({ cached: false, error: expect.any(String) }); expect(cache).toBeUndefined();
     const childPid = Number(readFileSync(pidFile, 'utf8'));
     expect(() => process.kill(childPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
@@ -719,8 +719,12 @@ describe('portable feed IO and settings', () => {
     // Only the tick budget crosses: no health default for mode, actEnabled or a threshold reaches the child.
     expect(JSON.parse(child.config)).toEqual({ tickBudgetMs: 19_000 });
     expect(child.now).toBe(String(NOW));
-    // Start-up headroom is at most a quarter of a short kill timeout, so a small budget is never zeroed.
-    expect(JSON.parse(liveOwnerChildEnv({ now: NOW, timeoutMs: 2000, env: {} }).WE_LIVE_OWNER_WATCH_CONFIG)).toEqual({ tickBudgetMs: 1500 });
+    // The start-up margin is fixed; a tick too short to leave the child a usable budget is skipped, not launched.
+    expect(JSON.parse(liveOwnerChildEnv({ now: NOW, timeoutMs: 8000, env: {} }).WE_LIVE_OWNER_WATCH_CONFIG)).toEqual({ tickBudgetMs: 3000 });
+    const shortRun = vi.fn();
+    expect(await probeLiveOwnerWatch({ dir: probeDir, now: NOW, remainingMs: 5999, readCache: () => null, writeCache: () => {}, runPass: shortRun }))
+      .toEqual({ skipped: 'tick budget exhausted' });
+    expect(shortRun).not.toHaveBeenCalled();
     const childIo = async ({ fileSettings, platform }) => {
       const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-child-')); dirs.push(dir);
       mkdirSync(join(dir, 'scripts/conveyor'), { recursive: true });
@@ -735,5 +739,5 @@ describe('portable feed IO and settings', () => {
       .toMatchObject({ mode: 'on', actEnabled: true, noMergeMinutes: 90, tickBudgetMs: 19_000 });
     expect(await childIo({ platform: { liveOwnerWatch: { mode: 'on', actEnabled: true } } })).toMatchObject({ mode: 'on', actEnabled: true });
     expect(await childIo({})).toMatchObject({ mode: 'shadow', actEnabled: false });
-  });
+  }, 15_000);
 });

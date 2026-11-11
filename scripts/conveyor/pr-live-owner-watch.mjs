@@ -246,7 +246,8 @@ export async function probeLiveOwnerWatch({ dir, now = Date.now(), config = {}, 
   const elapsed = now - millis(previous?.at);
   if (elapsed >= 0 && elapsed < cfg.intervalMinutes * MINUTE) return { ...previous, cached: true };
   if (flags['state-root'] || flags['logs-dir'] || flags['lock-root'] || flags['dry-run']) return { skipped: 'isolated health tick' };
-  if (remainingMs < 1000) return { skipped: 'tick budget exhausted' };
+  // Below this the child's start-up margin would leave it no usable budget: skip rather than launch a doomed pass.
+  if (remainingMs < CHILD_STARTUP_MARGIN_MS + 1000) return { skipped: 'tick budget exhausted' };
   try {
     const result = await runPass({ now, config: cfg, timeoutMs: Math.min(remainingMs, cfg.tickBudgetMs) });
     const value = { at: new Date(now).toISOString(), result }; writeCache(value); return { ...value, cached: false };
@@ -256,13 +257,14 @@ export async function probeLiveOwnerWatch({ dir, now = Date.now(), config = {}, 
  * Child env for the bounded pass. Forward only the tick budget the parent's kill timeout enforces: policy
  * (mode, actEnabled) and thresholds resolve in the child's own cascade (settings file → platform → env), so
  * health defaults never override an explicit opt-in or a configured threshold. The child's budget clock starts
- * after Node boot and imports, so it gets the kill timeout minus a start-up margin (at most a quarter of it):
- * a pass that spends its whole budget still finishes before the SIGKILL, never between intent and did.
+ * after Node boot and imports, so it gets the kill timeout minus a fixed start-up margin; the probe skips a
+ * tick too short to leave one. This keeps the budget checks from running past the kill. It does NOT bound
+ * the work after an intent record: an action admitted near the end of the budget can still be killed
+ * between intent and did (acting is off by default; disclosed in docs/agent/testing.md).
  */
 export function liveOwnerChildEnv({ now, timeoutMs, env = process.env }) {
-  const margin = Math.min(CHILD_STARTUP_MARGIN_MS, Math.floor(timeoutMs / 4));
   return { ...env, WE_LIVE_OWNER_WATCH_NOW: String(now),
-    WE_LIVE_OWNER_WATCH_CONFIG: JSON.stringify({ tickBudgetMs: Math.max(1, Math.floor(timeoutMs - margin)) }) };
+    WE_LIVE_OWNER_WATCH_CONFIG: JSON.stringify({ tickBudgetMs: Math.max(1, Math.floor(timeoutMs - CHILD_STARTUP_MARGIN_MS)) }) };
 }
 /** Runs the pass in a child killed with SIGKILL at the timeout; the child's own gh/git/ps reads carry ≤5s timeouts. */
 export function runBoundedPass({ now, timeoutMs, script = fileURLToPath(import.meta.url) }) {
