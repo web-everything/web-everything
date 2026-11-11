@@ -53,16 +53,14 @@ export function readDeferredMarker(gitDir) {
  * - unless the main marker is `infrastructure-failure` for exactly this sha, there is no deferral (fail closed: a
  *   missing marker after `reset` or a manual `rm`, a corrupt, running, red or green one, or one for another sha
  *   each void any deferred file left behind — a stale file alone can never open a PR);
- * - then a well-formed deferred file for this exact sha is used;
- * - otherwise the main marker's deferrable evidence is turned into the same record (a legacy `red`-with-signal
- *   record never defers).
+ * - the record is then built from the main marker's own deferrable evidence, never from the deferred file (that
+ *   file is a second copy that a later same-sha kill does not rewrite, so it could show stale evidence); a legacy
+ *   `red`-with-signal record never defers.
  */
 export function readDeferredForSha(gitDir, headSha) {
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return null;
   const main = readVerifyMarker(gitDir);
   if (!main || main.corrupt || main.sha !== headSha || main.status !== 'infrastructure-failure') return null;
-  const file = readDeferredMarker(gitDir);
-  if (file && !file.corrupt && file.status === DEFERRED_STATUS && file.sha === headSha) return file;
   return buildDeferredRecord({ sha: headSha, infrastructure: main.infrastructure, exitCode: main.exitCode,
     ...(typeof main.finishedAt === 'string' ? { recordedAt: main.finishedAt } : {}) });
 }
@@ -100,7 +98,35 @@ export function deferredToCiDecision({ gate, deferred, headSha, mode } = {}) {
   if (!deferred || deferred.corrupt || deferred.status !== DEFERRED_STATUS) return no('no-deferred-marker');
   if (!headSha || deferred.sha !== headSha) return no('deferred-sha-mismatch');
   if (!validInfra(deferred.infrastructure) || deferred.reason !== deferred.infrastructure.reason) return no('deferred-evidence-invalid');
-  return { ok: true, reason: 'deferred-to-ci', disclosure: `lane verify deferred to CI: ${oneLine(deferred.reason, 64)} - ${oneLine(deferred.detail)}` };
+  const disclosure = disclosureFor(deferred.infrastructure);
+  if (!disclosure) return no('deferred-evidence-invalid');
+  return { ok: true, reason: 'deferred-to-ci', disclosure };
+}
+
+const SIGNAL_NAME = /^SIG[A-Z0-9]{1,12}$/;
+/**
+ * Pure. The disclosure sentence, rendered from a FIXED template per deferrable reason — never from the marker's free
+ * `detail` text. Any process in the lane can write `.lane-verify`, and text in a PR body means something to GitHub
+ * and the bots that read it (`fixes #N` closes an issue on merge, `@user` pings, a main-red sha claims the red-main
+ * fix), which no character filter can neutralise. Only validated fields are filled in: an integer ceiling, a
+ * `queue`/`gate` phase, a `SIG*` name. The full evidence stays in the marker and the verify log.
+ * @returns {string|null} null for an unknown reason
+ */
+export function disclosureFor(infrastructure) {
+  const i = infrastructure && typeof infrastructure === 'object' ? infrastructure : {};
+  let fact = null;
+  if (i.reason === 'verify-timeout') {
+    const ms = Number.isSafeInteger(i.ceilingMs) && i.ceilingMs > 0 ? `${i.ceilingMs}ms ` : '';
+    const phase = i.phase === 'queue' || i.phase === 'gate' ? `${i.phase}-phase ` : '';
+    fact = `the verify process tree was killed after the ${ms}${phase}ceiling`;
+  } else if (i.reason === 'verify-signal') {
+    fact = `the verify process ended on ${SIGNAL_NAME.test(String(i.signal)) ? i.signal : 'a signal'}`;
+  } else if (i.reason === 'verify-unsettled') {
+    fact = 'a test shard stayed inventory-incomplete after one split retry';
+  } else if (i.reason === 'remote-termination-unconfirmed') {
+    fact = 'the remote verify run could not be confirmed terminated';
+  }
+  return fact ? `lane verify deferred to CI: ${i.reason} - ${fact}; no test verdict (details in the lane verify marker and log)` : null;
 }
 
 /** Longest `detail` the disclosure carries; the full evidence stays in the marker and the verify log. */
@@ -124,7 +150,9 @@ export function oneLine(text, max = DISCLOSURE_DETAIL_MAX) {
     .replace(INVISIBLE_RE, '')
     .replace(/`/g, "'").replace(/</g, '‹').replace(/>/g, '›')
     .replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+  // Cut on code points (never a lone surrogate) and end with ASCII `...` so a second pass (NFKC) is a no-op.
+  const cps = Array.from(flat);
+  return cps.length > max ? `${cps.slice(0, max - 3).join('')}...` : flat;
 }
 
 export function appendDeferredDisclosure(body, disclosure) {

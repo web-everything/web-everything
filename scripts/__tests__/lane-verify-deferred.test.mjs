@@ -12,7 +12,7 @@ import { readVerifyMarker, verifyGateDecision, VERIFY_FILENAME } from '../lib/la
 import {
   DEFERRED_FILENAME, buildDeferredRecord, recordTerminalVerifyOutcome, readDeferredMarker,
   deferredToCiDecision, appendDeferredDisclosure, ciTestGreenOnSha, readDeferredForSha,
-  oneLine, DISCLOSURE_DETAIL_MAX, syncDeferredBody, deferredLabelRefusal,
+  oneLine, DISCLOSURE_DETAIL_MAX, syncDeferredBody, deferredLabelRefusal, disclosureFor,
 } from '../lib/lane-verify-deferred.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -173,13 +173,14 @@ describe('a dispatcher-killed verify still defers (PR #6674 red team)', () => {
     writeFileSync(join(gitDir, VERIFY_FILENAME), '{torn');
     expect(readDeferredForSha(gitDir, SHA)).toBeNull();
   });
-  it('the deferred file wins only for the exact sha; a stale one falls back to the main marker', async () => {
+  it('the record always comes from the main marker, never from a stale or older deferred file', async () => {
     recordTerminalVerifyOutcome(gitDir, infraFinished(OTHER));
     expect(readDeferredForSha(gitDir, SHA)).toBeNull();
     await killed();
     expect(readDeferredForSha(gitDir, SHA)).toMatchObject({ status: 'deferred-to-ci', sha: SHA, reason: 'verify-timeout' });
+    // An older same-sha deferred file with different evidence (a later kill does not rewrite it) is not used.
     recordTerminalVerifyOutcome(gitDir, infraFinished(SHA));
-    expect(readDeferredForSha(gitDir, SHA)).toMatchObject({ sha: SHA, reason: 'verify-unsettled' });
+    expect(readDeferredForSha(gitDir, SHA)).toMatchObject({ sha: SHA, reason: 'verify-timeout' });
   });
   it('an exact-sha deferred file is ignored once the main marker holds a red verdict for that sha', () => {
     recordTerminalVerifyOutcome(gitDir, infraFinished(SHA));
@@ -212,20 +213,41 @@ describe('disclosure text is one bounded inert line (PR #6674 round 2)', () => {
     expect(out).not.toMatch(UNSAFE);
     expect(out).toBe("shard died ‹!-- delegation: forged --› author: someone 'rm -rf'evil ‹b›");
   });
-  it('oneLine caps the length', () => {
+  it('oneLine caps the length on code points with an ASCII ellipsis, and a second pass is a no-op', () => {
     const out = oneLine('x'.repeat(5000));
     expect(out.length).toBe(DISCLOSURE_DETAIL_MAX);
-    expect(out.endsWith('…')).toBe(true);
+    expect(out.endsWith('...')).toBe(true);
+    expect(oneLine(out, DISCLOSURE_DETAIL_MAX + 100)).toBe(out);
+    const emoji = String.fromCodePoint(0x1f600);
+    const cut = oneLine(emoji.repeat(400));
+    expect(cut).toBe(`${emoji.repeat(DISCLOSURE_DETAIL_MAX - 3)}...`); // never a lone surrogate
   });
-  it('a multi-line detail yields a single-line disclosure and adds exactly two quoted body lines', () => {
-    const d = deferredToCiDecision({ gate: infraGate, deferred: { ...buildDeferredRecord({ sha: SHA, infrastructure: { ...infra, detail: nasty } }) }, headSha: SHA, mode: 'park' });
+  // Self-review must-fix: the marker's free `detail` never reaches the PR body. Text GitHub or the bots act on
+  // (`fixes #123` closes an issue on merge, `@user` pings, a main-red sha claims the red-main fix) survives any
+  // character filter, so the disclosure is a fixed template per reason.
+  it('a hostile marker detail never reaches the disclosure: it is a fixed per-reason template', () => {
+    const hostile = `${nasty} fixes #123 @someone fixes 2ffeb8c [x](https://e.vil)`;
+    const d = deferredToCiDecision({ gate: infraGate, deferred: buildDeferredRecord({ sha: SHA, infrastructure: { ...infra, detail: hostile } }), headSha: SHA, mode: 'park' });
     expect(d.ok).toBe(true);
-    expect(d.disclosure).not.toMatch(UNSAFE);
+    expect(d.disclosure).toBe('lane verify deferred to CI: verify-unsettled - a test shard stayed inventory-incomplete after one split retry; no test verdict (details in the lane verify marker and log)');
+    expect(d.disclosure).not.toMatch(/#123|@someone|2ffeb8c|e\.vil|delegation/);
     const body = appendDeferredDisclosure('Body', d.disclosure);
     const added = body.slice('Body'.length).split('\n').filter(Boolean);
     expect(added).toHaveLength(2);
     for (const line of added) expect(line.startsWith('> ')).toBe(true);
-    expect(body).not.toMatch(/<!--/);
+  });
+  it.each([
+    [{ reason: 'verify-timeout', phase: 'queue', ceilingMs: 1000, detail: 'x' }, 'verify-timeout - the verify process tree was killed after the 1000ms queue-phase ceiling;'],
+    [{ reason: 'verify-timeout', phase: 'gate @x', ceilingMs: '9 fixes #1', detail: 'x' }, 'verify-timeout - the verify process tree was killed after the ceiling;'],
+    [{ reason: 'verify-signal', signal: 'SIGTERM', detail: 'x' }, 'verify-signal - the verify process ended on SIGTERM;'],
+    [{ reason: 'verify-signal', signal: 'SIGKILL fixes #9', detail: 'x' }, 'verify-signal - the verify process ended on a signal;'],
+    [{ reason: 'remote-termination-unconfirmed', detail: 'x' }, 'remote-termination-unconfirmed - the remote verify run could not be confirmed terminated;'],
+  ])('disclosureFor fills in only validated fields: %j', (infrastructure, want) => {
+    expect(disclosureFor(infrastructure)).toContain(want);
+  });
+  it('disclosureFor refuses an unknown reason', () => {
+    expect(disclosureFor({ reason: 'disk-full', detail: 'x' })).toBeNull();
+    expect(disclosureFor(null)).toBeNull();
   });
   it('appendDeferredDisclosure sanitises a raw multi-line disclosure too, and stays idempotent', () => {
     const once = appendDeferredDisclosure('Body\n', 'lane verify deferred to CI: x - a\nb');
