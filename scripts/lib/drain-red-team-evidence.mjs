@@ -421,7 +421,26 @@ const sealedResultKey = result => JSON.stringify(result && typeof result === 'ob
 export function keepSeal(prior, result) {
   if (!prior) return false;
   if (prior.damaged === true) return true;
-  return result == null || sealedResultKey(prior.result) === sealedResultKey(result);
+  // A resume finishes the SAME pass's effects (it never re-runs the model), so it keeps the pass's seal.
+  return result == null || resumedResult(result) || sealedResultKey(prior.result) === sealedResultKey(result);
+}
+
+const resumedResult = result => (typeof result === 'string' ? result : result?.status) === 'resumed';
+
+/**
+ * The stored findings a rewrite must carry (PR #6622): a resume replaces the seat-posted result object with a bare
+ * `resumed`, which would drop the only stored evidence of an unsealed pass. Carried as `storedFindings`, read by
+ * `sealedFromStatus` exactly like the result's own findings. PURE.
+ */
+export function carriedStoredFindings(prior, result) {
+  if (!prior) return undefined;
+  if (resumedResult(result)) {
+    const r = prior.result;
+    if (r && typeof r === 'object' && r.status === 'ran') return Array.isArray(r.findings) ? r.findings : 'unreadable';
+    return prior.storedFindings;
+  }
+  // A rewrite with no result yet, or the same result, keeps what an earlier resume carried; a NEW result drops it.
+  return keepSeal({ ...prior, damaged: false }, result) ? prior.storedFindings : undefined;
 }
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
@@ -492,6 +511,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
       ...(prior?.sealedPosted !== undefined ? { sealedPosted: prior.sealedPosted } : {}),
       ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),
     } : {}),
+    ...(carriedStoredFindings(prior, result) !== undefined ? { storedFindings: carriedStoredFindings(prior, result) } : {}),
     ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }

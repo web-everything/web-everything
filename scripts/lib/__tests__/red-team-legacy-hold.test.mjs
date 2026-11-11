@@ -476,6 +476,26 @@ describe('the stored result is the authority on every status shape (self-review 
       { env: process.env });
     expect(readStatusFile().sealedBreaks).toEqual(['k']);
   });
+  it('a resume (bare `resumed` result) keeps the pass\'s seal: a later "no break found" comment still holds', () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    publish([clearComment]); // seals the stored break
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'resumed' }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toHaveLength(1);
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('a resume of an unsealed seat-posted (deduped) result carries its stored findings, through a later running rewrite too', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: { ...posted([brokenFinding]), comment: 'deduped' } });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'resumed' }, { env: process.env });
+    expect(readStatusFile()).toMatchObject({ result: 'resumed', storedFindings: [expect.objectContaining({ confirmed: true })] });
+    expect(heldBy([render([brokenFinding]), later(clearComment)]).held.length).toBeGreaterThanOrEqual(1);
+    expect(heldBy([render([brokenFinding])]).held.filter(f => f.index === 0)).toEqual([]);
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expect(readStatusFile().storedFindings).toHaveLength(1);
+    // A NEW result drops the carried findings (the new result is the evidence now).
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: posted([]) }, { env: process.env });
+    expect(readStatusFile().storedFindings).toBeUndefined();
+  });
   it('a "publication pending" hold asks no ruling (no false round-cap row), yet still holds the merge', () => {
     store([seatRow()]);
     writeStatusFile(legacyStatus());

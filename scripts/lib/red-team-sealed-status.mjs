@@ -46,6 +46,10 @@ export function sealedFromStatus(status, head) {
   if (seal === undefined && status.status === 'finished' && r && typeof r === 'object' && r.status === 'ran') {
     return Array.isArray(r.findings) ? { findings: r.findings, legacyHold } : { unreadable: true };
   }
+  // The same evidence carried across a resume (which writes a bare `resumed` result): `storedFindings`.
+  if (seal === undefined && status.storedFindings !== undefined) {
+    return Array.isArray(status.storedFindings) ? { findings: status.storedFindings, legacyHold } : { unreadable: true };
+  }
   if (seal === undefined && !legacyHold) return null;
   return { breaks: seal ?? [], legacyHold, ...(posted !== undefined ? { posted } : {}) };
 }
