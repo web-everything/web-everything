@@ -462,7 +462,7 @@ describe('fs roundtrip — atomic write, tolerant read, idempotent record-IO', (
     const wallMs = Date.now() - t0;
     const { user, system } = process.cpuUsage(cpu0);
     expect(wallMs).toBeGreaterThanOrEqual(400);
-    expect((user + system) / 1000).toBeLessThan(wallMs * 0.5); // a spin loop uses ~100% of one core
+    expect((user + system) / 1000).toBeLessThan(wallMs * 0.2); // a spin loop burns up to a whole core (less on a busy host); a sleeping wait ~0
   });
 
   it('mutateInfraStore re-reads the CURRENT on-disk store (no stale snapshot) then applies the transform', () => {
