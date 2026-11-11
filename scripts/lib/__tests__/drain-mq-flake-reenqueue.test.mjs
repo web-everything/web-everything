@@ -84,8 +84,8 @@ function fixture({ checks = [job(21)], events = history(1), mergeState = 'CLEAN'
     throw new Error(`unexpected GitHub IO: ${args.join(' ')}`);
   });
   return { posts, checkReads, setChecks: value => { currentChecks = value; },
-    guard: () => {
-      const result = mqSameHeadGuard({ repo, pr, head, exec, now, quarantine: { readList: null } });
+    guard: (extra = {}) => {
+      const result = mqSameHeadGuard({ repo, pr, head, exec, now, quarantine: { readList: null }, ...extra });
       expect(unexpected).toEqual([]);
       return result;
     } };
@@ -138,6 +138,14 @@ describe('rerun-confirmed MQ flakes through mqSameHeadGuard', () => {
     vi.stubEnv('WE_UNDER_TEST', '');
   });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
+
+  it('never POSTs a rerun during a dry run and still holds with a visible dry-run reason', () => {
+    const f = fixture({ checks: [job(21), job(22)], logText: testLog });
+    const decision = f.guard({ dryRun: true });
+    expect(decision.hold).toBe(true);
+    expect(f.posts).toEqual([]);
+    expect(decision.reason ?? decision.line).toMatch(/dry.?run/i);
+  });
 
   it.each([['assertion failure', testLog], ['heavy-admission run ceiling', ceilingLog]])(
     'requests one rerun per failed Actions job on first sight of %s and holds visibly', (_name, logText) => {
