@@ -13,8 +13,11 @@ const run = (id, conclusion, created_at, updated_at) => ({
   path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
 });
 const shard = (i, conclusion = 'cancelled') => ({ id: 100 + i, name: `ci / test-shard (${i})`, status: 'completed', conclusion, output: { title: '', summary: '' } });
-const gate = (summary = 'HOLD red-main-freeze main is RED (freeze: main CI red since ac12ebdb5)') =>
-  ({ id: 50, name: 'ci / merge-gate', status: 'completed', conclusion: 'failure', output: { title: 'merge-gate', summary } });
+const FREEZE = '2026-11-11T21:02:22Z   hold              red-main-freeze        main is RED (freeze: main CI red since ac12ebdb5)';
+let gateLog = FREEZE;
+const gate = (log = FREEZE) => { gateLog = log;
+  return { id: 50, name: 'ci / merge-gate', status: 'completed', conclusion: 'failure', output: { title: null, summary: null },
+    details_url: `https://github.com/${repo}/actions/runs/1/job/50` }; };
 
 // Main was red when the PR was removed (21:11Z) and is green now.
 const redAtRemoval = [run(2, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'),
@@ -41,6 +44,7 @@ function fixture(checks, mainRuns = redAtRemoval) {
       if (before?.startsWith('<')) selected = selected.filter(item => Date.parse(item.created_at) < Date.parse(before.slice(1)));
       return JSON.stringify({ total_count: selected.length, workflow_runs: selected });
     }
+    if (endpoint === `repos/${repo}/actions/jobs/50/logs`) return gateLog;
     if (endpoint?.includes('/logs')) throw new Error('no log');
     throw new Error(`unexpected GitHub read: ${args.join(' ')}`);
   });
@@ -79,17 +83,17 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   });
 
   it('still holds a merge-gate failure that is not the red-main-freeze hold', () => {
-    const f = fixture([gate('2 tests failed'), shard(1)], greenAtRemoval);
+    const f = fixture([gate('2026-11-11T21:02:22Z   hold              required-checks        2 tests failed'), shard(1)], greenAtRemoval);
     expect(f.guard().hold).toBe(true);
   });
 
-  it('still holds a merge-gate with extra lines after the hold (mocha-style failure)', () => {
-    const f = fixture([gate('HOLD red-main-freeze main is RED (freeze: main CI red since ac12ebdb5)\n1 failing\nError: boom'), shard(1)], greenAtRemoval);
+  it('still holds a merge-gate with a second hold reason next to the freeze', () => {
+    const f = fixture([gate(`${FREEZE}\n2026-11-11T21:02:23Z   hold              required-checks        test red`), shard(1)], greenAtRemoval);
     expect(f.guard().hold).toBe(true);
   });
 
-  it('still holds a merge-gate that mentions red-main-freeze but also reports a test failure', () => {
-    const f = fixture([gate('HOLD red-main-freeze ... also: 2 tests failed, expected 1 to be 2'), shard(1)], greenAtRemoval);
+  it('still holds a merge-gate whose log does not show the freeze hold', () => {
+    const f = fixture([gate('not a gate log'), shard(1)], greenAtRemoval);
     expect(f.guard().hold).toBe(true);
   });
 });

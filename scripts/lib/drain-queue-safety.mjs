@@ -485,13 +485,23 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
     // Infra proof without logs: every failed job was cancelled/never ran, or the only real failure is the
     // merge-gate's own red-main-freeze HOLD (caused by main, not by this PR). A real failing job never qualifies.
     const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
-    const freezeGate = check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure'
-      // Whitelist the exact hold line: the summary is nothing but that line, and no other text rides along.
-      && typeof check.output?.summary === 'string'
-      && /^HOLD red-main-freeze main is RED \(freeze: main CI red since [0-9a-f]{7,40}\)$/.test(check.output.summary.trim())
-      && [check.output?.title, check.output?.text].every(value => value == null || value === '' || value === 'merge-gate');
-    const noLogInfra = failed.every(check => cancelledOnly(check) || freezeGate(check))
-      && (failed.every(cancelledOnly) || failed.some(freezeGate));
+    // The merge-gate's reason is only in its job log: read it once (budgeted) and require the freeze to be the SOLE hold.
+    const gates = failed.filter(check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure');
+    let freezeProven = false;
+    if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
+      try {
+        const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
+        if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
+          budget--;
+          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}/logs`], {
+            encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
+            .slice(-MQ_INFRA_SCAN_BYTES);
+          const holds = log.split('\n').filter(line => /^\S+\s+hold\s{2,}\S+/.test(line));
+          freezeProven = holds.length === 1 && /^\S+\s+hold\s{2,}red-main-freeze\s+main is RED \(freeze:/.test(holds[0]);
+        }
+      } catch { /* unreadable gate log: the hold stays */ }
+    }
+    const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;
     const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
     const logVerdicts = new Map();
