@@ -2763,7 +2763,7 @@ async function cmdAcquire(repo) {
             if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
           }
           provisionClaimedLane(repo, pick, false, {
-            beforeFetch: () => unpushedLaneWork(repo, laneDir(repo, pick), { allowFetch: true }),
+            beforeFetch: () => assertNoUnpushedLaneWork(repo, pick),
             beforeReset: () => assertNoUnpushedLaneWork(repo, pick),
           }); // auto-pick never targets a reserved lane
           chosen = pick;
@@ -2908,7 +2908,7 @@ async function cmdAcquire(repo) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       provisionClaimedLane(repo, chosen, targetWasReserved, {
-        beforeFetch: () => unpushedLaneWork(repo, dir, { allowFetch: true }),
+        beforeFetch: () => assertNoUnpushedLaneWork(repo, chosen),
         beforeReset: () => assertNoUnpushedLaneWork(repo, chosen),
       });
     } catch (e) {
@@ -3277,7 +3277,15 @@ async function salvageUnpushed(repo, { lanes = existingLanes(repo), dryRun = fal
       if (!current || JSON.stringify(current) !== JSON.stringify(local)) throw new Error('local tips changed during salvage; no reset');
       assertLiveness();
       journalLaneEvent(dir, { action: 'salvage-verified', reason: `all ${refs.length} remote refs verified before reset`, salvagedTo: base });
-      provisionClaimedLane(repo, n, false, { beforeDestructiveStep: assertSalvageLease });
+      let tipsChecked = false;
+      provisionClaimedLane(repo, n, false, { beforeDestructiveStep: () => {
+        assertSalvageLease();
+        if (tipsChecked) return; // later steps follow our own checkout, which legitimately moves HEAD
+        tipsChecked = true;
+        // The ordinary fetch runs before this step: a stash/tip added meanwhile must not be reset or cleared.
+        const now = releaseLocalWorkTips(dir);
+        if (!now || JSON.stringify(now) !== JSON.stringify(local)) throw new Error('local tips or stashes changed during salvage fetch; no reset');
+      } });
       assertSalvageLease();
       git(['stash', 'clear'], dir);
       journalLaneEvent(dir, { action: 'salvage-reset', reason: `reset after verified salvage; stash cleared`, salvagedTo: base, headAfter: laneHead(dir) });
