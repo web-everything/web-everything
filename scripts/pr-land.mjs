@@ -130,7 +130,7 @@ import { join } from 'node:path';
 import { pushRefusal, callerIdentity, repoKeyForCheckout } from './conveyor/fix-procedure.mjs'; // fix procedure — refuse a push to a branch another fixer holds the fix claim on
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
-import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, ciTestGreenOnSha } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
+import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
@@ -1116,9 +1116,8 @@ async function runCli() {
     try {
       const liveBody = forge.viewPr(prNum, 'body').body || '';
       const updated = composePrBody(liveBody);
-      if (updated !== liveBody) forge.editBody(prNum, updated);
-      // R893: a rerun records the deferral on an existing PR too (idempotent).
-      if (DEFERRED_TO_CI && !updated.includes(DEFERRED_TO_CI.disclosure)) forge.editBody(prNum, appendDeferredDisclosure(updated, DEFERRED_TO_CI.disclosure));
+      // R893: a rerun records the deferral on an existing PR too (idempotent), in the same single body edit.
+      syncDeferredBody({ forge, prNum, liveBody, composed: updated, deferred: DEFERRED_TO_CI });
     } catch { /* best-effort — drain ref fallback covers a miss */ }
   }
   if (prNum == null) return ghFailed('could not determine the PR number after create');
@@ -1392,12 +1391,11 @@ async function runCli() {
 
   // Required checks are GREEN — NOW apply the producer-certified label (#2199: never before this point).
   // R893 — a deferred-to-ci PR is labelled only on a green CI `test` check-run for this exact sha (no new bypass).
-  if (PLAN.labelWhenGreen && DEFERRED_TO_CI) {
-    let ciView = null;
-    try { ciView = forge.viewPr(prNum, 'headRefOid,statusCheckRollup'); } catch { ciView = null; }
-    if (!ciTestGreenOnSha(ciView, refSha)) emit({ repo: REPO, merged: false, reason: 'deferred-ci-not-green', pr: Number(prNum), sha: refSha, detail: `PR #${prNum} opened with lane verify deferred to CI - no green CI test check-run on ${refSha.slice(0, 8)} yet, so ready-to-merge is NOT applied` }, 3);
+  if (PLAN.labelWhenGreen) {
+    const deferredRefusal = deferredLabelRefusal({ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI });
+    if (deferredRefusal) emit({ repo: REPO, merged: false, ...deferredRefusal }, 3);
+    applyLabel();
   }
-  if (PLAN.labelWhenGreen) applyLabel();
 
   // #2307 — and the deterministic review-escalation label (review:human / review:pending), alongside
   // ready-to-merge — a green producer PR IS ready; the review label is the *landing gate*, which the drain

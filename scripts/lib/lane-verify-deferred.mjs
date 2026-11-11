@@ -49,24 +49,22 @@ export function readDeferredMarker(gitDir) {
  * The deferred record pr-land's open path may use for EXACTLY `headSha`, or null. PR #6674 red team: a verify the
  * dispatcher KILLS (queue/gate ceiling) is settled into `.lane-verify` by the dispatcher itself
  * (recordKilledVerification); the killed child never reaches its terminal hook, so no deferred file is written.
- * The main marker is the single source of truth for the latest verdict, so read both here:
- * - a corrupt main marker, or a red/green main marker for this sha, means no deferral (fail closed: a newer verdict
- *   voids any deferred file left for the same sha);
- * - otherwise a well-formed deferred file for this exact sha wins;
- * - otherwise an `infrastructure-failure` main marker for this exact sha with deferrable evidence is turned into
- *   the same record (no carry-forward to another sha; a legacy `red`-with-signal record never defers).
+ * The main marker is the single source of truth for the latest verdict, so it must AUTHORISE every deferral:
+ * - unless the main marker is `infrastructure-failure` for exactly this sha, there is no deferral (fail closed: a
+ *   missing marker after `reset` or a manual `rm`, a corrupt, running, red or green one, or one for another sha
+ *   each void any deferred file left behind — a stale file alone can never open a PR);
+ * - then a well-formed deferred file for this exact sha is used;
+ * - otherwise the main marker's deferrable evidence is turned into the same record (a legacy `red`-with-signal
+ *   record never defers).
  */
 export function readDeferredForSha(gitDir, headSha) {
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return null;
   const main = readVerifyMarker(gitDir);
-  if (main?.corrupt) return null;
-  const mainForSha = main && main.sha === headSha ? main : null;
-  if (mainForSha && (mainForSha.status === 'red' || mainForSha.status === 'green')) return null;
+  if (!main || main.corrupt || main.sha !== headSha || main.status !== 'infrastructure-failure') return null;
   const file = readDeferredMarker(gitDir);
   if (file && !file.corrupt && file.status === DEFERRED_STATUS && file.sha === headSha) return file;
-  if (mainForSha?.status !== 'infrastructure-failure') return null;
-  return buildDeferredRecord({ sha: headSha, infrastructure: mainForSha.infrastructure, exitCode: mainForSha.exitCode,
-    ...(typeof mainForSha.finishedAt === 'string' ? { recordedAt: mainForSha.finishedAt } : {}) });
+  return buildDeferredRecord({ sha: headSha, infrastructure: main.infrastructure, exitCode: main.exitCode,
+    ...(typeof main.finishedAt === 'string' ? { recordedAt: main.finishedAt } : {}) });
 }
 
 export function clearDeferredMarker(gitDir) {
@@ -102,13 +100,65 @@ export function deferredToCiDecision({ gate, deferred, headSha, mode } = {}) {
   if (!deferred || deferred.corrupt || deferred.status !== DEFERRED_STATUS) return no('no-deferred-marker');
   if (!headSha || deferred.sha !== headSha) return no('deferred-sha-mismatch');
   if (!validInfra(deferred.infrastructure) || deferred.reason !== deferred.infrastructure.reason) return no('deferred-evidence-invalid');
-  return { ok: true, reason: 'deferred-to-ci', disclosure: `lane verify deferred to CI: ${deferred.reason} - ${deferred.detail}` };
+  return { ok: true, reason: 'deferred-to-ci', disclosure: `lane verify deferred to CI: ${oneLine(deferred.reason, 64)} - ${oneLine(deferred.detail)}` };
+}
+
+/** Longest `detail` the disclosure carries; the full evidence stays in the marker and the verify log. */
+export const DISCLOSURE_DETAIL_MAX = 300;
+/**
+ * Pure. Collapse marker text (verify detail derived from shard/runner output) to ONE bounded, inert line before it
+ * reaches a PR body or a terminal: no newline, CR, U+2028/2029 or other control character (it would escape the
+ * `> ` blockquote and could forge body lines that bots parse), no invisible/bidi format character, no backtick or
+ * angle bracket (no code span or HTML comment marker). NFKC first so a full-width look-alike cannot slip through.
+ */
+// Built from code points so this source stays ASCII (a raw U+2028 would end a regex literal; raw bidi characters
+// in source are a trojan-source hazard). [lo, hi] is a range; a bare number is one character.
+const charClass = (...cps) => cps.map((c) => (Array.isArray(c) ? `${String.fromCharCode(c[0])}-${String.fromCharCode(c[1])}` : String.fromCharCode(c))).join('');
+/** C0/C1 controls (newline, CR, tab, ESC...) plus the Unicode line and paragraph separators. */
+const CONTROL_RE = new RegExp(`[${charClass([0x00, 0x1f], [0x7f, 0x9f], 0x2028, 0x2029)}]+`, 'g');
+/** Invisible and bidi format characters: soft hyphen, ALM, MVS, zero-width/LRM/RLM, embeddings/overrides, isolates, BOM. */
+const INVISIBLE_RE = new RegExp(`[${charClass(0xad, 0x61c, 0x180e, [0x200b, 0x200f], [0x202a, 0x202e], [0x2060, 0x2064], [0x2066, 0x2069], 0xfeff)}]`, 'g');
+export function oneLine(text, max = DISCLOSURE_DETAIL_MAX) {
+  const flat = String(text ?? '').normalize('NFKC')
+    .replace(CONTROL_RE, ' ')
+    .replace(INVISIBLE_RE, '')
+    .replace(/`/g, "'").replace(/</g, '‹').replace(/>/g, '›')
+    .replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
 export function appendDeferredDisclosure(body, disclosure) {
   const base = typeof body === 'string' ? body : '';
-  if (base.includes(disclosure)) return base; // idempotent: a rerun never stacks a second copy
-  return `${base}${base.endsWith('\n') || !base ? '' : '\n'}\n> ${disclosure}\n> ready-to-merge is withheld until the GitHub CI \`test\` check is green on this exact commit.\n`;
+  const line = oneLine(disclosure, DISCLOSURE_DETAIL_MAX + 100);
+  if (base.includes(line)) return base; // idempotent: a rerun never stacks a second copy
+  return `${base}${base.endsWith('\n') || !base ? '' : '\n'}\n> ${line}\n> ready-to-merge is withheld until the GitHub CI \`test\` check is green on this exact commit.\n`;
+}
+
+/**
+ * pr-land's rerun path for an ALREADY-OPEN PR: write the composed body plus (for a deferred-to-ci open) the
+ * disclosure in ONE edit, and only when it differs from the live body. Returns the body the PR now carries.
+ * @param {{forge:{editBody:(pr:number|string, body:string)=>void}, prNum:number|string, liveBody:string, composed:string, deferred:{disclosure:string}|null}} o
+ */
+export function syncDeferredBody({ forge, prNum, liveBody, composed, deferred }) {
+  const target = deferred?.disclosure ? appendDeferredDisclosure(composed, deferred.disclosure) : composed;
+  if (target !== liveBody) forge.editBody(prNum, target);
+  return target;
+}
+
+/**
+ * pr-land's ready-to-merge gate for a deferred-to-ci PR: null when the label may be applied (not deferred, or a
+ * green CI `test` check-run exists on exactly `sha`), else the `deferred-ci-not-green` refusal to emit (exit 3)
+ * INSTEAD of labelling. A failed or unreadable PR view refuses (fail closed).
+ */
+export function deferredLabelRefusal({ forge, prNum, sha, deferred }) {
+  if (!deferred) return null;
+  let view = null;
+  try { view = forge.viewPr(prNum, 'headRefOid,statusCheckRollup'); } catch { view = null; }
+  if (ciTestGreenOnSha(view, sha)) return null;
+  return {
+    reason: 'deferred-ci-not-green', pr: Number(prNum), sha,
+    detail: `PR #${prNum} opened with lane verify deferred to CI - no green CI test check-run on ${String(sha).slice(0, 8)} yet, so ready-to-merge is NOT applied`,
+  };
 }
 
 /** Pure. A `gh pr view --json headRefOid,statusCheckRollup` result: is the `test` check green on exactly `sha`? */

@@ -301,7 +301,10 @@ function siblingLeasesExcept(thisLeaseFile) {
 // because either side lacks an identity signal) still refuses: someone else may be relying on the current
 // marker, matching the START-write guard's own protective posture rather than working around it.
 if (MODE === 'reset') {
-  if (!existsSync(MARKER)) emit({ sha: headSha, status: 'noop', reason: 'no-marker', detail: `no marker at ${MARKER} — nothing to reset.` }, 0);
+  if (!existsSync(MARKER)) {
+    clearDeferredMarker(GIT_DIR); // R893 — a deferred file orphaned by a manual `rm` of the marker goes too
+    emit({ sha: headSha, status: 'noop', reason: 'no-marker', detail: `no marker at ${MARKER} — nothing to reset.` }, 0);
+  }
   const record = readMarker();
   const leaseFile = join(GIT_DIR, LEASE_FILENAME);
   let lease = null;

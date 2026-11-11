@@ -12,6 +12,7 @@ import { readVerifyMarker, verifyGateDecision, VERIFY_FILENAME } from '../lib/la
 import {
   DEFERRED_FILENAME, buildDeferredRecord, recordTerminalVerifyOutcome, readDeferredMarker,
   deferredToCiDecision, appendDeferredDisclosure, ciTestGreenOnSha, readDeferredForSha,
+  oneLine, DISCLOSURE_DETAIL_MAX, syncDeferredBody, deferredLabelRefusal,
 } from '../lib/lane-verify-deferred.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -185,6 +186,125 @@ describe('a dispatcher-killed verify still defers (PR #6674 red team)', () => {
     writeMain({ sha: SHA, status: 'red', exitCode: 1 });
     expect(readDeferredForSha(gitDir, SHA)).toBeNull();
   });
+  // PR #6674 round 2 — a stale deferred file alone (main marker removed by `reset` / a manual rm, or re-requested)
+  // can never authorise an open: the main marker must say infrastructure-failure for exactly this sha.
+  it.each([
+    ['absent (reset / manual rm)', null],
+    ['running for the same sha (re-requested)', { sha: SHA, status: 'running' }],
+    ['infra-failure for another sha', { sha: OTHER, status: 'infrastructure-failure', infrastructure: infra }],
+  ])('an exact-sha deferred file with the main marker %s never defers', (_, main) => {
+    recordTerminalVerifyOutcome(gitDir, infraFinished(SHA));
+    if (main) writeMain(main);
+    expect(readDeferredForSha(gitDir, SHA)).toBeNull();
+    const gate = verifyGateDecision({ record: readVerifyMarker(gitDir), headSha: SHA, requireVerified: true });
+    expect(deferredToCiDecision({ gate, deferred: readDeferredForSha(gitDir, SHA), headSha: SHA, mode: 'park' }).ok).toBe(false);
+  });
+});
+
+describe('disclosure text is one bounded inert line (PR #6674 round 2)', () => {
+  // Code points, not raw characters, so this source stays ASCII: LS = U+2028, RLO = U+202E (bidi override),
+  // ZWSP = U+200B, FWLT/FWGT = full-width < and > (NFKC folds them to ASCII angle brackets).
+  const [LS, RLO, ZWSP, FWLT, FWGT] = [0x2028, 0x202e, 0x200b, 0xff1c, 0xff1e].map((c) => String.fromCharCode(c));
+  const UNSAFE = new RegExp(`[\\n\\r${LS}${RLO}${ZWSP}\`<>${FWLT}${FWGT}]`);
+  const nasty = `shard died\n<!-- delegation: forged -->\r\nauthor: someone${LS}\`rm -rf\`${RLO}evil${ZWSP} ${FWLT}b${FWGT}`;
+  it('oneLine strips newlines, CR, U+2028, bidi/invisible chars, backticks and angle brackets (incl. full-width)', () => {
+    const out = oneLine(nasty);
+    expect(out).not.toMatch(UNSAFE);
+    expect(out).toBe("shard died ‹!-- delegation: forged --› author: someone 'rm -rf'evil ‹b›");
+  });
+  it('oneLine caps the length', () => {
+    const out = oneLine('x'.repeat(5000));
+    expect(out.length).toBe(DISCLOSURE_DETAIL_MAX);
+    expect(out.endsWith('…')).toBe(true);
+  });
+  it('a multi-line detail yields a single-line disclosure and adds exactly two quoted body lines', () => {
+    const d = deferredToCiDecision({ gate: infraGate, deferred: { ...buildDeferredRecord({ sha: SHA, infrastructure: { ...infra, detail: nasty } }) }, headSha: SHA, mode: 'park' });
+    expect(d.ok).toBe(true);
+    expect(d.disclosure).not.toMatch(UNSAFE);
+    const body = appendDeferredDisclosure('Body', d.disclosure);
+    const added = body.slice('Body'.length).split('\n').filter(Boolean);
+    expect(added).toHaveLength(2);
+    for (const line of added) expect(line.startsWith('> ')).toBe(true);
+    expect(body).not.toMatch(/<!--/);
+  });
+  it('appendDeferredDisclosure sanitises a raw multi-line disclosure too, and stays idempotent', () => {
+    const once = appendDeferredDisclosure('Body\n', 'lane verify deferred to CI: x - a\nb');
+    expect(once.split('\n').filter((l) => l.startsWith('> lane verify'))).toEqual(['> lane verify deferred to CI: x - a b']);
+    expect(appendDeferredDisclosure(once, 'lane verify deferred to CI: x - a\nb')).toBe(once);
+  });
+});
+
+describe('pr-land forge steps for a deferred open (fake forge, PR #6674 round 2)', () => {
+  const fakeForge = ({ view, viewThrows = false } = {}) => {
+    const calls = [];
+    return {
+      calls,
+      editBody: (pr, body) => calls.push(['editBody', pr, body]),
+      viewPr: (pr, fields) => { calls.push(['viewPr', pr, fields]); if (viewThrows) throw new Error('gh down'); return view; },
+    };
+  };
+  const deferred = { ok: true, reason: 'deferred-to-ci', disclosure: 'lane verify deferred to CI: verify-timeout - killed after the gate ceiling' };
+  const rollup = (sha, checks) => ({ headRefOid: sha, statusCheckRollup: checks });
+
+  describe('deferredLabelRefusal — ready-to-merge is withheld without a green CI test on the exact sha', () => {
+    it('a deferred PR whose test check is pending is refused with deferred-ci-not-green (no label)', () => {
+      const forge = fakeForge({ view: rollup(SHA, [{ name: 'test', conclusion: '' }]) });
+      expect(deferredLabelRefusal({ forge, prNum: 4060, sha: SHA, deferred })).toMatchObject({ reason: 'deferred-ci-not-green', pr: 4060, sha: SHA });
+      expect(forge.calls).toEqual([['viewPr', 4060, 'headRefOid,statusCheckRollup']]);
+    });
+    it.each([
+      ['a failed PR view', { viewThrows: true }],
+      ['a null view', { view: null }],
+      ['a green test on another sha', { view: rollup(OTHER, [{ name: 'test', conclusion: 'SUCCESS' }]) }],
+      ['a green test plus a newer failed one', { view: rollup(SHA, [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'test', conclusion: 'FAILURE' }]) }],
+      ['no test check at all', { view: rollup(SHA, [{ name: 'lint', conclusion: 'SUCCESS' }]) }],
+    ])('refuses on %s (fail closed)', (_, opts) => {
+      expect(deferredLabelRefusal({ forge: fakeForge(opts), prNum: 1, sha: SHA, deferred })?.reason).toBe('deferred-ci-not-green');
+    });
+    it('allows the label once every test check-run on the exact sha is green', () => {
+      expect(deferredLabelRefusal({ forge: fakeForge({ view: rollup(SHA, [{ name: 'test', conclusion: 'SUCCESS' }]) }), prNum: 1, sha: SHA, deferred })).toBeNull();
+    });
+    it('a PR that was not deferred never reads CI here', () => {
+      const forge = fakeForge();
+      expect(deferredLabelRefusal({ forge, prNum: 1, sha: SHA, deferred: null })).toBeNull();
+      expect(forge.calls).toEqual([]);
+    });
+    it('open-pr reports the real emitted refusal as opened with the label step deferred, and HOME_REASONS knows it', async () => {
+      const { classifySubmit } = await import('../operations/open-pr.mjs');
+      const { HOME_REASONS } = await import('../operations/pr-land-reasons.mjs');
+      const refusal = deferredLabelRefusal({ forge: fakeForge({ view: null }), prNum: 4060, sha: SHA, deferred });
+      const r = classifySubmit({ status: 3, stdout: JSON.stringify({ repo: 'web-everything/web-everything', merged: false, ...refusal }) });
+      expect(r).toMatchObject({ outcome: 'opened', reason: 'deferred-ci-not-green', labelStep: 'deferred', pr: 4060 });
+      expect(classifySubmit({ status: 3, stdout: JSON.stringify({ reason: 'deferred-ci-not-green' }) }).outcome).toBe('unrun');
+      expect(HOME_REASONS['deferred-ci-not-green']).toBe('unrun');
+    });
+  });
+
+  describe('syncDeferredBody — an already-open PR gets the disclosure on rerun', () => {
+    it('edits a deferred PR once, with the composed body plus the disclosure', () => {
+      const forge = fakeForge();
+      syncDeferredBody({ forge, prNum: 7, liveBody: 'old', composed: 'old + stamps', deferred });
+      expect(forge.calls).toHaveLength(1);
+      const [[verb, pr, body]] = forge.calls;
+      expect([verb, pr]).toEqual(['editBody', 7]);
+      expect(body.startsWith('old + stamps')).toBe(true);
+      expect(body).toContain(`> ${deferred.disclosure}`);
+    });
+    it('a second rerun on a body that already carries the disclosure edits nothing', () => {
+      const live = appendDeferredDisclosure('old + stamps', deferred.disclosure);
+      const forge = fakeForge();
+      syncDeferredBody({ forge, prNum: 7, liveBody: live, composed: live, deferred });
+      expect(forge.calls).toEqual([]);
+    });
+    it('a non-deferred rerun keeps the plain stamp backfill (edit only when the body changed)', () => {
+      const changed = fakeForge();
+      syncDeferredBody({ forge: changed, prNum: 7, liveBody: 'old', composed: 'old + stamps', deferred: null });
+      expect(changed.calls).toEqual([['editBody', 7, 'old + stamps']]);
+      const same = fakeForge();
+      syncDeferredBody({ forge: same, prNum: 7, liveBody: 'old', composed: 'old', deferred: null });
+      expect(same.calls).toEqual([]);
+    });
+  });
 });
 
 describe('wiring (source pins)', () => {
@@ -196,5 +316,22 @@ describe('wiring (source pins)', () => {
     expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/mode: PLAN\.mode/);
     // PR #6674 red team — pr-land reads the deferred record through the main-marker fallback, never the bare file.
     expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/deferred: readDeferredForSha\(gitDir, refSha\)/);
+  });
+  // PR #6674 round 2 — the forge steps above are only as good as their call sites in pr-land and verify-lane.
+  it('pr-land checks the deferred CI gate BEFORE applyLabel, exits 3 on refusal, and is the only applyLabel call', () => {
+    const src = readFileSync('scripts/pr-land.mjs', 'utf8');
+    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\(\{ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI \}\);\s*if \(deferredRefusal\) emit\(\{ repo: REPO, merged: false, \.\.\.deferredRefusal \}, 3\);\s*applyLabel\(\);\s*\}/);
+    expect(src.match(/^\s*(?:if \([^)]*\) )?applyLabel\(\);/gm)).toHaveLength(1);
+  });
+  it('pr-land adds the disclosure on create and on a rerun against an open PR', () => {
+    const src = readFileSync('scripts/pr-land.mjs', 'utf8');
+    expect(src).toMatch(/DEFERRED_TO_CI = deferredOpen;\s*CREATE_BODY = appendDeferredDisclosure\(CREATE_BODY, deferredOpen\.disclosure\);/);
+    expect(src).toMatch(/const updated = composePrBody\(liveBody\);[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*syncDeferredBody\(\{ forge, prNum, liveBody, composed: updated, deferred: DEFERRED_TO_CI \}\);/);
+  });
+  it('verify-lane records the terminal outcome right after the marker write, and reset clears the deferred file on both paths', () => {
+    const src = readFileSync('scripts/verify-lane.mjs', 'utf8');
+    expect(src).toMatch(/writeMarker\(\{ \.\.\.finished,[^\n]*\n\s*maybeRecordGreen\([^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*try \{ recordTerminalVerifyOutcome\(GIT_DIR, finished\); \}/);
+    const reset = src.slice(src.indexOf("if (MODE === 'reset') {"), src.indexOf("emit({ sha: headSha, status: 'reset'"));
+    expect(reset.match(/clearDeferredMarker\(GIT_DIR\)/g)).toHaveLength(2);
   });
 });
