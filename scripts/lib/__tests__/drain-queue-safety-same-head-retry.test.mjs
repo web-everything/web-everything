@@ -125,15 +125,15 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499 head \w+ — failed_checks/);
   }));
 
-  it('allows no second retry on the same head', () => fixture(f => {
-    f.events = [removed(), added, removed()];
+  it('allows no third retry on the same head', () => fixture(f => {
+    f.events = [removed(), added, removed(), added, removed()];
     const result = f.guard();
     expect(result.hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/failed_checks/);
   }));
 
   it('allows no retry again once the retried head was re-enqueued and left the queue', () => fixture(f => {
-    f.events = [removed(), added];
+    f.events = [removed(), added, removed(), added];
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/already spent/);
   }));

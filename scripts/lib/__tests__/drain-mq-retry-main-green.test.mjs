@@ -73,7 +73,7 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
   it('accepts a recent completed green run while the newest main push is in progress', () => {
     const f = fixture([pending(), run(102)]);
     expect(f.guard().hold).toBe(false);
-    expect(f.retryLog()).toContain('failed_checks infra retry 1/1 (main green, PR CLEAN');
+    expect(f.retryLog()).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN');
     expect(f.retryLog()).toContain('102');
     expect(f.retryLog()).toContain(failedName);
   });
@@ -127,13 +127,15 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
     expect(f.declineLog()).toContain(failedName);
   });
 
-  it('still holds a second removal on the same head despite fresh green main CI', () => {
+  it('still holds a third removal on the same head despite fresh green main CI', () => {
     const f = fixture([pending(), run(102)], [removal(), {
       __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:46:00Z',
+    }, removal('2026-11-01T13:50:00Z'), {
+      __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:51:00Z',
     }, removal('2026-11-01T13:55:00Z')]);
     const result = f.guard();
     expect(result.hold).toBe(true);
-    expect(result.line).toContain('2 removals on this head');
+    expect(result.line).toContain('3 removals on this head');
     expect(result.line).toContain('operator must inspect history and enqueue manually');
     expect(f.declineLog()).toContain('retry bound reached');
     expect(f.retryLog()).toBeUndefined();
