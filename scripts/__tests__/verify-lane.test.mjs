@@ -2343,3 +2343,40 @@ describe('full build gate default', () => {
       }
     });
 });
+
+describe('verify-lane — the deferred-to-ci record follows the terminal verdict (R893, PR #6674 round 2)', () => {
+  const deferredFile = () => join(dir, '.git', '.lane-verify-deferred');
+  const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
+  function runReset() {
+    try {
+      const out = execFileSync('node', [VERIFY_LANE, 'reset', '--json'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      return JSON.parse(out.trim().split('\n').pop());
+    } catch (e) { return JSON.parse(String(e.stdout).trim().split('\n').pop()); }
+  }
+  const killedGate = `node -e 'process.kill(process.pid, "SIGKILL")'`;
+
+  it('a signal-killed gate writes infrastructure-failure AND the deferred record for HEAD; a later green clears it', () => {
+    const killed = runVerify(killedGate);
+    expect(killed.json.status).toBe('infrastructure-failure');
+    expect(readJson(marker())).toMatchObject({ sha: headSha(), status: 'infrastructure-failure' });
+    expect(readJson(deferredFile())).toMatchObject({ status: 'deferred-to-ci', sha: headSha(), reason: 'verify-signal' });
+
+    expect(runVerify('true').json.status).toBe('green');
+    expect(existsSync(deferredFile())).toBe(false);
+  });
+
+  it('reset removes the deferred record with the marker', () => {
+    runVerify(killedGate);
+    expect(existsSync(deferredFile())).toBe(true);
+    expect(runReset().status).toBe('reset');
+    expect(existsSync(marker())).toBe(false);
+    expect(existsSync(deferredFile())).toBe(false);
+  });
+
+  it('reset with no marker (a manual rm) still removes an orphaned deferred record', () => {
+    runVerify(killedGate);
+    rmSync(marker());
+    expect(runReset().status).toBe('noop');
+    expect(existsSync(deferredFile())).toBe(false);
+  });
+});
