@@ -119,16 +119,22 @@ function splitNul(buffer) {
   if (start < buffer.length) out.push(buffer.subarray(start));
   return out;
 }
-/** Added lines (without the leading '+', each newline-terminated) of a -U0 diff, from the first hunk header on. */
-function splitLines(raw, startLine) {
-  const out = []; let line = 0, from = 0;
+/** Split a -U3 diff after its first hunk header: added lines, and context+added lines (each newline-terminated, no prefix). */
+function splitDiffLines(raw) {
+  const added = [], context = []; let start = -1, removed = false, line = 0, from = 0;
   for (let i = 0; i <= raw.length; i++) {
-    if (i === raw.length || raw[i] === 10) {
-      if (line >= startLine && raw[from] === 0x2b) out.push(raw.subarray(from + 1, i), Buffer.from('\n'));
-      line++; from = i + 1;
+    if (i !== raw.length && raw[i] !== 10) continue;
+    const first = raw[from];
+    if (start < 0 && first === 0x40 && raw[from + 1] === 0x40) start = line;
+    else if (start >= 0) {
+      const text = raw.subarray(from + 1, i);
+      if (first === 0x2b) { added.push(text, Buffer.from('\n')); context.push(text, Buffer.from('\n')); }
+      else if (first === 0x20) context.push(text, Buffer.from('\n'));
+      else if (first === 0x2d) removed = true;
     }
+    line++; from = i + 1;
   }
-  return out;
+  return { start, removed, added: Buffer.concat(added), context: Buffer.concat(context) };
 }
 const SIGNATURE_ARMOR = /-----(?:BEGIN|END) (?:PGP SIGNATURE|SSH SIGNATURE|SIGNED MESSAGE)-----/g;
 const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
@@ -285,19 +291,24 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     const key = `${m.oldSha}\0${m.newSha}\0${m.path.toString('latin1')}`;
     if (seenDiff.has(key)) continue;
     seenDiff.add(key);
-    const diff = await git(['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', m.oldSha, m.newSha]);
+    const diff = await git(['diff', '-U3', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', m.oldSha, m.newSha]);
     if (diff.code !== 0 || diff.stdout == null) throw bundleError('bundle-credential-scan-failed');
     const raw = bytes(diff.stdout);
     if (raw.length > SCAN_BATCH_BYTES) throw bundleError('bundle-credential-scan-too-large');
     if (raw.includes(0) || /^Binary files /m.test(raw.toString('latin1')) || /^GIT binary patch/m.test(raw.toString('latin1'))) { wholeFallback.push(m); continue; }
-    const hunks = raw.toString('latin1').split('\n');
-    const start = hunks.findIndex(line => line.startsWith('@@'));
-    if (start < 0) { wholeFallback.push(m); continue; } // no hunks (mode-only change): scan whole, fail closed
-    const added = Buffer.concat(splitLines(raw, start));
+    const lines = splitDiffLines(raw);
+    if (lines.start < 0) { wholeFallback.push(m); continue; } // no hunks (mode-only change): scan whole, fail closed
+    const added = lines.added;
+    // A replacement inside multi-line context (a block scalar under `password: |`) needs that context to be seen.
+    const contextual = lines.removed ? lines.context : null;
     const finding = credentialTextFinding(added.toString('latin1')) ?? credentialTextFinding(added.toString('utf8'));
     let policy = null;
     try { policy = credentialContentFinding(m.path, added); } catch { policy = 'content-scan-error'; }
-    const hit = policy ?? finding;
+    let hit = policy ?? finding;
+    if (!hit && contextual) {
+      hit = credentialTextFinding(contextual.toString('latin1')) ?? credentialTextFinding(contextual.toString('utf8'));
+      try { hit ??= credentialContentFinding(m.path, contextual); } catch { hit ??= 'content-scan-error'; }
+    }
     if (hit) return { path: m.label, finding: hit };
   }
   for (const m of wholeFallback) {
@@ -306,8 +317,10 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     paths.set(m.path.toString('latin1'), { label: m.label, path: m.path });
   }
   const shas = [...blobs.keys()];
-  if (!shas.length) return null;
-  const check = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], shas.join('\n') + '\n');
+  // Modified blobs are not read whole, but their size still counts against the same caps.
+  const sized = [...new Set([...shas, ...modified.map(m => m.newSha)])];
+  if (!sized.length) return null;
+  const check = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], sized.join('\n') + '\n');
   if (check.code !== 0) throw bundleError('bundle-credential-scan-failed');
   const sizes = new Map(); let total = 0;
   for (const line of bytes(check.stdout).toString('utf8').split('\n')) {
@@ -316,7 +329,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     if (type !== 'blob' || !Number.isSafeInteger(Number(size))) throw bundleError('bundle-credential-scan-failed');
     sizes.set(sha, Number(size)); total += Number(size);
   }
-  if (sizes.size !== shas.length || total > maxTotalBytes || [...sizes.values()].some(size => size > SCAN_BATCH_BYTES)) throw bundleError('bundle-credential-scan-too-large');
+  if (sizes.size !== sized.length || total > maxTotalBytes || [...sizes.values()].some(size => size > SCAN_BATCH_BYTES)) throw bundleError('bundle-credential-scan-too-large');
   let batch = [], batchBytes = 0;
   const flush = async () => {
     if (!batch.length) return null;
@@ -342,6 +355,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     batch = []; batchBytes = 0;
     return null;
   };
+  if (!shas.length) return null;
   for (const sha of shas) {
     if (batchBytes + sizes.get(sha) > SCAN_BATCH_BYTES) { const hit = await flush(); if (hit) return hit; }
     batch.push(sha); batchBytes += sizes.get(sha);
