@@ -89,7 +89,7 @@ export function contentContainedInBuild(git, sha, build) {
  * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -739,7 +739,7 @@ export async function prepareRebuild({
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
   const lease = claimBuildLease({
-    state, plan, root, run, env: stEnv, nowMs: nowMs(),
+    state, plan, root, run, env: stEnv, nowMs: nowMs(), adoptOnly,
   });
   if (!lease) {
     const b = state.building;

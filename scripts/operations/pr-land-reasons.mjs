@@ -47,7 +47,7 @@ export const HOME_REASONS = Object.freeze({
   'verify-unfinished': 'refused', 'verify-red': 'refused', 'verify-corrupt': 'refused',
   unverified: 'refused', untracked: 'refused', 'red-ci-gated': 'refused',
   // the environment could not complete — the request is not what is wrong
-  'gh-error': 'unrun', 'push-failed': 'unrun', 'fallback-failed': 'unrun', 'check-timeout': 'unrun',
+  'gh-error': 'unrun', 'push-failed': 'unrun', 'fallback-failed': 'unrun', 'check-timeout': 'unrun', 'deferred-ci-not-green': 'unrun',
   'blocked-on-infra': 'unrun',
   // an unexpected internal fault in pr-land itself (async CLI catch) — the request is not what is wrong
   'internal-error': 'unrun',
