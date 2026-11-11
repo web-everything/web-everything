@@ -916,9 +916,10 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
     headSha: evidence.headSha || readOptions?.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
   // A listing that says "hold" may be stale: after a refresh merge GitHub's file list still shows main's content. Confirm
   // against the NET diff (merge-base...head) at the exact head before parking; unreadable fails closed (defer).
-  if (workflow.hold && !workflow.defer && !netRead && readOptions?.workflowEditSetting !== 'off' && readOptions?.local) {
+  if (workflow.hold && !workflow.defer && !netRead && readOptions?.workflowEditSetting !== 'off' && readOptions?.local
+    && typeof readOptions.defaultBranch === 'string' && readOptions.defaultBranch) { // unknown base: keep the listing's hold
     const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
-      base: readOptions.defaultBranch ?? 'main', cwd: readOptions.cwd ?? process.cwd(),
+      base: readOptions.defaultBranch, cwd: readOptions.cwd ?? process.cwd(),
       exec: readOptions.exec ?? execFileSync });
     if (read.error) return { action: 'defer', applyLabel: null,
       reason: `workflow-edit change list unreadable — merge deferred this pass: ${read.error}` };

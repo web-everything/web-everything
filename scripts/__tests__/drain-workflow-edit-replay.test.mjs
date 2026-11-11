@@ -139,3 +139,9 @@ describe('refreshed PR: stale listing vs net diff', () => {
     expect(r.action).toBe('defer');
   });
 });
+
+it('unknown default branch keeps the listing hold (no net-diff clearing against a guessed base)', () => {
+  const pr = { number: 6666, headRefOid: '5ab05b337d000000000000000000000000000000', labels: ['ready-to-merge', 'review:accepted'], files: ['.github/workflows/ci.yml'] };
+  const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
+  expect(replay(pr, { defaultBranch: undefined, exec: (cmd) => cmd === 'gh' ? JSON.stringify({ headRefOid: pr.headRefOid, comments }) : '' }).action).toBe('park');
+});
