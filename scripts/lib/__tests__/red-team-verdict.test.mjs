@@ -16,8 +16,8 @@ const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'bro
 const clean = (rev = head, login = 'web-everything', findings = [], pr = 5283) => ({ author: { login }, body: renderRedTeamComment({ pr, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 const accept = (sha, cleared = false, who = cleared ? human : bot) => ({ ...who, ...(cleared ? { id: 'IC_clearance' } : {}), body: cleared
-  ? ['review cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildReviewedDiffMarker('d'.repeat(64)), buildClearedHumanMarker('operator')].join('\n')
-  : ['review - accepted', '', buildReviewedShaMarker(sha)].join('\n') });
+  ? ['✅ review — `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildReviewedDiffMarker('d'.repeat(64)), buildClearedHumanMarker('operator')].join('\n')
+  : ['✅ review — accepted', '', buildReviewedShaMarker(sha)].join('\n') });
 const carry = ({ from = prior, to = head, findings = [], gates = [], author = bot.author } = {}) => ({ author, body: [
   ...gates.map(o => redTeamGateMarker(5283, to, o)),
   buildVerdictCarriedMarker({ fromSha: from, toSha: to, patchId: 'c'.repeat(40) }),
