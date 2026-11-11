@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch, LIVE_OWNER_DEFAULTS } from '../pr-live-owner-watch.mjs';
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
 const ago = minutes => new Date(NOW - minutes * MIN).toISOString();
@@ -670,8 +671,9 @@ describe('portable feed IO and settings', () => {
   });
   it('timed-out production pass is terminated before the probe returns', async () => {
     const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-hang-')); dirs.push(dir);
-    const pidFile = join(dir, 'pid'), script = join(dir, 'hang.mjs');
-    writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+    const pidFile = join(dir, 'pid'), script = join(dir, 'hang.cjs');
+    // An anchored keep-alive: if the kill under test regresses, the child still exits with the test runner.
+    writeFileSync(script, keepAliveScript({ prelude: `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));` }));
     const { runBoundedPass } = await import('../pr-live-owner-watch.mjs');
     let cache;
     const result = await probeLiveOwnerWatch({ dir, now: NOW, readCache: () => null, writeCache: v => { cache = v; },
