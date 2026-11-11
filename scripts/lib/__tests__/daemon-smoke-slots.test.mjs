@@ -442,8 +442,9 @@ describe('daemon smoke slots', () => {
     [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1.5' }, 900000, 'default'],
     [{}, { WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '9007199254740992' }, 900000, 'default'],
     [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000' }, 60000, 'default'],
-    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '120000' }, 0, 'default'],
-    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '60000' }, 0, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '120000' }, 1000, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '60000' }, 1000, 'default'],
+    [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '1' }, 1000, 'default'],
     [{ smokeQueueMaxWaitMs: 5001 }, { WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000' }, 5001, 'tool'],
     [{}, { WE_DAEMON_REBUILD_LEASE_STALE_MS: 'invalid' }, 900000, 'default'],
   ])('bounds queue residence with setting %j env %j at %sms (%s)', async (value, env, bound, source) => {
@@ -468,6 +469,23 @@ describe('daemon smoke slots', () => {
     await slot.release();
     expect(state().holders.map(e => e.pid)).toEqual([11]);
     await holder.release();
+  });
+
+  it.each(['1', '60000', '120000'])('takes a free slot when the rebuild lease lifetime is %sms (ceiling never collapses to 0)', async stale => {
+    settings.value = { smokeMaxConcurrent: 1 };
+    const slot = await acquire(11, { env: { WE_DAEMON_REBUILD_LEASE_STALE_MS: stale } });
+    expect(slot.acquired).toBe(true);
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
+    expect(log.error).not.toHaveBeenCalledWith(expect.stringContaining('smoke-queue-timeout'));
+    await slot.release();
+  });
+
+  it('takes a free slot even when the clock is already past the deadline at the first check', async () => {
+    settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 1 };
+    let time = 0;
+    const slot = await acquire(11, { now: () => (time += 5) });
+    expect(slot.acquired).toBe(true);
+    await slot.release();
   });
 
   it.each([false, true])('returns no slot at the deadline with a busy state lock and never exceeds the cap (ticket=%s)', async hasTicket => {

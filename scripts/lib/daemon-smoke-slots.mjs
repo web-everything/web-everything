@@ -16,6 +16,8 @@ import { rebuildLeaseStaleMs } from './daemon-rebuild/lease.mjs';
 const failedTickets = new Set();
 
 const positive = value => Number.isSafeInteger(value) && value > 0;
+// The queue-wait ceiling never collapses to 0: a short rebuild lease must still allow a capacity check.
+const MIN_QUEUE_WAIT_MS = 1000;
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
 
 function setting(env, log, key, envKey, fallback, ceiling = Infinity) {
@@ -83,7 +85,7 @@ export async function acquireSmokeSlot({
   if (!positive(pid)) throw new Error('daemon-live-smoke: invalid slot pid');
   const cap = setting(env, log, 'smokeMaxConcurrent', 'WE_DAEMON_SMOKE_MAX_CONCURRENT', 2);
   const maxWait = setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 900_000,
-    Math.max(0, rebuildLeaseStaleMs(env) - 2 * 60_000));
+    Math.max(MIN_QUEUE_WAIT_MS, rebuildLeaseStaleMs(env) - 2 * 60_000));
   const queuedAt = now();
   const deadline = queuedAt + maxWait;
   const expired = new Error('smoke queue expired');
@@ -203,9 +205,9 @@ export async function acquireSmokeSlot({
       for (const entry of pending) failedTickets.delete(entry);
     }
     for (;;) {
-      if (now() >= deadline) throw expired;
+      // Always attempt capacity first; the deadline is only tested after a failed attempt.
+      const priorTicket = ticket;
       const ahead = await transaction(state => {
-        if (now() >= deadline) throw expired;
         if (ticket === undefined) {
           if (!positive(state.nextTicket + 1)) throw new Error('daemon-live-smoke: slot tickets exhausted; inspect state before retrying');
           ticket = state.nextTicket++;
@@ -217,6 +219,11 @@ export async function acquireSmokeSlot({
         if (index === 0 && state.holders.length < cap) {
           state.holders.push(...state.waiters.splice(index, 1));
           return null;
+        }
+        if (now() >= deadline) {
+          // Nothing persists when update throws: forget a ticket created in this attempt.
+          ticket = priorTicket;
+          throw expired;
         }
         return index;
       }, deadline);
