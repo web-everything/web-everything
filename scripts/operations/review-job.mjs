@@ -1053,8 +1053,18 @@ function finalHeadSeatsGate(input, io) {
   return d;
 }
 
+/** An operator-pinned dispatch must refuse unknown or superseded live evidence. */
+function expectedHeadRefusal(expectedHead, input, io) {
+  if (expectedHead === undefined) return null;
+  try {
+    const head = io.liveHead(input);
+    if (isRealHead(expectedHead) && isRealHead(head) && head.toLowerCase() === expectedHead.toLowerCase()) return null;
+  } catch { /* unreadable evidence refuses */ }
+  return { refused: true, outcome: 'refused-head-moved', reason: 'PR head changed or unreadable; operator must inspect before retrying' };
+}
+
 function runReviewArc({
-  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -1167,6 +1177,8 @@ function runReviewArc({
 
     const { head } = prepareReviewArc({ pr: planned.pr, repo: planned.repo, lanePath }, io);
     const finishArc = input => {
+      const refusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo }, io);
+      if (refusal) { classified = refusal; return result({ ...refusal, lanePath }); }
       seatsBox.laneHead = head;
       // Both modes persist and verify admission while the job claim still excludes another writer.
       if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
@@ -1347,8 +1359,10 @@ export function dispatchReviewJob({
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
   isAlive = pidAlive,
-  checkoutExists = existsSync, home = homedir(),
+  checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
 } = {}) {
+  const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io);
+  if (refusal) return { pr, repo, ...refusal };
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   assertNotALaneCheckout(root);
   // The job path is the DEFAULT review dispatch (the daemon calls it), so it must narrow a managed clone's
@@ -1384,6 +1398,7 @@ export function dispatchReviewJob({
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
+      ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -1533,6 +1548,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       const redTeamMode = flag('red-team-only') ?? 'fresh';
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
+        ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from

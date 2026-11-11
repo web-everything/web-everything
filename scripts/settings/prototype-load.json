@@ -40,6 +40,10 @@
       "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs.",
       "runs": "merge-queue drain (drain-queue-safety, enqueue)"
     },
+    "pr-merge-watch": {
+      "label": "com.we.conveyor-pass-daemon.pr-merge-watch",
+      "runs": "PR merge watcher (ready-stuck alerts and guarded stale-check refresh)"
+    },
     "merge-watch": {
       "label": "com.we.conveyor-pass-daemon.merge-orphan-sweep",
       "clone": "wev-merge-daemon",
