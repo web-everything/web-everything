@@ -135,14 +135,23 @@ function samePatch(exec, a, b, mbPrior, mbHead, path) {
 export function netInterdiff({ exec: rawExec, priorHead, head, base, rawFiles, budgetMs = TOTAL_BUDGET_MS, now = Date.now } = {}) {
   try {
     if (typeof rawExec !== 'function' || !SHA.test(priorHead ?? '') || !SHA.test(head ?? '')) return null;
-    if (typeof now !== 'function' || typeof budgetMs !== 'number' || !(budgetMs > 0)) return null;
+    if (typeof now !== 'function' || !Number.isFinite(budgetMs) || !(budgetMs > 0)) return null;
     // One deadline for the whole call. Every git call is clamped to the time left, and once none is left the call throws,
-    // so the caller keeps the raw range instead of blocking the review on a slow or stalled git.
-    const deadline = now() + budgetMs;
-    const exec = (cmd, args, opts = {}) => {
+    // so the caller keeps the raw range instead of blocking the review on a slow or stalled git. The same check runs
+    // once per path and after the last one, so in-process parsing between git calls is bounded too.
+    const start = now();
+    if (!Number.isFinite(start)) return null;
+    const deadline = start + budgetMs;
+    const timeLeft = () => {
       const left = deadline - now();
       if (!(left > 0)) throw new Error('interdiff-budget-exhausted');
-      return rawExec(cmd, args, { ...opts, timeout: Math.min(opts.timeout ?? TIMEOUT_MS, left) });
+      return left;
+    };
+    const exec = (cmd, args, opts = {}) => {
+      const left = timeLeft();
+      const own = opts.timeout > 0 ? opts.timeout : TIMEOUT_MS;
+      // execFileSync wants a whole number of milliseconds; round up so a fractional clock never makes every call throw.
+      return rawExec(cmd, args, { ...opts, timeout: Math.max(1, Math.ceil(Math.min(own, left))) });
     };
     if (typeof base !== 'string' || base.startsWith('-') || !REF.test(base)) return null;
     if (!rawFiles || typeof rawFiles !== 'object' || Array.isArray(rawFiles)) return null;
@@ -159,11 +168,13 @@ export function netInterdiff({ exec: rawExec, priorHead, head, base, rawFiles, b
     const mbPrior = mergeBase(exec, priorHead, base);
     const mbHead = mergeBase(exec, head, base);
     for (const [path, lines] of entries) {
+      timeLeft();
       // A path git does not see at either head would give an empty diff at both and be "dropped": refuse instead.
       if (!inTree(exec, priorHead, path) && !inTree(exec, head, path)) return null;
       if (samePatch(exec, ownPatch(exec, priorHead, mbPrior, path), ownPatch(exec, head, mbHead, path), mbPrior, mbHead, path)) dropped.push(path);
       else kept.push([path, lines]);
     }
+    timeLeft();
     return { files: Object.fromEntries(kept), dropped };
   } catch {
     return null;

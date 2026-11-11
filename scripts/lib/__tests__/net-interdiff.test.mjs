@@ -163,7 +163,34 @@ describe('netInterdiff', () => {
       expect(timeouts.length).toBeGreaterThan(0);
       expect(Math.max(...timeouts)).toBeLessThanOrEqual(5_000);
     });
-    it.each([['zero', 0], ['negative', -1], ['NaN', NaN], ['a string', '9']])('a %s budget → null, git never called', (_n, budgetMs) => {
+    it('the budget runs out AFTER a path was already judged "unchanged" → null, never a partial result', () => {
+      let t = 0;
+      const calls = [];
+      const tick = (...a) => { calls.push(a); t += 10; return exec(...a); };
+      const rawFiles = { 'a.txt': null, 'b.txt': null };
+      expect(netInterdiff({ exec: tick, ...valid(), rawFiles, budgetMs: 55, now: () => t })).toBeNull();
+      // 2 merge-bases + all 3 calls for a.txt were made, so a.txt had been put in `dropped` before the budget ended.
+      expect(calls.length).toBeGreaterThanOrEqual(5);
+    });
+    it('the budget is also checked after the last path (parsing between git calls counts)', () => {
+      let t = 0;
+      const lastCall = (...a) => { const r = exec(...a); if (a[1].includes('diff')) t += 1000; return r; };
+      // Only the diff calls are slow: 2 diffs × 1000 ms for the single path, budget 1500 → exhausted by the final check.
+      expect(netInterdiff({ exec: lastCall, ...valid(), rawFiles: { 'a.txt': null }, budgetMs: 1500, now: () => t })).toBeNull();
+    });
+    it('a fractional clock still gives whole-millisecond timeouts and completes', () => {
+      const timeouts = [];
+      const spy = (c, a, o) => { timeouts.push(o.timeout); return exec(c, a, o); };
+      const out = netInterdiff({ exec: spy, ...valid(), budgetMs: 4000.5, now: () => 12345.25 });
+      expect(out).not.toBeNull();
+      expect(timeouts.every(Number.isInteger)).toBe(true);
+    });
+    it('a clock that returns a non-number → null, git never called', () => {
+      const calls = [];
+      expect(netInterdiff({ exec: (...a) => { calls.push(a); return exec(...a); }, ...valid(), now: () => 'soon' })).toBeNull();
+      expect(calls).toEqual([]);
+    });
+    it.each([['zero', 0], ['negative', -1], ['NaN', NaN], ['Infinity', Infinity], ['a string', '9']])('a %s budget → null, git never called', (_n, budgetMs) => {
       const calls = [];
       expect(netInterdiff({ exec: (...a) => { calls.push(a); return exec(...a); }, ...valid(), budgetMs })).toBeNull();
       expect(calls).toEqual([]);
