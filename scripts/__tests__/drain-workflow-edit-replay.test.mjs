@@ -96,7 +96,7 @@ describe('live workflow-edit replay', () => {
     });
     expect(result).toMatchObject({ action: 'park', applyLabel: 'review:human' });
     expect(calls.find(([, args]) => args[0] === 'diff')).toEqual(['git',
-      ['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/trunk...${fixtures[1].headRefOid}`], '/fixture']);
+      ['diff', '--name-only', '--no-renames', '--no-relative', '-z', '--end-of-options', `refs/remotes/origin/trunk...${fixtures[1].headRefOid}`], '/fixture']);
   });
   it('bare sweep does no acceptance or git calls for complete non-workflow files', () => {
     let calls = 0;
