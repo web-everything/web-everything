@@ -1,6 +1,7 @@
 /**
  * Replay a legacy finished red team whose exact-head seat row holds a confirmed break while the posted comment says
- * "no break found". One sweep pass must plan red-team:blocked (never red-team:clear) and strip a clear label.
+ * "no break found". One sweep pass must plan red-team:blocked (never red-team:clear) and strip a clear label, and a
+ * reader that runs BEFORE the publisher's first pass (the status not sealed yet) must hold too.
  * Production modules come from sourceRoot; the seat row and the comments are injected, the status file lives in a
  * temp runs dir so the planner's fresh read of the stored evidence is exercised for real.
  */
@@ -36,7 +37,7 @@ export default {
     try {
       const { CONSTELLATION_REPOS: { we: { slug: REPO } } } = await load('scripts/lib/constellation-repos.mjs');
       const { sweepAdvisoryLabels } = await load('scripts/conveyor/advisory-label-sweep.mjs');
-      const { redTeamMarker } = await load('scripts/lib/red-team-gate.mjs');
+      const { redTeamMarker, readRedTeamDisposition } = await load('scripts/lib/red-team-gate.mjs');
       const { publishStoredRedTeamResult } = await load('scripts/lib/red-team-withheld-publish.mjs');
       const statusFile = join(dir, 'red-team-status', `${encodeURIComponent(REPO)}-${PR}-${HEAD}.json`);
       const clear = { author: { login: 'web-everything' }, createdAt: '2026-11-10T12:00:00Z',
@@ -55,6 +56,10 @@ export default {
             if (add && !labels.includes(add)) labels.push(add);
           } };
         const read = () => JSON.parse(readFileSync(statusFile, 'utf8'));
+        // Live case (#6622 head dc813a2ca): BEFORE the publisher's first pass the status is not sealed yet, and a reader
+        // such as the merge gate must still hold on it instead of trusting the posted "no break found" comment.
+        check(readRedTeamDisposition({ comments: [clear], pr: PR, head: HEAD, repo: REPO }).held.length >= 1,
+          `from ${start}: before the publisher ran, a reader cleared the unsealed stored status on the posted comment`);
         sweepAdvisoryLabels({ repo: REPO, listPrs: () => [live()], readPr: live, provider, log: line => log?.(line),
           listUnpublishedStatuses: () => [read()], readStatusEvidence: () => ({ status: read() }),
           publishStored: input => publishStoredRedTeamResult({ ...input, readSeatRow: () => row, publishNeedsYou: () => {} }) });

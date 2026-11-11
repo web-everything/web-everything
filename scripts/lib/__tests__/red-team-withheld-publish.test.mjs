@@ -91,14 +91,19 @@ describe('legacy bare-string red-team publication', () => {
     expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
     expect(io.status.legacyHoldPublished).toBe(true);
   });
-  it('leaves the existing posted comment authoritative and records nothing about it', () => {
+  it('an agreeing posted comment is left alone; only the empty seal is recorded (it lifts the publication-pending hold)', () => {
     const io = harness(legacy(), { readSeatRow: () => seatRow(),
       listComments: () => [{ author: { login: 'web-everything' },
         body: `${redTeamMarker(42, head)}\n### Post-accept red team — no break found` }] });
     expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
     expect(io.postComment).not.toHaveBeenCalled();
-    expect(io.writeStatus).not.toHaveBeenCalled();
+    expect(io.writeStatus).toHaveBeenCalledTimes(1);
+    expect(io.writeStatus.mock.calls[0][0]).toMatchObject({ result: 'ran', sealedBreaks: [] });
+    expect(io.writeStatus.mock.calls[0][0]).not.toHaveProperty('legacyHoldPublished');
     expect(io.publishNeedsYou).not.toHaveBeenCalled();
+    // A second pass finds the seal already recorded and writes nothing more.
+    expect(publishStoredRedTeamResult(io)).toEqual({ status: 'skipped' });
+    expect(io.writeStatus).toHaveBeenCalledTimes(1);
   });
   const posted = (text = '### Post-accept red team — no break found', login = 'web-everything') =>
     [{ author: { login }, body: `${redTeamMarker(42, head)}\n${text}` }];

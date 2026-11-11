@@ -62,8 +62,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
         return;
       }
       const keys = sealedBreakKeys(findings);
-      // No confirmed break and no earlier seal: nothing to authorize, nothing to record.
-      if (!keys.length && status.sealedBreaks === undefined) return;
+      // An empty list is sealed too: an unsealed status that owes publication holds every reader (red-team-sealed-status).
       if (JSON.stringify(status.sealedBreaks ?? null) !== JSON.stringify(keys)) {
         // New breaks invalidate a fallback body sealed for the old ones.
         const { sealedPosted: _stale, ...rest } = status;

@@ -267,13 +267,16 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
       const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.source === 'operator' && r.kind !== 'block');
       // Index 0 is the shared hold on stored evidence the thread does not show in full: no operator ruling settles it.
-      const owed = (state.result?.findings ?? []).some(f => f.confirmed && !settled(f)) || open.has(0);
+      // An index-0 hold that is only "publication pending" (stored evidence not sealed yet) is no break: never approve, never alarm.
+      const publicationPending = (disposition?.held ?? []).some(f => f.index === 0 && f.unsealed === true);
+      const owed = (state.result?.findings ?? []).some(f => f.confirmed && !settled(f)) || (open.has(0) && !publicationPending);
       // A confirmed break is classified before the hold: a hold (blocked, sent back) must not hide the alert.
       if (reasons.length && !owed) { held.push({ item, reasons }); return; }
       if (owed) {
         out[index] = verified({ ...stripAction(checked), kind: 'confirmed-break-owed-send-back',
           reason: 'a confirmed red-team break is owed a send-back on the live head' });
-      } else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable') && headlineAgrees(view.comments, item.pr, view.headRefOid)) out[index] = verified(checked);
+      } else if (publicationPending) out[index] = undecided(checked);
+      else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable') && headlineAgrees(view.comments, item.pr, view.headRefOid)) out[index] = verified(checked);
       else out[index] = undecided(checked);
     } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = undecided(checked); }
   };

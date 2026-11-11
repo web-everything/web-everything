@@ -34,6 +34,11 @@ export function sealedFromStatus(status, head) {
   const posted = status.sealedPosted;
   if (posted !== undefined && (seal === undefined || !keyList(posted))) return { unreadable: true };
   const legacyHold = status.legacyHoldPublished === true && status.status === 'finished' && status.result === 'ran';
+  // A status that still owes publication (same test as the publisher's `needsPublish`) and has no seal yet: nothing has
+  // compared the stored evidence with the thread, so no posted comment may clear it. Hold until the publisher seals.
+  const owesPublish = status.status === 'finished' && (status.result === 'ran'
+    || (status.result?.status === 'ran' && ['withheld', 'error'].includes(status.result?.comment)));
+  if (seal === undefined && owesPublish) return { unsealed: true, legacyHold };
   if (seal === undefined && !legacyHold) return null;
   return { breaks: seal ?? [], legacyHold, ...(posted !== undefined ? { posted } : {}) };
 }

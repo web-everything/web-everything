@@ -214,6 +214,45 @@ describe('the sealed status reader fails closed', () => {
     expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toEqual({ unreadable: true });
     expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
   });
+  // Before the publisher's first pass the status owes publication and carries no seal: nothing has compared the stored
+  // evidence with the thread yet, so a trusted "no break found" comment must not clear any reader (live probe, #6622 head).
+  it.each([
+    ['a bare legacy `ran` result', legacyStatus()],
+    ['a withheld result', { ...legacyStatus(), result: { status: 'ran', comment: 'withheld', findings: [brokenFinding] } }],
+    ['an errored publication', { ...legacyStatus(), result: { status: 'ran', comment: 'error', findings: [brokenFinding] } }],
+  ])('%s that owes publication and has no seal holds every reader before the publisher runs', (_name, status) => {
+    store([seatRow()]);
+    writeStatusFile(status);
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ unsealed: true });
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    expect(redTeamEnqueueHold({ comments: [clearComment], pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/confirmed a break/);
+    expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: [], comments: [clearComment], evidence: {} }).add)
+      .toBe('red-team:blocked');
+  });
+  it('a stored row with no confirmed break seals an EMPTY list, which lifts the unsealed hold for an agreeing comment', () => {
+    store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);
+    writeStatusFile(legacyStatus());
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    expect(publish([clearComment]).out).toEqual({ status: 'skipped' });
+    expect(readStatusFile().sealedBreaks).toEqual([]);
+    expect(heldBy([clearComment]).held).toEqual([]);
+  });
+  it('the needs-you feed never approves an unsealed head, and does not call it a confirmed break either', async () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    const gh = async (_f, args) => args[0] === 'api'
+      ? JSON.stringify([[{ user: { login: 'web-everything' }, body: clearComment.body, created_at: clearComment.createdAt }]])
+      : JSON.stringify({ headRefOid: head, labels: [] });
+    const report = { ready: [{ repo, number: 42, title: 't' }] };
+    const { kept, held } = await gateReadyItems(itemsFromReport(report), report, { gh, log: () => {}, fixClaimLive: () => false });
+    expect(held).toEqual([]);
+    expect(kept.filter(i => i.pr === 42 && ['needs-you', 'confirmed-break-owed-send-back', 'red-team-undecided'].includes(i.kind)))
+      .toEqual([expect.objectContaining({ head, kind: 'red-team-undecided' })]);
+  });
+  it('a status already published (comment posted) needs no seal: it holds nothing on its own', () => {
+    writeStatusFile({ ...legacyStatus(), result: { status: 'ran', comment: 'posted', findings: [] } });
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toBeNull();
+  });
   it('the pure decision: no seal holds nothing, an empty seal holds nothing, an unreadable seal holds', () => {
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: null }).held).toBe(false);
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: { breaks: [] } }).held).toBe(false);

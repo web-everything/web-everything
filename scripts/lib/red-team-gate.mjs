@@ -719,6 +719,7 @@ export function postedBreakKeys(parsed) {
 export function redTeamHoldDecision({ comments, pr, head, sealed } = {}) {
   if (!sealed) return { held: false, reason: null };
   if (sealed.unreadable) return { held: true, reason: 'sealed red-team evidence is unreadable' };
+  if (sealed.unsealed) return { held: true, reason: 'stored red-team evidence is not sealed yet (publication pending)' };
   if (sealed.legacyHold === true) return { held: true, reason: 'legacy red-team evidence is unreadable or conflicts with the posted comment' };
   if (!Array.isArray(sealed.breaks) || !sealed.breaks.length) return { held: false, reason: null };
   const { posted, agree, keys } = redTeamBreaksAgree({ comments, pr, head, breaks: sealed.breaks });
@@ -883,8 +884,11 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     }
   }
   const hold = redTeamHoldDecision({ comments, pr, head: live, sealed: seal });
+  // `unsealed`: the hold is only "publication pending" (no conflict found yet), so alert surfaces can say so.
+  const unsealed = hold.held && seal?.unsealed === true && seal.legacyHold !== true && legacyHold !== true;
   if (legacyHold === true || hold.held) held.push({ index: 0, confirmed: true, category: 'legacy-conflict', file: null, line: null,
-    summary: hold.reason ?? 'Legacy red-team evidence conflicts with the posted comment; operator review required.', legacyHold: true });
+    summary: hold.reason ?? 'Legacy red-team evidence conflicts with the posted comment; operator review required.', legacyHold: true,
+    ...(unsealed ? { unsealed: true } : {}) });
   return { result, sendBack, held, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };
 }
 
