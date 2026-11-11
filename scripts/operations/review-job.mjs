@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, publishCarriedCheckDurably } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -496,8 +496,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { ok: r.status === 0, reason: String(r.stderr || r.stdout || r.error || `exit ${r.status}`) };
     },
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
-    publishCarriedCheck: ({ pr, repo, headSha }) => publishRedTeamCheckFromLive({ pr, repo, headSha,
-      appId: env.WE_APP_ID, env, gh: (args, options) => exec('gh', args, { ...options, cwd: root, env }) }),
+    // The outbox marker outlives a failed attempt, so the on-skip recovery pass retries the carried check (#6606).
+    publishCarriedCheck: ({ pr, repo, headSha }) => publishCarriedCheckDurably({ repo, pr, head: headSha, env,
+      publish: () => publishRedTeamCheckFromLive({ pr, repo, headSha,
+        appId: env.WE_APP_ID, env, gh: (args, options) => exec('gh', args, { ...options, cwd: root, env }) }) }),
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },

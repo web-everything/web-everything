@@ -417,6 +417,83 @@ describe('red-team check run contract', () => {
       expect(posts(io)).toEqual([]);
     });
 
+    // #6606 red team: a transient verification failure makes the helper supersede its own success. That failure is
+    // newer than the carry, but it is the helper's own publication record, not a round's: a retry with restored reads
+    // must republish. A round's failure newer than the carry must still refuse, wherever it sits.
+    describe('retry after the helper superseded its own success', () => {
+      const LIVE_FAIL = { status: 'finished', hold: 'live red-team check not clear: gh pr view timed out' };
+      function retryFixture(initial = []) {
+        const io = fixture();
+        io.readComments.mockReturnValue([carryComment('2026-11-07T12:00:00Z')]);
+        const check_runs = [...initial];
+        let nextId = 40;
+        io.gh.mockImplementation((args, options) => {
+          if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+          if (args.includes('POST')) {
+            const id = nextId++;
+            check_runs.push(run({ ...JSON.parse(options.input), id, completed_at: '2026-11-07T13:00:00Z' }));
+            return JSON.stringify({ id });
+          }
+          return JSON.stringify({ total_count: check_runs.length, check_runs });
+        });
+        let reads = 0;
+        io.readLive.mockImplementation(() => {
+          if (++reads === 2) throw Error('gh pr view timed out');
+          return { headRefOid: HEAD, labels: [] };
+        });
+        return { io, check_runs };
+      }
+      const ownFailure = (id, completed_at = '2026-11-07T13:00:00Z') => run({ id, completed_at,
+        ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...LIVE_FAIL, liveSupersede: true }) });
+      const fact = runs => api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: runs });
+
+      it('a retry with restored reads republishes success over the helper\'s own failure', () => {
+        const { io, check_runs } = retryFixture();
+        expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/timed out/) });
+        expect(check_runs.map(r => r.conclusion)).toEqual(['success', 'failure']);
+        expect(fact(check_runs)).toMatchObject({ ok: false });
+        expect(publish(io)).toMatchObject({ ok: true });
+        expect(check_runs.map(r => r.conclusion)).toEqual(['success', 'failure', 'success']);
+        expect(fact(check_runs)).toMatchObject({ ok: true });
+      });
+      it('the helper\'s supersede is marked as its own, and no round writer\'s payload is', () => {
+        const { io, check_runs } = retryFixture();
+        publish(io);
+        expect(api.isLiveSupersedeRun(check_runs[1])).toBe(true);
+        expect(api.isLiveSupersedeRun(check_runs[0])).toBe(false);
+        for (const payload of [api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: 'break' }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null, sendBack: true }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: 'x', policyClear: true })])
+          expect(api.isLiveSupersedeRun(payload)).toBe(false);
+      });
+      it.each([
+        ['a round failure newer than the carry, after the helper\'s failure', () => [run({ id: 20 }), ownFailure(21),
+          run({ id: 22, conclusion: 'failure', completed_at: '2026-11-07T14:00:00Z' })]],
+        ['a round failure newer than the carry, behind the helper\'s failure', () => [run({ id: 20 }),
+          run({ id: 21, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }), ownFailure(22)]],
+        ['a round still in progress behind the helper\'s failure', () => [run({ id: 20 }),
+          run({ id: 21, status: 'in_progress', conclusion: null }), ownFailure(22)]],
+        ['a round-writer failure with the same summary but no supersede marker', () => [run({ id: 20 }), run({ id: 21,
+          completed_at: '2026-11-07T13:00:00Z', ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...LIVE_FAIL }) })]],
+      ])('still refuses: %s', (_name, build) => {
+        const initial = build();
+        const { io, check_runs } = retryFixture(initial);
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: false });
+        expect(check_runs).toHaveLength(initial.length);
+      });
+      it('only the helper\'s own failures over an older round failure: the round failure still dates the carry', () => {
+        const older = [run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' }), ownFailure(21)];
+        const { io } = retryFixture(older);
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: true });
+        const newer = [run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }), ownFailure(21)];
+        const again = retryFixture(newer);
+        again.io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(again.io)).toMatchObject({ ok: false, reason: expect.stringMatching(/not demonstrably newer/) });
+      });
+    });
+
     it.each([false, true])('failed failure supersede posts a second-channel hold and never throws (hold fails=%s)', async holdFails => {
       const io = fixture();
       const baseGh = io.gh.getMockImplementation();

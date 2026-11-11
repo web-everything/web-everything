@@ -62,6 +62,27 @@ describe('review job rebase carry', () => {
   });
 });
 
+// #6606: the production carry publisher leaves a durable retry marker when its attempt is not confirmed, so the
+// on-skip recovery pass republishes the check instead of skipping the carried head for good.
+describe('review job carried check outbox wiring', () => {
+  it('a refused carried-check publication leaves the head owed for recovery', async () => {
+    const { createReviewJobIo } = await import('../review-job.mjs');
+    const { readCarriedCheckUnpublished } = await import('../../lib/drain-red-team-evidence.mjs');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'carry-outbox-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: join(dir, 'locks'), WE_APP_ID: 'unset' };
+    try {
+      const exec = vi.fn(() => { throw Error('no GitHub in tests'); });
+      const io = createReviewJobIo({ root: dir, env, exec });
+      expect(io.publishCarriedCheck({ pr: 1, repo: 'web-everything/web-everything', headSha: b })).toMatchObject({ ok: false });
+      expect(readCarriedCheckUnpublished({ repo: 'web-everything/web-everything', pr: 1, head: b, env })).toBe(true);
+      expect(readCarriedCheckUnpublished({ repo: 'web-everything/web-everything', pr: 1, head: a, env })).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('human clearance remains owned by restamp', () => {
   it.each([true, false])('equal patches carry human clearance only if the restamp agrees (%s)', async agrees => {
     const { decideRestampHumanClearance, buildVerdictComment } = await import('../../review-set-label.mjs');

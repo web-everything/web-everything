@@ -35,6 +35,39 @@ export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }
   }
 }
 
+/** Carried-check outbox (#6606): a verdict carry settles the head without a round, so no round writer republishes its
+ * check. The marker is written BEFORE the publication attempt and removed only once it is confirmed, so a failed,
+ * crashed or self-superseded attempt leaves a local record the on-skip recovery pass retries from live evidence. */
+const carriedCheckOutboxPath = (key, env) => `${statusPath(key, env)}.carried-check-unpublished`;
+
+/** `true` when a carried check is still owed on this head. An unreadable probe counts as owed: a retry re-validates
+ * every live fact before it posts, so retrying is the fail-closed answer. */
+export function readCarriedCheckUnpublished({ repo, pr, head, env = process.env }) {
+  try { statSync(carriedCheckOutboxPath({ repo, pr, head }, env)); return true; }
+  catch (error) { return error.code !== 'ENOENT'; }
+}
+
+/** Publish a carried check through `publish`, keeping the outbox marker until it is confirmed. A marker that cannot be
+ * written does not stop the attempt (a confirmed check needs no retry); its failure is named in the reason. */
+export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish }) {
+  const path = carriedCheckOutboxPath({ repo, pr, head }, env);
+  let markError = null;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeJsonAtomic(path, { repo, pr: Number(pr), head });
+  } catch (error) { markError = String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 200); }
+  let result;
+  try { result = publish(); }
+  catch (error) { result = { ok: false, reason: String(error?.message ?? error) }; }
+  if (result?.ok === true) {
+    try { rmSync(path, { force: true }); }
+    catch (error) { return { ok: true, warning: `carried-check marker not removed (${error?.message ?? error}); next retry re-validates` }; }
+    return result;
+  }
+  const reason = String(result?.reason ?? 'unknown error');
+  return { ...result, ok: false, reason: markError ? `${reason}; carried-check retry marker not written (${markError}): operator must republish` : reason };
+}
+
 /** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */
 function retryMarkerSpent(path) {
   try { statSync(`${path}.retry-1`); return true; }
