@@ -11,6 +11,14 @@ let lockRoot;
 beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'heavy-run-ceiling-')); });
 afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
 
+// A SIGKILLed group member stays visible to kill(pid, 0) until its parent (or, once orphaned, init) reaps it - on a CI
+// container without a prompt reaper that lags the kill by a moment (main af7b65e8a flaked on exactly this). Poll for
+// the process to be gone instead of asserting the instant the wrapper returns; a genuine orphan still fails after 15s.
+async function expectGone(pid) {
+  for (let i = 0; i < 60; i++) { try { process.kill(pid, 0); } catch { return; } await new Promise((res) => setTimeout(res, 250)); }
+  expect(() => process.kill(pid, 0)).toThrow();
+}
+
 describe('runUnderAdmission — run ceiling counted from slot grant', () => {
   it('applies runCeilingMs as the exec timeout only after the slot is held, and reports 124 on ETIMEDOUT', async () => {
     const seen = [];
@@ -26,7 +34,7 @@ describe('runUnderAdmission — run ceiling counted from slot grant', () => {
     const r = await runUnderAdmission({ lockRoot, cap: 1, owner: 'G', command: `sleep 30 & echo $! > ${pidFile}; wait`, runCeilingMs: 400, log: () => {}, now: () => T0, sleep: async () => {} });
     expect(r.exitCode).toBe(124);
     expect(Date.now() - started).toBeLessThan(15_000);
-    expect(() => process.kill(Number(readFileSync(pidFile, 'utf8')), 0)).toThrow();
+    await expectGone(Number(readFileSync(pidFile, 'utf8')));
     const b = await runUnderAdmission({ lockRoot, cap: 1, owner: 'H', command: 'sleep 30', bypass: 'no-pool', runCeilingMs: 300, log: () => {} });
     expect(b.exitCode).toBe(124);
     const ok = await runUnderAdmission({ lockRoot, cap: 1, owner: 'I', command: 'exit 3', runCeilingMs: 5000, log: () => {}, now: () => T0, sleep: async () => {} });
@@ -36,7 +44,7 @@ describe('runUnderAdmission — run ceiling counted from slot grant', () => {
     const pidFile = join(lockRoot, 'pid2');
     const r = await runUnderAdmission({ lockRoot, cap: 1, owner: 'F', command: `sleep 30 & echo $! > ${pidFile}; wait`, kind: 'files', env: { WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS: '1000' }, runCeilingMs: 60_000, log: () => {}, now: () => T0, sleep: async () => {} });
     expect(r.exitCode).toBe(124);
-    expect(() => process.kill(Number(readFileSync(pidFile, 'utf8')), 0)).toThrow();
+    await expectGone(Number(readFileSync(pidFile, 'utf8')));
     // Wrapper killed with SIGKILL: no handler runs, the watchdog must reap the group.
     const pidFile3 = join(lockRoot, 'pid3');
     const url = `file://${join(process.cwd(), 'scripts/readiness/heavy-admission.mjs')}`;
@@ -45,9 +53,8 @@ describe('runUnderAdmission — run ceiling counted from slot grant', () => {
     for (let i = 0; i < 150 && !existsSync(pidFile3); i++) await new Promise((res) => setTimeout(res, 100));
     const orphan = Number(readFileSync(pidFile3, 'utf8'));
     wrapper.kill('SIGKILL');
-    for (let i = 0; i < 40; i++) { try { process.kill(orphan, 0); } catch { break; } await new Promise((res) => setTimeout(res, 250)); }
-    expect(() => process.kill(orphan, 0)).toThrow();
-  }, 30_000);
+    await expectGone(orphan);
+  }, 60_000);
   it('no runCeilingMs means no exec timeout; admittedArgv carries the flag only when asked', async () => {
     const seen = [];
     await runUnderAdmission({ lockRoot, cap: 1, owner: 'B', command: 'x', exec: (_c, o) => seen.push(o.timeout), now: () => T0, sleep: async () => {} });
