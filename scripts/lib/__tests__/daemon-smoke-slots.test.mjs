@@ -470,6 +470,35 @@ describe('daemon smoke slots', () => {
     await holder.release();
   });
 
+  it.each(['60000', '120000', '120001', '180000'])('a rebuild lease lifetime of %sms (wait clamped to 0) still admits a free slot', async lease => {
+    settings.value = { smokeMaxConcurrent: 1 };
+    const env = { WE_DAEMON_REBUILD_LEASE_STALE_MS: lease };
+    const slot = await acquire(11, { env, sleep: async () => { throw new Error('unexpected wait'); } });
+    expect(slot.acquired).toBe(true);
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
+    expect(state().waiters).toEqual([]);
+    await slot.release();
+    expect(state().holders).toEqual([]);
+  });
+
+  it.each(['60000', '120000'])('a zero wait (lease %sms) never queues behind a full cap or jumps an existing waiter', async lease => {
+    settings.value = { smokeMaxConcurrent: 1 };
+    const env = { WE_DAEMON_REBUILD_LEASE_STALE_MS: lease };
+    const holder = await acquire(11, { env });
+    const full = await acquire(12, { env, sleep: async () => { throw new Error('unexpected wait'); } });
+    expect(full.acquired).toBe(false);
+    expect(state().waiters).toEqual([]);
+    await holder.release();
+    // A waiter already ahead keeps its place: a zero-wait caller must not take the free slot past it.
+    const next = JSON.parse(readFileSync(join(stateDir, 'smoke-slots.json'), 'utf8'));
+    writeFileSync(join(stateDir, 'smoke-slots.json'), JSON.stringify({ ...next, nextTicket: next.nextTicket + 1,
+      waiters: [{ pid: 13, ticket: next.nextTicket, at: 123 }] }));
+    const behind = await acquire(14, { env, sleep: async () => { throw new Error('unexpected wait'); } });
+    expect(behind.acquired).toBe(false);
+    expect(state().holders).toEqual([]);
+    expect(state().waiters.map(e => e.pid)).toEqual([13]);
+  });
+
   it.each([false, true])('returns no slot at the deadline with a busy state lock and never exceeds the cap (ticket=%s)', async hasTicket => {
     settings.value = { smokeMaxConcurrent: 1, smokeQueueMaxWaitMs: 3001 };
     await acquire(11);

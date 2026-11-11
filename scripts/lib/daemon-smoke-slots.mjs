@@ -203,10 +203,13 @@ export async function acquireSmokeSlot({
       for (const entry of pending) failedTickets.delete(entry);
     }
     for (;;) {
-      if (now() >= deadline) throw expired;
+      // A zero/spent budget (a rebuild lease of 2min or less clamps the wait to 0) must still make one
+      // admission attempt: only an unqueued caller may take a slot that is free right now.
+      if (ticket !== undefined && now() >= deadline) throw expired;
       const ahead = await transaction(state => {
-        if (now() >= deadline) throw expired;
+        if (ticket !== undefined && now() >= deadline) throw expired;
         if (ticket === undefined) {
+          if (now() >= deadline && (state.waiters.length > 0 || state.holders.length >= cap)) throw expired;
           if (!positive(state.nextTicket + 1)) throw new Error('daemon-live-smoke: slot tickets exhausted; inspect state before retrying');
           ticket = state.nextTicket++;
           state.waiters.push({ pid, ticket, at: now() });
@@ -219,7 +222,8 @@ export async function acquireSmokeSlot({
           return null;
         }
         return index;
-      }, deadline);
+        // A zero budget leaves no room to even take the state lock; give that one attempt the lock's own 30s cap.
+      }, ticket === undefined && deadline <= queuedAt ? queuedAt + 30_000 : deadline);
       if (ahead === null) return { acquired: true, release };
       if (ahead !== lastAhead) log.error?.(`daemon-live-smoke: smoke-queued (${ahead} ahead)`);
       lastAhead = ahead;
