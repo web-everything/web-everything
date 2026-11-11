@@ -18,10 +18,14 @@ export const DEFERRED_OPEN_MODES = Object.freeze(['park', 'label-on-green', 'ope
 /** Finish-guard statuses a deferred marker may stand in for. red / corrupt / running are never overridden. */
 const OVERRIDABLE_GATE_STATUSES = Object.freeze(['absent', 'unverified', 'untracked', 'infrastructure-failure']);
 
+/** The only infrastructure reasons that may defer to CI (verificationInfrastructureFailure + remote termination). */
+export const DEFERRABLE_INFRA_REASONS = Object.freeze(['verify-unsettled', 'verify-timeout', 'verify-signal', 'remote-termination-unconfirmed']);
+const validInfra = i => !!i && typeof i === 'object' && !Array.isArray(i) && DEFERRABLE_INFRA_REASONS.includes(i.reason) && typeof i.detail === 'string' && i.detail.length > 0;
+
 /** Pure. Null unless there is an exact sha and infra evidence. */
 export function buildDeferredRecord({ sha, infrastructure, exitCode = null, recordedAt = new Date().toISOString() } = {}) {
   if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) return null;
-  if (!infrastructure || typeof infrastructure !== 'object' || !infrastructure.reason) return null;
+  if (!validInfra(infrastructure)) return null;
   return {
     status: DEFERRED_STATUS, sha,
     reason: String(infrastructure.reason),
@@ -72,7 +76,7 @@ export function deferredToCiDecision({ gate, deferred, headSha, mode } = {}) {
   if (!DEFERRED_OPEN_MODES.includes(mode)) return no(`mode-${mode}`);
   if (!deferred || deferred.corrupt || deferred.status !== DEFERRED_STATUS) return no('no-deferred-marker');
   if (!headSha || deferred.sha !== headSha) return no('deferred-sha-mismatch');
-  if (!deferred.reason || !deferred.infrastructure) return no('deferred-evidence-missing');
+  if (!validInfra(deferred.infrastructure) || deferred.reason !== deferred.infrastructure.reason) return no('deferred-evidence-invalid');
   return { ok: true, reason: 'deferred-to-ci', disclosure: `lane verify deferred to CI: ${deferred.reason} - ${deferred.detail}` };
 }
 

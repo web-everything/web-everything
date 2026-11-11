@@ -85,6 +85,12 @@ describe('deferredToCiDecision (the open path only)', () => {
     expect(ok({ deferred: { corrupt: true } }).ok).toBe(false);
     expect(ok({ deferred: { status: 'green', sha: SHA, reason: 'x', infrastructure: infra } }).ok).toBe(false);
   });
+  it('rejects malformed or unknown infra evidence', () => {
+    expect(buildDeferredRecord({ sha: SHA, infrastructure: true })).toBeNull();
+    expect(buildDeferredRecord({ sha: SHA, infrastructure: { reason: 'anything', detail: 'x' } })).toBeNull();
+    expect(ok({ deferred: { status: 'deferred-to-ci', sha: SHA, reason: 'x', infrastructure: true } }).ok).toBe(false);
+    expect(ok({ deferred: { status: 'deferred-to-ci', sha: SHA, reason: 'verify-timeout', infrastructure: infra } }).ok).toBe(false);
+  });
   it('is a no-op for an already-ok gate', () => { expect(ok({ gate: { ok: true, status: 'green' } }).ok).toBe(false); });
   it('disclosure is idempotent', () => {
     const once = appendDeferredDisclosure('Body', 'lane verify deferred to CI: r');
