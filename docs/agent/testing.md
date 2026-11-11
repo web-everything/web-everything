@@ -1347,8 +1347,10 @@ waits up to 20 seconds for live leases to drain, then refuses with "retry sync" 
 resetting or cleaning; a live sync lock is refused before any fetch. Ownership is judged by
 process liveness, never by a timer: a pid that is gone, or that now names a process with a
 different `ps -o lstart` start time (pid reuse), is an exited owner. Unknown evidence counts as
-live. Launchers ignore an exited owner's lock (and an old-protocol lock directory); the next
-sync reclaims it and prunes exited leases, and the pristine and freshness checks still guard a
+live. Launchers ignore an exited owner's lock (and an ownerless old-protocol lock directory) but
+wait for, then deny behind, an old-protocol directory whose `owner` record is live, judged exactly
+as reclaim judges it; an `owner` that is not a readable file denies. The next
+sync reclaims an abandoned lock and prunes exited leases, and the pristine and freshness checks still guard a
 clone a crashed sync left half-reset. Reclaim is serialised behind `<clone>.guard-lock.reclaim`
 and removes only an existing record judged dead: a lock observed absent is never reclaimed
 (a peer may publish at any moment after that read). An old-protocol directory (the empty mkdir

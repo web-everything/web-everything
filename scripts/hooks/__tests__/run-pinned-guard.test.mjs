@@ -239,6 +239,50 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
     expect(leases(f)).toEqual([]);
   });
+  // An earlier revision's sync lock was a directory holding its record in `<lock>/owner`.
+  const legacyLock = (f, record) => {
+    const lock = syncLock(f);
+    writeFileSync(join(lock, 'owner'), record);
+    return lock;
+  };
+  it.each([
+    ['live owner', () => `${process.pid} 0 earlier\n`],
+    ['live owner without a start time', () => `${process.pid}\n`],
+  ])('waits out and then denies while a legacy lock directory names a %s', (_kind, record) => {
+    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    const lock = legacyLock(f, record());
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('sync is in progress; retry the hook') });
+    expect(readFileSync(join(lock, 'owner'), 'utf8')).toBe(record());
+    expect(leases(f)).toEqual([]);
+  });
+  it('waits for a live legacy lock directory to be released, then runs the guard', async () => {
+    const f = fixture();
+    const lock = legacyLock(f, `${process.pid} 0 earlier\n`);
+    const hook = start(f, ['scripts/guard-bash.mjs']);
+    await hook.stderrIncludes('for guard clone sync to finish');
+    expect(leases(f)).toEqual([]);
+    rmSync(lock, { recursive: true });
+    hook.child.stdin.end('payload');
+    expect(JSON.parse(await hook.line())).toMatchObject({ root: f.lane, input: 'payload' });
+    expect(await hook.finish(), hook.stderr).toBe(0);
+  });
+  it.each([
+    ['dead owner', () => `${deadPid()} 0 crashed\n`],
+    ['reused pid', () => `${process.pid} 1000 earlier\n`],
+  ])('runs past a legacy lock directory whose owner record names a %s', (_kind, record) => {
+    const f = fixture();
+    const lock = legacyLock(f, record());
+    expect(f.launch()).toMatchObject({ status: 0, stderr: 'guard stderr\n' });
+    expect(existsSync(join(lock, 'owner'))).toBe(true);
+    expect(leases(f)).toEqual([]);
+  });
+  it('fails closed on a legacy lock directory whose owner record cannot be read as a file', () => {
+    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    const lock = syncLock(f);
+    mkdirSync(join(lock, 'owner'));
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('denying (exit 2)') });
+    expect(leases(f)).toEqual([]);
+  });
   it('records its own start time in the lease so a reused pid is told apart', async () => {
     const f = fixture();
     writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), `console.log('ready'); process.stdin.resume(); process.stdin.on('end', () => {});`);

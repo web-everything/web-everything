@@ -61,16 +61,31 @@ function alive(pid, started) {
   // ps reports whole seconds; a larger gap is a different process reusing the pid.
   return actual === null || Math.abs(actual - started) < 3_000;
 }
-/** True while a live sync process holds the exclusive lock file. An absent lock, an
- * old-protocol lock directory (no owner record) or an exited owner is not a running sync. */
+/** True while a live sync process holds the exclusive lock. The lock is a file holding the
+ * owner record, or a directory from an earlier revision: the mkdir lock (empty, no owner) or one
+ * keeping its record in `<lock>/owner`. A live owner there still holds the clone, exactly as
+ * sync's reclaim judges it; an absent lock, an ownerless directory or an exited owner is not
+ * a running sync. Any other unreadable evidence throws, so the hook denies. */
 function syncRunning(lockPath) {
-  let record;
-  try { record = readFileSync(lockPath, 'utf8'); }
-  catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'EISDIR') return false;
-    throw error;
+  // The lock can switch between file and directory between reads; re-read, then fail closed.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { return holderAlive(readFileSync(lockPath, 'utf8')); }
+    catch (error) {
+      if (error.code === 'ENOENT') return false;
+      if (error.code !== 'EISDIR') throw error;
+    }
+    try { return holderAlive(readFileSync(join(lockPath, 'owner'), 'utf8')); }
+    catch (error) {
+      if (error.code === 'ENOENT') {
+        // Ownerless only while the lock is still a directory; else it changed hands.
+        try { if (lstatSync(lockPath).isDirectory()) return false; }
+        catch (inner) { if (inner.code === 'ENOENT') return false; throw inner; }
+        continue;
+      }
+      if (error.code !== 'ENOTDIR') throw error;
+    }
   }
-  return holderAlive(record);
+  throw new Error('guard clone sync lock kept changing while it was read; retry the hook');
 }
 function holderAlive(record) {
   if (typeof record !== 'string' || !record) return false;
