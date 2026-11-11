@@ -48,25 +48,34 @@ function parsePatch(text) {
   return { header: header.join('\n'), hunks };
 }
 
-/** Old-side hunks of a `--unified=0` diff: how main's own change moved lines between the two merge-bases. */
+/**
+ * Old-side hunks of a `--unified=0` diff: how main's own change moved lines between the two merge-bases. `lines` is the
+ * text of every line main added or removed, used to detect an ambiguous alignment (see mapStart).
+ */
 function shiftHunks(text) {
-  const out = [];
+  const hunks = [];
+  const lines = new Set();
+  let inHunk = false;
   for (const l of text.split('\n')) {
     const m = HUNK.exec(l);
-    if (m) out.push({ oldStart: Number(m[1]), oldLen: m[2] === undefined ? 1 : Number(m[2]), newLen: m[4] === undefined ? 1 : Number(m[4]) });
+    if (m) { inHunk = true; hunks.push({ oldStart: Number(m[1]), oldLen: m[2] === undefined ? 1 : Number(m[2]), newLen: m[4] === undefined ? 1 : Number(m[4]) }); continue; }
+    if (inHunk && (l[0] === '+' || l[0] === '-')) lines.add(l.slice(1));
   }
-  return out;
+  return { hunks, lines };
 }
 
 /**
  * Where a PR hunk that started at old line `h.oldStart` in the prior merge-base sits in the head merge-base, given
- * main's own hunks between the two. null = main touched lines in or next to the hunk, so its place cannot be proven.
+ * main's own hunks between the two. null = the place cannot be proven: main touched lines in or next to the hunk, or
+ * main added or removed a line whose text also appears in the hunk. Inside a run of identical lines git may report
+ * main's edit at either end of the run, so the offset it implies is not trustworthy; keeping the file is the safe side.
  */
-function mapStart(h, mainHunks) {
+function mapStart(h, main) {
   const s = h.oldStart;
   const e = s + Math.max(h.oldLen, 1) - 1;
+  if (main.lines.size && h.body.some(l => l[0] !== '\\' && main.lines.has(l.slice(1)))) return null;
   let offset = 0;
-  for (const m of mainHunks) {
+  for (const m of main.hunks) {
     // A pure insertion by main (oldLen 0) sits between old lines oldStart and oldStart+1; treat both as touched.
     const a1 = m.oldStart;
     const a2 = m.oldLen === 0 ? m.oldStart + 1 : m.oldStart + m.oldLen - 1;
@@ -113,7 +122,7 @@ function samePatch(exec, a, b, mbPrior, mbHead, path) {
   if (a.header !== b.header || a.hunks.length !== b.hunks.length) return false;
   for (let i = 0; i < a.hunks.length; i += 1) if (a.hunks[i].body.join('\n') !== b.hunks[i].body.join('\n')) return false;
   if (!a.hunks.length) return true;
-  const main = mbPrior === mbHead ? [] : shiftHunks(run(exec, [...DIFF_FLAGS, '--unified=0', mbPrior, mbHead, '--', path], { maxBuffer: MAX }));
+  const main = mbPrior === mbHead ? { hunks: [], lines: new Set() } : shiftHunks(run(exec, [...DIFF_FLAGS, '--unified=0', mbPrior, mbHead, '--', path], { maxBuffer: MAX }));
   return a.hunks.every((h, i) => mapStart(h, main) === b.hunks[i].oldStart);
 }
 

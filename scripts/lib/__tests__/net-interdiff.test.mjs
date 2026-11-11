@@ -178,7 +178,7 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
     write('q/a.txt', lines(10)); write('q/b.txt', lines(10));
     write('e.txt', lines(5));
     // Repetitive files: 40 identical lines, so an insertion has the SAME 3-line context at every spot inside the run.
-    write('rep.txt', rep()); write('rep2.txt', rep()); write('rep3.txt', rep());
+    write('rep.txt', rep()); write('rep2.txt', rep()); write('rep3.txt', rep()); write('rep4.txt', rep());
     commit('main fixtures for the edge-case matrix');
   });
 
@@ -298,6 +298,30 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
     write('rep3.txt', insertAfter(`MAIN top 1\nMAIN top 2\n${rep()}`, 27, 'PR'));
     const head = commit('pr2 moves the insertion to line 27');
     expect(Object.keys(net(prior, head).files)).toEqual(['rep3.txt']);
+    git('checkout', '-q', 'main');
+  });
+
+  it('keeps a moved insertion when main added one more identical line elsewhere in the same run (git may align main\'s edit at either end)', () => {
+    start('runslide');
+    write('rep4.txt', insertAfter(rep(), 30, 'PR'));
+    const prior = commit('pr1 inserts after line 30');
+    git('checkout', '-q', 'main');
+    const mainText = insertAfter(rep(), 20, 'same');
+    write('rep4.txt', mainText);
+    commit('main adds one identical line inside the run');
+    git('checkout', '-q', 'runslide');
+    // `-s ours` records main as a parent (so the merge-base moves) while the tree stays under the test's control.
+    git('merge', '-q', '-s', 'ours', '--no-edit', 'main');
+    // With main's extra line above it, the SAME placement is "after line 31". Every other position is a real move.
+    const moved = [];
+    for (const q of [27, 28, 29, 30, 32, 33, 34, 35]) {
+      write('rep4.txt', insertAfter(mainText, q, 'PR'));
+      moved.push([q, commit(`pr2 inserts after line ${q}`)]);
+    }
+    for (const [q, head] of moved) {
+      const out = net(prior, head, { 'rep4.txt': null });
+      expect(Object.keys(out.files), `insertion after line ${q}`).toEqual(['rep4.txt']);
+    }
     git('checkout', '-q', 'main');
   });
 
