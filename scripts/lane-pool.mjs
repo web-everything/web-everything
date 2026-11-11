@@ -3093,7 +3093,9 @@ function releaseVerifyStashBundle(dir, bundle, shas) {
     if (!shas.every(sha => tips.has(sha))) return false;
     const objects = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], probeDir,
       { stdio: ['pipe', 'pipe', 'pipe'], input: shas.map(sha => `${sha}\n`).join('') });
-    return objects === shas.map(sha => `${sha} commit`).join('\n');
+    if (objects !== shas.map(sha => `${sha} commit`).join('\n')) return false;
+    // Every tree, blob and parent reachable from the stash commits must be in the bundle too, not only the commit objects.
+    return releaseEvidenceGit(['rev-list', '--objects', '--quiet', ...shas], probeDir) !== null;
   } catch { return false; }
   finally { if (probeDir) rmSync(probeDir, { recursive: true, force: true }); }
 }
@@ -3130,14 +3132,15 @@ function releaseSalvageStash(dir) {
     if (todo.length) {
       mkdirSync(backupDir, { recursive: true });
       const file = `stash-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}-${todo[0].slice(0, 8)}.bundle`;
-      const names = todo.map((_, i) => `refs/release-stash/${i}`);
+      const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      const names = todo.map((_, i) => `refs/release-stash/${nonce}/${i}`);
       try {
         for (const [i, sha] of todo.entries()) {
-          if (releaseEvidenceGit(['update-ref', names[i], sha], dir) === null) return [...recorded.keys()];
+          if (releaseEvidenceGit(['update-ref', '--no-deref', names[i], sha, ''], dir) === null) return [...recorded.keys()];
         }
         if (releaseEvidenceGit(['bundle', 'create', join(backupDir, file), ...names], dir) === null) return [...recorded.keys()];
       } finally {
-        for (const name of names) releaseEvidenceGit(['update-ref', '-d', name], dir);
+        for (const name of names) releaseEvidenceGit(['update-ref', '--no-deref', '-d', name], dir);
       }
       if (!releaseVerifyStashBundle(dir, join(backupDir, file), todo)) return [...recorded.keys()];
       writeFileSync(recordFile, `${[...recorded].map(([sha, f]) => `${sha} ${f}`).join('\n')}${recorded.size ? '\n' : ''}${todo.map(sha => `${sha} ${file}`).join('\n')}\n`);
