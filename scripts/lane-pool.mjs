@@ -3207,11 +3207,44 @@ function acquireBlockingWork(repo, dir) {
   return { ...work, commits: left.join('\n') };
 }
 
+/** Network-free, bounded cheap check (PR #6647 judge sweep R903): is EVERY local tip — HEAD, each branch, each stash
+ *  entry — already contained in the lane's own `refs/remotes/origin/*` tracking refs? Returns true when no commit is
+ *  local-only (nothing to prove against the canonical origin), false when at least one is, and null when any read is
+ *  unreadable or times out (callers then take the strict proof, never skip it). It exists because the strict proof
+ *  (transport-config reads, a bounded `ls-remote`, the verification fetch) ran twice per candidate lane on every
+ *  acquire — ~2.5x the git children of main — and timed the sim daemon's smoke acquire out at 90s. By the time the
+ *  pre-reset guard runs, acquire's own `fetch --prune` has refreshed those tracking refs, the same evidence the
+ *  #2924 re-verify and `rev-list origin/<branch>..HEAD` already trust. Symbolic refs (origin/HEAD) and the
+ *  coordination namespace (origin/ops/*) never count as proof, exactly as in the operator hint above; a lane whose
+ *  fetch refspec is narrowed simply has fewer tracking refs, so more tips look local-only and take the strict path. */
+function laneTipsOnTrackingRefs(dir) {
+  const local = releaseLocalWorkTips(dir);
+  if (!local) return null;
+  const tracking = releaseEvidenceGit(['for-each-ref', '--format=%(objectname) %(refname) %(symref)', 'refs/remotes/origin/'], dir,
+    { timeout: LOCAL_GIT_TIMEOUT_MS });
+  if (tracking === null) return null;
+  const proofs = [];
+  for (const line of tracking.split('\n')) {
+    if (!line) continue;
+    const [sha, ref, symref] = line.split(' ');
+    if (!/^[a-f0-9]{40,64}$/.test(sha ?? '') || !ref) return null;
+    if (symref || ref === 'refs/remotes/origin/HEAD' || ref.startsWith('refs/remotes/origin/ops/')) continue;
+    proofs.push(sha);
+  }
+  const input = [...local.tips, ...[...new Set(proofs)].map(sha => `^${sha}`)].map(line => `${line}\n`).join('');
+  const unproven = releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir,
+    { stdio: ['pipe', 'pipe', 'pipe'], input, timeout: LOCAL_GIT_TIMEOUT_MS });
+  return unproven === null ? null : unproven === '';
+}
+
 /** Acquire's pre-fetch step: primes object-only verification and fails closed when the preservation evidence is
  *  UNREADABLE. Unpushed work found here is deliberately NOT refused yet: the #2924 fresh-fetch re-verify, the hold
- *  rule and `assertNoUnpushedLaneWork` (pre-reset) all re-read it on post-fetch refs and own the refusal wording. */
+ *  rule and `assertNoUnpushedLaneWork` (pre-reset) all re-read it on post-fetch refs and own the refusal wording.
+ *  A lane with no local-only commit (see {@link laneTipsOnTrackingRefs}) has nothing to prime, so it skips the
+ *  network proof entirely. */
 function assertReadableLaneEvidence(repo, chosen) {
   if (flags.force) return;
+  if (laneTipsOnTrackingRefs(laneDir(repo, chosen)) === true) return;
   const work = acquireBlockingWork(repo, laneDir(repo, chosen));
   if (work.commits === null) throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually (or --force to discard)`);
 }
@@ -3220,6 +3253,7 @@ function assertReadableLaneEvidence(repo, chosen) {
  *  `--force` is the documented operator override, exactly as for the #2924 containment re-verify. */
 function assertNoUnpushedLaneWork(repo, chosen) {
   if (flags.force) return;
+  if (laneTipsOnTrackingRefs(laneDir(repo, chosen)) === true) return; // fresh post-fetch tracking refs place every tip
   const work = acquireBlockingWork(repo, laneDir(repo, chosen));
   if (work.commits !== '') throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually (or --force to discard)`);
 }

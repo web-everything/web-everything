@@ -255,7 +255,7 @@ describe('lane-pool salvage-unpushed', () => {
     expect(JSON.parse(result.stdout).lane).toBe(2);
   });
 
-  it('acquires an unfetched free lane after canonical origin/main advances using object-only verification', () => {
+  it('acquires an unfetched free lane after canonical origin/main advances with no network proof (daemon-tick cost)', () => {
     const publisher = join(root, 'publisher');
     git(['clone', origin, publisher]);
     const advanced = commit(publisher, 'advanced main');
@@ -267,11 +267,35 @@ describe('lane-pool salvage-unpushed', () => {
     expect(JSON.parse(result.stdout).lane).toBe(1);
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(advanced);
     const log = events();
-    const verification = log.findIndex(e => e.cwd === lane && e.args.includes('fetch')
-      && e.args.some(arg => arg.includes(':refs/release-verify/')));
-    const reset = log.findIndex(e => e.cwd === lane && e.args.includes('checkout') && e.args.includes('-B'));
-    expect(verification).toBeGreaterThanOrEqual(0); expect(reset).toBeGreaterThan(verification);
-    expect(git(['for-each-ref', '--format=%(refname)', 'refs/release-verify/'], lane)).toBe('');
+    // Every local tip is already on the lane's freshly fetched origin tracking refs: no local-only commits exist, so
+    // acquire must not pay for the canonical-origin listing, a verification fetch or the salvage evidence reads
+    // (they made every sim-daemon smoke acquire 2-3x slower and timed daemon-soak ticks out at 90s).
+    expect(log.filter(e => e.args.includes('ls-remote'))).toEqual([]);
+    expect(log.filter(e => e.args.some(arg => String(arg).includes('refs/release-verify/')))).toEqual([]);
+    expect(log.some(e => e.cwd === lane && e.args.includes('checkout') && e.args.includes('-B'))).toBe(true);
+  });
+
+  it('a clean free-lane acquire stays cheap: no ls-remote and a bounded number of git calls', () => {
+    const result = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--lane=1', '--json']);
+    expect(result.status, result.stderr).toBe(0);
+    const log = events();
+    expect(log.filter(e => e.args.includes('ls-remote'))).toEqual([]);
+    expect(log.filter(e => e.cwd === lane).length).toBeLessThan(60);
+  });
+
+  it('acquire still refuses a stash entry or a local-only branch commit that the cheap check cannot place on origin', () => {
+    writeFileSync(join(lane, 'work.txt'), 'stashed edit');
+    git(['stash', 'push', '-m', 'keep me'], lane);
+    const stashed = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--lane=1', '--session=s1', '--json']);
+    expect(stashed.status).not.toBe(0);
+    expect(git(['stash', 'list'], lane)).toMatch(/keep me/);
+    git(['stash', 'clear'], lane);
+    git(['checkout', '-q', '-b', 'side'], lane);
+    const sha = commit(lane, 'local only on a side branch');
+    git(['checkout', '-q', 'main'], lane);
+    const branch = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--lane=1', '--session=s2', '--json']);
+    expect(branch.status).not.toBe(0);
+    expect(git(['rev-parse', 'side'], lane)).toBe(sha);
   });
 
   it('create-only salvage preserves a competing ref created between inspection and push', () => {
