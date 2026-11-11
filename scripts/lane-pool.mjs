@@ -3095,7 +3095,9 @@ function releaseVerifyStashBundle(dir, bundle, shas) {
       { stdio: ['pipe', 'pipe', 'pipe'], input: shas.map(sha => `${sha}\n`).join('') });
     if (objects !== shas.map(sha => `${sha} commit`).join('\n')) return false;
     // Every tree, blob and parent reachable from the stash commits must be in the bundle too, not only the commit objects.
-    return releaseEvidenceGit(['rev-list', '--objects', '--quiet', ...shas], probeDir) !== null;
+    // fsck checks every unpacked object and that each tree's blobs exist (rev-list --objects --quiet does not).
+    return releaseEvidenceGit(['rev-list', '--objects', '--quiet', ...shas], probeDir) !== null
+      && releaseEvidenceGit(['fsck', '--full', '--no-dangling', '--no-progress'], probeDir) !== null;
   } catch { return false; }
   finally { if (probeDir) rmSync(probeDir, { recursive: true, force: true }); }
 }
@@ -3182,13 +3184,23 @@ function releaseUnprovenCommits(dir, salvage, proof, preservedStash = []) {
   const localHeads = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/heads/'], dir);
   const headSha = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
   if (localHeads === null || !headSha) return { commits: null };
-  const tips = [headSha, ...localHeads.split('\n'), ...(stashRef ? stashRef.split('\n') : []),
-    ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  // A bundled stash entry is itself preserved, but its first parent (the commit it was made on) is not: it stays a tip,
+  // so an unpushed branch commit beneath a stash still needs canonical-origin proof (a `^stash` exclusion would hide it).
+  const preservedSet = new Set(preservedStash);
+  const stashTips = [...(stashRef ? stashRef.split('\n') : []), ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  const stashBases = [];
+  for (const sha of stashTips) {
+    if (!preservedSet.has(sha)) continue;
+    const base = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', `${sha}^1`], dir);
+    if (!base) return { commits: null };
+    stashBases.push(base);
+  }
+  const tips = [headSha, ...localHeads.split('\n'), ...stashBases, ...stashTips.filter(sha => !preservedSet.has(sha))].filter(Boolean);
   const present = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], dir,
     { stdio: ['pipe', 'pipe', 'pipe'], input: tips.map(sha => `${sha}\n`).join('') });
   const presentLines = present === null ? [] : present.split('\n');
   if (presentLines.length !== tips.length || !presentLines.every(line => / commit$/.test(line))) return { commits: null };
-  const input = [...tips, ...[...heads, ...preservedStash, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
+  const input = [...tips, ...[...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
     .map(line => `${line}\n`).join('');
   const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir,
     { stdio: ['pipe', 'pipe', 'pipe'], input });

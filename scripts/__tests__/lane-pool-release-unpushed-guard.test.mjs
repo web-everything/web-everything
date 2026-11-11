@@ -409,6 +409,17 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     const result = release([], '', '', RECOVERY_ON);
     refused(result, sha);
   });
+  it('with recovery on, still refuses an unpushed branch commit that sits beneath a stash entry', () => {
+    git(['checkout', '--quiet', '-b', 'work/under'], laneDir);
+    writeFileSync(join(laneDir, 'real.txt'), 'real work\n');
+    git(['add', 'real.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'real'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir);
+    writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit on top\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    git(['checkout', '--quiet', '--detach', 'origin/main'], laneDir);
+    refused(release([], '', '', RECOVERY_ON), sha);
+  });
   it('releases a lane whose HEAD is behind an origin tip it has not fetched yet', () => {
     const other = join(base, 'other');
     git(['clone', '--quiet', origin, other]);
