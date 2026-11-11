@@ -199,7 +199,18 @@ describe('the sealed status reader fails closed', () => {
     const loopPayload = { findings: { read: { netBasis: { rev: head } } } };
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'ran' }, { env: process.env });
     expect(JSON.parse(readFileSync(sealedStatusPath({ repo, pr: 42, head }, process.env), 'utf8'))).toMatchObject({ repo, pr: 42, head, result: 'ran' });
-    expect(sealedStatusPath({ repo, pr: 42, head }, {})).toBe(sealedStatusPath({ repo, pr: 42, head }, { [SHARED_RUNS_DIR_ENV]: '' }));
+    // Without the override (review round 7, PR #6622): the WRITER writes under an isolated coordination root through its
+    // own default path, and the reader finds that exact file at the documented default location.
+    const coordination = join(dir, 'workspace', '.operations', 'coordination');
+    const env = { ...process.env, WE_COORDINATION_ROOT: coordination };
+    delete env[SHARED_RUNS_DIR_ENV];
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: 'ran' }, { env });
+    const defaultFile = join(dir, 'workspace', '.operations', 'red-team-status', `${encodeURIComponent(repo)}-42-${head}.json`);
+    expect(JSON.parse(readFileSync(defaultFile, 'utf8'))).toMatchObject({ repo, pr: 42, head, status: 'finished', result: 'ran' });
+    expect(sealedStatusPath({ repo, pr: 42, head }, env)).toBe(defaultFile);
+    expect(readSealedStatus({ repo, pr: 42, head, env })).toMatchObject({ unsealed: true });
+    // The override-set file is a different file, so the default read is not riding on it.
+    expect(sealedStatusPath({ repo, pr: 42, head }, process.env)).not.toBe(defaultFile);
   });
   it('nothing sealed, a missing file and bad identity inputs hold nothing or fail closed', () => {
     expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toBeNull();
@@ -495,6 +506,40 @@ describe('the stored result is the authority on every status shape (self-review 
     // A NEW result drops the carried findings (the new result is the evidence now).
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: posted([]) }, { env: process.env });
     expect(readStatusFile().storedFindings).toBeUndefined();
+  });
+  // Review round 7 (PR #6622): a retry rewrites a finished, unsealed seat-posted result as queued/running with no
+  // result. That rewrite removed the result, and with it the only stored findings, so a clear comment lifted the hold.
+  it.each([['posted'], ['deduped']])('running rewrite preserves unsealed seat-posted findings (%s)', comment => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: { ...posted([brokenFinding]), comment } });
+    for (const status of ['queued', 'running']) {
+      recordRedTeamStatus({ repo, pr: 42, loopPayload, status }, { env: process.env });
+      expect(readStatusFile()).toMatchObject({ status, result: null, storedFindings: [expect.objectContaining({ confirmed: true })] });
+      expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ findings: [expect.objectContaining({ confirmed: true })] });
+      expect(heldBy([render([brokenFinding]), later(clearComment)]).held.length).toBeGreaterThanOrEqual(1);
+      expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    }
+    // The replacement result is the evidence now: it drops the carried findings.
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: posted([]) }, { env: process.env });
+    expect(readStatusFile().storedFindings).toBeUndefined();
+  });
+  // The rest of the no-result rewrite matrix: every stored shape that held before the rewrite still holds after it.
+  it.each([
+    ['unreadable seat-posted findings', { status: 'finished', result: { status: 'ran', comment: 'posted' } }, 'unreadable'],
+    ['a withheld result that owes publication', { status: 'finished', result: { ...posted([brokenFinding]), comment: 'withheld' } }, 'findings'],
+    ['an unsealed bare legacy `ran` result', { status: 'finished', result: 'ran' }, 'unreadable'],
+  ])('a running rewrite of %s keeps it held', (_name, prior, kind) => {
+    writeStatusFile({ repo, pr: 42, head, ...prior });
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    const sealed = readSealedStatus({ repo, pr: 42, head, env: process.env });
+    expect(kind === 'unreadable' ? sealed : sealed?.findings).toEqual(kind === 'unreadable' ? { unreadable: true } : [expect.objectContaining({ confirmed: true })]);
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('a no-result rewrite after a clean seat-posted result holds nothing (no false hold)', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([]) });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expect(readStatusFile().storedFindings).toEqual([]);
+    expect(heldBy([clearComment]).held).toEqual([]);
   });
   it('a "publication pending" hold asks no ruling (no false round-cap row), yet still holds the merge', () => {
     store([seatRow()]);

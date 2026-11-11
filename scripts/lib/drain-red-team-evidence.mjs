@@ -428,18 +428,30 @@ export function keepSeal(prior, result) {
 const resumedResult = result => (typeof result === 'string' ? result : result?.status) === 'resumed';
 
 /**
- * The stored findings a rewrite must carry (PR #6622): a resume replaces the seat-posted result object with a bare
- * `resumed`, which would drop the only stored evidence of an unsealed pass. Carried as `storedFindings`, read by
- * `sealedFromStatus` exactly like the result's own findings. PURE.
+ * The prior pass's own stored findings, when its result is about to be dropped: a `ran` result object's findings
+ * (unreadable when they cannot be read). With `legacy`, also `unreadable` for an unsealed bare legacy `ran` (its
+ * findings live only in the seat row, which the publisher has not sealed yet). Undefined when there is none.
+ */
+function priorPassFindings(prior, { legacy = false } = {}) {
+  const r = prior.result;
+  if (r && typeof r === 'object' && r.status === 'ran') return Array.isArray(r.findings) ? r.findings : 'unreadable';
+  if (legacy && r === 'ran' && prior.sealedBreaks === undefined) return 'unreadable';
+  return undefined;
+}
+
+/**
+ * The stored findings a rewrite must carry (PR #6622). Any rewrite that drops the prior result WITHOUT a replacement
+ * result — a resume (bare `resumed`) or a queued/running rewrite (no result yet) — would drop the only stored evidence
+ * of an unsealed pass, so its findings are carried as `storedFindings`, read by `sealedFromStatus` exactly like the
+ * result's own findings, until a NEW result replaces them. A queued/running rewrite also carries an unsealed bare
+ * legacy `ran` as unreadable: the new pass's result replaces it. A resume does not (no new result would ever replace
+ * it, so it would hold forever); the publisher's legacy path owns that shape. PURE.
  */
 export function carriedStoredFindings(prior, result) {
   if (!prior) return undefined;
-  if (resumedResult(result)) {
-    const r = prior.result;
-    if (r && typeof r === 'object' && r.status === 'ran') return Array.isArray(r.findings) ? r.findings : 'unreadable';
-    return prior.storedFindings;
-  }
-  // A rewrite with no result yet, or the same result, keeps what an earlier resume carried; a NEW result drops it.
+  if (result == null) return priorPassFindings(prior, { legacy: true }) ?? prior.storedFindings;
+  if (resumedResult(result)) return priorPassFindings(prior) ?? prior.storedFindings;
+  // The same result keeps what an earlier rewrite carried; a NEW result drops it (the new result is the evidence now).
   return keepSeal({ ...prior, damaged: false }, result) ? prior.storedFindings : undefined;
 }
 
