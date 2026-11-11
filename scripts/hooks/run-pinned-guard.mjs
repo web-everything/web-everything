@@ -74,7 +74,7 @@ function syncRunning(lockPath) {
       if (error.code === 'ENOENT') return false;
       if (error.code !== 'EISDIR') throw error;
     }
-    try { return holderAlive(readFileSync(join(lockPath, 'owner'), 'utf8')); }
+    try { return legacyOwnerAlive(join(lockPath, 'owner')); }
     catch (error) {
       if (error.code === 'ENOENT') {
         // Ownerless only while the lock is still a directory; else it changed hands.
@@ -91,6 +91,15 @@ function holderAlive(record) {
   if (typeof record !== 'string' || !record) return false;
   const [pid, started] = record.trim().split(' ').map(Number);
   return alive(pid, started);
+}
+/** An earlier revision's `<lock>/owner` record is `<pid> <hex nonce>`, with no start time, so
+ * its second field is never read as one. Its owner wrote it after starting: a live pid whose
+ * process started after the file was written is a reuse. Unknown start evidence counts as live. */
+function legacyOwnerAlive(ownerPath) {
+  const pid = Number(readFileSync(ownerPath, 'utf8').trim().split(' ')[0]);
+  if (!alive(pid, NaN)) return false;
+  const started = processStart(pid);
+  return started === null || started <= lstatSync(ownerPath).mtimeMs + 3_000;
 }
 
 const argv = process.argv.slice(2);

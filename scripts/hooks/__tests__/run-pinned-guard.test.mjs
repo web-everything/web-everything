@@ -239,15 +239,17 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
     expect(leases(f)).toEqual([]);
   });
-  // An earlier revision's sync lock was a directory holding its record in `<lock>/owner`.
+  // An earlier revision's sync lock was a directory holding `<pid> <12-hex nonce>` in `<lock>/owner`.
   const legacyLock = (f, record) => {
     const lock = syncLock(f);
     writeFileSync(join(lock, 'owner'), record);
     return lock;
   };
   it.each([
-    ['live owner', () => `${process.pid} 0 earlier\n`],
-    ['live owner without a start time', () => `${process.pid}\n`],
+    ['live owner', () => `${process.pid} 9f3a0c2b7e41\n`],
+    // An all-digit nonce must never be read as a start time (it would judge the owner reused).
+    ['live owner with an all-digit nonce', () => `${process.pid} 123456789012\n`],
+    ['live owner without a nonce', () => `${process.pid}\n`],
   ])('waits out and then denies while a legacy lock directory names a %s', (_kind, record) => {
     const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
     const lock = legacyLock(f, record());
@@ -257,7 +259,7 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
   });
   it('waits for a live legacy lock directory to be released, then runs the guard', async () => {
     const f = fixture();
-    const lock = legacyLock(f, `${process.pid} 0 earlier\n`);
+    const lock = legacyLock(f, `${process.pid} 9f3a0c2b7e41\n`);
     const hook = start(f, ['scripts/guard-bash.mjs']);
     await hook.stderrIncludes('for guard clone sync to finish');
     expect(leases(f)).toEqual([]);
@@ -267,11 +269,13 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     expect(await hook.finish(), hook.stderr).toBe(0);
   });
   it.each([
-    ['dead owner', () => `${deadPid()} 0 crashed\n`],
-    ['reused pid', () => `${process.pid} 1000 earlier\n`],
-  ])('runs past a legacy lock directory whose owner record names a %s', (_kind, record) => {
+    ['dead owner', () => `${deadPid()} 9f3a0c2b7e41\n`, false],
+    // The live pid's process started long after the record was written: a reuse.
+    ['reused pid', () => `${process.pid} 9f3a0c2b7e41\n`, true],
+  ])('runs past a legacy lock directory whose owner record names a %s', (_kind, record, aged) => {
     const f = fixture();
     const lock = legacyLock(f, record());
+    if (aged) utimesSync(join(lock, 'owner'), new Date(1_000_000), new Date(1_000_000));
     expect(f.launch()).toMatchObject({ status: 0, stderr: 'guard stderr\n' });
     expect(existsSync(join(lock, 'owner'))).toBe(true);
     expect(leases(f)).toEqual([]);
@@ -385,7 +389,7 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     };
     const launcher = source('scripts/hooks/run-pinned-guard.mjs');
     const sync = source('scripts/hooks/sync-guard-clone.mjs');
-    for (const name of ['lockWaitMs', 'pause', 'processStart', 'alive', 'holderAlive']) {
+    for (const name of ['lockWaitMs', 'pause', 'processStart', 'alive', 'holderAlive', 'legacyOwnerAlive']) {
       expect(helper(launcher, name), name).toBe(helper(sync, name));
     }
     expect(launcher).toContain('const MAX_WAIT_MS = 20_000;');

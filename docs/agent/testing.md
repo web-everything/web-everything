@@ -1349,7 +1349,9 @@ process liveness, never by a timer: a pid that is gone, or that now names a proc
 different `ps -o lstart` start time (pid reuse), is an exited owner. Unknown evidence counts as
 live. Launchers ignore an exited owner's lock (and an ownerless old-protocol lock directory) but
 wait for, then deny behind, an old-protocol directory whose `owner` record is live, judged exactly
-as reclaim judges it; an `owner` that is not a readable file denies. The next
+as reclaim judges it; an `owner` that is not a readable file denies. That record is
+`<pid> <hex nonce>`, never read as a start time: its pid is a reuse only when that process started
+after the `owner` file was written. The next
 sync reclaims an abandoned lock and prunes exited leases, and the pristine and freshness checks still guard a
 clone a crashed sync left half-reset. Reclaim is serialised behind `<clone>.guard-lock.reclaim`
 and removes only an existing record judged dead: a lock observed absent is never reclaimed

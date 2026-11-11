@@ -62,6 +62,15 @@ function holderAlive(record) {
   const [pid, started] = record.trim().split(' ').map(Number);
   return alive(pid, started);
 }
+/** An earlier revision's `<lock>/owner` record is `<pid> <hex nonce>`, with no start time, so
+ * its second field is never read as one. Its owner wrote it after starting: a live pid whose
+ * process started after the file was written is a reuse. Unknown start evidence counts as live. */
+export function legacyOwnerAlive(ownerPath) {
+  const pid = Number(readFileSync(ownerPath, 'utf8').trim().split(' ')[0]);
+  if (!alive(pid, NaN)) return false;
+  const started = processStart(pid);
+  return started === null || started <= lstatSync(ownerPath).mtimeMs + 3_000;
+}
 const nonce = () => `${process.pid}-${randomBytes(6).toString('hex')}`;
 
 /** Create `path` holding `record`, atomically; false when it already exists. */
@@ -103,9 +112,10 @@ export function reclaim(lockPath, judged, record, { beforeRemove = () => {} } = 
       // Directory locks: the mkdir lock (empty) and an earlier revision of this lock, which
       // kept its record in `<lock>/owner`. A live owner there still holds the clone.
       const ownerFile = join(lockPath, 'owner');
-      let inner = '';
-      try { inner = readRecord(ownerFile); } catch (error) { if (error.code !== 'ENOTDIR') throw error; }
-      if (holderAlive(inner)) throw new Error('guard clone is busy: another sync is running; retry sync');
+      let inner = false;
+      try { inner = legacyOwnerAlive(ownerFile); }
+      catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+      if (inner) throw new Error('guard clone is busy: another sync is running; retry sync');
       beforeRemove();
       try { rmSync(ownerFile, { force: true }); } catch (error) { if (error.code !== 'ENOTDIR') throw error; }
       // rmdir removes only a directory, never a lock file published meanwhile.

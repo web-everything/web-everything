@@ -233,7 +233,15 @@ console.log(revision);
     writeFileSync(join(lock, 'owner'), `${process.pid} other\n`);
     expect(() => reclaim(lock, LEGACY, record)).toThrow('another sync is running');
     expect(readFileSync(join(lock, 'owner'), 'utf8')).toContain('other');
-    writeFileSync(join(lock, 'owner'), `${deadPid()} crashed\n`);
+    // The real earlier record is `<pid> <12-hex nonce>`; an all-digit nonce is not a start time.
+    writeFileSync(join(lock, 'owner'), `${process.pid} 123456789012\n`);
+    expect(() => reclaim(lock, LEGACY, record)).toThrow('another sync is running');
+    // A live pid whose process started after the record was written is a reuse.
+    utimesSync(join(lock, 'owner'), new Date(1_000_000), new Date(1_000_000));
+    reclaim(lock, LEGACY, record);
+    expect(existsSync(lock)).toBe(false);
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner'), `${deadPid()} 9f3a0c2b7e41\n`);
     reclaim(lock, LEGACY, record);
     expect(existsSync(lock)).toBe(false);
     mkdirSync(lock);
