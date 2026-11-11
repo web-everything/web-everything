@@ -14,6 +14,8 @@ export function markInfraOnlyRuns(runs, { repo, exec, maxReads = 4 } = {}) {
       const verdict = classifyRun(run);
       if (verdict === 'green') break;
       if (verdict !== 'red') continue;
+      // A re-run (attempt > 1) may hide an earlier genuine failure behind cancelled jobs: it stays red.
+      if (Number(run.attempt) > 1) continue;
       if (reads >= limit) break;
       reads += 1;
       try {

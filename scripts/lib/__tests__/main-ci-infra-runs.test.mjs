@@ -17,6 +17,14 @@ const jobsExec = (data) => vi.fn((bin, args) => {
 });
 
 describe('markInfraOnlyRuns', () => {
+  it('keeps a re-run (attempt > 1) red: an inconclusive re-run cannot erase an earlier genuine failure', () => {
+    const runs = [{ ...failure(), attempt: 2 }, green];
+    const exec = jobsExec(page(['cancelled', 'cancelled']));
+    markInfraOnlyRuns(runs, { repo, exec });
+    expect(runs[0].infraOnly).toBeUndefined();
+    expect(mainRedState(runs).status).toBe('red');
+    expect(exec).not.toHaveBeenCalled();
+  });
   it('marks an all-cancelled failure run infra-only so mainRedState is not red', () => {
     const runs = [failure(), green];
     const exec = jobsExec(page(['cancelled', 'cancelled']));
