@@ -132,7 +132,7 @@ export function planOperatorControl(name, read, input) {
   const records = name === 'clear-claim' ? (read.claims ?? []).map(c => ({ ...record, pr: c.meta.pr, key: `${name}:${input.repo}:pr:${c.meta.pr}:${planKey(stateDigest(c))}`, details: { ...record.details, kind: c.meta.kind } })) : [record];
   if (!why) steps.push(input.item ? 'append operator-action record to operator-actions.jsonl' : 'post one operator-action comment per PR target');
   return { op: name, target, action: why ? 'noop' : 'apply', ...(why ? { why } : {}), steps, undo, record, records,
-    body: buildOperatorActionComment(record), fingerprint, input, claims: read.claims, extension, ...(resets ? { resets } : {}) };
+    body: buildOperatorActionComment(record), fingerprint, input, claims: read.claims, extension, ...(name === 'refresh' ? { refreshExpect: { head: read.head, main: read.main } } : {}), ...(resets ? { resets } : {}) };
 }
 export function operatorControlOperation(name, { readContext } = {}) {
   const optional = (type, value) => ({ type, required: false, default: value });
