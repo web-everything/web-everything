@@ -303,10 +303,14 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
   });
   it('keeps identical copies of the lock helpers in the launcher and sync', () => {
     const source = file => readFileSync(join(repo, file), 'utf8');
+    // One function's text: its own line when it closes there, else through its closing `}` line.
     const helper = (text, name) => {
-      const match = new RegExp(`^(?:export )?function ${name}\\([^]*?\\n}\\n`, 'm').exec(text);
-      expect(match, name).not.toBeNull();
-      return match[0].replace(/^export /, '');
+      const lines = text.split('\n');
+      const start = lines.findIndex(line => line.replace(/^export /, '').startsWith(`function ${name}(`));
+      expect(start, name).toBeGreaterThanOrEqual(0);
+      const end = lines[start].trimEnd().endsWith('}') ? start : lines.indexOf('}', start);
+      expect(end, name).toBeGreaterThanOrEqual(start);
+      return lines.slice(start, end + 1).join('\n').replace(/^export /, '');
     };
     const launcher = source('scripts/hooks/run-pinned-guard.mjs');
     const sync = source('scripts/hooks/sync-guard-clone.mjs');
