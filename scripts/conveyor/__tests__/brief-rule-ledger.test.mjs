@@ -10,14 +10,14 @@ import {
   readBriefs, validateLedger, weakestStatus,
 } from '../brief-rule-ledger.mjs';
 
-import { pinnedHookScript } from '../../lib/pinned-hook-command.mjs';
+import { pinnedHookScript, pinnedStopHookScript } from '../../lib/pinned-hook-command.mjs';
 
 const BRIEF = 'skills-src/conveyor/x-agent-brief.md';
 
 // Bounded to the registrations used here: an actual node invocation, with its script argument.
 // Comments, echo/prose and similarly named scripts cannot supply registration evidence.
 function invokes(command, script) {
-  if (pinnedHookScript(command) === script) return true;
+  if (pinnedHookScript(command) === script || pinnedStopHookScript(command) === script) return true;
   return String(command).split('\n').some((line) => {
     if (line.trimStart().startsWith('#')) return false;
     const groups = [[]];
@@ -70,6 +70,12 @@ describe('hook registration evidence (#4416)', () => {
   });
   it('accepts the script argument after the pinned launcher', () => {
     expect(missingRegistrations(fixture, [registration(pinned), settings[1]], read)).toEqual([]);
+  });
+  it('accepts the script argument of the non-blocking Stop wrapper', () => {
+    const stop = "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs; stop guard skipped\" >&2; exit 1; }; exec node \"$launcher\" --stop-hook scripts/project.mjs'";
+    expect(missingRegistrations(fixture, [registration(stop), settings[1]], read)).toEqual([]);
+    expect(missingRegistrations(fixture, [registration(stop.replace('scripts/project.mjs', 'scripts/not-project.mjs')), settings[1]], read))
+      .toEqual(['project: no command registration for scripts/project.mjs']);
   });
   it.each([
     `echo ${pinned}`,

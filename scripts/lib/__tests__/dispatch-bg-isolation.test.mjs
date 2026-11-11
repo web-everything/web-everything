@@ -150,6 +150,8 @@ describe('xl5reby dispatched worker effective settings include the repo guard ho
       command.replace(' || exit 2', ''),
       command.replace('scripts/guard-bash.mjs;', 'scripts/guard-bash.mjs-extra;'),
       command.replace('scripts/guard-bash.mjs;', 'scripts/guard-bash.mjs\n;'),
+      // The non-blocking Stop form must never become a PreToolUse guard.
+      repo.hooks.Stop[0].hooks[0].command.replace('guard-stop-passive-wait.mjs', 'guard-bash.mjs'),
     ];
     expect(dispatchGuardHooks({ repoRoot: '/r', preToolUse: [{ matcher: 'Bash', hooks: [
       ...invalid.map((command) => ({ type: 'command', command })),

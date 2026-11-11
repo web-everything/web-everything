@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { tmpdir } from 'node:os';
@@ -22,6 +22,23 @@ function fixture() {
   const repo=join(temp,'operated'); git(temp,'clone','--',origin,repo);
   const run=(args=[],cwd=repo)=>spawnSync(process.execPath,[script,...args],{cwd,env,encoding:'utf8',timeout:30_000,maxBuffer:1024*1024});
   return {temp,origin,clone,repo,env,git,run, writable() { execFileSync('chmod', ['-R', 'u+w', clone]); }};
+}
+function deadPid() {
+  return Number(spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' }).stdout.trim());
+}
+/** Route git through a recording shim; returns the JSONL log path. */
+function gitLog(f) {
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const bin = join(f.temp, 'recording-git'); mkdirSync(bin);
+  const log = join(f.temp, 'git-calls.jsonl');
+  writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const {appendFileSync} = require('node:fs');
+const {spawnSync} = require('node:child_process');
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2))+'\\n');
+process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+  f.env.PATH = bin + ':' + f.env.PATH;
+  return log;
 }
 describe('dedicated guard clone synchronization (temporary local origins only)',()=>{
   it('locks an in-place guard against concurrent sync until late imports finish', async () => {
@@ -53,20 +70,26 @@ console.log(revision);
       const ready = await nextLine();
       const entry = JSON.parse(ready).entry;
       expect(entry).toBe(join(f.clone, 'scripts/delayed.mjs'));
-      expect(existsSync(`${f.clone}.guard-lock`)).toBe(true);
+      // The running guard holds a shared lease, not the exclusive sync lock.
+      expect(readdirSync(`${f.clone}.guard-readers`)).toHaveLength(1);
+      expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
       rmSync(join(f.origin, 'scripts/late-v1.mjs'));
       writeFileSync(join(f.origin, 'scripts/late-v2.mjs'), 'export const revision = "new revision";');
       writeFileSync(join(f.origin, 'scripts/delayed.mjs'), 'console.log("new guard");');
       f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'remove original dependency');
+      f.env.WE_GUARD_LOCK_WAIT_MS = '50';
       const refresh = f.run();
+      delete f.env.WE_GUARD_LOCK_WAIT_MS;
       expect(refresh).toMatchObject({ status: 2, stderr: expect.stringContaining('retry sync') });
+      expect(refresh.stderr).toContain('guard hook(s) still running');
       expect(existsSync(join(f.clone, 'scripts/late-v1.mjs'))).toBe(true);
       expect(existsSync(join(f.clone, 'scripts/late-v2.mjs'))).toBe(false);
+      expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
       const imported = nextLine();
       child.stdin.end('continue');
       expect(await imported).toBe('original revision');
       expect((await closed)[0], stderr).toBe(0);
-      expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+      expect(readdirSync(`${f.clone}.guard-readers`)).toEqual([]);
       const refreshAfterExit = f.run();
       expect(refreshAfterExit.status, refreshAfterExit.stderr).toBe(0);
       expect(existsSync(join(f.clone, 'scripts/late-v1.mjs'))).toBe(false);
@@ -77,14 +100,49 @@ console.log(revision);
       lines.close();
     }
   }, 30_000);
-  it('refuses a busy clone without fetching, resetting, cleaning or reclaiming its lock', () => {
+  it.each(['live sync lock', 'live guard lease'])('refuses a %s without fetching, resetting, cleaning or reclaiming it', kind => {
     const f = fixture(); expect(f.run().status).toBe(0);
-    const lock = `${f.clone}.guard-lock`; mkdirSync(lock);
+    const held = kind === 'live sync lock' ? `${f.clone}.guard-lock` : join(`${f.clone}.guard-readers`, `${process.pid}-feed`);
+    if (kind === 'live sync lock') { mkdirSync(held); writeFileSync(join(held, 'owner'), `${process.pid} other\n`); }
+    else writeFileSync(held, '');
     f.writable();
     writeFileSync(join(f.clone, 'keep'), 'precious');
+    const log = gitLog(f);
+    f.env.WE_GUARD_LOCK_WAIT_MS = '50';
     expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('retry sync') });
     expect(readFileSync(join(f.clone, 'keep'), 'utf8')).toBe('precious');
-    expect(existsSync(lock)).toBe(true);
+    expect(existsSync(held)).toBe(true);
+    if (kind === 'live guard lease') expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+    const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+    for (const args of calls) expect(args.filter(arg => ['fetch', 'reset', 'clean', 'clone'].includes(arg)), args.join(' ')).toEqual([]);
+  });
+  it.each(['dead owner', 'no owner record'])('reclaims a sync lock left by a %s and prunes dead guard leases', kind => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const lock = `${f.clone}.guard-lock`; mkdirSync(lock);
+    if (kind === 'dead owner') writeFileSync(join(lock, 'owner'), `${deadPid()} crashed\n`);
+    const lease = join(`${f.clone}.guard-readers`, `${deadPid()}-dead`);
+    writeFileSync(lease, '');
+    writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'second');
+    const result = f.run();
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('second');
+    expect(existsSync(lock)).toBe(false);
+    expect(existsSync(lease)).toBe(false);
+    expect(readdirSync(dirname(f.clone)).filter(name => name.includes('.guard-lock'))).toEqual([]);
+  });
+  it('syncs to HOME/workspace/.guard-main with WE_GUARD_CLONE unset, where the settings launcher looks', () => {
+    const f = fixture(); delete f.env.WE_GUARD_CLONE;
+    f.env.HOME = join(f.temp, 'home with spaces');
+    mkdirSync(f.env.HOME);
+    const result = f.run();
+    expect(result.status, result.stderr).toBe(0);
+    const clone = join(f.env.HOME, 'workspace/.guard-main');
+    expect(f.git(clone, 'config', '--local', '--get', 'we.guardClone')).toBe(clone);
+    expect(f.git(clone, 'rev-parse', 'HEAD')).toBe(f.git(f.origin, 'rev-parse', 'main'));
+    expect(existsSync(f.clone)).toBe(false);
+    const settings = JSON.parse(readFileSync(resolve(dirname(script), '../../.claude/settings.json'), 'utf8'));
+    const launcher = settings.hooks.PreToolUse[0].hooks[0].command.match(/launcher="([^"]+)"/)[1];
+    expect(launcher.replace('$HOME', f.env.HOME)).toBe(join(clone, 'scripts/hooks/run-pinned-guard.mjs'));
   });
   it('clones origin/main only using the current repository origin, then resets and cleans only its owned clone',()=>{
     const f=fixture(); expect(f.run()).toMatchObject({status:0});

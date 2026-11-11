@@ -51,8 +51,8 @@ export function pinnedFixture({ launcherOnly = false } = {}) {
   writeFileSync(join(clone, '.git/FETCH_HEAD'), '');
   delete env.WE_GUARD_CLONE;
   return { primary, lane, clone, temp, env, git,
-    run(cwd, script, event) {
-      return spawnSync(process.execPath, [join(clone, 'scripts/hooks/run-pinned-guard.mjs'), script], {
+    run(cwd, script, event, args = []) {
+      return spawnSync(process.execPath, [join(clone, 'scripts/hooks/run-pinned-guard.mjs'), script, ...args], {
         cwd, env, encoding: 'utf8', input: JSON.stringify(event), maxBuffer: 1024 * 1024,
       });
     },

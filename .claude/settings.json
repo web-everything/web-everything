@@ -127,7 +127,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-passive-wait.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs; stop guard skipped\" >&2; exit 1; }; exec node \"$launcher\" --stop-hook scripts/guard-stop-passive-wait.mjs'"
           }
         ]
       }
@@ -137,11 +137,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-passive-wait.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs; stop guard skipped\" >&2; exit 1; }; exec node \"$launcher\" --stop-hook scripts/guard-stop-passive-wait.mjs'"
           },
           {
             "type": "command",
-            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-stop-background-running.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs; stop guard skipped\" >&2; exit 1; }; exec node \"$launcher\" --stop-hook scripts/guard-stop-background-running.mjs'"
           }
         ]
       }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { hookRoot } from '../../lib/hook-root.mjs';
 import { pinnedFixture } from './pinned-fixture.mjs';
@@ -79,6 +79,39 @@ describe('real guards launched from the dedicated clone', () => {
       }).status).toBe(0);
     });
   }
+  // The clone holds only scripts/, so each guard below decides from operated-checkout data
+  // that a clone-rooted guard could not see.
+  function laneFile(rel, text) {
+    const path = join(fixture.lane, rel);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+    return path;
+  }
+  it('backlog guard reads child cards from the operated checkout', () => {
+    const parent = laneFile('backlog/100-parent.md', '---\nkind: story\nsize: 3\n---\n# Parent\n\nA sized story.\n');
+    laneFile('backlog/101-child.md', '---\nkind: task\nparent: 100\n---\n# Child\n\nIts child.\n');
+    expect(existsSync(join(fixture.clone, 'backlog'))).toBe(false);
+    const result = fixture.run(fixture.lane, 'scripts/backlog-guard.mjs', {
+      tool_name: 'Write', cwd: fixture.lane, tool_input: { file_path: parent },
+    });
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('#100 is a sized `story` that also has children');
+  });
+  it('memory guard reads the operated checkout memory index', () => {
+    laneFile('.claude/agent-memory/MEMORY.md', `# Memory\n\n- ${'x'.repeat(240)}\n`);
+    expect(existsSync(join(fixture.clone, '.claude/agent-memory'))).toBe(false);
+    const result = fixture.run(fixture.lane, 'scripts/check-memory.mjs', {});
+    expect(result.status, result.stdout + result.stderr).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain('(> 200)');
+    expect(result.stdout + result.stderr).not.toContain('no memory index');
+  });
+  it('locus lint sweeps the operated checkout corpus', () => {
+    laneFile('backlog/0200-leak.md', '---\nkind: task\nstatus: open\n---\n# Leak\n\nMentions scripts/leak.ts bare.\n');
+    const result = fixture.run(fixture.lane, 'scripts/lint-locus-prefix.mjs', {}, ['--all']);
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('backlog/0200-leak.md');
+    expect(result.stderr).toContain('scripts/leak.ts');
+  });
   it('overrides inherited roots and canonicalizes a nested symlink cwd', async () => {
     const { symlinkSync } = await import('node:fs');
     const nested = join(fixture.primary, 'nested'); mkdirSync(nested);

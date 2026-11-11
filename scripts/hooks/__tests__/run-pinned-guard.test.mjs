@@ -1,16 +1,64 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pinnedFixture } from './pinned-fixture.mjs';
+import { dispatchGuardHooks } from '../../lib/dispatch-bg-isolation.mjs';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const settings = JSON.parse(readFileSync(join(repo, '.claude/settings.json'), 'utf8'));
-const commands = ['PreToolUse', 'Stop', 'SubagentStop'].flatMap(event =>
-  settings.hooks[event].flatMap(group => group.hooks.map(hook => hook.command)));
+const hookCommands = event => settings.hooks[event].flatMap(group => group.hooks.map(hook => hook.command));
+const stopCommands = ['Stop', 'SubagentStop'].flatMap(hookCommands);
+const commands = [...hookCommands('PreToolUse'), ...stopCommands];
+const isStop = command => stopCommands.includes(command);
+const scriptOf = command => command.match(/node "\$launcher" (?:--stop-hook )?(scripts\/[^ ;']+)/)[1];
+const editCommands = settings.hooks.PreToolUse.find(group => group.matcher === 'Edit|Write').hooks.map(hook => hook.command);
 const bashCommand = settings.hooks.PreToolUse.find(group => group.matcher === 'Bash').hooks[0].command;
 const fixtures = [];
+/** A process id that has exited, for abandoned lock and lease records. */
+function deadPid() {
+  const child = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });
+  return Number(child.stdout.trim());
+}
+function syncLock(f, pid) {
+  const lock = `${f.clone}.guard-lock`;
+  mkdirSync(lock);
+  if (pid !== undefined) writeFileSync(join(lock, 'owner'), `${pid} test\n`);
+  return lock;
+}
+const leases = f => { try { return readdirSync(`${f.clone}.guard-readers`); } catch { return []; } };
+function commitClone(f, message) {
+  f.git(f.clone, 'add', '-A');
+  f.git(f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', message);
+  f.git(f.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+}
+/** Start a hook asynchronously; `line()` resolves its next stdout line or rejects if it exits first. */
+function start(f, args, { shell = false, cwd = f.lane } = {}) {
+  const child = shell
+    ? spawn('sh', ['-c', args], { cwd, env: f.env, stdio: ['pipe', 'pipe', 'pipe'] })
+    : spawn(process.execPath, [join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'), ...args], { cwd, env: f.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const closed = once(child, 'close');
+  const lines = createInterface({ input: child.stdout });
+  let stderr = '';
+  const stderrWaiters = [];
+  child.stderr.on('data', chunk => {
+    stderr += chunk;
+    for (const waiter of stderrWaiters.splice(0)) if (stderr.includes(waiter.text)) waiter.resolve(); else stderrWaiters.push(waiter);
+  });
+  const exited = closed.then(([code]) => { throw new Error(`hook exited (${code}) first: ${stderr}`); });
+  exited.catch(() => {});
+  return {
+    child, closed,
+    get stderr() { return stderr; },
+    line: () => Promise.race([once(lines, 'line').then(([line]) => line), exited]),
+    stderrIncludes: text => stderr.includes(text) ? Promise.resolve()
+      : Promise.race([new Promise(resolve => stderrWaiters.push({ text, resolve })), exited]),
+    finish: async () => { if (!child.stdin.writableEnded) child.stdin.end(); const [code] = await closed; lines.close(); return code; },
+  };
+}
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
 function fixture() {
   const f = pinnedFixture({ launcherOnly: true }); fixtures.push(f);
@@ -20,7 +68,7 @@ function fixture() {
 console.log(JSON.stringify({root:process.env.WE_HOOK_ROOT,cwd:process.cwd(),args:process.argv.slice(2),gitKeys:Object.keys(process.env).filter(key=>key.startsWith('GIT_')),input:readFileSync(0,'utf8')}));
 console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT || 0);`;
   for (const command of commands) {
-    const script = command.match(/node "\$launcher" (scripts\/[^ ;]+)/)[1];
+    const script = scriptOf(command);
     writeFileSync(join(clone, script), probe);
     for (const cwd of [f.primary, f.lane]) writeFileSync(join(cwd, script), 'console.log("UNTRUSTED GUARD");');
   }
@@ -160,28 +208,114 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
       status: 2, stdout: '', stderr: expect.stringContaining('denying (exit 2)'),
     });
   });
-  it('denies a busy clone without running a guard or reclaiming the lock, then permits retry', () => {
+  it('runs every hook of one matcher concurrently on one clone without denying any', async () => {
     const f = fixture();
-    const lock = `${f.clone}.guard-lock`; mkdirSync(lock);
-    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('retry the hook') });
-    // An existing lock must remain owned by the other invocation.
-    expect(existsSync(lock)).toBe(true);
-    rmSync(lock, { recursive: true });
-    expect(f.launch().status).toBe(0);
+    // Each guard reports readiness while its lease is held, then waits for the test.
+    const barrier = `console.log('ready'); process.stdin.resume(); process.stdin.on('end', () => console.log('done'));`;
+    for (const command of editCommands) writeFileSync(join(f.clone, scriptOf(command)), barrier);
+    commitClone(f, 'barrier probes');
+    expect(editCommands.length).toBeGreaterThan(1);
+    const hooks = editCommands.map(command => start(f, command, { shell: true }));
+    try {
+      expect(await Promise.all(hooks.map(hook => hook.line()))).toEqual(editCommands.map(() => 'ready'));
+      expect(leases(f)).toHaveLength(editCommands.length);
+    } finally {
+      const codes = await Promise.all(hooks.map(hook => hook.finish()));
+      expect(codes, hooks.map(hook => hook.stderr).join('\n')).toEqual(editCommands.map(() => 0));
+    }
+    expect(leases(f)).toEqual([]);
   });
-  it('fails closed on a missing clone script and on a cwd outside Git', () => {
+  it.each(['dead owner', 'no owner record'])('runs past a sync lock left by a %s, keeping the integrity checks', kind => {
     const f = fixture();
-    expect(f.launch(f.temp).status).toBe(2);
+    const lock = syncLock(f, kind === 'dead owner' ? deadPid() : undefined);
+    expect(f.launch()).toMatchObject({ status: 0, stderr: 'guard stderr\n' });
+    // Abandoned locks are reclaimed by the next sync, not by hooks.
+    expect(existsSync(lock)).toBe(true);
+    writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), 'console.log("HALF RESET");');
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
+    expect(leases(f)).toEqual([]);
+  });
+  it('waits for a live sync to release its lock, then runs the guard', async () => {
+    const f = fixture();
+    const lock = syncLock(f, process.pid);
+    const hook = start(f, ['scripts/guard-bash.mjs']);
+    await hook.stderrIncludes('waiting for guard clone sync');
+    expect(leases(f)).toEqual([]);
+    rmSync(lock, { recursive: true });
+    hook.child.stdin.end('payload');
+    expect(JSON.parse(await hook.line())).toMatchObject({ root: f.lane, input: 'payload' });
+    expect(await hook.finish(), hook.stderr).toBe(0);
+    expect(leases(f)).toEqual([]);
+  });
+  it('denies after its bounded wait while a live sync holds the lock, leaving the lock and no lease', () => {
+    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    const lock = syncLock(f, process.pid);
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('sync is in progress; retry the hook') });
+    expect(existsSync(lock)).toBe(true);
+    expect(leases(f)).toEqual([]);
+  });
+  it('never fetches, resets, cleans or reclaims, whether it runs or waits out a live sync', () => {
+    const f = fixture();
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    const bin = join(f.temp, 'bin'); mkdirSync(bin);
+    const log = join(f.temp, 'git-args.jsonl');
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const {appendFileSync} = require('node:fs');
+const {spawnSync} = require('node:child_process');
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2))+'\\n');
+process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+    f.env.PATH = bin + ':' + f.env.PATH;
+    expect(f.launch().status).toBe(0);
+    f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    const lock = syncLock(f, process.pid);
+    expect(f.launch().status).toBe(2);
+    expect(existsSync(lock)).toBe(true);
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls.length).toBeGreaterThan(0);
+    for (const args of calls) {
+      expect(args.filter(arg => ['fetch', 'pull', 'clone', 'reset', 'clean', 'checkout', 'gc', 'prune'].includes(arg)), args.join(' ')).toEqual([]);
+    }
+  });
+  it('fails closed on a missing clone script and on a cwd outside Git with no primary beside the clone', () => {
+    const f = fixture();
+    expect(f.launch(f.temp)).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('outside Git') });
     rmSync(join(f.clone,'scripts/guard-bash.mjs'));
     expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('denying (exit 2)')});
   });
-  it.each(['scripts/../outside.mjs','../scripts/guard-bash.mjs','/scripts/guard-bash.mjs','scripts/directory','scripts/escape.mjs','scripts/escape-dir/guard.mjs'])('refuses invalid or escaping target %s', script => {
-    const f = fixture(); const outside = join(f.temp,'outside'); mkdirSync(outside);
-    writeFileSync(join(outside,'guard.mjs'),'console.log("ESCAPE");');
-    mkdirSync(join(f.clone,'scripts/directory'));
-    symlinkSync(join(outside,'guard.mjs'),join(f.clone,'scripts/escape.mjs'));
-    symlinkSync(outside,join(f.clone,'scripts/escape-dir'),'dir');
-    expect(f.launch(f.lane,script)).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('denying (exit 2)')});
+  it('dispatched scratch worker executes pinned guards against the primary beside the clone', () => {
+    const f = fixture();
+    const primary = join(dirname(f.clone), 'webeverything'); mkdirSync(primary);
+    f.git(primary, 'init', '-q', '-b', 'main');
+    const scratch = join(f.temp, 'operations/dispatch/scratch'); mkdirSync(scratch, { recursive: true });
+    const carried = dispatchGuardHooks({ preToolUse: settings.hooks.PreToolUse, repoRoot: '/unused' })
+      .flatMap(group => group.hooks.map(hook => hook.command));
+    expect(carried).toEqual(hookCommands('PreToolUse'));
+    for (const command of carried) {
+      const result = f.command(scratch, command, { cwd: scratch });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ root: realpathSync(primary), cwd: scratch });
+    }
+  });
+  it('refuses a malformed path before any containment check', () => {
+    const f = fixture();
+    for (const script of ['scripts/../outside.mjs', '../scripts/guard-bash.mjs', '/scripts/guard-bash.mjs']) {
+      expect(f.launch(f.lane, script)).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('expected a relative path inside scripts') });
+    }
+  });
+  it.each(['scripts/directory/guard', 'scripts/directory', 'scripts/escape.mjs', 'scripts/escape-dir/guard.mjs'])('refuses committed escaping or non-file target %s on a pristine clone', script => {
+    const f = fixture(); const outside = join(f.temp, 'outside'); mkdirSync(outside);
+    const ran = join(f.temp, 'ESCAPED');
+    writeFileSync(join(outside, 'guard.mjs'), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(ran)}, '1');`);
+    mkdirSync(join(f.clone, 'scripts/directory/guard'), { recursive: true });
+    writeFileSync(join(f.clone, 'scripts/directory/guard/keep'), '');
+    symlinkSync(join(outside, 'guard.mjs'), join(f.clone, 'scripts/escape.mjs'));
+    symlinkSync(outside, join(f.clone, 'scripts/escape-dir'), 'dir');
+    commitClone(f, 'escaping entries');
+    expect(f.git(f.clone, 'status', '--porcelain', '--untracked-files=all')).toBe('');
+    expect(f.launch().status).toBe(0);
+    expect(f.launch(f.lane, script)).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('clone guard must be a regular file inside clone/scripts') });
+    expect(existsSync(ran)).toBe(false);
   });
   it('refuses a scripts directory symlink that escapes the clone', () => {
     const f = fixture(); const scripts = join(f.temp,'outside-scripts');
@@ -282,8 +416,23 @@ describe('configured settings wrappers executed via sh -c', () => {
       const result = f.command(f.lane,command,{hello:'world'});
       expect(result.status,result.stderr).toBe(0);
       expect(JSON.parse(result.stdout)).toMatchObject({root:f.lane,input:'{"hello":"world"}'});
-      f.env.PROBE_EXIT='7'; expect(f.command(f.lane,command,{}).status).toBe(2); delete f.env.PROBE_EXIT;
+      // PreToolUse maps every failure to a deny; Stop hooks keep Claude Code's own exit-code meaning.
+      f.env.PROBE_EXIT='7'; expect(f.command(f.lane,command,{}).status).toBe(isStop(command) ? 7 : 2);
+      f.env.PROBE_EXIT='2'; expect(f.command(f.lane,command,{}).status).toBe(2); delete f.env.PROBE_EXIT;
     }
+  });
+  it.each(['stale sync', 'missing launcher', 'busy sync', 'missing guard'])('a %s never blocks Stop or SubagentStop, but still denies PreToolUse', kind => {
+    const f = fixture();
+    if (kind === 'stale sync') { const old = new Date(Date.now() - 25*60*60*1000); utimesSync(join(f.clone, '.git/FETCH_HEAD'), old, old); }
+    if (kind === 'missing launcher') rmSync(join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'));
+    if (kind === 'busy sync') { f.env.WE_GUARD_LOCK_WAIT_MS = '50'; syncLock(f, process.pid); }
+    if (kind === 'missing guard') { for (const command of stopCommands) rmSync(join(f.clone, scriptOf(command)), { force: true }); rmSync(join(f.clone, 'scripts/guard-bash.mjs')); }
+    expect(stopCommands.length).toBeGreaterThan(0);
+    for (const command of stopCommands) {
+      const result = f.command(f.lane, command, { hook_event_name: 'Stop', stop_hook_active: false });
+      expect(result, command).toMatchObject({ status: 1, stdout: '', stderr: expect.stringContaining('stop guard skipped') });
+    }
+    expect(f.command(f.lane, bashCommand, {})).toMatchObject({ status: 2, stdout: '' });
   });
   it('ignores an env-selected launcher for every hook, including when the fixed launcher is missing', () => {
     const f = fixture(); const hostile = join(f.temp, 'hostile');
@@ -296,7 +445,7 @@ describe('configured settings wrappers executed via sh -c', () => {
     }
     rmSync(f.clone, {recursive:true, force:true});
     for (const command of commands) {
-      expect(f.command(f.lane,command,{})).toMatchObject({status:2, stdout:'', stderr:expect.stringContaining('launcher missing')});
+      expect(f.command(f.lane,command,{})).toMatchObject({status:isStop(command) ? 1 : 2, stdout:'', stderr:expect.stringContaining('launcher missing')});
     }
   });
   it('fails closed for missing clone, missing launcher, broken launcher and missing guard', () => {

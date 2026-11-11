@@ -1299,8 +1299,15 @@ Tests redirect that fixed location through a temporary `HOME`. The launcher deri
 from its own realpath and refuses locations other than `<clone>/scripts/hooks/run-pinned-guard.mjs`.
 The launcher requires a real regular file within the clone's `scripts/` tree (symlinks cannot
 escape), sets `WE_HOOK_ROOT` to the real cwd checkout toplevel, and preserves stdin, argv,
-cwd and guard exit codes. Missing clone, launcher, script or Git evidence fails closed with
-stderr and exit 2; settings map any nonzero launcher result to exit 2.
+cwd and guard exit codes. From a cwd outside Git (a dispatched worker's scratch directory),
+`WE_HOOK_ROOT` is the primary checkout beside the clone (`webeverything` or `web-everything`);
+with neither present the launcher denies. For `PreToolUse`, missing clone, launcher, script or
+Git evidence fails closed with stderr and exit 2, and the settings wrapper maps any nonzero
+launcher result to exit 2. `Stop` and `SubagentStop` use a separate wrapper
+(`exec node "$launcher" --stop-hook …`): exit 2 there means "keep going", so a launcher
+failure that would recur on every retry exits 1 (non-blocking, stderr shown), and the guard's
+own exit code passes through unchanged. `scripts/lib/pinned-hook-command.mjs` recognizes the
+two forms separately, and dispatch carries only the deny form as a `PreToolUse` guard.
 The hook never fetches. Sync freshness uses only `<clone>/.git/FETCH_HEAD` mtime;
 missing, unreadable, non-file, invalid or future-dated evidence denies execution. A last sync
 older than 24 hours fails closed with exit 2, the exact recovery command
@@ -1323,19 +1330,31 @@ move it aside and rerun sync to create the disposable clone. Never point this at
 checkout; all tracked edits and untracked/ignored files in the owned clone are discarded.
 Use an absolute origin URL/path so the scheduler and interactive invocations agree.
 
-Launcher execution and sync share a non-reclaiming sibling `.guard-lock` directory.
+Hooks matching one event run in parallel (six share the `Edit|Write` matcher), so launchers
+never exclude each other. Each launcher holds a shared lease, a
+`<clone>.guard-readers/<pid>-<nonce>` file, until its guard exits. Only sync takes the
+exclusive sibling `<clone>.guard-lock`, published in one rename with an `owner` record
+(`<pid> <nonce>`). A launcher that finds a live sync waits up to 20 seconds, then denies with
+"retry the hook". Sync takes its lock before it lists leases, and a launcher re-checks the
+lock after publishing its lease, so sync cannot reset a clone a guard is running from. After
+taking the lock, sync waits up to 20 seconds for live leases to drain, then refuses with
+"retry sync" without fetching, resetting or cleaning. Ownership is judged by process
+liveness, never by a timer: a lock or lease whose owner has exited (a hook killed on timeout
+or by SIGKILL) is ignored by launchers and reclaimed or pruned by the next sync, and the
+pristine and freshness checks still guard a clone a crashed sync left half-reset. Sync
+refuses on unrecognised lease entries rather than guessing. `WE_GUARD_LOCK_WAIT_MS` may only
+shorten either wait (tests use it); it can never lengthen it.
 The launcher canonicalizes the clone and guard entry path, passes the guard realpath as
 Node's `argv[1]`, and runs in place without a temporary copy. This keeps CLI entry checks
 working through symlinked HOME/TMPDIR paths (including macOS `/var` → `/private/var`).
-It retains the mutex until the guard exits so sync cannot reset/clean delayed imports.
 After the child exits, a changed or unreadable entry realpath fails closed with exit 2;
 repair the clone with `scripts/hooks/sync-guard-clone.mjs` before retrying.
-Both commands fail closed on lock contention and tell the operator to retry. Inspect an
-abandoned lock only after confirming its owner has stopped; never steal it on a timer.
 The named concurrent-sync regression pauses before a delayed import, removes that dependency
-in origin/main, verifies sync refuses while the guard is running, and verifies refresh
-succeeds after the original import finishes and the lock is released. Keep all coordination
-event-driven, without sleep/poll loops.
+in origin/main, verifies sync refuses while the guard's lease is live, and verifies refresh
+succeeds after the original import finishes and the lease is released. The named
+concurrent-hook regression starts every `Edit|Write` hook at once and requires each to report
+ready while all leases are held, then exit 0. Keep test coordination event-driven (stdout and
+stderr lines), without sleep/poll loops.
 
 For macOS scheduling, initialize the clone first, then copy
 `scripts/hooks/com.we.guard-main-sync.plist.template` to

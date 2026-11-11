@@ -1,8 +1,16 @@
 /** Run guards only from the clone containing this launcher at scripts/hooks/run-pinned-guard.mjs.
  * Preserve the operated checkout as WE_HOOK_ROOT; never fetch from a hook.
+ * Usage: run-pinned-guard.mjs [--stop-hook] scripts/<guard>.mjs [guard arguments...]
+ *
+ * Locking: hooks run in parallel (six share the Edit|Write matcher), so each launcher takes only a
+ * shared lease, a `<clone>.guard-readers/<pid>-<nonce>` file. Only sync takes the exclusive
+ * `<clone>.guard-lock`; it waits for live leases to drain before it changes the clone. A launcher
+ * waits a bounded time for a live sync. A lock or lease whose owner process has exited is ignored
+ * here and reclaimed by the next sync, so a killed process never wedges the hooks.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, realpathSync, rmdirSync, statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,9 +24,40 @@ function git(...args) {
   }).trim();
 }
 
-let lock;
+// Keep this bootstrap self-contained: importing a clone-local lock helper before taking the
+// lease would itself race with reset/clean. sync-guard-clone.mjs carries the same three helpers.
+const MAX_WAIT_MS = 20_000;
+/** WE_GUARD_LOCK_WAIT_MS may only shorten the wait (tests); it can never lengthen it. */
+function lockWaitMs() {
+  const value = Number(process.env.WE_GUARD_LOCK_WAIT_MS);
+  return process.env.WE_GUARD_LOCK_WAIT_MS !== undefined && Number.isFinite(value) && value >= 0
+    ? Math.min(value, MAX_WAIT_MS) : MAX_WAIT_MS;
+}
+function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+function alive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+/** True while a live sync process holds the exclusive lock. No record means no live owner. */
+function syncRunning(lockPath) {
+  let owner;
+  try { owner = readFileSync(join(lockPath, 'owner'), 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+    throw error;
+  }
+  return alive(Number(owner.split(' ')[0]));
+}
+
+const argv = process.argv.slice(2);
+// Stop and SubagentStop wrappers pass --stop-hook. There exit 2 means "keep going", and an
+// infrastructure failure would recur on every retry, so it exits 1 (non-blocking) instead.
+const stopHook = argv[0] === '--stop-hook';
+if (stopHook) argv.shift();
+const failureCode = stopHook ? 1 : 2;
+let lease;
 try {
-  const [script, ...args] = process.argv.slice(2);
+  const [script, ...args] = argv;
   if (!script?.startsWith('scripts/') || script.split('/').includes('..')) {
     throw new Error('expected a relative path inside scripts without ..');
   }
@@ -28,15 +67,32 @@ try {
       realpathSync(git('-C', clone, 'rev-parse', '--show-toplevel')) !== clone) {
     throw new Error('launcher must be located at <clone>/scripts/hooks/run-pinned-guard.mjs');
   }
-  // Keep this bootstrap self-contained: importing a clone-local lock helper
-  // before acquiring the lock would itself race with reset/clean.
   const lockPath = `${clone}.guard-lock`;
-  try { mkdirSync(lockPath); }
-  catch (error) {
-    if (error.code === 'EEXIST') throw new Error('guard clone is busy; retry the hook; inspect an abandoned .guard-lock only after confirming its owner has stopped');
-    throw error;
+  const readers = `${clone}.guard-readers`;
+  mkdirSync(readers, { recursive: true });
+  if (!lstatSync(readers).isDirectory()) throw new Error(`${readers} must be a real directory`);
+  const marker = join(readers, `${process.pid}-${randomBytes(6).toString('hex')}`);
+  const deadline = Date.now() + lockWaitMs();
+  let announced = false;
+  for (;;) {
+    if (!syncRunning(lockPath)) {
+      writeFileSync(marker, '', { flag: 'wx' });
+      lease = marker;
+      // Sync takes its lock before it lists leases, so re-checking after publishing ours
+      // means either sync sees this lease or this launcher sees sync's lock.
+      if (!syncRunning(lockPath)) break;
+      rmSync(marker, { force: true });
+      lease = undefined;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error('guard clone sync is in progress; retry the hook');
+    }
+    if (!announced) {
+      process.stderr.write('Pinned guard: waiting for guard clone sync to finish\n');
+      announced = true;
+    }
+    pause(50);
   }
-  lock = lockPath;
   const scripts = join(clone, 'scripts');
   const target = realpathSync(join(clone, script));
   const withinScripts = relative(scripts, target);
@@ -76,10 +132,10 @@ try {
   if (Date.now() - fetchTime > 24 * 60 * 60 * 1000) {
     throw new Error(`guard clone is stale: last sync was more than 24h ago (FETCH_HEAD mtime); ${syncHelp}`);
   }
-  const hookRoot = realpathSync(git('rev-parse', '--show-toplevel'));
+  const hookRoot = operatedRoot(clone);
   // Run the canonical entry point in place so Node's module URL and argv[1]
   // agree, including when HOME or TMPDIR contains symlinked path components.
-  // Retain the clone lock through execution to protect delayed imports from sync.
+  // Hold the lease through execution so sync cannot reset/clean delayed imports.
   const child = spawnSync(process.execPath, [target, ...args], {
     stdio: 'inherit', env: { ...env, WE_HOOK_ROOT: hookRoot },
   });
@@ -88,10 +144,29 @@ try {
   if (realpathSync(target) !== target) {
     throw new Error('guard entry path changed during execution; run scripts/hooks/sync-guard-clone.mjs before retrying');
   }
-  process.exitCode = child.status ?? 2;
+  process.exitCode = child.status ?? failureCode;
 } catch (error) {
-  process.stderr.write(`Pinned guard: cannot load dedicated clone guard; denying (exit 2): ${error.message}\n`);
-  process.exitCode = 2;
+  process.stderr.write(stopHook
+    ? `Pinned guard: cannot load dedicated clone guard; stop guard skipped (exit 1, non-blocking): ${error.message}\n`
+    : `Pinned guard: cannot load dedicated clone guard; denying (exit 2): ${error.message}\n`);
+  process.exitCode = failureCode;
 } finally {
-  if (lock) rmdirSync(lock);
+  if (lease) rmSync(lease, { force: true });
+}
+
+/** The cwd's checkout; from a non-Git scratch directory (a dispatched worker), the primary
+ * checkout beside the clone, which is where the legacy absolute-path hooks lived. */
+function operatedRoot(clone) {
+  try {
+    return realpathSync(git('rev-parse', '--show-toplevel'));
+  } catch (error) {
+    if (!/not a git repository/i.test(String(error.stderr ?? ''))) throw error;
+  }
+  for (const name of ['webeverything', 'web-everything']) {
+    const candidate = join(dirname(clone), name);
+    let top;
+    try { top = realpathSync(git('-C', candidate, 'rev-parse', '--show-toplevel')); } catch { continue; }
+    if (top === realpathSync(candidate)) return top;
+  }
+  throw new Error(`cwd is outside Git and no primary checkout exists at ${join(dirname(clone), 'webeverything')}`);
 }
