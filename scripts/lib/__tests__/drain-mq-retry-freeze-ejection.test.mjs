@@ -83,6 +83,11 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     expect(f.guard().hold).toBe(true);
   });
 
+  it('still holds a merge-gate with extra lines after the hold (mocha-style failure)', () => {
+    const f = fixture([gate('HOLD red-main-freeze main is RED (freeze: main CI red since ac12ebdb5)\n1 failing\nError: boom'), shard(1)], greenAtRemoval);
+    expect(f.guard().hold).toBe(true);
+  });
+
   it('still holds a merge-gate that mentions red-main-freeze but also reports a test failure', () => {
     const f = fixture([gate('HOLD red-main-freeze ... also: 2 tests failed, expected 1 to be 2'), shard(1)], greenAtRemoval);
     expect(f.guard().hold).toBe(true);
