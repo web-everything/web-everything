@@ -2,9 +2,10 @@
 bornAs: x660rls
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/lib/pr-state/holds/verdict.mjs", "we:scripts/conveyor/delegated-clear-human.mjs", "we:scripts/lib/verdict-ledger.mjs"]
 dateOpened: "2026-10-29"
+dateResolved: "2026-11-10"
 tags: []
 ---
 
