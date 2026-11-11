@@ -317,6 +317,11 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
       process.env.SOAK_TREE_ROOT = tree;
       const { violations } = await soakBreak.run();
       expect(violations).toContain('hook runs the lane-local script: node scripts/guard-stop-passive-wait.mjs');
+      // A command that only mentions the pinned launcher but runs the lane copy is still flagged.
+      const mention = `node scripts/guard-stop-passive-wait.mjs # $HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs`;
+      reverted.hooks[event][0].hooks[0].command = mention;
+      writeFileSync(join(tree, '.claude/settings.json'), JSON.stringify(reverted));
+      expect((await soakBreak.run()).violations).toContain(`hook runs the lane-local script: ${mention.slice(0, 80)}`);
       process.env.SOAK_TREE_ROOT = repo;
       expect((await soakBreak.run()).violations).toEqual([]);
     } finally {
@@ -336,7 +341,7 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     };
     const launcher = source('scripts/hooks/run-pinned-guard.mjs');
     const sync = source('scripts/hooks/sync-guard-clone.mjs');
-    for (const name of ['lockWaitMs', 'pause', 'processStart', 'alive']) {
+    for (const name of ['lockWaitMs', 'pause', 'processStart', 'alive', 'holderAlive']) {
       expect(helper(launcher, name), name).toBe(helper(sync, name));
     }
     expect(launcher).toContain('const MAX_WAIT_MS = 20_000;');

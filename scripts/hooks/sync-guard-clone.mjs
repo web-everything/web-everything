@@ -15,7 +15,8 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
 // Bootstrap uses only built-ins so a concurrent reset cannot rewrite a lock helper during
-// module loading. lockWaitMs, pause, processStart, alive and readRecord match run-pinned-guard.mjs.
+// module loading. lockWaitMs, pause, processStart, alive and holderAlive match run-pinned-guard.mjs
+// (a test keeps the copies identical).
 const MAX_WAIT_MS = 20_000;
 /** WE_GUARD_LOCK_WAIT_MS may only shorten the wait (tests); it can never lengthen it. */
 export function lockWaitMs() {
@@ -98,13 +99,27 @@ export function reclaim(lockPath, judged, record, { beforeRemove = () => {} } = 
   }
   try {
     if (readRecord(lockPath) !== judged) return;
-    beforeRemove();
     if (judged === LEGACY) {
-      // rmdir removes only an empty directory, never a lock file published meanwhile.
+      // Directory locks: the mkdir lock (empty) and an earlier revision of this lock, which
+      // kept its record in `<lock>/owner`. A live owner there still holds the clone.
+      const ownerFile = join(lockPath, 'owner');
+      let inner = '';
+      try { inner = readRecord(ownerFile); } catch (error) { if (error.code !== 'ENOTDIR') throw error; }
+      if (holderAlive(inner)) throw new Error('guard clone is busy: another sync is running; retry sync');
+      beforeRemove();
+      try { rmSync(ownerFile, { force: true }); } catch (error) { if (error.code !== 'ENOTDIR') throw error; }
+      // rmdir removes only a directory, never a lock file published meanwhile.
       try { rmdirSync(lockPath); }
-      catch (error) { if (!['ENOENT', 'ENOTDIR', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; }
+      catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return;
+        if (error.code === 'ENOTEMPTY' || error.code === 'EEXIST') {
+          throw new Error(`an abandoned lock directory holds unexpected entries; confirm no sync is running, then remove ${lockPath}`);
+        }
+        throw error;
+      }
       return;
     }
+    beforeRemove();
     const aside = `${lockPath}.stale-${nonce()}`;
     try { renameSync(lockPath, aside); }
     catch (error) { if (error.code === 'ENOENT') return; throw error; }

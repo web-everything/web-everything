@@ -30,7 +30,7 @@ function git(...args) {
 
 // Keep this bootstrap self-contained: importing a clone-local lock helper before taking the
 // lease would itself race with reset/clean. lockWaitMs, pause, processStart, alive and
-// readRecord match sync-guard-clone.mjs.
+// holderAlive match sync-guard-clone.mjs (a test keeps the copies identical).
 const MAX_WAIT_MS = 20_000;
 /** WE_GUARD_LOCK_WAIT_MS may only shorten the wait (tests); it can never lengthen it. */
 function lockWaitMs() {
@@ -70,6 +70,10 @@ function syncRunning(lockPath) {
     if (error.code === 'ENOENT' || error.code === 'EISDIR') return false;
     throw error;
   }
+  return holderAlive(record);
+}
+function holderAlive(record) {
+  if (typeof record !== 'string' || !record) return false;
   const [pid, started] = record.trim().split(' ').map(Number);
   return alive(pid, started);
 }

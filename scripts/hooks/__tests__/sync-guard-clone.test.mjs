@@ -225,6 +225,32 @@ console.log(revision);
     expect(existsSync(lock)).toBe(false);
     expect(readdirSync(temp)).toEqual([]);
   });
+  it('reclaims a lock directory from an earlier revision only when its owner record is dead', () => {
+    const temp = realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'guard-reclaim-'))); temps.push(temp);
+    const lock = join(temp, 'clone.guard-lock');
+    const record = `${process.pid} 0 reclaimer\n`;
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner'), `${process.pid} other\n`);
+    expect(() => reclaim(lock, LEGACY, record)).toThrow('another sync is running');
+    expect(readFileSync(join(lock, 'owner'), 'utf8')).toContain('other');
+    writeFileSync(join(lock, 'owner'), `${deadPid()} crashed\n`);
+    reclaim(lock, LEGACY, record);
+    expect(existsSync(lock)).toBe(false);
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'unexpected'), '');
+    expect(() => reclaim(lock, LEGACY, record)).toThrow(`then remove ${lock}`);
+    expect(existsSync(join(lock, 'unexpected'))).toBe(true);
+    expect(readdirSync(temp)).toEqual(['clone.guard-lock']);
+  });
+  it('a sync recovers from a dead earlier-revision lock directory', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const lock = `${f.clone}.guard-lock`;
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner'), `${deadPid()} crashed\n`);
+    const result = f.run();
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(lock)).toBe(false);
+  });
   it('serialises reclaim: a live reclaimer blocks a second one, which leaves the lock where it is', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
     const lock = `${f.clone}.guard-lock`;

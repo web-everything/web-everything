@@ -1351,8 +1351,10 @@ live. Launchers ignore an exited owner's lock (and an old-protocol lock director
 sync reclaims it and prunes exited leases, and the pristine and freshness checks still guard a
 clone a crashed sync left half-reset. Reclaim is serialised behind `<clone>.guard-lock.reclaim`
 and removes only an existing record judged dead: a lock observed absent is never reclaimed
-(a peer may publish at any moment after that read), and an old-protocol directory is removed
-with `rmdir`, which cannot remove a lock file published meanwhile. An abandoned reclaim marker
+(a peer may publish at any moment after that read). An old-protocol directory (the empty mkdir
+lock, or an earlier revision's directory holding an `owner` record) is reclaimed only when that
+record is absent or dead, by unlinking `owner` and then `rmdir`, which cannot remove a lock file
+published meanwhile; a directory with other entries is refused and named. An abandoned reclaim marker
 (a sync killed inside that few-millisecond step) makes sync refuse and name the marker to
 remove. Sync sweeps staging and aside debris left by exited syncs, and ignores entries in
 `.guard-readers` that are not `<pid>-<hex>` leases. A launcher killed outright orphans its

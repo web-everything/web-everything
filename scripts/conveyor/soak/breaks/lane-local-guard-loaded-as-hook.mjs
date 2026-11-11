@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pinnedHookScript, pinnedStopHookScript } from '../../../lib/pinned-hook-command.mjs';
 
 const GUARD = /scripts\/(guard-[\w-]+|lint-[\w-]+|check-memory|backlog-guard)\.mjs/;
 const SECURITY_EVENTS = ['PreToolUse', 'Stop', 'SubagentStop'];
@@ -20,15 +21,16 @@ export default {
     const violations = [];
     const settings = JSON.parse(readFileSync(join(root, '.claude/settings.json'), 'utf8'));
     // Every security event is pinned, not only PreToolUse (PostToolUse hooks are advisory).
-    const groups = SECURITY_EVENTS.flatMap((event) => settings.hooks?.[event] ?? []);
     if (!SECURITY_EVENTS.every((event) => (settings.hooks?.[event] ?? []).length)) {
       violations.push('a security hook event (PreToolUse, Stop or SubagentStop) has no hooks to inspect');
     }
-    for (const group of groups) {
-      for (const hook of group.hooks ?? []) {
-        const cmd = hook.command ?? '';
-        if (GUARD.test(cmd) && !cmd.includes('.guard-main/scripts/hooks/run-pinned-guard.mjs')) {
-          violations.push(`hook runs the lane-local script: ${cmd.slice(0, 80)}`);
+    for (const event of SECURITY_EVENTS) {
+      // The exact committed wrapper for the event, not a command that merely mentions the launcher.
+      const pinned = event === 'PreToolUse' ? pinnedHookScript : pinnedStopHookScript;
+      for (const group of settings.hooks?.[event] ?? []) {
+        for (const hook of group.hooks ?? []) {
+          const cmd = hook.command ?? '';
+          if (GUARD.test(cmd) && !pinned(cmd)) violations.push(`hook runs the lane-local script: ${cmd.slice(0, 80)}`);
         }
       }
     }
