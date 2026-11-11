@@ -324,7 +324,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
                 const first = idleStamp(entry.file, entry.key, sampledAt);
                 if (sampledAt - first < idleConfirmMs) continue;
               }
-            } else if (!evidence.complete || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
+            } else if (!(evidence.complete || boundedOrphan(evidence, sampledAt, diedBy)) || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
             // dispatch marker is ever lost, whatever the timing and without any lease or lock.
@@ -341,6 +341,16 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
       return reaped;
     },
   };
+}
+
+// A run-less marker's owner died before it learned its run id. On a busy Forge the active-run count is never zero for long,
+// so count-only proof leaked the marker for good (a dozen of them walled off the cap while Forge sat idle). Any run that
+// owner could have started began before it died, and no admitted run outlives the admission run ceiling, so once the
+// sample is a full ceiling (plus skew) past the first-seen-dead stamp, the active runs cannot be it. Needs Forge's
+// authoritative activeRunIds (byIds); `maybeOwnsInflight` still guards any unfinished receipt inside the window.
+export const ORPHAN_RUN_BOUND_MS = 120 * 60_000; // = heavy-admission DEFAULT_ADMISSION_CEILING_MS
+function boundedOrphan(evidence, sampledAt, diedBy) {
+  return evidence.byIds === true && sampledAt - diedBy >= ORPHAN_RUN_BOUND_MS + CLOCK_SKEW_MS;
 }
 
 // A run-less marker's run could only have started between dispatch and owner death; Forge timestamps can skew either way.
