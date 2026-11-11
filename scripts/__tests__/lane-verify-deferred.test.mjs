@@ -105,3 +105,13 @@ describe('ready-to-merge needs a green CI test check on the exact sha', () => {
     [null],
   ])('refuses %j', (v) => { expect(ciTestGreenOnSha(v, SHA)).toBe(false); });
 });
+
+describe('wiring (source pins)', () => {
+  const { readFileSync } = require('node:fs');
+  it('only pr-land and verify-lane reference the deferred module; the open path refuses land mode', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const out = execFileSync('git', ['grep', '-l', 'lane-verify-deferred', '--', 'scripts', ':!scripts/__tests__'], { encoding: 'utf8' }).split('\n').filter(Boolean).sort();
+    expect(out).toEqual(['scripts/lib/lane-verify-deferred.mjs', 'scripts/pr-land.mjs', 'scripts/verify-lane.mjs'].sort());
+    expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/mode: PLAN\.mode/);
+  });
+});

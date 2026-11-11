@@ -72,6 +72,7 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { recordTerminalVerifyOutcome, clearDeferredMarker } from './lib/lane-verify-deferred.mjs'; // R893 — own file; no other marker reader can see it
 import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
@@ -318,6 +319,7 @@ if (MODE === 'reset') {
     );
   }
   unlinkSync(MARKER);
+  clearDeferredMarker(GIT_DIR);
   const desc = record && !record.corrupt ? `${record.status || 'stranded'} marker for ${String(record.sha || '?').slice(0, 8)}` : 'a corrupt marker';
   emit({ sha: headSha, status: 'reset', reason: 'cleared', detail: `cleared ${desc} — ${MARKER} removed.` }, 0);
 }
@@ -1100,6 +1102,8 @@ const finished = verifyFinishBody(startBody, {
 });
 writeMarker({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
+// R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
+try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 
