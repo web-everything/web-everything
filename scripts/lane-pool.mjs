@@ -3218,14 +3218,20 @@ function assertNoUnpushedLaneWork(repo, chosen) {
 /** Park abandoned commits on the canonical remote before recycling a free lane. An exclusive lease spans
  *  the evidence read, every push + SHA verification, and the normal acquire reset. No live holder is touched.
  *  Unknown evidence fails closed: restore/inspect the lane manually, then retry salvage-unpushed. */
-async function salvageUnpushed(repo, { dryRun = false, refBase = (n, stamp) => `lane/salvage-lane-${n}-${stamp}-parked` } = {}) {
+async function salvageUnpushed(repo, { lanes = existingLanes(repo), dryRun = false, refBase = (n, stamp) => `lane/salvage-lane-${n}-${stamp}-parked` } = {}) {
   if (flags['no-reset'] || flags.base || flags.force || flags.reserve) throw new Error('salvage-unpushed requires the normal reset (no --no-reset, --base, --force or --reserve)');
   let failed = false;
-  for (const n of existingLanes(repo)) {
+  for (const n of lanes) {
     const dir = laneDir(repo, n);
     if (liveLease(dir, Date.now(), ttlMsFromFlags())) continue;
     let claim = null;
     try {
+      const assertLiveness = () => {
+        const liveness = laneLivenessGate({ dir, ignoreLeaseSession: claim?.session });
+        if (liveness.eligible !== true) throw new Error(`liveness refused: ${liveness.reason || 'unknown evidence'}`);
+      };
+      // Check the original holder before replacing a stale lease; an expired lease can still have a live owner.
+      assertLiveness();
       if (!dryRun) {
         const session = `salvage-unpushed-${process.pid}-${randomBytes(4).toString('hex')}`;
         if (!tryClaimLane(dir, session, Date.now(), ttlMsFromFlags())) continue;
@@ -3251,6 +3257,7 @@ async function salvageUnpushed(repo, { dryRun = false, refBase = (n, stamp) => `
         log(`salvage-unpushed lane-${n}: would push and verify ${refs.map(({ ref, sha }) => `${ref}=${sha}`).join(', ')}, then reset and clear stash`);
         continue;
       }
+      assertLiveness();
       const io = realSalvageIo({ repo, preflightLaneDir: dir });
       for (const { ref, sha } of refs) {
         // Refuse known collisions early; the create-only push also closes the race after this inspection.
@@ -3268,6 +3275,7 @@ async function salvageUnpushed(repo, { dryRun = false, refBase = (n, stamp) => `
       assertSalvageLease();
       const current = releaseLocalWorkTips(dir);
       if (!current || JSON.stringify(current) !== JSON.stringify(local)) throw new Error('local tips changed during salvage; no reset');
+      assertLiveness();
       journalLaneEvent(dir, { action: 'salvage-verified', reason: `all ${refs.length} remote refs verified before reset`, salvagedTo: base });
       provisionClaimedLane(repo, n, false, { beforeDestructiveStep: assertSalvageLease });
       assertSalvageLease();
@@ -5469,26 +5477,45 @@ async function cmdGc(repo) {
   // below still handles it by its own preservation path — so a per-lane refusal must not flip gc's exit status
   // (gc exited 0 before salvage joined it). A thrown error (bad flags) still fails the run.
   // Preserve GC recovery's established salvage namespace while covering every branch and stash tip.
-  const salvage = async () => { try { const prior = process.exitCode; const ok = await salvageUnpushed(repo, { dryRun: !!flags['dry-run'], refBase: n => salvageRefName(n, new Date()) }); process.exitCode = prior; return ok; } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
+  const salvage = async (lanes) => { try { const prior = process.exitCode; const ok = await salvageUnpushed(repo, { lanes, dryRun: !!flags['dry-run'], refBase: n => salvageRefName(n, new Date()) }); process.exitCode = prior; return ok; } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
   const heal = () => { try { healSiblings(repo); } catch (e) { log(`heal-siblings skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); } };
-  const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
-  const recover = async () => {
+  const pass = () => {
+    const lanes = existingLanes(repo);
+    const admitted = new Set();
+    const result = scheduledLaneGc(lanes.map(n => laneDir(repo, n)), {
+      log, interactive: !flags.watch && !!process.stdin.isTTY,
+      // Only successful GC executions have passed the shared lock, per-lane schedule and host-load gates.
+      exec: (file, args, options) => {
+        const output = execFileSync(file, args, options);
+        admitted.add(options.cwd);
+        return output;
+      },
+    });
+    return { ...result, lanes: lanes.filter(n => admitted.has(laneDir(repo, n))) };
+  };
+  const recover = async (lanes) => {
     if (!recoveryEnabled()) return;
     if (!repo.originUrl) {
       log('gc recovery skipped: canonical origin unresolved — pass --origin=<url> or --reference=<primary-checkout>');
       return;
     }
-    try { await recoverRepoPool(repo); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
+    try { await recoverRepoPool(repo, lanes); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   };
-  if (!flags.watch) { heal(); await salvage(); const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
+  const maintain = async () => {
+    const result = pass();
+    // Partial/unknown passes refuse recovery too; never act on a lane whose own schedule did not admit.
+    if (result.ran && !result.reason) {
+      heal();
+      if (recoveryEnabled()) { await salvage(result.lanes); await recover(result.lanes); }
+    }
+    return result;
+  };
+  if (!flags.watch) { const result = await maintain(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); return; }
   const tick = async () => {
     let interval = 60000; // unreadable policy refuses the pass, then retries policy later
     try {
       interval = loadHostOverloadSettings({ log }).settings.lanes.gc.schedule;
-      heal();
-      await salvage();
-      const result = pass();
-      if (result.ran) await recover();
+      await maintain();
     } catch (e) { log(`gc skipped: ${e.message}`); }
     setTimeout(tick, Math.min(interval, 2147483647));
   };

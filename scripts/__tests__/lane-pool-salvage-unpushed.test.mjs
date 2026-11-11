@@ -1,6 +1,7 @@
 import { beforeEach, afterEach, describe, it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -18,7 +19,7 @@ const commit = (dir, value) => {
   return git(['rev-parse', 'HEAD'], dir);
 };
 const events = () => readFileSync(join(root, 'git-log'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
-const refs = () => git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/lane/'], origin);
+const refs = () => git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/lane/', 'refs/heads/salvage/'], origin);
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'lane-salvage-'));
@@ -67,7 +68,25 @@ if (result.status === 0 && process.cwd() === process.env.TEST_LEASE_LANE
 }
 process.exit(result.status ?? 1);
 `, { mode: 0o755 });
-  env = { ...process.env, PATH: bin + ':' + process.env.PATH, LANE_POOL_ROOT: pool,
+  // Private host state and deterministic liveness probes; no workstation agents or locks are touched.
+  const preload = join(root, 'host.cjs');
+  writeFileSync(preload, `const os = require('node:os');
+const userInfo = os.userInfo;
+os.userInfo = () => ({ ...userInfo(), homedir: process.env.TEST_HOST_HOME });
+require('node:module').syncBuiltinESMExports();
+if (process.env.TEST_WATCH_ONCE) global.setTimeout = () => {};`);
+  writeFileSync(join(bin, 'claude'), `#!${process.execPath}
+if (process.env.TEST_AGENTS === 'unknown') process.exit(1);
+process.stdout.write(process.env.TEST_AGENTS || '[]');`, { mode: 0o755 });
+  writeFileSync(join(bin, 'lsof'), `#!${process.execPath}
+if (process.env.TEST_CWDS === 'unknown') process.exit(1);
+if (process.env.TEST_LIVE_AFTER_PUSH && require('node:fs').readFileSync(process.env.TEST_GIT_LOG, 'utf8').includes('\"push\"')) {
+  process.stdout.write('p999999\\nn' + process.env.TEST_LIVE_AFTER_PUSH + '\\n'); process.exit(0);
+}
+process.stdout.write(process.env.TEST_CWDS || '');`, { mode: 0o755 });
+  env = { ...process.env, NODE_OPTIONS: `--require=${preload}`, TEST_HOST_HOME: root,
+    VITEST: 'true', WE_TEST_HOST_LOAD1: '0', WE_TEST_HOST_MEMORY_MB: '999999',
+    WE_HOST_CAPACITY_SIGNAL: 'load', WE_LANE_SALVAGE_QUIET_MIN: '0', PATH: bin + ':' + process.env.PATH, LANE_POOL_ROOT: pool,
     TEST_GIT_LOG: join(root, 'git-log'), LANE_POOL_AUTO_RECOVER: '0', LANE_POOL_NO_RECOVER: '1' };
   common = [`--origin=${origin}`, `--reference=${primary}`, '--name=salvage-test', '--branch=main', '--no-install'];
   const provision = run('provision', ['--count=2']);
@@ -79,6 +98,114 @@ process.exit(result.status ?? 1);
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('lane-pool salvage-unpushed', () => {
+  const assertKept = sha => {
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(sha);
+    expect(refs()).toBe('');
+    expect(events().some(e => e.args.includes('push') || e.args.includes('reset')
+      || (e.args.includes('checkout') && e.args.includes('-B'))
+      || (e.args.includes('stash') && e.args.includes('clear')))).toBe(false);
+  };
+
+  it.each(['absent', 'expired'].flatMap(lease =>
+    ['agent', 'cwd', 'recent', 'unknown agents', 'unknown cwds'].map(signal => [lease, signal])))
+  ('refuses %s lease salvage with %s liveness evidence and asks for manual inspection', (lease, signal) => {
+    const sha = commit(lane, 'still in use');
+    if (lease === 'expired') writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify({
+      session: 'old', acquiredAt: '2000-01-01T00:00:00.000Z',
+    }));
+    const extra = signal === 'agent' ? { TEST_AGENTS: JSON.stringify([{ cwd: lane, state: 'running' }]) }
+      : signal === 'cwd' ? { TEST_CWDS: `p${process.pid}\nn${lane}\n` }
+      : signal === 'recent' ? { WE_LANE_SALVAGE_QUIET_MIN: '30' }
+      : signal === 'unknown agents' ? { TEST_AGENTS: 'unknown' } : { TEST_CWDS: 'unknown' };
+    const result = run('salvage-unpushed', [], extra);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/liveness.*inspect manually/);
+    assertKept(sha);
+  });
+
+  it('refuses an expired lease whose owner session is still live outside the lane', () => {
+    const sha = commit(lane, 'live expired owner');
+    writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify({
+      session: 'old', acquiredAt: '2000-01-01T00:00:00.000Z',
+    }));
+    const result = run('salvage-unpushed', [], { TEST_AGENTS: JSON.stringify([{ sessionId: 'old', cwd: primary }]) });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/liveness.*inspect manually/);
+    expect(JSON.parse(readFileSync(join(lane, '.git', '.lane-lease'), 'utf8')).session).toBe('old');
+    assertKept(sha);
+  });
+
+  it('rechecks liveness after pushing and refuses reset if a process has entered the lane', () => {
+    const sha = commit(lane, 'late live process');
+    const result = run('salvage-unpushed', [], { TEST_LIVE_AFTER_PUSH: lane });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/liveness.*inspect manually/);
+    expect(refs()).toContain(sha);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(sha);
+    expect(events().some(e => e.args.includes('checkout') && e.args.includes('-B'))).toBe(false);
+  });
+
+  it.each([
+    { TEST_WATCH_ONCE: '1', LANE_POOL_AUTO_RECOVER: '0', LANE_POOL_NO_RECOVER: '0' },
+    { TEST_WATCH_ONCE: '1', LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '1' },
+    { LANE_POOL_AUTO_RECOVER: '0', LANE_POOL_NO_RECOVER: '0' },
+    { LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '1' },
+  ])('gc honours the recovery opt-out %j', extra => {
+    const sha = commit(lane, 'opt out');
+    const result = run('gc', extra.TEST_WATCH_ONCE ? ['--watch'] : [], extra);
+    expect(result.status, result.stderr).toBe(0);
+    if (!extra.TEST_WATCH_ONCE) expect(result.stderr).toContain('gc: pass completed');
+    assertKept(sha);
+  });
+
+  it.each(['lock', 'schedule', 'load', 'unknown load', 'unknown cursor', 'watch load'])
+  ('gc performs no salvage when admission refuses %s', refusal => {
+    const sha = commit(lane, 'admission refused');
+    const state = join(root, '.cache', 'we-host-overload');
+    mkdirSync(state, { recursive: true });
+    if (refusal === 'lock') writeFileSync(join(state, 'gc.lock'), `${process.pid}\n`);
+    if (refusal === 'schedule') {
+      const cursor = Object.fromEntries([1, 2].map(n => [createHash('sha256')
+        .update(join(pool, 'salvage-test', `lane-${n}`)).digest('hex'), Date.now()]));
+      writeFileSync(join(state, 'gc-cursor.json'), JSON.stringify(cursor));
+    }
+    if (refusal === 'unknown cursor') writeFileSync(join(state, 'gc-cursor.json'), '{');
+    const result = run('gc', refusal === 'watch load' ? ['--watch'] : [], { LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '0',
+      ...(refusal === 'watch load' ? { TEST_WATCH_ONCE: '1', WE_TEST_HOST_LOAD1: '999999' } : {}),
+      ...(refusal === 'load' ? { WE_TEST_HOST_LOAD1: '999999' }
+        : refusal === 'unknown load' ? { WE_TEST_HOST_LOAD1: 'unknown' } : {}),
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain('gc: pass completed');
+    assertKept(sha);
+  });
+
+  it('gc leaves a lane whose schedule is not due intact when another lane admits', () => {
+    const sha = commit(lane, 'not due');
+    const state = join(root, '.cache', 'we-host-overload');
+    mkdirSync(state, { recursive: true });
+    const key = createHash('sha256').update(lane).digest('hex');
+    writeFileSync(join(state, 'gc-cursor.json'), JSON.stringify({ [key]: Date.now() }));
+    const result = run('gc', [], { LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '0' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('gc: pass completed');
+    // Only the not-due lane must be untouched; the admitting lane-2 is recycled normally.
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(sha);
+    expect(refs()).toBe('');
+    expect(events().some(e => e.cwd === lane && (e.args.includes('push') || e.args.includes('reset')
+      || (e.args.includes('checkout') && e.args.includes('-B'))
+      || (e.args.includes('stash') && e.args.includes('clear'))))).toBe(false);
+  });
+
+  it('gc salvages only after an admitted pass with recovery enabled', () => {
+    const sha = commit(lane, 'admitted salvage');
+    const result = run('gc', [], { LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '0' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(refs()).toContain(sha);
+    const log = events();
+    expect(log.findIndex(e => e.args.includes('gc'))).toBeLessThan(log.findIndex(e => e.args.includes('push')));
+  });
+
   it.each(['unpushed', 'unreadable'])('explicit acquire refuses %s preservation evidence with unpublished main off HEAD', evidence => {
     const sha = commit(lane, 'unpublished main');
     git(['checkout', '-b', 'clean-head', 'origin/main'], lane);
