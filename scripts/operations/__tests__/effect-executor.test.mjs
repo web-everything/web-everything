@@ -19,6 +19,7 @@ import { describe, it, expect } from 'vitest';
 
 import { advance, advanceWhileRunning, runStatus, startRun } from '../engine.mjs';
 import { LEDGER_EFFECT_TYPE, applyPendingEffects, createEffectExecutor, inFlight, inFlightEntries, notApplied, resolveInFlight } from '../effect-executor.mjs';
+import * as effectExecutor from '../effect-executor.mjs';
 import { createMemoryRunStore, createFileRunStore } from '../run-store.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -55,6 +56,53 @@ function recordingSinks({ fail = null, certain = true } = {}) {
   };
   return { calls, sinks: { 'comment.post': make('comment.post'), 'label.swap': make('label.swap') } };
 }
+
+describe('permanent guard refusals', () => {
+  it('exports isPermanentGuardRefusal and requires BOTH notApplied and the SELF-CLEAR REFUSED marker', () => {
+    expect(effectExecutor.isPermanentGuardRefusal).toBeTypeOf('function');
+    expect(effectExecutor.isPermanentGuardRefusal(notApplied('guard: SELF-CLEAR REFUSED — author cannot clear'))).toBe(true);
+    expect(effectExecutor.isPermanentGuardRefusal(notApplied('connection refused before writing'))).toBe(false);
+    expect(effectExecutor.isPermanentGuardRefusal(new Error('SELF-CLEAR REFUSED — outcome unknown'))).toBe(false);
+    expect(effectExecutor.isPermanentGuardRefusal(null)).toBe(false);
+    expect(effectExecutor.isPermanentGuardRefusal(undefined)).toBe(false);
+  });
+
+  it.each([false, true])('persists a permanent refusal and halts before later effects (dispatch: %s)', async (dispatch) => {
+    const r = createRegistry();
+    r.register(op('guard-refusal', {
+      go: effect({ effects: () => [
+        { type: 'guard.clear', dispatch },
+        { type: 'note.write' },
+      ] }),
+    }));
+    const store = createMemoryRunStore();
+    const run = advance(startRun({ op: 'guard-refusal', id: 'run-guard', registry: r }), { registry: r });
+    store.write(run);
+    const calls = [];
+    const error = notApplied('guard: SELF-CLEAR REFUSED — author cannot clear');
+    const outcome = await applyPendingEffects(run, { store, sinks: {
+      'guard.clear': async () => { calls.push('guard.clear'); throw error; },
+      'note.write': async () => { calls.push('note.write'); },
+    } });
+
+    expect(calls).toEqual(['guard.clear']);
+    expect(outcome.error).toBe(error);
+    expect(outcome.applied).toEqual([]);
+    expect(outcome.halted).toMatchObject({ key: 'run-guard#0#0', status: 'refused', error: error.message });
+    expect(outcome.run.effects.map((e) => e.status)).toEqual(['refused', 'declared']);
+    expect(store.read(run.id).effects).toEqual(outcome.run.effects);
+
+    // A restart preserves the refusal even when its sink is no longer registered.
+    const replay = await applyPendingEffects(store.read(run.id), { store, sinks: {
+      'note.write': async () => { calls.push('note.write'); },
+    } });
+    expect(replay.run).toEqual(outcome.run);
+    expect(replay.halted).toEqual(outcome.halted);
+    expect(replay.error.message).toBe(error.message);
+    expect(replay.applied).toEqual([]);
+    expect(calls).toEqual(['guard.clear']);
+  });
+});
 
 describe('the happy path', () => {
   it('applies every declared effect in declared order and lets the run complete', async () => {

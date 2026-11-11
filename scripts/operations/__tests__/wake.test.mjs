@@ -9,14 +9,14 @@
  * is injected.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import { createWakeObservers } from '../wake.mjs';
 import { createDispatchObservers } from '../dispatch-lane-io.mjs';
 import { createExploreObservers } from '../explore-io.mjs';
 
 import { advanceWhileRunning, runStatus, startRun } from '../engine.mjs';
-import { applyPendingEffects, inFlight, inFlightEntries } from '../effect-executor.mjs';
+import { applyPendingEffects, inFlight, inFlightEntries, notApplied } from '../effect-executor.mjs';
 import { createEffectObserver, observeRun, planObservations, OBSERVATIONS, SKIPS } from '../effect-observer.mjs';
 import { hoursStuck, isParkedOnDispatch, renderPass, stuckPast, wakePass, wakeRun, STUCK_ESCALATION_HOURS } from '../wake.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
@@ -783,5 +783,76 @@ describe('the observer table the CLI actually runs', () => {
     for (const [key, observer] of Object.entries(createWakeObservers())) {
       expect(typeof observer, `observer for ${key}`).toBe('function');
     }
+  });
+});
+
+// A PERMANENT GUARD REFUSAL AFTER A RESOLVED DISPATCH (PR #6584 red-team). driveRun hands a refusal to advance
+// so the engine settles the run refused; the waker used to exit on outcome.error before advancing, leaving
+// statuses applied/refused with pending still set: awaiting-effect forever, every later wake a no-op.
+describe('wakeRun settles a permanent guard refusal exactly as driveRun does', () => {
+  const REFUSE_OP = 'fx-wake-refuse';
+  const refuseRegistry = () => {
+    const r = createRegistry();
+    r.register(op(REFUSE_OP, {
+      input: { pr: { type: 'number', required: true } },
+      go: effect({
+        reads: ['input.pr'],
+        effects: () => [
+          { type: 'start.build', payload: {}, dispatch: true },
+          { type: 'guard.check', payload: {} },
+        ],
+      }),
+    }));
+    return r;
+  };
+  const sinksFor = (guard) => ({ 'start.build': SINKS['start.build'], 'guard.check': guard });
+  const observers = { 'start.build': async () => ({ status: 'succeeded', result: { exit: 0 } }) };
+  const REFUSAL = 'guard: SELF-CLEAR REFUSED — author cannot clear';
+
+  async function parkedRefuse(guard) {
+    const reg = refuseRegistry();
+    const store = createMemoryRunStore();
+    let run = advanceWhileRunning(startRun({ op: REFUSE_OP, id: 'run-r', input: { pr: 7 }, registry: reg }), { registry: reg });
+    store.write(run);
+    run = (await applyPendingEffects(run, { sinks: sinksFor(guard), store })).run;
+    expect(run.effects[0].status).toBe('in-flight');
+    return { run, store, reg };
+  }
+
+  it('advances to a terminal refused outcome, and a second wake leaves the settled run alone', async () => {
+    const guard = async () => { throw notApplied(REFUSAL); };
+    const { run, store, reg } = await parkedRefuse(guard);
+
+    const report = await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(report.advanced).toBe(true);
+    expect(report.status).toBe('complete');
+    // Not silent: the refusal is reported once so the wake CLI exits non-zero, as driveRun's effect-refused does.
+    expect(report.errors.map((e) => e.error)).toEqual([REFUSAL]);
+    const saved = store.read('run-r');
+    expect(saved.outcome).toBe('refused');
+    expect(saved.pending).toBeNull();
+    expect(saved.effects.map((e) => e.status)).toEqual(['applied', 'refused']);
+
+    const again = await wakeRun(saved, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(again.status).toBe('complete');
+    expect(again.errors).toEqual([]);
+    expect(store.read('run-r').outcome).toBe('refused');
+  });
+
+  it('never re-invokes the refused guard on a later wake', async () => {
+    const guard = vi.fn(async () => { throw notApplied(REFUSAL); });
+    const { run, store, reg } = await parkedRefuse(guard);
+    await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    await wakeRun(store.read('run-r'), { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(guard).toHaveBeenCalledTimes(1);
+  });
+
+  it('an ordinary (non-permanent) failure still stops the pass and reports the error, unchanged', async () => {
+    const guard = async () => { throw new Error('network down'); };
+    const { run, store, reg } = await parkedRefuse(guard);
+    const report = await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(report.errors.map((e) => e.error)).toEqual(['network down']);
+    expect(store.read('run-r').outcome ?? null).toBeNull();
+    expect(report.status).toBe('awaiting-effect');
   });
 });

@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/__tests__/cli-adapter-prefilled-seats.test.mjs", "we:scripts/operations/__tests__/parallel-judges.test.mjs", "we:scripts/operations/parallel-judges.mjs", "we:scripts/lib/judge-spawn.mjs", "we:scripts/lib/__tests__/judge-spawn.test.mjs", "we:scripts/operations/run-record.mjs", "we:scripts/operations/__tests__/run-record.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-stderr-redaction.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
+scope: ["we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/__tests__/cli-adapter.test.mjs", "we:scripts/operations/__tests__/cli-adapter-prefilled-seats.test.mjs", "we:scripts/operations/__tests__/parallel-judges.test.mjs", "we:scripts/operations/parallel-judges.mjs", "we:scripts/lib/judge-spawn.mjs", "we:scripts/lib/__tests__/judge-spawn.test.mjs", "we:scripts/operations/run-record.mjs", "we:scripts/operations/__tests__/run-record.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-stderr-redaction.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-10-10"
 preparedDate: "2026-11-10"
 preparedAgainstSha: "ce706a2fc3b067b52890c3893fa247b034d47100"

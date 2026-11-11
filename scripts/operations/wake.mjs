@@ -129,12 +129,22 @@ export async function wakeRun(run, { observers, store, registry, sinks = {}, now
         // `auto`, because this is the timer. The distinction is the whole point of recording it.
         const outcome = await applyPendingEffects(current, { sinks, store, attemptedBy: 'auto' });
         current = outcome.run;
-        if (outcome.error) { report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) }); break; }
+        // A permanent guard refusal is a settled fact, not a halt: it must reach `advance` so the engine ends the
+        // run `refused`, exactly as `driveRun` does. Breaking here left it awaiting-effect forever.
+        if (outcome.error && outcome.halted?.status !== 'refused') { report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) }); break; }
         // Parked again on a NEW dispatch — a legitimate outcome, and the next pass picks it up.
         if (outcome.inFlight && outcome.inFlight.length) break;
         // ADVANCE, do not loop back. `applyPendingEffects` does not clear `pending` — only `advance` does — so
         // re-entering the effect branch would apply nothing and spin to the turn cap.
-        current = advance(current, { registry });
+        const settled = advance(current, { registry });
+        // A refusal is reported ONCE, here: the run is terminal after this pass, so no later tick repeats it, and
+        // the wake CLI exits non-zero exactly as `driveRun` does for `effect-refused`.
+        if (outcome.error) {
+          report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) });
+          // An advance that cannot settle it would re-apply the same refusal every turn: stop instead of spinning.
+          if (settled === current) break;
+        }
+        current = settled;
         // THE FINISH STAMP a dispatch was missing (#3368): a build that ran 40 minutes now reads as 40
         // minutes, not as absent — `withStepFinish` is a no-op unless `advance` just resolved THIS step.
         current = current.cursor > stepIndex ? withStepFinish(current, { stepIndex, at: nowIso() }) : current;
