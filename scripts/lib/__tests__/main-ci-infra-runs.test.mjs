@@ -8,15 +8,27 @@ const repo = 'owner/repo';
 const green = { databaseId: 1, headSha: 'aaaaaaa', status: 'completed', conclusion: 'success', createdAt: '2026-11-10T00:00:00Z' };
 const failure = (id = 2) => ({ databaseId: id, headSha: 'bbbbbbb', status: 'completed', conclusion: 'failure', createdAt: `2026-11-10T${String(id).padStart(2, '0')}:00:00Z` });
 const page = (conclusions, total = conclusions.length) => ({ total_count: total,
-  jobs: conclusions.map((conclusion, id) => ({ id, name: `test-shard-${id}`, conclusion })) });
+  jobs: conclusions.map((conclusion, id) => ({ id, name: `test-shard-${id}`, status: conclusion == null ? 'in_progress' : 'completed', conclusion, run_attempt: 1 })) });
 const jobsExec = (data) => vi.fn((bin, args) => {
   expect(bin).toBe('gh');
   expect(args[0]).toBe('api');
-  expect(args[1]).toMatch(/^repos\/owner\/repo\/actions\/runs\/\d+\/jobs\?per_page=100$/);
+  expect(args[1]).toMatch(/^repos\/owner\/repo\/actions\/runs\/\d+\/attempts\/1\/jobs\?per_page=100$/);
   return JSON.stringify(data);
 });
 
 describe('markInfraOnlyRuns', () => {
+  it('counts a never-started (queued, no conclusion) job as infra, with the cancelled ones', () => {
+    const runs = [failure(), green];
+    markInfraOnlyRuns(runs, { repo, exec: jobsExec({ total_count: 3, jobs: [{ id: 1, status: 'completed', conclusion: 'success', run_attempt: 1 }, { id: 2, status: 'completed', conclusion: 'cancelled', run_attempt: 1 }, { id: 3, status: 'queued', conclusion: null, run_attempt: 1 }] }) });
+    expect(runs[0].infraOnly).toBe(true);
+  });
+  it('stays red when a job is still running (a re-run began between the list and jobs reads) or from another attempt', () => {
+    for (const data of [page(['cancelled', null]), { total_count: 1, jobs: [{ id: 1, status: 'completed', conclusion: 'cancelled', run_attempt: 2 }] }]) {
+      const runs = [failure(), green];
+      markInfraOnlyRuns(runs, { repo, exec: jobsExec(data) });
+      expect(runs[0].infraOnly).toBeUndefined();
+    }
+  });
   it('keeps a re-run (attempt > 1) red: an inconclusive re-run cannot erase an earlier genuine failure', () => {
     const runs = [{ ...failure(), attempt: 2 }, green];
     const exec = jobsExec(page(['cancelled', 'cancelled']));
