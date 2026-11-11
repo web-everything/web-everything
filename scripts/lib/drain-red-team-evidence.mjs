@@ -411,6 +411,19 @@ export function decodeRecoveryAdmission(value) {
   return data;
 }
 
+/** A result's identity for the seal: everything but the publication state (`comment`), which the publisher itself moves. */
+const sealedResultKey = result => JSON.stringify(result && typeof result === 'object' ? { ...result, comment: undefined } : result ?? null);
+
+/**
+ * Does a rewrite keep the prior seal (PR #6622)? Yes when the prior file was damaged (its seal reads unreadable: fail
+ * closed), when the rewrite carries no result yet (queued/running), or when it carries the SAME result. PURE.
+ */
+export function keepSeal(prior, result) {
+  if (!prior) return false;
+  if (prior.damaged === true) return true;
+  return result == null || sealedResultKey(prior.result) === sealedResultKey(result);
+}
+
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
 function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
@@ -436,7 +449,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
     // A damaged file that carried a seal or a legacy hold must not be repaired into "nothing sealed": seal it unreadable.
     let raw = '';
     try { raw = String(optionalBytes(path) ?? ''); } catch { raw = '"sealedBreaks"'; }
-    prior = /"(sealedBreaks|sealedPosted|legacyHoldPublished)"/.test(raw) ? { sealedBreaks: 'unreadable' } : null;
+    prior = /"(sealedBreaks|sealedPosted|legacyHoldPublished)"/.test(raw) ? { sealedBreaks: 'unreadable', damaged: true } : null;
   }
   const spent = prior?.retryCount;
   if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
@@ -471,10 +484,14 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
   writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
     ...(admissionId ? { admissionId } : {}),
-    // The sealed stored breaks and the legacy hold flag survive every rewrite (PR #6622): dropping them lifts the hold.
-    ...(prior?.sealedBreaks !== undefined ? { sealedBreaks: prior.sealedBreaks } : {}),
-    ...(prior?.sealedPosted !== undefined ? { sealedPosted: prior.sealedPosted } : {}),
-    ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),
+    // The sealed stored breaks and the legacy hold flag survive a rewrite that keeps the sealed result (a retry or recovery
+    // that has no new result yet) (PR #6622): dropping them lifts the hold. A NEW result drops them, so the status reads
+    // as unsealed (or as the seat's own findings) until the publisher seals it: a seal never vouches for another result.
+    ...(keepSeal(prior, result) ? {
+      ...(prior?.sealedBreaks !== undefined ? { sealedBreaks: prior.sealedBreaks } : {}),
+      ...(prior?.sealedPosted !== undefined ? { sealedPosted: prior.sealedPosted } : {}),
+      ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),
+    } : {}),
     ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }

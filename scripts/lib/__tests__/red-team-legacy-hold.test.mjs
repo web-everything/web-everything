@@ -305,9 +305,11 @@ describe('the sealed status reader fails closed', () => {
     expect(kept.filter(i => i.pr === 42 && ['needs-you', 'confirmed-break-owed-send-back', 'red-team-undecided'].includes(i.kind)))
       .toEqual([expect.objectContaining({ head, kind: 'red-team-undecided' })]);
   });
-  it('a status already published (comment posted) needs no seal: it holds nothing on its own', () => {
+  it('a status already published (comment posted) with no confirmed break needs no seal: it holds nothing on its own', () => {
     writeStatusFile({ ...legacyStatus(), result: { status: 'ran', comment: 'posted', findings: [] } });
-    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toBeNull();
+    // Its own findings are the stored evidence (self-review round 3): an empty list, so nothing is held.
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toEqual({ findings: [], legacyHold: false });
+    expect(heldBy([clearComment]).held).toEqual([]);
   });
   it('the pure decision: no seal holds nothing, an empty seal holds nothing, an unreadable seal holds', () => {
     expect(redTeamHoldDecision({ comments: [], pr: 42, head, sealed: null }).held).toBe(false);
@@ -418,6 +420,68 @@ describe('the seal survives the rest of the pipeline (self-review round 1)', () 
     const snapshotWithoutHold = { ...legacyStatus(), sealedBreaks: [] };
     expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: [], comments: [clearComment],
       evidence: { status: snapshotWithoutHold } }).add).toBe('red-team:blocked');
+  });
+});
+
+describe('the stored result is the authority on every status shape (self-review round 3)', () => {
+  const loopPayload = { findings: { read: { netBasis: { rev: head } } } };
+  const later = c => ({ ...c, createdAt: '2026-11-10T13:00:00Z' });
+  // The REAL stored shape of a seat-posted result: review-job keeps only these five fields per finding (live data: 370
+  // stored findings, all of this shape). The thread's comment is rendered from the FULL finding.
+  const stored = f => ({ summary: f.summary, file: f.file ?? null, line: f.line ?? null, category: f.category ?? null,
+    confirmed: f.confirmedByRecheck === true });
+  const posted = findings => ({ status: 'ran', comment: 'posted', foldedVerdict: 'changes', recheckStatus: 'ok',
+    provider: 'claude', model: 'test-model', findings: findings.map(stored) });
+  it('a result the seat posted itself (never sealed) is not lifted by a later trusted "no break found" comment', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([brokenFinding]) });
+    const comments = [render([brokenFinding]), later(clearComment)];
+    expect(heldBy(comments).held.length).toBeGreaterThanOrEqual(1);
+    expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: ['red-team:pending'], comments, evidence: {} }).add)
+      .toBe('red-team:blocked');
+    expect(redTeamEnqueueHold({ comments, pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/confirmed a break/);
+  });
+  it('the same posted result with its own faithful comment adds no extra hold (the comment agrees)', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([brokenFinding]) });
+    expect(heldBy([render([brokenFinding])]).held.filter(f => f.index === 0)).toEqual([]);
+    // The full renderer adds a scenario, a class and its basis the stored projection never carries: still the same breaks.
+    const rich = { ...brokenFinding, failure_scenario: 'Given X, the check is skipped.', findingClass: 'live-reproduced',
+      classBasis: 'Reproduced against the real reader.' };
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([rich, { ...otherFinding, confirmedByRecheck: false }]) });
+    expect(heldBy([render([rich, { ...otherFinding, confirmedByRecheck: false }])]).held.filter(f => f.index === 0)).toEqual([]);
+  });
+  it('the same posted result with a DIFFERENT break in the thread is held (whole bodies, never counts)', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([brokenFinding]) });
+    expect(heldBy([render([otherFinding])]).held.some(f => f.index === 0)).toBe(true);
+  });
+  it('a posted result whose findings cannot be read holds (fail closed)', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: { status: 'ran', comment: 'posted' } });
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toEqual({ unreadable: true });
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('a NEW result drops the old seal: an empty seal never vouches for a retry that found a break', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([]), sealedBreaks: [] });
+    expect(heldBy([clearComment]).held).toEqual([]);
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished',
+      result: { ...posted([brokenFinding]), comment: 'withheld' } }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toBeUndefined();
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
+  it('a rewrite with no result yet, or the same result, keeps the seal', () => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([brokenFinding]), sealedBreaks: ['k'] });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expect(readStatusFile().sealedBreaks).toEqual(['k']);
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([brokenFinding]), sealedBreaks: ['k'] });
+    // Only the publication state moved (the publisher's own `comment`): still the same result.
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: { ...posted([brokenFinding]), comment: 'withheld' } },
+      { env: process.env });
+    expect(readStatusFile().sealedBreaks).toEqual(['k']);
+  });
+  it('a "publication pending" hold asks no ruling (no false round-cap row), yet still holds the merge', () => {
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    expect(redTeamRulingNeeded(prFor([clearComment]))).toBeNull();
+    expect(redTeamEnqueueHold({ comments: [clearComment], pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/not published yet/);
   });
 });
 

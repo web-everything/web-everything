@@ -465,10 +465,14 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { re
 /** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
 export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null } = {}) {
   const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo, standingRuling });
-  if (!disposition.held.length) return null;
+  // A hold that is only "publication pending" (PR #6622: stored evidence not sealed yet, no conflict found) is no break
+  // and asks no ruling; like every other caller ({@link redTeamHoldPendingOnly}) it is never reported as one. It still
+  // holds every merge path (the drain enqueue hold, the operator queue, red-team:pending). A real conflict is reported.
+  const held = disposition.held.filter(f => f.unsealed !== true);
+  if (!held.length) return null;
   const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   if (labels.includes('review:changes')) return null;
-  return { head: disposition.result?.rev ?? String(pr?.headRefOid ?? '').toLowerCase(), since: disposition.since, findings: disposition.held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
+  return { head: disposition.result?.rev ?? String(pr?.headRefOid ?? '').toLowerCase(), since: disposition.since, findings: held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
 }
 
 const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
@@ -679,6 +683,17 @@ const breakKey = b => JSON.stringify([b.category, b.impact, b.file, b.line, b.su
   b.findingClass ?? null, b.classBasis ?? null, [...(b.alsoClasses ?? [])].sort(), b.security === true]);
 
 /**
+ * THE projection mask for a seat-posted result (PR #6622): its stored findings keep only category, file, line, summary
+ * and the confirmed flag (review-job's status projection), so both sides are compared on exactly those fields: impact,
+ * scenario, class, basis, extra classes and the security flag are masked out. Applied to BOTH sides after the shared
+ * normalizers, never to a seal (a seal compares whole bodies). PURE.
+ */
+export function projectedBreakKeys(keys) {
+  return (keys ?? []).map(k => { const [category, , file, line, summary] = JSON.parse(k);
+    return JSON.stringify([category, file, line, summary]); }).sort();
+}
+
+/**
  * SHARED NORMALIZER, stored side: the confirmed breaks of stored findings (seat row or result), each reduced to the
  * fields a posted comment shows (category, impact, file, line, summary, scenario, class, classBasis, extra classes,
  * security flag) exactly as the renderer would write them. Order-free. PURE.
@@ -721,8 +736,20 @@ export function redTeamHoldDecision({ comments, pr, head, sealed } = {}) {
   if (sealed.unreadable) return { held: true, reason: 'sealed red-team evidence is unreadable' };
   if (sealed.unsealed) return { held: true, reason: 'stored red-team evidence is not sealed yet (publication pending)' };
   if (sealed.legacyHold === true) return { held: true, reason: 'legacy red-team evidence is unreadable or conflicts with the posted comment' };
-  if (!Array.isArray(sealed.breaks) || !sealed.breaks.length) return { held: false, reason: null };
-  const { posted, agree, keys } = redTeamBreaksAgree({ comments, pr, head, breaks: sealed.breaks });
+  // An unsealed result the seat posted itself: its stored (projected) findings, through the SAME normalizer the publisher
+  // seals with, then compared with the posted comment under the projection mask (the fields the projection keeps).
+  if (sealed.findings !== undefined) {
+    if (!Array.isArray(sealed.findings)) return { held: true, reason: 'stored red-team evidence is unreadable' };
+    const stored = projectedBreakKeys(sealedBreakKeys(sealed.findings));
+    if (!stored.length) return { held: false, reason: null };
+    const { posted, keys } = redTeamBreaksAgree({ comments, pr, head, breaks: [] });
+    if (posted && JSON.stringify(projectedBreakKeys(keys)) === JSON.stringify(stored)) return { held: false, reason: null };
+    return { held: true, reason: posted ? 'the posted comment differs from the stored confirmed breaks'
+      : 'stored evidence holds a confirmed break and no red-team comment shows it' };
+  }
+  const breaks = sealed.breaks;
+  if (!Array.isArray(breaks) || !breaks.length) return { held: false, reason: null };
+  const { posted, agree, keys } = redTeamBreaksAgree({ comments, pr, head, breaks });
   if (agree) return { held: false, reason: null };
   // The publisher's OWN scrub-fallback body (sealed with the breaks when it posted one): an exact whole-body match that
   // still shows every stored break as confirmed (an unknown impact reads as broken), so it never lifts a break.

@@ -39,6 +39,13 @@ export function sealedFromStatus(status, head) {
   const owesPublish = status.status === 'finished' && (status.result === 'ran'
     || (status.result?.status === 'ran' && ['withheld', 'error'].includes(status.result?.comment)));
   if (seal === undefined && owesPublish) return { unsealed: true, legacyHold };
+  // A finished result the seat posted itself (`posted`, `deduped`, …) owes no publication and is never sealed, yet its
+  // findings ARE the stored evidence: hand them over as they are, so a later comment cannot lift their breaks. Findings
+  // that cannot be read hold (fail closed), never "no breaks".
+  const r = status.result;
+  if (seal === undefined && status.status === 'finished' && r && typeof r === 'object' && r.status === 'ran') {
+    return Array.isArray(r.findings) ? { findings: r.findings, legacyHold } : { unreadable: true };
+  }
   if (seal === undefined && !legacyHold) return null;
   return { breaks: seal ?? [], legacyHold, ...(posted !== undefined ? { posted } : {}) };
 }
