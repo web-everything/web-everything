@@ -1115,8 +1115,9 @@ async function runCli() {
     // never becomes the recorded author) by different means, and neither one "picks the first stamp".
     try {
       const liveBody = forge.viewPr(prNum, 'body').body || '';
-      const updated = composePrBody(DEFERRED_TO_CI ? appendDeferredDisclosure(liveBody, DEFERRED_TO_CI.disclosure) : liveBody); // R893: a rerun records the deferral on an existing PR too
-      if (updated !== liveBody) forge.editBody(prNum, updated);
+      const updated = composePrBody(liveBody);
+      const disclosed = DEFERRED_TO_CI ? appendDeferredDisclosure(updated, DEFERRED_TO_CI.disclosure) : updated; // R893: a rerun records the deferral on an existing PR too
+      if (disclosed !== liveBody) forge.editBody(prNum, disclosed);
     } catch { /* best-effort — drain ref fallback covers a miss */ }
   }
   if (prNum == null) return ghFailed('could not determine the PR number after create');
