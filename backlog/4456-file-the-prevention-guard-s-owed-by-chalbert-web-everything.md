@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-08"
-preparedAgainstSha: "7cf64add2e939aa00bb940bdd61ca428c0b16937"
+preparedDate: "2026-11-10"
+preparedAgainstSha: "42b15b8a8d6dd045a4df2ffd36b677a6d4e3fa9c"
 tags: []
 ---
 
@@ -29,6 +29,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Re-prepare 2026-11-05 against origin/main 27e2ab3d: premise still open (no `backlog-retired-field` guard on main; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). Only drift: later-scan citations shifted about 8 lines (now :1482, :1525, :1567, :1748, :1805, :1962); raw loop (:1058-1061) and parse scan (:999-1000) unchanged. No scope, size or goal change.
 
 - Re-prepare 2026-11-08 against origin/main 7cf64add: premise still open (no `backlog-retired-field` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 27e2ab3d..HEAD` shows no change to we:scripts/check-standards.mjs, we:scripts/check-standards-rules.mjs or the 1683 card, so every citation above holds. No scope, size or goal change; only the stamp is refreshed.
+
+- Re-prepare 2026-11-10 against origin/main 42b15b8a: premise still open (no `backlog-retired-field` or `backlog-unreadable-card` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 7cf64add..HEAD` over we:scripts/check-standards.mjs, we:scripts/readiness/claimScope.mjs, we:src/_data/backlog.js and the 1683 card is empty; we:scripts/check-standards-rules.mjs gained only two `LEASH_PIN_SNAPSHOT` entries (~:4456), below every cited line. Raw loop (:1058-1061) and parse scan (:999-1000) unchanged. No scope, size or goal change; only the stamp is refreshed.
 
 ## Design
 
