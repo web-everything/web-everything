@@ -10,12 +10,15 @@ related: ["6535"]
 
 # Red-team verdict: a trusted newer result with no/ malformed findings supersedes a confirmed break (reinforce the fold)
 
-`deriveRedTeamVerdict` folds red-team evidence through `readRedTeamDisposition`, which is latest-result-wins per head. A trusted, same-PR, same-head result posted AFTER a confirmed break replaces it even when that newer result carries no findings, or a header that claims a break with no parseable finding lines. The verdict then reads `clear` and the break is gone. This item reinforces the fold so a superseding result must be complete (a real re-run that covers the earlier break) before it can release a recorded break. Today's behaviour is pinned by characterization tests in `we:scripts/lib/__tests__/red-team-verdict.test.mjs`.
+`deriveRedTeamVerdict` folds red-team evidence through `readRedTeamDisposition`, which is latest-result-wins per head. A trusted, same-PR, same-head result posted AFTER a confirmed break replaces it, including a malformed one (a header that claims a break with no parseable finding lines) and a carried empty result from the break's head. The verdict then reads `clear` and the break is gone. This item reinforces the fold so a superseding result must be complete (a real re-run that covers the earlier break) before it can release a recorded break. Today's behaviour is pinned by characterization tests in `we:scripts/lib/__tests__/red-team-verdict.test.mjs`.
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit` on the test file `we:scripts/lib/__tests__/red-team-verdict.test.mjs` passes. The `known weakness (#8156)` describe block pins today's behaviour (a newer trusted empty or malformed same-head result clears a confirmed break). When this item lands, those two superseding-result assertions flip to `held`, and the control tests (untrusted author, other PR) stay `held`.
-- [A2] **Executable** — a new test: a newer trusted same-head result whose header count disagrees with its parsed finding lines is never `clear` when an earlier confirmed break exists on that head.
+- [A1] **Executable** — `npm run test:unit` on the test file `we:scripts/lib/__tests__/red-team-verdict.test.mjs` fails before this item lands and passes after. The `known weakness (#8156)` block currently pins the weakness (the malformed-result and carry-hop tests expect `clear`); landing this item flips those assertions to `held`, so the file is red until they are updated deliberately.
+- [A2] **Executable** — the same test file gains a test that a newer trusted same-head result whose header claims a break but carries no parsed finding lines is `held`, never `clear`, when an earlier confirmed break exists on that head.
+- [A3] **Executable** — the same test file gains a test that a trusted carry of an empty result onto the live head does not release a break recorded on the carried-from head.
+
+"Complete" means: a superseding result may release an earlier break only if its header and its parsed finding lines agree (a header claiming N findings parses to N lines). A well-formed clean result (header says no break found) after a fix is the intended release path and stays `clear`; the first characterization test records today's behaviour for that case and is not a defect.
 
 ## Non-goals
 
