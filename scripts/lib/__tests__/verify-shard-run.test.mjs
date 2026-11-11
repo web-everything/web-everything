@@ -169,13 +169,12 @@ describe('one split retry for incomplete inventory', () => {
     });
     return { code, calls, output: lines.join('') };
   }
-  it('incomplete shard retries in halves with independent argv and report paths, all-pass stays UNSETTLED with exit 75', async () => {
+  it('complete, passed halves settle PASS with exit 0 and independent argv and report paths', async () => {
     const f = await run(['missing', 'pass', 'pass']);
-    expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
-    expect(f.output).toContain('verify-shard 1/1: UNSETTLED (4 files,');
-    expect(f.output).toContain('verify-shards: UNSETTLED (1:UNSETTLED;');
-    expect(f.output).not.toContain('GREEN');
-    expect(f.output.match(/verify-shard 1\/1: UNSETTLED /g)).toHaveLength(1);
+    expect(f.code).toBe(0);
+    expect(f.output).toContain('verify-shards: GREEN (all 1 shards, 4 files executed and passed)');
+    expect(f.output).not.toContain('UNSETTLED');
+    expect(f.output.match(/verify-shard 1\/1: PASS /g)).toHaveLength(1);
     expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c', 'd'], ['a', 'b'], ['c', 'd']]);
     expect(new Set(f.calls.map(c => c.report)).size).toBe(3);
     expect(new Set(f.calls.map(c => c.remoteReport)).size).toBe(3);
@@ -243,7 +242,7 @@ describe('one split retry for incomplete inventory', () => {
     expect(f.output).not.toContain('GREEN');
     expect(f.calls).toHaveLength(3);
   });
-  it('exit 75 with no report stays UNSETTLED after passing retries', async () => {
+  it('unexplained initial exit 75 with no report stays UNSETTLED after passing retries', async () => {
     const f = await run([{ exitCode: 75, reportText: null }, 'pass', 'pass']);
     expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
     expect(f.output).not.toContain('GREEN');
@@ -300,6 +299,14 @@ describe('one split retry for incomplete inventory', () => {
     expect(f.output).toContain('verify-shards: UNSETTLED (');
     expect(f.output).not.toMatch(/RED|GREEN/); expect(f.calls).toHaveLength(3);
   });
+  it('a file never reporting in its half stays UNSETTLED with exit 75, never green', async () => {
+    const retry = { exitCode: 0, reportText: JSON.stringify({ testResults: [{ name: 'a', status: 'passed',
+      assertionResults: [{ status: 'passed' }] }] }) };
+    const f = await run(['missing', retry, 'pass']);
+    expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(f.output).toContain('verify-shards: UNSETTLED (1:UNSETTLED;');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
   it.each([['fail', 'missing', 1], ['missing', 'fail', 1], ['timeout', 'missing', 124], ['missing', 'timeout', 124]])('real %s / %s half takes precedence over incomplete inventory', async (left, right, code) => {
     const f = await run(['missing', left, right]);
     expect(f.code).toBe(code); expect(f.output).toContain(`verify-shards: RED (1:${code === 124 ? 'TIMEOUT' : 'FAIL'};`);
@@ -329,10 +336,11 @@ describe('one split retry for incomplete inventory', () => {
     expect(f.output).not.toContain('GREEN');
     expect(f.calls).toHaveLength(3);
   });
-  it('retry exit 75 without inventory remains unsettled-eligible', async () => {
+  it('unexplained retry exit 75 without inventory stays UNSETTLED, never green', async () => {
     const f = await run(['missing', { exitCode: SHARD_UNSETTLED_EXIT, reportText: null }, 'pass']);
     expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
     expect(f.output).toContain('verify-shards: UNSETTLED (1:UNSETTLED;');
+    expect(f.output).not.toContain('GREEN');
     expect(f.calls).toHaveLength(3);
   });
   it.each(['killed', 'signal'])('first split half %s halts before the second half and preserves infrastructure exit', async mode => {
