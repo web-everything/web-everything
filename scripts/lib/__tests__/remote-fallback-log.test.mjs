@@ -15,14 +15,6 @@ describe('recordLocalSlotFallback', () => {
       expect(rows[0]).toEqual({ ts: '1970-01-01T00:00:00.000Z', reason: 'remote-disabled', detail: null, lane: 'lane-43', kind: 'test-unit' });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
-  it('repairs a missing trailing newline', () => {
-    const root = mkdtempSync(join(tmpdir(), 'rfl-'));
-    try {
-      writeFileSync(join(root, 'remote-fallbacks.jsonl'), '{"a":1}');
-      recordLocalSlotFallback({ lockRoot: root, reason: 'r', repo: '/x/l', kind: 'k' });
-      expect(readFileSync(join(root, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n')).toHaveLength(2);
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
   it('never throws on an unwritable root', () => {
     expect(recordLocalSlotFallback({ lockRoot: '/dev/null/x', reason: 'r', repo: '/x/l', kind: 'k' })).toBeNull();
     expect(() => recordLocalSlotFallback({})).not.toThrow();

@@ -78,11 +78,14 @@ export function deferredToCiDecision({ gate, deferred, headSha, mode } = {}) {
 
 export function appendDeferredDisclosure(body, disclosure) {
   const base = typeof body === 'string' ? body : '';
+  if (base.includes(disclosure)) return base; // idempotent: a rerun never stacks a second copy
   return `${base}${base.endsWith('\n') || !base ? '' : '\n'}\n> ${disclosure}\n> ready-to-merge is withheld until the GitHub CI \`test\` check is green on this exact commit.\n`;
 }
 
 /** Pure. A `gh pr view --json headRefOid,statusCheckRollup` result: is the `test` check green on exactly `sha`? */
 export function ciTestGreenOnSha(view, sha) {
   if (!view || !sha || view.headRefOid !== sha || !Array.isArray(view.statusCheckRollup)) return false;
-  return view.statusCheckRollup.some(c => c && c.name === 'test' && String(c.conclusion).toUpperCase() === 'SUCCESS');
+  // EVERY `test` entry must be green: a newer pending/failed run of the same name voids an older success.
+  const tests = view.statusCheckRollup.filter(c => c && c.name === 'test');
+  return tests.length > 0 && tests.every(c => String(c.conclusion).toUpperCase() === 'SUCCESS');
 }

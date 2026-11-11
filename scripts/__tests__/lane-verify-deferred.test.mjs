@@ -86,6 +86,10 @@ describe('deferredToCiDecision (the open path only)', () => {
     expect(ok({ deferred: { status: 'green', sha: SHA, reason: 'x', infrastructure: infra } }).ok).toBe(false);
   });
   it('is a no-op for an already-ok gate', () => { expect(ok({ gate: { ok: true, status: 'green' } }).ok).toBe(false); });
+  it('disclosure is idempotent', () => {
+    const once = appendDeferredDisclosure('Body', 'lane verify deferred to CI: r');
+    expect(appendDeferredDisclosure(once, 'lane verify deferred to CI: r')).toBe(once);
+  });
   it('appends the disclosure to a PR body', () => {
     expect(appendDeferredDisclosure('Body', 'lane verify deferred to CI: r')).toContain('lane verify deferred to CI: r');
   });
@@ -101,6 +105,7 @@ describe('ready-to-merge needs a green CI test check on the exact sha', () => {
     [view(SHA, [{ name: 'test', conclusion: 'FAILURE' }])],
     [view(SHA, [{ name: 'test', status: 'IN_PROGRESS', conclusion: '' }])],
     [view(SHA, [{ name: 'lint', conclusion: 'SUCCESS' }])],
+    [view(SHA, [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'test', status: 'IN_PROGRESS', conclusion: '' }])],
     [view(OTHER, [{ name: 'test', conclusion: 'SUCCESS' }])],
     [null],
   ])('refuses %j', (v) => { expect(ciTestGreenOnSha(v, SHA)).toBe(false); });

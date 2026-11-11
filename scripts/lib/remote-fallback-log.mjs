@@ -15,10 +15,9 @@ export function recordLocalSlotFallback({ lockRoot, reason, repo, kind, now = ()
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
     const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: null, lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
     mkdirSync(lockRoot, { recursive: true });
-    let prior = existsSync(file) ? readFileSync(file, 'utf8') : '';
-    if (prior.length > MAX_BYTES) prior = prior.slice(-MAX_BYTES);
-    const sep = prior && !prior.endsWith('\n') ? '\n' : '';
-    writeFileSync(file, prior + sep + JSON.stringify(row) + '\n', 'utf8');
+    // Append (atomic for one small write); trim only when oversized, so concurrent writers never rewrite each other.
+    if (existsSync(file) && statSync(file).size > MAX_BYTES) writeFileSync(file, readFileSync(file, 'utf8').slice(-MAX_BYTES / 2), 'utf8');
+    appendFileSync(file, JSON.stringify(row) + '\n', 'utf8');
     return row;
   } catch { return null; }
 }

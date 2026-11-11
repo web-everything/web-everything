@@ -1115,7 +1115,7 @@ async function runCli() {
     // never becomes the recorded author) by different means, and neither one "picks the first stamp".
     try {
       const liveBody = forge.viewPr(prNum, 'body').body || '';
-      const updated = composePrBody(liveBody);
+      const updated = composePrBody(DEFERRED_TO_CI ? appendDeferredDisclosure(liveBody, DEFERRED_TO_CI.disclosure) : liveBody); // R893: a rerun records the deferral on an existing PR too
       if (updated !== liveBody) forge.editBody(prNum, updated);
     } catch { /* best-effort — drain ref fallback covers a miss */ }
   }
