@@ -4,7 +4,7 @@ import { homedir, hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { LIVE_OWNER_DEFAULTS, processLive } from './pr-live-owner-watch.mjs';
+import { DECISION_WINDOW_MS, LIVE_OWNER_DEFAULTS, NOTIFY_MAX_WINDOW_MS, processLive } from './pr-live-owner-watch.mjs';
 import { handoffHome } from '../lib/handoff-path.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
@@ -23,19 +23,24 @@ function optional(path, fallback) {
 /** Recent merged PRs read per tick; a PR created before this window but merged inside it is not seen (disclosed residual). */
 const MERGED_LIST_LIMIT = 100;
 
-/** Actual byte tail; feed files can be large. Never interpret human text as JSONL. */
-export function feedTail(path, { read = readSync } = {}) {
+/**
+ * Actual byte tail of an append-only line log. When the file exceeds the window, the partial leading
+ * record is dropped; a window holding no newline at all is one partial record and yields no lines.
+ */
+export function tailRecords(path, { read = readSync } = {}) {
   let fd;
   try {
     fd = openSync(path, 'r'); const size = statSync(path).size, start = Math.max(0, size - MAX_BYTES);
     const buffer = Buffer.alloc(Math.min(size, MAX_BYTES));
     const count = read(fd, buffer, 0, buffer.length, start);
     let text = buffer.subarray(0, count).toString('utf8');
-    if (start) text = text.slice(text.indexOf('\n') + 1);
-    return text.split('\n').filter(Boolean);
-  } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+    if (start) { const cut = text.indexOf('\n'); text = cut === -1 ? '' : text.slice(cut + 1); }
+    return { lines: text.split('\n').filter(Boolean), truncated: start > 0 };
+  } catch (e) { if (e.code === 'ENOENT') return { lines: [], truncated: false }; throw e; }
   finally { if (fd !== undefined) closeSync(fd); }
 }
+/** Feed tail; feed files can be large. Never interpret human text as JSONL. */
+export function feedTail(path, options) { return tailRecords(path, options).lines; }
 export function resolveLiveOwnerSettings({ env = process.env, tool = {}, platform, log = console.error } = {}) {
   const settings = platform === undefined ? readPlatformPreferences({ env }) : { prefs: platform, errors: [] };
   const envValues = env.WE_LIVE_OWNER_WATCH_MODE === undefined ? {} : { mode: env.WE_LIVE_OWNER_WATCH_MODE };
@@ -225,17 +230,37 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
       stuckRequiredCheck: old && checks.some(c => required.includes(c.name ?? c.context) && ['QUEUED', 'IN_PROGRESS', 'PENDING'].includes(c.status ?? c.state)),
       validatorAvailable: typeof adapters.validateDataRefresh === 'function' };
   };
+  const readLastMergeAt = () => {
+    // No search-backed listing (#no-label-search): list recent merged PRs plainly and filter by mergedAt
+    // client-side. List order is creation order, so take the newest mergedAt inside the window, not the first row.
+    const mergeFloor = now - config.noMergeMinutes * 60_000;
+    const mergedAll = readGh(['pr', 'list', '--repo', repo, '--state', 'merged', '--base', 'main',
+      '--limit', String(MERGED_LIST_LIMIT), '--json', 'mergedAt']);
+    if (!Array.isArray(mergedAll) || mergedAll.some(p => !Number.isFinite(Date.parse(p?.mergedAt)))) throw Error('merge evidence unavailable');
+    const merged = mergedAll.filter(p => Date.parse(p.mergedAt) >= mergeFloor)
+      .sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
+    return merged[0]?.mergedAt ?? mergeFloor - 1;
+  };
   return {
     repo, config,
     acquireRun: () => acquireLiveOwnerWatchLock(dir, adapters.lockOptions),
     readHistory() {
-      const months = [new Date(now).toISOString().slice(0, 7), new Date(now - 3600_000).toISOString().slice(0, 7)];
-      return [...new Set(months)].flatMap(month => optional(join(dir, `${month}.jsonl`), '').split('\n').filter(Boolean).map(line => {
-        const r = JSON.parse(line);
-        if (!r.repo || !Number.isSafeInteger(r.pr) || !r.head || !['would-do', 'intent', 'did'].includes(r.phase)
-          || !Number.isFinite(Date.parse(r.ts))) throw Error('decision audit incomplete');
-        return r;
-      }));
+      // The month log is append-only and grows past any fixed read cap, but dedup only needs the last
+      // DECISION_WINDOW_MS. Read a byte tail; a truncated tail must reach back past that window or fail closed.
+      const floor = now - DECISION_WINDOW_MS;
+      const months = [new Date(now).toISOString().slice(0, 7), new Date(floor).toISOString().slice(0, 7)];
+      return [...new Set(months)].flatMap(month => {
+        const { lines, truncated } = tailRecords(join(dir, `${month}.jsonl`));
+        const records = lines.map(line => {
+          const r = JSON.parse(line);
+          if (!r.repo || !Number.isSafeInteger(r.pr) || !r.head || !['would-do', 'intent', 'did'].includes(r.phase)
+            || !Number.isFinite(Date.parse(r.ts))) throw Error('decision audit incomplete');
+          return r;
+        });
+        if (truncated && !(Date.parse(records[0]?.ts) <= floor))
+          throw Error('oversized decision audit tail does not cover the dedup window; operator must inspect full input');
+        return records;
+      });
     },
     appendDecision(record) { appendFileSync(join(dir, `${record.ts.slice(0, 7)}.jsonl`), `${JSON.stringify(record)}\n`); },
     readSweepHistory: () => sweep.readAuditHistory(sweep.stallSweepDir(env)),
@@ -320,6 +345,16 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
           reason: result?.reason ?? 'stale-base gate did not refresh; operator must inspect missing/stuck check' };
       }
       const { dispatchManualPass } = await import('../operations/manual-daemon-pass-io.mjs');
+      const reviewJob = await (adapters.loadReviewJob ?? (() => import('../operations/review-job.mjs')))();
+      // Resolve the dispatch mode from this IO's env (not process.env) and hand it to the dispatcher, so the
+      // check below and the launch cannot disagree. Session mode has no job-side head pin: refuse it.
+      const reviewMode = reviewJob.resolveReviewDispatchMode(env);
+      if (action.action === 'review-dispatch' && reviewMode !== 'job')
+        return { ok: false, reason: `review dispatch mode ${reviewMode} cannot pin the PR head at launch; operator must dispatch review by hand` };
+      // The manual launcher drops expectedHead on the review path; pin it here so the job refuses a head that
+      // moved after the precheck below (the red-team path already forwards it to dispatchReviewJob).
+      const loadPinned = async () => ({ ...reviewJob,
+        dispatchReviewByMode: opts => reviewJob.dispatchReviewByMode({ ...opts, mode: reviewMode, expectedHead: pr.headRefOid }) });
       if (action.action === 'review-dispatch') {
         try {
           const { readCompletePrComments } = await import('./pr-comments-complete.mjs');
@@ -356,7 +391,8 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
       if (typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) throw Error('PR head unreadable; operator must inspect before retrying');
       if (head.toLowerCase() !== pr.headRefOid.toLowerCase()) throw Error('PR head changed; operator must inspect before retrying');
       const result = await (adapters.dispatchManualPass ?? dispatchManualPass)({ daemon: action.action === 'review-dispatch' ? 'review' : 'red-team',
-        repo: pr.repo, pr: pr.number, expectedHead: pr.headRefOid, ...(redTeamMode ? { redTeamMode } : {}) }, { env, readHead: () => readGh(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'headRefOid']).headRefOid });
+        repo: pr.repo, pr: pr.number, expectedHead: pr.headRefOid, ...(redTeamMode ? { redTeamMode } : {}) }, { env, load: loadPinned,
+        readHead: () => readGh(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'headRefOid']).headRefOid });
       return { ok: !result?.error && !result?.skipped && result?.ok !== false
         && (result?.launched === true || (Number.isSafeInteger(result?.jobPid) && result.jobPid > 0)
           || (action.action === 'review-dispatch' && typeof result?.agentId === 'string' && result.agentId.length > 0)),
@@ -368,21 +404,17 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
         || Object.values(state).some(v => !Number.isFinite(Date.parse(v)))) throw Error('smell state unreadable');
       return state;
     },
-    writeSmellState: state => writeJsonAtomic(join(dir, 'smell-state.json'), state),
+    // One key per PR head would grow past the 2 MiB read cap; no notify window looks back further than this.
+    writeSmellState: state => writeJsonAtomic(join(dir, 'smell-state.json'), Object.fromEntries(Object.entries(state)
+      .filter(([, at]) => Date.parse(at) > now - NOTIFY_MAX_WINDOW_MS))),
     emit(event) {
       const { lines } = feed.diffFeed([], [event], now);
       feed.appendLines(path, lines);
     },
     readGaps: () => optional(join(handoff, 'hook-gaps.jsonl'), '').split('\n').filter(Boolean).map(line => JSON.parse(line)),
+    readLastMergeAt,
     async readSystemEvidence(prs) {
-      // No search-backed listing (#no-label-search): list recent merged PRs plainly and filter by mergedAt
-      // client-side. List order is creation order, so take the newest mergedAt inside the window, not the first row.
-      const mergeFloor = now - config.noMergeMinutes * 60_000;
-      const mergedAll = readGh(['pr', 'list', '--repo', repo, '--state', 'merged', '--base', 'main',
-        '--limit', String(MERGED_LIST_LIMIT), '--json', 'mergedAt']);
-      if (!Array.isArray(mergedAll) || mergedAll.some(p => !Number.isFinite(Date.parse(p.mergedAt)))) throw Error('merge evidence unavailable');
-      const merged = mergedAll.filter(p => Date.parse(p.mergedAt) >= mergeFloor)
-        .sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
+      const lastMergeAt = readLastMergeAt();
       const pending = [];
       const roots = clones.daemonCloneRoots(join(home, 'workspace'), { env });
       if (roots.length > 64) throw Error('overlay clone inventory oversized; operator inspection required');
@@ -416,7 +448,7 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
         && forgeSmell.evaluate({ forgeShare: forge }).some(s => s.breach);
       const feedEvents = feedTail(path).map(feed.parseFeedLine).filter(Boolean);
       return { prs: prs.map(p => ({ ...p, ready: p.labels.some(l => ['ready-to-merge', 'review:accepted'].includes(l.name ?? l)) })),
-        lastMergeAt: merged[0]?.mergedAt ?? mergeFloor - 1, overlays: pending,
+        lastMergeAt, overlays: pending,
         heavyFallback: process.platform === 'darwin' && (breach || fallbackBreach), feedEvents };
     },
   };

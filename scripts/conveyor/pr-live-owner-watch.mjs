@@ -18,7 +18,11 @@ const age = (v, now) => Number.isFinite(millis(v)) && millis(v) <= now ? (now - 
 const labelsOf = pr => (pr.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
 const operator = pr => labelsOf(pr).some(l => ['review:human', 'needs-you', 'operator-approval'].includes(l));
 const keyOf = pr => `${pr.repo}#${pr.number ?? pr.pr}`;
-const recent = (r, now, window = HOUR) => Number.isFinite(millis(r.ts ?? r.at)) && millis(r.ts ?? r.at) > now - window;
+/** Decisions dedup over this window; the IO reads at least this far back from the decision log. */
+export const DECISION_WINDOW_MS = HOUR;
+/** Longest notify dedup window; the IO prunes smell state older than this. */
+export const NOTIFY_MAX_WINDOW_MS = 24 * HOUR;
+const recent = (r, now, window = DECISION_WINDOW_MS) => Number.isFinite(millis(r.ts ?? r.at)) && millis(r.ts ?? r.at) > now - window;
 /** PURE. Explicit false (including a zombie) is dead; unknown probes never authorize a takeover. */
 export function processLive(row) {
   if (row?.alive === false || /^Z/i.test(row?.stat ?? '') || /defunct/i.test(row?.command ?? '')) return false;
@@ -133,6 +137,7 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
   let release;
   const started = Date.now(), inBudget = () => Date.now() - started < config.tickBudgetMs;
   const notify = async (key, reason, pr = {}, window = HOUR, details = {}) => {
+    if (!(window <= NOTIFY_MAX_WINDOW_MS)) throw Error('notify window exceeds smell-state retention; operator inspection required');
     const state = await io.readSmellState();
     if (state[key] && recent({ ts: state[key] }, now, window)) return false;
     await io.emit({ at: new Date(now).toISOString(), repo: pr.repo ?? io.repo, pr: pr.number ?? 0,
@@ -147,7 +152,7 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
     const gaps = await io.readGaps();
     if (!Array.isArray(gaps) || gaps.length > 5000) throw Error('hook gaps incomplete or oversized; operator must inspect full input');
     result.selfAudit = selfAudit(gaps);
-    if (config.actEnabled !== true || result.selfAudit.unruled.length) await notify('SELF-AUDIT', result.selfAudit.summary, {}, 24 * HOUR);
+    if (config.actEnabled !== true || result.selfAudit.unruled.length) await notify('SELF-AUDIT', result.selfAudit.summary, {}, NOTIFY_MAX_WINDOW_MS);
     const history = await io.readHistory(), sweep = await io.readSweepHistory();
     if (sweep.complete !== true) throw Error('stall-sweep audit incomplete');
     const prs = await io.listPRs();
@@ -241,10 +246,19 @@ export async function probeLiveOwnerWatch({ dir, now = Date.now(), config = {}, 
     const value = { at: new Date(now).toISOString(), result }; writeCache(value); return { ...value, cached: false };
   } catch (e) { return { error: e.message, cached: false }; }
 }
-function runBoundedPass({ now, config, timeoutMs }) {
-  return new Promise((done, reject) => execFile(process.execPath, [fileURLToPath(import.meta.url), '--json'], {
-    timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-    env: { ...process.env, WE_LIVE_OWNER_WATCH_NOW: String(now), WE_LIVE_OWNER_WATCH_CONFIG: JSON.stringify(config) },
+/**
+ * Child env for the bounded pass. Forward only the tick budget the parent's kill timeout enforces: policy
+ * (mode, actEnabled) and thresholds resolve in the child's own cascade (settings file → platform → env), so
+ * health defaults never override an explicit opt-in or a configured threshold.
+ */
+export function liveOwnerChildEnv({ now, timeoutMs, env = process.env }) {
+  return { ...env, WE_LIVE_OWNER_WATCH_NOW: String(now),
+    WE_LIVE_OWNER_WATCH_CONFIG: JSON.stringify({ tickBudgetMs: Math.max(1, Math.floor(timeoutMs)) }) };
+}
+/** Runs the pass in a child killed with SIGKILL at the timeout; the child's own gh/git/ps reads carry ≤5s timeouts. */
+export function runBoundedPass({ now, timeoutMs, script = fileURLToPath(import.meta.url) }) {
+  return new Promise((done, reject) => execFile(process.execPath, [script, '--json'], {
+    timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, env: liveOwnerChildEnv({ now, timeoutMs }),
   }, (error, stdout) => { if (error) reject(error); else { try { done(JSON.parse(stdout)); } catch (e) { reject(e); } } }));
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

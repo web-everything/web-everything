@@ -50,8 +50,8 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   ...CLAUDE_JOBS_ARCHIVE_DEFAULTS,
   mode: 'shadow',
   tickBudgetMs: 60_000,
-  liveOwnerWatch: { intervalMinutes: 5, mode: 'shadow', progressMinutes: 20, ciMinutes: 60,
-    stackMinutes: 120, redTeamMinutes: 120, reviewQueueMinutes: 20, noMergeMinutes: 30, overlayMinutes: 20 },
+  // Cadence only: the watch's policy and thresholds resolve in its own settings cascade, never from here.
+  liveOwnerWatch: { intervalMinutes: 5 },
   flapMax: 3,
   flapWindowMs: 24 * HOUR,
   flapCloseAfter: 12,

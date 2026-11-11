@@ -3,7 +3,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, readSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch } from '../pr-live-owner-watch.mjs';
+import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch, LIVE_OWNER_DEFAULTS } from '../pr-live-owner-watch.mjs';
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
@@ -266,11 +266,11 @@ describe('health-watch registration', () => {
 
 describe('portable feed IO and settings', () => {
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
-  async function localIo(adapters = {}, now = NOW, dir, actEnabled = true) {
+  async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
     if (!dir) { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir); }
     writeFileSync(join(dir, 'platform.json'), '{}');
     const env = { GH_REPO: pr().repo, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'platform.json'),
-      ...(actEnabled ? { WE_LIVE_OWNER_WATCH_ACT: '1' } : {}),
+      ...(actEnabled ? { WE_LIVE_OWNER_WATCH_ACT: '1' } : {}), ...extraEnv,
       WE_COORDINATION_ROOT: join(dir, 'coordination'), WE_LIVE_OWNER_WATCH_DIR: join(dir, 'watch'), WE_NEEDS_YOU_FEED: join(dir, 'feed.jsonl'), WE_POLICY_CASCADE_LOG: '0' };
     return { dir, io: await createLiveOwnerWatchIo({ env, home: dir, root: dir, now, adapters: {
       lockOptions: { stamp: () => ({ runnerStart: 'fixture-birth' }), identity: () => ({ alive: true }) }, ...adapters,
@@ -338,7 +338,7 @@ describe('portable feed IO and settings', () => {
     const touched = vi.fn(() => { throw Error('mutation adapter accessed'); });
     const adapters = {};
     for (const name of ['labelProvider', 'staleBaseGate', 'resolveLiveQueueBaseline', 'buildFixThrottle',
-      'reconcileFixDispatch', 'reconcileReview', 'dispatchManualPass', 'validateDataRefresh',
+      'reconcileFixDispatch', 'reconcileReview', 'dispatchManualPass', 'loadReviewJob', 'validateDataRefresh',
       'abandonStaleRedTeamRun', 'planRedTeamRecovery']) {
       Object.defineProperty(adapters, name, { enumerable: true, get: touched });
     }
@@ -579,5 +579,119 @@ describe('portable feed IO and settings', () => {
     const { io, dir } = await localIo(); const release = io.acquireRun();
     writeFileSync(join(dir, 'watch', '2026-11.jsonl'), 'x'.repeat(2 * 1024 * 1024 + 1));
     expect(() => io.readHistory()).toThrow(/oversized.*operator must inspect full input/); release();
+  });
+  it('a month of decisions beyond 2 MiB still reads the dedup hour from the tail', async () => {
+    const { io, dir } = await localIo(); const release = io.acquireRun();
+    const rec = minutes => ({ ts: ago(minutes), et: 'ET', repo: pr().repo, pr: 863, head: pr().headRefOid,
+      ownerClass: 'none', action: 'clear-label', phase: 'would-do', reason: 'x'.repeat(200) });
+    const old = `${JSON.stringify(rec(600))}\n`, recent = rec(20);
+    writeFileSync(join(dir, 'watch', '2026-11.jsonl'), `${old.repeat(Math.ceil(2.5 * 1024 * 1024 / old.length))}${JSON.stringify(recent)}\n`);
+    const history = io.readHistory();
+    expect(history.at(-1)).toEqual(recent);
+    expect(planActions([classified(pr({ labels: ['status:fixing'] }))], history, NOW)).toEqual([]);
+    release();
+  });
+  it('a truncated decision tail that does not reach back past the dedup hour fails closed', async () => {
+    const { io, dir } = await localIo(); const release = io.acquireRun();
+    const line = `${JSON.stringify({ ts: ago(5), et: 'ET', repo: pr().repo, pr: 863, head: pr().headRefOid,
+      ownerClass: 'none', action: 'clear-label', phase: 'would-do', reason: 'x'.repeat(200) })}\n`;
+    writeFileSync(join(dir, 'watch', '2026-11.jsonl'), line.repeat(Math.ceil(2.5 * 1024 * 1024 / line.length)));
+    expect(() => io.readHistory()).toThrow(/oversized.*operator must inspect full input/); release();
+  });
+  it('smell state drops keys older than the longest notify window on write', async () => {
+    const { io } = await localIo(); const release = io.acquireRun();
+    io.writeSmellState({ stale: new Date(NOW - 25 * 60 * MIN).toISOString(), daily: new Date(NOW - 23 * 60 * MIN).toISOString(), fresh: ago(1) });
+    expect(Object.keys(io.readSmellState()).sort()).toEqual(['daily', 'fresh']); release();
+  });
+  it('an oversized feed tail with no newline in the retained window yields no partial record', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir);
+    const path = join(dir, 'unterminated-feed.jsonl');
+    writeFileSync(path, `${'y'.repeat(2 * 1024 * 1024 + 100)}`);
+    expect(feedTail(path)).toEqual([]);
+  });
+  it.each(['review-dispatch', 'red-team-dispatch'])('%s job refuses a head changed after the manual precheck through the production dispatcher', async action => {
+    const real = await import('../../operations/review-job.mjs');
+    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
+    const spawnJob = vi.fn(() => ({ pid: 4242 })), seen = [], outcomes = [];
+    // The job-side live head moved after the precheck; nothing here can launch a real job.
+    const jobOpts = { io: { liveHead: () => 'b'.repeat(40) }, spawnJob, checkoutExists: () => false,
+      stackCheck: () => ({ base: null }), readCompletion: () => null };
+    const record = result => { outcomes.push(result); return result; };
+    const loadReviewJob = async () => ({ ...real,
+      dispatchReviewByMode: opts => { seen.push(opts); return record(real.dispatchReviewByMode({ ...opts, ...jobOpts })); },
+      dispatchReviewJob: opts => { seen.push(opts); return record(real.dispatchReviewJob({ ...opts, ...jobOpts })); } });
+    const { io } = await localIo({ loadReviewJob, readGhText: commentGh(), readAgents: () => [],
+      // Keep the stub loader even if production passes none, so this test never reaches a real launcher.
+      dispatchManualPass: (input, opts) => dispatchManualPass(input, { ...opts, load: opts.load ?? loadReviewJob }),
+      reconcileReview: () => ({ dispatch: [{ kind: 'review', prNumber: 863 }], refusals: [] }),
+      readRedTeamStatus: () => null, readRecoveryWitness: () => ({}), planRedTeamRecovery: () => ({ abandon: false, mode: 'fresh' }) });
+    expect((await io.execute({ pr: pr(), action })).ok).toBe(false);
+    expect(seen).toEqual([expect.objectContaining({ expectedHead: pr().headRefOid })]);
+    expect(outcomes).toEqual([expect.objectContaining({ refused: true, outcome: 'refused-head-moved' })]);
+    expect(spawnJob).not.toHaveBeenCalled();
+  });
+  it('review dispatch in session mode refuses, since that launcher cannot pin the head', async () => {
+    const dispatchManualPass = vi.fn(), reconcileReview = vi.fn();
+    const { io } = await localIo({ dispatchManualPass, reconcileReview, readGhText: commentGh(), readAgents: () => [] },
+      NOW, undefined, true, { WE_REVIEW_DISPATCH_MODE: 'session' });
+    expect(await io.execute({ pr: pr(), action: 'review-dispatch' })).toEqual({ ok: false, reason: expect.stringContaining('session cannot pin the PR head') });
+    expect(dispatchManualPass).not.toHaveBeenCalled(); expect(reconcileReview).not.toHaveBeenCalled();
+  });
+  it('system evidence selects the newest in-window merge from creation-ordered results without --search', async () => {
+    const calls = [], merged = rows => vi.fn(args => { calls.push(args); return JSON.stringify(rows); });
+    const window = 30;
+    let { io } = await localIo({ readGhText: merged([{ mergedAt: ago(5) }, { mergedAt: ago(90) }, { mergedAt: ago(2) }, { mergedAt: ago(20) }]) });
+    expect(io.readLastMergeAt()).toBe(ago(2));
+    expect(calls[0]).toEqual(expect.arrayContaining(['pr', 'list', '--state', 'merged']));
+    expect(calls[0].some(arg => /^--search|^-S$/.test(arg))).toBe(false);
+    ({ io } = await localIo({ readGhText: merged([{ mergedAt: ago(90) }, { mergedAt: ago(45) }]) }));
+    expect(io.readLastMergeAt()).toBe(NOW - window * MIN - 1);
+    ({ io } = await localIo({ readGhText: merged([]) }));
+    expect(io.readLastMergeAt()).toBe(NOW - window * MIN - 1);
+    for (const rows of [[{ mergedAt: 'garbage' }], [null], { mergedAt: ago(1) }]) {
+      ({ io } = await localIo({ readGhText: merged(rows) }));
+      expect(() => io.readLastMergeAt()).toThrow('merge evidence unavailable');
+    }
+  });
+  it('a corrupt platform preferences file closes acting even with the env opt-in', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir);
+    writeFileSync(join(dir, 'platform.json'), '{ not json');
+    const log = vi.fn();
+    const value = resolveLiveOwnerSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'platform.json'),
+      WE_LIVE_OWNER_WATCH_ACT: '1', WE_LIVE_OWNER_WATCH_MODE: 'on' }, tool: {}, log });
+    expect(value).toMatchObject({ actEnabled: false, mode: 'shadow' });
+    expect(log.mock.calls.at(-1)[0]).toContain('"actEnabled":"fail-closed (invalid policy)"');
+  });
+  it('timed-out production pass is terminated before the probe returns', async () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-hang-')); dirs.push(dir);
+    const pidFile = join(dir, 'pid'), script = join(dir, 'hang.mjs');
+    writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+    const { runBoundedPass } = await import('../pr-live-owner-watch.mjs');
+    let cache;
+    const result = await probeLiveOwnerWatch({ dir, now: NOW, readCache: () => null, writeCache: v => { cache = v; },
+      remainingMs: 5000, runPass: options => runBoundedPass({ ...options, script }) });
+    expect(result).toMatchObject({ cached: false, error: expect.any(String) }); expect(cache).toBeUndefined();
+    const childPid = Number(readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(childPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+  }, 15_000);
+  it('health child preserves explicit settings-file and platform opt-ins', async () => {
+    const { DEFAULT_HEALTH_CONFIG } = await import('../health-watch-core.mjs');
+    const { liveOwnerChildEnv } = await import('../pr-live-owner-watch.mjs');
+    const childConfig = { ...DEFAULT_HEALTH_CONFIG.liveOwnerWatch };
+    const childIo = async ({ fileSettings, platform }) => {
+      const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-child-')); dirs.push(dir);
+      mkdirSync(join(dir, 'scripts/conveyor'), { recursive: true });
+      if (fileSettings) writeFileSync(join(dir, 'scripts/conveyor/pr-live-owner-watch.settings.json'), JSON.stringify({ liveOwnerWatch: fileSettings }));
+      writeFileSync(join(dir, 'platform.json'), JSON.stringify(platform ?? {}));
+      // The production parent: health defaults → probe cfg → child env (the same helper runBoundedPass uses).
+      const cfg = { ...LIVE_OWNER_DEFAULTS, ...childConfig };
+      const env = liveOwnerChildEnv({ now: NOW, timeoutMs: Math.min(30_000, cfg.tickBudgetMs), env: { GH_REPO: pr().repo,
+        WE_PLATFORM_PREFERENCES_FILE: join(dir, 'platform.json'), WE_POLICY_CASCADE_LOG: '0' } });
+      return (await createLiveOwnerWatchIo({ env, home: dir, root: dir, now: NOW })).config;
+    };
+    expect(await childIo({ fileSettings: { mode: 'on', actEnabled: true, noMergeMinutes: 90 } }))
+      .toMatchObject({ mode: 'on', actEnabled: true, noMergeMinutes: 90, tickBudgetMs: 30_000 });
+    expect(await childIo({ platform: { liveOwnerWatch: { mode: 'on', actEnabled: true } } })).toMatchObject({ mode: 'on', actEnabled: true });
+    expect(await childIo({})).toMatchObject({ mode: 'shadow', actEnabled: false });
   });
 });
