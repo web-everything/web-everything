@@ -129,6 +129,21 @@ describe('netInterdiff', () => {
       expect(netInterdiff({ exec: spy, ...valid(), ...patch })).toBeNull();
       expect(calls).toEqual([]);
     });
+    it('more paths than the cap → null, git never called (the caller keeps the raw range)', () => {
+      const rawFiles = Object.fromEntries(Array.from({ length: 2001 }, (_, i) => [`f${i}.txt`, null]));
+      const calls = [];
+      expect(netInterdiff({ exec: (...a) => { calls.push(a); return ''; }, ...valid(), rawFiles })).toBeNull();
+      expect(calls).toEqual([]);
+    });
+    it('a path git does not see at either head → null (an empty diff must not read as "unchanged")', () => {
+      expect(netInterdiff({ exec, ...valid(), rawFiles: { 'no/such/file.txt': null } })).toBeNull();
+    });
+    it.each([['undefined', undefined], ['null', null], ['a Buffer', Buffer.from('')]])(
+      'an exec that returns %s for the diff → null, never an "unchanged" drop', (_n, value) => {
+        const sha = valid().head;
+        const exec3 = (cmd, args) => (args.includes('merge-base') ? `${sha}\n` : args.includes('ls-tree') ? 'a.txt\0' : value);
+        expect(netInterdiff({ exec: exec3, ...valid() })).toBeNull();
+      });
     it('non-function exec → null', () => {
       expect(netInterdiff({ exec: 'git', ...valid() })).toBeNull();
     });
@@ -250,12 +265,29 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
 
   it('treats a data-derived path literally, never as a glob pathspec', () => {
     start('glob');
-    write('q/a.txt', setLine(lines(10), 2, 'A'));
-    const prior = commit('pr1 edits q/a.txt');
+    write('q/*.txt', 'literal star file\n');
+    const prior = commit('pr1 adds a file literally named q/*.txt');
     write('q/b.txt', setLine(lines(10), 2, 'B'));
-    const head = commit('pr2 edits q/b.txt');
-    // "q/*.txt" is not a file; as a glob it would match both q files and wrongly look changed.
+    const head = commit('pr2 edits only q/b.txt');
+    // As a glob, "q/*.txt" would also match q/b.txt and wrongly look changed; literally it is unchanged.
     const out = net(prior, head, { 'q/*.txt': null });
     expect(out).toEqual({ files: {}, dropped: ['q/*.txt'] });
+  });
+
+  it('keeps a submodule pointer bump even when git config says to ignore submodules', () => {
+    start('sub');
+    const gitlink = (id) => git('update-index', '--add', '--cacheinfo', `160000,${id},sub`);
+    gitlink('1'.repeat(40));
+    git('commit', '-q', '-m', 'pr1 adds submodule pointer');
+    const prior = git('rev-parse', 'HEAD');
+    gitlink('2'.repeat(40));
+    git('commit', '-q', '-m', 'pr2 bumps submodule pointer');
+    const head = git('rev-parse', 'HEAD');
+    git('config', 'diff.ignoreSubmodules', 'all');
+    try {
+      expect(Object.keys(net(prior, head, { sub: null }).files)).toEqual(['sub']);
+    } finally {
+      git('config', '--unset', 'diff.ignoreSubmodules');
+    }
   });
 });

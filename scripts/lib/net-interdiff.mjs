@@ -12,6 +12,8 @@
 const SHA = /^[0-9a-f]{4,64}$/i;
 const REF = /^[A-Za-z0-9._/-]+$/;
 const MAX = 64 * 1024 * 1024;
+const MAX_FILES = 2000;
+const TIMEOUT_MS = 60_000;
 
 /**
  * Normalise a `git diff` for one path into a signature of the PR's own change. Only the parts that vary with what
@@ -35,14 +37,31 @@ function signature(text) {
   return out.join('\n');
 }
 
-/** One file's PR-own patch since the merge-base with `base`, as a position-independent signature. */
-function ownPatch(exec, head, base, path) {
-  const mb = String(exec('git', ['merge-base', head, base], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim();
+/** Run git through the injected `exec`; anything but a string (null, undefined, a Buffer) is unreadable → throw. */
+function run(exec, args, extra = {}) {
+  const out = exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: TIMEOUT_MS, ...extra });
+  if (typeof out !== 'string') throw new Error('exec-returned-non-string');
+  return out;
+}
+
+/** The merge-base of `head` with `base` (path-independent, so computed once per head). */
+function mergeBase(exec, head, base) {
+  const mb = run(exec, ['merge-base', head, base]).trim();
   if (!SHA.test(mb)) throw new Error('merge-base-unreadable');
+  return mb;
+}
+
+/** True when `path` is a tracked entry (file, symlink or submodule) of the tree at `rev`. Literal, never a glob. */
+function inTree(exec, rev, path) {
+  return run(exec, ['--literal-pathspecs', 'ls-tree', '-z', '--name-only', rev, '--', path]).split('\0').includes(path);
+}
+
+/** One file's PR-own patch from the merge-base `mb` to `head`, as a position-independent signature. */
+function ownPatch(exec, head, mb, path) {
   // --literal-pathspecs: `path` is data from the caller, never a glob or pathspec magic.
-  const text = String(exec('git', ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', '--unified=3', mb, head, '--', path],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: MAX }));
-  return signature(text);
+  // --ignore-submodules=none: a repo/user `diff.ignoreSubmodules` or `.gitmodules` `ignore=all` must not hide a pointer bump.
+  return signature(run(exec, ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames',
+    '--ignore-submodules=none', '--binary', '--unified=3', mb, head, '--', path], { maxBuffer: MAX }));
 }
 
 /**
@@ -52,13 +71,21 @@ function ownPatch(exec, head, base, path) {
 export function netInterdiff({ exec, priorHead, head, base, rawFiles } = {}) {
   try {
     if (typeof exec !== 'function' || !SHA.test(priorHead ?? '') || !SHA.test(head ?? '')) return null;
-    if (typeof base !== 'string' || !base || base.startsWith('-') || !REF.test(base)) return null;
+    if (typeof base !== 'string' || base.startsWith('-') || !REF.test(base)) return null;
     if (!rawFiles || typeof rawFiles !== 'object' || Array.isArray(rawFiles)) return null;
+    const entries = Object.entries(rawFiles);
+    // Bound the work (about five git calls per path): over the cap the caller keeps the raw range.
+    if (entries.length > MAX_FILES) return null;
+    for (const [path] of entries) if (typeof path !== 'string' || !path || path.startsWith('-')) return null;
     const files = {};
     const dropped = [];
-    for (const [path, lines] of Object.entries(rawFiles)) {
-      if (typeof path !== 'string' || !path || path.startsWith('-')) return null;
-      if (ownPatch(exec, priorHead, base, path) === ownPatch(exec, head, base, path)) dropped.push(path);
+    if (!entries.length) return { files, dropped };
+    const mbPrior = mergeBase(exec, priorHead, base);
+    const mbHead = mergeBase(exec, head, base);
+    for (const [path, lines] of entries) {
+      // A path git does not see at either head would give an empty diff at both and be "dropped": refuse instead.
+      if (!inTree(exec, priorHead, path) && !inTree(exec, head, path)) return null;
+      if (ownPatch(exec, priorHead, mbPrior, path) === ownPatch(exec, head, mbHead, path)) dropped.push(path);
       else files[path] = lines;
     }
     return { files, dropped };
