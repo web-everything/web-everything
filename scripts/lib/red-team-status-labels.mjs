@@ -12,7 +12,9 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
   // pass never plans clear for a conflict it just recorded.
   const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
-  const broken = disposition.sendBack.length || disposition.held.length;
+  // A hold that is only "publication pending" (stored evidence not sealed yet) is no break: pending, never clear.
+  const pendingOnly = !disposition.sendBack.length && disposition.held.length > 0 && disposition.held.every(f => f.unsealed === true);
+  const broken = !pendingOnly && (disposition.sendBack.length || disposition.held.length);
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
     const names = labels.map(label => typeof label === 'string' ? label : label?.name);
@@ -22,6 +24,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
   const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
   const desired = broken ? 'red-team:blocked'
+    : pendingOnly ? 'red-team:pending'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;

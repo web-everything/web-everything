@@ -56,6 +56,10 @@ function publish(comments, extra = {}) {
   const out = publishStoredRedTeamResult({ status: readStatusFile(), listComments: () => comments, postComment, publishNeedsYou, ...extra });
   return { out, postComment, publishNeedsYou };
 }
+/** A trusted carry of the "no break found" result from `head` onto `to` (the carry machine's own comment shape). */
+const carriedClear = to => trusted([`<!-- review-verdict-carried from=${head} to=${to} patch-id=${'c'.repeat(40)} -->`,
+  'Review verdict carried across an identical contribution.', redTeamMarker(42, to),
+  '### Post-accept red team — no break found'].join('\n'));
 const heldBy = comments => readRedTeamDisposition({ comments, pr: 42, head, repo, env: process.env });
 const prFor = comments => ({ number: 42, repo, headRefOid: head, comments, labels: ['review:human'] });
 
@@ -226,8 +230,41 @@ describe('the sealed status reader fails closed', () => {
     expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toMatchObject({ unsealed: true });
     expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
     expect(redTeamEnqueueHold({ comments: [clearComment], pr: 42, head, repo, ok: true, loopPayload: null })).toMatch(/confirmed a break/);
-    expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: [], comments: [clearComment], evidence: {} }).add)
-      .toBe('red-team:blocked');
+    // Not a break yet (nothing compared), so pending: never clear, and an existing clear label is stripped.
+    expect(planRedTeamStatusLabels({ repo, pr: 42, head, env: process.env, labels: ['red-team:clear'], comments: [clearComment], evidence: {} }))
+      .toEqual({ add: 'red-team:pending', remove: ['red-team:clear'] });
+  });
+  it('a carried result whose source head is unsealed: one sweep pass seals the source (posting nothing) and plans blocked', () => {
+    // Head A holds the stored break, unsealed; the live head B carries A's "no break found" comment.
+    const live = 'b'.repeat(40);
+    store([seatRow()]);
+    writeStatusFile(legacyStatus());
+    const thread = [clearComment, { ...carriedClear(live), createdAt: '2026-11-10T12:05:00Z' }];
+    const at = h => readRedTeamDisposition({ comments: thread, pr: 42, head: h, repo, env: process.env });
+    // Precondition: the carry is read as a carry from A, and A's unsealed status holds B (pending, not clear).
+    expect(at(live).held).toEqual([expect.objectContaining({ index: 0, unsealed: true })]);
+    let labels = ['red-team:clear'];
+    const posted = [];
+    const view = () => ({ number: 42, state: 'OPEN', labels: labels.map(name => ({ name })), headRefOid: live, comments: thread, reviews: [] });
+    sweepAdvisoryLabels({ repo, listPrs: () => [view()], readPr: view, log: () => {},
+      provider: { currentRepo: () => repo, readComments: () => thread, postComment: (...a) => posted.push(a), ensureLabel: () => {},
+        setLabels: (_r, _p, { add, remove }) => { labels = labels.filter(l => !remove.includes(l)); if (add && !labels.includes(add)) labels.push(add); } },
+      listUnpublishedStatuses: () => [], publishStored: input => publishStoredRedTeamResult({ ...input, publishNeedsYou: () => {} }) });
+    expect(posted).toEqual([]);
+    expect(readStatusFile().sealedBreaks).toHaveLength(1);
+    expect(at(live).held).toEqual([expect.objectContaining({ index: 0 })]);
+    expect(at(live).held[0].unsealed).toBeUndefined();
+    expect(labels).toEqual(['red-team:blocked']);
+  });
+  it('a carried result from a source with no break: the source seals empty and the carried head is not held', () => {
+    const live = 'b'.repeat(40);
+    store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);
+    writeStatusFile(legacyStatus());
+    const thread = [clearComment, { ...carriedClear(live), createdAt: '2026-11-10T12:05:00Z' }];
+    expect(publishStoredRedTeamResult({ status: readStatusFile(), sealOnly: true, listComments: () => thread,
+      postComment: () => { throw Error('never'); }, publishNeedsYou: () => { throw Error('never'); } })).toEqual({ status: 'skipped' });
+    expect(readStatusFile().sealedBreaks).toEqual([]);
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held).toEqual([]);
   });
   it('a stored row with no confirmed break seals an EMPTY list, which lifts the unsealed hold for an agreeing comment', () => {
     store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);

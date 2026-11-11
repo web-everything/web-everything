@@ -2,6 +2,7 @@
 import { RED_TEAM_STATUS_LABELS, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { readDrainRedTeamEvidence, redTeamStatusDir, settleUnknownEvidenceByComment } from '../lib/drain-red-team-evidence.mjs';
 import { needsPublish, publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
+import { redTeamCarrySources } from '../lib/red-team-gate.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
  * @description THE `advisory:*` STALENESS SWEEP — drops `advisory:accepted` / `advisory:changes` from any open PR
@@ -204,6 +205,22 @@ export function sweepAdvisoryLabels({
         } catch (e) {
           publication.publishError = String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 300);
           log(`red-team publication #${pr.number}: ${publication.publishError}`);
+        }
+      }
+      // A carried result holds on the seal of the head it came from, and only the live head is published above: seal
+      // those source heads too (seal only, nothing posted for a superseded head), or the carried head holds forever.
+      if (!dryRun) {
+        for (const from of redTeamCarrySources({ comments, pr: pr.number, head: live.headRefOid })) {
+          try {
+            const source = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: from }).status;
+            if (!needsPublish(source) || source.head !== from) continue;
+            const sealed = publishStored({ status: source, sealOnly: true,
+              listComments: () => provider.readComments(resolvedRepo, pr.number),
+              postComment: () => { throw Error('a seal-only pass never posts'); } });
+            if (sealed.status !== 'skipped') (publication.sourceSeals ??= []).push(`${from.slice(0, 9)}:${sealed.status}`);
+          } catch (e) {
+            log(`red-team source seal #${pr.number}@${from.slice(0, 9)}: ${String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 200)}`);
+          }
         }
       }
       evidence = settleUnknownEvidenceByComment(evidence, comments, pr.number, live.headRefOid, live.reviews);

@@ -732,6 +732,22 @@ export function redTeamHoldDecision({ comments, pr, head, sealed } = {}) {
     : 'stored evidence holds a confirmed break and no red-team comment shows it' };
 }
 
+/**
+ * The heads the live head's red-team result was carried from, nearest first (at most 8 hops). The disposition reads
+ * their seal for a carried result, and the sweep seals them, from this one list. PURE.
+ */
+export function redTeamCarrySources({ comments, pr, head } = {}) {
+  const out = [];
+  let rs = indexedRecords(comments), hit = latestResult(rs, pr, String(head ?? '').toLowerCase());
+  for (let hop = 0; hit?.from && hop < 8; hop++) {
+    out.push(hit.from);
+    const at = hit.at;
+    rs = rs.filter(r => r.at < at);
+    hit = latestResult(rs, pr, hit.from);
+  }
+  return out;
+}
+
 /** Does the live head's posted red-team comment show EXACTLY these confirmed breaks (whole normalized lists)? PURE. */
 export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
   const parsed = latestResult(indexedRecords(comments), pr, String(head ?? '').toLowerCase())?.parsed ?? null;
@@ -875,12 +891,10 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     // directory with no seal (a missing file reads as "nothing sealed", which would clear). Explicit keys still win.
     const sealEnv = { ...process.env, ...(env ?? {}) };
     seal = readSealedStatus({ repo, pr, head: live, env: sealEnv });
-    let hit = latestResult(records, pr, live), rs = records;
-    for (let hop = 0; seal === null && hit?.from && hop < 8; hop++) {
-      const at = hit.at;
-      rs = rs.filter(r => r.at < at);
-      seal = readSealedStatus({ repo, pr, head: hit.from, env: sealEnv });
-      hit = latestResult(rs, pr, hit.from);
+    // The sweep seals these source heads too (seal only), so an unsealed source cannot hold a carried head forever.
+    for (const from of redTeamCarrySources({ comments, pr, head: live })) {
+      if (seal !== null) break;
+      seal = readSealedStatus({ repo, pr, head: from, env: sealEnv });
     }
   }
   const hold = redTeamHoldDecision({ comments, pr, head: live, sealed: seal });

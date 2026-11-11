@@ -32,7 +32,7 @@ export function renderMinimalRedTeamComment({ pr, rev, findings, omitLocation = 
 }
 
 /** Synchronous IO shell, like the sweep. Persist retry/escalation state atomically, with a two-attempt bound. */
-export function publishStoredRedTeamResult({ status, listComments, postComment,
+export function publishStoredRedTeamResult({ status, listComments, postComment, sealOnly = false,
   renderFull = renderRedTeamComment, renderMinimal = renderMinimalRedTeamComment,
   redTeamCommentPosted = markerPosted, scrub = scrubPublish,
   statusDir = redTeamStatusDir(), withLock = withFileLock,
@@ -151,7 +151,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
           return { status: 'skipped' };
         }
       }
-    } catch { return failedAttempt(); }
+    } catch { return sealOnly ? { status: 'retry' } : failedAttempt(); }
     // Outside the try: a failing alert write must not be counted as a publish attempt.
     if (conflict) return holdLegacy();
     if (legacy) {
@@ -159,6 +159,11 @@ export function publishStoredRedTeamResult({ status, listComments, postComment,
     }
     // Sealed before any post (unreadable findings seal as unreadable), so a crash or a failed post leaves the hold in place.
     seal(result?.findings);
+    // `sealOnly` (a superseded head a carried result came from): record the seal, never post or escalate for it.
+    if (sealOnly) {
+      if (sealDirty) writeStatus(status);
+      return { status: 'sealed' };
+    }
     if (status.publishAttempts >= 2) return escalate();
     try {
       if (!Array.isArray(result.findings)) throw Error('red-team findings unreadable');
