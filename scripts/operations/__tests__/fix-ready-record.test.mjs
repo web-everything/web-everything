@@ -490,6 +490,40 @@ describe('fix-ready-record main()', () => {
           expect(existsSync(ledger)).toBe(false);
           expect(existsSync(join(dir, 'missing'))).toBe(false);
         });
+        // A terminal `/`, `/.` or `/..` names a DIRECTORY: the kernel refuses to open a regular file through it (ENOTDIR),
+        // so the adoption matrix reads nothing, yet a textual or symlink-resolving compare would call it the same file.
+        it.each([
+          ['a trailing slash', (l) => `${l}/`],
+          ['a trailing `/.`', (l) => `${l}/.`],
+          ['a trailing `/./`', (l) => `${l}/./`],
+          ['a trailing double slash', (l) => `${l}//`],
+          ['a trailing `/..` that cannot reach the file', (l) => `${l}/..`],
+        ])('refuses (exit 1) a reader path with %s after an existing ledger file, and appends nothing', (_n, spell) => {
+          const { dir, settingsFile, ledger } = setup();
+          const { err } = quiet();
+          writeFileSync(ledger, '');
+          const env = { HOME: dir, WE_FIX_READY_PATH: spell(ledger) };
+          expect(main(argv, { env, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+          expect(err.mock.calls[0][0]).toMatch(/refused/);
+          expect(err.mock.calls[0][0]).toContain(`adoption matrix reads ${spell(ledger)}`);
+          expect(readFileSync(ledger, 'utf8')).toBe('');
+        });
+        it('refuses the same trailing spellings on the writer side, and when the ledger does not exist yet', () => {
+          const { dir, settingsFile, ledger } = setup();
+          quiet();
+          writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: `${ledger}/.` }));
+          expect(main(argv, { env: { HOME: dir, WE_FIX_READY_PATH: ledger }, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+          writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: ledger }));
+          expect(main(argv, { env: { HOME: dir, WE_FIX_READY_PATH: `${dir}/not-yet.jsonl/` }, settingsFile, adoptionSettings: { fixReadyPath: null } })).toBe(1);
+          expect(existsSync(ledger)).toBe(false);
+        });
+        it('canonicalPath returns null for a terminal `/`, `/.` or `/..` and keeps accepting a middle `.` or `//`', () => {
+          const { dir } = setup();
+          writeFileSync(join(dir, 'plain.txt'), 'x');
+          for (const tail of ['/', '/.', '/./', '//', '/..', '/sub/..']) expect(canonicalPath(`${dir}/plain.txt${tail}`)).toBeNull();
+          expect(canonicalPath(`${dir}/sub/`)).toBeNull(); // even a real directory is not a ledger file
+          expect(canonicalPath(`${dir}/./sub//plain`)).toBe(`${dir}/sub/plain`);
+        });
         it('refuses an unopenable name on the writer side too', () => {
           const { dir, settingsFile } = setup();
           const { err } = quiet();
@@ -513,6 +547,15 @@ describe('fix-ready-record main()', () => {
           const err = Object.assign(new Error('boom'), { code: 'EACCES' });
           const fsApi = { realpathSync: () => { throw err; }, lstatSync: () => { throw err; }, statSync: () => { throw err; } };
           expect(canonicalPath('/a/b', fsApi)).toBeNull();
+        });
+        it('treats a lookup error after a missing component, or on a `..` / `.` step, as unopenable too', () => {
+          const code = (c) => Object.assign(new Error(c), { code: c });
+          const throws = (c) => () => { throw code(c); };
+          // realpath says "missing" but the follow-up lstat fails differently: not an ordinary missing file
+          expect(canonicalPath('/a/b', { realpathSync: throws('ENOENT'), lstatSync: throws('EACCES'), statSync: throws('EACCES') })).toBeNull();
+          // the directory check behind `..` and `.` fails
+          expect(canonicalPath('/a/../b', { realpathSync: (p) => p, lstatSync: throws('ENOENT'), statSync: throws('EACCES') })).toBeNull();
+          expect(canonicalPath('/a/./b', { realpathSync: (p) => p, lstatSync: throws('ENOENT'), statSync: throws('EACCES') })).toBeNull();
         });
       });
       it('still refuses two different files whose names merely look alike', () => {

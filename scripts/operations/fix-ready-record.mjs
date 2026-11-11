@@ -39,16 +39,29 @@ export function adoptionReaderPath({ env = process.env, home = env.HOME || homed
  *
  *  Returns null when the kernel itself would refuse the name, so a spelling that only LOOKS like another file is never
  *  accepted as it: `..` after a component that does not exist (ENOENT), after a regular file (ENOTDIR) or after a
- *  dangling symlink; any component below a regular file or a dangling symlink; and any lookup error other than "does
- *  not exist" (permission, symlink loop, name too long), which is treated as unopenable, never as a missing file. */
+ *  dangling symlink; any component below a regular file or a dangling symlink; a name that ends in `/`, `/.` or `/..`
+ *  (it names a directory, so a ledger file cannot be opened through it: ENOTDIR); a `.` after a regular file; and any
+ *  lookup error other than "does not exist" (permission, symlink loop, name too long), which is treated as unopenable,
+ *  never as a missing file. */
 export function canonicalPath(p, fsApi = fs) {
   const abs = isAbsolute(p) ? p : `${process.cwd()}${sep}${p}`;
   let cur = parse(abs).root;
   let exists = true;
   let dangling = false; // the last component is a symlink whose target is missing: nothing can be looked up below it
-  for (const part of abs.slice(cur.length).split(sep)) {
-    if (part === '' || part === '.') continue;
+  const parts = abs.slice(cur.length).split(sep);
+  // A name that ends in `/`, `/.` or `/..` names a DIRECTORY: the kernel refuses to open a regular file through it
+  // (ENOTDIR), so no reader can open a ledger by that spelling, however the rest of it resolves.
+  const last = parts[parts.length - 1];
+  if (last === '' || last === '.' || last === '..') return null;
+  for (const part of parts) {
+    if (part === '') continue; // redundant slashes (a//b) are one separator
     if (dangling) return null;
+    if (part === '.') {
+      // `.` is looked up in the directory resolved so far: it must exist and be a directory (`file/./x` is ENOTDIR)
+      if (!exists) continue; // not written yet: the writer creates these directories, nothing to check
+      try { if (!fsApi.statSync(cur).isDirectory()) return null; } catch { return null; }
+      continue;
+    }
     if (part === '..') {
       if (!exists) return null; // the kernel must look up the missing directory before it can step out of it
       try { if (!fsApi.statSync(cur).isDirectory()) return null; } catch { return null; }
