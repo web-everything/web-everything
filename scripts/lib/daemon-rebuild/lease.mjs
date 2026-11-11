@@ -89,6 +89,11 @@ export const ACTIVE_BUILD_TOKENS = new Set();
 export const REBUILD_LEASE_STALE_ENV = 'WE_DAEMON_REBUILD_LEASE_STALE_MS';
 export const DEFAULT_REBUILD_LEASE_STALE_MS = 20 * 60_000;
 
+/** Effective lifetime shared by lease liveness and smoke queue admission. */
+export function rebuildLeaseStaleMs(env = process.env) {
+  return Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : DEFAULT_REBUILD_LEASE_STALE_MS;
+}
+
 /**
  * Is `building` (a `state.building` lease record) held by a build that is still running? Same host + this pid:
  * only while its token is in {@link ACTIVE_BUILD_TOKENS}. Same host, other pid: while that pid is alive and the
@@ -132,7 +137,7 @@ export function pidReusedSince(pid, startedMs, startTimeOf = processStartMs) {
 
 export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now(), startTimeOf = processStartMs } = {}) {
   if (!building || typeof building !== 'object') return false;
-  const staleMs = Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : DEFAULT_REBUILD_LEASE_STALE_MS;
+  const staleMs = rebuildLeaseStaleMs(env);
   const startedMs = Date.parse(building.startedAt || '');
   if (!Number.isFinite(startedMs) || nowMs - startedMs > staleMs) return false;
   if (building.host !== hostname()) return true;

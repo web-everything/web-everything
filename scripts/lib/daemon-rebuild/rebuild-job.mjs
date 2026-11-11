@@ -49,7 +49,7 @@ const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
 
 /** Env override: `1` forces job mode on for every caller, `0` forces it off (rollback). */
 export const REBUILD_AS_JOB_ENV = 'WE_DAEMON_REBUILD_AS_JOB';
-export const DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS = 5 * 60_000;
+export const DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS = 15 * 60_000;
 export const FINISHED_REBUILD_JOB_KEEP_MS = 24 * 60 * 60_000;
 export const RESULT_SUFFIX = '.result';
 const CONSUMED_FILE = 'consumed.json';
@@ -219,13 +219,12 @@ export async function rebuildCloneAsJob({
     return { ...r, finishedJobs };
   }
 
-  // 4. A build is due. Space builds by `minIntervalMs` after one that did not record a ready candidate (a
-  //    transient hold writes no reject record; without this the job would re-smoke back to back).
+  // 4. A build is due. Space builds by `minIntervalMs` after ANY finished build, ready or not, so queued main
+  //    moves fold into one rebuild per interval (a ready candidate is adopted in step 3, never delayed).
   const last = mine().filter((x) => TERMINAL_JOB_STATUSES.includes(x.job.status))
     .sort((a, b) => Date.parse(b.job.finishedAt || 0) - Date.parse(a.job.finishedAt || 0))[0];
-  const lastRes = last ? readResult(store.dir, last.id) : null;
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
-  if (last && !lastRes?.readyRecorded && sinceMs < settings.minIntervalMs) {
+  if (last && sinceMs < settings.minIntervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: settings.minIntervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
