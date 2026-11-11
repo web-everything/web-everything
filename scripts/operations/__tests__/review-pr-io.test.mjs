@@ -281,7 +281,12 @@ describe('the label sink', () => {
   });
 
   it.each(['UNKNOWN: connection reset', '--body-file=gone.md is unreadable after write',
-    'some file is unreadable (ENOENT)', 'invalid --repo'])('does not recover unrelated pending errors: %s', error => {
+    'some file is unreadable (ENOENT)', 'invalid --repo',
+    // A post-write gh line that only CONTAINS a body-file refusal phrase is not proof (patterns are anchored).
+    'review-set-label.mjs failed and its outcome is UNKNOWN: HTTP 422: --body-file=x.md is unreadable (ENOENT)',
+    'review-set-label.mjs failed and its outcome is UNKNOWN: gh: --body-file=x.md is empty — pass the verdict write-up',
+    'review-set-label.mjs reported an error and its outcome is UNKNOWN: comment failed: --body-file must live under the repo root or a temp dir (got /x)',
+  ])('does not recover unrelated pending errors: %s', error => {
     const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root });
     expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error })).toBe(false);
   });

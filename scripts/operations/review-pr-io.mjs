@@ -799,10 +799,13 @@ export function createReviewPrReader({
  */
 // These argument checks run in the CLI entry point before runReviewLabelCli can mutate anything.
 // Exported so a test can require one real-CLI no-write case per pattern: each one licenses a replay.
+// ANCHORED to the start of the CLI's own error text (optionally behind the sink's own UNKNOWN wrapper), so a
+// post-write `gh` stderr line that merely CONTAINS one of these phrases never licenses a replay.
+const BODY_FILE_ANCHOR = '^(?:review-set-label\\.mjs (?:failed|reported an error) and its outcome is UNKNOWN: )?';
 export const BODY_FILE_REFUSALS = Object.freeze([
-  /--body-file=[^\r\n]+ is unreadable \(/,
-  /--body-file=[^\r\n]+ is empty — pass the verdict write-up/,
-  /--body-file must live under the repo root or a temp dir \(got /,
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is unreadable \\(`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is empty — pass the verdict write-up`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file must live under the repo root or a temp dir \\(got `),
 ]);
 const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_REFUSALS.some(p => p.test(text));
 
