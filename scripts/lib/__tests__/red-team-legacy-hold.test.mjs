@@ -535,6 +535,43 @@ describe('the stored result is the authority on every status shape (self-review 
     expect(kind === 'unreadable' ? sealed : sealed?.findings).toEqual(kind === 'unreadable' ? { unreadable: true } : [expect.objectContaining({ confirmed: true })]);
     expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
   });
+  // The REAL queued writers (review-job's fresh admission, the retry admission) re-send the prior result with status
+  // `queued`; the reader takes a result as evidence only when finished, so the findings must be carried there too.
+  it.each([
+    ['a deduped seat-posted result', () => ({ ...posted([brokenFinding]), comment: 'deduped' }), 'findings'],
+    ['a withheld result', () => ({ ...posted([brokenFinding]), comment: 'withheld' }), 'findings'],
+    ['an unsealed bare legacy `ran` result', () => 'ran', 'unreadable'],
+  ])('a queued retry that re-sends %s keeps it held, through running and a finished error or skip', (_name, priorResult, kind) => {
+    writeStatusFile({ repo, pr: 42, head, status: 'finished', result: priorResult() });
+    const expectHeld = () => {
+      const sealed = readSealedStatus({ repo, pr: 42, head, env: process.env });
+      expect(kind === 'unreadable' ? sealed : sealed?.findings).toEqual(kind === 'unreadable' ? { unreadable: true } : [expect.objectContaining({ confirmed: true })]);
+      expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+    };
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'queued', result: priorResult() }, { env: process.env });
+    expectHeld();
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expectHeld();
+    // An error or a skip is not a replacement result: it carries no findings of its own.
+    for (const result of [{ status: 'error' }, 'skipped']) {
+      recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result }, { env: process.env });
+      if (kind === 'findings') expectHeld();
+      recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+      expectHeld();
+    }
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'finished', result: posted([]) }, { env: process.env });
+    expect(readStatusFile().storedFindings).toBeUndefined();
+    expect(heldBy([clearComment]).held).toEqual([]);
+  });
+  it('a truncated status file whose evidence is a seat-posted result is repaired as unreadable, never as nothing stored', () => {
+    const whole = JSON.stringify({ repo, pr: 42, head, status: 'finished', result: posted([brokenFinding]) });
+    mkdirSync(join(statusFile(), '..'), { recursive: true });
+    writeFileSync(statusFile(), whole.slice(0, whole.indexOf('"findings"') + 14));
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toEqual({ unreadable: true });
+    recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });
+    expect(readSealedStatus({ repo, pr: 42, head, env: process.env })).toEqual({ unreadable: true });
+    expect(heldBy([clearComment]).held.length).toBeGreaterThanOrEqual(1);
+  });
   it('a no-result rewrite after a clean seat-posted result holds nothing (no false hold)', () => {
     writeStatusFile({ repo, pr: 42, head, status: 'finished', result: posted([]) });
     recordRedTeamStatus({ repo, pr: 42, loopPayload, status: 'running' }, { env: process.env });

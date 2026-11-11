@@ -439,18 +439,22 @@ function priorPassFindings(prior, { legacy = false } = {}) {
   return undefined;
 }
 
+/** Does a rewritten status present its OWN result as pass evidence (what `sealedFromStatus` reads)? Only a finished `ran`. */
+const presentsOwnEvidence = (status, result) => status === 'finished'
+  && (result === 'ran' || (result != null && typeof result === 'object' && result.status === 'ran'));
+
 /**
- * The stored findings a rewrite must carry (PR #6622). Any rewrite that drops the prior result WITHOUT a replacement
- * result — a resume (bare `resumed`) or a queued/running rewrite (no result yet) — would drop the only stored evidence
- * of an unsealed pass, so its findings are carried as `storedFindings`, read by `sealedFromStatus` exactly like the
- * result's own findings, until a NEW result replaces them. A queued/running rewrite also carries an unsealed bare
- * legacy `ran` as unreadable: the new pass's result replaces it. A resume does not (no new result would ever replace
- * it, so it would hold forever); the publisher's legacy path owns that shape. PURE.
+ * The stored findings a rewrite must carry (PR #6622). The reader takes a result's findings as evidence only from a
+ * FINISHED `ran` result, so every rewrite that stops presenting the prior pass that way — a queued retry that re-sends
+ * the same result, a running rewrite with no result, a resume (bare `resumed`), a finished error/skip — would drop the
+ * only stored evidence of an unsealed pass. Its findings are carried as `storedFindings`, read exactly like the result's
+ * own, until a NEW finished `ran` result replaces them. While a pass is pending (not finished), an unsealed bare legacy
+ * `ran` is carried as unreadable too: the pending pass's result replaces it. A finished rewrite does not carry that
+ * shape (nothing would ever replace it, so it would hold forever); the publisher's legacy path owns it. PURE.
  */
-export function carriedStoredFindings(prior, result) {
+export function carriedStoredFindings(prior, result, status = 'finished') {
   if (!prior) return undefined;
-  if (result == null) return priorPassFindings(prior, { legacy: true }) ?? prior.storedFindings;
-  if (resumedResult(result)) return priorPassFindings(prior) ?? prior.storedFindings;
+  if (!presentsOwnEvidence(status, result)) return priorPassFindings(prior, { legacy: status !== 'finished' }) ?? prior.storedFindings;
   // The same result keeps what an earlier rewrite carried; a NEW result drops it (the new result is the evidence now).
   return keepSeal({ ...prior, damaged: false }, result) ? prior.storedFindings : undefined;
 }
@@ -477,10 +481,11 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
     // Without a retry marker, ordinary writers may repair damaged JSON just as before retry admission.
     // Preserve marked evidence for inspection, and propagate filesystem errors even without a marker.
     if (retryMarkerSpent(path) || (!(error instanceof SyntaxError) && error.code !== 'RED_TEAM_STATUS_IDENTITY')) throw error;
-    // A damaged file that carried a seal or a legacy hold must not be repaired into "nothing sealed": seal it unreadable.
+    // A damaged file that carried a seal, a legacy hold or stored pass evidence (a `ran` result, its findings, carried
+    // `storedFindings`) must not be repaired into "nothing sealed": seal it unreadable.
     let raw = '';
     try { raw = String(optionalBytes(path) ?? ''); } catch { raw = '"sealedBreaks"'; }
-    prior = /"(sealedBreaks|sealedPosted|legacyHoldPublished)"/.test(raw) ? { sealedBreaks: 'unreadable', damaged: true } : null;
+    prior = /"(sealedBreaks|sealedPosted|legacyHoldPublished|storedFindings|findings)"|"ran"/.test(raw) ? { sealedBreaks: 'unreadable', damaged: true } : null;
   }
   const spent = prior?.retryCount;
   if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
@@ -523,7 +528,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
       ...(prior?.sealedPosted !== undefined ? { sealedPosted: prior.sealedPosted } : {}),
       ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),
     } : {}),
-    ...(carriedStoredFindings(prior, result) !== undefined ? { storedFindings: carriedStoredFindings(prior, result) } : {}),
+    ...(carriedStoredFindings(prior, result, status) !== undefined ? { storedFindings: carriedStoredFindings(prior, result, status) } : {}),
     ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }
