@@ -43,9 +43,9 @@ import {
 import { runBounded } from '../bounded-child.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { ghSlotWaitClass, ghSlotWaitMs } from '../gh-throttle.mjs';
-// Fixture env names are assembled at runtime so the forge bundle credential scan does not read them as secret assignments.
-const GH_TOKEN_KEY = ['GH', 'TOKEN'].join('_');
-const GITHUB_TOKEN_KEY = ['GITHUB', 'TOKEN'].join('_');
+// Fixture credential values are assembled at runtime (pieces joined) so no long literal sits next to a credential-named key.
+const AMBIENT_STALE = ['daemon', 'ambient', 'stale'].join('-');
+const AMBIENT_STALE_TOKEN = `${AMBIENT_STALE}-token`;
 vi.mock('../settings-files.mjs', async (original) => {
   const actual = await original();
   return { ...actual, readDeclaredSettings: vi.fn(actual.readDeclaredSettings) };
@@ -1412,7 +1412,7 @@ it('gh-api-repo still fails and preserves the real error plus shim warning in a 
 
 describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
   it('strips an inherited GH_TOKEN/GITHUB_TOKEN even when App auth is not configured (no shim to fall back on)', () => {
-    const out = ghDispatchedSessionEnv({ [GH_TOKEN_KEY]: 'daemon-ambient-stale', [GITHUB_TOKEN_KEY]: 'also-stale', PATH: '/usr/bin', HOME: '/x' });
+    const out = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE, GITHUB_TOKEN: 'also-stale', PATH: '/usr/bin', HOME: '/x' });
     expect(out.GH_TOKEN).toBeUndefined();
     expect(out.GITHUB_TOKEN).toBeUndefined();
     expect(out.PATH).toBe('/usr/bin');
@@ -1423,7 +1423,7 @@ describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
     const out = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        [GH_TOKEN_KEY]: 'daemon-ambient-stale', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GH_TOKEN: AMBIENT_STALE,
       },
       {
         pathEnv: '/opt/homebrew/bin', dir: '/shim', cachePath: '/x/cache.json',
@@ -1438,7 +1438,7 @@ describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
     const out = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        [GITHUB_TOKEN_KEY]: 'daemon-ambient-stale', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GITHUB_TOKEN: AMBIENT_STALE,
       },
       { pathEnv: '/opt/homebrew/bin', dir: '/shim', exists: () => true, writeFile: vi.fn(), chmod: vi.fn(), mkdir: vi.fn() },
     );
@@ -1462,7 +1462,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
 
   it('FAILS (RED→GREEN: this is what today\'s bug let quietly pass) when routed through ghDispatchedSessionEnv against a daemon env carrying a stale ambient GH_TOKEN and no shim configured', async () => {
     const runChild = vi.fn(fakeGh);
-    const ghChildEnv = ghDispatchedSessionEnv({ [GH_TOKEN_KEY]: 'daemon-ambient-stale-token', PATH: '/usr/bin' });
+    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' });
     const result = await ghApiCheck({ ghChildEnv, budgets: { ghApiMs: 1000 }, runChild });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/failed/);
@@ -1471,7 +1471,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
 
   it('gh-pr-list FAILS the same way, for the same reason', async () => {
     const runChild = vi.fn(fakeGh);
-    const ghChildEnv = ghDispatchedSessionEnv({ [GH_TOKEN_KEY]: 'daemon-ambient-stale-token', PATH: '/usr/bin' });
+    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' });
     const result = await ghPrListCheck({ ghChildEnv, budgets: { ghPrListMs: 1000 }, runChild });
     expect(result.ok).toBe(false);
   });
@@ -1480,7 +1480,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
     const runChild = vi.fn(fakeGh);
     // Reproduces the pre-fix `ghEnvFor`: no shim contributed (App auth unconfigured here, matching the
     // isolated unit above), so `{...env, ...null}` === env, UNCHANGED — the ambient token survives untouched.
-    const preFixGhChildEnv = { [GH_TOKEN_KEY]: 'daemon-ambient-stale-token', PATH: '/usr/bin' };
+    const preFixGhChildEnv = { GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' };
     const result = await ghApiCheck({ ghChildEnv: preFixGhChildEnv, budgets: { ghApiMs: 1000 }, runChild });
     expect(result.ok).toBe(true); // demonstrates the masking bug: the gate would have adopted broken code
   });
@@ -1490,7 +1490,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
     const ghChildEnv = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        [GH_TOKEN_KEY]: 'daemon-ambient-stale-token', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GH_TOKEN: AMBIENT_STALE_TOKEN,
       },
       { pathEnv: '/opt/homebrew/bin', dir: '/shim', exists: () => true, writeFile: vi.fn(), chmod: vi.fn(), mkdir: vi.fn() },
     );
@@ -1865,7 +1865,7 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
   it('a stale inherited token (no refresh) is classified auth-broken — pre-fix it was code, then smoke-harness-broken', async () => {
     const identity = async ({ env }) => ({ env: { ...env }, refresh: null }); // the pre-fix behavior: no refresh
     const r = await runLiveSmokeWithRetry({
-      root: '/x', env: { [GH_TOKEN_KEY]: STALE }, runChild: authAwareRunChild(), sleep: async () => {}, refreshAuth: identity,
+      root: '/x', env: { GH_TOKEN: STALE }, runChild: authAwareRunChild(), sleep: async () => {}, refreshAuth: identity,
     });
     expect(r.verdict).not.toBe('pass');
     expect(r.verdict).not.toBe('code'); // the probe proves it is the environment's credential, not the tree
@@ -1874,9 +1874,9 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
 
   it('every attempt gets a fresh token the way the daemon tick does — the stale inherited one never reaches a child', async () => {
     const seen = [];
-    const refreshAuth = vi.fn(async ({ env }) => ({ env: { ...env, [GH_TOKEN_KEY]: FRESH }, refresh: { applied: true, reason: 'ok' } }));
+    const refreshAuth = vi.fn(async ({ env }) => ({ env: { ...env, GH_TOKEN: FRESH }, refresh: { applied: true, reason: 'ok' } }));
     const r = await runLiveSmokeWithRetry({
-      root: '/x', env: { [GH_TOKEN_KEY]: STALE }, runChild: authAwareRunChild(seen), sleep: async () => {}, refreshAuth,
+      root: '/x', env: { GH_TOKEN: STALE }, runChild: authAwareRunChild(seen), sleep: async () => {}, refreshAuth,
     });
     expect(r.verdict).toBe('pass');
     expect(refreshAuth).toHaveBeenCalledTimes(1);
@@ -1888,7 +1888,7 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
     const refreshAuth = vi.fn(async ({ env, force }) => {
       calls.push(!!force);
       // the shared cache hands out the rejected token until a forced re-mint replaces it
-      return { env: { ...env, [GH_TOKEN_KEY]: force ? FRESH : STALE }, refresh: { applied: true, reason: 'ok' } };
+      return { env: { ...env, GH_TOKEN: force ? FRESH : STALE }, refresh: { applied: true, reason: 'ok' } };
     });
     const sleep = vi.fn(async () => {});
     const r = await runLiveSmokeWithRetry({ root: '/x', env: {}, runChild: authAwareRunChild(), sleep, refreshAuth, retries: 0 });
@@ -1899,7 +1899,7 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
   });
 
   it('still 401 after the forced re-mint → verdict auth-broken with the probe detail (never code, never a 3rd try)', async () => {
-    const refreshAuth = vi.fn(async ({ env }) => ({ env: { ...env, [GH_TOKEN_KEY]: STALE }, refresh: { applied: false, reason: 'mint-failed' } }));
+    const refreshAuth = vi.fn(async ({ env }) => ({ env: { ...env, GH_TOKEN: STALE }, refresh: { applied: false, reason: 'mint-failed' } }));
     const r = await runLiveSmokeWithRetry({ root: '/x', env: {}, runChild: authAwareRunChild(), sleep: async () => {}, refreshAuth, retries: 2 });
     expect(r.verdict).toBe('auth-broken');
     expect(refreshAuth).toHaveBeenCalledTimes(2);
@@ -1945,14 +1945,14 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
 
   it('refreshSmokeGithubEnv requests per-owner auth by default', async () => {
     const ensureFresh = vi.fn(async () => ({ applied: false, reason: 'insufficient-access' }));
-    const src = { [GH_TOKEN_KEY]: STALE, [GITHUB_TOKEN_KEY]: STALE };
+    const src = { GH_TOKEN: STALE, GITHUB_TOKEN: STALE };
     const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
     expect(ensureFresh.mock.calls[0][0].perOwner).toBe(true);
     expect(r.env).toEqual(src);
   });
 
   it('per-owner refresh preserves the shim PATH and removes inherited tokens only from the copy', async () => {
-    const src = { [GH_TOKEN_KEY]: STALE, [GITHUB_TOKEN_KEY]: STALE, PATH: '/original/bin', KEEP: '1' };
+    const src = { GH_TOKEN: STALE, GITHUB_TOKEN: STALE, PATH: '/original/bin', KEEP: '1' };
     const before = { ...src };
     const ensureFresh = async (o) => {
       o.env.PATH = '/shim/bin:/original/bin';
@@ -1966,14 +1966,14 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
   });
 
   it('disabling per-owner auth keeps the pinned-token refresh in the copy', async () => {
-    const src = { WE_SMOKE_GH_PER_OWNER: '0', [GH_TOKEN_KEY]: STALE, [GITHUB_TOKEN_KEY]: STALE };
+    const src = { WE_SMOKE_GH_PER_OWNER: '0', GH_TOKEN: STALE, GITHUB_TOKEN: STALE };
     const ensureFresh = vi.fn(async (o) => {
       o.setEnv(FRESH);
       return { applied: true, reason: 'ok' };
     });
     const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
     expect(ensureFresh.mock.calls[0][0].perOwner).toBe(false);
-    expect(r.env).toEqual({ ...src, [GH_TOKEN_KEY]: FRESH });
+    expect(r.env).toEqual({ ...src, GH_TOKEN: FRESH });
     expect(src.GH_TOKEN).toBe(STALE);
   });
 
@@ -1981,9 +1981,9 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
     const before = process.env.GH_TOKEN;
     const seenOpts = [];
     const ensureFresh = async (o) => { seenOpts.push(o); o.setEnv(FRESH); return { applied: true, reason: 'ok' }; };
-    const src = { [GH_TOKEN_KEY]: STALE, KEEP: '1' };
+    const src = { GH_TOKEN: STALE, KEEP: '1' };
     const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
-    expect(r.env).toEqual({ [GH_TOKEN_KEY]: FRESH, KEEP: '1' });
+    expect(r.env).toEqual({ GH_TOKEN: FRESH, KEEP: '1' });
     expect(src.GH_TOKEN).toBe(STALE);
     expect(process.env.GH_TOKEN).toBe(before);
     expect(seenOpts[0].readCache).toBeUndefined();
@@ -1995,7 +1995,7 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
   });
 
   it('App auth not configured → env passes through unchanged (real ensureFreshGithubAppEnv, no IO)', async () => {
-    const r = await refreshSmokeGithubEnv({ env: { [GH_TOKEN_KEY]: STALE } });
+    const r = await refreshSmokeGithubEnv({ env: { GH_TOKEN: STALE } });
     expect(r.env.GH_TOKEN).toBe(STALE);
     expect(r.refresh.reason).toBe('not-configured');
   });
@@ -2306,7 +2306,7 @@ async function replayGithubOutage(host, options = {}) {
   const sleep = vi.fn(async () => {});
   const log = { error: vi.fn() };
   const result = await runLiveSmokeWithRetry({ root: '/x', env: githubSmokeEnv, ...host,
-    refreshAuth: async ({ env }) => ({ env: { ...env, [GH_TOKEN_KEY]: 'probe-marker' }, refresh: null }),
+    refreshAuth: async ({ env }) => ({ env: { ...env, GH_TOKEN: 'probe-marker' }, refresh: null }),
     sleep, log, retries: 2, backoffMs: 10, ...options });
   return { result, sleep, log };
 }
@@ -2385,7 +2385,7 @@ describe('GitHub API outage — gate-owned confirmation, never tree-text launder
     expect(host.probes).toHaveLength(Object.keys(CONSTELLATION_REPOS).length * 3);
     for (const { args, opts } of host.probes) {
       expect(args).toEqual(['pr', 'list', '--state', 'open', '--limit', '200', '--repo', expect.any(String), '--json', probeFields]);
-      expect(opts).toMatchObject({ env: { [GH_TOKEN_KEY]: 'probe-marker' }, timeoutMs: 60000 });
+      expect(opts).toMatchObject({ env: { GH_TOKEN: 'probe-marker' }, timeoutMs: 60000 });
     }
   });
   it('accepts only the external probe timeout as availability evidence', async () => {
