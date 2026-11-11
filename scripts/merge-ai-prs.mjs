@@ -2500,9 +2500,11 @@ export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = []
     const key = `${r.headSha}@${r.baseRefName}`;
     if (!cache.has(key)) { const read = readFiles({ headSha: r.headSha, base: r.baseRefName }); cache.set(key, read?.error || !Array.isArray(read?.files) ? null : read.files); }
     const files = cache.get(key);
-    if (!files) { cache.delete(key); return r; } // unreadable: keep the listing, retry next pass
-    return { ...r, files: files.map((path) => ({ path })), filesComplete: true };
+    if (!files) { cache.delete(key); unreadable = true; return r; } // unreadable: keep the listing, retry next pass
+    const listed = new Map((r.files || []).map((f) => [f?.path ?? f, f])); // keep each file's additions/deletions: land order ranks by size
+    return { ...r, files: files.map((path) => (typeof listed.get(path) === 'object' ? listed.get(path) : { path, additions: 0, deletions: 0 })), filesComplete: true };
   };
+  let unreadable = false;
   const netByKey = new Map();
   const refined = (r) => { const k = overlapRowKey(r); if (!netByKey.has(k)) netByKey.set(k, net(r)); return netByKey.get(k); };
   const out = candidateRows.map((x) => {
@@ -2513,7 +2515,8 @@ export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = []
     const py = paths(y);
     return candidateRows.some((x) => x.number !== y.number && (x.repo || null) === (y.repo || null) && [...paths(x)].some((p) => py.has(p))) ? refined(y) : y;
   });
-  return { candidateRows: out, openPrRows: ys };
+  // Any unreadable net diff keeps EVERY listing: mixing net and listed sets could erase an overlap on unread evidence.
+  return unreadable ? { candidateRows, openPrRows } : { candidateRows: out, openPrRows: ys };
 }
 const readOverlapNetDiff = ({ headSha, base }) => readPinnedChangedFiles({ headSha, base, cwd: process.cwd() });
 

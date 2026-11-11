@@ -51,3 +51,17 @@ describe('refineOverlapRowsToNetDiff', () => {
     expect(readFiles).not.toHaveBeenCalled();
   });
 });
+
+describe('refineOverlapRowsToNetDiff audit findings', () => {
+  it('keeps listing sizes so land order still ranks by size', () => {
+    const rows = rowsFor(ok, ok);
+    rows.openPrRows.find((r) => r.number === 6381).files[0].additions = 500;
+    const out = refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles: () => ({ files: ['a.mjs'] }), cache: new Map() });
+    expect(out.openPrRows.find((r) => r.number === 6381).files[0].additions).toBe(500);
+  });
+  it('one unreadable net diff keeps every listing, never a mixed set', () => {
+    const rows = rowsFor(ok, ok);
+    const readFiles = ({ headSha }) => (headSha === sha('9') ? { files: ['other.mjs'] } : { error: 'boom' });
+    expect(waits(refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, readFiles, cache: new Map() })).get(`${repo}#6679`).yieldTo).toBe(6381);
+  });
+});
