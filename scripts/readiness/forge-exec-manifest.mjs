@@ -106,6 +106,86 @@ const secretText=[
 ];
 export const credentialTextFinding=text=>textFinding(text);
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+// R824/R825: in test files only, a name:value whose value is a code expression
+// (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
+// strings are stripped first, so a literal that merely contains `(` still hits.
+// Known token patterns run before this on the whole text and always hit.
+// The skip never covers a value that carries a high-entropy token of its own (card x5b2hyl): a quoted literal
+// beside a call (`f('<random>')`) and an unquoted token beside a call or arrow (`<random>(x)`) both keep the
+// scan. Only short fixture words and identifiers (`'ghp_acceptance_fixture'`, `createHash`) are skipped.
+function codeExpression(raw) {
+  // Zero-width and other format characters split a token without changing how it reads; fold them away first.
+  const value=raw.replace(/\p{Cf}/gu,'');
+  let code='';
+  const pieces=[];
+  for(let i=0;i<value.length;i++) {
+    const char=value[i];
+    // Comments can contain misleading quotes or calls. Without a full parser,
+    // refuse the exemption rather than interpreting their contents as code.
+    if(char==='/'&&/[/*]/.test(value[i+1]??''))return false;
+    if(!/["'`]/.test(char)) {code+=char;continue;}
+    const quote=char;
+    let closed=false,inner='';
+    for(i++;i<value.length;i++) {
+      if(value[i]===quote) {closed=true;break;}
+      // Escapes, interpolation and partial multiline strings need a parser to
+      // prove safe. Keep the original entropy rejection for these forms.
+      if(value[i]==='\\'||(quote==='`'&&value[i]==='$'&&value[i+1]==='{'))return false;
+      inner+=value[i];
+    }
+    if(!closed)return false;
+    // A quoted literal that is opaque once whitespace is removed is a secret, whatever it sits beside.
+    if(opaqueCode(inner.replace(/\s/g,''),inner))return false;
+    pieces.push(inner);
+    code+='\u0001';
+  }
+  // An unquoted opaque token (split at punctuation, so a chained secret piece still counts) keeps the scan.
+  if(code.split(/[^\w$+/=-]+/).some(token=>opaqueCode(token)))return false;
+  // A secret can be cut into short pieces (`'Xk9m...'+'R4tW...'`, `f(a.b)`, `f(x, y)`). The base scan reads the
+  // value whole, so read the arguments whole too: drop call names and keywords, put every quoted literal back
+  // in place, join what is left and test that. Fails closed: long argument lists with several digits also keep
+  // the scan.
+  let next=0;
+  const args=code.replace(nonCallKeyword,' ').replace(/[A-Za-z_$][\w$]*(?=\s*\()/g,' ')
+    .replace(/\u0001/g,()=>pieces[next++]);
+  const joined=args.replace(/[^\w$+/=-]+/g,'');
+  // `args` keeps the separators (as spaces) so the word-shape rule reads each piece as its own word: unquoted
+  // pieces cut at `.` or `,` (`f(zgujkzpaen.sjbhrujdsb)`) join into one token the base scan flags.
+  if(opaqueCode(joined,args.replace(/[^\w$+/=-]+/g,' ')))return false;
+  // Quoted pieces joined without the surrounding code (identifiers around them would blur the word shape).
+  if(pieces.length>1&&opaqueCode(pieces.join('').replace(/\s/g,''),pieces.join(' ')))return false;
+  // Only an arrow or a call to a real identifier is a code expression. A bare paren, or a keyword before a
+  // paren (`return (`, `typeof (`), only groups a literal, so it never proves the value is not a secret.
+  return /=>|[A-Za-z_$][\w$]*\s*\(/.test(code.replace(nonCallKeyword,' '));
+}
+// A token inside a test-file code expression counts as a secret when it is long and either digit-bearing or
+// very high entropy. Word-like fixtures and long camelCase identifiers (digit-free, entropy under ~4.1) pass.
+const opaqueLiteral=token=>{
+  if(token.length<20)return false;
+  const bits=entropy(token);
+  return bits>=3.5&&(bits>=4.3||(token.match(/\d/g)??[]).length>=3);
+};
+// The digit/entropy floor above lets a random 20+ char token with few digits (lowercase, mixed-case or hex-like,
+// entropy 3.5-4.3) through, which the base scan flags. So inside a test-file code expression a long token also
+// counts as a secret unless it reads as words: two or more letters-only segments (split at whitespace, `_`, `.`,
+// `-` and camelCase humps), none over 14 letters, none with a 4-consonant run, and at most one without a vowel
+// (`ghp` in `ghp_acceptance_fixture`). Random strings fail this almost always; a rare lowercase-and-separator
+// token that happens to read as words still passes (residual, tracked in the card).
+const wordLike=text=>{
+  const segments=text.split(/[\s_.:-]+|(?<=[a-z])(?=[A-Z])/).filter(Boolean);
+  if(segments.length<2)return false;
+  let vowelless=0;
+  for(const segment of segments) {
+    if(!/^(?:[A-Za-z]{1,14}\d{0,3}|\d{1,3})$/.test(segment)||/[^aeiou\d]{4}/i.test(segment))return false;
+    if(segment.length>1&&!/[aeiou]/i.test(segment)&&++vowelless>1)return false;
+  }
+  return true;
+};
+// A hex run is judged by length: 20+ hex chars with digits sit just under the 3.5-bit floor on their own.
+const opaqueCode=(token,words=token)=>opaqueLiteral(token)||/^(?=(?:[a-f]*\d){3})[0-9a-f]{20,}$/i.test(token)
+  ||(token.length>=20&&entropy(token)>=3.5&&!wordLike(words.replace(/[+/=$]+/g,' ')));
+const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|case|in|of|instanceof|if|while|for|switch|catch|with|else|do|new|async|function|class|import|super|this|default|let|const|var|extends|as|satisfies|static|get|set)(?![\w$])/g;
+const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
@@ -146,6 +226,7 @@ export function credentialContentFinding(path,content) {
   if(text.includes('\0'))return 'unsupported-text-encoding';
   const raw=textFinding(text);
   if(raw)return raw;
+  const testSource=isTestFile(path);
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
   for(const match of text.matchAll(assignmentLine)) {
@@ -168,13 +249,25 @@ export function credentialContentFinding(path,content) {
       if(!continuation)return `unbounded-continuation-${field}`;
       if(credentialNamed) {
         for(const line of [...continuation,continuation.join('')]) {
-          if(line.length>=20&&entropy(line)>=3.5)return `high-entropy-${field}`;
+          if(line.length>=20&&entropy(line)>=3.5&&!(testSource&&codeExpression(line)))return `high-entropy-${field}`;
         }
       }
     }
     // A whole-value reference with no continuation line cannot hide a literal.
     if(reference&&!continuation.length)continue;
-    if(credentialNamed&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    // An unquoted value with internal whitespace is a code expression or a sentence, never one opaque secret
+    // (`keys: [index], at: r.at });`). Contiguous and quoted values, and continuation lines above, keep the full rule.
+    // Only source and prose files qualify (never YAML/INI, where `${{ 'literal' }}` is a real leak shape), and a quote
+    // anywhere in the value keeps it scanned (apostrophes and, as code spans, backticks are allowed in .md prose only;
+    // in source a backtick opens a template literal). A value that carries any single opaque token
+    // (`<secret> # prod`, `<secret> (rotated)`, a backticked secret in prose) is a secret with a tail, not prose.
+    // Quoted/backticked spans also keep the scan when their content is opaque after removing whitespace;
+    // word boundaries around the quotes prevent prose apostrophes from forming spans.
+    // Boundaries pinned in forge-scan-code-expression.test.mjs (whitespace-exemption boundaries).
+    const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
+      &&!(leaf.endsWith('.md')?/["]/:/["'`]/).test(trimmed)&&!trimmed.split(/\s+/).some(opaqueToken)
+      &&![...trimmed.matchAll(/(?<![\w])(['`])(.+?)\1(?![\w])/g)].some(([, ,span])=>opaqueToken(span.replace(/\s/g,'')));
+    if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value)))return `high-entropy-${field}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; mixed expressions do not.
       if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;

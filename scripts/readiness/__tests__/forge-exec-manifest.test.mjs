@@ -37,7 +37,8 @@ describe('credentialContentFinding GitHub Actions references', () => {
   });
 
   it.each([
-    ['PEM block', '-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n', 'pem-header'],
+    // Marker words are split so this file never spells them contiguously (it would fail its own scan).
+    ['PEM block', ['-----', 'BEGIN', ' PRIV', 'ATE KE', 'Y-----'].join('') + '\nfixture\n' + ['-----', 'END PRIV', 'ATE KE', 'Y-----\n'].join(''), 'pem-header'],
     ['GitHub token', 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8', 'github-token'],
   ])('still refuses a %s elsewhere in a file containing a reference', (_name, content, finding) => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n' + content)).toBe(finding);
@@ -103,5 +104,62 @@ describe('credentialContentFinding GitHub Actions references', () => {
 
   it('refuses a literal continuation led by a non-breaking space after a reference', () => {
     expect(scan('private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}\n  \u00a0' + literal + '\n')).not.toBeNull();
+  });
+});
+
+// R824/R825: in test files only, the name:value high-entropy heuristic skips code expressions.
+describe('credentialContentFinding code expressions in test files (R824)', () => {
+  const at = (path, text) => credentialContentFinding(Buffer.from(path), Buffer.from(text));
+  const testPath = 'scripts/readiness/__tests__/heavy-admission-remote-client.test.mjs';
+  const hashLine = "  pathKey: createHash('sha256').update(String(p)).digest('hex'),\n";
+  const randomValue = 'q8Zr3LkP0vXw9TnB5mJd2YcH7sFgA4uE6oIe1KtN';
+
+  it('does not flag a createHash code expression in a test file', () => {
+    expect(at(testPath, hashLine)).toBeNull();
+  });
+  it('does not flag an arrow/vi.fn fixture carrying a ghp_ prefix that is not a real token', () => {
+    // Assembled at runtime: written out whole, this line would be a name:value pair the scan reads in THIS file.
+    const [fn, ctor, field, rest] = ['readRecoveryCredential', 'vi.fn(() => ({', 'token', "'ghp_acceptance_fixture', other: 1})),\n"];
+    expect(at('scripts/conveyor/__tests__/missing-run-startup-failure.test.mjs', `${fn}: ${ctor}${field}:${rest}`)).toBeNull();
+  });
+  it('still flags the same createHash line in a non-test file', () => {
+    expect(at('scripts/readiness/some-module.mjs', hashLine)).toBe('high-entropy-pathKey');
+  });
+  it('does not treat a lookalike path as a test file', () => {
+    expect(at('scripts/readiness/__tests__x/a.mjs', hashLine)).toBe('high-entropy-pathKey');
+    expect(at('scripts/readiness/a.test.txt', hashLine)).toBe('high-entropy-pathKey');
+  });
+  it('still flags a bare high-entropy string literal in a test file', () => {
+    expect(at(testPath, `API_TOKEN: '${randomValue}'\n`)).toBe('high-entropy-API_TOKEN');
+  });
+  it('still flags a bare literal that merely contains a call-like fragment', () => {
+    expect(at(testPath, `API_TOKEN: 'q8Zr3LkP0vXw9TnB5mJd2Y(cH7sFgA4uE6oIe1KtN'\n`)).toBe('high-entropy-API_TOKEN');
+  });
+  it.each([
+    ['escaped literal', '"\\x61B3dE5fG7hJ9kL2mN4pQ6rS8" + suffix()'],
+    ['interpolated template', '`aB3dE5fG7hJ9kL2mN4pQ6rS8${suffix()}`'],
+    ['comment quote', "/* ' */ 'aB3dE5fG7hJ9kL2mN4pQ6rS8abc('"] ,
+    ['trailing comment', '"aB3dE5fG7hJ9kL2mN4pQ6rS8", // suffix('],
+    ['unclosed template', '`aB3dE5fG7hJ9kL2mN4pQ6rS8abc('],
+  ])('rejects %s forms the skip cannot prove safe, including continuations', (_name, value) => {
+    expect(at(testPath, `creds: ${value}\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, `creds:\n  ${value}\n`)).toBe('high-entropy-creds');
+  });
+  it('flags a high-entropy argument inside a test-file credential call', () => {
+    expect(at(testPath, `creds: f('${randomValue}')\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, 'creds: "aB3dE5fG7hJ9kL2mN4pQ6rS8" + suffix()\n')).toBe('high-entropy-creds');
+  });
+  it('flags an unquoted high-entropy value beside a call or arrow in a test file', () => {
+    expect(at(testPath, `creds: ${randomValue}(x)\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, `creds: ${randomValue} => x\n`)).toBe('high-entropy-creds');
+  });
+  it('rejects a multiline template whose literal content resembles a call', () => {
+    expect(at(testPath, `creds: \`${randomValue}abc(\n  \`,\n`)).toBe('high-entropy-creds');
+    expect(at(testPath, `creds: \`\n  ${randomValue}abc(\n  \`,\n`)).toBe('high-entropy-creds');
+  });
+  it('always flags a real-format token inside a code expression in a test file', () => {
+    const real = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+    expect(at(testPath, `getToken: vi.fn(() => ({token:'${real}'})),\n`)).toBe('github-token');
+    expect(at(testPath, `x: createHash('sha256').update('sk-${randomValue}')\n`)).toBe('sk-token');
   });
 });
