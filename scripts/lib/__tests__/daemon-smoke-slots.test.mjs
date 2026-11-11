@@ -481,6 +481,20 @@ describe('daemon smoke slots', () => {
     expect(state().holders).toEqual([]);
   });
 
+  it('a zero wait rides out a briefly held state lock instead of timing out with free capacity', async () => {
+    settings.value = { smokeMaxConcurrent: 1 };
+    const env = { WE_DAEMON_REBUILD_LEASE_STALE_MS: '120000' };
+    const lock = join(stateDir, 'smoke-slots.lock');
+    mkdirSync(lock);
+    writeFileSync(join(lock, `owner-${'a'.repeat(8)}-0000-0000-0000-${'b'.repeat(12)}.pid`), '99');
+    let time = 1000;
+    const slot = await acquire(11, { env, now: () => time, isAlive: owner => owner === 99 || owner === 11,
+      sleep: async ms => { time += ms; rmSync(lock, { recursive: true, force: true }); } });
+    expect(slot.acquired).toBe(true);
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
+    await slot.release();
+  });
+
   it.each(['60000', '120000'])('a zero wait (lease %sms) never queues behind a full cap or jumps an existing waiter', async lease => {
     settings.value = { smokeMaxConcurrent: 1 };
     const env = { WE_DAEMON_REBUILD_LEASE_STALE_MS: lease };

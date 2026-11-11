@@ -86,6 +86,9 @@ export async function acquireSmokeSlot({
     Math.max(0, rebuildLeaseStaleMs(env) - 2 * 60_000));
   const queuedAt = now();
   const deadline = queuedAt + maxWait;
+  // A zero budget leaves no room to even take the state lock; an unqueued caller's first
+  // transactions (failed-ticket cleanup, then admission) get the lock's own 30s cap instead.
+  const firstUntil = deadline <= queuedAt ? queuedAt + 30_000 : deadline;
   const expired = new Error('smoke queue expired');
   mkdirSync(stateDir, { recursive: true });
   const path = resolve(stateDir, 'smoke-slots.json');
@@ -199,7 +202,7 @@ export async function acquireSmokeSlot({
       await transaction(state => {
         state.holders = state.holders.filter(e => e.pid !== pid || !tickets.has(e.ticket));
         state.waiters = state.waiters.filter(e => e.pid !== pid || !tickets.has(e.ticket));
-      }, deadline);
+      }, firstUntil);
       for (const entry of pending) failedTickets.delete(entry);
     }
     for (;;) {
@@ -222,8 +225,7 @@ export async function acquireSmokeSlot({
           return null;
         }
         return index;
-        // A zero budget leaves no room to even take the state lock; give that one attempt the lock's own 30s cap.
-      }, ticket === undefined && deadline <= queuedAt ? queuedAt + 30_000 : deadline);
+      }, ticket === undefined ? firstUntil : deadline);
       if (ahead === null) return { acquired: true, release };
       if (ahead !== lastAhead) log.error?.(`daemon-live-smoke: smoke-queued (${ahead} ahead)`);
       lastAhead = ahead;
