@@ -141,16 +141,19 @@ const assignmentLine=new RegExp(`(?:^|[${lineBreaks}])([\\t ]*)(?:-[\\t ]+)?["']
 const physicalTail=/[^\r\n]*/y;
 const continuationRe=new RegExp(`[${lineBreaks}]([\\t ]*)([^${lineBreaks}]*)`,'y');
 const maxContinuationLines=256;
-// Double-quoted YAML/JSON escapes (\xNN, \uNNNN, \UNNNNNNNN, an escaped line break) spell a credential the raw bytes
-// never contain. Decoding every backslash sequence over-approximates a parser: it can only add findings.
-const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|(?:\\r\\n|[${lineBreaks}])[\\t ]*|([^]))`,'g');
-const escapeChars={0:'\0',a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
-const decodeEscapes=text=>text.replace(escapeSequence,(all,x,u,U,char)=>{
-  const hex=x??u??U;
-  if(hex){const point=parseInt(hex,16);return point<=0x10ffff?String.fromCodePoint(point):all;}
+// Escapes spell a credential the raw bytes never contain: YAML/JSON (\xNN, \uNNNN, \UNNNNNNNN, an escaped line
+// break), JS (\u{...}, octal \NNN) and Markdown/shell (`ghp\_...`: a backslash that only quotes the next character).
+// Decoding every backslash sequence over-approximates a parser: it can only add findings.
+const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\\{([0-9A-Fa-f]{1,6})\\}|([0-7]{1,3})|(?:\\r\\n|[${lineBreaks}])[\\t ]*|([^]))`,'g');
+const escapeChars={a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
+const decodeEscapes=text=>text.replace(escapeSequence,(all,x,u,U,braced,octal,char)=>{
+  const hex=x??u??U??braced;
+  const point=hex?parseInt(hex,16):octal?parseInt(octal,8):null;
+  if(point!==null)return point<=0x10ffff?String.fromCodePoint(point):all;
   return char===undefined?'':escapeChars[char]??char;
 });
-const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text));
+// Linear: three views of the same text (raw, decoded, backslashes dropped).
+const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(text.replace(/\\/g,''));
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
 // line that is not. Returns null when more than maxContinuationLines remain (caller blocks).
 function continuationLines(text,from,indent) {
@@ -158,10 +161,11 @@ function continuationLines(text,from,indent) {
   continuationRe.lastIndex=from;
   for(let m;(m=continuationRe.exec(text));) {
     if(m[2].trim()==='')continue;
-    if(m[1].length<=indent)return lines;
+    // `end` is where the block stops: the break before the first line that is not more indented.
+    if(m[1].length<=indent)return Object.assign(lines,{end:m.index});
     if(lines.push(m[2].trim())>maxContinuationLines)return null;
   }
-  return lines;
+  return Object.assign(lines,{end:text.length});
 }
 // Credential formats and unreadable evidence block. Readable generic evidence is advisory.
 export function credentialContentFinding(path,content) {
@@ -193,6 +197,7 @@ export function credentialContentWarning(path,content) {
 function assignmentFinding(text,blockOnly=false) {
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This advisory heuristic is not a parser for arbitrary formats.
+  let joinedUntil=0;
   for(const match of text.matchAll(assignmentLine)) {
     const [,indent,field]=match;
     // `value` is the whole physical (CR/LF-bounded) value, including any text after a NEL/LS/PS
@@ -212,9 +217,11 @@ function assignmentFinding(text,blockOnly=false) {
       continuation=continuationLines(text,match.index+match[0].length+tail.length,indent.length);
       if(!continuation)return `unbounded-continuation-${findingField(field)}`;
       // A folded, plain or quoted multi-line scalar can split a credential format across lines.
-      if(blockOnly&&continuation.length) {
+      // A key nested inside an already-joined block is a substring of that join: scan each block once (linear).
+      if(blockOnly&&continuation.length&&match.index>=joinedUntil) {
         const joined=decodedFinding(literal+continuation.join(''));
         if(joined)return joined;
+        joinedUntil=continuation.end;
       }
       if(credentialNamed) {
         if(!blockOnly)for(const line of [...continuation,continuation.join('')]) {

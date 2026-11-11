@@ -368,7 +368,17 @@ describe('bundle scan keeps main parity (R903)', () => {
     ['\\U escape', `note: "\\U00000067${token.slice(1)}"\n`],
     ['escaped line break in a quoted scalar', `token: "${token.slice(0, 12)}\\\n  ${token.slice(12)}"\n`],
     ['folded scalar split across lines', `token: >-\n  ${token.slice(0, 12)}\n  ${token.slice(12)}\n`],
+    ['nested key split inside an outer block', `auth:\n  token: >-\n    ${token.slice(0, 12)}\n    ${token.slice(12)}\n`],
+    ['Markdown-escaped underscore', `Rotate ghp\\_${token.slice(4)} today\n`],
+    ['JS braced \\u{} escape', `const value = "\\u{67}${token.slice(1)}";\n`],
+    ['JS octal escape', `const value = "\\147${token.slice(1)}";\n`],
   ];
+  it('scans nested credential keys in linear time', () => {
+    const nested = Array.from({ length: 250 }, (_, i) => `${' '.repeat(i)}token${i}:`).join('\n') + '\n';
+    const started = performance.now();
+    expect(credentialContentFinding(Buffer.from('notes.yml'), Buffer.from(nested.repeat(40)))).toBeNull();
+    expect(performance.now() - started).toBeLessThan(5000);
+  });
   it.each(escaped)('blocks a YAML-escaped token (%s) on both transports', async (_shape, content) => {
     expect(content).not.toContain(token);
     expect(credentialContentFinding(Buffer.from('token-settings.yml'), Buffer.from(content))).toBe('github-token');
