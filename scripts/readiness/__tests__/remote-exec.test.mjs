@@ -2110,7 +2110,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
     writeFileSync(join(cwd, name), 'must run');
     f.listFiles.mockResolvedValue(['package-lock.json', name]);
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
     expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
@@ -2129,7 +2132,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     writeFileSync(join(cwd, name), 'must run locally');
     f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', name]);
 
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
     expect(f.local).toHaveBeenCalledTimes(1);
     expect(f.local).toHaveBeenCalledWith(f.argv);
@@ -2197,7 +2203,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
         .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
       const exec = acceptingTransport(paths, index);
       expect(await runRemote({argv, cwd, runId, exec}))
-        .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+        .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
       const local = vi.fn(async () => 7);
       expect(await runRemoteCli({argv, cwd, runId, exec, local, lockRoot:join(cwd,'heavy'), log:vi.fn()})).toBe(7);
       expect(local).toHaveBeenCalledWith(argv);
@@ -2267,7 +2273,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const exec = acceptingTransport(paths, indexRecord(name, 'must run locally'));
     await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
     expect(await runRemote({argv, cwd, runId, exec}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
@@ -2434,7 +2440,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
     const refused = acceptingTransport(excludedPaths, excludedStage);
     expect(await runRemote({argv, cwd, runId, exec:refused}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(refused).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
