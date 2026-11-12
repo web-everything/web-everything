@@ -61,15 +61,15 @@ describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
 });
 
 describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
-  const clean = { repo: 'fixture/repo', decision: 'skip', reason: 'merge state BEHIND', state: 'BEHIND',
+  const clean = { repo: 'fixture/repo', decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND',
     mergeable: 'MERGEABLE', hasManifest: false, certifyLabel: true, testGreen: true, headSha: 'reviewed-head' };
-  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, patch = {} } = {}) => {
+  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, reclassified = true, patch = {} } = {}) => {
     const verdict = { ...clean, ...patch };
     const before = { ...verdict };
     const rebaseDropManifest = vi.fn(() => ({ action: 'skip', reason: 'fixture rebase probe' }));
     const mergeStrategy = { queueOwnsFreshness: vi.fn(() => ownsFreshness) };
     const operation = routeRebaseBeforeEnqueue(verdict, {
-      setting, mergeStrategy, manifestFree: () => manifestFree, rebase: rebaseDropManifest,
+      setting, mergeStrategy, manifestFree: () => manifestFree, reclassifiesMerge: () => reclassified, rebase: rebaseDropManifest,
     });
     const args = { laneRef: 'lane/fixture', base: 'origin/main' };
     const result = operation?.(args);
@@ -94,6 +94,7 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     ['DIRTY still calls rebaseDropManifest', { patch: { state: 'DIRTY' } }],
     ['manifest PR still calls rebaseDropManifest', { patch: { hasManifest: true } }],
     ['unproven manifest-free head still calls rebaseDropManifest', { manifestFree: false }],
+    ['a guard that classifyPr still fails (body/review hold) still calls rebaseDropManifest', { reclassified: false }],
     ['missing manifest evidence still calls rebaseDropManifest', { patch: { hasManifest: undefined } }],
   ])('%s', (_name, options) => {
     const { verdict, before, operation, rebaseDropManifest, args, result } = route(options);
@@ -450,14 +451,19 @@ it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => 
 
 describe('headTreeLacksManifestFile — authoritative manifest-path probe', () => {
   const sha = 'a'.repeat(40);
-  const mk = (lsTree, show) => (args) => {
+  const mk = (lsTree, show, root = '') => (args) => {
     if (args[0] === 'cat-file') return '';
+    if (args[0] === 'ls-tree' && args.includes('--name-only')) return root;
     if (args[0] === 'ls-tree') { if (lsTree instanceof Error) throw lsTree; return lsTree; }
     if (args[0] === 'show') { if (show instanceof Error) throw show; return show; }
     return '';
   };
   const call = (git) => headTreeLacksManifestFile({ headRef: 'lane/x', headSha: sha, prNumber: 1, git });
   it('true only when the head tree lists no manifest path', () => { expect(call(mk('', ''))).toBe(true); });
+  it('false when a root fix-evidence scratch file exists (rebaseDropManifest would strip it)', () => {
+    expect(call(mk('', '', 'package.json\n.fix-abc-evidence.md'))).toBe(false);
+  });
+  it('true when the root holds only ordinary files', () => { expect(call(mk('', '', 'package.json\nREADME.md'))).toBe(true); });
   it('false for a malformed manifest file (parses to null but the path exists)', () => {
     expect(call(mk('100644 blob abc\t.lane-manifest.json', '{not json'))).toBe(false);
   });

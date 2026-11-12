@@ -6,6 +6,7 @@ import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, crea
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
+import { isDrainTransientPath } from './lib/transient-paths.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -1363,14 +1364,17 @@ export function headTreeLacksManifestFile({ headRef, headSha, prNumber, git }) {
   try {
     const read = readLegacyLocalManifestAt({ headRef, headSha, prNumber, git });
     if (read.unreadable || !read.definitive || read.manifest != null) return false;
-    return String(git(['ls-tree', '--end-of-options', headSha, '--', '.lane-manifest.json']) ?? '').trim() === '';
+    if (String(git(['ls-tree', '--end-of-options', headSha, '--', '.lane-manifest.json']) ?? '').trim() !== '') return false;
+    // rebaseDropManifest also strips root fix-evidence scratch files; keep that backstop by requiring none exist.
+    const root = String(git(['ls-tree', '--name-only', '--end-of-options', headSha]) ?? '').split('\n').filter(Boolean);
+    return !root.some(name => isDrainTransientPath(name));
   } catch { return false; }
 }
 
 /** Return the rebase operation unless the queue can preserve this proven manifest-free head. */
-export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFree, rebase = rebaseDropManifest }) {
+export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFree, reclassifiesMerge, rebase = rebaseDropManifest }) {
   if (setting === 'conflict-only' && mergeStrategy.queueOwnsFreshness(v.repo) === true
-    && isBehindButClean(v) && manifestFree() === true) {
+    && isBehindButClean(v) && manifestFree() === true && reclassifiesMerge() === true) {
     v.decision = 'merge';
     v.reason = 'behind main but clean; merge queue tests PR + main - enqueued on its existing head';
     v.rebaseDrop = 'skipped-behind-clean';
@@ -5937,6 +5941,13 @@ async function runCli() {
       }
       const behindCleanDir = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
       const rebase = routeRebaseBeforeEnqueue(v, { setting: rebaseBeforeEnqueue.value, mergeStrategy,
+        // Re-run every classifyPr guard (body, review hold, claims, checks) with BEHIND treated as queue-landable,
+        // exactly as the approved-head path does; BEHIND alone must be the only thing that was blocking.
+        reclassifiesMerge: () => {
+          const live = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
+          return !!live && classifyPr(retainApprovedHumanQueueHead(live, { hold: true, queueOwnsFreshness: true }), { requiredCheck: REQUIRED,
+            defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge';
+        },
         manifestFree: () => !!behindCleanDir && headTreeLacksManifestFile({
           headRef: v.headRef, headSha: v.listedHeadSha || v.headSha, prNumber: v.num,
           git: (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: behindCleanDir }),
