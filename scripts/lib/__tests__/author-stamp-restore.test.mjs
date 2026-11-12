@@ -101,9 +101,15 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
     expectReason(plan({ edits }), 'refuse');
   });
 
-  it.each([{ edits: [] }, { edits: [edit('never stamped')] }])('refuses history without a stamped snapshot: %j', ({ edits }) => {
-    expectReason(plan({ edits }), 'refuse');
-  });
+  it.each([{ edits: [] }, { edits: [edit('never stamped')] }, { edits: [edit('never stamped', 'chalbert')] }])(
+    'marks complete history with zero stamps as stamp-lost, never as a restored id: %j', ({ edits }) => {
+      const result = plan({ edits });
+      expectReason(result, 'mark-lost');
+      expect(result.id).toBeUndefined();
+      expect(result.body).toBe(`${BODY}\n\n${buildStampLostMarker()}\n`);
+      expect(hasStampLostMarker(result.body)).toBe(true);
+      expect(readAuthorActorStamps(result.body)).toEqual([]);
+    });
 
   it.each(['', '   ', null, undefined])('refuses an empty authorLogin: %s', (authorLogin) => {
     expectReason(plan({ authorLogin }), 'refuse');
@@ -304,13 +310,30 @@ describe('restoreAuthorStamp — injected IO and concurrent edits', () => {
     ['unreadable history', () => null],
     ['history throws', () => { throw new Error('history unavailable'); }],
     ['conflicting ids', () => [...history(), edit(buildAuthorActorMarker(OTHER))]],
-    ['no stamp', () => [edit('plain body')]],
     ['another editor only', () => [edit(buildAuthorActorMarker(ID), 'chalbert')]],
   ])('refuses %s without writing anything, including a stamp-lost marker', async (_name, readEdits) => {
     const seams = io({ readEdits: vi.fn(readEdits) });
     expectReason(await restoreAuthorStamp(seams), 'refuse');
     expect(seams.writeBody).not.toHaveBeenCalled();
     expect(seams.log.mock.calls.flat().join('\n')).not.toContain('restored stamp');
+  });
+
+  it('writes the stamp-lost marker once for complete zero-stamp history, never inventing an id', async () => {
+    const seams = io({ readEdits: vi.fn(() => [edit('plain body', 'chalbert')]) });
+    const result = await restoreAuthorStamp(seams);
+    expectReason(result, 'mark-lost');
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${buildStampLostMarker()}\n`);
+    expect(readAuthorActorStamps(seams.writeBody.mock.calls[0][1])).toEqual([]);
+    expect(seams.log.mock.calls.flat().join('\n')).toContain('stamp-lost');
+    expect(seams.log.mock.calls.flat().join('\n')).not.toContain('restored stamp');
+  });
+
+  it('does not mark stamp-lost when the history changes before the write', async () => {
+    const readEdits = vi.fn().mockReturnValueOnce([edit('plain body')]).mockReturnValueOnce([edit('plain body'), edit(buildAuthorActorMarker(ID))]);
+    const seams = io({ readEdits });
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
   it('skips stamp-lost without consulting history or writing', async () => {
