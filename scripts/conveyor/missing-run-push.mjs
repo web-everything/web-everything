@@ -10,7 +10,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { recoveryPreflight, recoveryPushCredential } from './recovery-preflight.mjs';
 export { recoveryPushCredential } from './recovery-preflight.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
-import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
+import { MISSING_RUN_CREDENTIAL_REFUSAL, DEFAULT_MISSING_RUN_THRESHOLD_MS } from './main-red-recovery.mjs';
 import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
 
@@ -99,7 +99,39 @@ export function pushMissingRunCommit(d, options = {}) {
     git('fetch', '--no-tags', remote, ref);
     if (git('rev-parse', 'FETCH_HEAD') !== d.headSha) return defer('branch moved before recovery');
     const message = git('show', '-s', '--format=%B', d.headSha);
-    if (message.split('\n').some(line => line.startsWith(RECOVERY_COMMIT_MARKER))) return { ok: false, action, error: 'recovery commit still has no PR checks; needs ci-heal, not another empty commit' };
+    if (message.split('\n').some(line => line.startsWith(RECOVERY_COMMIT_MARKER))) {
+      // Live 2026-11-11 (#6684/#6633): the marked empty commit produced no pull_request run either. A second empty
+      // commit cannot help, but a workflow_dispatch of ci.yml on the branch reports `test`/`smoke` on this head
+      // (the manual fix). ONE dispatch per head: any existing ci.yml run on the head (queued, running, done) blocks it.
+      stage = 'dispatch';
+      const ghEnv = { ...gitEnv, GH_TOKEN: token };
+      const existing = JSON.parse(String(exec('gh', ['api', `repos/${repo}/actions/runs?head_sha=${d.headSha}&per_page=100`], { ...opts, env: ghEnv })));
+      if (!Number.isSafeInteger(existing.total_count) || existing.total_count < 0 || existing.total_count >= 100
+        || !Array.isArray(existing.workflow_runs) || existing.workflow_runs.length !== existing.total_count) {
+        return defer('head runs unreadable or incomplete; needs ci-heal inspection');
+      }
+      // Live #6684/#6633: the pull_request ci.yml run sat `queued` for hours and never reported a check, so a bare
+      // "a run exists" guard would refuse exactly the stuck case. A fresh queued/pending run is left alone; a
+      // queued run older than the missing-run threshold is stuck. Any earlier dispatch on this head blocks (one per head).
+      const stuckAfterMs = DEFAULT_MISSING_RUN_THRESHOLD_MS;
+      const blocksDispatch = (run) => {
+        if (!String(run?.path ?? '').includes('ci.yml')) return false;
+        if (run?.event === 'workflow_dispatch') return true;
+        if (!['queued', 'waiting', 'pending', 'requested'].includes(String(run?.status))) return true;
+        const created = Date.parse(run?.created_at);
+        return !Number.isFinite(created) || (now - created) < stuckAfterMs;
+      };
+      if (existing.workflow_runs.some(blocksDispatch)) {
+        return { ok: false, action, error: 'recovery commit still has no PR checks and CI was already dispatched for this head; needs ci-heal, not another trigger' };
+      }
+      // Re-check ownership and the exact head right before mutating (the push path does the same via its lease).
+      const heldAtDispatch = claim();
+      if (heldAtDispatch !== null) return defer(heldAtDispatch?.message || 'fix claim held or unreadable; needs human/ci-heal inspection');
+      const live = JSON.parse(String(exec('gh', ['api', `repos/${repo}/pulls/${d.prNumber}`], { ...opts, env: ghEnv })));
+      if (live.state !== 'open' || live.head?.sha !== d.headSha || live.head?.ref !== d.headRefName) return defer('PR head or state changed');
+      exec('gh', ['api', '-X', 'POST', `repos/${repo}/actions/workflows/ci.yml/dispatches`, '-f', `ref=${d.headRefName}`], { ...opts, env: ghEnv });
+      return { ok: true, action, dispatched: true };
+    }
     const tree = git('rev-parse', `${d.headSha}^{tree}`);
     stage = 'commit-tree';
     const newHeadSha = git('-c', 'user.name=Web Everything', '-c', 'user.email=conveyor@users.noreply.github.com',
