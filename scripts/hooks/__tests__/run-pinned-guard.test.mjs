@@ -165,6 +165,14 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     writeFileSync(join(f.clone, kind === 'tracked' ? 'scripts/guard-bash.mjs' : 'unexpected'), 'console.log("TAMPERED");');
     expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('not pristine')});
   });
+  it('names the offending paths (capped, control characters stripped) in the not-pristine deny', () => {
+    const f = fixture();
+    writeFileSync(join(f.clone, 'stray-cache.tmp'), 'x');
+    const result = f.launch();
+    expect(result).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
+    expect(result.stderr).toContain('stray-cache.tmp');
+    expect(result.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f]/);
+  });
   it('denies a clean local commit ahead of origin/main', () => {
     const f = fixture();
     f.git(f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'local');

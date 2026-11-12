@@ -162,9 +162,14 @@ try {
   if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
   // --ignored: a file hidden by .gitignore or info/exclude (e.g. a planted node_modules
   // package shadowing a bare import) is not part of the pinned revision either.
-  if (entries.slice(0, -1).some(entry => !entry.startsWith('H ')) ||
-      git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')) {
-    throw new Error('guard clone is not pristine; run scripts/hooks/sync-guard-clone.mjs to repair it');
+  const hidden = entries.slice(0, -1).filter(entry => !entry.startsWith('H '));
+  const dirty = git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored');
+  if (hidden.length || dirty) {
+    // Name the first offenders (capped, control characters stripped) so the next occurrence
+    // identifies the writer without a repair destroying the evidence. The check stays strict.
+    const named = [...hidden, ...dirty.split('\n').filter(Boolean)].slice(0, 5)
+      .map(line => line.replace(/[^\x20-\x7e]/g, '?').slice(0, 200)).join('; ');
+    throw new Error(`guard clone is not pristine (${named}); run scripts/hooks/sync-guard-clone.mjs to repair it`);
   }
   git('-C', clone, 'diff-index', '--quiet', 'HEAD', '--');
   if (git('-C', clone, 'rev-parse', 'HEAD') !== git('-C', clone, 'rev-parse', 'refs/remotes/origin/main')) {
