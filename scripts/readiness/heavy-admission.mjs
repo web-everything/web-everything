@@ -251,7 +251,10 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
     elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
-    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
+    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000,
+    // forge-busy-wait: a Forge `forge-busy` rejection waits (backoff between tries, no local slot held) up to busyWaitMs
+    // before falling back to the Mac. 0 = old behaviour. A busy Forge is not a health failure, so it never arms the backoff window.
+    busyWaitMs: 600000, busyBackoffMs: 45000 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -294,6 +297,8 @@ const ADMISSION_VALID = {
   'remote.stuckMinSlots': admissionInt(1),
   'remote.stuckAgeMs': isValidRunWaitMs,
   'remote.stuckSignalEveryMs': isValidRunWaitMs,
+  'remote.busyWaitMs': isValidRunWaitMs,
+  'remote.busyBackoffMs': (v) => isValidRunWaitMs(v) && v >= 1000,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
@@ -1071,10 +1076,27 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+    const dispatch = () => Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
-    const result = await Promise.race([remote, timeout, signalPromise]);
+    let remote = dispatch();
+    let result = await Promise.race([remote, timeout, signalPromise]);
+    // forge-busy-wait: an explicit, confirmed non-start (never 'unconfirmed') waits and retries Forge within a total
+    // budget. Only the remote slot marker is held meanwhile, no local heavy slot. A client signal ends the wait.
+    const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
+    const busyStart = clock();
+    const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && r.reason === 'forge-busy';
+    while (isBusy(result) && busyBudget > 0) {
+      const spent = clock() - busyStart;
+      const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
+      if (spent + backoff > busyBudget) { result = { ...result, reason: 'forge-busy-after-wait' }; break; }
+      log(`heavy-admission: remote forge-busy; waiting ${Math.round(backoff / 1000)}s then retrying Forge (${Math.round(spent / 1000)}s of ${Math.round(busyBudget / 1000)}s used, no local slot held)\n`);
+      const slept = await Promise.race([sleep(backoff).then(() => 'slept'), signalPromise]);
+      if (slept !== 'slept') { result = slept; break; }
+      remote = dispatch();
+      result = await Promise.race([remote, timeout, signalPromise]);
+      if (result?.mode === 'remote') log(`heavy-admission: Forge accepted the run after ${Math.round((clock() - busyStart) / 1000)}s of forge-busy waiting\n`);
+    }
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
       let cancelTimer;
@@ -1114,7 +1136,8 @@ export async function runWithRemoteDecision({
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
-      await record(result);
+      // A busy Forge is healthy, just occupied: with the wait enabled it must not count toward the failure backoff.
+      if (!(busyBudget > 0 && (result?.reason === 'forge-busy' || result?.reason === 'forge-busy-after-wait'))) await record(result);
       if (killedExit()) return killedExit();
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed

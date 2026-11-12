@@ -2309,3 +2309,59 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     expect(r.stderr).toMatch(/acquired slot-\d after waiting/);
   }, 30_000);
 });
+
+// forge-busy wait-retry: a Forge `forge-busy` rejection waits and retries Forge (bounded) before any local run.
+describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
+  const NOW = Date.parse('2026-10-29T21:40:00-04:00');
+  const roots = [];
+  afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+  const busy = { mode: 'not-started', terminated: true, reason: 'forge-busy' };
+  async function fixture(remote) {
+    const { runWithRemoteDecision, resolveAdmissionPolicy } = await import('../heavy-admission.mjs');
+    const runner = await import('../forge-exec-run.mjs');
+    const cwd = mkdtempSync(join(tmpdir(), 'forge-busy-wait-')); roots.push(cwd);
+    const state = { time: NOW, sleeps: [] };
+    const sample = () => ({ sampledAtET: runner.easternTimestamp(state.time), cores: 8, loadPerCore: 0.12, memFreePct: 96, activeRuns: 3,
+      recent: [{ runId: 'r-' + 'a'.repeat(32), startedAtET: runner.easternTimestamp(state.time - 41000), stageMs: { install: 1000, run: 40000 }, code: 0 }] });
+    const f = { argv: ['npx', 'vitest', 'run', 'a.test.mjs'], cwd, env: {}, lockRoot: join(cwd, 'heavy'), state, run: runWithRemoteDecision,
+      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', ...remote } } }),
+      clock: () => state.time, readTelemetry: vi.fn(async () => sample()), remoteExec: vi.fn(async () => ({ mode: 'remote', code: 0 })), log: vi.fn(),
+      sleep: async (ms) => { state.sleeps.push(ms); state.time += ms; } };
+    return f;
+  }
+  const go = (f) => f.run({ argv: f.argv, policy: f.policy, cwd: f.cwd, env: f.env, lockRoot: f.lockRoot, clock: f.clock, readTelemetry: f.readTelemetry, remoteExec: f.remoteExec, log: f.log, sleep: f.sleep });
+
+  it('retries Forge after forge-busy and returns the remote result with no local run', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValueOnce(busy).mockResolvedValueOnce(busy).mockResolvedValueOnce({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect(f.state.sleeps).toHaveLength(2);
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy; waiting'));
+  });
+  it('falls back locally with forge-busy-after-wait once the budget is spent', async () => {
+    const f = await fixture({ busyWaitMs: 90000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    expect(await go(f)).toEqual({ handled: false });
+    expect(f.remoteExec.mock.calls.length).toBeGreaterThan(1);
+    expect(f.remoteExec.mock.calls.length).toBeLessThanOrEqual(4);
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy-after-wait'));
+  });
+  it('a busy Forge never arms the failure backoff: later runs still try Forge instead of going straight to the Mac', async () => {
+    const f = await fixture({ busyWaitMs: 60000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    for (let i = 0; i < 4; i++) expect(await go(f)).toEqual({ handled: false });
+    const before = f.remoteExec.mock.calls.length;
+    f.remoteExec.mockResolvedValue({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec.mock.calls.length).toBe(before + 1);
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('backoff-forge-busy'));
+  });
+  it('keeps today\'s behaviour for other not-started reasons (no wait)', async () => {
+    const f = await fixture({ busyWaitMs: 600000 });
+    f.remoteExec.mockResolvedValue({ mode: 'not-started', terminated: true, reason: 'copy-failed' });
+    expect(await go(f)).toEqual({ handled: false });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toHaveLength(0);
+  });
+});
