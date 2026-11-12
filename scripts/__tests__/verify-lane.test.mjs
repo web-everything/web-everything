@@ -69,7 +69,7 @@ afterEach(() => {
 const marker = () => join(dir, '.git', '.lane-verify');
 /** The env a child verify-lane should see: this test run may itself be inside a verify gate, whose own admission,
  *  selection and standards variables would otherwise leak into the child processes and change what they decide. */
-const GATE_ONLY_ENV = /^(WE_HEAVY_|WE_VERIFY_|VERIFY_|WE_BUILD_FINAL_|WE_LOAD_|WE_QUEUE_|WE_REQUIRE_VERIFIED$|WE_LAND_UNVERIFIED$|FORGE_)/;
+const GATE_ONLY_ENV = /^(WE_HEAVY_|WE_VERIFY_|VERIFY_|WE_BUILD_FINAL_|WE_LOAD_|WE_QUEUE_|WE_REQUIRE_VERIFIED$|WE_LAND_UNVERIFIED$|WE_FORGE_|FORGE_)/;
 const gateScrubbedEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !GATE_ONLY_ENV.test(k)));
 const headSha = () => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
 
