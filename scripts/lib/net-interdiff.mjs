@@ -123,12 +123,14 @@ function inTree(exec, rev, path) {
   return run(exec, ['--literal-pathspecs', 'ls-tree', '-z', '--name-only', rev, '--', path]).split('\0').includes(path);
 }
 
-const DIFF_FLAGS = ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--ignore-submodules=none'];
+const DIFF_FLAGS = ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--ignore-submodules=none', '--submodule=short'];
 
 /** One file's PR-own patch from the merge-base `mb` to `head`, parsed. */
 function ownPatch(exec, head, mb, path) {
   // --literal-pathspecs: `path` is data from the caller, never a glob or pathspec magic.
   // --ignore-submodules=none: a repo/user `diff.ignoreSubmodules` or `.gitmodules` `ignore=all` must not hide a pointer bump.
+  // --submodule=short: a repo/user `diff.submodule=log` prints abbreviated hashes, so two different pointers can read alike.
+  // `short` prints the full `Subproject commit <sha>` line.
   return parsePatch(runDiff(exec, [...DIFF_FLAGS, '--binary', '--unified=3', mb, head, '--', path], { maxBuffer: MAX }));
 }
 

@@ -501,4 +501,22 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
       git('config', '--unset', 'diff.ignoreSubmodules');
     }
   });
+
+  it('keeps a submodule pointer change whose abbreviated hashes match when git config asks for log format', () => {
+    start('sub-log');
+    const gitlink = (id) => git('update-index', '--add', '--cacheinfo', `160000,${id},sub`);
+    // The two ids share their first 7 hex digits, so `diff.submodule=log` (abbreviated hashes) prints the same line for both.
+    gitlink('1111111' + 'a'.repeat(33));
+    git('commit', '-q', '-m', 'pr1 adds submodule pointer');
+    const prior = git('rev-parse', 'HEAD');
+    gitlink('1111111' + 'b'.repeat(33));
+    git('commit', '-q', '-m', 'pr2 moves submodule pointer within the same abbreviation');
+    const head = git('rev-parse', 'HEAD');
+    git('config', 'diff.submodule', 'log');
+    try {
+      expect(Object.keys(net(prior, head, { sub: null }).files)).toEqual(['sub']);
+    } finally {
+      git('config', '--unset', 'diff.submodule');
+    }
+  });
 });
