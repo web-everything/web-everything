@@ -2078,13 +2078,13 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     if (r.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} failed: ${String(r.stderr || r.error?.message || '').trim().slice(0, 300)}`);
     return String(r.stdout ?? '');
   };
-  // Seal at finish (#6535, operator ruling R907): the finished result's stored evidence is sealed by the shared
-  // publisher in seal-only mode (it never posts or escalates here; the sweep still posts an unposted comment), so the
-  // red-team check written once at finish reads the sealed breaks, not an unsealed bare `ran`.
+  // Seal at finish (#6535, operator ruling R907): the finished result is sealed AND, when its comment was withheld or
+  // its post failed, published by the shared publisher (the sweep's own path, bounded by its attempt count), so the
+  // red-team check written once at finish reads the sealed breaks and the posted result, not an unsealed bare `ran`.
   const sealFinished = sealResult ?? (({ repo, pr, head }) => publishStoredRedTeamResult({
-    status: { repo, pr, head }, sealOnly: true, statusDir: redTeamStatusDir(env),
+    status: { repo, pr, head }, statusDir: redTeamStatusDir(env),
     listComments: () => readCompleteComments({ pr, repo }),
-    postComment: () => { throw Error('seal at finish never posts'); },
+    postComment: ({ repo: r, pr: p, body }) => gh(['pr', 'comment', String(p), `--repo=${r}`, '--body-file', '-'], body),
     readSeatRow: key => priorRedTeamRow(readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records,
       key.pr, key.head, key.repo),
   }));

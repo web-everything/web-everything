@@ -25,6 +25,17 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 /** How `redTeamEnqueueHold` names a hold that is only "result not sealed yet" (PR #6622); a test pins it to that text. */
 export const RED_TEAM_UNSEALED_HOLD_PREFIX = 'post-accept red team result is not published yet';
+/** How `redTeamEnqueueHold` names a head with no posted result comment; pinned by the same test. */
+export const RED_TEAM_NO_RESULT_HOLD_PREFIX = 'post-accept red team has no recorded result';
+/** Does the persisted status still owe its result comment (the publisher's `needsPublish` test, mirrored here to keep
+ * this module free of the publisher's import graph; a test pins the two together)? Unreadable counts as owing. */
+export function statusOwesPublication(status) {
+  return status?.status === 'finished' && (status.result === 'ran'
+    || (status.result?.status === 'ran' && ['withheld', 'error'].includes(status.result.comment)));
+}
+const persistedOwesPublication = path => {
+  try { return statusOwesPublication(JSON.parse(readFileSync(path, 'utf8'))); } catch { return true; }
+};
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
 /** Publication outbox only: no status parsing or review-run scan at enqueue. */
@@ -498,9 +509,11 @@ export function recordRedTeamStatus(input, options = {}) {
             hold = redTeamEnqueueHold({ ...input, head, comments, scheduled: true,
               recorded: input.result === 'ran', env: options.env ?? process.env });
           } catch { /* unreadable evidence retains the hold */ }
-          // A result still unsealed (the sealer failed or none was given) is no break: it must not publish FAILURE (R907).
-          // It publishes the check as in progress, which still holds merge-gate (fail closed) without naming a break.
-          if (!sendBack && typeof hold === 'string' && hold.startsWith(RED_TEAM_UNSEALED_HOLD_PREFIX)) checkStatus = 'running';
+          // A result not yet sealed or not yet posted (the sealer failed, none was given, or its post failed) is no break:
+          // it must not publish FAILURE (R907). It publishes the check as in progress, which still holds merge-gate
+          // (fail closed) without naming a break. A confirmed break or unknown evidence keeps its failure.
+          if (!sendBack && typeof hold === 'string' && (hold.startsWith(RED_TEAM_UNSEALED_HOLD_PREFIX)
+            || (hold.startsWith(RED_TEAM_NO_RESULT_HOLD_PREFIX) && persistedOwesPublication(path)))) checkStatus = 'running';
         }
         const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: checkStatus, hold, sendBack });
         const post = payload => {

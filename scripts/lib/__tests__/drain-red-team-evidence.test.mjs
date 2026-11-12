@@ -12,8 +12,8 @@ import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
-import { publishStoredRedTeamResult } from '../red-team-withheld-publish.mjs';
-import { RED_TEAM_UNSEALED_HOLD_PREFIX } from '../drain-red-team-evidence.mjs';
+import { publishStoredRedTeamResult, needsPublish } from '../red-team-withheld-publish.mjs';
+import { RED_TEAM_UNSEALED_HOLD_PREFIX, RED_TEAM_NO_RESULT_HOLD_PREFIX, statusOwesPublication } from '../drain-red-team-evidence.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -154,6 +154,47 @@ describe('status persistence and check publication share one claim', () => {
         checkRuns: [{ ...checks[0], id: 1, app: { id: 5037855 } }] }).ok).toBe(false);
     });
 
+    // Self-review must-fix: the seat's comment was withheld (secret scrub) or its post failed, so the thread has no result.
+    it('a withheld comment is posted by the finish sealer, then the one check is success', () => {
+      const f = fixture(), checks = [], thread = [], posted = [];
+      const sealFinished = key => publishStoredRedTeamResult({ status: key, statusDir: redTeamStatusDir(f.env),
+        listComments: () => thread, postComment: ({ body }) => { posted.push(body); thread.push({ author: { login: 'web-everything' }, body }); },
+        readSeatRow: () => seatRow(key.head), publishNeedsYou: () => {} });
+      expect(recordRedTeamStatus(finished(f), finishOptions(f, checks, { comments: thread, sealFinished }))).toEqual({ published: true });
+      expect(posted).toHaveLength(1);
+      expect(readRedTeamStatus(f)).toMatchObject({ sealedBreaks: [], result: { status: 'ran', comment: 'posted' } });
+      expect(checks).toMatchObject([{ status: 'completed', conclusion: 'success' }]);
+    });
+
+    it.each([
+      ['seal-only (nothing posts)', f => sealAtFinish(f, { comments: [] })],
+      ['a post that fails', f => key => publishStoredRedTeamResult({ status: key, statusDir: redTeamStatusDir(f.env),
+        listComments: () => [], postComment: () => { throw Error('HTTP 502'); }, readSeatRow: () => seatRow(key.head),
+        publishNeedsYou: () => {} })],
+    ])('a sealed result whose comment is still unposted (%s) never publishes FAILURE: in progress, still held', (_l, sealer) => {
+      const f = fixture(), checks = [];
+      recordRedTeamStatus(finished(f), finishOptions(f, checks, { comments: [], sealFinished: sealer(f) }));
+      expect(readRedTeamStatus(f).sealedBreaks).toEqual([]);
+      expect(checks).toHaveLength(1);
+      expect(checks[0].status).toBe('in_progress');
+      expect(checks[0].output.summary).toContain(RED_TEAM_NO_RESULT_HOLD_PREFIX);
+    });
+
+    it('a result that owes no publication and has no recorded result keeps its FAILURE', () => {
+      const f = fixture(), checks = [];
+      recordRedTeamStatus({ ...finished(f), result: { status: 'ran', comment: 'posted', findings: [] } },
+        finishOptions(f, checks, { comments: [] }));
+      expect(checks).toMatchObject([{ status: 'completed', conclusion: 'failure' }]);
+    });
+
+    it('statusOwesPublication mirrors the publisher\'s needsPublish', () => {
+      for (const status of [{ status: 'finished', result: 'ran' }, { status: 'running', result: 'ran' },
+        { status: 'finished', result: { status: 'ran', comment: 'withheld' } }, { status: 'finished', result: { status: 'ran', comment: 'error' } },
+        { status: 'finished', result: { status: 'ran', comment: 'posted' } }, { status: 'finished', result: 'failed' }, null]) {
+        expect(statusOwesPublication(status)).toBe(needsPublish(status));
+      }
+    });
+
     it('an explicit send-back on an unsealed result still publishes FAILURE (only "not sealed" is downgraded)', () => {
       const f = fixture(), checks = [];
       recordRedTeamStatus({ ...finished(f), sendBack: true }, finishOptions(f, checks));
@@ -166,6 +207,9 @@ describe('status persistence and check publication share one claim', () => {
       const hold = redTeamEnqueueHold({ ...finished(f), head: f.head, comments: [cleanResultComment(f)], scheduled: true,
         recorded: true, env: f.env });
       expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
+      sealAtFinish(f, { comments: [] })({ repo: f.repo, pr: f.pr, head: f.head });
+      expect(redTeamEnqueueHold({ ...finished(f), head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
+        .toMatch(new RegExp(`^${RED_TEAM_NO_RESULT_HOLD_PREFIX}`));
     });
   });
 
