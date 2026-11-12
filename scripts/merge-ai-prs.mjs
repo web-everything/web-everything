@@ -1346,7 +1346,11 @@ export function isRebaseDropCandidate(v) {
 
 /** Pure: only complete, clean evidence permits retaining a BEHIND head for the merge queue. */
 export function isBehindButClean(v) {
+  // BEHIND must be the SOLE blocker: the verdict reason is exactly the plain BEHIND reason (no queueBlocker suffix,
+  // no CodeQL / read-error / review-hold / fix-claim reason, which replace it) and no blocker flag is set.
   return isRebaseDropCandidate(v) && v.state === 'BEHIND' && v.mergeable === 'MERGEABLE'
+    && v.reason === unlandableStateReason('BEHIND')
+    && !v.codeqlBlocked && !v.reviewHeld && !v.requiredCheckReadError && !v.prestagePendingCi && !v.offDefaultBase
     && v.hasManifest === false && v.testGreen === true && (v.certifyLabel === true || v.aiGenerated === true);
 }
 

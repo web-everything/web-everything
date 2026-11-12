@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,7 +20,7 @@ import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
 
 describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
-  const clean = { decision: 'skip', state: 'BEHIND', mergeable: 'MERGEABLE', hasManifest: false,
+  const clean = { decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND', mergeable: 'MERGEABLE', hasManifest: false,
     certifyLabel: true, aiGenerated: false, testGreen: true };
 
   it('is true for behind + clean + certified + green, including AI certification', () => {
@@ -39,6 +39,10 @@ describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
     ['unknown mergeability', { mergeable: 'UNKNOWN' }],
     ['unknown state', { state: 'UNKNOWN' }],
     ['invalid manifest evidence', { hasManifest: null }],
+    ['another blocker reason', { reason: unlandableStateReason('BEHIND') + '; reviewDecision=CHANGES_REQUESTED' }],
+    ['codeql blocked', { codeqlBlocked: true }],
+    ['review held', { reviewHeld: true }],
+    ['required check read error', { requiredCheckReadError: true }],
     ['invalid green evidence', { testGreen: 'true' }],
     ['invalid certification evidence', { certifyLabel: 'true' }],
   ])('is false for %s', (_name, patch) => {
