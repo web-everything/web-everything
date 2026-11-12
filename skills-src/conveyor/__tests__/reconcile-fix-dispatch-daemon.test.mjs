@@ -2633,17 +2633,22 @@ describe('fix pass budgets', () => {
     expect(rotation[phase]).toBeUndefined();
   });
 
-  it('keeps a deferred repo at the head of rotation when the budget stops the loop later', async () => {
+  it('a budget stop still heads the next pass with the first skipped repo, not a visited deferred one', async () => {
     let time = 0;
-    const cursors = {}, rotation = {};
+    const cursors = {}, rotation = {}, visited = [];
     const opts = fixture({ now: () => time, prCursors: cursors, budgetRotation: rotation,
       ciHealTick: async ({ repo }) => {
+        visited.push(repo);
         if (repo === 'a') { time += 1001; return { ...empty(), deferred: [9], nextCursor: 9 }; }
         return empty();
       },
     });
     await runTickAllRepos(opts);
-    expect(rotation['ci-heal']).toBe('a');
+    expect(cursors['ci-heal']).toEqual({ a: 9 });
+    expect(rotation['ci-heal']).toBe('b');
+    visited.length = 0;
+    await runTickAllRepos(opts);
+    expect(visited[0]).toBe('b');
   });
 
   it.each(['fix', 'notes'])('bounds %s between repos and resumes the skipped repo', async phase => {
