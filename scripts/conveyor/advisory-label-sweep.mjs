@@ -212,13 +212,19 @@ export function sweepAdvisoryLabels({
       // A carried result holds on the seal of the head it came from, and only the live head is published above: seal
       // those source heads too (seal only, nothing posted for a superseded head), or the carried head holds forever.
       if (!dryRun) {
+        // One thread read per PR per pass, shared by every source head (a held source is re-compared each pass).
+        let sourceThread;
+        const readSourceThread = () => (sourceThread ??= provider.readComments(resolvedRepo, pr.number));
         for (const from of redTeamCarrySources({ comments, pr: pr.number, head: live.headRefOid })) {
           try {
             // Pick by the READER's own view of the raw status file (never the run-evidence summary, which can omit a status
-            // that exists): exactly the heads every reader holds as unsealed. The publisher re-reads the file under its lock.
-            if (readSeal({ repo: resolvedRepo, pr: pr.number, head: from })?.unsealed !== true) continue;
+            // that exists): the heads every reader holds as unsealed, and the sealed heads still carrying the legacy hold
+            // flag (only the publisher lifts it, once the thread agrees with the seal, so a corrected comment must be
+            // re-compared every pass or the carried head holds forever). The publisher re-reads the file under its lock.
+            const seal = readSeal({ repo: resolvedRepo, pr: pr.number, head: from });
+            if (seal?.unsealed !== true && seal?.legacyHold !== true) continue;
             const sealed = publishStored({ status: { repo: resolvedRepo, pr: pr.number, head: from }, sealOnly: true,
-              listComments: () => provider.readComments(resolvedRepo, pr.number),
+              listComments: readSourceThread,
               postComment: () => { throw Error('a seal-only pass never posts'); } });
             if (sealed.status !== 'skipped') (publication.sourceSeals ??= []).push(`${from.slice(0, 9)}:${sealed.status}`);
           } catch (e) {

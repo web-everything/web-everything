@@ -66,6 +66,37 @@ export default {
         check(!labels.includes('red-team:clear'), `from ${start}: one sweep pass planned red-team:clear for a stored confirmed break`);
         check(labels.includes('red-team:blocked'), `from ${start}: one sweep pass did not plan red-team:blocked`);
       }
+      // Live case (#6622 head 44f1fb0a7): a carry source sealed clean but flagged by a stale conflicting comment. Once
+      // both trusted comments are corrected (the carry kept), the sweep must revisit the source and lift its hold.
+      {
+        const NEXT = 'd'.repeat(40);
+        const clean = { ...row, foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] };
+        writeFileSync(statusFile, JSON.stringify({ repo: REPO, pr: PR, head: HEAD, status: 'finished', result: 'ran' }));
+        const trusted = (body, at) => ({ author: { login: 'web-everything' }, createdAt: at, body });
+        const carried = (rest, at) => trusted([`<!-- review-verdict-carried from=${HEAD} to=${NEXT} patch-id=${'e'.repeat(40)} -->`,
+          'Review verdict carried across an identical contribution.', redTeamMarker(PR, NEXT), rest].join('\n'), at);
+        const breakBody = '### Post-accept red team\n\n1. [**confirmed**] (correctness, broken) `scripts/example.mjs:1` — A stale break';
+        let thread = [trusted(`${redTeamMarker(PR, HEAD)}\n${breakBody}`, '2026-11-10T12:00:00Z'), carried(breakBody, '2026-11-10T12:05:00Z')];
+        let labels = ['red-team:pending'];
+        const live = () => ({ number: PR, state: 'OPEN', headRefOid: NEXT, labels: labels.map(name => ({ name })), comments: thread, reviews: [] });
+        const provider = { currentRepo: () => REPO, readComments: () => thread, postComment: () => { throw Error('never posts'); },
+          ensureLabel: () => {}, setLabels: (_repo, _pr, { add, remove }) => {
+            labels = labels.filter(l => !remove.includes(l));
+            if (add && !labels.includes(add)) labels.push(add);
+          } };
+        const sweep = () => sweepAdvisoryLabels({ repo: REPO, listPrs: () => [live()], readPr: live, provider, log: line => log?.(line),
+          listUnpublishedStatuses: () => [], readStatusEvidence: () => ({ ok: false }),
+          publishStored: input => publishStoredRedTeamResult({ ...input, readSeatRow: () => clean, publishNeedsYou: () => {} }) });
+        sweep();
+        const flagged = JSON.parse(readFileSync(statusFile, 'utf8')).legacyHoldPublished === true;
+        check(flagged, 'carry source: the stale conflicting comment did not record the legacy hold (precondition)');
+        thread = [clear, carried('### Post-accept red team — no break found', '2026-11-10T12:10:00Z')];
+        sweep();
+        check(JSON.parse(readFileSync(statusFile, 'utf8')).legacyHoldPublished !== true,
+          'carry source: after both comments were corrected the sweep never revisited the source, so its legacy hold stayed');
+        check(readRedTeamDisposition({ comments: thread, pr: PR, head: NEXT, repo: REPO }).held.length === 0,
+          'carry source: the carried head stayed held on matching clean evidence');
+      }
     } catch (error) {
       violations.push(`scenario failed: ${error.stack ?? error}`);
     } finally {

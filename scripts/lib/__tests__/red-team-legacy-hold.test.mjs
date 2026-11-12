@@ -301,6 +301,34 @@ describe('the sealed status reader fails closed', () => {
     expect(readStatusFile().sealedBreaks).toEqual([]);
     expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held).toEqual([]);
   });
+  it('a sealed carry source held by a stale conflict clears once its comments are corrected (the sweep revisits it)', () => {
+    // A: finished legacy `ran`, clean exact-head row, but a stale trusted comment showing a break, carried to B.
+    const live = 'b'.repeat(40);
+    store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);
+    writeStatusFile(legacyStatus());
+    const carried = (body, to) => trusted([`<!-- review-verdict-carried from=${head} to=${to} patch-id=${'c'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', body].join('\n'));
+    const staleBreak = render([brokenFinding]);
+    const staleCarry = { ...carried(render([brokenFinding], live).body, live), createdAt: '2026-11-10T12:05:00Z' };
+    let thread = [staleBreak, staleCarry];
+    let labels = [];
+    const view = () => ({ number: 42, state: 'OPEN', labels: labels.map(name => ({ name })), headRefOid: live, comments: thread, reviews: [] });
+    const sweep = () => sweepAdvisoryLabels({ repo, listPrs: () => [{ ...view(), labels: [{ name: 'red-team:pending' }] }], readPr: view,
+      log: () => {}, listUnpublishedStatuses: () => [],
+      provider: { currentRepo: () => repo, readComments: () => thread, postComment: () => { throw Error('never'); }, ensureLabel: () => {},
+        setLabels: (_r, _p, { add, remove }) => { labels = labels.filter(l => !remove.includes(l)); if (add && !labels.includes(add)) labels.push(add); } },
+      publishStored: input => publishStoredRedTeamResult({ ...input, publishNeedsYou: () => {} }) });
+    sweep();
+    // The conflict pass seals A empty and records the legacy hold: B is held.
+    expect(readStatusFile()).toMatchObject({ sealedBreaks: [], legacyHoldPublished: true });
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held.length).toBeGreaterThan(0);
+    // Both trusted comments corrected to show no findings, the A-to-B carry kept.
+    thread = [clearComment, { ...carriedClear(live), createdAt: '2026-11-10T12:10:00Z' }];
+    sweep();
+    expect(readStatusFile().legacyHoldPublished).toBeUndefined();
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held).toEqual([]);
+    expect(labels).not.toContain('red-team:blocked');
+  });
   it('a stored row with no confirmed break seals an EMPTY list, which lifts the unsealed hold for an agreeing comment', () => {
     store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);
     writeStatusFile(legacyStatus());
