@@ -91,20 +91,28 @@ export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, 
     // and the removal. A newer attempt that marked the head since owns the marker and its outcome: leave both.
     const settled = lock(() => {
       const marker = readCarriedCheckMarker(path);
-      if (!marker.exists) return { ok: true };
-      if (marker.attempt !== null && marker.attempt !== attempt) {
+      if (marker.exists && marker.attempt !== null && marker.attempt !== attempt) {
         // Only a marker this attempt wrote proves a NEWER attempt replaced it. When this attempt's own mark failed, the
         // marker may be an older failed attempt's (and its hold): neither trust it as newer nor clear it as ours.
         if (markError) return { ok: false, reason: `carried-check retry marker not written (${markError}): operator must republish` };
         return { ok: true };
       }
       // Always ask: clearHold removes only the live helper's own holds, so a hold whose intent was never recorded
-      // (beforeHold failed) is cleared too. A failed read or clear keeps the marker for the next retry.
+      // (beforeHold failed) is cleared too. A failed read or clear keeps the marker for the next retry. An ABSENT
+      // marker is asked too (red team on 914348f86): when marker writes fail, the hold an earlier attempt posted has no
+      // local record, so this confirmed attempt is the only thing that can clear it.
       let cleared;
       try { cleared = clearHold ? clearHold() : { ok: false, reason: 'no publication hold clearer' }; }
       catch (error) { cleared = { ok: false, reason: safeText(error) }; }
-      if (cleared?.ok !== true)
-        return { ok: false, reason: `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}` };
+      if (cleared?.ok !== true) {
+        const reason = `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}`;
+        if (marker.exists) return { ok: false, reason };
+        // No marker: record one so the recovery pass retries the clear; if that write fails too, nothing will.
+        try { markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true, attempt }); }
+        catch (error) { return { ok: false, reason: `${reason}; carried-check retry marker not written (${safeText(error).slice(0, 200)}): operator must republish` }; }
+        return { ok: false, reason };
+      }
+      if (!marker.exists) return { ok: true };
       try { rmSync(path, { force: true }); }
       catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
       return { ok: true };

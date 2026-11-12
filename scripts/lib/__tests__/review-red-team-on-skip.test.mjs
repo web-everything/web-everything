@@ -17,7 +17,7 @@ import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublica
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { chmodSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -2191,6 +2191,38 @@ describe('#6606 carried check recovered after a transient verification failure',
       expect(clearHold).not.toHaveBeenCalled();
       expect(w.owed()).toBe(true);
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a confirmed attempt clears the helper hold even when no marker could ever be written', () => {
+    // Red team on 914348f86: marker writes fail (the outbox directory is not writable), attempt 1 posts the hold, the
+    // retry succeeds. With no marker to read, settlement used to return ok without clearing: merge stayed blocked.
+    const w = world({ failCheckPosts: new Set([2]) });
+    const statusDir = redTeamStatusDir(w.env);
+    try {
+      mkdirSync(statusDir, { recursive: true });
+      chmodSync(statusDir, 0o555);
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/retry marker not written/) });
+      expect(w.holdFact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(false);
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: true });
+      expect(w.fact()).toMatchObject({ ok: true });
+      expect(w.holdFact()).toMatchObject({ ok: true });
+      // A clear that fails with no marker left is not ok, and names that nothing will retry it.
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }),
+        clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/hold not cleared: HTTP 502.*retry marker not written.*operator must republish/) });
+    } finally { chmodSync(statusDir, 0o755); rmSync(w.dir, { recursive: true, force: true }); }
+    // With writable storage, a failed clear on an absent marker writes one, so the recovery pass retries the clear.
+    const v = world();
+    try {
+      expect(v.owed()).toBe(false);
+      expect(publishCarriedCheckDurably({ repo, pr, head, env: v.env, newAttempt: () => 'a', lock: fn => {
+        rmSync(join(redTeamStatusDir(v.env), `${encodeURIComponent(repo)}-${pr}-${head}.json.carried-check-unpublished`), { force: true });
+        return fn();
+      }, publish: () => ({ ok: true }), clearHold: () => ({ ok: false, reason: 'HTTP 502' }) }))
+        .toMatchObject({ ok: false, reason: expect.stringMatching(/hold not cleared: HTTP 502$/) });
+      expect(v.owed()).toBe(true);
+    } finally { rmSync(v.dir, { recursive: true, force: true }); }
   });
 
   it('a hold clear that fails keeps the marker so the next retry clears it', () => {
