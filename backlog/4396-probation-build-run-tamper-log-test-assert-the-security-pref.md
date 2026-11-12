@@ -5,8 +5,8 @@ status: open
 scope: ["we:scripts/operations/__tests__/probation-build-run.test.mjs"]
 estimatedLoc: 6
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-08"
-preparedAgainstSha: "7cf64add2e939aa00bb940bdd61ca428c0b16937"
+preparedDate: "2026-11-12"
+preparedAgainstSha: "c29ba91a2b29e423e21ff72de2787a0c1c7f6575"
 tags: []
 ---
 
@@ -16,7 +16,7 @@ Advisory follow-up from PR #2867 (WE #4291): the worker-hook tamper test in we:s
 
 ## Acceptance
 
-1. [A1] **Executable** — The existing test named “a worker that changes the lane's git-hook surface is refused, discarded, and never committed/PR-opened” in we:scripts/operations/__tests__/probation-build-run.test.mjs must assert that the captured worker-tamper message begins with `SECURITY:` after the runner's contextual prefix. Run the focused command below and the mutation check in Proof plan. The mutation check fails before this build (the prefix-removal mutant survives) and passes afterward (the new assertion kills that mutant); the unmodified runtime must pass in both cases.
+1. [A1] **Executable** — The existing test named “a worker that changes the lane's git-hook surface is refused, discarded, and never committed/PR-opened” in we:scripts/operations/__tests__/probation-build-run.test.mjs must assert that the captured worker-tamper message begins with `SECURITY:` after the runner's contextual prefix. Run the focused command below and the mutation check in Proof plan. Before this build the prefix-removal mutant survives (the check does not detect it); after, the new assertion kills that mutant; the unmodified runtime must pass in both cases.
 
 ## Design
 
@@ -30,7 +30,7 @@ Edit only we:scripts/operations/__tests__/probation-build-run.test.mjs. Add loca
 
 ## Test plan
 
-From the WE repository root, run the affected test file through the host queue. The command uses the queue-backed `test:unit` script defined in we:package.json:30. The variable below strips the documentation-only repository prefix so the command remains executable:
+From the WE repository root, run the affected test file through the host queue. The command uses the queue-backed `test:unit` script defined in we:package.json:31. The variable below strips the documentation-only repository prefix so the command remains executable:
 
 ```bash
 test_ref=we:scripts/operations/__tests__/probation-build-run.test.mjs
@@ -57,3 +57,4 @@ None required for this advisory. Other security log branches remain outside this
 - Preparation is based on source inspection; no implementation or test run is claimed. Stamping and checks remain runner-owned.
 - Re-prepare 2026-11-06: the scope file changed on main after the earlier stamp (PR #5484). Re-verified against current `main`: goal not delivered (no `SECURITY` assertion in the test file); citations still hold (test at :600–614, shared logger :106, runtime :311 and :520). No design change; re-stamped.
 - Re-prepare 2026-11-08: citations drifted after main moved; updated to test :606–620 and shared logger :112 (runtime :311, :520 unchanged). Goal still undelivered (no SECURITY assertion in the test). No design change; re-stamped.
+- Re-prepare 2026-11-12: no commits touched the test or runtime since the last stamp; citations re-verified (test :606, shared logger :112, runtime :311/:520). Goal still undelivered. No design change; re-stamped.
