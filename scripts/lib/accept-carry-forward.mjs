@@ -128,7 +128,7 @@ const KNOWN_MACHINE_SHAPE_RES = [
 // Whole-body anchored (a trailing objection must not ride a known prefix) and refused when the free text voices a hold.
 const TRUSTED_AUTHOR_NOTE_RES = [
   /^🛠 operator action — refresh\n\nOperator @[\w-]+ via \w+:\n> [^\n]+\n\nUndo: [^\n]+\n\n<!-- operator-action: \{"version":1,"op":"refresh"[^\n]*\} -->\s*$/,
-  /^Manual R247 pass — daemon: [^\n]+$/,
+  /^Manual R247 pass — daemon: [\w-]+; reason: EMERGENCY \(labelled\): [^\n]+$/,
 ];
 const TRUSTED_NOTE_HOLD_WORD_RE = /\b(?:hold|held|do not|don'?t|must not|never merge|block(?:ed|s|ing)?|changes? requested|reject(?:ed)?|stop|wait|unsafe)\b/i;
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
