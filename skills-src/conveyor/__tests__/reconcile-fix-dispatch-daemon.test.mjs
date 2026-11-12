@@ -2589,13 +2589,13 @@ describe('fix pass budgets', () => {
       passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { notesMs: 1000 } } }),
     });
     const first = await runTickAllRepos(opts);
-    expect(first.noteComments).toEqual([]);
-    expect(first.phasePrCounts.notes).toEqual({ handled: 0, deferred: 2 });
-    expect(first.budgets.notes).toMatchObject({ hit: true, skipped: [42, 43] });
-    expect(cursors.notes.a).toBe(42);
+    expect(first.noteComments.map(row => row.prNumber)).toEqual([42]); // one note per started repo: never starved
+    expect(first.phasePrCounts.notes).toEqual({ handled: 1, deferred: 1 });
+    expect(first.budgets.notes).toMatchObject({ hit: true, skipped: [43] });
+    expect(cursors.notes.a).toBe(43);
     const second = await runTickAllRepos(opts);
-    expect(notesTick.mock.calls[1][0]).toMatchObject({ repo: 'a', deadlineAt: 2001, cursor: 42 });
-    expect(second.noteComments.map(row => row.prNumber)).toEqual([42, 43]);
+    expect(notesTick.mock.calls[1][0]).toMatchObject({ repo: 'a', deadlineAt: 2001, cursor: 43 });
+    expect(second.noteComments.map(row => row.prNumber)).toEqual([43, 42]);
     expect(second.phasePrCounts.notes).toEqual({ handled: 2, deferred: 0 });
     expect(cursors.notes.a).toBeUndefined();
   });

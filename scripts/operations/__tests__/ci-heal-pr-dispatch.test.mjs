@@ -21,7 +21,7 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { briefPath, REPO_ROOT } from '../dispatch-lane-io.mjs';
-import { dispatchCiHeal, runReconcileCiHealDispatch, orderCiHealEntriesOldestFirst, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
+import { dispatchCiHeal, runReconcileCiHealDispatch, resetCiHealFlushDeadlineState, orderCiHealEntriesOldestFirst, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
 import { createCiHealReserve } from '../../lib/ci-heal-reserve.mjs';
 import { readUnsupported } from '../../conveyor/unsupported-repo.mjs';
 import { flushOwedWrites, readOwedWrites, recordOwedWrite, OWED_MAX_AGE_MS } from '../../conveyor/ci-heal-owed.mjs';
@@ -1309,6 +1309,7 @@ it('past deadline without a cursor skips every blocking prelude (including recon
 });
 
 it('a flush skipped for the deadline is forced next pass even if still past deadline, so a slow prelude cannot starve it', async () => {
+  resetCiHealFlushDeadlineState();
   const flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []), reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
   const options = { root: '/repo', checkStaleness: FRESH, now: () => 11, deadlineAt: 10, cursor: 7,
     pollAttempts: () => [], flushOwed, flushTimeouts, reconcile, resolveProfile: () => ({ capabilities: { ciHeal: true } }), pickFreeLanes: () => [] };

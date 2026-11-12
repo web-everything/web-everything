@@ -441,7 +441,8 @@ export function runReconcileNotesAllRepos({
     // PRs whose cap note a grant made moot (this pass's own, another worker's, or one being decided right now).
     const graceNotes = new Set();
     for (const n of repoNotes) {
-      if (pastDeadline()) {
+      // Always handle one note per started repo, so slow discovery cannot starve notes pass after pass.
+      if (repoHandled > 0 && pastDeadline()) {
         deferred = repoNotes.slice(repoHandled).map(note => note.prNumber);
         break;
       }
@@ -527,7 +528,6 @@ export function runReconcileNotesAllRepos({
     // Never silently stuck after an automatic grant: a PR still at its round limit well after one gets its
     // needs-you event (published even though the grant's own pass suppressed it; the feed dedups per head). A PR
     // whose note a grant made moot is checked too, so a suppressed stale note can never hide a stuck PR.
-    if (deferred.length) break;
     if (!dryRun && safety.value.alertAtRoundCap) {
       const noted = new Set((result?.notes ?? []).map((n) => n.prNumber).filter((number) => !graceNotes.has(number)));
       for (const pr of prsByNumber.values()) {
@@ -541,6 +541,7 @@ export function runReconcileNotesAllRepos({
         catch (e) { process.stderr.write(`needs-you publication failed: ${redactedFirstLine(e)}\n`); }
       }
     }
+    if (deferred.length) break;
   }
   return { handled, deferred, nextCursor: deferred[0] ?? null, ...(deadlineSkipped ? { deadlineSkipped: true } : {}),
     repos: perRepo, notes, refusals, comments, autoGrants };

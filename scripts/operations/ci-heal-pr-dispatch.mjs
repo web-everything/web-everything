@@ -401,6 +401,8 @@ export function orderCiHealEntriesOldestFirst(entries) {
  */
 // A repo whose durable flushes were skipped for the deadline runs them unconditionally next pass (never starved).
 const flushSkippedRepos = new Set();
+/** Test seam: forget which repos had a flush skipped. */
+export const resetCiHealFlushDeadlineState = () => flushSkippedRepos.clear();
 
 export async function runReconcileCiHealDispatch({
   root = REPO_ROOT,
