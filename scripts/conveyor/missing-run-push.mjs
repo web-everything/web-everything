@@ -2,7 +2,7 @@
  * Uses a scratch bare repository: no daemon checkout, index or branch is changed.
  * A marked recovery tip is never nudged again, even if posting its comment failed.
  */
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, openSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -10,7 +10,8 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { recoveryPreflight, recoveryPushCredential } from './recovery-preflight.mjs';
 export { recoveryPushCredential } from './recovery-preflight.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
-import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
+import { MISSING_RUN_CREDENTIAL_REFUSAL, DEFAULT_MISSING_RUN_THRESHOLD_MS } from './main-red-recovery.mjs';
+import { daemonConveyorStateRoot } from '../lib/daemon-last-good.mjs';
 import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
 
@@ -31,10 +32,29 @@ export function ownerInstallationToken(repo, { env = process.env, readCache = de
   return typeof cached.token === 'string' && cached.token.startsWith('ghs_') ? cached.token : null;
 }
 
+/** Take the ONE dispatch reservation for `key` (repo + exact head). An exclusive file create is atomic across
+ *  processes, so two ticks can never both win, unlike the run listing, which lags a fresh dispatch by seconds.
+ *  The reservation is never released: a POST whose outcome is unknown must not be repeated, and a head that
+ *  still has no checks goes to ci-heal. Returns false when already taken; throws (caller fails closed) when it
+ *  cannot be written.
+ *  @returns {boolean} */
+export function reserveMissingRunDispatch(key, { env = process.env } = {}) {
+  const dir = join(daemonConveyorStateRoot(env), 'missing-run-dispatch');
+  mkdirSync(dir, { recursive: true });
+  try {
+    closeSync(openSync(join(dir, `${createHash('sha256').update(key).digest('hex')}.reserved`), 'wx'));
+    return true;
+  } catch (error) {
+    if (error?.code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
 export function pushMissingRunCommit(d, options = {}) {
   const {
   repo, defaultBranch = 'main', exec = execFileSyncThrottled, env = process.env,
   checkClaim = pushRefusal, readCache = defaultReadCache, now = Date.now(),
+  reserveDispatch = (key) => reserveMissingRunDispatch(key, { env }),
   } = options;
   const action = 'pull-request-push';
   const defer = (error) => ({ ok: false, action, deferred: true, error });
@@ -99,7 +119,49 @@ export function pushMissingRunCommit(d, options = {}) {
     git('fetch', '--no-tags', remote, ref);
     if (git('rev-parse', 'FETCH_HEAD') !== d.headSha) return defer('branch moved before recovery');
     const message = git('show', '-s', '--format=%B', d.headSha);
-    if (message.split('\n').some(line => line.startsWith(RECOVERY_COMMIT_MARKER))) return { ok: false, action, error: 'recovery commit still has no PR checks; needs ci-heal, not another empty commit' };
+    if (message.split('\n').some(line => line.startsWith(RECOVERY_COMMIT_MARKER))) {
+      // Live 2026-11-11 (#6684/#6633): the marked empty commit produced no pull_request run either. A second empty
+      // commit cannot help, but a workflow_dispatch of ci.yml on the branch reports `test`/`smoke` on this head
+      // (the manual fix). ONE dispatch per head is enforced by the atomic reservation taken below, NOT by this run
+      // listing, which lags a fresh dispatch by seconds. The listing only refuses early: a ci.yml run that is
+      // running/done, or any earlier workflow_dispatch, blocks; a fresh queued one is left alone; a stuck one passes.
+      stage = 'dispatch';
+      const ghEnv = { ...gitEnv, GH_TOKEN: token };
+      const existing = JSON.parse(String(exec('gh', ['api', `repos/${repo}/actions/runs?head_sha=${d.headSha}&per_page=100`], { ...opts, env: ghEnv })));
+      if (!Number.isSafeInteger(existing.total_count) || existing.total_count < 0 || existing.total_count >= 100
+        || !Array.isArray(existing.workflow_runs) || existing.workflow_runs.length !== existing.total_count) {
+        return defer('head runs unreadable or incomplete; needs ci-heal inspection');
+      }
+      // Live #6684/#6633: the pull_request ci.yml run sat `queued` for hours and never reported a check, so a bare
+      // "a run exists" guard would refuse exactly the stuck case. A fresh queued/pending run is left alone; a
+      // queued run older than the missing-run threshold is stuck. Any earlier dispatch on this head blocks (one per head).
+      const stuckAfterMs = DEFAULT_MISSING_RUN_THRESHOLD_MS;
+      const blocksDispatch = (run) => {
+        // A run whose workflow path cannot be read might be a ci.yml run: block rather than skip it.
+        if (typeof run?.path !== 'string' || run.path === '') return true;
+        if (!run.path.includes('ci.yml')) return false;
+        if (run?.event === 'workflow_dispatch') return true;
+        if (!['queued', 'waiting', 'pending', 'requested'].includes(String(run?.status))) return true;
+        const created = Date.parse(run?.created_at);
+        return !Number.isFinite(created) || (now - created) < stuckAfterMs;
+      };
+      if (existing.workflow_runs.some(blocksDispatch)) {
+        return { ok: false, action, error: 'recovery commit still has no PR checks and CI was already dispatched for this head; needs ci-heal, not another trigger' };
+      }
+      // Re-check ownership and the exact head right before mutating (the push path does the same via its lease).
+      const heldAtDispatch = claim();
+      if (heldAtDispatch !== null) return defer(heldAtDispatch?.message || 'fix claim held or unreadable; needs human/ci-heal inspection');
+      const live = JSON.parse(String(exec('gh', ['api', `repos/${repo}/pulls/${d.prNumber}`], { ...opts, env: ghEnv })));
+      if (live.state !== 'open' || live.head?.sha !== d.headSha || live.head?.ref !== d.headRefName) return defer('PR head or state changed');
+      // The listing above only sees runs GitHub has already indexed. The reservation is what makes it ONE dispatch
+      // per head: taken after the last re-check and before the POST, never released (see reserveMissingRunDispatch).
+      // GitHub slugs are case-insensitive: one key for `Org/Repo` and `org/repo`.
+      if (!reserveDispatch(`${repo.toLowerCase()}@${d.headSha}`)) {
+        return { ok: false, action, error: 'ci.yml dispatch already reserved for this head (taken by an earlier attempt, which may not have completed); needs ci-heal, not another trigger' };
+      }
+      exec('gh', ['api', '-X', 'POST', `repos/${repo}/actions/workflows/ci.yml/dispatches`, '-f', `ref=${d.headRefName}`], { ...opts, env: ghEnv });
+      return { ok: true, action, dispatched: true };
+    }
     const tree = git('rev-parse', `${d.headSha}^{tree}`);
     stage = 'commit-tree';
     const newHeadSha = git('-c', 'user.name=Web Everything', '-c', 'user.email=conveyor@users.noreply.github.com',
