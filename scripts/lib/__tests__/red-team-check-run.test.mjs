@@ -1228,3 +1228,156 @@ describe('bounded reads (round-4 finding): every red-team GitHub read asks for o
       .toMatchObject({ ok: false, reason: expect.stringMatching(/100-run bound/) });
   });
 });
+
+// #6535 operator send-backs (2026-11-12, R903): the daemon never sets WE_APP_ID, and the reviewer App (5267537)
+// holds only checks:read. The id comes from one resolver (env, else the repository variable) and every red-team
+// write runs as today's App (5037855), whatever role the calling daemon plays.
+describe('WE App id resolver and the red-team writer identity (#6535 operator send-back)', () => {
+  const WE_APP = '5037855', REVIEWER_APP = 5267537;
+  const head = 'c'.repeat(40);
+  const VARIABLE_READ = ['api', 'repos/o/r/actions/variables/WE_APP_ID', '--jq', '.value'];
+  beforeAll(async () => { api = await import('../red-team-check-run.mjs'); });
+  // Models GitHub: the App a call authenticates as follows the shim role in its env. Only today's App may create a
+  // check run (a role App has checks:read: HTTP 403) and the variable read returns the configured id.
+  const daemonGh = ({ variable = () => `${WE_APP}\n` } = {}) => {
+    const runs = [], calls = [];
+    let nextId = 100;
+    const appOf = env => env?.WE_GITHUB_APP_ROLE === 'legacy' ? Number(WE_APP) : REVIEWER_APP;
+    const run = vi.fn((args, options = {}) => {
+      calls.push({ args, role: options.env?.WE_GITHUB_APP_ROLE, app: appOf(options.env) });
+      if (args[1]?.includes('/actions/variables/')) return variable();
+      if (args.includes('POST')) {
+        if (appOf(options.env) !== Number(WE_APP)) throw Error('HTTP 403: Resource not accessible by integration');
+        const payload = JSON.parse(options.input);
+        runs.push({ ...payload, id: nextId++, app: { id: appOf(options.env) }, conclusion: payload.conclusion ?? null });
+        return '{}';
+      }
+      return JSON.stringify({ total_count: runs.length, check_runs: runs });
+    });
+    return { run, runs, calls };
+  };
+  const daemonEnv = () => ({ PATH: '/bin', WE_GITHUB_APP_ROLE: 'reviewer' }); // the review daemon: no WE_APP_ID
+  const args = { repo: 'o/r', pr: 7, headSha: head };
+
+  it('(1) a daemon env without WE_APP_ID resolves 5037855 from the variable; the writer gets that id, never 5267537', () => {
+    api.resetWeAppIdCacheForTest();
+    const fake = daemonGh();
+    const publish = vi.fn(api.publishRedTeamPolicyClearCheck);
+    const result = api.createPolicyClearPublisher({ env: daemonEnv(), run: fake.run, publish })(args);
+    expect(result).toEqual({ ok: true });
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish.mock.calls[0][0].appId).toBe(WE_APP);
+    expect(publish.mock.calls.every(([a]) => Number(a.appId) !== REVIEWER_APP)).toBe(true);
+    expect(fake.calls.filter(c => c.args[1]?.includes('/actions/variables/'))).toEqual([
+      { args: VARIABLE_READ, role: 'legacy', app: Number(WE_APP) }]);
+    expect(fake.runs).toHaveLength(1);
+    expect(fake.runs[0]).toMatchObject({ app: { id: Number(WE_APP) }, conclusion: 'success', external_id: 'o/r#7' });
+  });
+
+  it('(2) a reviewer-role identity in the env is never used for a write', () => {
+    api.resetWeAppIdCacheForTest();
+    const fake = daemonGh();
+    api.createPolicyClearPublisher({ env: daemonEnv(), run: fake.run })(args);
+    const writes = fake.calls.filter(c => c.args.includes('POST'));
+    expect(writes.length).toBeGreaterThan(0);
+    expect(writes.every(c => c.role === 'legacy' && c.app === Number(WE_APP))).toBe(true);
+    // Every writer, not only policy-clear: the round writer's check post and the publication-hold status too.
+    const seen = [];
+    const gh = (a, options) => { seen.push(options.env); return '{}'; };
+    const env = { ...daemonEnv(), WE_GITHUB_APP_ROLE: 'merger', KEEP: '1' };
+    api.postRedTeamCheckRun({ ...args, gh, env, payload: api.redTeamCheckRunPayload({ ...args, status: 'in_progress' }) });
+    api.postRedTeamPublicationHold({ ...args, held: true, gh, env });
+    expect(seen).toEqual([{ ...env, WE_GITHUB_APP_ROLE: 'legacy' }, { ...env, WE_GITHUB_APP_ROLE: 'legacy' }]);
+    expect(env.WE_GITHUB_APP_ROLE).toBe('merger'); // the caller's env is never mutated
+    // An inherited role-App token never reaches the write (the shim's inherited-token path or a bare gh would use it).
+    const inherited = { ...env, GH_TOKEN: 'fixture-role-token', GITHUB_TOKEN: 'x', WE_GH_AUTH_TOKEN_HASH: 'h', WE_GH_AUTH_SOURCE: 'cache', WE_GH_AUTH_INSTALLATION: '1' };
+    expect(api.redTeamWriterEnv(inherited)).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+    expect(inherited.GH_TOKEN).toBe('fixture-role-token');
+  });
+
+  it('an on-demand refresh for the legacy role mints today\'s App only, never a configured role App', async () => {
+    const { buildIdentityChain, LEGACY_ROLE } = await import('../github-app-identity.mjs');
+    const app = id => ({ appId: id, installations: { o: '1' }, key: { file: '/k.pem' } });
+    const identity = { roles: { reviewer: app('5267537'), worker: app('5267514') }, invalid: [], anyConfigured: true, callerRoles: {} };
+    const chain = buildIdentityChain({ requestedRole: LEGACY_ROLE, identity, env: {}, cachePath: '/c/web-everything.json' });
+    expect(chain.steps).toEqual([]);
+    expect(chain.candidates.map(c => c.role)).toEqual([LEGACY_ROLE]);
+    expect(buildIdentityChain({ requestedRole: 'reviewer', identity, env: {}, cachePath: '/c/web-everything.json' })
+      .candidates.map(c => c.role)).toEqual(['reviewer', 'worker', LEGACY_ROLE]);
+  });
+
+  it.each([
+    ['unreadable (HTTP 403)', () => { throw Error('HTTP 403: Resource not accessible by integration'); }, /unreadable: HTTP 403/],
+    ['empty', () => '\n', /missing or invalid/],
+    ['not an id', () => 'abc', /missing or invalid/],
+  ])('(3) a variable that is %s yields the existing fail-closed reason, with no publication', (_label, variable, detail) => {
+    api.resetWeAppIdCacheForTest();
+    const fake = daemonGh({ variable });
+    const publish = vi.fn(api.publishRedTeamPolicyClearCheck);
+    const result = api.createPolicyClearPublisher({ env: daemonEnv(), run: fake.run, publish })(args);
+    expect(result).toMatchObject({ ok: false, reason: 'WE_APP_ID unset or invalid; configure the WE App repository variable',
+      detail: expect.stringMatching(detail) });
+    expect(publish).not.toHaveBeenCalled();
+    expect(fake.calls.some(c => c.args.includes('POST'))).toBe(false);
+    // A reader handed the unresolved id keeps the same reason and reads no check runs.
+    const read = vi.fn();
+    expect(api.readRedTeamCheckFact({ ...args, appId: api.resolveWeAppId({ env: daemonEnv(), gh: fake.run, repo: 'o/r' }).appId, gh: read }))
+      .toEqual({ ok: false, reason: 'WE_APP_ID unset or invalid; configure the WE App repository variable' });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('env first; a resolved variable is cached per process and repo; a failure is not cached', () => {
+    api.resetWeAppIdCacheForTest();
+    const gh = vi.fn(() => `${WE_APP}\n`);
+    expect(api.resolveWeAppId({ env: { WE_APP_ID: '42' }, gh, repo: 'o/r' })).toEqual({ ok: true, appId: '42', source: 'env' });
+    expect(gh).not.toHaveBeenCalled();
+    expect(api.resolveWeAppId({ env: { WE_APP_ID: 'bad' }, gh, repo: 'o/r' })).toEqual({ ok: true, appId: WE_APP, source: 'repository-variable' });
+    expect(api.resolveWeAppId({ env: {}, gh, repo: 'O/R' })).toEqual({ ok: true, appId: WE_APP, source: 'repository-variable' });
+    expect(gh).toHaveBeenCalledTimes(1);
+    const flaky = vi.fn().mockImplementationOnce(() => { throw Error('HTTP 502'); }).mockReturnValue(WE_APP);
+    expect(api.resolveWeAppId({ env: {}, gh: flaky, repo: 'o/other' }).ok).toBe(false);
+    expect(api.resolveWeAppId({ env: {}, gh: flaky, repo: 'o/other' })).toMatchObject({ ok: true, appId: WE_APP });
+    expect(api.resolveWeAppId({ env: {}, gh, repo: 'bad repo; rm' })).toMatchObject({ ok: false, reason: api.WE_APP_ID_UNSET });
+  });
+
+  it('the gh shim gives the legacy role today\'s App only, never a configured role App', async () => {
+    const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { spawnSync } = await import('node:child_process');
+    const { fileURLToPath } = await import('node:url');
+    // Render in a plain node child: the shim embeds helpers via Function#toString, which vitest's transform rewrites.
+    const renderGhShimScript = options => {
+      const r = spawnSync(process.execPath, ['--input-type=module', '-e',
+        `const m = await import(${JSON.stringify(fileURLToPath(new URL('../gh-app-shim.mjs', import.meta.url)))}); process.stdout.write(m.renderGhShimScript(JSON.parse(process.argv[1])));`,
+        JSON.stringify(options)], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+      if (r.status !== 0) throw Error(`shim render failed: ${r.stderr}`);
+      return r.stdout;
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-writer-shim-'));
+    try {
+      const cache = (name, token) => {
+        const path = join(dir, `${name}.json`);
+        // Synthetic fixture values only.
+        writeFileSync(path, JSON.stringify({ v: 2, installationId: '1', appId: name, token, expiresAt: new Date(Date.now() + 3600e3).toISOString() }));
+        return path;
+      };
+      const gh = join(dir, 'real-gh');
+      writeFileSync(gh, `#!${process.execPath}\nprocess.stdout.write(String(process.env.GH_TOKEN));\n`);
+      chmodSync(gh, 0o755);
+      const shim = join(dir, 'shim.cjs');
+      writeFileSync(shim, renderGhShimScript({ realGhPath: gh, cachePath: cache('legacy', 'fixture-legacy'),
+        ghThrottleCliPath: join(dir, 'missing-throttle'), refreshCliPath: join(dir, 'missing-refresh'),
+        roleTable: { reviewer: { cachePath: cache('reviewer', 'fixture-reviewer'), installations: { o: '1' } },
+          worker: { cachePath: cache('worker', 'fixture-worker'), installations: { o: '1' } } } }));
+      const as = role => spawnSync(process.execPath, [shim, 'api', 'rate_limit'], { cwd: dir, encoding: 'utf8',
+        env: { PATH: process.env.PATH, HOME: dir, WE_GITHUB_APP_ROLE: role } });
+      const legacy = as('legacy');
+      expect(`${legacy.stdout}|${legacy.status}|${String(legacy.error ?? '')}|${legacy.stderr.slice(0, 600)}`)
+        .toMatch(/^fixture-legacy\|0\|/);
+      expect(legacy.stderr).not.toMatch(/using the worker App|unavailable/);
+      expect(as('reviewer').stdout).toBe('fixture-reviewer');
+      expect(as(api.redTeamWriterEnv({ WE_GITHUB_APP_ROLE: 'reviewer' }).WE_GITHUB_APP_ROLE).stdout).toBe('fixture-legacy');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
