@@ -5,6 +5,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import vm from 'node:vm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { publishStoredRedTeamResult } from '../red-team-withheld-publish.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
@@ -18,6 +19,10 @@ import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
 import { SHARED_RUNS_DIR_ENV } from '../../operations/run-store.mjs';
 import { gateReadyItems, itemsFromReport } from '../../operations/needs-you-feed.mjs';
 
+// Matches a `readRedTeamDisposition({ ... })` call with at most one level of nested braces. The character classes
+// exclude BOTH braces, so each character has exactly one way to match (a `[^}]*` that may also eat `{` lets the
+// nested group's repetitions overlap — exponential backtracking on a long run of `{`, CodeQL js/redos).
+const READ_DISPOSITION_CALL = /readRedTeamDisposition\(\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}\)/g;
 const head = 'a'.repeat(40);
 const repo = 'o/n';
 const trusted = body => ({ author: { login: 'web-everything' }, body, createdAt: '2026-11-10T12:00:00Z' });
@@ -746,10 +751,20 @@ describe('(e) every disposition caller reports the hold', () => {
     'scripts/operations/record-red-team-ruling-io.mjs',
   ])('%s passes the repo to every readRedTeamDisposition call, so the shared reader finds the sealed status', file => {
     const text = readFileSync(join(import.meta.dirname, '..', '..', '..', file), 'utf8');
-    const calls = [...text.matchAll(/readRedTeamDisposition\(\{([^}]*(?:\{[^}]*\}[^}]*)*)\}\)/g)].map(m => m[1]);
+    const calls = [...text.matchAll(READ_DISPOSITION_CALL)].map(m => m[1]);
     expect(calls.length).toBeGreaterThan(0);
     // The operator-ruling replay inside red-team-gate.mjs reads with the disposition's own defaults by design.
     const withoutRepo = calls.filter(c => !/\brepo\b|\.\.\.key\(/.test(c));
     expect(withoutRepo).toHaveLength(file.endsWith('red-team-gate.mjs') ? 1 : 0);
+  });
+  it('the call-finder regex finishes at once on a long run of unbalanced braces (no exponential backtracking)', () => {
+    const hostile = `readRedTeamDisposition({${'{{}'.repeat(40)}`;
+    // vm's timeout aborts a runaway synchronous regex — the old `[^}]*(?:\{[^}]*\}[^}]*)*` shape never returns here.
+    const run = () => vm.runInNewContext('hostile.match(re)', { hostile, re: new RegExp(READ_DISPOSITION_CALL.source, 'g') }, { timeout: 1000 });
+    expect(run).not.toThrow();
+    expect(run()).toBeNull();
+    // And it still finds a real call, including one nested object.
+    const real = 'x = readRedTeamDisposition({ repo, key: { a: 1 }, pr });';
+    expect([...real.matchAll(READ_DISPOSITION_CALL)].map(m => m[1])).toEqual([' repo, key: { a: 1 }, pr ']);
   });
 });
