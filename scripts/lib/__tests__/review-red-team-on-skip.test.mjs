@@ -13,7 +13,7 @@ import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir,
   readCarriedCheckUnpublished, publishCarriedCheckDurably } from '../drain-red-team-evidence.mjs';
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
-  readRedTeamPublicationHoldFact } from '../red-team-check-run.mjs';
+  readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
@@ -2126,7 +2126,7 @@ describe('#6606 carried check recovered after a transient verification failure',
     const tick = (over = {}) => runRedTeamOnSkip(runFixture({ env,
       rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [] }],
       readCarriedCheck: key => readCarriedCheckUnpublished({ ...key, env }), publishCarriedCheck: publish, ...over }));
-    return { dir, env, checkRuns, extraRuns, statuses, publish, owed, fact, holdFact, tick };
+    return { dir, env, gh, checkRuns, extraRuns, statuses, publish, owed, fact, holdFact, tick };
   }
 
   it('a retry that succeeds clears the publication hold the failed attempt set (and only that hold)', () => {
@@ -2177,8 +2177,9 @@ describe('#6606 carried check recovered after a transient verification failure',
         } });
       expect(out).toMatchObject({ ok: true });
       expect(w.owed()).toBe(true);
-      // Fourth self-review: when THIS attempt's own mark failed, another id in the marker proves nothing (it may be an
-      // older failed attempt's, with its hold): not ok, nothing cleared, the marker kept.
+      // When THIS attempt's own mark failed, the id read before marking decides (red team on a67e77345). The same id
+      // still there means no attempt marked since: that marker and its hold are OLDER, so this confirmed attempt clears
+      // the hold (the recovery pass would otherwise fail on the same unwritable marker forever).
       const clearHold = vi.fn(() => ({ ok: true }));
       const statusDir = redTeamStatusDir(w.env);
       chmodSync(statusDir, 0o555);
@@ -2187,10 +2188,65 @@ describe('#6606 carried check recovered after a transient verification failure',
         failedMark = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'this', clearHold,
           publish: () => ({ ok: true }), lock: fn => fn() });
       } finally { chmodSync(statusDir, 0o755); }
-      expect(failedMark).toMatchObject({ ok: false, reason: expect.stringMatching(/retry marker not written/) });
-      expect(clearHold).not.toHaveBeenCalled();
+      expect(failedMark).toMatchObject({ ok: true });
+      expect(clearHold).toHaveBeenCalledTimes(1);
+      // A different id at settlement proves an attempt marked AFTER this one read: it is newer and owns marker and hold.
+      const keptHold = vi.fn(() => ({ ok: true }));
+      chmodSync(statusDir, 0o555);
+      let newerMarked;
+      try {
+        newerMarked = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'stale-read', clearHold: keptHold,
+          publish: () => {
+            chmodSync(statusDir, 0o755);
+            publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'later', publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+            chmodSync(statusDir, 0o555);
+            return { ok: true };
+          }, lock: fn => fn() });
+      } finally { chmodSync(statusDir, 0o755); }
+      expect(newerMarked).toMatchObject({ ok: true });
+      expect(keptHold).not.toHaveBeenCalled();
       expect(w.owed()).toBe(true);
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('settlement runs inside the publisher\'s writers\' lock, so no later attempt\'s hold lands before the clear', () => {
+    // Red team on a67e77345: publish and settlement took the lock separately, so a later attempt could post its hold in
+    // between (with no marker of its own) and the earlier attempt's late clear removed it.
+    const w = world({ failCheckPosts: new Set([2]) });
+    try {
+      w.publish({ pr, headSha: head });
+      const probes = [];
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env,
+        lock: () => { throw Error('settlement must not take a second lock acquisition'); },
+        publish: hooks => publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env, ...hooks,
+          gh: (args, options) => w.gh(args, options),
+          readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [carry()],
+          readStandingRuling: () => null, holdFn: () => null }),
+        clearHold: () => {
+          // The writers' lock is still held here: another writer cannot acquire it.
+          probes.push(withRedTeamCheckLock({ repo, pr, headSha: head, env: w.env, lockTimeoutMs: 0 }, () => ({ ok: true })));
+          return clearLivePublicationHold({ repo, pr, headSha: head, gh: w.gh });
+        } });
+      expect(out).toMatchObject({ ok: true });
+      expect(out).not.toHaveProperty('settled');
+      expect(probes).toEqual([expect.objectContaining({ ok: false, reason: expect.stringMatching(/lock failed/) })]);
+      expect(w.holdFact()).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a settlement lock failure with no marker written names that the operator must republish', () => {
+    const w = world();
+    const statusDir = redTeamStatusDir(w.env);
+    try {
+      mkdirSync(statusDir, { recursive: true });
+      chmodSync(statusDir, 0o555);
+      const clearHold = vi.fn(() => ({ ok: true }));
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }), clearHold,
+        lock: () => ({ ok: false, reason: 'red-team check lock failed: timed out' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/lock failed: timed out; carried-check retry marker not written.*operator must republish/) });
+      expect(clearHold).not.toHaveBeenCalled();
+    } finally { chmodSync(statusDir, 0o755); rmSync(w.dir, { recursive: true, force: true }); }
   });
 
   it('a confirmed attempt clears the helper hold even when no marker could ever be written', () => {

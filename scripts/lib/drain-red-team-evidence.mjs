@@ -74,53 +74,70 @@ const safeText = value => String(value?.message ?? value).replace(/[\x00-\x1f\x7
  * cannot be written does not stop the attempt (a confirmed check needs no retry); its failure is named in the reason.
  * `hooks.beforeHold` records that the attempt is about to set the GitHub-visible publication hold, so a later
  * confirmed attempt clears it through `clearHold` before the marker goes (#6606: a hold left behind would block the
- * head after the check itself is clear). */
+ * head after the check itself is clear). `hooks.onConfirmed` is that settlement, for the publisher to run inside its
+ * writers' lock right after it confirms the success. */
 export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish, clearHold,
   lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn), newAttempt = randomUUID }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
   const attempt = newAttempt();
+  // The marker's attempt before this one marks: if this attempt's own mark fails and the same id is still there at
+  // settlement, no attempt marked since, so that marker (and its hold) is OLDER and this confirmed attempt settles it
+  // (red team on a67e77345: treating it as unknowable left the hold set and the recovery pass failing forever).
+  const priorAttempt = readCarriedCheckMarker(path).attempt;
   let markError = null;
   try { markCarriedCheckUnpublished({ repo, pr, head, env, attempt }); }
   catch (error) { markError = safeText(error).slice(0, 200); }
   const beforeHold = () => markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true, attempt });
+  // A publisher that takes `onConfirmed` runs settlement inside its own writers' lock, right after confirming the
+  // success, so no later attempt's hold can land before the clear (red team on a67e77345). A publisher that does not
+  // gets settlement under a separate acquisition of the same lock, below.
+  let settledInPublish = null;
+  const settleSafely = () => {
+    try { return settle(); } catch (error) { return { ok: false, reason: `carried-check settlement failed: ${safeText(error)}` }; }
+  };
+  const onConfirmed = () => (settledInPublish = settleSafely());
   let result;
-  try { result = publish({ beforeHold }); }
+  try { result = publish({ beforeHold, onConfirmed }); }
   catch (error) { result = { ok: false, reason: safeText(error) }; }
+  const markFailure = markError ? `; carried-check retry marker not written (${markError}): operator must republish` : '';
   if (result?.ok === true) {
-    // Under the writers' lock, so no other attempt's publication (or its hold) can land between the read, the clear
-    // and the removal. A newer attempt that marked the head since owns the marker and its outcome: leave both.
-    const settled = lock(() => {
-      const marker = readCarriedCheckMarker(path);
-      if (marker.exists && marker.attempt !== null && marker.attempt !== attempt) {
-        // Only a marker this attempt wrote proves a NEWER attempt replaced it. When this attempt's own mark failed, the
-        // marker may be an older failed attempt's (and its hold): neither trust it as newer nor clear it as ours.
-        if (markError) return { ok: false, reason: `carried-check retry marker not written (${markError}): operator must republish` };
-        return { ok: true };
-      }
-      // Always ask: clearHold removes only the live helper's own holds, so a hold whose intent was never recorded
-      // (beforeHold failed) is cleared too. A failed read or clear keeps the marker for the next retry. An ABSENT
-      // marker is asked too (red team on 914348f86): when marker writes fail, the hold an earlier attempt posted has no
-      // local record, so this confirmed attempt is the only thing that can clear it.
-      let cleared;
-      try { cleared = clearHold ? clearHold() : { ok: false, reason: 'no publication hold clearer' }; }
-      catch (error) { cleared = { ok: false, reason: safeText(error) }; }
-      if (cleared?.ok !== true) {
-        const reason = `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}`;
-        if (marker.exists) return { ok: false, reason };
-        // No marker: record one so the recovery pass retries the clear; if that write fails too, nothing will.
-        try { markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true, attempt }); }
-        catch (error) { return { ok: false, reason: `${reason}; carried-check retry marker not written (${safeText(error).slice(0, 200)}): operator must republish` }; }
-        return { ok: false, reason };
-      }
-      if (!marker.exists) return { ok: true };
-      try { rmSync(path, { force: true }); }
-      catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
-      return { ok: true };
-    });
-    return settled?.ok === true ? { ...result, ...settled } : { ok: false, reason: String(settled?.reason ?? 'carried-check settlement failed') };
+    const published = { ...result };
+    delete published.settled;
+    const settled = settledInPublish ?? lock(onConfirmed);
+    if (settled?.ok === true) return { ...published, ...settled };
+    // Settlement never ran (the lock failed) and no marker was written: nothing would retry the clear.
+    const reason = String(settled?.reason ?? 'carried-check settlement failed');
+    return { ok: false, reason: settledInPublish === null ? `${reason}${markFailure}` : reason };
   }
   const reason = String(result?.reason ?? 'unknown error');
-  return { ...result, ok: false, reason: markError ? `${reason}; carried-check retry marker not written (${markError}): operator must republish` : reason };
+  return { ...result, ok: false, reason: `${reason}${markFailure}` };
+
+  function settle() {
+    const marker = readCarriedCheckMarker(path);
+    // A NEWER attempt marked the head since: it owns the marker and its outcome, so leave both. Only a marker this
+    // attempt wrote, or (its own mark failed) a change from the id read before marking, proves the other id newer.
+    const newer = markError ? marker.attempt !== priorAttempt : marker.attempt !== attempt;
+    if (marker.exists && marker.attempt !== null && newer) return { ok: true };
+    // Always ask: clearHold removes only the live helper's own holds, so a hold whose intent was never recorded
+    // (beforeHold failed) is cleared too. A failed read or clear keeps the marker for the next retry. An ABSENT
+    // marker is asked too (red team on 914348f86): when marker writes fail, the hold an earlier attempt posted has no
+    // local record, so this confirmed attempt is the only thing that can clear it.
+    let cleared;
+    try { cleared = clearHold ? clearHold() : { ok: false, reason: 'no publication hold clearer' }; }
+    catch (error) { cleared = { ok: false, reason: safeText(error) }; }
+    if (cleared?.ok !== true) {
+      const reason = `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}`;
+      if (marker.exists) return { ok: false, reason };
+      // No marker: record one so the recovery pass retries the clear; if that write fails too, nothing will.
+      try { markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true, attempt }); }
+      catch (error) { return { ok: false, reason: `${reason}; carried-check retry marker not written (${safeText(error).slice(0, 200)}): operator must republish` }; }
+      return { ok: false, reason };
+    }
+    if (!marker.exists) return { ok: true };
+    try { rmSync(path, { force: true }); }
+    catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
+    return { ok: true };
+  }
 }
 
 /** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */

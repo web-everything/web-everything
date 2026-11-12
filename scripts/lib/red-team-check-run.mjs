@@ -227,7 +227,7 @@ export function publishRedTeamCheckFromLive(options = {}) {
 
 function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
-  holdFn = redTeamEnqueueHold, beforeHold } = {}) {
+  holdFn = redTeamEnqueueHold, beforeHold, onConfirmed } = {}) {
   let published = false;
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
@@ -302,7 +302,6 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
     if (after[0] !== postedId || after.length !== before.length + 1
       || before.some((id, index) => after[index + 1] !== id))
       throw Error('another red-team check raced publication');
-    return { ok: true };
   } catch (error) {
     const reason = `live red-team check not clear: ${message(error)}`;
     if (published) {
@@ -320,6 +319,13 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
     }
     return failure(reason);
   }
+  // Confirmed. `onConfirmed` runs here, still under the writers' lock (#6606 red team on a67e77345): a hold any helper
+  // attempt posted is then necessarily older than this confirmed success, and no later attempt can post one between
+  // the confirmation and the caller's clear. Its outcome never turns the confirmed success into a failure check.
+  if (!onConfirmed) return { ok: true };
+  let settled;
+  try { settled = onConfirmed(); } catch (error) { settled = failure(`carried-check settlement failed: ${message(error)}`); }
+  return { ok: true, settled };
 }
 
 /** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a
