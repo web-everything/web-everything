@@ -558,6 +558,21 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
     api.postRedTeamPublicationHold({ ...args, held: true, gh, env });
     expect(seen).toEqual([{ ...env, WE_GITHUB_APP_ROLE: 'legacy' }, { ...env, WE_GITHUB_APP_ROLE: 'legacy' }]);
     expect(env.WE_GITHUB_APP_ROLE).toBe('merger'); // the caller's env is never mutated
+    // An inherited role-App token never reaches the write (the shim's inherited-token path or a bare gh would use it).
+    const inherited = { ...env, GH_TOKEN: 'fixture-role-token', GITHUB_TOKEN: 'x', WE_GH_AUTH_TOKEN_HASH: 'h', WE_GH_AUTH_SOURCE: 'cache', WE_GH_AUTH_INSTALLATION: '1' };
+    expect(api.redTeamWriterEnv(inherited)).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+    expect(inherited.GH_TOKEN).toBe('fixture-role-token');
+  });
+
+  it('an on-demand refresh for the legacy role mints today\'s App only, never a configured role App', async () => {
+    const { buildIdentityChain, LEGACY_ROLE } = await import('../github-app-identity.mjs');
+    const app = id => ({ appId: id, installations: { o: '1' }, key: { file: '/k.pem' } });
+    const identity = { roles: { reviewer: app('5267537'), worker: app('5267514') }, invalid: [], anyConfigured: true, callerRoles: {} };
+    const chain = buildIdentityChain({ requestedRole: LEGACY_ROLE, identity, env: {}, cachePath: '/c/web-everything.json' });
+    expect(chain.steps).toEqual([]);
+    expect(chain.candidates.map(c => c.role)).toEqual([LEGACY_ROLE]);
+    expect(buildIdentityChain({ requestedRole: 'reviewer', identity, env: {}, cachePath: '/c/web-everything.json' })
+      .candidates.map(c => c.role)).toEqual(['reviewer', 'worker', LEGACY_ROLE]);
   });
 
   it.each([

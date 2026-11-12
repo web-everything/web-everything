@@ -46,7 +46,14 @@ export const WE_APP_ID_UNSET = 'WE_APP_ID unset or invalid; configure the WE App
  * calling process plays (`WE_GITHUB_APP_ROLE=reviewer` in the review daemon) is overridden for this call only.
  */
 export const RED_TEAM_WRITER_ROLE = LEGACY_ROLE;
-export const redTeamWriterEnv = (env = process.env) => ({ ...env, [ROLE_ENV]: RED_TEAM_WRITER_ROLE });
+// An inherited token (the caller's role App, applied as GH_TOKEN with its hash) would be used by the shim's
+// fallback or by a bare gh: it is dropped, so only the shim's today's-App token can authenticate the write.
+const INHERITED_AUTH = ['GH_TOKEN', 'GITHUB_TOKEN', 'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_AUTH_SOURCE', 'WE_GH_AUTH_INSTALLATION'];
+export const redTeamWriterEnv = (env = process.env) => {
+  const out = { ...env, [ROLE_ENV]: RED_TEAM_WRITER_ROLE };
+  for (const key of INHERITED_AUTH) delete out[key];
+  return out;
+};
 
 const weAppIdCache = new Map();
 /** Test seam: forget the per-process cache. */
