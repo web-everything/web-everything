@@ -1,17 +1,18 @@
 ---
+bornAs: x6krzgo
 kind: story
-size: 3
+size: 2
 status: active
 scaffoldedBy: "card-ruling-non-regression"
 dateScaffolded: "2026-11-11"
-scope: ["we:scripts/lib/review-head-index.mjs"]
+scope: ["we:scripts/operations/record-referral-ruling-io.mjs"]
 dateOpened: "2026-11-11"
 tags: []
 ---
 
-# review-head-index: HTML-aware marker scan (blockquote depth, </pre> in attribute)
+# card-ruling: persist --notWorseThanMain evidence when two-step filing reuses an existing card
 
-Red-team break on PR #6378 (we:scripts/lib/review-head-index.mjs:306): the marker scan is not HTML-aware, so a marker inside a blockquote of nested depth, or a closing pre tag inside an attribute value, is mis-read. Carded under R903: the module is new in the PR, absent on main and has no callers, so the break cannot regress main. Make the scan HTML-aware (blockquote depth, pre close in an attribute) with tests.
+Residual from the R903 audit: when two-step card filing reuses an existing card (we:scripts/operations/record-referral-ruling-io.mjs:329), the card is not updated and no ruling is posted, so the not-worse-than-main evidence is only recorded if the later --card ruling repeats it. Require or carry the evidence on the --card call after a two-step filing that used the flag.
 
 ## Acceptance
 
