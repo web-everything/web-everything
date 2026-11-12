@@ -73,7 +73,7 @@ import { runGhSync } from '../lib/gh-throttle.mjs';
 import { createMqLiveReader } from '../lib/drain-queue-safety.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import {
-  REVIEW_LABELS, hasReviewLabel, STALE_PENDING_HEAL_MARKER, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
+  REVIEW_LABELS, hasReviewLabel, buildStalePendingHealComment, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
   parseLatestHumanClearedSha,
 } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
@@ -359,7 +359,9 @@ export function sweepReviewHoldLabels({
       // The heal's own comment is not a verdict; every park/hold marker AFTER the accept is one.
       const FILES_API_CAP = 3000;
       const evalHeal = (st0) => {
-        const st = { ...st0, comments: (st0.comments ?? []).filter((c) => !(isTrustedMarkerAuthor(c) && String(c?.body ?? '').startsWith(STALE_PENDING_HEAL_MARKER))) };
+        // Only the exact comment this heal would post for THIS head, by the trusted bot, is ignored.
+        const ownBody = buildStalePendingHealComment({ headSha: st0.headRefOid });
+        const st = { ...st0, comments: (st0.comments ?? []).filter((c) => !(isTrustedMarkerAuthor(c) && c?.body === ownBody)) };
         let rec = latestAcceptRecord(st.comments);
         const acc = (rec?.sha ?? '').toLowerCase();
         const hd = st.headRefOid.toLowerCase();

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createLiveHoldReaders, needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo, STRANDED_BACKOFF_MS, STRANDED_RECHECK_MS,
 } from '../review-hold-reconcile.mjs';
+import { buildStalePendingHealComment } from '../../lib/review-escalation.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
 import { resolveAcceptCarryForward } from '../../lib/accept-carry-forward.mjs';
 import { buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
@@ -622,6 +623,12 @@ describe('#5045 park markers and file-list cap (R907)', () => {
   });
   it('keeps pending when an untrusted comment quotes the heal marker after the accept', () => {
     const { p, r } = run([accept, { author: { login: 'someone-else' }, body: '<!-- stale-pending-heal -->\nI object' }], ['docs/a.md']);
+    expect(r.flagged).toBeDefined();
+    expect(p.calls.set).toEqual([]);
+  });
+  it('keeps pending when a trusted heal comment was edited to carry an objection', () => {
+    const own = buildStalePendingHealComment({ headSha: head });
+    const { p, r } = run([accept, { author: { login: 'web-everything' }, body: `${own}\n\nOBJECTION: not safe to merge` }], ['docs/a.md']);
     expect(r.flagged).toBeDefined();
     expect(p.calls.set).toEqual([]);
   });
