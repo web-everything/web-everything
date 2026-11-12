@@ -28,6 +28,7 @@
  */
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { NO_ASK_NOTE_KINDS } from '../lib/pr-comment-policy.mjs';
+import { isSettledReferralHold } from '../lib/settled-referral-pause.mjs';
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
@@ -258,9 +259,13 @@ export function deriveWaitingOn(pr, ctx) {
     return { state, actor, since: since ?? t(pr.updatedAt), approxSince: since === null || since === undefined, why, next, evidence };
   };
 
-  const hold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
+  const openHold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
+  const holdEv = openHold ? holdEvidence(pr, openHold, ctx.holdOptions) : null;
+  // A pause notice re-posted after the ruling for this head was recorded (nothing open) is settled: not "ruling needed" (#6719).
+  const hold = openHold && !(holdEv.open.length === 0 && !holdEv.unreadable && !holdEv.persistenceFailed
+    && isSettledReferralHold({ holdBody: openHold.body, comments: pr.comments, head })) ? openHold : null;
   if (hold) {
-    const ev = holdEvidence(pr, hold, ctx.holdOptions);
+    const ev = holdEv;
     const keys = ev.open.map((f) => `${f.file}${f.line ? `:${f.line}` : ''}`);
     const NO_ASK = { summary: 'no operator action: resumes on the next successful review save; the fix is the reviewer\'s outbox', command: null };
     // An unreadable thread is never excused: the operator is asked, as before.
