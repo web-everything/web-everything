@@ -5,7 +5,7 @@
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { DAEMON_CLONE_SEED } from '../lib/daemon-clone-registry.mjs';
@@ -85,14 +85,30 @@ function defaultExec(file, args, { timeout }) {
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
     env.GIT_NO_REPLACE_OBJECTS = '1'; // replacement refs must not falsify ancestry
     env.GIT_NO_LAZY_FETCH = '1';
+    if (args[0] !== '-C') return execFileSync(file, args, { ...options, env });
     const dir = args[1];
+    const started = performance.now();
+    const real = assertCloneRoot(dir);
     // The named directory must itself be the repository root, never a parent repository git discovered.
-    if (args[0] === '-C' && execFileSync(file, ['-C', dir, 'rev-parse', '--show-toplevel'], { ...options, env }).trim() !== realpathSync(dir)) {
-      throw new Error('not a repository root');
-    }
-    return execFileSync(file, args, { ...options, env });
+    if (execFileSync(file, ['-C', dir, 'rev-parse', '--show-toplevel'], { ...options, env }).trim() !== real) throw new Error('not a repository root');
+    // Both git calls share one budget: the second gets only what the first left.
+    const left = Math.floor(options.timeout - (performance.now() - started));
+    if (left < 1) throw new Error('await command deadline reached');
+    return execFileSync(file, args, { ...options, timeout: left, env });
   }
   throw new Error('unsupported executable');
+}
+
+/**
+ * The registered clone path must be a real directory at its registry location: its realpath must equal the
+ * registry-expected root (workspace realpath + the registry-relative name). A symlink pointing elsewhere is refused.
+ * @returns {string} the verified realpath
+ */
+export function assertCloneRoot(dir, { realpath = realpathSync, workspace = join(homedir(), 'workspace') } = {}) {
+  const expected = join(realpath(workspace), relative(workspace, dir));
+  const real = realpath(dir);
+  if (real !== expected) throw new Error('clone path is not its registry root (symlink refused)');
+  return real;
 }
 
 /** A daemon clone is named by its registry entry (`wev-fix-daemon`, `.lanes/we-drain-daemon/code`), relative to the workspace root. */
@@ -156,6 +172,8 @@ export function awaitCondition(opts, {
     } catch {
       // A failed command or malformed response cannot establish completion.
     }
+    // A probe that finished after the budget ran out cannot certify completion.
+    if (result.done && now() > deadline) result = { ...result, done: false, ...(opts.kind === 'adoption' ? { adopted: false } : {}) };
     if (result.done) return result;
     const remaining = deadline - now();
     // Less than one poll gap left: the next poll cannot happen inside the budget, so time out without pausing.

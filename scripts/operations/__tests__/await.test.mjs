@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseArgs, awaitCondition, main, cloneDir } from '../await.mjs';
+import { parseArgs, awaitCondition, main, cloneDir, assertCloneRoot } from '../await.mjs';
 
 const SHA = 'abc123def456';
 const CLONE = 'wev-fix-daemon';
@@ -291,5 +291,26 @@ describe('main', () => {
     expect(output.join('').trim().length).toBeGreaterThan(0);
     expect(h.calls).toEqual([]);
     expect(h.sleeps).toEqual([]);
+  });
+});
+
+describe('adoption hardening', () => {
+  const ws = '/w';
+  it('accepts a clone whose realpath equals its registry root', () => {
+    const realpath = p => ({ '/w': '/real/w', '/w/wev-fix-daemon': '/real/w/wev-fix-daemon' })[p];
+    expect(assertCloneRoot('/w/wev-fix-daemon', { realpath, workspace: ws })).toBe('/real/w/wev-fix-daemon');
+  });
+
+  it('refuses a registered clone path that is a symlink to elsewhere (e.g. a pool lane)', () => {
+    const realpath = p => ({ '/w': '/real/w', '/w/wev-fix-daemon': '/real/w/.lanes/web-everything/lane-22' })[p];
+    expect(() => assertCloneRoot('/w/wev-fix-daemon', { realpath, workspace: ws })).toThrow(/symlink refused/);
+  });
+
+  it('a probe finishing after the deadline cannot certify adoption: done:false with resumeWith', () => {
+    let clock = 0;
+    const io = { now: () => clock, sleep: () => { throw new Error('must not sleep'); },
+      exec() { clock += 90000; return ''; } };
+    const r = awaitCondition(parseArgs([...adoptionArgs, '--wait-ms', '60000']), io);
+    expect(r).toMatchObject({ done: false, adopted: false, timedOut: true, resumeWith: expect.stringContaining('run.mjs await') });
   });
 });
