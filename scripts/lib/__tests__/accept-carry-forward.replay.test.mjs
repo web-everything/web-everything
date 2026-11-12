@@ -19,6 +19,7 @@ import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs'
 import * as redTeamGate from '../red-team-gate.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { buildOperatorActionComment } from '../../operations/operator-controls.mjs';
 import {
   buildClearedFromMarker, buildReviewedDiffMarker, parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
 } from '../review-escalation.mjs';
@@ -907,7 +908,13 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
   // R907 06:33 ET: the live #6381/#6595 operator comments (refresh note, manual R247 pass) are machine-marked notes that
   // decide nothing about the review, but ONLY from a trusted marker author; any other author's copy still holds.
   describe('operator refresh / manual R247 shapes (R907)', () => {
-    const REFRESH = '🛠 operator action — refresh\n\nOperator @chalbert via chat:\n> R895: smoke failed on runner apt DNS — refresh so CI re-runs\n\nUndo: restore the previous head only through a reviewed repair\n\n<!-- operator-action: {"version":1,"op":"refresh","pr":6381,"actor":"chalbert","details":{"undo":"x"}} -->';
+    // The refresh note is built by the REAL producer (`buildOperatorActionComment`), so the exemption cannot drift from it.
+    const SHA_A = 'a'.repeat(40), SHA_B = 'b'.repeat(40);
+    const REFRESH_REASON = 'R895: smoke failed on runner apt DNS — refresh so CI re-runs';
+    const refreshRecord = (over = {}) => ({ version: 1, op: 'refresh', repo: 'web-everything/web-everything', pr: 6381, actor: 'chalbert', channel: 'chat',
+      reason: REFRESH_REASON, at: '2026-10-09T10:33:00.000Z', key: `refresh:web-everything/web-everything:pr:6381:${'c'.repeat(64)}@2026-10-09T10:33:00.000Z`,
+      details: { undo: 'restore the previous head only through a reviewed content-preserving git repair', previousHead: SHA_A, headRef: 'lane/x-y', main: SHA_B }, ...over });
+    const REFRESH = buildOperatorActionComment(refreshRecord());
     const MANUAL = 'Manual R247 pass — daemon: red-team; reason: EMERGENCY (labelled): refresh moved head; old-head review run left review-unfinished';
     const OP = { login: 'chalbert' };
     for (const [name, body] of Object.entries({ refresh: REFRESH, 'manual R247 pass': MANUAL })) {
@@ -924,30 +931,46 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
       });
     }
     // Review finding (PR #6713): the exemption was a hold-word BLACKLIST, so an objection worded without a listed word
-    // slipped through. The free text is now a closed-vocabulary ALLOW-list: any word outside it holds.
+    // slipped through; a bag-of-allowed-words fix still passed "review failed on the new head; run review again". The reason is
+    // now a closed set of whole clauses: anything else holds.
     const REVOCATIONS = ['approval revoked; further review required before merging', 'withdrawn', 'not approved', 'needs work',
       'no-go', 'don’t ship this', 'revoke the accept', 'please re-review before merge', 'LGTM no longer holds true',
-      'refresh moved head; approval revoked', 'smoke failed — not ready', `refresh moved head${String.fromCharCode(0x200b)}; approval revoked`];
+      'refresh moved head; approval revoked', 'smoke failed — not ready', `refresh moved head${String.fromCharCode(0x200b)}; approval revoked`,
+      'review failed on the new head; run review again', 'new-head review again', 'review only on the old-head',
+      'review is stale since the new-head', 'a b c', 'refresh moved head; refresh moved head; refresh moved head; refresh moved head',
+      'refresh moved head and approval revoked', 'refresh moved head\nreject'];
     for (const phrase of REVOCATIONS) {
-      it(`a revocation phrased "${phrase}" holds in the manual pass and in the refresh note (closed vocabulary)`, () => {
+      it(`a revocation phrased ${JSON.stringify(phrase)} holds in the manual pass and in the refresh note (closed clause set)`, () => {
         const manual = `Manual R247 pass — daemon: review; reason: EMERGENCY (labelled): ${phrase}`;
-        const refresh = REFRESH.replace('R895: smoke failed on runner apt DNS — refresh so CI re-runs', phrase);
-        const undo = REFRESH.replace('restore the previous head only through a reviewed repair', phrase);
-        const json = REFRESH.replace('"undo":"x"', `"undo":${JSON.stringify(phrase)}`);
-        for (const b of [manual, refresh, undo, json]) expect(isKnownMachineBody(b, { author: OP })).toBe(false);
+        const refresh = buildOperatorActionComment(refreshRecord({ reason: phrase }));
+        for (const b of [manual, refresh]) expect(isKnownMachineBody(b, { author: OP })).toBe(false);
       });
     }
+    it('the real producer refresh note (all record fields, real undo text) is a known machine shape', () => {
+      expect(isKnownMachineBody(REFRESH, { author: OP })).toBe(true);
+      expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ actor: 'CHalbert' })), { author: OP })).toBe(true);
+    });
+    it('a refresh note with a different handle, channel, undo text or a record that disagrees with the prose holds (trust boundary)', () => {
+      const record = refreshRecord();
+      for (const over of [{ actor: 'revoked-approval' }, { channel: 'approval_revoked' }, { channel: 'x' },
+        { details: { ...record.details, undo: 'restore previous' } }, { details: { ...record.details, note: 'revoked' } },
+        { details: { ...record.details, headRef: 'approval revoked' } }, { details: { ...record.details, previousHead: 'zzz' } },
+        { details: 'revoked' }, { extra: 'revoked' }, { pr: '6381' }, { repo: 'a b' }, { at: 'not a date' }, { key: 'a b' }, { version: 2 }, { op: 'rearm' }]) {
+        expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord(over)), { author: OP })).toBe(false);
+      }
+      // prose vs record disagreement: only the JSON carries a different reason
+      const split = REFRESH.replace(`"reason":"${REFRESH_REASON}"`, '"reason":"CI flaked"');
+      expect(split).not.toBe(REFRESH);
+      expect(isKnownMachineBody(split, { author: OP })).toBe(false);
+    });
     it('the producer’s real manual-pass trailer (checkout sha) is still a machine shape; a non-hex trailer or unknown daemon holds', () => {
       expect(isKnownMachineBody(`${MANUAL}; checkout sha: 0123abc456def.`, { author: OP })).toBe(true);
       expect(isKnownMachineBody(`${MANUAL}; checkout sha: approval revoked.`, { author: OP })).toBe(false);
       expect(isKnownMachineBody(MANUAL.replace('daemon: red-team', 'daemon: approval-revoked'), { author: OP })).toBe(false);
       expect(isKnownMachineBody(`${MANUAL} ${'refresh '.repeat(60)}`, { author: OP })).toBe(false);
     });
-    it('refresh JSON with extra keys, a non-string actor or a non-object details holds (fail closed)', () => {
-      for (const payload of ['{"version":1,"op":"refresh","pr":1,"actor":"chalbert","details":{"undo":"x","note":"revoked"}}',
-        '{"version":1,"op":"refresh","pr":1,"actor":"chalbert","extra":"revoked"}',
-        '{"version":1,"op":"refresh","pr":1,"actor":{"x":1},"details":{"undo":"x"}}',
-        '{"version":1,"op":"refresh","pr":1,"actor":"chalbert","details":"revoked"}', '{"version":1,"op":"refresh"']) {
+    it('refresh JSON that is malformed, truncated or not an object holds (fail closed)', () => {
+      for (const payload of ['{"version":1,"op":"refresh"', '[]', 'null', '"x"', '{"version":1,"op":"refresh","actor":{"x":1}}']) {
         const body = REFRESH.replace(/<!-- operator-action: .* -->/, `<!-- operator-action: ${payload} -->`);
         expect(isKnownMachineBody(body, { author: OP })).toBe(false);
       }
