@@ -266,7 +266,7 @@ export function deriveWaitingOn(pr, ctx) {
   // A pause notice re-posted after the ruling for this head was recorded (nothing open) is settled: not "ruling needed" (#6719).
   // Settled only on ledger proof: every finding the notice counts has a standing ruling (ruled or blocked), none is still
   // awaiting an answer, and the trusted automatic-policy ruling record for THIS head is on the thread.
-  const hold = openHold && !(!holdEv.unreadable && !holdEv.persistenceFailed && holdEv.awaiting === 0
+  const hold = openHold && !(!holdEv.unreadable && (has('review:changes') || has('status:fixing') || has('review-status:fixing')) && !holdEv.persistenceFailed && holdEv.awaiting === 0
     && Number.isInteger(openHold.count) && openHold.count >= 1 && holdEv.open.length + holdEv.ruled >= openHold.count
     && isSettledReferralHold({ holdBody: openHold.body, comments: pr.comments, head })) ? openHold : null;
   if (hold) {

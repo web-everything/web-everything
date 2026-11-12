@@ -151,8 +151,10 @@ describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
     const auto = (head, actor = 'auto-policy') => c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head,
       rulings: [{ runId: 'review-pr-1', key, result: 'block' }], actor, channel: 'review daemon', reason: 'auto-blocked by policy', at: '2026-10-21T11:46:28Z', clearerId: 's1' }));
     const later = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
-    const wait = (comments) => row(sweep([pr(comments)]), 5530).waitingOn;
+    const wait = (comments, labels = L('review:changes', 'status:fixing')) => row(sweep([pr(comments, { labels })]), 5530).waitingOn;
     expect(wait([recordComment, auto(HEAD), later])).not.toBe('ruling-needed:referral-hold');
+    // a block alone, without the send-back to the fixer (accepted labels), never settles the hold
+    expect(wait([recordComment, auto(HEAD), later], L('ready-to-merge', 'review:accepted'))).toBe('ruling-needed:referral-hold');
     // a ruling for another head, a human/other actor's ruling (existing rule above), or prose without the payload all stay with the operator
     expect(wait([recordComment, auto('e'.repeat(40)), later])).toBe('ruling-needed:referral-hold');
     expect(wait([recordComment, c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', `## Automatic policy ruling on mandatory referrals\n\nfor head \`${HEAD}\``), later])).toBe('ruling-needed:referral-hold');
