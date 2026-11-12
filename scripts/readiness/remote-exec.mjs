@@ -1121,7 +1121,7 @@ export function safeFallbackDetail(kind,raw){
   else if(kind==='excluded-source-file'){
     const at=typeof raw==='string'?raw.lastIndexOf(': '):-1;
     const path=at>0?safePathDetail(raw.slice(0,at)):undefined, rule=at>0?raw.slice(at+2):'';
-    if(path&&DETAIL_FINDING.test(rule)&&rule.length<=60)out=`${path}: ${rule}`;
+    if(path&&DETAIL_FINDING.test(rule)&&rule.length<=60&&!TOKENISH.test(rule))out=`${path}: ${rule}`;
   }
   else if(kind==='command-not-allowed'){
     const first=Array.isArray(raw)&&typeof raw[0]==='string'?raw[0]:'';

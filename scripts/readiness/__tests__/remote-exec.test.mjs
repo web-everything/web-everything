@@ -2898,6 +2898,14 @@ describe('safeFallbackDetail', () => {
   ])('yields unavailable for hostile bundle input %j', raw => {
     expect(remoteManifestAPI.safeFallbackDetail('bundle-credential-hit',raw)).toBe('unavailable');
   });
+  it('passes path: rule for an excluded source file', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file','backlog/1-x.md: credential-named-not-identical-to-main')).toBe('backlog/1-x.md: credential-named-not-identical-to-main');
+  });
+  it.each([
+    'a\nb: x', '/etc/passwd: x', '../x: y', 'a.js: bad rule', 'a.js: '+'x'.repeat(250), 'a/'+'z'.repeat(40)+': f', 'a.js: ghp_'+'A1'.repeat(20), undefined, 42,
+  ])('yields unavailable for hostile excluded-source input %j', raw => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file',raw)).toBe('unavailable');
+  });
   it('sibling detail is a safe relative path or unavailable', () => {
     expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','plugs/index.js')).toBe('plugs/index.js');
     expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','/Users/me/x')).toBe('unavailable');
