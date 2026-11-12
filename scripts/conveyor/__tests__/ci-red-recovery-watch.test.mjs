@@ -943,7 +943,7 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     const calls = [];
     const exec = vi.fn((file, args) => {
       calls.push(args);
-      if (args[args.length - 1] === 'cancel') throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)');
+      if (args[args.length - 1].endsWith('/cancel')) throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)');
       return '';
     });
     const sleepSync = vi.fn();
