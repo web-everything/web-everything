@@ -11,13 +11,17 @@
  * an unresolvable relative import, a missing FUI checkout, a deny entry in the policy file.
  *
  * The closure reuses `related-test-selection.mjs#resolveSpecifier`, so "what a test imports" has one definition.
- * Pure of side effects except reads; no store is touched here (S2 owns the store and the shadow log).
+ * Trace retention: runs older than 3 days are removed, then oldest eligible runs until below 15 GiB.
+ * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override those limits. Active runs and runs
+ * younger than 6 hours are protected, as are runs whose owner PID is alive or cannot be checked.
+ * Key contexts prune at most hourly, only for enabled cache runs.
  */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, futimesSync, lstatSync, openSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { arch, platform } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { isVitestTestFile, resolveSpecifier } from './related-test-selection.mjs';
 
 /** Bump to invalidate every stored result. */
@@ -47,6 +51,91 @@ export function cacheEnabled(env = process.env) {
 /** Store location (S2 writes here). Outside every lane so all lanes share it. */
 export function cacheDir(env = process.env, home = env.HOME || '') {
   return env.WE_TEST_CACHE_DIR || join(home, '.cache', 'we-vitest-results', `v${CACHE_SCHEMA_VERSION}`);
+}
+
+export const TEST_CACHE_RETENTION_DEFAULTS = Object.freeze({
+  maxAgeDays: 3, maxBytes: 15 * 1024 ** 3, minAgeMs: 6 * 3600 * 1000,
+});
+
+/** Effective retention limits, including the source or fallback for each setting. */
+export function retentionSettings(env = process.env) {
+  const settings = { ...TEST_CACHE_RETENTION_DEFAULTS, source: { minAgeMs: 'default' } };
+  for (const [key, name] of [['maxAgeDays', 'WE_TEST_CACHE_MAX_AGE_DAYS'], ['maxBytes', 'WE_TEST_CACHE_MAX_BYTES']]) {
+    const value = Number(env[name]);
+    if (env[name] !== undefined && Number.isFinite(value) && value > 0) {
+      settings[key] = value;
+      settings.source[key] = name;
+    } else {
+      settings.source[key] = env[name] === undefined ? 'default' : `default (invalid/non-positive ${name}; fallback)`;
+    }
+  }
+  return settings;
+}
+
+/** Count regular file bytes without following symlinks. Unreadable trees are left alone. */
+function traceBytes(path) {
+  const stat = lstatSync(path);
+  if (stat.isFile()) return stat.size;
+  if (!stat.isDirectory()) return 0;
+  return readdirSync(path).reduce((bytes, name) => bytes + traceBytes(join(path, name)), 0);
+}
+
+/** Best-effort retention of real, directly contained trace run directories. */
+export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now(), runId = env.WE_TEST_CACHE_RUN_ID } = {}) {
+  const settings = retentionSettings(env);
+  const result = { removed: [], freedBytes: 0, remainingBytes: 0, settings };
+  const runs = [];
+  const traces = join(dir, 'traces');
+  try {
+    if (!lstatSync(traces).isDirectory()) return result;
+    for (const name of readdirSync(traces)) {
+      if (!/^\d{8}T\d{6}-\d+-[0-9a-f]+$/.test(name)) continue;
+      try {
+        const path = join(traces, name);
+        const stat = lstatSync(path);
+        if (!stat.isDirectory()) continue;
+        const bytes = traceBytes(path);
+        runs.push({ name, path, mtimeMs: stat.mtimeMs, bytes });
+        result.remainingBytes += bytes;
+      } catch { /* An unreadable or disappearing run is never a reason to fail a test run. */ }
+    }
+  } catch { return result; }
+  runs.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name));
+  for (const run of runs) {
+    const age = now - run.mtimeMs;
+    if (run.name === runId || age < settings.minAgeMs) continue;
+    if (age <= settings.maxAgeDays * 86400 * 1000 && result.remainingBytes <= settings.maxBytes) continue;
+    try {
+      // Recheck eligibility immediately before removal; never follow a replacement symlink.
+      const stat = lstatSync(run.path);
+      if (!stat.isDirectory() || now - stat.mtimeMs < settings.minAgeMs) continue;
+      if (now - stat.mtimeMs <= settings.maxAgeDays * 86400 * 1000 && result.remainingBytes <= settings.maxBytes) continue;
+      rmSync(run.path, { recursive: true });
+      result.removed.push(run.name);
+      result.freedBytes += run.bytes;
+      result.remainingBytes -= run.bytes;
+    } catch { /* Retention must never break a run. */ }
+  }
+  return result;
+}
+
+/** Persist the hourly throttle across processes; a missing store is never created. */
+export function maybePruneCache({ dir = cacheDir(), env = process.env, now = Date.now(), runId = env.WE_TEST_CACHE_RUN_ID } = {}) {
+  const stamp = join(dir, '.prune-stamp');
+  try {
+    const stat = lstatSync(stamp);
+    if (!stat.isFile() || now - stat.mtimeMs < 3600 * 1000) return null;
+  } catch { /* Missing or unreadable stamps do not prevent best-effort pruning. */ }
+  const result = pruneCache({ dir, env, now, runId });
+  let fd;
+  try {
+    fd = openSync(stamp, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+    if (fstatSync(fd).isFile()) futimesSync(fd, new Date(now), new Date(now));
+  } catch { /* Read-only or missing stores must not break a run. */ }
+  finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } }
+  }
+  return result;
 }
 
 /** The effective test timeout factor (`WE_VERIFY_TEST_TIMEOUT_FACTOR`), as a stable string. */
@@ -142,6 +231,7 @@ export function createKeyContext({
   root, env = process.env, nodeVersion = process.version, vitestVersion, platformName = platform(), archName = arch(),
   fuiRoot = resolve(root, '../frontierui'), policy, testEnvironment = 'happy-dom', pool = 'threads', schema = CACHE_SCHEMA_VERSION,
 } = {}) {
+  if (env.WE_TEST_CACHE_RUN_ID && cacheEnabled(env)) maybePruneCache({ dir: cacheDir(env), env });
   const contentHash = new Map();
   const directDeps = new Map();
   const fileOk = new Map();
@@ -279,4 +369,9 @@ export function keyAll({ root, env = process.env, ...ctxOptions } = {}) {
   const tiers = {};
   for (const r of rows) tiers[r.tier] = (tiers[r.tier] ?? 0) + 1;
   return { rows, tiers, cacheable: rows.filter((r) => r.cacheable).length, uncacheable: rows.filter((r) => !r.cacheable) };
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv[2] === 'prune') {
+  const result = pruneCache({ dir: cacheDir(process.env), env: process.env });
+  console.log(JSON.stringify({ ...result, removed: result.removed.length }));
 }
