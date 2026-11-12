@@ -180,7 +180,7 @@ describe('setting-driven red-team queue floor', () => {
         capacity: { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } },
         floor: configured, readCpuIdlePct: () => 50, run, log: f.log });
       expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(4);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(6);
       expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(2);
     },
   );
@@ -880,11 +880,11 @@ describe('idle-only review start allowance', () => {
   });
   it.each([undefined, null, '3', -1, 1.5, 99, 3])('loads file review starts %j with fail-closed integer bounds', value => {
     const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: value } } });
-    const expected = Number.isInteger(value) && value >= 0 ? Math.min(value, 4) : 0;
+    const expected = Number.isInteger(value) && value >= 0 ? Math.min(value, 6) : 0;
     expect(loadRedTeamQueueFloor({ env: {}, readFile }).reviewStartsPerTick).toBe(expected);
-    expect(RED_TEAM_QUEUE_REVIEW_STARTS_CAP).toBe(4);
+    expect(RED_TEAM_QUEUE_REVIEW_STARTS_CAP).toBe(6);
   });
-  it.each([['3', 3], ['99', 4], ['', 0], [' ', 0], ['bad', 0], ['Infinity', 0], ['1.5', 0], ['-1', 0]])(
+  it.each([['3', 3], ['99', 6], ['', 0], [' ', 0], ['bad', 0], ['Infinity', 0], ['1.5', 0], ['-1', 0]])(
     'environment review starts %j overrides file with %s', (value, expected) => {
       const log = vi.fn();
       const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: 4 } } });
