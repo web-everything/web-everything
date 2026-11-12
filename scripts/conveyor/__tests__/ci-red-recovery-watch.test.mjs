@@ -1179,6 +1179,23 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.postComment).toHaveBeenCalledTimes(1);
   });
 
+  it('hung-cap-escalate: an already-completed run is recorded as handled for that head and is not re-selected next tick', () => {
+    const f = fixture('hung-cap-escalate');
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'already-completed' })]);
+    const body = f.comments.at(-1).body;
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(true);
+    expect(bodyHasExactLine(body, 'run: 36161558017')).toBe(true);
+    expect(body).toContain('ci-heal');
+
+    const again = sweepHungCiRecovery(f.options);
+    expect(again.applied).toEqual([]);
+    expect(again.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(f.postComment).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['old-head', reason, 36161558017],
     [PR_2636_HUNG.headRefOid, 'another-reason', 36161558017],
