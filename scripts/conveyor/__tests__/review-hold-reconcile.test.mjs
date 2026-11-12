@@ -603,6 +603,19 @@ describe('#5045 same-head accept guards (R907)', () => {
   });
 });
 
+describe('#5045 push during the explanatory comment (R907)', () => {
+  it('aborts the removal when the head moves while the comment posts', () => {
+    const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
+    let current = head;
+    const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: current, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` }] }) });
+    p.postComment = (repo, number, body) => { p.calls.postComment.push({ repo, number, body }); current = 'b'.repeat(40); };
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readReviews: () => [], readFiles: () => ['docs/a.md'], assertReferrals: () => ({}) });
+    expect(p.calls.postComment.length).toBe(1);
+    expect(results.find((r) => r.num === 5045).removalAborted).toBe('recheck-changed');
+    expect(p.calls.set).toEqual([]);
+  });
+});
+
 describe('#5045 pending with a stale accept', () => {
   const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
   for (const current of [false, true]) it(current ? 'removes stale pending beside same-head acceptance' : 'posts evidence and removes only stale accepted', () => {

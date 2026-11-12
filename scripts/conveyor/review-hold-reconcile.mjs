@@ -398,7 +398,16 @@ export function sweepReviewHoldLabels({
             entry.error = String((e && e.message) || e).split('\n')[0];
           }
           // A pending removed without its durable explanation is worse than a pending kept one more tick.
-          if (toRemove.length && !(heal.reason === 'stale-pending' && !entry.commentPosted)) {
+          let abortRemoval = heal.reason === 'stale-pending' && !entry.commentPosted;
+          if (!abortRemoval && toRemove.length && heal.reason === 'stale-pending') {
+            // Re-read AFTER the comment post: a push or label change during the post keeps the pending.
+            try {
+              const last = { ...provider.readPrState(repoOf(), pr.number), comments: readComments(pr.number, { repo: repoOf() }) };
+              if (last.state !== 'OPEN' || last.headRefOid !== state.headRefOid || evalHeal(last).reason !== 'stale-pending') abortRemoval = true;
+            } catch { abortRemoval = true; }
+            if (abortRemoval) entry.removalAborted = 'recheck-changed';
+          }
+          if (toRemove.length && !abortRemoval) {
             try {
               provider.setLabels(repoOf(), pr.number, { remove: toRemove });
             } catch (e) {
