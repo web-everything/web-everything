@@ -45,6 +45,7 @@ import * as heavyAdmission from '../../../scripts/readiness/heavy-admission.mjs'
 import * as resourceGate from '../../../scripts/lib/resource-gate.mjs';
 import * as unsupportedRepo from '../../../scripts/conveyor/unsupported-repo.mjs';
 import * as rulingStandDown from '../../../scripts/conveyor/ruling-resolved-stand-down.mjs';
+import { FIX_END_MARKER } from '../../../scripts/conveyor/fix-procedure.mjs';
 
 describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
   it.each([
@@ -2173,6 +2174,77 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(result.stuckFixers.orphanRounds.rows).toEqual([
       { decision: 'error', reason: 'orphan-guard: unknown repo fui' },
     ]);
+    expect(fixDispatch.runReconcileFixDispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual({ repo: 'fui', prNumber: null,
+      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+  });
+
+  it.each(['keys', 'slugs'])('never dispatches a capped orphan in a budget-skipped repo and escalates it next pass (%s)', async form => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = Date.parse('2026-10-10T16:00:00Z');
+    const comment = (hour, body) => ({ createdAt: `2026-10-10T${hour}:00:00Z`, body,
+      author: { login: 'web-everything' }, includesCreatedEdit: false });
+    const capped = { number: 4715, labels: ['review:changes'], isDraft: false, headRefOid: 'a'.repeat(40),
+      comments: [comment('10', orphanFixRound.CHANGES_VERDICT_PREFIX),
+        comment('11', `${orphanFixRound.ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
+        comment('12', `${orphanFixRound.ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
+        comment('13', FIX_END_MARKER)] };
+    expect(orphanFixRound.planOrphanFixRound({ pr: capped, nowMs: time }).decision).toBe('escalate');
+    const fixRepos = [];
+    const dispatch = vi.fn();
+    vi.mocked(fixDispatch.runReconcileFixDispatch).mockImplementation(({ repo }) => {
+      fixRepos.push(repo);
+      f.live.invalid = true;
+      const rows = repo === CONSTELLATION_REPOS.we.slug || repo === 'we' ? [] : [capped];
+      const dispatched = rows.filter(pr => !pr.labels.includes('review:human')).map(pr => {
+        dispatch({ repo, pr: pr.number });
+        return { pr: pr.number };
+      });
+      return { dispatched, refusals: [] };
+    });
+    const escalate = vi.fn(async () => { capped.labels.push('review:human'); return { ok: true }; });
+    const repos = ['we', 'frontierui'].map(key => form === 'slugs' ? CONSTELLATION_REPOS[key].slug : key);
+    const options = { ...f.options, repos, now: () => time, budgetRotation: {},
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
+        listBounced: slug => { time += 1001; return slug === CONSTELLATION_REPOS.frontierui.slug ? [capped] : []; },
+        readComments: async () => capped.comments, isOwned: async () => false,
+        escalate, redispatch: dispatch, postComment: () => {} }),
+    };
+    const first = await realRunTickAllRepos(options);
+    expect(first.budgets['orphan-guard'].skipped).toEqual([repos[1]]);
+    expect(fixRepos).toEqual([repos[0]]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(escalate).not.toHaveBeenCalled();
+    expect(first.refusals).toContainEqual({ repo: repos[1], prNumber: null,
+      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+    fixRepos.length = 0;
+    const second = await realRunTickAllRepos(options);
+    expect(second.budgets['orphan-guard'].skipped).toEqual([repos[0]]);
+    expect(fixRepos).toEqual([repos[1]]);
+    expect(escalate).toHaveBeenCalledTimes(1);
+    expect(escalate).toHaveBeenCalledWith({ slug: CONSTELLATION_REPOS.frontierui.slug,
+      pr: 4715, labels: ['review:changes'] });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(second.stuckFixers.orphanRounds.rows).toContainEqual(expect.objectContaining({
+      pr: 4715, decision: 'escalate', result: 'escalated',
+    }));
+  });
+
+  it.each(['throws', 'returns early'])('defers fix until next pass when orphan-guard %s before completing a repo', async mode => {
+    const f = productionFixture();
+    const result = await realRunTickAllRepos({ ...f.options,
+      orphanGuardTick: async ({ repos }) => {
+        for (const repo of repos) {
+          expect(repo.key).toBe('we');
+          if (mode === 'throws') throw new Error('guard failed');
+          return { rows: [] };
+        }
+      } });
+    expect(fixDispatch.runReconcileFixDispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual({ repo: 'we', prNumber: null,
+      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
   });
 
   it('runs the orphan-round guard before fix so a capped orphan is not re-dispatched first', async () => {

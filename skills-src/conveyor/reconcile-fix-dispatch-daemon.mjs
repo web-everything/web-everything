@@ -1225,23 +1225,35 @@ export async function runTickAllRepos({
     return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile, ...reuseOptions(step, tick) });
   };
   // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
+  const requireOrphanGuard = !stuckFixerTick && realTick && !!orphanGuardTick;
+  const orphanGuardCompleted = new Set();
   const orphanGuard = await timedAsync('orphan-guard', async () => {
-    if (stuckFixerTick || !realTick || !orphanGuardTick) return { rows: [] };
+    if (!requireOrphanGuard) return { rows: [] };
     try { return await orphanGuardTick({ env: process.env, nowMs: now(),
       repos: (function* () {
         for (const repo of budgetRepos('orphan-guard', repos)) {
           const key = repoKeyForSlug(repo);
           if (!key) throw new Error(`orphan-guard: unknown repo ${repo}`);
           yield { key, slug: CONSTELLATION_REPOS[key].slug };
+          // Resuming the iterator proves the guard finished this repo before requesting another.
+          orphanGuardCompleted.add(repo);
         }
       })(),
     }) ?? { rows: [] }; }
-    catch (e) { return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] }; }
+    catch (e) {
+      orphanGuardCompleted.clear();
+      return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] };
+    }
   });
+  const orphanGuardDeferred = requireOrphanGuard
+    ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo)) : [];
+  const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', stepRepos.get('fix')), allowStandDownAutoProceed,
+    : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  for (const repo of orphanGuardDeferred) fix.refusals.push({ repo, prNumber: null,
+    kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
   planCache?.markTouched(fix);
   // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
   // The hooks cannot interrupt in-flight work or bound discovery/endFix/release IO.
