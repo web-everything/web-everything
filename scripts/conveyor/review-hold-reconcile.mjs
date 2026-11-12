@@ -337,7 +337,7 @@ export function sweepReviewHoldLabels({
       }
     }
     if (plan.flagged?.length) {
-      // Fail closed: an unreadable file list is treated as engine-tier by the decision.
+      // Fail closed: an unreadable file list keeps the pending.
       const readChangedFiles = () => {
         try {
           if (readFiles) return readFiles(pr.number, { repo: repoOf() });
@@ -346,17 +346,31 @@ export function sweepReviewHoldLabels({
           return Array.isArray(files) ? files : null;
         } catch { return null; }
       };
-      const acc = (latestAcceptRecord(state.comments)?.sha ?? '').toLowerCase();
-      const hd = state.headRefOid.toLowerCase();
-      const sameHeadAccept = hasReviewLabel(state.labels, 'review:pending') && hasReviewLabel(state.labels, 'review:accepted') && !!acc && (acc.startsWith(hd) || hd.startsWith(acc));
-      const heal = decideContradictoryVerdictHeal({
-        currentLabels: state.labels,
-        humanClearedSha: parseLatestHumanClearedSha(state.comments),
-        acceptedSha: latestAcceptRecord(state.comments)?.sha ?? null,
-        headSha: state.headRefOid,
-        fetchOk: true,
-        changedFiles: sameHeadAccept ? readChangedFiles() : null,
-      });
+      const evalHeal = (st) => {
+        const rec = latestAcceptRecord(st.comments);
+        const acc = (rec?.sha ?? '').toLowerCase();
+        const hd = st.headRefOid.toLowerCase();
+        const sameHeadAccept = hasReviewLabel(st.labels, 'review:pending') && hasReviewLabel(st.labels, 'review:accepted') && !!acc
+          && (acc.startsWith(hd) || hd.startsWith(acc));
+        return decideContradictoryVerdictHeal({
+          currentLabels: st.labels,
+          humanClearedSha: parseLatestHumanClearedSha(st.comments),
+          acceptedSha: rec?.sha ?? null,
+          headSha: st.headRefOid,
+          fetchOk: true,
+          changedFiles: sameHeadAccept ? readChangedFiles() : null,
+          laterVerdict: !!(rec?.laterVerdict || rec?.laterBodyDerivedHold || rec?.reviewsUnreadable),
+        });
+      };
+      let heal = evalHeal(state);
+      if (heal.heal && heal.reason === 'stale-pending' && !dryRun) {
+        // Re-read right before the write: a push or renewed hold since the first read keeps the pending.
+        try {
+          const fresh = { ...provider.readPrState(repoOf(), pr.number), comments: readComments(pr.number, { repo: repoOf() }) };
+          if (fresh.state !== 'OPEN' || fresh.headRefOid !== state.headRefOid
+            || evalHeal(fresh).reason !== 'stale-pending') heal = { heal: false, reason: 'recheck-changed' };
+        } catch { heal = { heal: false, reason: 'recheck-failed' }; }
+      }
       if (heal.heal) {
         // Account for this pass's own successful cleanup; GitHub rejects removing an absent label.
         const toRemove = heal.decision.removeLabels.filter((l) => hasReviewLabel(state.labels, l)
