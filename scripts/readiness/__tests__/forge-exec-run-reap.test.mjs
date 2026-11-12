@@ -116,7 +116,7 @@ describe('production uidBusy scanner', () => {
     expect(killed.sort()).toEqual([50, 51, 53]);
     const none = [];
     await killRun({uid: workerUid, ownerPid: 50, ownerStart: '9'}, proc, pid => none.push(pid), async () => '10');
-    expect(none).toEqual([]);
+    expect(none).toEqual([53]); // owner pid reused: only the slot UID is killed
   });
   it('keeps slots for a zombie with no thread count (fail closed)', async () => {
     const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)')});
