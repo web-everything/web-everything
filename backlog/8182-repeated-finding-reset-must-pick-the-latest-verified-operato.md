@@ -1,4 +1,5 @@
 ---
+bornAs: x6d09ko
 kind: story
 size: 2
 status: open
