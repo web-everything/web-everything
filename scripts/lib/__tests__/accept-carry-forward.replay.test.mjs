@@ -936,6 +936,10 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
         expect(isKnownMachineBody(`${body}\nFurther review is required before merging.`, { author: WORKER })).toBe(false);
       });
     }
+    it('prose swapped into the recovered envelope kind still holds (audit)', () => {
+      expect(isKnownMachineBody(RECOVERED.replace('after exhaustion', 'after further review is required before merging'), { author: { login: 'web-everything' } })).toBe(false);
+      expect(isKnownMachineBody(RECOVERED.replace('after exhaustion', 'after ci-heal-exhausted'), { author: { login: 'web-everything' } })).toBe(true);
+    });
     it('prose swapped INSIDE the timeout-note envelope still holds (audit)', () => {
       const swapped = NOTE.split('timeout retry ineligible (timeout-evidence:evidence-read-deadline); falling back to ordinary ci-heal (0 of 3 attempts spent)')
         .join('Further review is required before merging.');
