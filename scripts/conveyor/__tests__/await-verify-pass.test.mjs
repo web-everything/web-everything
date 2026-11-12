@@ -1603,8 +1603,8 @@ describe('timeout-only load recovery', () => {
 // the exact pushed head's green required `test` CI check. Anything else keeps today's infra ladder.
 describe('infra verify failure falls back to green CI on the pushed head', () => {
   const run = (row) => ({ name: row[0], status: 'COMPLETED', conclusion: row[1] });
-  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live', pushResult } = {}) => {
-    const h = harness({ pushResult, records: [rec({ retries: 2, earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
+  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live', pushResult, infraRetry } = {}) => {
+    const h = harness({ pushResult, records: [rec({ retries: 2, ...(infraRetry ? { infraRetry } : {}), earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
     h.state.marker = mark ?? marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'SIGKILL after 1800000ms' } });
     h.io.readPreviousHead = async () => head;
     h.io.readPreviousRequired = async () => ({ checks: required, source });
@@ -1654,8 +1654,34 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
     for (const change of [h => { h.state.lane = lane({ dirty: true }); }, h => { h.state.marker = marker('red'); }]) {
       const h = ciHarness();
       h.io.readPreviousChecks = async () => { change(h); return [run(['test', 'SUCCESS'])]; };
-      await tick(h);
+      const { rows } = await tick(h);
+      // The fallback sets skipPush, so a push count of 0 holds with or without the re-check. What the re-check prevents is the
+      // hand-back itself: no resume, and no fallback reason on the row.
+      expect(h.calls.resume).toHaveLength(0);
       expect(h.calls.push).toHaveLength(0);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
+  });
+  // Acceptance "retries spent": the fallback gate is `d.resume === 'infra' || exhausted || attempts >= max`, so a FIRST infra kill
+  // on a pushed head with green required CI is handed back without spending the remaining infraRetry attempts (ruled residual:
+  // CI on the exact head is the stronger evidence). Both sides of the boundary are pinned so a change to either is deliberate.
+  it.each([
+    ['no infra retry has run yet (attempts 0 < max 3)', undefined],
+    ['retries are spent (attempts 3 = max 3)', { attempts: 3 }],
+    ['the ladder is marked exhausted', { attempts: 1, exhausted: true }],
+  ])('hands back on green CI when %s', async (_name, infraRetry) => {
+    const h = ciHarness({ infraRetry });
+    const { rows } = await tick(h);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.rerequest).toHaveLength(0);
+  });
+  it('keeps the ladder at either side of the retries boundary when CI is not green', async () => {
+    for (const infraRetry of [undefined, { attempts: 3 }]) {
+      const h = ciHarness({ infraRetry, checks: [['test', 'FAILURE']] });
+      const { rows } = await tick(h);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+      expect(rows[0].action).toMatch(/^infra-/);
     }
   });
   it('accepts the marker the real verifyFinishBody writes for a killed run, though it drops the failing tests', async () => {
