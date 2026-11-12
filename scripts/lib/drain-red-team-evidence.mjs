@@ -72,9 +72,11 @@ const unfinishedSince = run => {
 };
 const hasOpenEffect = run => run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
 const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
-// An unfinished run whose read head is a readable sha other than the live head reviews a superseded head: it cannot
-// hold the live head. Unreadable or absent head (cleanRev null) stays unfinished (fail closed). Only the gate decision.
+// An unfinished run that already ACCEPTED a readable sha other than the live head only waits on bookkeeping effects
+// for a superseded head: it cannot hold the live head. A run still deciding or rejecting (it may send the PR back),
+// or with an unreadable head (cleanRev null), stays unfinished (fail closed). Only the gate decision changes.
 const supersededUnfinished = (run, head) => {
+  if (verdictOf(run) !== 'accept') return false;
   const rev = cleanRev(run?.findings?.read?.netBasis?.rev), live = cleanRev(head);
   return rev !== null && live !== null && rev !== live;
 };
