@@ -235,3 +235,13 @@ it('review regressions: a finding repeated in real rendered comments for two hea
     }
   }
 });
+it('a stand-down-answer comment carrying scope-baseline in its reason authorizes a reset (live #6703 loop)', async () => {
+  const { buildOperatorAnswer } = await import('../stand-down-answer-core.mjs');
+  const baseline = 'b'.repeat(40);
+  const reason = `R907 decision: carded. scope-baseline: ${baseline}`;
+  const answer = c(buildOperatorAnswer({ standDownId: 'IC_x', reason, actor: 'chalbert', channel: 'chat' }));
+  const history = [finding('same bug'), c('🔓 conveyor fix-end'), finding('same bug')];
+  expect(repeatedFindingPlan([answer, ...history])).toMatchObject({ action: 'reset', baseline });
+  expect(repeatedFindingPlan([c(answer.body, 'stranger'), ...history]).action).toBe('stand-down');
+  expect(repeatedFindingPlan([answer, ...history.slice(0, 2), finding('new bug')]).action).toBe('patch');
+});

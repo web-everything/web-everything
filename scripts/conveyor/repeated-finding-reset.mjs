@@ -5,6 +5,7 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../lib/ruling-ledger.mjs';
 import { createHash } from 'node:crypto';
+import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 
 export function resolveFixSafety({ env = process.env, tool = readSettings().fix, platform } = {}) {
   const bool = v => v === undefined ? undefined : /^(true|1|on)$/i.test(v) ? true : /^(false|0|off)$/i.test(v) ? false : v;
@@ -94,6 +95,11 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
       const marker = c.body.match(/^(?:<!--\s*)?scope-baseline:\s*([0-9a-f]{40})(?:\s*-->)?\s*$/m);
       if (marker) baseline = marker[1];
     }
+    // stand-down-answer.mjs quotes the operator's reason, so its scope-baseline is never alone on a line.
+    // Read it from the verified answer record (trusted poster + exact rebuild checked by parseOperatorAnswer).
+    const answer = parseOperatorAnswer(raw);
+    const inAnswer = answer?.reason.match(/(?:^|\s)scope-baseline:\s*([0-9a-f]{40})(?![0-9a-f])/);
+    if (inAnswer) baseline = inAnswer[1];
     if (/^🔓 conveyor fix-end/.test(c.body)) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;
       continue;
