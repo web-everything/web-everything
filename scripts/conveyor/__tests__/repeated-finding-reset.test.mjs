@@ -252,6 +252,8 @@ it('a stand-down-answer comment carrying scope-baseline in its reason authorizes
   expect(repeatedFindingPlan([fake, answer, ...history.slice(1)]).action).toBe('stand-down');
   const neg = c(buildOperatorAnswer({ standDownId: 'IC_x', reason: `Do not use scope-baseline: ${baseline}`, actor: 'chalbert', channel: 'chat' }));
   expect(repeatedFindingPlan([target, neg, ...history.slice(1)]).action).toBe('stand-down');
+  const semi = c(buildOperatorAnswer({ standDownId: 'IC_x', reason: `Do not use the following baseline; scope-baseline: ${baseline}`, actor: 'chalbert', channel: 'chat' }));
+  expect(repeatedFindingPlan([target, semi, ...history.slice(1)]).action).toBe('stand-down');
   expect(repeatedFindingPlan([c(answer.body, 'stranger'), ...history]).action).toBe('stand-down');
   expect(repeatedFindingPlan([answer, ...history.slice(0, 3), finding('new bug')]).action).toBe('patch');
 });

@@ -103,7 +103,8 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
     const list = comments ?? [];
     const named = answer && list.slice(0, list.indexOf(raw)).some((x, i) => x?.id && String(x.id) === answer.standDownId
       && operatorAnswerForStandDown(list, i)?.reason === answer.reason);
-    const inAnswer = named && answer.reason.match(/(?:^|[.;!?\n]\s*)scope-baseline:\s*([0-9a-f]{40})\s*$/);
+    // The marker must be its own final sentence: nothing but the baseline after the last . ! ? or newline.
+    const inAnswer = named && answer.reason.match(/(?:^|[.!?\n]\s*)scope-baseline:\s*([0-9a-f]{40})\s*$/);
     if (inAnswer) baseline = inAnswer[1];
     if (/^🔓 conveyor fix-end/.test(c.body)) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;
