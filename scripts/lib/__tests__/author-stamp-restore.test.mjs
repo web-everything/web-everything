@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGhSync } from '../gh-throttle.mjs';
 import { planStampRestore, readAuthorStampEdits, restoreAuthorStamp, sweepAuthorStamps } from '../author-stamp-restore.mjs';
-import { buildAuthorActorMarker, buildStampLostMarker, hasStampLostMarker, readAuthorActorStamps } from '../review-independence.mjs';
+import { buildAuthorActorMarker, buildStampLostMarker, decideClearerIndependence, hasStampLostMarker, readAuthorActorStamps } from '../review-independence.mjs';
 
 const ID = '01f39b97-274a-4078-8eeb-e7f8d6008673';
 const OTHER = 'ffffffff-1111-2222-3333-444444444444';
@@ -327,6 +327,16 @@ describe('restoreAuthorStamp — injected IO and concurrent edits', () => {
     expect(readAuthorActorStamps(seams.writeBody.mock.calls[0][1])).toEqual([]);
     expect(seams.log.mock.calls.flat().join('\n')).toContain('stamp-lost');
     expect(seams.log.mock.calls.flat().join('\n')).not.toContain('restored stamp');
+  });
+
+  it('a marked zero-stamp PR is never independent, for any clearer, with or without the PR date', () => {
+    const { body } = plan({ edits: [] });
+    for (const prCreatedAt of [undefined, '2020-01-01T00:00:00Z', '2026-11-01T00:00:00Z']) {
+      const verdict = decideClearerIndependence({ authorId: readAuthorActorStamps(body)[0], clearerId: 'some-session',
+        prCreatedAt, stampLostMarked: hasStampLostMarker(body) });
+      expect(verdict.independent).toBe(false);
+      expect(verdict.status).toBe('stamp-lost');
+    }
   });
 
   it('does not mark stamp-lost when the history changes before the write', async () => {
