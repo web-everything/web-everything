@@ -528,7 +528,7 @@ export function runReconcileNotesAllRepos({
     // needs-you event (published even though the grant's own pass suppressed it; the feed dedups per head). A PR
     // whose note a grant made moot is checked too, so a suppressed stale note can never hide a stuck PR.
     if (deferred.length) break;
-    if (!dryRun && safety.value.alertAtRoundCap && !pastDeadline()) {
+    if (!dryRun && safety.value.alertAtRoundCap) {
       const noted = new Set((result?.notes ?? []).map((n) => n.prNumber).filter((number) => !graceNotes.has(number)));
       for (const pr of prsByNumber.values()) {
         if (noted.has(pr?.number)) continue;

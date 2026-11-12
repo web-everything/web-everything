@@ -1307,3 +1307,16 @@ it('past deadline without a cursor skips every blocking prelude (including recon
   expect(result).toMatchObject({ handled: 0, deferred: [], nextCursor: null, deadlineSkipped: true });
   for (const fn of [reconcile, pollAttempts, flushOwed, flushTimeouts, dispatch]) expect(fn).not.toHaveBeenCalled();
 });
+
+it('a flush skipped for the deadline is forced next pass even if still past deadline, so a slow prelude cannot starve it', async () => {
+  const flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []), reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => 11, deadlineAt: 10, cursor: 7,
+    pollAttempts: () => [], flushOwed, flushTimeouts, reconcile, resolveProfile: () => ({ capabilities: { ciHeal: true } }), pickFreeLanes: () => [] };
+  await runReconcileCiHealDispatch(options);
+  expect(flushOwed).not.toHaveBeenCalled();
+  const second = await runReconcileCiHealDispatch(options);
+  expect(flushOwed).toHaveBeenCalledTimes(1);
+  expect(flushTimeouts).toHaveBeenCalledTimes(1);
+  expect(reconcile).not.toHaveBeenCalled();
+  expect(second).toMatchObject({ handled: 0, deferred: [7], nextCursor: 7 });
+});
