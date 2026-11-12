@@ -3091,9 +3091,11 @@ function releaseTrackedChanges(dir) {
   return [status, ...hidden.map(line => `?! ${line}`)].filter(Boolean).join('\n');
 }
 
-// Commits count as preserved only when the canonical origin lists them RIGHT NOW (ls-remote of the pool's resolved
-// origin, run in the primary checkout), or when a salvage push verified its remote SHA. No local refs/remotes/* ref is
-// proof: a lane can make one stale, forged or a symbolic alias of its own branch. A listed tip the lane has not
+// RELEASE and SALVAGE: commits count as preserved only when the canonical origin lists them RIGHT NOW (ls-remote of the
+// pool's resolved origin, run in the primary checkout), or when a salvage push verified its remote SHA. No local
+// refs/remotes/* ref is proof there: a lane can make one stale, forged or a symbolic alias of its own branch.
+// ACQUIRE is the deliberate exception (R903, daemon-tick bound): it runs `acquireBlockingWork`, network-free, against
+// the tracking tips its own prune-fetch refreshed immediately before (`localRemoteShas`), exactly like the #2924 re-verify. A listed tip the lane has not
 // fetched is skipped (`--ignore-missing`); if that leaves commits unproven, one hardened object-only fetch of the origin
 // heads runs (into a private ref namespace it deletes again, never refs/remotes/*) and the check repeats. A failed
 // listing or fetch never releases: it keeps the stricter result.
