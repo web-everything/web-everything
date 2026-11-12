@@ -357,18 +357,19 @@ describe('existing-card IO', () => {
     expect(f.labelSyncs).toHaveLength(1);
   });
   it('reader and sink default to the production standing-ruling scope verifier', async () => {
+    const env = { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' };
     const comments = standingThread();
     const scope = verifiedScope({ repo, pr: { number: PR, headRefOid: HEAD, comments } });
     const { vi } = await import('vitest');
     const spy = vi.spyOn(await import('../../conveyor/standing-ruling-io.mjs'), 'standingRulingScope').mockReturnValue(scope);
     try {
       const readThread = () => ({ headRefOid: HEAD, labels: [], comments });
-      const context = createRecordRedTeamRulingReader({ assertFresh: () => {}, readThread,
+      const context = createRecordRedTeamRulingReader({ env, assertFresh: () => {}, readThread,
         resolveIdentity: () => OP, resolveCard: () => card, readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }) })(input());
       expect(context.standingRuling).toBe(scope);
       expect(() => planRedTeamRuling(context, input())).toThrow(/no red-team break is held/);
       const posted = [];
-      const sinks = createRecordRedTeamRulingSinks({ readThread, resolveIdentity: () => OP, post: (...args) => posted.push(args) });
+      const sinks = createRecordRedTeamRulingSinks({ env, readThread, resolveIdentity: () => OP, post: (...args) => posted.push(args) });
       expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no red-team break is held.*nothing written/);
       expect(posted).toEqual([]);
       expect(spy).toHaveBeenCalledTimes(2);
@@ -548,6 +549,7 @@ describe('standalone CLI', () => {
     const { createMemoryCallLogStore } = await import('../call-log-store.mjs');
     const f = fake({ initial: standingThread(lateCap) });
     const entry = () => ({ declaration: recordRedTeamRulingOperation({ readRulingContext: createRecordRedTeamRulingReader({
+      env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' },
       assertFresh: () => {}, readThread: () => ({ headRefOid: HEAD, comments: f.comments }),
       readStandingRulingScope: verifiedScope,
       readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), resolveIdentity: () => OP, resolveCard: () => card,
