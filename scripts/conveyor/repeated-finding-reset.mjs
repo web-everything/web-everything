@@ -5,7 +5,7 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../lib/ruling-ledger.mjs';
 import { createHash } from 'node:crypto';
-import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
+import { parseOperatorAnswer, operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 
 export function resolveFixSafety({ env = process.env, tool = readSettings().fix, platform } = {}) {
   const bool = v => v === undefined ? undefined : /^(true|1|on)$/i.test(v) ? true : /^(false|0|off)$/i.test(v) ? false : v;
@@ -100,8 +100,10 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
     // Operator-authored only, naming a stand-down present in this thread, with the marker ending the reason
     // (so quoted/negated prose such as "do not use scope-baseline: <sha>; rejected" cannot grant a reset).
     const answer = c.operator ? parseOperatorAnswer(raw) : null;
-    const named = answer && (comments ?? []).some(x => x?.id && String(x.id) === answer.standDownId);
-    const inAnswer = named && answer.reason.match(/(?:^|\s)scope-baseline:\s*([0-9a-f]{40})\s*$/);
+    const list = comments ?? [];
+    const named = answer && list.slice(0, list.indexOf(raw)).some((x, i) => x?.id && String(x.id) === answer.standDownId
+      && operatorAnswerForStandDown(list, i)?.reason === answer.reason);
+    const inAnswer = named && answer.reason.match(/(?:^|[.;!?\n]\s*)scope-baseline:\s*([0-9a-f]{40})\s*$/);
     if (inAnswer) baseline = inAnswer[1];
     if (/^🔓 conveyor fix-end/.test(c.body)) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;

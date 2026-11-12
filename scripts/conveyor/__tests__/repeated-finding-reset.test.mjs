@@ -1,6 +1,7 @@
 import { it, expect } from 'vitest';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../repeated-finding-reset.mjs';
 import { buildFixEndComment } from '../fix-procedure.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
 const c = (body, login = 'chalbert') => ({ author: { login }, body });
 const finding = text => c(`🔁 review — changes requested\nRecorded by agent\n### Findings (1)\n**correctness/bug** (1)\n- \`a.mjs:10\` — ${text}`, 'web-everything');
 const comments = [finding('Same   BUG'), c('🔓 conveyor fix-end'), finding('same bug')];
@@ -240,13 +241,17 @@ it('a stand-down-answer comment carrying scope-baseline in its reason authorizes
   const baseline = 'b'.repeat(40);
   const reason = `R907 decision: carded. scope-baseline: ${baseline}`;
   const answer = c(buildOperatorAnswer({ standDownId: 'IC_x', reason, actor: 'chalbert', channel: 'chat' }));
-  const target = { ...c('🛑 stand-down', 'web-everything'), id: 'IC_x' };
+  const target = { ...c(buildStandDownComment({ reason: 'repeated-finding', head: 'a'.repeat(40), detail: 'x' }), 'web-everything'), id: 'IC_x' };
   const bad = c(buildOperatorAnswer({ standDownId: 'IC_x', reason: `Do not use scope-baseline: ${baseline}; rejected.`, actor: 'chalbert', channel: 'chat' }));
   const history = [target, finding('same bug'), c('🔓 conveyor fix-end'), finding('same bug')];
   expect(repeatedFindingPlan([answer, ...history.slice(1)]).action).toBe('stand-down');
   expect(repeatedFindingPlan([bad, ...history]).action).toBe('stand-down');
   expect(repeatedFindingPlan([...history.slice(0, 1), answer, ...history.slice(1)])).toMatchObject({ action: 'reset', baseline });
-  expect(repeatedFindingPlan([answer, ...history])).toMatchObject({ action: 'reset', baseline });
+  expect(repeatedFindingPlan([answer, ...history]).action).toBe('stand-down'); // answer precedes its stand-down
+  const fake = { ...c('hello', 'stranger'), id: 'IC_x' };
+  expect(repeatedFindingPlan([fake, answer, ...history.slice(1)]).action).toBe('stand-down');
+  const neg = c(buildOperatorAnswer({ standDownId: 'IC_x', reason: `Do not use scope-baseline: ${baseline}`, actor: 'chalbert', channel: 'chat' }));
+  expect(repeatedFindingPlan([target, neg, ...history.slice(1)]).action).toBe('stand-down');
   expect(repeatedFindingPlan([c(answer.body, 'stranger'), ...history]).action).toBe('stand-down');
   expect(repeatedFindingPlan([answer, ...history.slice(0, 3), finding('new bug')]).action).toBe('patch');
 });
