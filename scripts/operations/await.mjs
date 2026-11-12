@@ -8,11 +8,13 @@ import { homedir } from 'node:os';
 import { join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { DAEMON_CLONE_SEED } from '../lib/daemon-clone-registry.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 
 const MAX_WAIT_MS = 540000;
 const POLL_MS = 30000;
+const REPO = ghRepoSlug('we');
 const USAGE = 'usage: run.mjs await --kind ci-run|adoption|pr [--branch REF] [--sha SHA] [--clone NAME] [--pr NUMBER] [--state open|closed|merged] [--labels-present LABEL] [--labels-absent LABEL] [--wait-ms MS] [--json]';
 
 /** Parse flags without filesystem or subprocess access. Clone values remain names. */
@@ -51,7 +53,7 @@ export function parseArgs(argv) {
   // Only registered daemon clones can satisfy an adoption gate; a pool lane or any other checkout never counts.
   if (opts.clone !== undefined && !DAEMON_CLONE_SEED.includes(opts.clone)) throw new Error('--clone must be a registered daemon clone');
   if (opts.kind === 'pr' && (!opts.pr || (!opts.state && !opts.labelsPresent.length && !opts.labelsAbsent.length))) throw new Error('pr needs --pr and a state or label predicate');
-  const allowed = { 'ci-run': ['branch', 'sha'], adoption: ['clone', 'sha'], pr: ['pr', 'state', 'labelsPresent', 'labelsAbsent'] }[opts.kind];
+  const allowed = { 'ci-run': ['branch', 'sha'], adoption: ['clone', 'sha'], pr: ['state', 'pr', 'labelsPresent', 'labelsAbsent'] }[opts.kind];
   for (const key of ['branch', 'sha', 'clone', 'pr', 'state', 'labelsPresent', 'labelsAbsent']) {
     const supplied = Array.isArray(opts[key]) ? opts[key].length > 0 : opts[key] !== undefined;
     if (supplied && !allowed.includes(key)) throw new Error(`${key} is not valid for ${opts.kind}`);
@@ -77,7 +79,7 @@ function defaultExec(file, args, { timeout }) {
         remaining();
       },
       exec(childArgs, childOptions) {
-        return execFileSync('gh', childArgs, { ...childOptions, timeout: Math.min(timeout, remaining()) });
+        return execFileSync('gh', childArgs, { ...childOptions, maxBuffer: 1024 * 1024, timeout: Math.min(timeout, remaining()) });
       },
     } });
   }
@@ -165,7 +167,7 @@ export function awaitCondition(opts, {
           result = { ...result, done: true, conclusion: run.conclusion, runId: run.databaseId, url: run.url };
         }
       } else {
-        const pr = JSON.parse(exec('gh', ['pr', 'view', String(opts.pr), '--json', 'state,labels'], commandOptions));
+        const pr = JSON.parse(exec('gh', ['pr', 'view', String(opts.pr), '--repo', REPO, '--json', 'state,labels'], commandOptions));
         if (pr && ['OPEN', 'CLOSED', 'MERGED'].includes(pr.state) && Array.isArray(pr.labels)
           && pr.labels.every(label => label && typeof label.name === 'string' && label.name.length > 0)) {
           const names = new Set(pr.labels.map(label => label.name));

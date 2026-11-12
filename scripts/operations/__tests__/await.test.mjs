@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { ghRepoSlug } from '../../lib/constellation-repos.mjs';
 import { parseArgs, awaitCondition, main, cloneDir, assertCloneRoot } from '../await.mjs';
 
 const SHA = 'abc123def456abc123def456abc123def456abcd';
@@ -46,7 +47,7 @@ const ciCall = (withSha = false) => ['gh', [
   '--limit', '1', '--json', 'databaseId,status,conclusion,url,headSha',
 ]];
 const adoptionCall = ['git', ['-C', cloneDir(CLONE), 'merge-base', '--is-ancestor', SHA, 'HEAD']];
-const prCall = ['gh', ['pr', 'view', '42', '--json', 'state,labels']];
+const prCall = ['gh', ['pr', 'view', '42', '--repo', ghRepoSlug('we'), '--json', 'state,labels']];
 
 describe('parseArgs', () => {
   it('parses CI options with the default nine-minute wait and empty label lists', () => {
