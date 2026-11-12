@@ -1,15 +1,19 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runReviewJob } from '../review-job.mjs';
 import { parseVerdictCarriedMarker } from '../../lib/rebase-verdict-carry.mjs';
-import { gateOutcomesForHead } from '../../lib/red-team-gate.mjs';
+import { gateOutcomesForHead, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 const a = 'a'.repeat(40), b = 'b'.repeat(40), p = 'c'.repeat(40);
 const trusted = body => ({ author: { login: 'chalbert' }, body });
+// #6606: a carry needs a publishable result on the source head. This is the canonical policy-clear result, and the
+// gate decision is bound to it, as the gate records one (a carry moves only decisions made on the carried result).
+const clearA = `<!-- we:red-team-advisory pr=1 rev=${a} -->\n\nRed team not required on this head: not owed (stored review)`;
+const gateA = redTeamGateMarker(1, a, 'card-queued', redTeamResultId(parseRedTeamComment(clearA)));
 function fixture() {
   return { root: '.', now: () => 0, claim: () => ({ ok: true }), unclaim: vi.fn(), report: vi.fn(), log: vi.fn(),
     redTeamStatus: () => {},
     readPrevCompletion: () => null, newActorId: () => 'actor', prepareLane: () => ({ head: 'a'.repeat(40) }), acquireLane: () => ({ lanePath: 'fake-lane' }), updateRecord: vi.fn(), releaseLane: vi.fn(),
     carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
-    readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] }),
+    readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(clearA), trusted(gateA)] }),
     contributionPatchId: () => p, restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),
     publishCarriedCheck: vi.fn(() => ({ ok: true })), markCarriedCheckOwed: vi.fn(),
     runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ stopped: 'complete', verdict: { verdict: 'accept', loop: { outcome: 'converged' } } }) })),
@@ -71,6 +75,39 @@ describe('review job rebase carry', () => {
     expect(io.publishCarriedCheck).not.toHaveBeenCalled();
     if (['red-team-pending', 'gate-with-hold'].includes(mode)) expect(io.restampVerdict).not.toHaveBeenCalled();
   });
+
+  // #6606 red team: a carry must never post a result the live publisher refuses, or the carried head waits forever
+  // for a check no retry can publish. The carry decision reads the re-keyed result with the publisher's own rule.
+  const clear = (reason, rev = a) => trusted(`<!-- we:red-team-advisory pr=1 rev=${rev} -->\n\nRed team not required on this head: ${reason}`);
+  const withAdvisory = advisory => () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
+    trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`), advisory] });
+  it('a canonical policy-clear result carries, re-keyed to the new head', () => {
+    const io = fixture();
+    io.readCarryEvidence = withAdvisory(clear('not owed (stored review)'));
+    const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
+    expect(out.outcome).toBe('carried');
+    expect(io.postCarryComment.mock.calls[0][0].body)
+      .toContain(`<!-- we:red-team-advisory pr=1 rev=${b} -->\n\nRed team not required on this head: not owed (stored review)`);
+  });
+  it.each([
+    ['a tab in the reason', clear('not\towed'), true],
+    ['a whitespace-only reason', clear('   '), true],
+    ['a line separator in the reason', clear(`not${String.fromCharCode(0x2028)}owed`), true],
+    ['a paragraph separator in the reason', clear(`not${String.fromCharCode(0x2029)}owed`), true],
+    ['no result at all beside the gate marker', null, true],
+    // Refused earlier, by the approval guard, not by the publishability gate; pinned so neither path regresses.
+    ['extra prose after the reason', trusted(`<!-- we:red-team-advisory pr=1 rev=${a} -->\n\nRed team not required on this head: x\nmore`), false],
+    ['a finding-shaped line', trusted(`<!-- we:red-team-advisory pr=1 rev=${a} -->\n 1. [confirmed] x`), false],
+  ])('a result the publisher would refuse (%s) is not carried: no restamp, owed marker or comment', (_, advisory, gated) => {
+    const io = fixture();
+    io.readCarryEvidence = advisory ? withAdvisory(advisory) : () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
+      trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] });
+    const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
+    expect(out.outcome).not.toBe('carried');
+    for (const key of ['restampVerdict', 'markCarriedCheckOwed', 'postCarryComment', 'publishCarriedCheck']) expect(io[key]).not.toHaveBeenCalled();
+    expect(io.runLoop).toHaveBeenCalledTimes(1);
+    if (gated) expect(io.log).toHaveBeenCalledWith(expect.stringMatching(/verdict carry unavailable \(carried red-team result is not publishable/));
+  });
 });
 
 // #6606: the production carry publisher leaves a durable retry marker when its attempt is not confirmed, so the
@@ -102,7 +139,7 @@ describe('human clearance remains owned by restamp', () => {
     const { parseLatestHumanClearedSha, parseReviewedSha, decideContradictoryVerdictHeal } = await import('../../lib/review-escalation.mjs');
     const oldDiff = 'diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n';
     const comments = [trusted(buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: a, reviewedDiff: oldDiff })),
-      trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)];
+      trusted(clearA), trusted(gateA)];
     const io = fixture(); io.readCarryEvidence = () => ({ headSha: b, comments });
     io.restampVerdict = vi.fn(() => {
       const humanClearance = decideRestampHumanClearance({ comments, headSha: b, headDiff: agrees ? oldDiff : oldDiff.replace('+new', '+changed') });

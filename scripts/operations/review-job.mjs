@@ -91,7 +91,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
@@ -1137,6 +1137,12 @@ function runReviewArc({
             const headPatchId = io.contributionPatchId({ sha: evidence.headSha, repo: planned.repo });
             const decision = decideRebaseVerdictCarry({ setting: setting.value, prior, priorPatchId, headPatchId });
             if (decision.carry) {
+              // #6606: carry only a result the live publisher accepts once re-keyed to this head (the same predicate),
+              // decided before any restamp, owed marker or comment. Anything else re-reviews instead of stranding.
+              const carriedAdvisory = prior.advisoryBody
+                ? prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha)) : null;
+              if (!isPublishableRedTeamResult(parseRedTeamComment(carriedAdvisory)))
+                throw Error('carried red-team result is not publishable on the new head');
               const stamped = io.restampVerdict({ pr: planned.pr, repo: planned.repo, newHead: evidence.headSha,
                 reason: `${decision.reason}; from ${prior.sha}; patch-id ${headPatchId}` });
               if (!stamped?.ok) throw Error(`restamp refused: ${stamped?.reason ?? 'unknown error'}`);
@@ -1147,7 +1153,7 @@ function runReviewArc({
                   : [...decided.outcomes].map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome, decided.resultId));
               const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
                 'Review verdict carried across an identical contribution.',
-                ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');
+                carriedAdvisory].join('\n');
               // #6606: mark the check owed BEFORE the comment. Recovery skips a head whose result is on it, so a crash
               // between the comment and the publication must still leave a marker for the retry to find.
               try { io.markCarriedCheckOwed?.({ pr: planned.pr, repo: planned.repo, headSha: evidence.headSha }); }

@@ -7,7 +7,7 @@ import { withFileLock } from './atomic-json-file.mjs';
 import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { readRedTeamDisposition, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
+import { isPublishableRedTeamResult, readRedTeamDisposition, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -248,9 +248,9 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
       if (!disposition.result) throw Error('no trusted red-team result on live head');
       if (!Array.isArray(disposition.result.shapedLines) || disposition.result.shapedLines.length)
         throw Error('red-team result has malformed or unparsed finding evidence; operator must inspect the full result');
-      // A completed review, or the canonical policy-clear result a carry re-keys onto this head (#6606).
-      if ((disposition.result.completedReview !== true && disposition.result.policyClear !== true)
-        || !redTeamResultId(disposition.result))
+      // A completed review, or the canonical policy-clear result a carry re-keys onto this head (#6606). The carry
+      // decision in review-job reads the same predicate, so it never carries what this refuses.
+      if (!isPublishableRedTeamResult(disposition.result))
         throw Error('red-team result lacks completed review content; operator must inspect the full result');
       const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
       if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);

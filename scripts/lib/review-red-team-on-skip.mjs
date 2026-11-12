@@ -476,8 +476,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (restamp?.to === head && source?.sha === restamp.from
           && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
           && comment && latestResultAt === rawPr.comments.indexOf(comment) && result && result.findings.length === 0
-          && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
-          && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
+          // The parser's one canonical policy-clear rule (#6606), the same shape the live check publisher accepts.
+          && parsed.policyClear === true) {
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
           const refusal = publishableClearGuard(context);
           if (refusal) return guardedSkip(refusal);

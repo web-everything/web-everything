@@ -140,6 +140,14 @@ export function redTeamResultId(parsed) {
   return createHash('sha256').update(JSON.stringify(classified ? ['v3', findings, extra] : extra.length ? ['v2', findings, extra] : ['v1', findings])).digest('hex').slice(0, 16);
 }
 
+/** The live check publisher's acceptance rule for a parsed result (#6606): every finding-shaped line parsed, and a
+ * completed review or the canonical policy-clear result. A carry decides with this same rule, so it never carries a
+ * result whose check no retry could publish. PURE; null and unparsed input are not publishable. */
+export function isPublishableRedTeamResult(parsed) {
+  return Boolean(parsed) && Array.isArray(parsed.shapedLines) && parsed.shapedLines.length === 0
+    && (parsed.completedReview === true || parsed.policyClear === true) && Boolean(redTeamResultId(parsed));
+}
+
 /**
  * The red-team comment for the LIVE head: the newest one a TRUSTED principal wrote whose marker names this PR and
  * exactly this head. A comment on another head is stale (the fixer already pushed) and is ignored. A result carried
