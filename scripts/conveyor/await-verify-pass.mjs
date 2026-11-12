@@ -645,7 +645,9 @@ export async function runAwaitVerifyPass({
         || (record.infraRetry?.attempts ?? 0) >= (recovery.value.infraRetry?.maxAttempts ?? Infinity))) {
         const fallback = await infraCiGreenFallback({ io, record, marker, lane });
         if (fallback) {
-          d = { action: 'push', reason: `infra-ci-green-fallback: ${fallback}` };
+          // skipPush: the head is already on the remote (early push, PR head re-read above); a second push would be refused by the
+          // claim binding (live #6693 08:12Z, push-refused) and adds nothing, so the round is handed back as the post-push path does.
+          d = { action: 'push', skipPush: true, reason: `infra-ci-green-fallback: ${fallback}` };
           Object.assign(row, { action: d.action, reason: d.reason });
         }
       }
@@ -740,7 +742,8 @@ export async function runAwaitVerifyPass({
         const srNote = gate.note;
         const attempt = record.pushRetries ?? 0;
         if (!persist({ ...record, pushRetries: attempt + 1 })) { rows.push(row); continue; }
-        const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
+        const pushed = d.skipPush ? { ok: true, upToDate: true }
+          : io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
         if (!pushed?.ok && pushed?.transient && attempt < limits.maxRetries) {
           // A network/auth hiccup is not a moved branch: retry the same push next tick (the attempt is already counted).
           row.result = `push-retry (${pushed.reason})`;
