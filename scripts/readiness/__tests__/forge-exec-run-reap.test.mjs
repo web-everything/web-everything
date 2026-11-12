@@ -309,6 +309,23 @@ describe('forge leaked-state reaper', () => {
     expect(await exists(stuck.lock)).toBe(false);
     expect(await readFile(join(receipts, 'reap-audit.log'), 'utf8')).toMatch(/past-max-runtime killed=2/);
   });
+  it('does not kill when the reservation is replaced by a new run before the kill', async () => {
+    const stuck = await leak(1, 22, {owner, ageMs: 3 * 3600e3});
+    const killedUids = [];
+    probe.uidBusy = async () => true;
+    probe.start = async () => owner.start;
+    probe.killRun = async a => { killedUids.push(a.uid); return 1; };
+    // The slot identity is resolved just before the kill; swap the reservation at that moment.
+    const swapping = createRunner({testRoot: root, testPath: '/usr/bin:/bin', testReapProbe: probe,
+      testWorkerIdentity: async user => {
+        await writeFile(join(stuck.lock, 'reservation.json'), JSON.stringify({run: runId(23), nonce: 'b'.repeat(32), slot: 'forge-exec-1', writerGuard: 1}));
+        return {uid: 20000 + Number(user.slice(11)), gid: 30000 + Number(user.slice(11)), groups: [30000 + Number(user.slice(11))]};
+      },
+      testSlotStat: async path => ({isSymbolicLink: () => false, isDirectory: () => true, mode: 0o40710, uid: process.getuid(), gid: 30000 + Number(path.slice(-1))})});
+    await swapping.telemetry();
+    expect(killedUids).toEqual([]);
+    expect(await exists(stuck.lock)).toBe(true);
+  });
   it('keeps a live run inside its max runtime and kills nothing', async () => {
     const live = await leak(1, 21, {owner, ageMs: 60e3});
     const killedUids = [];
