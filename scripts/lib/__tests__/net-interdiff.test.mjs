@@ -10,7 +10,8 @@ let dir;
 const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const write = (p, text) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), text); };
 const commit = (msg) => { git('add', '-A'); git('commit', '-q', '-m', msg); return git('rev-parse', 'HEAD'); };
-const exec = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+// The encoding the module asks for is honoured (default utf8), so a test can tell a lossy decode from a byte-exact one.
+const exec = (cmd, args, opts) => execFileSync(cmd, args, { encoding: 'utf8', ...opts, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
 const rawOf = (a, b) => Object.fromEntries(git('diff', '--name-only', a, b).split('\n').filter(Boolean).map(p => [p, null]));
 const lines = n => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join('\n') + '\n';
 
@@ -399,6 +400,36 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
     expect(Object.keys(out.files)).toEqual(['__proto__']);
     expect(Object.getOwnPropertyDescriptor(out.files, '__proto__')?.value).toBe(arr);
     expect(Object.getPrototypeOf(out.files)).toBe(Object.prototype);
+  });
+
+  it('keeps a text file whose edit only swaps one invalid-UTF-8 byte for another (no lossy decoding)', () => {
+    start('legacy-bytes');
+    // No NUL byte, so git emits a text patch; 0x80 and 0x81 both decode to U+FFFD if the patch is read as UTF-8.
+    writeFileSync(join(dir, 'legacy.txt'), Buffer.from([0x62, 0x61, 0x73, 0x65, 0x0a]));
+    commit('base legacy');
+    writeFileSync(join(dir, 'legacy.txt'), Buffer.from([0x80, 0x0a]));
+    const prior = commit('pr1 sets 0x80');
+    writeFileSync(join(dir, 'legacy.txt'), Buffer.from([0x81, 0x0a]));
+    const head = commit('pr2 sets 0x81');
+    const out = net(prior, head, { 'legacy.txt': [1] });
+    expect(Object.keys(out.files)).toEqual(['legacy.txt']);
+    expect(out.dropped).toEqual([]);
+  });
+
+  it('keeps an invalid-byte edit inside surrounding text, and still drops one that is byte-identical at both heads', () => {
+    start('legacy-mid');
+    const body = (b) => Buffer.concat([Buffer.from('one\ntwo\nthree\n'), Buffer.from([b]), Buffer.from('\nfour\nfive\n')]);
+    writeFileSync(join(dir, 'mid.txt'), Buffer.from('one\ntwo\nthree\nX\nfour\nfive\n'));
+    writeFileSync(join(dir, 'same.txt'), Buffer.from('a\nb\n'));
+    commit('base');
+    writeFileSync(join(dir, 'mid.txt'), body(0xe9));
+    writeFileSync(join(dir, 'same.txt'), Buffer.from([0x61, 0x0a, 0xff, 0x0a]));
+    const prior = commit('pr1');
+    writeFileSync(join(dir, 'mid.txt'), body(0xe8));
+    const head = commit('pr2 changes only mid.txt');
+    const out = net(prior, head, { 'mid.txt': null, 'same.txt': null });
+    expect(Object.keys(out.files)).toEqual(['mid.txt']);
+    expect(out.dropped).toEqual(['same.txt']);
   });
 
   it('preserves the raw line arrays of kept files (same reference)', () => {

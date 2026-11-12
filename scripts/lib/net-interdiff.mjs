@@ -93,6 +93,18 @@ function run(exec, args, extra = {}) {
   return out;
 }
 
+/**
+ * Run a `git diff` and return its bytes as a string with one character per byte (latin1). UTF-8 decoding is lossy: two
+ * different invalid bytes (0x80, 0x81) both become U+FFFD, so a real edit in a legacy-encoded text file would compare
+ * equal and be dropped. latin1 is one-to-one, so equal strings mean equal bytes. The text is only ever compared with
+ * itself, never shown or matched against a UTF-8 path.
+ */
+function runDiff(exec, args, extra = {}) {
+  const out = exec('git', args, { encoding: 'latin1', stdio: ['ignore', 'pipe', 'ignore'], timeout: TIMEOUT_MS, ...extra });
+  if (typeof out !== 'string') throw new Error('exec-returned-non-string');
+  return out;
+}
+
 /** The merge-base of `head` with `base` (path-independent, so computed once per head). */
 function mergeBase(exec, head, base) {
   const mb = run(exec, ['merge-base', head, base]).trim();
@@ -111,7 +123,7 @@ const DIFF_FLAGS = ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textco
 function ownPatch(exec, head, mb, path) {
   // --literal-pathspecs: `path` is data from the caller, never a glob or pathspec magic.
   // --ignore-submodules=none: a repo/user `diff.ignoreSubmodules` or `.gitmodules` `ignore=all` must not hide a pointer bump.
-  return parsePatch(run(exec, [...DIFF_FLAGS, '--binary', '--unified=3', mb, head, '--', path], { maxBuffer: MAX }));
+  return parsePatch(runDiff(exec, [...DIFF_FLAGS, '--binary', '--unified=3', mb, head, '--', path], { maxBuffer: MAX }));
 }
 
 /**
@@ -123,7 +135,7 @@ function samePatch(exec, a, b, mbPrior, mbHead, path) {
   if (a.header !== b.header || a.hunks.length !== b.hunks.length) return false;
   for (let i = 0; i < a.hunks.length; i += 1) if (a.hunks[i].body.join('\n') !== b.hunks[i].body.join('\n')) return false;
   if (!a.hunks.length) return true;
-  const main = mbPrior === mbHead ? { hunks: [], lines: new Set() } : shiftHunks(run(exec, [...DIFF_FLAGS, '--unified=0', mbPrior, mbHead, '--', path], { maxBuffer: MAX }));
+  const main = mbPrior === mbHead ? { hunks: [], lines: new Set() } : shiftHunks(runDiff(exec, [...DIFF_FLAGS, '--unified=0', mbPrior, mbHead, '--', path], { maxBuffer: MAX }));
   return a.hunks.every((h, i) => mapStart(h, main) === b.hunks[i].oldStart);
 }
 
