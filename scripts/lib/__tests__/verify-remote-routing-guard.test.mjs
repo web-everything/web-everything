@@ -1,0 +1,21 @@
+import { it, expect } from 'vitest';
+import { phaseAdmissionPlan } from '../verify-remote-routing.mjs';
+
+const guard = "npx vitest run 'scripts/a.test.mjs' 'scripts/b.test.mjs' --reporter=default --reporter=json --outputFile.json='/tmp/we-verify/guard-report.json' --testTimeout=60000 --hookTimeout=60000";
+
+it('the always-run guard phase is planned remote through the nested heavy-admission wrapper', () => {
+  const plan = phaseAdmissionPlan({ command: guard, decision: { remote: true } });
+  expect(plan.takeLocalSlot).toBe(false);
+  expect(plan.command).toContain('node scripts/readiness/heavy-admission.mjs run -- npx vitest run');
+  expect(plan.command).toContain("--outputFile.json='/tmp/we-verify/guard-report.json'");
+});
+
+it('the guard phase stays local without a remote decision', () => {
+  const plan = phaseAdmissionPlan({ command: guard, decision: { remote: false } });
+  expect(plan).toMatchObject({ command: guard, takeLocalSlot: true });
+});
+
+it('a json report with a config or a second outputFile stays local', () => {
+  expect(phaseAdmissionPlan({ command: `${guard} --config vitest.soak.config.ts`, decision: { remote: true } }).takeLocalSlot).toBe(true);
+  expect(phaseAdmissionPlan({ command: `${guard} --outputFile.json=/tmp/x.json`, decision: { remote: true } }).takeLocalSlot).toBe(true);
+});
