@@ -573,11 +573,38 @@ describe('red-team check run contract', () => {
         const gh = vi.fn(args => {
           if (args.includes('POST')) return '{}';
           if (!newest) throw Error('HTTP 502');
-          return JSON.stringify([{ id: 5, state: 'failure', context: 'red-team/publication #7', description: newest.description,
-            creator: { login: newest.login } }, { id: 4, state: 'failure', context: 'red-team/publication #8' }]);
+          const history = [{ id: 5, state: 'failure', context: 'red-team/publication #7', description: newest.description,
+            creator: { login: newest.login } }, { id: 4, state: 'failure', context: 'red-team/publication #8' }];
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: history.map(({ context, state }) => ({ context, state })) });
+          return JSON.stringify(history);
         });
         expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok, ...(ok ? { cleared } : {}) });
         expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(cleared ? 1 : 0);
+      });
+      // Red-team break on c639d9ba108e: 100 unrelated statuses on the head, no publication context. The combined
+      // summary proves the context absent, so the clearer settles (ok, nothing posted) instead of failing on the full
+      // history page and keeping the retry marker forever.
+      it('clearLivePublicationHold: a full page of unrelated statuses with the context absent is settled, not unreadable', () => {
+        const unrelated = Array.from({ length: 100 }, (_, i) => ({ id: 1000 - i, state: 'success', context: 'ci/build', creator: { login: 'x' } }));
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context: 'ci/build', state: 'success' }] });
+          return JSON.stringify(unrelated);
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: false });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
+      });
+      it.each([
+        ['an incomplete combined summary', { total_count: 101, statuses: [{ context: 'ci/build', state: 'success' }] }],
+        ['a malformed combined summary', { statuses: 'x' }],
+      ])('clearLivePublicationHold: %s fails closed', (_name, combined) => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify(combined);
+          return '[]';
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: false });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
       });
       it('only the helper\'s own failures over an older round failure: the round failure still dates the carry', () => {
         const older = [run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' }), ownFailure(21)];

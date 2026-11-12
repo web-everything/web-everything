@@ -465,6 +465,14 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, is
   // range (a round writer's unconfirmed publication) is its owner's to clear: leave all of them.
   let holds = [];
   try {
+    // The combined summary (one latest status per context) settles absence first, the same way the gate reader does:
+    // unrelated contexts can fill the 100-status history page, and absence must never read as an incomplete history
+    // (that kept the retry marker forever and re-published checks until the check-run bound refused the head).
+    const combined = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/status?per_page=100`], ioOptions));
+    const latest = combined?.statuses;
+    if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
+      throw Error('combined status unreadable or incomplete');
+    if (!latest.some(status => status?.context === context)) return { ok: true, cleared: false, reason: 'no publication hold on head' };
     const statuses = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions));
     if (!Array.isArray(statuses) || statuses.some(status => !Number.isSafeInteger(status?.id)))
       throw Error('statuses unreadable');
