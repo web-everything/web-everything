@@ -1111,7 +1111,7 @@ export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolv
     if (!text.includes('"confirm"') || !text.toLowerCase().includes(String(headSha).toLowerCase())) continue;
     let r;
     try { r = JSON.parse(text); } catch { continue; }
-    if (r?.op !== 'review-pr' || r.input?.repo !== repo || Number(r.input?.pr) !== Number(pr)) continue;
+    if (r?.op !== 'review-pr' || name !== `${r.id}.json` || r.input?.repo !== repo || Number(r.input?.pr) !== Number(pr)) continue;
     if (r.pending?.kind !== 'confirm') continue;
     if (String(r.findings?.read?.netBasis?.rev || '').toLowerCase() !== String(headSha).toLowerCase()) continue;
     let ok = false;
