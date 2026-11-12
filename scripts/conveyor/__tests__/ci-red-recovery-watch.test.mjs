@@ -939,19 +939,47 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
-  it('treats a 409 "run that is completed" cancel refusal as done: re-runs only the failed/cancelled jobs, no cancel-failed', () => {
+  const completed409 = (conclusion) => {
     const calls = [];
     const exec = vi.fn((file, args) => {
       calls.push(args);
       if (args[args.length - 1].endsWith('/cancel')) throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)');
+      if (typeof conclusion === 'function') return conclusion(args);
+      if (args.includes('--jq')) return `${conclusion}\n`;
       return '';
     });
+    return { calls, exec };
+  };
+
+  it.each(['cancelled', 'timed_out'])('409 completed + conclusion %s: reads the conclusion, then re-runs only the failed jobs', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
     const sleepSync = vi.fn();
     const result = cancelAndRerunHungRun(43093913029, { repo: 'web-everything/web-everything', exec, sleepSync });
     expect(result).toEqual({ ok: true, action: 'rerun-failed-jobs-after-completed' });
-    expect(calls[1]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/43093913029/rerun-failed-jobs']);
-    expect(exec).toHaveBeenCalledTimes(2);
+    expect(calls[1]).toEqual(['api', 'repos/web-everything/web-everything/actions/runs/43093913029', '--jq', '.conclusion']);
+    expect(calls[2]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/43093913029/rerun-failed-jobs']);
+    expect(exec).toHaveBeenCalledTimes(3);
     expect(sleepSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['failure', 'success', 'skipped', 'startup_failure'])('409 completed + conclusion %s: never re-runs, hands to ci-red/ci-heal', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: true, action: 'already-completed' });
+    expect(calls.some((a) => a.some((x) => /rerun/.test(String(x))))).toBe(false);
+  });
+
+  it.each(['', 'null', 'surprise'])('409 completed + unreadable conclusion %j: fails closed with no rerun write', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result).toMatchObject({ ok: false, action: 'conclusion-unreadable' });
+    expect(calls.some((a) => a.some((x) => /rerun/.test(String(x))))).toBe(false);
+  });
+
+  it('409 completed + conclusion read throws: fails closed with no rerun write', () => {
+    const { calls, exec } = completed409(() => { throw new Error('gh: HTTP 502'); });
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result).toEqual({ ok: false, action: 'conclusion-unreadable', error: 'gh: HTTP 502' });
+    expect(calls).toHaveLength(2);
   });
 
   it('does not treat any other 409 cancel refusal as completed', () => {
@@ -1194,6 +1222,20 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(again.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
     expect(f.cancelOnly).toHaveBeenCalledTimes(1);
     expect(f.postComment).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['viewer-less other commenter', { author: { login: 'some-random-user' } }],
+    ['no author at all', {}],
+  ])('hung-cap-escalate: a handled marker forged by %s does not suppress recovery', (_name, authorship) => {
+    const f = fixture('hung-cap-escalate');
+    const forged = buildHungCiComment({ runId: 36161558017, headSha: PR_2636_HUNG.headRefOid, jobName: 'test-shard (1)', reason: 'run-already-completed' });
+    f.comments.push({ body: forged, ...authorship });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
   });
 
   it.each([

@@ -672,6 +672,8 @@ export function buildHungCiComment({
       ? `could not cancel run ${runId ?? '?'}; triggered CI for the current PR head via "${markerFreeText(action)}".`
       : reason === 'run-already-completed'
       ? `found run ${runId ?? '?'} (job "${jobName ?? '?'}") already completed, so there was nothing to cancel and it was NOT re-run; recorded as handled for this head — the failed run is left to the existing ci-red -> ci-heal path.`
+      : action === 'rerun-failed-jobs-after-completed'
+      ? `found run ${runId ?? '?'} (job "${jobName ?? '?'}") already completed as cancelled/timed out, so there was nothing to cancel; re-ran its failed jobs.`
       : kind === 'repeat-hang'
       ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
       : kind === 'hung-cap-escalate'
@@ -889,7 +891,12 @@ export function describeExecError(e) {
   return raw.length > 500 ? `${raw.slice(0, 500)}…` : raw;
 }
 
-const COMPLETED_CANCEL_REFUSAL_RE = /cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i;
+/** Final run conclusions that mean the hang ended by cancellation/timeout, so re-running its jobs is the recovery. */
+const RERUNNABLE_COMPLETED_CONCLUSIONS = new Set(['cancelled', 'timed_out']);
+/** Final conclusions that belong to ci-red/ci-heal (or need nothing): recorded as handled, never re-run here. */
+const SETTLED_NO_RERUN_CONCLUSIONS = new Set(['success', 'failure', 'neutral', 'skipped', 'action_required', 'startup_failure', 'stale']);
+
+const COMPLETED_CANCEL_REFUSAL_RE =/cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i;
 
 export function isRunNotFoundError(error) {
   return typeof error === 'string' && /\bHTTP 404\b|\bNot Found\b/i.test(error);
@@ -941,6 +948,19 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
     // refusal (same rule as ci-queue-watch's refusalAftermath), so re-run just its failed/cancelled jobs.
     if (!COMPLETED_CANCEL_REFUSAL_RE.test(error)) {
       return { ok: false, action: 'cancel-failed', error };
+    }
+    // Read the run's FINAL conclusion first: a run that finished with a genuine failure (or success) after
+    // candidate selection is ci-red/ci-heal's, never re-run here. Only a cancelled/timed-out end is the hang
+    // resolving. An unreadable conclusion fails closed (counted attempt, no write).
+    let conclusion;
+    try {
+      conclusion = String(exec('gh', ['api', `repos/${slug}/actions/runs/${runId}`, '--jq', '.conclusion'], opts) ?? '').trim();
+    } catch (e3) {
+      return { ok: false, action: 'conclusion-unreadable', error: describeExecError(e3) };
+    }
+    if (!RERUNNABLE_COMPLETED_CONCLUSIONS.has(conclusion)) {
+      if (SETTLED_NO_RERUN_CONCLUSIONS.has(conclusion)) return { ok: true, action: 'already-completed' };
+      return { ok: false, action: 'conclusion-unreadable', error: `run ${runId} conclusion is not readable ("${conclusion}")` };
     }
     try {
       exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun-failed-jobs`], opts);
@@ -1008,9 +1028,11 @@ export function sweepHungCiRecovery({
     });
     const successfulRetriggerCount = countHungCiComments(successfulRetriggers, c.headSha);
     // A run the cancel found already completed was recorded as handled for this head: do not select it again.
+    // Provenance: only a trusted-author leading-marker comment counts; any other commenter's body is data.
     const alreadyCompleted = comments.some((cm) => {
       const body = typeof cm === 'string' ? cm : cm?.body;
-      return bodyHasExactLine(body, 'reason: run-already-completed') && bodyHasExactLine(body, `run: ${c.runId}`)
+      return countTrustedLeadingMarker([cm], HUNG_CI_COMMENT_MARKER) > 0
+        && bodyHasExactLine(body, 'reason: run-already-completed') && bodyHasExactLine(body, `run: ${c.runId}`)
         && bodyHasExactLine(body, `sha: ${c.headSha}`);
     });
     if (alreadyCompleted) {
