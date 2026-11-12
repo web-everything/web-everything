@@ -1427,6 +1427,24 @@ describe('guard-bash — raw PR creation loses the author stamp', () => {
   });
 });
 
+describe('guard-bash — --skipPrePrReview is operator-only', () => {
+  it('denies the flag on pr-land / open-pr / run.mjs open-pr in any spelling', () => {
+    for (const command of ['node scripts/pr-land.mjs --ref=x --skipPrePrReview',
+      'node scripts/pr-land.mjs --skipPrePrReview=true --ref=x',
+      'node scripts/operations/run.mjs open-pr --ref=x --skipPrePrReview true',
+      'cd /x && node scripts/operations/open-pr.mjs --skipPrePrReview']) {
+      expect(decide(command), command).toMatch(/--skipPrePrReview/);
+    }
+  });
+  it('allows the same commands without it and mere mentions', () => {
+    for (const command of ['node scripts/pr-land.mjs --ref=x',
+      'node scripts/operations/run.mjs open-pr --ref=x',
+      'git commit -m "never use --skipPrePrReview"', 'grep -rn skipPrePrReview scripts']) {
+      expect(decide(command), command).toBeNull();
+    }
+  });
+});
+
 describe('guard-bash — raw gh-merge bypass block (#2290 assertMayMerge)', () => {
   const blockedMerge = (c) => expect(decide(c), c).toMatch(/assertMayMerge/);
   const allowed = (c) => expect(decide(c), c).toBeNull();

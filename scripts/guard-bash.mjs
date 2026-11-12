@@ -4572,6 +4572,13 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && atCommand(/^gh\s+pr\s+create\b/))
     return 'raw `gh pr create` opens a PR with no `authored-by-actor` stamp, so the review gate cannot prove reviewer independence and the mandatory referral reviewer\'s rulings are ignored (plateau-app #204). Open it with `node <web-everything lane>/scripts/operations/run.mjs open-pr --ref=<branch> …` run from the target repo\'s lane clone (works for plateau-app and frontierui too), or repair an existing PR with `node scripts/pr-body-edit.mjs --pr=<n> --repair`. Escape hatch: prefix `RAW_PR_CREATE_OK=1`.';
 
+  // `--skipPrePrReview` skips the pre-PR review gate of open-pr (pr-land / open-pr / run.mjs open-pr). It is an
+  // operator-only bypass: an agent that passes it defeats the gate it exists to enforce. Matched only as an
+  // ARGUMENT of one of those scripts in command position (`atCommand`), so prose mentioning the flag passes.
+  if (atCommand(/^(?:node\s+)?\S*(?:pr-land|open-pr)(?:\.mjs)?\b[^]*--skipPrePrReview(?![\w-])/)
+    || atCommand(/^(?:node\s+)?\S*run\.mjs\s+open-pr\b[^]*--skipPrePrReview(?![\w-])/))
+    return '`--skipPrePrReview` skips the pre-PR review gate and requires an explicit operator instruction run outside agent sessions (the operator runs it from their own terminal). Agents: drop the flag and let the pre-PR review run; if it is wrongly red, fix the review tooling instead of bypassing it.';
+
   // A raw `gh pr merge` or its REST equivalent bypasses `pr-merge-gate.mjs`'s `assertMayMerge` — the ONE
   // place a PR may merge to `main` (#2290's sole-writer invariant) — and, upstream of it, the
   // review-escalation check (`review:pending`/`review:human`) that only runs inside the drain's own
