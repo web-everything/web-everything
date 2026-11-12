@@ -505,7 +505,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     await publicLoad;
     return publicBlobs.get(key);
   }
-  const excludedSource = () => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
+  const excludedSource = (path,rule) => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file',detail:`${Buffer.isBuffer(path)?path.toString('utf8'):String(path)}: ${rule}`});
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
   if (files.reduce((size,path) => size + path.length + 3,0) > LIMIT) throw new Error('Inventory limit exceeded; use local fallback');
@@ -538,14 +538,14 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (!indexedOid || indexedOid !== publicOid) {
         // Not tracked-and-identical to origin/main: never ships. Source files
         // refuse the manifest (local fallback); other types stay excluded as before.
-        if (sourceExtension.test(names.at(-1))) throw excludedSource();
+        if (sourceExtension.test(names.at(-1))) throw excludedSource(path,'credential-named-not-identical-to-main');
         publicOid = undefined;
       }
     }
     if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
       const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
       if (!names.includes('node_modules') && excludedByPolicy && excludedTest && /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/.test(names.at(-1))) {
-        throw excludedSource();
+        throw excludedSource(path,'excluded-policy-test');
       }
       if (excludedTest) throw new Error('Excluded test: use local fallback');
       return {excluded:path};
@@ -580,7 +580,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // Index equality alone must not authorize private, unstaged working bytes.
       const oid = createHash(publicOid.length === 64 ? 'sha256' : 'sha1')
         .update(`blob ${content.length}\0`).update(content).digest('hex');
-      if (oid !== publicOid) throw excludedSource();
+      if (oid !== publicOid) throw excludedSource(path,'credential-named-content-differs-from-main');
     }
     hashDone();
     // Match warm export: pattern-spelling public files stay excluded without
@@ -1118,6 +1118,11 @@ export function safeFallbackDetail(kind,raw){
     const path=at>0?safePathDetail(raw.slice(0,at)):undefined, finding=at>0?raw.slice(at+2):'';
     if(path&&DETAIL_FINDING.test(finding)&&finding.length<=60&&!TOKENISH.test(finding))out=`${path}: ${finding}`;
   }else if(kind==='sibling-inventory-failed')out=safePathDetail(raw);
+  else if(kind==='excluded-source-file'){
+    const at=typeof raw==='string'?raw.lastIndexOf(': '):-1;
+    const path=at>0?safePathDetail(raw.slice(0,at)):undefined, rule=at>0?raw.slice(at+2):'';
+    if(path&&DETAIL_FINDING.test(rule)&&rule.length<=60&&!TOKENISH.test(rule))out=`${path}: ${rule}`;
+  }
   else if(kind==='command-not-allowed'){
     const first=Array.isArray(raw)&&typeof raw[0]==='string'?raw[0]:'';
     return DETAIL_BINARIES.has(first)?first:'other';
@@ -1377,7 +1382,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
-      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
+      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
       return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {

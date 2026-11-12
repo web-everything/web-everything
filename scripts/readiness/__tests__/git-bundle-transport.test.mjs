@@ -305,7 +305,7 @@ describe('R593 mirror main freshness bound (R559)', () => {
     await fs.writeFile(stamp, JSON.stringify({ sha: runnerMain, fetchedAtMs: 400 }));
     await call(5000);
     expect(git(work, 'rev-parse', 'HEAD')).toBe(tip);
-  });
+  }, 60_000); // three git-spawning materializations + a bundle plan: generous timeout for a loaded CI shard, not a perf assertion
   it('remote.bundle.mainMaxAgeMin defaults to 10 and resolves through the policy cascade', () => {
     expect(resolveAdmissionPolicy({ platform: {} }).settings.remote.bundle.mainMaxAgeMin).toBe(10);
     const set = resolveAdmissionPolicy({ platform: { remote: { bundle: { mainMaxAgeMin: 3 } } } });

@@ -23,7 +23,7 @@ import {
   verdictClears, verdictLabel, verdictForLabelTarget, labelVerdictOf, foldVerdictLedger, ledgerCoversHead,
   compareLedgerToLabels, summarizeAgreement, summarizeShadowAgreement,
   NON_BEARING, verdictBears,
-  appendVerdictAsync, ledgerWriteErrorSummary, ledgerEventId, checkLedgerAppendRows, homeLedgerStore, appendVerdict, resolveLedgerBoard, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
+  appendVerdictAsync, appendVerdictBatch, ledgerWriteErrorSummary, ledgerEventId, checkLedgerAppendRows, homeLedgerStore, appendVerdict, resolveLedgerBoard, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
   listLedgerRepos, DEFAULT_VERDICT_LEDGER_READ_STORE, resolveLedgerReadStore, readLedgerEventsFromStore, foldRepoFromStore,
   EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
   buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
@@ -1811,5 +1811,81 @@ describe('configured shared ledger readers (Part B)', () => {
     try { run('missing-store'); } catch (e) { failure = e; }
     expect(failure?.status).toBe(2);
     expect(String(failure?.stderr)).toMatch(/missing-store.*unknown-store/);
+  });
+});
+
+describe('appendVerdictBatch: one git push for many holding rows', () => {
+  let dir;
+  const prevDir = process.env.WE_VERDICT_LEDGER_DIR;
+  const mk = (verdict, pr) => buildVerdictRecord({
+    repo: 'web-everything/web-everything', pr, verdict, at: '2026-10-07T12:00:00.000Z', source: 'test',
+  });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-batch-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    if (prevDir === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = prevDir;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+  const opts = (calls, fail = false) => ({ store: 'dual', board: '/board', warn: () => {},
+    gitAppend: (a) => { calls.push(a); if (fail) throw new Error('push exhausted'); return { status: 'appended' }; } });
+
+  it('writes every holding row home but pushes git ONCE with all of them', () => {
+    const calls = [];
+    const out = appendVerdictBatch([mk('changes', 31), mk('changes', 32), mk('pending', 33)], opts(calls));
+    expect(out).toHaveLength(3);
+    expect(out.every((r) => r.ok && !r.ledgerWriteMiss)).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].records.map((r) => r.pr)).toEqual([31, 32, 33]);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(3);
+  });
+
+  it('a failed flush marks EVERY deferred row ledgerWriteMiss; the home rows stay (hold stands)', () => {
+    const calls = [];
+    const out = appendVerdictBatch([mk('changes', 41), mk('changes', 42)], opts(calls, true));
+    expect(calls).toHaveLength(1);
+    expect(out.every((r) => r.ok === true && r.ledgerWriteMiss === true && r.git.status === 'miss')).toBe(true);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(2);
+  });
+
+  it('clearing rows stay per-row and git order = call order (queued holding rows flush before a clearing row)', () => {
+    const calls = [];
+    const out = appendVerdictBatch([mk('changes', 51), mk('accepted', 52), mk('changes', 53)], opts(calls));
+    expect(out.map((r) => r.ok)).toEqual([true, true, true]);
+    expect(calls.map((c) => c.records.map((r) => r.pr))).toEqual([[51], [52], [53]]);
+  });
+
+  it('a clearing row whose git write misses is refused and writes no home row', () => {
+    const calls = [];
+    const out = appendVerdictBatch([mk('accepted', 61)], opts(calls, true));
+    expect(out[0].ok).toBe(false);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(0);
+  });
+
+  it('an invalid record is refused and does not poison the others; empty input is a no-op', () => {
+    const calls = [];
+    const out = appendVerdictBatch([{ nope: true }, mk('changes', 71)], opts(calls));
+    expect(out[0].ok).toBe(false);
+    expect(out[1].ok).toBe(true);
+    expect(calls[0].records.map((r) => r.pr)).toEqual([71]);
+    expect(appendVerdictBatch([], opts(calls))).toEqual([]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('store=home never touches git', () => {
+    const calls = [];
+    const out = appendVerdictBatch([mk('changes', 81), mk('changes', 82)], { ...opts(calls), store: 'home' });
+    expect(out.every((r) => r.ok)).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('store=git rows (no home row to fall back on) are never deferred: each keeps its own push and spill', () => {
+    const calls = [];
+    const out = appendVerdictBatch([mk('changes', 91), mk('changes', 92)], { ...opts(calls), store: 'git', warn: () => {} });
+    expect(out).toHaveLength(2);
+    expect(calls.map((c) => c.records.length)).toEqual([1, 1]);
   });
 });
