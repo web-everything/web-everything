@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { parseArgs, awaitCondition, main } from '../await.mjs';
+import { parseArgs, awaitCondition, main, cloneDir } from '../await.mjs';
 
 const SHA = 'abc123def456';
-const CLONE = 'fixtures/adoption clone';
+const CLONE = 'adoption-clone';
 const RUN = {
   databaseId: 123, status: 'completed', conclusion: 'success',
   url: 'https://github.com/example/project/actions/runs/123', headSha: SHA,
@@ -45,7 +45,7 @@ const ciCall = (withSha = false) => ['gh', [
   ...(withSha ? ['--commit', SHA] : []),
   '--limit', '1', '--json', 'databaseId,status,conclusion,url,headSha',
 ]];
-const adoptionCall = ['git', ['-C', CLONE, 'merge-base', '--is-ancestor', SHA, 'HEAD']];
+const adoptionCall = ['git', ['-C', cloneDir(CLONE), 'merge-base', '--is-ancestor', SHA, 'HEAD']];
 const prCall = ['gh', ['pr', 'view', '42', '--json', 'state,labels']];
 
 describe('parseArgs', () => {
@@ -216,18 +216,17 @@ describe('awaitCondition: pr', () => {
 });
 
 describe('polling bounds and resume options', () => {
-  it('never sleeps less than 30000 ms even for a shorter remaining budget', () => {
+  it('never sleeps less than 30000 ms and times out without sleeping on a shorter budget', () => {
     const h = harness(Array(20).fill('[]'));
     expect(awaitCondition(parseArgs([...ciArgs, '--wait-ms', '1']), h.io))
       .toMatchObject({ done: false, timedOut: true });
-    expect(h.sleeps).toHaveLength(1);
-    expect(h.sleeps[0]).toBeGreaterThanOrEqual(30000);
+    expect(h.sleeps).toHaveLength(0);
   });
 
   it.each([
     [...ciArgs, '--sha', SHA, '--wait-ms', '30000', '--json'],
     // A simple portable path keeps this round-trip independent of shell quoting style.
-    ['--kind', 'adoption', '--clone', 'fixtures/clone', '--sha', SHA, '--wait-ms', '30000'],
+    ['--kind', 'adoption', '--clone', 'clone-b', '--sha', SHA, '--wait-ms', '30000'],
     [...prArgs, '--state=merged', '--label-present', 'ready', '--label-absent', 'blocked', '--wait-ms', '30000'],
     [...ciArgs, '--wait-ms', '999999999'],
   ])('rebuilds a resume command retaining parsed options: %j', (...argv) => {
