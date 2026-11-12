@@ -29,13 +29,13 @@
  *
  * Fails open on unparseable input / non-backlog paths.
  */
+import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, basename } from 'node:path';
 import { idFromName } from './backlog/id.mjs';
 import { scrubPublish } from './lib/secret-scrub.mjs';
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const ROOT = hookRoot(import.meta.url);
 // two-form id (#2288): a landed NNN or a provisional `xNNNNNN` hash — keep in sync with id.mjs ID_TOKEN_RE.
 const BACKLOG_RE = /(?:^|\/)backlog\/(\d{1,5}|x[0-9a-z]{6})-[^/]+\.md$/;
 

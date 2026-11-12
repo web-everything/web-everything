@@ -656,6 +656,10 @@ jobs:
     # 3x146s≈7.3min, rounded up to 10min.
     # Raised 10->20: today's cancellations at the 10m limit (#6005 merge group 00:16-00:26Z; #5980 10m19s).
     timeout-minutes: 20
+    # Version-locked Playwright container (same pin as the `visual` job; `npm run check:standards` fails
+    # loud on drift from `@playwright/test`): browsers + system libs are pre-installed, so no apt at run time.
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.1-jammy
     steps:
       - name: Gate on card-only detection
         run: |
@@ -724,29 +728,12 @@ jobs:
         working-directory: web-everything
         run: npm run build:docs
 
-      # Cache the Playwright browser bundle keyed on the installed @playwright/test version, so the ~19s
-      # `playwright install` only re-downloads chromium when the version actually changes. `--with-deps`
-      # (apt system libs) still runs each time — those aren't cacheable across runners — but the browser
-      # download, the bulk of the cost, is served from cache on a hit.
-      - name: Resolve Playwright version
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        id: pw
-        working-directory: web-everything
-        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
-      - name: Cache Playwright browsers
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
-
       # Deterministic Playwright interaction lane (#2070): drives the client-side backlog-table behaviour
       # over a fixed fixture page served by tests/interaction/serve.mjs. WE_INTERACTION_ONLY skips the app
       # dev-server webServer entry (see playwright.config.ts) so no build/live-data is needed.
-      - name: Install Playwright chromium
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        working-directory: web-everything
-        run: npx playwright install --with-deps chromium
+      # No "Install Playwright chromium" step: the pinned container (see `container:` above) already ships
+      # chromium at the exact `@playwright/test` version, so smoke no longer runs `apt` / depends on the
+      # Ubuntu mirror (every merge-queue batch failed on azure.archive.ubuntu.com resolution).
 
       - name: Interaction lane
         if: ${{ needs.changes.outputs.light != 'true' }}
