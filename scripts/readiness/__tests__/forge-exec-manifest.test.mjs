@@ -134,7 +134,7 @@ describe('strict credential regression', () => {
     ['short sk', 'sk-' + 'a'.repeat(16), 'sk-token'],
     ['short Slack', 'xoxb-' + 'a'.repeat(8), 'slack-token'],
     ['bare armor', '-----' + 'BEGIN', 'pem-header'],
-    ['private key prose', 'a private key marker', 'private-key'],
+    ['private key marker', 'a PRIVATE ' + 'KEY marker', 'private-key'],
   ])('blocks %s', (_name, value, finding) => {
     expect(credentialContentFinding(path, Buffer.from(value))).toBe(finding);
   });

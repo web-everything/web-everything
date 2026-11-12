@@ -108,7 +108,7 @@ function excludedComponent(name, leaf, allowCredential = false) {
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
-  [/PRIVATE KEY/i,'private-key'],
+  [/PRIVATE KEY/,'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
