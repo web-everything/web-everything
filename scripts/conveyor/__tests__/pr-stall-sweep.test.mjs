@@ -2,6 +2,7 @@
  * @description Slice 2 of the automatic PR stall sweep: settings + kill switch, the shadow pass and its audit log, the
  *   rate limits, and the hard rule that shadow mode makes ZERO GitHub writes.
  */
+import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -243,6 +244,17 @@ describe('the shadow pass', () => {
     const dir2 = auditDir(); mkdirSync(dir2, { recursive: true }); writeFileSync(join(dir2, '2026-09.jsonl'), '{"phase":"would-do"\n');
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: dir2, log: () => {} });
     expect(out.act).toEqual([]); expect(out.incomplete).toBe(true);
+  });
+  it('a referral hold with no findings block still runs the judge for its own trigger (never a null verdict)', async () => {
+    const pr = { ...PRS[0], number: 14, labels: [] };
+    const { gh } = fakeGh({ prs: [pr] });
+    const hold = [[{ user: { login: AUTOMATION_LOGINS[0] }, created_at: new Date(NOW - 2 * 3600_000).toISOString(), body: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back\n\n<!-- review-referral-hold: a1b5166bcd74 -->' }]];
+    const wrapped = (bin, args, o) => (/\/comments\?/.test(String(args.at(-1))) ? JSON.stringify(hold) : gh(bin, args, o));
+    const calls = [];
+    const judge = (o) => { calls.push(o.trigger); return { verdict: 'escalate', reasons: ['no-evidence'], evidence: { trigger: o.trigger, head: o.head.slice(0, 12) } }; };
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)), judge, dir: auditDir(), log: () => {} });
+    expect(calls).toEqual(['referral-hold']);
+    expect(JSON.stringify(out)).not.toMatch(/not an object/);
   });
   it('one unreadable PR row makes the whole pass plan nothing', async () => {
     const fresh = { ...PRS[0], number: 13, headRefOid: 'not-a-sha', updatedAt: new Date(NOW).toISOString(), labels: [] };
