@@ -2188,8 +2188,9 @@ export async function readRemoteManifestViaApi({ exec, repo, headRef, apiArgs = 
     const { stdout } = await exec('gh', apiArgs(repo, headRef), { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const b64 = (stdout || '').trim();
     if (b64) {
-      // card 8036 — a 200 whose body is not valid JSON is a PER-PR poison record, not a transport failure: flag it
-      // `malformed` (that PR alone is held in planLabelDrain) instead of `degraded`, which latched the WHOLE pass incomplete.
+      // card 8036 — a 200 whose body is not valid JSON is a poison record, not a transport failure: flag it
+      // `malformed` instead of `degraded`. The context stays complete, but planLabelDrain holds that PR
+      // (`malformed-manifest`) AND, as on main, every manifest-less non-WE PR (it may be the hidden carrier's impl half).
       let m;
       try { m = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch { return { manifest: null, degraded: false, malformed: true }; }
       if (m && m.item != null) return { manifest: m, degraded: false };
@@ -2258,7 +2259,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       // fetched this pass, no extra `gh` call.
       v.baseRefName = typeof p.baseRefName === 'string' ? p.baseRefName : null;
       attachManifestToVerdict(v, read.manifest ?? null, { repo, isLocalRepo, localSlug });
-      if (read.malformed) { v.readMalformed = true; console.error(`  ⚠ card 8036 — #${p.number} (${repo || 'local'}): malformed head-tree manifest; holding this PR only`); }
+      if (read.malformed) { v.readMalformed = true; console.error(`  ⚠ card 8036 — #${p.number} (${repo || 'local'}): malformed head-tree manifest; holding this PR, and manifest-less non-WE PRs as possible impl halves`); }
       v.prLabels = p.labels || [];
       // #2447 — the body's own `graduatedTo:` note, extracted now so the escalation pass (which no longer holds `p`)
       // can derive the resolution basis without keeping the whole body on every verdict. `null` for nearly all PRs.
