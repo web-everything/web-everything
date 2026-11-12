@@ -131,7 +131,7 @@ const TRUSTED_AUTHOR_NOTE_RES = [
   /^Manual R247 pass — daemon: [\w-]+; reason: EMERGENCY \(labelled\): [^\n]+$/,
   // #6584: conveyor machine notes (`buildExhaustedRetryRecoveredComment`; the timeout-retry fallback heal note). Whole body.
   /^<!-- we:exhausted-retry-recovered -->\nthe automatic retry after [a-z -]+ went green on [0-9a-f]{7}; the exhaustion and automatic retry budgets remain spent\nhead: [0-9a-f]{40}$/,
-  /^ℹ️ conveyor — note\n\nnote: timeout-retry-fallback-heal\n\nPR #\d+: [^\n]+\n\n<!-- conveyor-note-key: timeout-retry-fallback-heal:[^\n]* -->$/,
+  /^ℹ️ conveyor — note\n\nnote: timeout-retry-fallback-heal\n\nPR #(\d+): (timeout retry ineligible \([\w:.-]+\); falling back to ordinary ci-heal \(\d+ of \d+ attempts spent\))\n\n<!-- conveyor-note-key: timeout-retry-fallback-heal:\1:PR #\1: \2 -->$/,
 ];
 const TRUSTED_NOTE_HOLD_WORD_RE = /\b(?:hold|held|do not|don'?t|must not|never merge|block(?:ed|s|ing)?|changes? requested|reject(?:ed)?|stop|wait|unsafe)\b/i;
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).

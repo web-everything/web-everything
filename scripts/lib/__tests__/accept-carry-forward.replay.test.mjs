@@ -936,6 +936,11 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
         expect(isKnownMachineBody(`${body}\nFurther review is required before merging.`, { author: WORKER })).toBe(false);
       });
     }
+    it('prose swapped INSIDE the timeout-note envelope still holds (audit)', () => {
+      const swapped = NOTE.split('timeout retry ineligible (timeout-evidence:evidence-read-deadline); falling back to ordinary ci-heal (0 of 3 attempts spent)')
+        .join('Further review is required before merging.');
+      expect(isKnownMachineBody(swapped, { author: { login: 'web-everything' } })).toBe(false);
+    });
     it('a trailing objection on a known prefix, even from a trusted author, still holds (audit)', () => {
       for (const b of [`${REFRESH}\nHold this PR; do not merge.`, `${MANUAL} Also hold this PR, do not merge.`,
         '🛠 operator action — refresh\nHold this PR; do not merge.', 'Manual R247 pass — daemon: review\nreject the change']) {
