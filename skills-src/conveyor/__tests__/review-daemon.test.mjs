@@ -1006,10 +1006,18 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
   it('defaultReviewHostAdmission (verify-admission): host verdict + the cascade per-tick cap, non-interactive; fails closed on an unreadable policy', async () => {
     const { defaultReviewHostAdmission } = await import('../review-daemon.mjs');
     const { loadHostOverloadSettings } = await import('../../../scripts/lib/host-overload-settings.mjs');
-    const env = { ...process.env, WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3' };
+    // Hermetic: the idle-CPU raise (red-team-queue.json) and the real host CPU reading must not move the per-tick cap here.
+    const env = { ...process.env, WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '0' };
     const admission = vi.fn(() => ({ admitted: true, reason: 'host load ok' }));
-    expect(defaultReviewHostAdmission({ env, admission, loadPolicy: loadHostOverloadSettings }))
+    expect(defaultReviewHostAdmission({ env, admission, loadPolicy: loadHostOverloadSettings, readCpuIdlePct: () => 90 }))
       .toEqual({ admitted: true, reason: 'host load ok', maxPerTick: 3 });
+    // The idle raise itself, pinned with an injected floor and CPU reading (never the host's real idle).
+    const raised = defaultReviewHostAdmission({ env, admission, loadPolicy: loadHostOverloadSettings, log: () => {},
+      loadFloor: () => ({ minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 4 }), readCpuIdlePct: () => 90 });
+    expect(raised).toEqual({ admitted: true, reason: 'host load ok', maxPerTick: 4 });
+    const busy = defaultReviewHostAdmission({ env, admission, loadPolicy: loadHostOverloadSettings, log: () => {},
+      loadFloor: () => ({ minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 4 }), readCpuIdlePct: () => 5 });
+    expect(busy).toEqual({ admitted: true, reason: 'host load ok', maxPerTick: 3 });
     expect(admission).toHaveBeenCalledWith({ env, interactive: false,
       policy: expect.objectContaining({ sources: expect.objectContaining({ 'host.maxReviewDispatchPerTick': 'env' }) }) });
     // A not-admitted host verdict flows through the tick: nothing dispatched, every review stays owed.

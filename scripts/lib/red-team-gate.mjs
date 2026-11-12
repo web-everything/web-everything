@@ -726,7 +726,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           // Use ownership at posting time: later handovers/grants cannot change a ruling's validity.
           // Match the writer's grant-aware decision: a pending extension belongs to automation.
           const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
-          if (!anyState && (prior.outcome !== GATE_OUTCOMES.ROUND_CAP || prior.reopened)) continue;
+          if (prior.reopened || (!anyState && prior.outcome !== GATE_OUTCOMES.ROUND_CAP)) continue;
         }
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {

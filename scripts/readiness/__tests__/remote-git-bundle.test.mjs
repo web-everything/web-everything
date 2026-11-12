@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { scanBundleRange } from '../remote-git-bundle.mjs';
-import { logLocalLocation, runRemote } from '../remote-exec.mjs';
+import { buildManifest, defaultExec, logLocalLocation, runRemote } from '../remote-exec.mjs';
+import { credentialContentFinding } from '../forge-exec-manifest.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
 const git = (cwd, ...args) => {
@@ -30,8 +31,8 @@ const commit = message => {
   git(lane, ...ident, 'commit', '-q', '-m', message);
   return git(lane, 'rev-parse', 'HEAD');
 };
-const scan = (injectedExec = exec) => scanBundleRange({
-  cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: originMain, exec: injectedExec,
+const scan = (injectedExec = exec, warnings = []) => scanBundleRange({
+  cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: originMain, exec: injectedExec, warnings,
 });
 
 beforeEach(() => {
@@ -63,6 +64,13 @@ const beginMainMerge = (publicContent = 'public update\n') => {
 };
 
 describe('scanBundleRange lane first-parent scope', () => {
+  it.each(['utf16le', 'utf16be'])('blocks a GitHub token in a %s blob', async encoding => {
+    const content = Buffer.from('ghp_' + 'a'.repeat(36), 'utf16le');
+    write('note.txt', encoding === 'utf16be' ? content.swap16() : content);
+    commit('encoded content');
+    expect(await scan()).toEqual({ path: 'note.txt', finding: 'github-token' });
+  });
+
   it('rejects a regular-file-to-symlink mode-only transition with the same prerequisite path and blob', async () => {
     write('link.txt', '.env.local');
     originMain = commit('public regular file');
@@ -92,20 +100,23 @@ describe('scanBundleRange lane first-parent scope', () => {
   it.each([
     ['literal api_key', `api_key: ${literal}\n`, 'high-entropy-api_key'],
     ['GitHub token', `${token}\n`, 'github-token'],
-  ])('still catches a lane-authored %s committed before merging main, even after scrubbing', async (_name, content, finding) => {
+  ])('applies format/block and generic/warn policy to a lane-authored %s committed before merging main, even after scrubbing', async (_name, content, finding) => {
     write('lane.yml', content);
     commit('lane change');
     beginMainMerge();
     commit('merge main');
     write('lane.yml', 'clean\n');
     commit('scrub lane');
-    expect(await scan()).toMatchObject({ path: 'lane.yml', finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='github-token')expect(hit).toMatchObject({path:'lane.yml',finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path:'lane.yml',finding});}
   });
 
   it.each([
     ['literal api_key', `api_key: ${literal}\n`, 'high-entropy-api_key'],
     ['GitHub token', `${token}\n`, 'github-token'],
-  ])('catches a %s introduced only in an evil merge resolution, even after scrubbing', async (_name, content, finding) => {
+  ])('applies format/block and generic/warn policy to a %s introduced only in an evil merge resolution, even after scrubbing', async (_name, content, finding) => {
     write('lane.txt', 'clean lane change\n');
     commit('lane change');
     beginMainMerge();
@@ -113,7 +124,10 @@ describe('scanBundleRange lane first-parent scope', () => {
     commit('merge main with resolution');
     write('resolution.yml', 'clean\n');
     commit('scrub resolution');
-    expect(await scan()).toMatchObject({ path: 'resolution.yml', finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='github-token')expect(hit).toMatchObject({path:'resolution.yml',finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path:'resolution.yml',finding});}
   });
 
   it('fails closed with bundle-credential-scan-failed when first-parent Git scoping fails', async () => {
@@ -132,7 +146,7 @@ describe('scanBundleRange lane first-parent scope', () => {
   it.each([
     ['literal api_key', `api_key: ${literal}\n`, 'high-entropy-api_key'],
     ['GitHub token', `${token}\n`, 'github-token'],
-  ])('catches a %s added and deleted on a merged side branch, though the merge tree is clean', async (_name, content, finding) => {
+  ])('applies format/block and generic/warn policy to a %s added and deleted on a merged side branch, though the merge tree is clean', async (_name, content, finding) => {
     write('lane.txt', 'clean lane change\n');
     commit('lane change');
     git(lane, 'checkout', '-q', '-b', 'side');
@@ -143,7 +157,10 @@ describe('scanBundleRange lane first-parent scope', () => {
     git(lane, 'checkout', '-q', 'lane');
     git(lane, ...ident, 'merge', '--no-ff', '-q', '-m', 'merge side', 'side');
     expect(git(lane, 'ls-tree', '-r', '--name-only', 'HEAD').split('\n')).not.toContain('side.yml');
-    expect(await scan()).toMatchObject({ path: 'side.yml', finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='github-token')expect(hit).toMatchObject({path:'side.yml',finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path:'side.yml',finding});}
   });
 
   // The prerequisite-skip key is path + mode + blob sha: an entry is skipped only when ALL THREE equal origin/main's.
@@ -152,7 +169,9 @@ describe('scanBundleRange lane first-parent scope', () => {
     originMain = commit('public cfg');
     write('cfg.yml', `api_key: ${literal}\n`);
     commit('lane edits cfg');
-    expect(await scan()).toMatchObject({ path: 'cfg.yml', finding: 'high-entropy-api_key' });
+    const warnings=[];
+    expect(await scan(exec,warnings)).toBeNull();
+    expect(warnings).toContainEqual({path:'cfg.yml',finding:'high-entropy-api_key'});
   });
 
   it.each([
@@ -163,7 +182,10 @@ describe('scanBundleRange lane first-parent scope', () => {
     originMain = commit('public blob');
     write(path, `api_key: ${literal}\n`);
     commit('lane copies public blob');
-    expect(await scan()).toMatchObject({ path, finding });
+    const warnings=[];
+    const hit=await scan(exec,warnings);
+    if(finding==='excluded-path')expect(hit).toMatchObject({path,finding});
+    else {expect(hit).toBeNull();expect(warnings).toContainEqual({path,finding});}
   });
 
   it.each(['deploy/id_rsa', 'certs/server.pem', 'keys/signing.key'])('rejects a lane-added regular key file %s even with innocuous contents', async path => {
@@ -310,7 +332,7 @@ describe('scanBundleRange changed-lines scan of modified blobs', () => {
     await expect(scanWith({ exec: failing })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
   });
 
-  it('refuses a value replaced under an existing multi-line secret key', async () => {
+  it('warns (R857: generic secret assignments are warn-only) on a value replaced under an existing multi-line secret key', async () => {
     git(lane, 'checkout', '-q', 'main');
     write('conf.yml', 'name: app\npassword: |\n  OldPassphraseValue12345xyz\nend: true\n');
     originMain = commit('public conf');
@@ -318,7 +340,9 @@ describe('scanBundleRange changed-lines scan of modified blobs', () => {
     git(lane, 'checkout', '-q', '-B', 'lane');
     write('conf.yml', 'name: app\npassword: |\n  NewPassphraseValue98765abc\nend: true\n');
     commit('replace value');
-    expect(await scanWith()).not.toBeNull();
+    const warnings = [];
+    expect(await scanWith({ warnings })).toBeNull();
+    expect(warnings).toEqual([{ path: 'conf.yml', finding: expect.stringMatching(/^(?:high-entropy|secret-assignment)-/) }]);
   });
 
   it('applies the object-size cap to modified blobs', async () => {
@@ -338,5 +362,108 @@ describe('scanBundleRange changed-lines scan of modified blobs', () => {
     write('notes.md', Buffer.concat([Buffer.from(`${token}\n`), Buffer.from([0, 1, 2, 3])]));
     commit('binary edit');
     expect(await scanWith()).not.toBeNull();
+  });
+});
+
+
+it('R857 refuses an unclassifiable bundle path instead of downgrading unknown evidence to a warning',async()=>{
+  write('lane.txt','ordinary change');commit('lane change');
+  const injected=async call=>call.args.includes('--raw')
+    ?{code:0,stdout:Buffer.from(`:000000 100644 ${'0'.repeat(40)} ${'a'.repeat(40)} A\0../bad.txt\0`)}
+    :exec(call);
+  await expect(scan(injected,[])).rejects.toMatchObject({code:'bundle-credential-scan-failed'});
+});
+
+
+ describe('strict bundle regression', () => {
+  it.each(['.env', '.env.local', '.netrc', '.npmrc', 'server.pem', 'id_rsa', 'id_rsa.pub',
+    'credentials.txt', 'secret.md', 'token.txt', 'oauth/config.txt', 'id_ed25519'])(
+    'blocks credential-named path %s with clean contents', async path => {
+      write(path, 'public'); commit('add file');
+      expect(await scan()).toMatchObject({finding:'excluded-path'});
+    });
+  it.each([
+    ['note.txt', 'a'+'ghp_'+'a'.repeat(20), 'github-token'],
+    ['note.txt', 'a'+'AKIA'+'A'.repeat(16)+'Z', 'aws-access-key'],
+    ['note.txt', 'sk-'+'a'.repeat(16), 'sk-token'],
+    ['note.txt', '-----'+'BEGIN', 'pem-header'],
+    ['data.json', '{', 'unparseable-json'],
+    ['data.json', '[]', 'non-object-json'],
+    ['note.txt', Buffer.from([255]), 'unsupported-text-encoding'],
+    ['note.txt', Buffer.from('public\0'), 'unsupported-text-encoding'],
+    ['.claude/note.txt', Buffer.from([255]), 'unsupported-text-encoding'],
+    ['.claude/note.txt', '-----'+'BEGIN', 'pem-header'],
+  ])('blocks unsafe content case %#', async (path, content, finding) => {
+    write(path, content); commit('add content');
+    expect(await scan()).toEqual({path,finding});
+  });
+  it('warns on a private directory only after its readable contents pass blocking checks', async () => {
+    write('.claude/note.txt','password=short'); commit('add readable notes');
+    const warnings=[];
+    expect(await scan(exec,warnings)).toBeNull();
+    expect(warnings).toContainEqual({path:'.claude/note.txt',finding:'excluded-path'});
+    expect(warnings).toContainEqual({path:'.claude/note.txt',finding:'secret-assignment-password'});
+  });
+});
+
+describe('credential directories and unsafe names block', () => {
+  it.each(['.ssh/config', '.gnupg/pubring.txt', '.aws/config', '.docker/config.json', '.kube/config', 'dir/.ssh/known_hosts',
+    'caf\u0435.txt', 'bad\u202Ename.txt', 'ctl\u0007name.txt'])(
+    'blocks %#: clean contents still block', async path => {
+      write(path, 'public'); commit('add file');
+      expect(await scan()).toMatchObject({finding:'excluded-path'});
+    });
+});
+
+// R903 send-back: the bundle scan must never block or ship what main's rule did not.
+describe('bundle scan keeps main parity (R903)', () => {
+  // Store the exact name bytes: macOS Git would otherwise precompose a decomposed argument.
+  const addExact = (name, content) => {
+    writeFileSync(join(lane, name), content);
+    const blob = git(lane, 'hash-object', '-w', '--', name);
+    git(lane, '-c', 'core.precomposeunicode=false', 'update-index', '--add', '--cacheinfo', `100644,${blob},${name}`);
+  };
+  it.each([['composed', '\u00C9tude.md'], ['decomposed', 'cafe\u0301.md']])(
+    'ships an accented Latin %s name on both the rsync manifest and the bundle', async (_form, name) => {
+      addExact(name, 'public notes\n');
+      addExact('package-lock.json', '{"lockfileVersion":3,"packages":{}}\n');
+      commit('accented name');
+      expect(git(lane, '-c', 'core.quotepath=false', '-c', 'core.precomposeunicode=false', 'ls-files', '--', name)).toBe(name);
+      const warnings = [];
+      expect(await scan(exec, warnings)).toBeNull();
+      expect(warnings).toEqual([]);
+      const manifest = await buildManifest({ cwd: lane, exec: defaultExec, listFiles: async () => [name, 'package-lock.json'] });
+      expect(manifest.entries.map(entry => entry.path.toString('utf8'))).toContain(name);
+      expect(manifest.excluded).toEqual([]);
+    });
+  it.each(['.pgpass', '.htpasswd', '.pypirc', '.dockercfg', 'conf/.pgpass', '.claude/.pypirc'])(
+    'blocks the credential-store dotfile %s even with clean contents', async path => {
+      write(path, 'public\n'); commit('credential-store dotfile');
+      const warnings = [];
+      expect(await scan(exec, warnings)).toEqual({ path, finding: 'excluded-path' });
+      expect(warnings).toEqual([]);
+    });
+  const escaped = [
+    ['\\x escape under a secret-named field', `token: "\\x67${token.slice(1)}"\n`],
+    ['\\u escape under a neutral field', `description: "\\u0067${token.slice(1)}"\n`],
+    ['\\U escape', `note: "\\U00000067${token.slice(1)}"\n`],
+    ['escaped line break in a quoted scalar', `token: "${token.slice(0, 12)}\\\n  ${token.slice(12)}"\n`],
+    ['folded scalar split across lines', `token: >-\n  ${token.slice(0, 12)}\n  ${token.slice(12)}\n`],
+    ['nested key split inside an outer block', `auth:\n  token: >-\n    ${token.slice(0, 12)}\n    ${token.slice(12)}\n`],
+    ['Markdown-escaped underscore', `Rotate ghp\\_${token.slice(4)} today\n`],
+    ['JS braced \\u{} escape', `const value = "\\u{67}${token.slice(1)}";\n`],
+    ['JS octal escape', `const value = "\\147${token.slice(1)}";\n`],
+  ];
+  it('scans nested credential keys in linear time', () => {
+    const nested = Array.from({ length: 250 }, (_, i) => `${' '.repeat(i)}token${i}:`).join('\n') + '\n';
+    const started = performance.now();
+    expect(credentialContentFinding(Buffer.from('notes.yml'), Buffer.from(nested.repeat(40)))).toBeNull();
+    expect(performance.now() - started).toBeLessThan(5000);
+  });
+  it.each(escaped)('blocks a YAML-escaped token (%s) on both transports', async (_shape, content) => {
+    expect(content).not.toContain(token);
+    expect(credentialContentFinding(Buffer.from('token-settings.yml'), Buffer.from(content))).toBe('github-token');
+    write('settings.yml', content); commit('escaped token');
+    expect(await scan()).toEqual({ path: 'settings.yml', finding: 'github-token' });
   });
 });

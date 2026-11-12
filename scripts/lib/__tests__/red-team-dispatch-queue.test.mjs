@@ -155,8 +155,8 @@ describe('setting-driven red-team queue floor', () => {
     expect(log).toHaveBeenCalledTimes(expected > 0 ? 1 : 0);
   });
 
-  it('loads defaults 2/10 from the real shipped settings file with no environment overrides', () => {
-    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ ...floor, reviewStartsPerTick: 3 });
+  it('loads defaults 4/10 from the real shipped settings file with no environment overrides', () => {
+    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 4 });
     expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(4);
   });
 
@@ -433,19 +433,23 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
-  it('planner skip rows (not in notStarted) count as attempts so a non-dispatchable head rotates', async () => {
+  it('planner skip rows (not in notStarted) count as attempts, rotate, and no longer starve the next PR', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'stale re-dispatch already spent';
+    const dispatchedPrs = [];
     const run = options => {
-      const pr = options.plan.refusals[0].prNumber;
-      return pr === 1
-        ? { rows: [{ prNumber: 1, action: 'skip', why: reason }], dispatched: [], notStarted: [] }
-        : started(options);
+      const rest = options.plan.refusals.filter(row => row.prNumber !== 1);
+      const res = started({ plan: { refusals: rest } });
+      dispatchedPrs.push(...res.dispatched.map(d => d.prNumber));
+      const skipped = options.plan.refusals.some(row => row.prNumber === 1);
+      return { rows: [...(skipped ? [{ prNumber: 1, action: 'skip', why: reason }] : []), ...res.rows],
+        dispatched: res.dispatched, notStarted: [] };
     };
     for (let tick = 0; tick < 2; tick++) {
       await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
     }
-    expect(numbers(f.queue.entries())).toEqual([2, 1]);
+    expect(dispatchedPrs).toEqual([2]); // PR2 really dispatched on tick 2 despite capacity 1
+    expect(numbers(f.queue.entries())).toEqual([1]);
     expect(f.logs.some(line => line.includes('requeue') && line.includes(reason))).toBe(true);
   });
 
@@ -735,6 +739,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(f.logs.some(line => line.includes('admit example/project#2: capacity 1'))).toBe(true);
       expect(f.logs.some(line => line.includes('hold example/project#3: capacity 1'))).toBe(true);
     });
+    it('a planner-skipped head (superseded acceptance) frees its slot for the next runnable PR', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'later verdict or hold supersedes acceptance' }], dispatched: [], notStarted: [] });
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2]);
+    });
     it('keeps FIFO order and the capacity bound among runnable PRs', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
@@ -891,5 +902,24 @@ describe('raiseReviewStartsPerTick guards', () => {
     expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 101 })).toBe(2);
     expect(raiseReviewStartsPerTick(0, { floor: f, cpuIdlePct: 50 })).toBe(0);
     expect(raiseReviewStartsPerTick(Infinity, { floor: f, cpuIdlePct: 50 })).toBe(Infinity);
+  });
+});
+
+describe('R878 red-team queue admits up to 4 only within the host ceiling', () => {
+  const floor4 = { minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 4 };
+  it('idle host with ceiling 4 raises remainingStarts to 4', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 4 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 50 });
+    expect(capacity.remainingStarts).toBe(4);
+  });
+  it('host ceiling of 2 (R853 not admitting more) holds the queue at 2', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 2 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 50 });
+    expect(capacity.remainingStarts).toBe(2);
+  });
+  it('busy CPU never raises above the existing allowance', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 4 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 5 });
+    expect(capacity.remainingStarts).toBe(2);
   });
 });
