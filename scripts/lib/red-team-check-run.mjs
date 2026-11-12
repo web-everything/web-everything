@@ -342,9 +342,17 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
           || Math.max(...dates) <= failedAt)
           throw Error('trusted live result not demonstrably newer than failed check; operator must inspect result and run timestamps');
       }
-      return runs.map(run => run.id);
+      return runs;
     };
-    const before = inspect();
+    const ids = runs => runs.map(run => run.id);
+    const newest = inspect();
+    // A retry whose earlier attempt already published this helper's success (its settlement failed, so the outbox
+    // marker stayed) re-validated it just now, under the writers' lock, with nothing newer on the head: that success
+    // is the confirmed one. Posting another per retry would exhaust the 100-run check history the gate reads (#6606
+    // red team on c639d9ba1: the recovery pass retries once per cooldown, without a cap).
+    if (newest[0] && isLiveCheckRun(newest[0]) && newest[0].status === 'completed' && newest[0].conclusion === 'success')
+      return confirmed();
+    const before = ids(newest);
     let postedId;
     const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha,
       gh: (args, options) => {
@@ -358,7 +366,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         return response;
       }, payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, liveCheck: true }) });
     if (!posted.ok) throw Error(posted.reason);
-    const after = inspect();
+    const after = ids(inspect());
     // Our newer id can hide an intervening round even when ours is the latest visible success.
     // Require the entire previous order, with only our run prepended (runs are newest first).
     if (after[0] !== postedId || after.length !== before.length + 1
@@ -381,13 +389,17 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
     }
     return failure(reason);
   }
+  return confirmed();
+
   // Confirmed. `onConfirmed` runs here, still under the writers' lock (#6606 red team on a67e77345): a hold any helper
   // attempt posted is then necessarily older than this confirmed success, and no later attempt can post one between
   // the confirmation and the caller's clear. Its outcome never turns the confirmed success into a failure check.
-  if (!onConfirmed) return { ok: true };
-  let settled;
-  try { settled = onConfirmed(); } catch (error) { settled = failure(`carried-check settlement failed: ${message(error)}`); }
-  return { ok: true, settled };
+  function confirmed() {
+    if (!onConfirmed) return { ok: true };
+    let settled;
+    try { settled = onConfirmed(); } catch (error) { settled = failure(`carried-check settlement failed: ${message(error)}`); }
+    return { ok: true, settled };
+  }
 }
 
 /** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a

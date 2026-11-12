@@ -2091,12 +2091,13 @@ describe('#6606 carried check recovered after a transient verification failure',
     'Review verdict carried across an identical contribution.',
     renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }),
   ].join('\n') });
-  function world({ failReadAt = 2, failCheckPosts = new Set() } = {}) {
+  function world({ failReadAt = 2, failCheckPosts = new Set(), statusReadError = false } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'carried-check-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: join(dir, 'locks') };
     const checkRuns = [], extraRuns = [], statuses = [];
     let nextId = 40, reads = 0, checkPosts = 0, statusId = 1;
     const gh = (args, options) => {
+      if (statusReadError && !args.includes('POST') && /\/status(?:es)?\?/.test(args[1])) throw Error('HTTP 502');
       if (args.includes('POST') && args[1].includes('/statuses/')) {
         statuses.unshift({ ...JSON.parse(options.input), id: statusId++, creator: { login: 'web-everything' } });
         return '{}';
@@ -2164,6 +2165,36 @@ describe('#6606 carried check recovered after a transient verification failure',
       expect(u.statuses.filter(status => status.state === 'success')).toEqual([]);
       expect(u.holdFact()).toMatchObject({ ok: false });
     } finally { rmSync(u.dir, { recursive: true, force: true }); }
+  });
+
+  // Red team on c639d9ba108e, end to end: 100 unrelated statuses and no publication context. The confirmed carry
+  // settles (marker gone) on the first attempt instead of keeping its retry marker.
+  it('a confirmed carry settles on a head whose status history is full of unrelated contexts', () => {
+    const w = world({ failReadAt: 0 });
+    try {
+      for (let i = 0; i < 100; i++) w.statuses.push({ id: 1000 - i, state: 'success', context: 'ci/build', creator: { login: 'x' } });
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+      expect(w.checkRuns).toHaveLength(1);
+      expect(w.fact()).toMatchObject({ ok: true });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  // Same red team, recovery path: the recovery pass retries an unsettled carry once per cooldown with no cap. While the
+  // clear keeps failing, each retry reuses the helper's confirmed success instead of posting another, so the head's
+  // check history never reaches the 100-run bound the gate refuses at.
+  it('retries whose publication-hold clear keeps failing reuse the confirmed success (one check run, not one per retry)', () => {
+    const w = world({ failReadAt: 0, statusReadError: true });
+    try {
+      for (let attempt = 0; attempt < 120; attempt++) {
+        expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared/) });
+        expect(w.owed()).toBe(true);
+      }
+      expect(w.checkRuns).toHaveLength(1);
+      expect(w.tick().rows[0]).toMatchObject({ why: CARRIED_CHECK_ESCALATION });
+      expect(w.checkRuns).toHaveLength(1);
+      expect(w.fact()).toMatchObject({ ok: true });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
 
   it('an older confirmed attempt never removes the marker a newer attempt owns', () => {

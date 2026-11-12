@@ -220,8 +220,10 @@ describe('red-team check run contract', () => {
         expect(events.filter(e => ['enter', 'exit'].includes(e.phase)).map(e => [e.first, e.phase]))
           .toEqual([['yes', 'enter'], ['yes', 'exit'], ['no', 'enter'], ['no', 'exit']]);
         if (secondMode === 'live') expect(events.find(e => e.first === 'no' && e.phase === 'read').count).toBe(1);
+        // A second live writer, serialized behind the first, re-validates and settles on the first's confirmed success
+        // (#6606 red team on c639d9ba108e: a success per attempt exhausts the check history); a failure writer posts.
         expect(JSON.parse(readFileSync(statePath, 'utf8')).map(run => run.conclusion))
-          .toEqual(['success', secondMode === 'live' ? 'success' : 'failure']);
+          .toEqual(secondMode === 'live' ? ['success'] : ['success', 'failure']);
       } finally {
         clearTimeout(timeout);
         children.forEach(child => child.kill());
@@ -563,6 +565,42 @@ describe('red-team check run contract', () => {
         io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
         expect(publish(io)).toMatchObject({ ok: false });
         expect(check_runs).toHaveLength(initial.length);
+      });
+      // Red team on c639d9ba108e: the recovery pass retries an unsettled carry once per cooldown, uncapped. A retry
+      // whose newest run is this helper's own confirmed success re-validates and settles on it, posting nothing.
+      it('a retry over its own newest success re-validates and settles without posting another check', () => {
+        const { io, check_runs } = retryFixture();
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        const onConfirmed = vi.fn(() => ({ ok: false, reason: 'publication hold not cleared' }));
+        for (let attempt = 0; attempt < 5; attempt++)
+          expect(publish({ ...io, onConfirmed })).toMatchObject({ ok: true, settled: { ok: false } });
+        expect(check_runs.map(r => `${r.id}:${r.conclusion}`)).toEqual(['40:success']);
+        expect(onConfirmed).toHaveBeenCalledTimes(5);
+        expect(fact(check_runs)).toMatchObject({ ok: true });
+      });
+      it.each([
+        ['the live evidence is now held', io => io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [{ name: 'red-team:pending' }] }))],
+        ['the head moved', io => io.readLive.mockImplementation(() => ({ headRefOid: 'f'.repeat(40), labels: [] }))],
+        ['the trusted result is gone', io => io.readComments.mockReturnValue([])],
+      ])('a retry over its own newest success still refuses (and posts nothing) when %s', (_name, change) => {
+        const { io, check_runs } = retryFixture();
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: true });
+        change(io);
+        const onConfirmed = vi.fn();
+        expect(publish({ ...io, onConfirmed })).toMatchObject({ ok: false });
+        expect(onConfirmed).not.toHaveBeenCalled();
+        expect(check_runs).toHaveLength(1);
+      });
+      it('a round run newer than the helper\'s own success is not reused: a fresh success is posted over it', () => {
+        const { io, check_runs } = retryFixture();
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: true });
+        // A round writer's success lands after the helper's (GitHub ids only grow, so it takes the next id).
+        io.gh(['api', 'repos/o/r/check-runs', '--method', 'POST'],
+          { input: JSON.stringify(api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null })) });
+        expect(publish(io)).toMatchObject({ ok: true });
+        expect(check_runs.map(r => `${r.id}:${api.isLiveCheckRun(r)}`)).toEqual(['40:true', '41:false', '42:true']);
       });
       it.each([
         ['its own trusted hold is cleared', { description: 'held: live red-team check not clear: x', login: 'web-everything' }, true, true],
