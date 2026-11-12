@@ -2142,7 +2142,13 @@ export async function readRemoteManifestViaApi({ exec, repo, headRef, apiArgs = 
   try {
     const { stdout } = await exec('gh', apiArgs(repo, headRef), { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const b64 = (stdout || '').trim();
-    if (b64) { const m = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); if (m && m.item != null) return { manifest: m, degraded: false }; }
+    if (b64) {
+      // card 8036 — a 200 whose body is not valid JSON is a PER-PR poison record, not a transport failure: flag it
+      // `malformed` (that PR alone is held in planLabelDrain) instead of `degraded`, which latched the WHOLE pass incomplete.
+      let m;
+      try { m = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch { return { manifest: null, degraded: false, malformed: true }; }
+      if (m && m.item != null) return { manifest: m, degraded: false };
+    }
     return { manifest: null, degraded: false }; // API read SUCCEEDED → confirmed no manifest, not degraded
   } catch (e) {
     return { manifest: null, degraded: !isContentsNotFound(e) };
@@ -2207,6 +2213,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       // fetched this pass, no extra `gh` call.
       v.baseRefName = typeof p.baseRefName === 'string' ? p.baseRefName : null;
       attachManifestToVerdict(v, read.manifest ?? null, { repo, isLocalRepo, localSlug });
+      if (read.malformed) { v.readMalformed = true; console.error(`  ⚠ card 8036 — #${p.number} (${repo || 'local'}): malformed head-tree manifest; holding this PR only`); }
       v.prLabels = p.labels || [];
       // #2447 — the body's own `graduatedTo:` note, extracted now so the escalation pass (which no longer holds `p`)
       // can derive the resolution basis without keeping the whole body on every verdict. `null` for nearly all PRs.
@@ -2709,7 +2716,7 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     // NON-WE repo MIGHT be a coupled impl whose carrier we could not read → it must never enter `ready`, whether or
     // not a join stamped `coupleDefer`. Catches the un-joined orphan the per-carrier gate structurally misses.
     const blindImplDefer = contextComplete !== true && c.hasManifest !== true && !isWeRepo(c.repo);
-    const blindWait = blindImplDefer ? ['incomplete-context'] : [];
+    const blindWait = blindImplDefer ? ['incomplete-context'] : (c.readMalformed === true ? ['malformed-manifest'] : []);
     // #xc7p3q9 (R2) — a verdict may NEVER waitOn its OWN item (a self-referential wait is structurally
     // unsatisfiable — the livelock). Strip any edge naming this verdict's own item.
     const waitOn = [...new Set([...blockWait, ...stackWait, ...coupleWait, ...blindWait, ...overlapWait])].filter((w) => c.item == null || String(w) !== String(c.item));
@@ -5176,7 +5183,7 @@ async function runCli() {
         fetchOne: async ({ repo, p }) => {
           const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
           const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
-          return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient };
+          return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient, ...(manifestRes.malformed ? { malformed: true } : {}) };
         },
       });
       const out = new Map();
@@ -5673,7 +5680,7 @@ async function runCli() {
     isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
     fetchOne: async ({ repo, p }) => {
       const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
-      return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded, transient: !!manifestRes.transient };
+      return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded, transient: !!manifestRes.transient, ...(manifestRes.malformed ? { malformed: true } : {}) };
     },
   }));
   // #2421 (generalizes #2216) — total ci-lifecycle relabel first, per swept repo.
