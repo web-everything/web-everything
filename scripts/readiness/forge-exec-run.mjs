@@ -766,12 +766,35 @@ export async function uidBusy(uid, procFs=filesystem) {
         const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
         if(!ids)return true; // credentials undeterminable: keep the reservation
         if(!ids.slice(1).some(id=>Number(id)===uid))continue;
-        return true; // any matching entry, even a zombie leader whose threads may live, keeps the slot
+        // A zombie with exactly one thread holds nothing and cannot be killed: it is dead, not busy.
+        // A zombie leader whose Threads count is absent or >1 may still have live threads: keep the slot.
+        if(/^State:\s+Z/m.test(status)&&/^Threads:\s+1\s*$/m.test(status))continue;
+        return true;
       } catch(error) {if(error.code!=='ENOENT')return true; vanished=true;}
     }
     if(!vanished)return false;
   }
   return true;
+}
+// Reaper kill for one slot UID past its hard max runtime. Zombies cannot be killed, so a zombie's live
+// PARENT is killed too, but only when that parent runs as the same slot UID. Never touches other UIDs.
+export async function killUid(uid, procFs=filesystem, kill=process.kill.bind(process)) {
+  const victims=new Set(),zombieParents=new Set(),owner=new Map();
+  for(const entry of await procFs.readdir('/proc')) {
+    if(!/^\d+$/.test(entry))continue;
+    try {
+      const status=(await procFs.readFile('/proc/'+entry+'/status')).toString('latin1');
+      const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
+      if(!ids||!ids.slice(1).every(id=>Number(id)===uid))continue; // all four ids must be this slot UID
+      const pid=Number(entry);
+      owner.set(pid,true);
+      if(/^State:\s+Z/m.test(status)){const pp=/^PPid:\s+(\d+)/m.exec(status);if(pp)zombieParents.add(Number(pp[1]));}
+      else victims.add(pid);
+    } catch(error) {if(error.code!=='ENOENT')throw error;}
+  }
+  for(const pp of zombieParents)if(pp>1&&owner.has(pp))victims.add(pp);
+  for(const pid of victims) {try{kill(pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}}
+  return victims.size;
 }
 async function unitActive(unit) {
   const result=await execute('/usr/bin/systemctl',['is-active',unit]);
@@ -900,7 +923,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     await atomicJSON(join(receipts,'telemetry.json'),value);
     return value;
   }
-  const reapProbe={start:procStart,uidBusy,unitActive,...testReapProbe};
+  const reapProbe={start:procStart,uidBusy,unitActive,killUid,...testReapProbe};
   async function reapLog(line) {
     const text='forge-exec-run: reaped '+line;
     process.stderr.write(text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
@@ -961,9 +984,12 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       // Empty, malformed or pre-lease (no writerGuard) reservations stay for operator cleanup, as the pruner does.
       if(!reservation||reservation.writerGuard!==1||reservation.slot!=='forge-exec-'+slotNumber||!runName(reservation.run)||!nonceOK(reservation.nonce))continue;
       const entries=reservation?found.filter(e=>e.run===reservation.run):[];
+      // A run past its hard max runtime is dead whatever its owner or UID still show (zombies, wedged children).
+      const pastMax=async()=>(await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0))>=FORGE_RUN_WALL_MS+REAP_GRACE_MS;
       const decide=async()=>{
         if(await keepReceipt(reservation.run))return false;
         if(entries.length>1)return false;
+        if(await pastMax())return true;
         if(entries.length){const record=await readRecord(entries[0].file);return !!record&&await ownerGone(record,entries[0].file,{allowAge:true});}
         const age=await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0);
         return age>=REAP_GRACE_MS;
@@ -972,11 +998,17 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await withWorkerExclusive(lock,async()=>{
         const again=await readRecord(join(lockPath,'reservation.json'));
         if(again?.run!==reservation.run||again?.nonce!==reservation.nonce||again?.writerGuard!==1)return;
-        if(slotNumber&&await reapProbe.uidBusy((await identity('forge-exec-'+slotNumber)).uid))return;
+        const slotUid=(await identity('forge-exec-'+slotNumber)).uid;
+        let killed=0;
+        if(await reapProbe.uidBusy(slotUid)) {
+          if(!await pastMax())return;
+          killed=await reapProbe.killUid(slotUid);
+          if(await reapProbe.uidBusy(slotUid))return;
+        }
         if(!await decide())return;
         await tombstone(lockPath);
         if(reservation?.run){await dropRecords(reservation.run);taken.add(reservation.run);}
-        await reapLog(`${lock} run=${reservation?.run??'none'} reason=owner-gone`);
+        await reapLog(`${lock} run=${reservation?.run??'none'} reason=${killed?'past-max-runtime killed='+killed:'owner-gone'}`);
       }).catch(error=>process.stderr.write('forge-exec-run: reap skipped '+lock+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'));
     }
     // Records whose own reservation is gone can no longer own a run.

@@ -2,7 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, readdir, utimes, realpath, stat} from 'node:fs/promises';
 import {join} from 'node:path';
-import {createRunner, uidBusy} from '../forge-exec-run.mjs';
+import {createRunner, uidBusy, killUid} from '../forge-exec-run.mjs';
 // R333: the runner reaps leaked reservations/receipts only on proof the owner is gone.
 let root, receipts, probe, calls;
 const nonce = 'a'.repeat(32);
@@ -103,9 +103,26 @@ describe('production uidBusy scanner', () => {
     expect(proc.calls.stats).toBe(0); // A non-dumpable worker's proc directory is owned by root.
   });
   it('keeps slots for a zombie leader whose threads may still live', async () => {
+    const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t3\n'});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+  });
+  it('keeps slots for a zombie with no thread count (fail closed)', async () => {
     const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)')});
     expect(await uidBusy(workerUid, proc)).toBe(true);
-    expect(proc.calls.reads).toEqual(['/proc/42/status']);
+  });
+  it('treats a UID whose only processes are single-thread zombies as idle', async () => {
+    const proc = procFixture({entries: ['42', '43'], readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n'});
+    expect(await uidBusy(workerUid, proc)).toBe(false);
+  });
+  it('killUid kills live members and live same-UID parents of zombies, never other UIDs', async () => {
+    const st = {'/proc/10/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t11\n',
+      '/proc/11/status': procStatus([workerUid, workerUid, workerUid, workerUid]) + 'PPid:\t1\n',
+      '/proc/12/status': procStatus([7, 7, 7, 7]) + 'PPid:\t1\n',
+      '/proc/13/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t12\n'};
+    const proc = procFixture({entries: ['10', '11', '12', '13'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
+    expect(killed).toEqual([[11, 'SIGKILL']]);
   });
   it('reports idle only after checking every numeric process entry', async () => {
     const proc = procFixture({entries: ['self', 'net', '42', '43']});
@@ -268,6 +285,27 @@ describe('forge leaked-state reaper', () => {
     probe.uidBusy = async () => true;
     expect((await makeRunner().telemetry()).activeRuns).toBe(1);
     expect(await exists(busy.lock)).toBe(true);
+  });
+  it('reaps and kills a run past max runtime even while its owner and UID look live', async () => {
+    const stuck = await leak(1, 20, {owner, ageMs: 3 * 3600e3});
+    let busy = true; const killedUids = [];
+    probe.start = async () => owner.start; // owner pid alive with the same start time
+    probe.uidBusy = async () => busy;
+    probe.killUid = async uid => { killedUids.push(uid); busy = false; return 2; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(0);
+    expect(killedUids).toEqual([20001]);
+    expect(await exists(stuck.lock)).toBe(false);
+    expect(await readFile(join(receipts, 'reap-audit.log'), 'utf8')).toMatch(/past-max-runtime killed=2/);
+  });
+  it('keeps a live run inside its max runtime and kills nothing', async () => {
+    const live = await leak(1, 21, {owner, ageMs: 60e3});
+    const killedUids = [];
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => true;
+    probe.killUid = async uid => { killedUids.push(uid); return 1; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+    expect(killedUids).toEqual([]);
+    expect(await exists(live.lock)).toBe(true);
   });
   it('reaps the Oct 31 shape: an aged ownerless lock and receipt with a quiet slot', async () => {
     const old = await leak(1, 8, {ageMs: 3600e3});
