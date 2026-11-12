@@ -2075,6 +2075,31 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(spy).toHaveBeenCalledTimes(2);
   });
 
+  it('discards the plan cache at the pass end: the next pass plans again (no time-based decision frozen across passes)', async () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const spy = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf());
+    await runTickAllRepos({ ...base, ...phases([]) });
+    expect(spy).toHaveBeenCalledTimes(2);
+    await runTickAllRepos({ ...base, ...phases([]) });
+    expect(spy).toHaveBeenCalledTimes(4);
+  });
+
+  it('logs one line per prelude read with its duration and start time, for planned reads and for cache hits', () => {
+    let time = 1000;
+    const lines = [];
+    const cache = createReconcilePlanCache({ now: () => time, log: line => lines.push(line),
+      reconcile: () => { time += 400; return planOf(); },
+      readFingerprints: () => { time += 30; return new Map([[7, 'a']]); },
+      readClaims: () => { time += 20; return new Set(); } });
+    cache.reconcile({ repo: 'repo-a' });
+    cache.reconcile({ repo: 'repo-a' });
+    const text = lines.join('\n');
+    expect(text).toMatch(/prelude-read kind=fingerprints repo=repo-a ms=30 /);
+    expect(text).toMatch(/prelude-read kind=claims repo=repo-a ms=20 /);
+    expect(text).toMatch(/prelude-read kind=plan repo=repo-a ms=\d+ cache=miss startedAt=/);
+    expect(text).toMatch(/prelude-read kind=plan repo=repo-a ms=\d+ cache=hit startedAt=/);
+  });
+
   // Keep all runTickAllRepos phase defaults. Decorate the real dispatch handlers only to supply hermetic IO;
   // injecting *Tick options would turn off the production default whose activation this fixture must defend.
   const productionFixture = () => {
