@@ -19,7 +19,8 @@ import { syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
 import * as completeComments from '../../conveyor/pr-comments-complete.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
-import { recordRedTeamStatus, readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readRedTeamPublicationHold, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { publishStoredRedTeamResult } from '../red-team-withheld-publish.mjs';
 import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
 
 // The real operator feed is never written from this file: every test either injects a publisher or relies on the
@@ -362,9 +363,14 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
       const input = { repo: LOCAL, pr: 5283, loopPayload: { verdict: { verdict: 'accept' },
         findings: { read: { netBasis: { rev: HEAD } } } } };
       const runs = [], attempts = [], appId = 5037855;
-      const options = { env, log: () => {},
-        comments: [{ author: { login: 'web-everything' }, body:
-          `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` }],
+      const clean = [{ author: { login: 'web-everything' }, body:
+        `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` }];
+      // Seal at finish (#6535, R907): the seat seals its clean result before the one finished check is written.
+      const sealFinished = sealKey => publishStoredRedTeamResult({ status: sealKey, sealOnly: true,
+        statusDir: redTeamStatusDir(env), listComments: () => clean, postComment: () => { throw Error('never posts'); },
+        readSeatRow: () => ({ rev: HEAD, findings: [], foldedVerdict: 'accept', confirmedMissCount: 0, provider: 'p', model: 'm', callId: 'c' }) });
+      const options = { env, log: () => {}, sealFinished,
+        comments: clean,
         gh: () => JSON.stringify({ headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] }),
         postCheckRun: ({ payload }) => {
           runs.push({ ...payload, id: runs.length + 1, app: { id: appId } });

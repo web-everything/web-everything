@@ -55,40 +55,38 @@ export const redTeamWriterEnv = (env = process.env) => {
   return out;
 };
 
-const weAppIdCache = new Map();
-/** Test seam: forget the per-process cache. */
-export function resetWeAppIdCacheForTest() { weAppIdCache.clear(); }
-
 /**
- * The WE App id readers trust and the writer must author as (#6535 operator send-back). `env.WE_APP_ID` first (CI
- * sets it from `vars.WE_APP_ID`); else the repository variable itself, read once per process and repo through today's
- * App (`gh api repos/<repo>/actions/variables/WE_APP_ID --jq .value`; role Apps hold no Variables permission). A
- * daemon never sets WE_APP_ID, so without this every reader and the policy-clear writer failed closed forever.
- * Only a valid id is cached; an unreadable or invalid variable returns `ok:false` with {@link WE_APP_ID_UNSET} (and
- * no appId), so a caller passing `appId` on keeps the existing fail-closed reason, and the next call retries.
- * @returns {{ok:true, appId:string, source:'env'|'repository-variable'} | {ok:false, reason:string, detail?:string}}
+ * The WE App id readers trust and the writer authors as (#6535; operator ruling R907 → setting R905). It is a SETTING,
+ * `redTeamGate.appId` in scripts/settings/red-team.json (5037855), resolved standard → platform → tool →
+ * `WE_APP_ID` env (CI sets it from `vars.WE_APP_ID`, the same value). The repository variable is documentation only and
+ * is never read at runtime: every installed App gets HTTP 403 on Actions variables. A missing, unreadable
+ * or invalid value at every layer returns `ok:false` with {@link WE_APP_ID_UNSET} and no appId, so a caller passing
+ * `appId` on keeps the existing fail-closed reason. Logs the effective value and its source.
+ * @returns {{ok:true, appId:string, source:string} | {ok:false, reason:string, detail?:string}}
  */
-export function resolveWeAppId({ env = process.env, gh = runGhSync, repo } = {}) {
-  if (validApp(env?.WE_APP_ID)) return { ok: true, appId: String(env.WE_APP_ID), source: 'env' };
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) return { ...failure(WE_APP_ID_UNSET), detail: 'repository missing or invalid' };
-  const key = repo.toLowerCase();
-  if (weAppIdCache.has(key)) return weAppIdCache.get(key);
-  let value;
+export function resolveWeAppId({ env = process.env, path = new URL('../settings/red-team.json', import.meta.url),
+  tool, platform, log = () => {} } = {}) {
+  let file = {};
+  try { file = tool ?? JSON.parse(readFileSync(path, 'utf8')); } catch { /* an unreadable file sets nothing (fails closed below) */ }
+  const pick = value => value?.appId === undefined ? {} : { appId: value.appId };
+  const raw = env?.WE_APP_ID;
+  let resolved;
   try {
-    value = String(gh(['api', `repos/${repo}/actions/variables/WE_APP_ID`, '--jq', '.value'],
-      { ...ioOptions, env: redTeamWriterEnv(env) }) ?? '').trim();
-  } catch (error) { return { ...failure(WE_APP_ID_UNSET), detail: `repository variable unreadable: ${message(error)}` }; }
-  if (!validApp(value)) return { ...failure(WE_APP_ID_UNSET), detail: 'repository variable missing or invalid' };
-  const resolved = { ok: true, appId: value, source: 'repository-variable' };
-  weAppIdCache.set(key, resolved);
-  return resolved;
+    resolved = resolveCascade({ standard: {}, platform: pick(platform ?? platformPreference('redTeamGate', { env })),
+      tool: pick(file?.redTeamGate), envValues: { appId: raw === '' ? undefined : raw }, valid: { appId: validApp } });
+  } catch (error) { return { ...failure(WE_APP_ID_UNSET), detail: `setting unreadable: ${message(error)}` }; }
+  try { log(formatCascadeSourcesLine('redTeamGate.appId', resolved)); } catch { /* logging is best effort */ }
+  const appId = resolved?.value?.appId;
+  if (!validApp(appId)) return { ...failure(WE_APP_ID_UNSET), detail: 'redTeamGate.appId setting missing or invalid' };
+  return { ok: true, appId: String(appId), source: resolved.sources?.appId ?? 'unknown' };
 }
 
 /** The daemon's policy-clear writer: resolve the trusted App id, then publish as that App (never the caller's role). */
-export function createPolicyClearPublisher({ env = process.env, run = runGhSync, publish = publishRedTeamPolicyClearCheck } = {}) {
+export function createPolicyClearPublisher({ env = process.env, run = runGhSync, publish = publishRedTeamPolicyClearCheck,
+  resolveAppId = () => resolveWeAppId({ env }) } = {}) {
   const gh = (ghArgs, options = {}) => run(ghArgs, { env, ...options });
   return args => {
-    const app = resolveWeAppId({ env, gh, repo: args?.repo });
+    const app = resolveAppId();
     if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
     return publish({ ...args, appId: app.appId, env, gh });
   };

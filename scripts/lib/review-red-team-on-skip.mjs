@@ -711,8 +711,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   // still attempted (as round writers publish in every mode), so a head settled during a rollback is not stranded
   // once the source switches back, but a failure does not block the settlement. Test runs need explicit IO for this
   // channel, as recordRedTeamStatus does.
-  // The App id comes from the shared resolver (env, else the WE_APP_ID repository variable: the daemon never sets
-  // the env), and the writes run as that App, never this daemon's reviewer role (#6535 operator send-back).
+  // The App id comes from the shared resolver (the `redTeamGate.appId` setting, WE_APP_ID env as its top layer: the
+  // daemon never sets the env), and the writes run as that App, never this daemon's reviewer role (#6535, R907).
   const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : createPolicyClearPublisher({ env }));
   const publishPolicyClearCheck = (pr, head) => {
     if (!publisher) return;

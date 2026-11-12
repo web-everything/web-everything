@@ -23,6 +23,8 @@ import { latestAcceptRecord } from './accept-carry-forward.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
+/** How `redTeamEnqueueHold` names a hold that is only "result not sealed yet" (PR #6622); a test pins it to that text. */
+export const RED_TEAM_UNSEALED_HOLD_PREFIX = 'post-accept red team result is not published yet';
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
 /** Publication outbox only: no status parsing or review-run scan at enqueue. */
@@ -475,7 +477,18 @@ export function recordRedTeamStatus(input, options = {}) {
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
+        let checkStatus = input.status;
         if (input.status === 'finished') {
+          // Seal at finish (#6535, operator ruling R907): the check is written ONCE, from the sealed result. The seat's
+          // finished result is a bare `ran` whose evidence is unsealed until sealed; the caller's sealer seals it here,
+          // under this claim and before the hold is read. Nothing re-publishes the check later.
+          if (typeof options.sealFinished === 'function') {
+            try { options.sealFinished({ repo: input.repo, pr: input.pr, head }); }
+            catch (error) {
+              try { (options.log ?? (line => process.stderr.write(`${line}\n`)))(JSON.stringify({ sealed: false, reason: safeReason(error?.message ?? error) })); }
+              catch { /* logging cannot fail the persisted local write */ }
+            }
+          }
           try {
             const comments = options.comments ?? readCompletePrComments(input.pr, { repo: input.repo,
               exec: (_file, args, opts) => gh(args, opts) });
@@ -485,8 +498,11 @@ export function recordRedTeamStatus(input, options = {}) {
             hold = redTeamEnqueueHold({ ...input, head, comments, scheduled: true,
               recorded: input.result === 'ran', env: options.env ?? process.env });
           } catch { /* unreadable evidence retains the hold */ }
+          // A result still unsealed (the sealer failed or none was given) is no break: it must not publish FAILURE (R907).
+          // It publishes the check as in progress, which still holds merge-gate (fail closed) without naming a break.
+          if (!sendBack && typeof hold === 'string' && hold.startsWith(RED_TEAM_UNSEALED_HOLD_PREFIX)) checkStatus = 'running';
         }
-        const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: input.status, hold, sendBack });
+        const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: checkStatus, hold, sendBack });
         const post = payload => {
           try {
             const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, pr: input.pr, headSha: head, payload, gh,

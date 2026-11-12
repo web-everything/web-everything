@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
-import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
 import { redTeamCheckRunIsEvidence } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
@@ -2066,7 +2067,7 @@ export function renderRedTeamSummary(r) {
 }
 
 /** The red team's effects: the added seats' io, plus the Claude re-check, the head message and the PR comment. */
-export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus,
+export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus, sealResult = null,
   readCompleteComments = ({ pr, repo }) => readCompletePrComments(pr, { repo,
     exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }), ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
@@ -2077,6 +2078,16 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     if (r.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} failed: ${String(r.stderr || r.error?.message || '').trim().slice(0, 300)}`);
     return String(r.stdout ?? '');
   };
+  // Seal at finish (#6535, operator ruling R907): the finished result's stored evidence is sealed by the shared
+  // publisher in seal-only mode (it never posts or escalates here; the sweep still posts an unposted comment), so the
+  // red-team check written once at finish reads the sealed breaks, not an unsealed bare `ran`.
+  const sealFinished = sealResult ?? (({ repo, pr, head }) => publishStoredRedTeamResult({
+    status: { repo, pr, head }, sealOnly: true, statusDir: redTeamStatusDir(env),
+    listComments: () => readCompleteComments({ pr, repo }),
+    postComment: () => { throw Error('seal at finish never posts'); },
+    readSeatRow: key => priorRedTeamRow(readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records,
+      key.pr, key.head, key.repo),
+  }));
   return {
     ...base,
     readRecords: ({ strict = false } = {}) => strict
@@ -2084,7 +2095,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
     readRecoveryComments: readCompleteComments,
     redTeamStatus: input => {
-      const outcome = recordStatus(input, { env });
+      const outcome = recordStatus(input, { env, sealFinished });
       if (input.status === 'running' && outcome?.published !== true && checkRunIsEvidence(env, base.log))
         throw new Error(`red-team in_progress check not published: ${String(outcome?.reason ?? 'publication not confirmed').slice(0, 300)}`);
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,

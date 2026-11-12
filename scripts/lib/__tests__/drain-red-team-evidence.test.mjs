@@ -12,6 +12,8 @@ import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
+import { publishStoredRedTeamResult } from '../red-team-withheld-publish.mjs';
+import { RED_TEAM_UNSEALED_HOLD_PREFIX } from '../drain-red-team-evidence.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -22,6 +24,19 @@ function fixture() {
   return { repo: 'web-everything/web-everything', pr: 5439, head: 'b'.repeat(40), runsDir,
     readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
 }
+const cleanResultComment = f => ({ author: { login: 'web-everything' }, body:
+  `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` });
+// Seal at finish (#6535, operator ruling R907): the seat's sealer is the shared publisher in seal-only mode over the
+// exact-head seat row. This one runs it for real over a fixture row and thread.
+const seatRow = (head, findings = []) => ({ rev: head, findings, provider: 'fixture', model: 'fixture', callId: 'c',
+  foldedVerdict: findings.some(x => x.confirmedByRecheck) ? 'changes' : 'accept',
+  confirmedMissCount: findings.filter(x => x.confirmedByRecheck).length });
+const sealAtFinish = (f, { findings = [], comments = [cleanResultComment(f)], calls = [] } = {}) => key => {
+  calls.push(key);
+  return publishStoredRedTeamResult({ status: key, sealOnly: true, statusDir: redTeamStatusDir(f.env),
+    listComments: () => comments, postComment: () => { throw Error('seal at finish never posts'); },
+    readSeatRow: () => seatRow(key.head, findings), publishNeedsYou: () => {} });
+};
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
 describe('status persistence and check publication share one claim', () => {
@@ -77,7 +92,7 @@ describe('status persistence and check publication share one claim', () => {
   ])('a finished clean red team ignores %s labels but preserves explicit send-back failure', (_name, labels) => {
     const f = fixture(), checks = [];
     const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' };
-    const options = { env: f.env, log: () => {},
+    const options = { env: f.env, log: () => {}, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
         `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels }),
@@ -91,10 +106,73 @@ describe('status persistence and check publication share one claim', () => {
     ]);
   });
 
+  // Operator ruling R907 (#6535): seal at finish. The check is written ONCE, from the sealed result; a bare `ran` result
+  // never publishes FAILURE; nothing re-publishes it later.
+  describe('seal at finish (R907)', () => {
+    const finishOptions = (f, checks, extra = {}) => ({ env: f.env, log: () => {}, comments: [cleanResultComment(f)],
+      gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
+      postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; }, ...extra });
+    const finished = f => ({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' });
+
+    it('a clean bare `ran` is sealed under the claim, then its check is written once as success', () => {
+      const f = fixture(), checks = [], calls = [];
+      expect(recordRedTeamStatus(finished(f), finishOptions(f, checks, { sealFinished: sealAtFinish(f, { calls }) })))
+        .toEqual({ published: true });
+      expect(calls).toEqual([{ repo: f.repo, pr: f.pr, head: f.head }]);
+      expect(readRedTeamStatus(f)).toMatchObject({ status: 'finished', result: 'ran', sealedBreaks: [] });
+      expect(checks).toHaveLength(1);
+      expect(checks[0]).toMatchObject({ status: 'completed', conclusion: 'success', head_sha: f.head });
+      expect(readRedTeamPublicationHold(f)).toBeNull();
+    });
+
+    it('a sealed confirmed break is written once as failure (send-back), never cleared by a clean-looking thread', () => {
+      const f = fixture(), checks = [];
+      const findings = [{ category: 'correctness', file: 'a.mjs', line: 3, summary: 'breaks x', confirmedByRecheck: true }];
+      recordRedTeamStatus(finished(f), finishOptions(f, checks, { comments: [],
+        sealFinished: sealAtFinish(f, { findings, comments: [] }) }));
+      expect(readRedTeamStatus(f).sealedBreaks).toHaveLength(1);
+      expect(checks).toHaveLength(1);
+      expect(checks[0]).toMatchObject({ status: 'completed', conclusion: 'failure',
+        output: { summary: expect.stringMatching(/confirmed a break/) } });
+    });
+
+    it.each([
+      ['no sealer', () => ({})],
+      ['a sealer that throws', () => ({ sealFinished: () => { throw Error('seat row unreadable'); } })],
+      ['a sealer that cannot read the thread', f => ({ sealFinished: key => publishStoredRedTeamResult({ status: key,
+        sealOnly: true, statusDir: redTeamStatusDir(f.env), listComments: () => { throw Error('HTTP 502'); }, postComment: () => {} }) })],
+    ])('an unsealed bare `ran` (%s) never publishes FAILURE: its one check stays in progress and still holds', (_label, extra) => {
+      const f = fixture(), checks = [];
+      expect(recordRedTeamStatus(finished(f), finishOptions(f, checks, extra(f)))).toEqual({ published: true });
+      expect(readRedTeamStatus(f).sealedBreaks).toBeUndefined();
+      expect(checks).toHaveLength(1);
+      expect(checks[0].status).toBe('in_progress');
+      expect(checks[0]).not.toHaveProperty('conclusion');
+      expect(checks[0].output.summary).toContain(RED_TEAM_UNSEALED_HOLD_PREFIX);
+      // In progress is not a pass: merge-gate still holds the head.
+      expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId: 5037855,
+        checkRuns: [{ ...checks[0], id: 1, app: { id: 5037855 } }] }).ok).toBe(false);
+    });
+
+    it('an explicit send-back on an unsealed result still publishes FAILURE (only "not sealed" is downgraded)', () => {
+      const f = fixture(), checks = [];
+      recordRedTeamStatus({ ...finished(f), sendBack: true }, finishOptions(f, checks));
+      expect(checks).toMatchObject([{ status: 'completed', conclusion: 'failure' }]);
+    });
+
+    it('pins the unsealed-hold prefix to the gate\'s own wording', () => {
+      const f = fixture();
+      recordRedTeamStatus(finished(f), { env: f.env });
+      const hold = redTeamEnqueueHold({ ...finished(f), head: f.head, comments: [cleanResultComment(f)], scheduled: true,
+        recorded: true, env: f.env });
+      expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
+    });
+  });
+
   it('successful completion followed by failed publication of a terminal failure keeps the hold and attempts the failure supersede', () => {
     const f = fixture(), appId = 5037855, runs = [], attempts = [];
     const input = { ...f, loopPayload: payload(f.head), status: 'finished' };
-    const options = { env: f.env, log: () => {},
+    const options = { env: f.env, log: () => {}, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
         `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
@@ -160,7 +238,7 @@ describe('status persistence and check publication share one claim', () => {
     const f = fixture(), appId = 5037855, runs = [], attempts = [], logs = [];
     const input = { ...f, loopPayload: payload(f.head) };
     const options = {
-      env: f.env,
+      env: f.env, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
         `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
@@ -319,7 +397,7 @@ describe('status persistence and check publication share one claim', () => {
     };
     const newerOptions = { env: f.env, gh: () => '', postCheckRun: publish };
     recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, {
-      env: f.env,
+      env: f.env, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
         `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
