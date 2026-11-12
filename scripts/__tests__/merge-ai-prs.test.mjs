@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +18,74 @@ import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
+
+describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
+  const clean = { decision: 'skip', state: 'BEHIND', mergeable: 'MERGEABLE', hasManifest: false,
+    certifyLabel: true, aiGenerated: false, testGreen: true };
+
+  it('is true for behind + clean + certified + green, including AI certification', () => {
+    expect(isBehindButClean(clean)).toBe(true);
+    expect(isBehindButClean({ ...clean, certifyLabel: false, aiGenerated: true })).toBe(true);
+  });
+
+  it.each([
+    ['CONFLICTING', { mergeable: 'CONFLICTING' }],
+    ['DIRTY', { state: 'DIRTY' }],
+    ['hasManifest', { hasManifest: true }],
+    ['uncertified', { certifyLabel: false, aiGenerated: false }],
+    ['not testGreen', { testGreen: false }],
+    ['already merge', { decision: 'merge' }],
+    ['off default base', { offDefaultBase: true }],
+    ['unknown mergeability', { mergeable: 'UNKNOWN' }],
+    ['unknown state', { state: 'UNKNOWN' }],
+    ['invalid manifest evidence', { hasManifest: null }],
+    ['invalid green evidence', { testGreen: 'true' }],
+    ['invalid certification evidence', { certifyLabel: 'true' }],
+  ])('is false for %s', (_name, patch) => {
+    expect(isBehindButClean({ ...clean, ...patch })).toBe(false);
+  });
+
+  it.each(['decision', 'state', 'mergeable', 'hasManifest', 'certifyLabel', 'testGreen'])('fails closed with missing %s', key => {
+    const incomplete = { ...clean };
+    delete incomplete[key];
+    expect(isBehindButClean(incomplete)).toBe(false);
+  });
+
+  it('fails closed with missing verdict fields', () => {
+    for (const v of [undefined, null, {}]) expect(isBehindButClean(v)).toBe(false);
+  });
+});
+
+describe('resolveRebaseBeforeEnqueue — setting and provenance', () => {
+  it('defaults to conflict-only from the standard', () => {
+    expect(resolveRebaseBeforeEnqueue({})).toEqual({ value: 'conflict-only', source: 'standard' });
+  });
+
+  it.each(['conflict-only', 'always'])('environment override selects %s over settings', value => {
+    expect(resolveRebaseBeforeEnqueue({ WE_DRAIN_REBASE_BEFORE_ENQUEUE: value }, {
+      platform: { rebaseBeforeEnqueue: 'always' }, tool: { rebaseBeforeEnqueue: 'always' },
+    })).toEqual({ value, source: 'env' });
+  });
+
+  it('resolves platform then tool settings before environment', () => {
+    const platform = { rebaseBeforeEnqueue: 'always' };
+    expect(resolveRebaseBeforeEnqueue({}, { platform })).toEqual({ value: 'always', source: 'platform' });
+    expect(resolveRebaseBeforeEnqueue({}, { platform, tool: { rebaseBeforeEnqueue: 'conflict-only' } }))
+      .toEqual({ value: 'conflict-only', source: 'tool' });
+  });
+
+  it.each(['invalid', '', null, false, 1, 'always\n', 'x'.repeat(10000)])('invalid environment value %# fails closed to always with visible provenance', value => {
+    expect(resolveRebaseBeforeEnqueue({ WE_DRAIN_REBASE_BEFORE_ENQUEUE: value }))
+      .toEqual({ value: 'always', source: 'env (invalid; fail closed to always)' });
+  });
+
+  it.each(['platform', 'tool'])('invalid %s setting, including object values, fails closed to always', source => {
+    for (const value of ['invalid', null, {}, { nested: 'conflict-only' }, ['conflict-only']]) {
+      expect(resolveRebaseBeforeEnqueue({}, { [source]: { rebaseBeforeEnqueue: value } }))
+        .toEqual({ value: 'always', source: `${source} (invalid; fail closed to always)` });
+    }
+  });
+});
 
 describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
   const reason = 'branch is BEHIND main — rebase needed';

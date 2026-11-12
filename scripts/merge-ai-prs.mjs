@@ -1344,6 +1344,24 @@ export function isRebaseDropCandidate(v) {
   return mergeable === 'CONFLICTING' || state === 'BEHIND' || state === 'DIRTY';
 }
 
+/** Pure: only complete, clean evidence permits retaining a BEHIND head for the merge queue. */
+export function isBehindButClean(v) {
+  return isRebaseDropCandidate(v) && v.state === 'BEHIND' && v.mergeable === 'MERGEABLE'
+    && v.hasManifest === false && v.testGreen === true && (v.certifyLabel === true || v.aiGenerated === true);
+}
+
+/** Pure: injected settings layers keep IO outside the resolver; invalid values retain the legacy rebase path. */
+export function resolveRebaseBeforeEnqueue(env = {}, { platform, tool } = {}) {
+  const checked = value => value === undefined || ['conflict-only', 'always'].includes(value) ? value : 'invalid';
+  const r = resolveCascade({
+    standard: 'conflict-only', platform: checked(platform?.rebaseBeforeEnqueue), tool: checked(tool?.rebaseBeforeEnqueue),
+    envValues: { '': checked(env?.WE_DRAIN_REBASE_BEFORE_ENQUEUE) },
+  });
+  const value = r.value, source = r.sources[''];
+  return ['conflict-only', 'always'].includes(value) ? { value, source }
+    : { value: 'always', source: `${source} (invalid; fail closed to always)` };
+}
+
 /**
  * #x5e2ldj — shell the SINGLE HOME to re-stamp. IO. Never throws: the caller treats a failure as "it may
  * re-park", which is exactly the behaviour that existed before this, so a broken re-stamp can only fail to
@@ -5378,6 +5396,10 @@ async function runCli() {
   };
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
+  const rebaseBeforeEnqueue = resolveRebaseBeforeEnqueue(process.env, {
+    platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
+  });
+  if (!AS_JSON) process.stderr.write(`  rebase-before-enqueue: ${rebaseBeforeEnqueue.value} (${rebaseBeforeEnqueue.source})\n`);
   const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false } = {}) => {
     // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
@@ -5882,6 +5904,13 @@ async function runCli() {
           && classifyPr(retainApprovedHumanQueueHead(pr, { hold: true, queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(v.repo) }), { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge') {
           v.decision = 'merge'; v.reason = 'approved human head retained for merge queue';
         }
+        continue;
+      }
+      if (rebaseBeforeEnqueue.value === 'conflict-only' && mergeStrategy.queueOwnsFreshness(v.repo) && isBehindButClean(v)) {
+        v.decision = 'merge';
+        v.reason = 'behind main but clean; merge queue tests PR + main - enqueued on its existing head';
+        v.rebaseDrop = 'skipped-behind-clean';
+        if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} ${v.reason}\n`);
         continue;
       }
 
