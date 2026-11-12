@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
@@ -172,6 +172,14 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     expect(result).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
     expect(result.stderr).toContain('stray-cache.tmp');
     expect(result.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f]/);
+  });
+  it('does not deny a clean clone whose index stat data is stale (chmod after sync changes ctime)', () => {
+    const f = fixture();
+    const target = join(f.clone, 'scripts/guard-bash.mjs');
+    f.git(f.clone, 'update-index', '--refresh', '-q');
+    chmodSync(target, 0o444);
+    chmodSync(target, 0o644);
+    expect(f.launch()).toMatchObject({ status: 0 });
   });
   it('denies a clean local commit ahead of origin/main', () => {
     const f = fixture();
