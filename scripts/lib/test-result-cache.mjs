@@ -13,7 +13,8 @@
  * The closure reuses `related-test-selection.mjs#resolveSpecifier`, so "what a test imports" has one definition.
  * Trace retention: runs older than 3 days are removed, then oldest eligible runs until below 15 GiB.
  * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override those limits. Active runs and runs
- * younger than 6 hours are protected, as are runs whose owner PID is alive or cannot be checked.
+ * younger than 6 hours are protected. A different run that is alive but idle over 6 hours is NOT yet protected
+ * (owner-PID liveness is a follow-up card).
  * Key contexts prune at most hourly, only for enabled cache runs.
  */
 import { createHash } from 'node:crypto';
