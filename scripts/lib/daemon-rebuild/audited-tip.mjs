@@ -20,10 +20,13 @@ export function makeAuditedTipGate(env = process.env) {
         }
       } catch { /* unaudited-tip: unreadable evidence never authorizes a moving tip. */ }
     }
-    return typeof sha === 'string' && records.some((r) => r?.ref === ref
-      && typeof r.sha === 'string' && r.sha.toLowerCase() === sha.toLowerCase()
-      && r.tests === 'green'
+    // The LATEST record for this exact ref+sha decides: a later red/WEAKENED record revokes earlier green evidence.
+    const mine = typeof sha === 'string' ? records.filter((r) => r?.ref === ref
+      && typeof r.sha === 'string' && r.sha.toLowerCase() === sha.toLowerCase()) : [];
+    const r = mine[mine.length - 1];
+    return !!r && r.tests === 'green'
       && (typeof r.audit === 'string' && /^NOT WEAKENED$/i.test(r.audit)
-        || r.audit === 'WEAKENED' && typeof r.auditRuling === 'string' && r.auditRuling.trim().length > 0));
+        || r.audit === 'WEAKENED' && typeof r.auditRuling === 'string' && /R\d+/.test(r.auditRuling)
+          && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0);
   };
 }

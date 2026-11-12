@@ -547,9 +547,12 @@ export async function planRebuild({
     }
     // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence.
     const adoptedTip = adoptedTips.get(ref);
+    let unauditedFrom = null;
     if (typeof auditedTip === 'function' && adoptedTip && adoptedTip !== ovSha
-      && !establishedRefs.has(ref) && !auditedTip(ref, ovSha)) {
+      && !establishedRefs.has(ref) && git(['merge-base', '--is-ancestor', ovSha, mainSha]).status !== 0
+      && !auditedTip(ref, ovSha)) {
       const newTip = ovSha;
+      unauditedFrom = newTip;
       ovSha = adoptedTip;
       alerts.push({
         kind: 'overlay-unaudited-tip',
@@ -708,7 +711,7 @@ export async function planRebuild({
     }
     cur = newSha;
     const edge = resolution?.edgeSha ? { edgeSha: resolution.edgeSha } : {};
-    applied.push({ ref, pr, sha: ovSha, ...(resolution?.ok ? { resolvedVia: resolution.via, ...edge } : {}) });
+    applied.push({ ref, pr, sha: ovSha, ...(unauditedFrom ? { pinnedFrom: unauditedFrom } : {}), ...(resolution?.ok ? { resolvedVia: resolution.via, ...edge } : {}) });
     decisions.push({ ref, pr, action: 'apply', reason: resolution?.ok ? `applied-${resolution.via}` : 'applied', sha: ovSha });
     if (resolution?.ok) alerts.push({ kind: 'overlay-conflict-resolved', detail: { ref, pr, via: resolution.via, ...edge } });
   }

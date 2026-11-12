@@ -65,7 +65,7 @@ describe('unaudited-tip plans', () => {
     const f = await fixture();
     const p = await f.plan({ noPin: new Set([ref]) });
     expect(p.ok).toBe(true);
-    expect(p.applied).toEqual([{ ref, pr: 42, sha: f.a }]);
+    expect(p.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
     expect(p.alerts).toContainEqual({ kind: 'overlay-unaudited-tip', detail: {
       ref, pr: 42, adopted: f.a, newTip: f.b,
       message: `overlay ${ref} keeps its audited adopted head ${f.a.slice(0, 10)}: new tip ${f.b.slice(0, 10)} has no fix-ready + audit record (unaudited-tip)`,
@@ -102,7 +102,7 @@ describe('unaudited-tip plans', () => {
   it('unreadable evidence fails closed to adopted A', async () => {
     const f = await fixture();
     rmSync(f.path);
-    expect((await f.plan()).applied).toEqual([{ ref, pr: 42, sha: f.a }]);
+    expect((await f.plan()).applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
   });
 });
 
@@ -138,10 +138,19 @@ describe('unaudited-tip evidence and policy', () => {
     f.save(record('abc', extra));
     expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(false);
   });
-  it('accepts WEAKENED only with a non-empty auditRuling string', () => {
+  it('accepts WEAKENED only with an R-number ruling and disclosed findings', () => {
     const f = evidence();
     f.save(record('abc', { audit: 'WEAKENED', auditRuling: 'operator accepted' }));
+    expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(false);
+    f.save(record('abc', { audit: 'WEAKENED', auditRuling: 'R907' }));
+    expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(false);
+    f.save(record('abc', { audit: 'WEAKENED', auditRuling: 'R907', auditDisclosed: ['finding'] }));
     expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(true);
+  });
+  it('a later red record for the same sha revokes earlier green evidence', () => {
+    const f = evidence();
+    f.save(record('abc'), record('abc', { tests: 'red' }));
+    expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(false);
   });
   it('reads lazily once and fails closed on unreadable files', () => {
     const f = evidence();
