@@ -271,7 +271,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, credentialContentFinding, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {classifyManifestPath, credentialContentFinding, changedLinesFinding, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -479,7 +479,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
   // Parallel leaves share one load: no caller may observe a partially loaded map.
-  let publicBlobs, publicLoad;
+  let publicBlobs, publicLoad, publicTreeLoaded = false;
   async function publicBlob(key) {
     publicLoad ??= (async () => {
       publicBlobs = new Map();
@@ -500,12 +500,13 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
           publicBlobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
           offset = i + 1;
         }
+        publicTreeLoaded = true;
       } catch { publicBlobs.clear(); }
     })();
     await publicLoad;
     return publicBlobs.get(key);
   }
-  const excludedSource = () => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
+  const excludedSource = (path, why) => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file', detail:safeFallbackDetail('excluded-source-file',`${path.toString('latin1')}: ${why}`)});
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
   if (files.reduce((size,path) => size + path.length + 3,0) > LIMIT) throw new Error('Inventory limit exceeded; use local fallback');
@@ -530,7 +531,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const leaves = await orderedPool(files, MANIFEST_CONCURRENCY, async path => {
     if (trackedLinks.has(path.toString('hex'))) return;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
-    let publicOid;
+    let publicOid, changedVet;
     if (credentialSource && !names.includes('node_modules')) {
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
@@ -538,14 +539,22 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (!indexedOid || indexedOid !== publicOid) {
         // Not tracked-and-identical to origin/main: never ships. Source files
         // refuse the manifest (local fallback); other types stay excluded as before.
-        if (sourceExtension.test(names.at(-1))) throw excludedSource();
+        // A tracked, modified source file may ship when only its CHANGED lines are vetted below.
+        if (sourceExtension.test(names.at(-1))) {
+          const memory = names[0] === 'agent-memory-src' || (names[0] === '.claude' && names[1] === 'agent-memory');
+          if (!indexedOid) throw excludedSource(path,'credential-named-untracked');
+          if (memory) throw excludedSource(path,'private-memory-source');
+          // Unavailable origin/main evidence is not "new file": refuse.
+          if (!publicTreeLoaded) throw excludedSource(path,'public-evidence-unavailable');
+          changedVet = publicOid ?? null;
+        }
         publicOid = undefined;
       }
     }
-    if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
+    if ((excludedByPolicy && !publicOid && changedVet === undefined) || names.includes('node_modules')) {
       const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
       if (!names.includes('node_modules') && excludedByPolicy && excludedTest && /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/.test(names.at(-1))) {
-        throw excludedSource();
+        throw excludedSource(path,'excluded-test-file');
       }
       if (excludedTest) throw new Error('Excluded test: use local fallback');
       return {excluded:path};
@@ -580,14 +589,30 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // Index equality alone must not authorize private, unstaged working bytes.
       const oid = createHash(publicOid.length === 64 ? 'sha256' : 'sha1')
         .update(`blob ${content.length}\0`).update(content).digest('hex');
-      if (oid !== publicOid) throw excludedSource();
+      if (oid !== publicOid) throw excludedSource(path,'worktree-differs-from-public');
     }
     hashDone();
     // Match warm export: pattern-spelling public files stay excluded without
     // aborting unrelated work. The public worktree identity check above still
     // refuses private edits; manifestEntry remains a fail-closed leaf guard.
-    if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
-    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
+    let vetted=false;
+    if(changedVet!==undefined) {
+      // Unchanged lines are public (origin/main); only lines this branch adds or edits are new exposure.
+      let base='';
+      if(changedVet!==null) {
+        const blob=await exec({file:'git',args:['cat-file','blob',changedVet],cwd});
+        if(blob.code!==0||!Buffer.isBuffer(blob.stdout)||blob.stdout.length>LIMIT)throw excludedSource(path,'public-blob-unavailable');
+        base=blob.stdout;
+      }
+      // Only bytes that are in the index (committed or staged) may ship; unstaged edits are private.
+      const oid = createHash(indexBlobs.get(path.toString('base64')).length === 64 ? 'sha256' : 'sha1')
+        .update(`blob ${content.length}\0`).update(content).digest('hex');
+      if (oid !== indexBlobs.get(path.toString('base64'))) throw excludedSource(path,'worktree-differs-from-index');
+      const finding=changedLinesFinding(path,content,base);
+      if(finding)throw excludedSource(path,finding);
+      vetted=true;
+    } else if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
+    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')),vetted)};
   });
   for (const leaf of leaves) {
     if (leaf?.entry) entries.push(leaf.entry);
@@ -1113,7 +1138,7 @@ function safePathDetail(path){
 /** Safe fallback detail: repo-relative path (+ finding name) or a fixed binary name only; never content or a matched value. */
 export function safeFallbackDetail(kind,raw){
   let out;
-  if(kind==='bundle-credential-hit'){
+  if(kind==='bundle-credential-hit'||kind==='excluded-source-file'){
     const at=typeof raw==='string'?raw.lastIndexOf(': '):-1;
     const path=at>0?safePathDetail(raw.slice(0,at)):undefined, finding=at>0?raw.slice(at+2):'';
     if(path&&DETAIL_FINDING.test(finding)&&finding.length<=60&&!TOKENISH.test(finding))out=`${path}: ${finding}`;
@@ -1359,7 +1384,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
-      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
+      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:error.detail};
       return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {

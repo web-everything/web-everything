@@ -221,11 +221,26 @@ export function classifyManifestPath(path) {
   const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};
 }
-export function manifestEntry(path,content,executable,tracked) {
+// Finding for the lines of `content` that origin/main's `base` lacks (plus 3 lines of context), or null.
+// Fails closed: undecodable bytes, NUL, or an unscannable fragment all return a finding.
+export function changedLinesFinding(path,content,base) {
+  let text,old;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);old=new TextDecoder('utf-8',{fatal:true}).decode(base);}
+  catch {return 'unsupported-text-encoding';}
+  if(text.includes('\0'))return 'unsupported-text-encoding';
+  const split=/\r\n|[\n\r\u0085\u2028\u2029]/,have=new Map();
+  for(const line of old.split(split))have.set(line,(have.get(line)??0)+1);
+  const lines=text.split(split),changed=lines.map(line=>{const n=have.get(line)??0;if(n>0){have.set(line,n-1);return false;}return true;});
+  const near=lines.map((_,i)=>changed.slice(Math.max(0,i-3),i+4).some(Boolean));
+  const window=lines.filter((_,i)=>near[i]).join('\n');
+  if(!window.trim())return null;
+  return credentialContentFinding(path,Buffer.from(window));
+}
+export function manifestEntry(path,content,executable,tracked,vetted=false) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
   if(classifyManifestPath(path).credentialSource) {
-    const finding=tracked?credentialContentFinding(path,content):'untracked';
+    const finding=tracked?(vetted?null:credentialContentFinding(path,content)):'untracked';
     if(finding)throw Object.assign(new Error(`Excluded credential-named file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
   return {path,sha256:sha(content),executable,tracked};

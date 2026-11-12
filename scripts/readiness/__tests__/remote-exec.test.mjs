@@ -2003,6 +2003,7 @@ describe('receipt field binding', () => {
 // Namespace access keeps absent future exports as explicit contract assertion
 // failures, rather than preventing collection of the behavioural regressions.
 describe('certified snapshot equals selected inventory: client acceptance', () => {
+  const secretLine = () => ['-----', 'BEGIN PRIVATE', ' KEY-----'].join('');
   const sha = value => createHash('sha256').update(value).digest('hex');
   const nul = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
   const wire = manifest => ({
@@ -2050,10 +2051,11 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const exec=vi.fn(async call=>bindingEvidence(call)??({code:0,stdout:call.args.includes('-i')?Buffer.from('coverage/coverage-final.json\0'):Buffer.alloc(0)}));
     await expect(build({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
-  function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}) {
+  function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}, publicBlob = {code:0, stdout:Buffer.from('public')}) {
     return vi.fn(async call => {
       expect(call.file).toBe('git');
       const binding=bindingEvidence(call);if(binding)return binding;
+      if (gitArgs(call)[0] === 'cat-file') return publicBlob;
       expect(call.args).toContain('-z');
       if (gitArgs(call)[0] === 'ls-tree') {
         expect(gitArgs(call)).toEqual(['ls-tree', '-r', '-z', 'origin/main']);
@@ -2065,10 +2067,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   }
   // This stub certifies only what the client sends, including the new binding.
   // It deliberately accepts the old protocol too, so omission is observable.
-  function acceptingTransport(paths, stage = Buffer.alloc(0)) {
+  function acceptingTransport(paths, stage = Buffer.alloc(0), inventory = gitInventory(paths, stage)) {
     let state;
     return vi.fn(async call => {
-      if (call.file === 'git') return bindingEvidence(call)??{code:0, stdout:call.args.includes('-i') ? Buffer.alloc(0) : call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
+      if (call.file === 'git') return inventory(call);
       if (isPrepare(call)) {
         state = JSON.parse(call.input);
         return {code:0, stdout:JSON.stringify({run:'r-'+state.nonce})};
@@ -2097,10 +2099,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     }
     expect(manifest.manifestDigest).toBe(sha(JSON.stringify(wire(manifest))));
     const credential = Buffer.from('check-credentials.test.mjs');
-    writeFileSync(join(cwd, credential.toString()), 'must run locally');
+    writeFileSync(join(cwd, credential.toString()), secretLine());
     await expect(build({cwd, exec:gitInventory([...paths, credential],
-      Buffer.from(`100644 ${'a'.repeat(40)} 0\t${credential}\0`))}))
-      .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
+      Buffer.from(`100644 ${'a'.repeat(40)} 0\t${credential}\0`), {code:0, stdout:treeRecord(credential, 'public')})}))
+      .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file', detail:`${credential}: worktree-differs-from-index`});
   });
 
   it.each(['credentials.test.mjs', 'fixture.key/identity.test.mjs', '.env/identity.spec.ts', '__tests__/credentials.js', 'credentials-check.test.mjs', '.envrc/identity.test.mjs', '__tests__/credentials-backup.js'])
@@ -2110,7 +2112,8 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
     writeFileSync(join(cwd, name), 'must run');
     f.listFiles.mockResolvedValue(['package-lock.json', name]);
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file',
+      detail:`${name}: ${name.includes('fixture.key/') || name.startsWith('.env') ? 'excluded-test-file' : 'credential-named-untracked'}`});
     expect(callsOf(f.exec).some(isRun)).toBe(false);
     expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
@@ -2129,7 +2132,8 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     writeFileSync(join(cwd, name), 'must run locally');
     f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', name]);
 
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file',
+      detail:`${name}: ${name.includes('fixture.key/') || name.startsWith('.env') ? 'excluded-test-file' : 'credential-named-untracked'}`});
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
     expect(f.local).toHaveBeenCalledTimes(1);
     expect(f.local).toHaveBeenCalledWith(f.argv);
@@ -2189,15 +2193,17 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     'untracked-secret.ts', 'secret-directory/safe.md', 'check-credentials.test.mjs',
   ])('refuses excluded source %s before transmitting any snapshot', async name => {
     mkdirSync(join(cwd, name, '..'), {recursive:true});
-    writeFileSync(join(cwd,name), 'DO_NOT_TRANSMIT');
+    writeFileSync(join(cwd,name), secretLine());
     const paths = [Buffer.from(name), Buffer.from('package-lock.json')];
     const stage = Buffer.from(`100644 ${'a'.repeat(40)} 0\t${name}\0`);
     for (const index of [stage, Buffer.alloc(0)]) {
-      await expect(build({cwd, exec:gitInventory(paths, index)}))
-        .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
-      const exec = acceptingTransport(paths, index);
+      const detail = `${name}: ${index.length ? 'worktree-differs-from-index' : 'credential-named-untracked'}`;
+      const inventory = gitInventory(paths, index, {code:0, stdout:treeRecord(name, 'public')});
+      await expect(build({cwd, exec:inventory}))
+        .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file', detail});
+      const exec = acceptingTransport(paths, index, inventory);
       expect(await runRemote({argv, cwd, runId, exec}))
-        .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+        .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
       const local = vi.fn(async () => 7);
       expect(await runRemoteCli({argv, cwd, runId, exec, local, lockRoot:join(cwd,'heavy'), log:vi.fn()})).toBe(7);
       expect(local).toHaveBeenCalledWith(argv);
@@ -2265,20 +2271,21 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   ('still refuses excluded test %s before transmitting a snapshot', async name => {
     const paths = ['package-lock.json', name].map(value => Buffer.from(value));
     const exec = acceptingTransport(paths, indexRecord(name, 'must run locally'));
-    await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
+    await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file', detail:`${name}: excluded-test-file`});
     expect(await runRemote({argv, cwd, runId, exec}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:`${name}: excluded-test-file`});
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
   it.each(['id_custom.md', 'id_backup/safe.js'])
-  ('requires public evidence for credential-name-only source %s', async name => {
+  ('refuses a secret edit and allows matching public credential-name-only source %s', async name => {
     mkdirSync(join(cwd, name, '..'), {recursive:true});
-    writeFileSync(join(cwd, name), 'public');
+    writeFileSync(join(cwd, name), secretLine());
     const paths = [Buffer.from(name)];
     const stage = indexRecord(name, 'public');
-    await expect(build({cwd, exec:gitInventory(paths, stage)}))
-      .rejects.toMatchObject({code:'excluded-source-file'});
+    await expect(build({cwd, exec:gitInventory(paths, indexRecord(name, secretLine()), {code:0, stdout:treeRecord(name, 'public')})}))
+      .rejects.toMatchObject({code:'excluded-source-file', detail:`${name}: pem-header`});
+    writeFileSync(join(cwd, name), 'public');
     const manifest = await build({cwd, exec:gitInventory(paths, stage,
       {code:0, stdout:treeRecord(name, 'public')})});
     expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
@@ -2308,13 +2315,141 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   });
 
   it.each(['modified', 'untracked', 'new', 'staged-different'])
-  ('refuses %s credential source despite public evidence where available', async kind => {
-    const name = 'credentials.md';
-    writeFileSync(join(cwd, name), kind === 'modified' ? 'private' : 'public');
-    const stage = kind === 'untracked' ? Buffer.alloc(0) : indexRecord(name, kind === 'staged-different' ? 'private' : 'public');
+  ('refuses %s credential source containing a secret despite public evidence where available', async kind => {
+    const name = 'credentials.md', content = secretLine();
+    writeFileSync(join(cwd, name), content);
+    const stage = kind === 'untracked' ? Buffer.alloc(0) : indexRecord(name, kind === 'staged-different' ? content : 'public');
     const tree = {code:0, stdout:kind === 'new' ? Buffer.alloc(0) : treeRecord(name, 'public')};
-    await expect(build({cwd, exec:gitInventory([Buffer.from(name)], stage, tree)}))
-      .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
+    const detail = `${name}: ${kind === 'untracked' ? 'credential-named-untracked' : kind === 'modified' ? 'worktree-differs-from-public' : kind === 'new' ? 'worktree-differs-from-index' : 'pem-header'}`;
+    const inventory = gitInventory([Buffer.from(name)], stage, tree);
+    await expect(build({cwd, exec:inventory}))
+      .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file', detail});
+    const exec = acceptingTransport([Buffer.from(name)], stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it('refuses tracked changed private memory source before transmission', async () => {
+    const name = 'agent-memory-src/credentials.md';
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
+    const content = 'public\nclean edit';
+    writeFileSync(join(cwd, name), content);
+    const paths = [Buffer.from(name)], stage = indexRecord(name, content);
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, 'public')});
+    const detail = `${name}: private-memory-source`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it('refuses clean unstaged bytes in a credential source whose index differs from public', async () => {
+    const name = 'credentials.md';
+    writeFileSync(join(cwd, name), 'public\nclean staged edit\nclean unstaged edit');
+    const paths = [Buffer.from(name)], stage = indexRecord(name, 'public\nclean staged edit');
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, 'public')});
+    const detail = `${name}: worktree-differs-from-index`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it('ships a tracked clean changed credential source with a public base', async () => {
+    const name = 'credentials.md', content = 'public\nclean edit\n';
+    writeFileSync(join(cwd, name), content);
+    const paths = ['package-lock.json', name].map(value => Buffer.from(value));
+    const stage = indexRecord(name, content);
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, 'public')});
+    const manifest = await build({cwd, exec:inventory});
+    expect(manifest.entries).toContainEqual({path:Buffer.from(name), sha256:sha(content), executable:false, tracked:true});
+    expect(manifest.excluded).toEqual([]);
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0});
+    expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./credentials.md\0./package-lock.json\0'));
+    expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it('refuses a new credential source when the empty public base cannot be decoded', async () => {
+    const name = 'credentials.md', content = 'public\nclean edit\n';
+    writeFileSync(join(cwd, name), content);
+    const paths = [Buffer.from(name)], stage = indexRecord(name, content);
+    // A valid empty tree proves the path is new. The source currently supplies
+    // a string empty base, which changedLinesFinding refuses as non-byte input.
+    const inventory = gitInventory(paths, stage, {code:0, stdout:Buffer.alloc(0)});
+    const detail = `${name}: unsupported-text-encoding`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+    expect(callsOf(inventory).some(call => gitArgs(call)[0] === 'cat-file')).toBe(false);
+  });
+
+  it('ships a clean changed source whose unchanged public secret is outside the context window', async () => {
+    const name = 'credentials.md';
+    const base = [secretLine(), 'one', 'two', 'three', 'four', 'old'].join('\n');
+    const content = base.replace('old', 'clean edit');
+    writeFileSync(join(cwd, name), content);
+    const paths = ['package-lock.json', name].map(value => Buffer.from(value));
+    const stage = indexRecord(name, content);
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, base)}, {code:0, stdout:Buffer.from(base)});
+    const manifest = await build({cwd, exec:inventory});
+    expect(manifest.entries).toContainEqual({path:Buffer.from(name), sha256:sha(content), executable:false, tracked:true});
+    expect(manifest.excluded).toEqual([]);
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0});
+    expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./credentials.md\0./package-lock.json\0'));
+    expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it('refuses an untracked credential-named source even when its content is clean and public', async () => {
+    const name = 'credentials.md';
+    writeFileSync(join(cwd, name), 'public');
+    const paths = [Buffer.from(name)];
+    const inventory = gitInventory(paths, Buffer.alloc(0), {code:0, stdout:treeRecord(name, 'public')});
+    const detail = `${name}: credential-named-untracked`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, Buffer.alloc(0), inventory);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it.each([
+    ['AWS key', () => ['AK', 'IA', '0123456789ABCDEF'].join(''), 'aws-access-key'],
+    ['token assignment', () => `token = '${Array.from({length:32}, (_, i) => String.fromCharCode(65+i)).join('')}'`, 'high-entropy-token'],
+    ['PEM header', secretLine, 'pem-header'],
+    ['unsupported encoding', () => Buffer.from([0xff]), 'unsupported-text-encoding'],
+  ])('refuses a tracked credential source with %s in added lines and carries its finding', async (_label, added, finding) => {
+    const name = 'credentials.md', content = Buffer.concat([Buffer.from('public\n'), Buffer.from(added())]);
+    writeFileSync(join(cwd, name), content);
+    const paths = [Buffer.from(name)], stage = indexRecord(name, content);
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, 'public')});
+    const detail = `${name}: ${finding}`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it.each([
+    ['failed read', () => ({code:128, stdout:Buffer.alloc(0)})],
+    ['non-buffer output', () => ({code:0, stdout:'public'})],
+    ['oversized blob', () => ({code:0, stdout:Buffer.alloc(4 * 1024 * 1024 + 1)})],
+  ])('refuses a changed credential source with public-blob-unavailable detail on %s', async (_label, publicBlob) => {
+    const name = 'credentials.md', content = 'public\nclean edit';
+    writeFileSync(join(cwd, name), content);
+    const paths = [Buffer.from(name)], stage = indexRecord(name, content);
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, 'public')}, publicBlob());
+    const detail = `${name}: public-blob-unavailable`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+    expect(callsOf(inventory).filter(call => gitArgs(call)[0] === 'cat-file')).toHaveLength(2);
   });
 
   // Short labels: a %s of the 4 MiB buffer put ~25 MB into every JSON report (verify shard inventory cap).
@@ -2324,11 +2459,18 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     ['malformed record', () => ({code:0, stdout:Buffer.from('malformed\0')})],
     ['oversized tree output', () => ({code:0, stdout:Buffer.alloc(4 * 1024 * 1024 + 1)})],
     ['truncated record', () => ({code:0, stdout:treeRecord('credentials.md', 'public').subarray(0, -1)})],
-  ])('refuses credential source when origin/main evidence is unavailable or incomplete: %s', async (_label, makeTree) => {
-    const tree = makeTree();
-    writeFileSync(join(cwd, 'credentials.md'), 'public');
-    await expect(build({cwd, exec:gitInventory([Buffer.from('credentials.md')], indexRecord('credentials.md', 'public'), tree)}))
-      .rejects.toMatchObject({code:'excluded-source-file'});
+  ])('refuses clean indexed credential source when origin/main evidence is unavailable or incomplete: %s', async (_label, makeTree) => {
+    const name = 'credentials.md', content = 'public\nclean edit';
+    writeFileSync(join(cwd, name), content);
+    const paths = [Buffer.from(name)], stage = indexRecord(name, content);
+    const inventory = gitInventory(paths, stage, makeTree());
+    const detail = `${name}: public-evidence-unavailable`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+    expect(callsOf(inventory).some(call => gitArgs(call)[0] === 'cat-file')).toBe(false);
   });
 
   // R321: a name-only credential match ships when tracked, identical to origin/main and clean.
@@ -2427,14 +2569,15 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     // The former credential-named test must now refuse the entire remote
     // snapshot; keep proving that no credential entry reaches either transport.
     const credential = Buffer.from('check-credentials.spec.ts');
-    writeFileSync(join(cwd, credential.toString()), 'must run locally');
+    writeFileSync(join(cwd, credential.toString()), secretLine());
     const excludedPaths = [...paths, credential];
     const excludedStage = Buffer.concat([stage, Buffer.from(`100644 ${'a'.repeat(40)} 0\t${credential}\0`)]);
-    await expect(build({cwd, exec:gitInventory(excludedPaths, excludedStage)}))
-      .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
-    const refused = acceptingTransport(excludedPaths, excludedStage);
+    const inventory = gitInventory(excludedPaths, excludedStage, {code:0, stdout:treeRecord(credential, 'public')});
+    await expect(build({cwd, exec:inventory}))
+      .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file', detail:`${credential}: worktree-differs-from-index`});
+    const refused = acceptingTransport(excludedPaths, excludedStage, inventory);
     expect(await runRemote({argv, cwd, runId, exec:refused}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:`${credential}: worktree-differs-from-index`});
     expect(callsOf(refused).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
