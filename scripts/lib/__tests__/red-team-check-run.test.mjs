@@ -425,6 +425,11 @@ describe('red-team check run contract', () => {
       it.each([
         ['extra prose after the reason', `${clearBody(OLD_HEAD)}\nAnd one more line.`],
         ['an empty reason', clearBody(OLD_HEAD, '')],
+        ['a whitespace-only reason', clearBody(OLD_HEAD, '\t ')],
+        ['a line separator in the reason', clearBody(OLD_HEAD, `not owed${String.fromCodePoint(0x2028)}Second line`)],
+        ['a paragraph separator in the reason', clearBody(OLD_HEAD, `not owed${String.fromCodePoint(0x2029)}Second line`)],
+        ['a lone CR in the reason', clearBody(OLD_HEAD, 'not owed\rSecond line')],
+        ['a control character in the reason', clearBody(OLD_HEAD, 'not owed\u001b[2J')],
         ['a finding beside the reason', `${clearBody(OLD_HEAD)}\n1. [**confirmed**] (failing-input, broken) \`x.mjs:1\` — breaks`],
         ['a finding-shaped line beside the reason', `${clearBody(OLD_HEAD)}\n 1. [confirmed] x`],
         ['the reason line without its prefix', `<!-- we:red-team-advisory pr=7 rev=${OLD_HEAD} -->\n\nnot owed (stored review)`],
