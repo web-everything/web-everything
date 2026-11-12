@@ -13,11 +13,13 @@ const repo = 'web-everything/web-everything';
 const d = { prNumber: 3209, headRefName: 'lane/model-routing', headSha: sha };
 const pr = { state: 'open', mergeable: true, head: { sha, ref: d.headRefName, repo: { full_name: repo } }, base: { ref: 'main' } };
 function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, checkClaim = () => null,
-  env = { GH_TOKEN: 'ghp_test-secret' } } = {}) {
+  env = { GH_TOKEN: 'ghp_test-secret' }, runs = [] } = {}) {
   const calls = [];
   const exec = vi.fn((cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     if (cmd === 'gh') {
+      if (args.includes('-X')) return '';
+      if (args[1].includes('/actions/runs')) return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
       expect(args).toEqual(['api', `repos/${repo}/pulls/3209`]);
       return JSON.stringify(live);
     }
@@ -96,10 +98,27 @@ describe('missing-run PR-event recovery', () => {
     // A fetch race is transient (deferred, free). A marked tip is terminal: a counted failure so the cap can hand it off.
     const race = fixture({ fetched: next });
     expect(race.result.deferred).toBe(true);
-    const marked = fixture({ message: `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old` });
+    const marked = fixture({ message: `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`, runs: [{ path: '.github/workflows/ci.yml' }] });
     expect(marked.result).toMatchObject({ ok: false, error: expect.stringContaining('needs ci-heal') });
     expect(marked.result.deferred).toBeUndefined();
     for (const { calls } of [race, marked]) expect(calls.some(c => c.args.includes('push') || c.args.includes('commit-tree'))).toBe(false);
+  });
+  it('dispatches ci.yml ONCE for a marked head that still has no CI run, never a second empty commit', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const fresh = fixture({ message: msg, runs: [{ path: '.github/workflows/review-gate.yml' }] });
+    expect(fresh.result).toMatchObject({ ok: true, action: 'pull-request-push', dispatched: true });
+    const post = fresh.calls.find(c => c.cmd === 'gh' && c.args.includes('-X'));
+    expect(post.args).toContain(`repos/${repo}/actions/workflows/ci.yml/dispatches`);
+    expect(post.args).toContain(`ref=${d.headRefName}`);
+    expect(fresh.calls.some(c => c.args.includes('push') || c.args.includes('commit-tree'))).toBe(false);
+    // A queued/pending CI run already on the head is left alone.
+    const pending = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', status: 'queued' }] });
+    expect(pending.result.ok).toBe(false);
+    expect(pending.calls.some(c => c.args.includes('-X'))).toBe(false);
+    // Incomplete run evidence or a claim taken meanwhile fails closed.
+    const claimed = fixture({ message: msg, checkClaim: vi.fn().mockReturnValueOnce(null).mockReturnValue({ message: 'held' }) });
+    expect(claimed.result.deferred).toBe(true);
+    expect(claimed.calls.some(c => c.args.includes('-X'))).toBe(false);
   });
   it('reports a stacked or fork PR as a counted failure (not a free deferral) and never pushes', () => {
     const stacked = fixture({ live: { ...pr, base: { ref: 'lane/other' } } });
