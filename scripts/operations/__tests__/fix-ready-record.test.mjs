@@ -356,6 +356,22 @@ describe('fix-ready-record', () => {
     const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => Date.parse('2026-11-10T13:00:00.000Z') });
     expect(r.record.at).toBe('2026-11-10T13:00:00.000Z');
   });
+  it('still writes when one ref has accumulated 150,000 records (the latest-`at` scan must not spread them into Math.max)', () => {
+    const file = tmp();
+    const at = '2026-11-10T12:00:00.000Z';
+    const line = JSON.stringify({ ref, sha: 'a'.repeat(40), tests: 'green', audit: 'NOT WEAKENED', at });
+    writeFileSync(file, `${Array.from({ length: 150_000 }, () => line).join('\n')}\n`);
+    // Plain node overflows the stack at this size; the test worker's stack is larger, so cap the argument count too.
+    const realMax = Math.max;
+    vi.spyOn(Math, 'max').mockImplementation((...xs) => {
+      if (xs.length > 1000) throw new RangeError('Maximum call stack size exceeded');
+      return realMax(...xs);
+    });
+    const r = writeReadyRecord({ ...base, audit: 'NOT WEAKENED' }, { file, now: () => Date.parse(at) - 3_600_000 });
+    expect(r.ok).toBe(true);
+    expect(r.record.at).toBe(at); // still never below the ref's latest `at`
+    expect(readFileSync(file, 'utf8').trimEnd().split('\n')).toHaveLength(150_001);
+  });
   it('passes a NOT WEAKENED record through the reader as ready-record', () => {
     const r = buildReadyRecord({ ...base, audit: 'NOT WEAKENED' });
     expect(readyEvidence([r.record], { branch: ref, sha }, []).source).toBe('ready-record');

@@ -228,7 +228,14 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
     // The reader keeps, per ref, the line with the greatest `at` (a tie goes to the later line). Stamp under the lock
     // and never go below the ref's latest `at` already in the ledger, so a clock step back, skew between machines or
     // two writers racing cannot make this newer record lose to an older one.
-    const priorAt = Math.max(-Infinity, ...jsonLines(locked.text).filter((r) => r && r.ref === ref && typeof r.at === 'string').map((r) => Date.parse(r.at)).filter(Number.isFinite));
+    // A running maximum, never `Math.max(...all)`: the ledger is append-only, so a ref's history has no size limit
+    // and spreading it into arguments overflows the call stack.
+    let priorAt = -Infinity;
+    for (const r of jsonLines(locked.text)) {
+      if (!r || r.ref !== ref || typeof r.at !== 'string') continue;
+      const t = Date.parse(r.at);
+      if (Number.isFinite(t) && t > priorAt) priorAt = t;
+    }
     const record = { ...built.record, at: new Date(Math.max(clockMs, priorAt)).toISOString() };
     const fd = fsApi.openSync(file, 'a');
     try {
