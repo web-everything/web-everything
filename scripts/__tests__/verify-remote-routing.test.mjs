@@ -928,9 +928,10 @@ describe('R332: scan phases and whole-gate chains route to Forge', () => {
   ])('keeps a chain with an ineligible segment local: %s', command => {
     expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
-  it('keeps the always-run guard (json report read locally) and soak (--config) local', () => {
+  it('routes the always-run guard remote (report copied back locally) and keeps soak (--config) local', () => {
+    const guard = "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000";
+    expect(phaseAdmissionPlan({ command: guard, decision: remote })).toMatchObject({ takeLocalSlot: false, setHeld: false });
     for (const command of [
-      "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000",
       'npx vitest run --config vitest.soak.config.ts scripts/conveyor/soak/breaks/x.soak.test.mjs',
     ]) expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
