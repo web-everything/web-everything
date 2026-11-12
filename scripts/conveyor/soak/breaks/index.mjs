@@ -38,6 +38,7 @@
  * `rebuild-adopt-only-lease.mjs` registers the R830 adopt-only build lease break through discovery.
  * `red-team-renamed-host-dead-owner-never-reaped.mjs` uses the same automatic registration.
  * `await-verify-delivered-previous-ci-never-retired.mjs` uses the same automatic registration.
+ * `hung-ci-completed-run-reselect.mjs` uses the same automatic registration.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and
