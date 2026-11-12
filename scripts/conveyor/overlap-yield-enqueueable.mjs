@@ -73,7 +73,7 @@ export function filterEnqueueableOverlapRows({ openPrRows = [], verdicts = [], l
     if (requiresLandable) {
       const labels = new Set((Array.isArray(row.labels) ? row.labels : []).map((label) => typeof label === 'string' ? label : label?.name));
       if (!row.requiredCheckGreen || !labels.has('ready-to-merge')
-        || ['blocked', 'ci:failed', 'review:changes'].some((label) => labels.has(label))) return false;
+        || ['blocked', 'ci:failed', 'review:changes', 'red-team:pending', 'red-team:blocked', 'review:human'].some((label) => labels.has(label))) return false;
     }
     const verdict = byKey.get(overlapRowKey({ ...row, repo: row.repo || localSlug }));
     return !enabled || !verdict || verdict.decision === 'merge';
