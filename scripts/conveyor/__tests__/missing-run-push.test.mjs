@@ -13,17 +13,20 @@ const repo = 'web-everything/web-everything';
 const d = { prNumber: 3209, headRefName: 'lane/model-routing', headSha: sha };
 const pr = { state: 'open', mergeable: true, head: { sha, ref: d.headRefName, repo: { full_name: repo } }, base: { ref: 'main' } };
 function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, checkClaim = () => null,
-  env = { GH_TOKEN: 'ghp_test-secret' }, runs = [], failDispatch = false, ...rest } = {}) {
+  env = { GH_TOKEN: 'ghp_test-secret' }, runs = [], failDispatch = false, listing, liveAtDispatch, ...rest } = {}) {
   const calls = [];
+  let prReads = 0;
   // Hermetic by default: never touch the real state root. The `reserveDispatch: undefined` key opts into the real one.
   const reserveDispatch = Object.hasOwn(rest, 'reserveDispatch') ? rest.reserveDispatch : (() => true);
   const exec = vi.fn((cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     if (cmd === 'gh') {
       if (args.includes('-X')) { if (failDispatch) throw new Error('secret credential in error'); return ''; }
-      if (args[1].includes('/actions/runs')) return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
+      // `listing` overrides the raw run-listing body (a string is returned verbatim, an object is serialised).
+      if (args[1].includes('/actions/runs')) return typeof listing === 'string' ? listing : JSON.stringify(listing ?? { total_count: runs.length, workflow_runs: runs });
       expect(args).toEqual(['api', `repos/${repo}/pulls/3209`]);
-      return JSON.stringify(live);
+      // The second PR read is the final exact-head re-check right before the dispatch POST.
+      return JSON.stringify(++prReads >= 2 && liveAtDispatch ? liveAtDispatch : live);
     }
     if (args.includes('FETCH_HEAD')) return fetched;
     if (args.includes('show')) return message;
@@ -127,6 +130,57 @@ describe('missing-run PR-event recovery', () => {
     const claimed = fixture({ message: msg, checkClaim: vi.fn().mockReturnValueOnce(null).mockReturnValue({ message: 'held' }) });
     expect(claimed.result.deferred).toBe(true);
     expect(claimed.calls.some(c => c.args.includes('-X'))).toBe(false);
+  });
+  it('fails closed on incomplete or malformed run evidence: deferred, no dispatch, no reservation taken', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const full = Array.from({ length: 100 }, () => ({ path: '.github/workflows/review-gate.yml' }));
+    const some = [{ path: '.github/workflows/review-gate.yml' }];
+    const listings = {
+      'total_count above the runs returned (truncated page)': { total_count: 150, workflow_runs: some },
+      'total_count below the runs returned': { total_count: 0, workflow_runs: some },
+      'a full 100-run page (more may exist)': { total_count: 100, workflow_runs: full },
+      'total_count over the page size': { total_count: 101, workflow_runs: full },
+      'a negative total_count': { total_count: -1, workflow_runs: [] },
+      'a non-integer total_count': { total_count: 1.5, workflow_runs: some },
+      'a string total_count': { total_count: '1', workflow_runs: some },
+      'a missing total_count': { workflow_runs: some },
+      'a missing workflow_runs': { total_count: 0 },
+      'a non-array workflow_runs': { total_count: 0, workflow_runs: {} },
+    };
+    for (const [name, listing] of Object.entries(listings)) {
+      const reserved = vi.fn(() => true);
+      const r = fixture({ message: msg, listing, reserveDispatch: reserved });
+      expect(r.result, name).toMatchObject({ ok: false, deferred: true, error: expect.stringContaining('unreadable or incomplete') });
+      expect(r.calls.some(c => c.args.includes('-X')), name).toBe(false);
+      expect(reserved, name).not.toHaveBeenCalled();
+    }
+    // An unparseable body throws inside the guard: a counted dispatch-stage failure, still never a POST.
+    const garbled = fixture({ message: msg, listing: 'not json' });
+    expect(garbled.result).toMatchObject({ ok: false, error: 'missing-run recovery failed during dispatch' });
+    expect(garbled.calls.some(c => c.args.includes('-X'))).toBe(false);
+    // 99 runs with a matching total_count is complete evidence and dispatches.
+    const ok = fixture({ message: msg, listing: { total_count: 99, workflow_runs: full.slice(0, 99) } });
+    expect(ok.result).toMatchObject({ ok: true, dispatched: true });
+  });
+  it('re-checks the exact head and state right before the dispatch POST: deferred, no dispatch, no reservation taken', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const moved = {
+      'the head moved to another sha': { ...pr, head: { ...pr.head, sha: next } },
+      'the head ref changed': { ...pr, head: { ...pr.head, ref: 'lane/other' } },
+      'the PR was closed': { ...pr, state: 'closed' },
+      'the PR was merged': { ...pr, state: 'merged' },
+    };
+    for (const [name, liveAtDispatch] of Object.entries(moved)) {
+      const reserved = vi.fn(() => true);
+      const r = fixture({ message: msg, liveAtDispatch, reserveDispatch: reserved });
+      expect(r.result, name).toMatchObject({ ok: false, deferred: true, error: 'PR head or state changed' });
+      expect(r.calls.some(c => c.args.includes('-X')), name).toBe(false);
+      expect(reserved, name).not.toHaveBeenCalled();
+      // The re-check really is a second, separate PR read.
+      expect(r.calls.filter(c => c.cmd === 'gh' && c.args[1] === `repos/${repo}/pulls/3209`), name).toHaveLength(2);
+    }
+    // An unchanged second read dispatches.
+    expect(fixture({ message: msg, liveAtDispatch: pr }).result).toMatchObject({ ok: true, dispatched: true });
   });
   it('reserves the dispatch per head: a second attempt whose run listing has not caught up never dispatches again', () => {
     const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;

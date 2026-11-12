@@ -122,7 +122,9 @@ export function pushMissingRunCommit(d, options = {}) {
     if (message.split('\n').some(line => line.startsWith(RECOVERY_COMMIT_MARKER))) {
       // Live 2026-11-11 (#6684/#6633): the marked empty commit produced no pull_request run either. A second empty
       // commit cannot help, but a workflow_dispatch of ci.yml on the branch reports `test`/`smoke` on this head
-      // (the manual fix). ONE dispatch per head: any existing ci.yml run on the head (queued, running, done) blocks it.
+      // (the manual fix). ONE dispatch per head is enforced by the atomic reservation taken below, NOT by this run
+      // listing, which lags a fresh dispatch by seconds. The listing only refuses early: a ci.yml run that is
+      // running/done, or any earlier workflow_dispatch, blocks; a fresh queued one is left alone; a stuck one passes.
       stage = 'dispatch';
       const ghEnv = { ...gitEnv, GH_TOKEN: token };
       const existing = JSON.parse(String(exec('gh', ['api', `repos/${repo}/actions/runs?head_sha=${d.headSha}&per_page=100`], { ...opts, env: ghEnv })));
