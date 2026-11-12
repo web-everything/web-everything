@@ -3145,7 +3145,14 @@ function releaseSalvageStash(dir) {
         for (const name of names) releaseEvidenceGit(['update-ref', '--no-deref', '-d', name], dir);
       }
       if (!releaseVerifyStashBundle(dir, join(backupDir, file), todo)) return [...recorded.keys()];
-      writeFileSync(recordFile, `${[...recorded].map(([sha, f]) => `${sha} ${f}`).join('\n')}${recorded.size ? '\n' : ''}${todo.map(sha => `${sha} ${file}`).join('\n')}\n`);
+      // The index is append-only evidence: keep every existing line (including bundles of stash entries since
+      // dropped) and replace the file by rename so a crash never leaves a truncated record.
+      const existing = existsSync(recordFile) ? readFileSync(recordFile, 'utf8').split('\n').filter(Boolean) : [];
+      const tmpRecord = `${recordFile}.${nonce}.tmp`;
+      try {
+        writeFileSync(tmpRecord, `${[...existing, ...todo.map(sha => `${sha} ${file}`)].join('\n')}\n`);
+        renameSync(tmpRecord, recordFile);
+      } finally { rmSync(tmpRecord, { force: true }); }
       for (const sha of todo) recorded.set(sha, file);
       log(`  ${basename(dir)}: salvaged ${todo.length} stash entr${todo.length === 1 ? 'y' : 'ies'} to ${join(backupDir, file)}`);
     }
