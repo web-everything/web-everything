@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
+import { verifyFinishBody, verificationInfrastructureFailure } from '../../lib/lane-verify.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
@@ -1631,7 +1632,7 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
     ['another required check is red', { required: ['test', 'lint'], checks: [['test', 'SUCCESS'], ['lint', 'FAILURE']] }],
     ['the CI read fails', { checks: () => { throw new Error('gh down'); } }],
     ['the setting is off', { fallback: false }],
-    ['the infra marker also carries a failing test', { mark: marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'x' }, failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } }) }],
+    ['the infra reason is verify-unsettled, not a kill', { mark: marker('infrastructure-failure', { infrastructure: { reason: 'verify-unsettled', detail: 'x' } }) }],
     ['the required set is a cache/fallback read', { source: 'fallback' }],
     ['the test check was skipped', { checks: [['test', 'SKIPPED']] }],
   ])('keeps the infra ladder when %s', async (_name, opts) => {
@@ -1656,6 +1657,16 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
       await tick(h);
       expect(h.calls.push).toHaveLength(0);
     }
+  });
+  it('accepts the marker the real verifyFinishBody writes for a killed run, though it drops the failing tests', async () => {
+    const infrastructure = verificationInfrastructureFailure({ timedOutPhase: 'vitest', ceilingMs: 1800000 });
+    const real = verifyFinishBody({ startedAt: new Date(T0).toISOString() }, { finishedAt: new Date(T0).toISOString(), exitCode: null, sha: SHA, treeHash: TREE, infrastructure, failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } });
+    expect(real).toMatchObject({ status: 'infrastructure-failure', infrastructure: { reason: 'verify-timeout' } });
+    expect(real.failureDetails).toBeUndefined();
+    const h = ciHarness({ mark: real });
+    const { rows } = await tick(h);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(1);
   });
   it('never masks a real red verdict: red goes to the fixer, not to CI', async () => {
     const h = ciHarness({ mark: marker('red') });

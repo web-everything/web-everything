@@ -469,8 +469,10 @@ async function infraCiGreenFallback({ io, record, marker, lane }) {
     if (!lane?.head || lower(lane.head) !== lower(record.sha) || lane.dirty) return null; // the lane must still be the pushed head, clean
     const setting = typeof io.infraFallbackToCi === 'function' ? io.infraFallbackToCi() : null;
     if (setting?.enabled !== true || record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure') return null;
-    // Infrastructure status next to an observed failing test is a real red in disguise: never masked.
-    if (marker.failureDetails?.tests?.length || marker.retriedFailures?.length || marker.failures?.length) return null;
+    // Plainly: the fallback applies ONLY to a process the harness killed (an infrastructure block with a timeout or signal
+    // reason, no verdict). verifyFinishBody drops failing-test names for an infrastructure failure, so their absence proves
+    // nothing; the kill reason is the evidence. Any other infra reason (e.g. verify-unsettled) keeps the retry ladder.
+    if (!['verify-timeout', 'verify-signal'].includes(marker.infrastructure?.reason)) return null;
     if (!record.earlyPush?.ok || lower(record.earlyPush.sha) !== lower(record.sha)) return null;
     if (typeof io.readPreviousHead !== 'function' || typeof io.readPreviousRequired !== 'function' || typeof io.readPreviousChecks !== 'function') return null;
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
