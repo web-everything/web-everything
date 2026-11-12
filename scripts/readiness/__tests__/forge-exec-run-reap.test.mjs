@@ -2,7 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, readdir, utimes, realpath, stat} from 'node:fs/promises';
 import {join} from 'node:path';
-import {createRunner, uidBusy, killUid} from '../forge-exec-run.mjs';
+import {createRunner, uidBusy, killUid, killRun} from '../forge-exec-run.mjs';
 // R333: the runner reaps leaked reservations/receipts only on proof the owner is gone.
 let root, receipts, probe, calls;
 const nonce = 'a'.repeat(32);
@@ -105,6 +105,17 @@ describe('production uidBusy scanner', () => {
   it('keeps slots for a zombie leader whose threads may still live', async () => {
     const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t3\n'});
     expect(await uidBusy(workerUid, proc)).toBe(true);
+  });
+  it('killRun kills the verified owner tree and the slot UID, but not a reused owner pid', async () => {
+    const st = {'/proc/50/stat': '50 (node) S 1 0', '/proc/51/stat': '51 (python3) S 50 0', '/proc/52/stat': '52 (x) S 99 0',
+      '/proc/50/status': procStatus([0, 0, 0, 0]), '/proc/51/status': procStatus([0, 0, 0, 0]), '/proc/52/status': procStatus([0, 0, 0, 0])};
+    const proc = {...procFixture({entries: ['50', '51', '52'], readStatus: path => st[path]}), readFile: async p => Buffer.from(st[p])};
+    const killed = [];
+    await killRun({uid: workerUid, ownerPid: 50, ownerStart: '9'}, proc, pid => killed.push(pid), async () => '9');
+    expect(killed.sort()).toEqual([50, 51]);
+    const none = [];
+    await killRun({uid: workerUid, ownerPid: 50, ownerStart: '9'}, proc, pid => none.push(pid), async () => '10');
+    expect(none).toEqual([]);
   });
   it('keeps slots for a zombie with no thread count (fail closed)', async () => {
     const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)')});
@@ -291,7 +302,7 @@ describe('forge leaked-state reaper', () => {
     let busy = true; const killedUids = [];
     probe.start = async () => owner.start; // owner pid alive with the same start time
     probe.uidBusy = async () => busy;
-    probe.killUid = async uid => { killedUids.push(uid); busy = false; return 2; };
+    probe.killRun = async a => { killedUids.push(a.uid); expect(a.ownerPid).toBe(4242); busy = false; return 2; };
     expect((await makeRunner().telemetry()).activeRuns).toBe(0);
     expect(killedUids).toEqual([20001]);
     expect(await exists(stuck.lock)).toBe(false);
@@ -302,7 +313,7 @@ describe('forge leaked-state reaper', () => {
     const killedUids = [];
     probe.start = async () => owner.start;
     probe.uidBusy = async () => true;
-    probe.killUid = async uid => { killedUids.push(uid); return 1; };
+    probe.killRun = async a => { killedUids.push(a.uid); return 1; };
     expect((await makeRunner().telemetry()).activeRuns).toBe(1);
     expect(killedUids).toEqual([]);
     expect(await exists(live.lock)).toBe(true);

@@ -796,6 +796,23 @@ export async function killUid(uid, procFs=filesystem, kill=process.kill.bind(pro
   for(const pid of victims) {try{kill(pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}}
   return victims.size;
 }
+// Past max runtime the owner (a root runner that holds the slot's flock) is wedged: kill it and its
+// descendants (only if its pid still has the recorded start time) plus the slot UID's processes.
+export async function killRun({uid,ownerPid,ownerStart}, procFs=filesystem, kill=process.kill.bind(process), start=procStart) {
+  let killed=await killUid(uid,procFs,kill);
+  if(Number.isSafeInteger(ownerPid)&&ownerPid>1&&typeof ownerStart==='string'&&await start(ownerPid)===ownerStart) {
+    const parents=new Map();
+    for(const entry of await procFs.readdir('/proc')) {
+      if(!/^\d+$/.test(entry))continue;
+      try {const data=(await procFs.readFile('/proc/'+entry+'/stat')).toString('latin1');parents.set(Number(entry),Number(data.slice(data.lastIndexOf(')')+2).split(' ')[1]));}
+      catch(error) {if(error.code!=='ENOENT')throw error;}
+    }
+    const tree=new Set([ownerPid]);
+    for(let grew=true;grew;) {grew=false;for(const [pid,pp] of parents)if(tree.has(pp)&&!tree.has(pid)){tree.add(pid);grew=true;}}
+    for(const pid of tree) {try{kill(pid,'SIGKILL');killed++;}catch(error){if(error.code!=='ESRCH')throw error;}}
+  }
+  return killed;
+}
 async function unitActive(unit) {
   const result=await execute('/usr/bin/systemctl',['is-active',unit]);
   const word=result.stdout.trim();
@@ -923,7 +940,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     await atomicJSON(join(receipts,'telemetry.json'),value);
     return value;
   }
-  const reapProbe={start:procStart,uidBusy,unitActive,killUid,...testReapProbe};
+  const reapProbe={start:procStart,uidBusy,unitActive,killRun,...testReapProbe};
   async function reapLog(line) {
     const text='forge-exec-run: reaped '+line;
     process.stderr.write(text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
@@ -995,16 +1012,16 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         return age>=REAP_GRACE_MS;
       };
       if(!await decide())continue;
+      let killed=0;
+      if(await pastMax()) {
+        const record=entries.length?await readRecord(entries[0].file):null;
+        killed=await reapProbe.killRun({uid:(await identity('forge-exec-'+slotNumber)).uid,ownerPid:record?.owner?.pid,ownerStart:record?.owner?.start}).catch(()=>0);
+      }
       await withWorkerExclusive(lock,async()=>{
         const again=await readRecord(join(lockPath,'reservation.json'));
         if(again?.run!==reservation.run||again?.nonce!==reservation.nonce||again?.writerGuard!==1)return;
         const slotUid=(await identity('forge-exec-'+slotNumber)).uid;
-        let killed=0;
-        if(await reapProbe.uidBusy(slotUid)) {
-          if(!await pastMax())return;
-          killed=await reapProbe.killUid(slotUid);
-          if(await reapProbe.uidBusy(slotUid))return;
-        }
+        if(await reapProbe.uidBusy(slotUid))return;
         if(!await decide())return;
         await tombstone(lockPath);
         if(reservation?.run){await dropRecords(reservation.run);taken.add(reservation.run);}
