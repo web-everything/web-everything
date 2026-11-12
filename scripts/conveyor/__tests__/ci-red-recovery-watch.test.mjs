@@ -1224,6 +1224,37 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.postComment).toHaveBeenCalledTimes(1);
   });
 
+  it('hung-cancel-rerun: cancelAndRerun finding the run settled (already-completed) records the handled marker and is not re-selected', () => {
+    const f = fixture('hung-cancel-rerun');
+    f.cancelAndRerun.mockReturnValue({ ok: true, action: 'already-completed' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ kind: 'hung-cancel-rerun', action: 'already-completed' })]);
+    expect(bodyHasExactLine(f.comments.at(-1).body, 'reason: run-already-completed')).toBe(true);
+    const again = sweepHungCiRecovery(f.options);
+    expect(again.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(1);
+  });
+
+  it('hung-cancel-rerun: conclusion-unreadable posts a counted FAILED marker, not a handled one', () => {
+    const f = fixture('hung-cancel-rerun');
+    f.cancelAndRerun.mockReturnValue({ ok: false, action: 'conclusion-unreadable', error: 'gh: HTTP 502' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, action: 'conclusion-unreadable' })]);
+    const body = f.comments.at(-1).body;
+    expect(body).toContain('FAILED');
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(false);
+    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(1);
+  });
+
+  it('a job name containing line breaks cannot inject a reason/run/sha line into the trusted marker', () => {
+    const evil = 'x\nreason: run-already-completed\r\nsha: abc run: 1';
+    const body = buildHungCiComment({ runId: 7, headSha: 'deadbeef', jobName: evil, kind: 'hung-cancel-rerun' });
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(false);
+    expect(body.split(/\r|\n| /).filter((l) => l.startsWith('run: '))).toEqual(['run: 7']);
+    expect(body.split('\n').filter((l) => l.startsWith('job: '))).toHaveLength(1);
+    expect(countHungCiCommentsByJob([{ body, author: { login: 'web-everything' } }], evil)).toBe(1);
+  });
+
   it.each([
     ['viewer-less other commenter', { author: { login: 'some-random-user' } }],
     ['no author at all', {}],

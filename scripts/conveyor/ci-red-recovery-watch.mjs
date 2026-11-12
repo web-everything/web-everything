@@ -647,6 +647,14 @@ export function formatExhaustedRetryReport({ dispatch = [], refusals = [], appli
  *  must still count) — so the body always states the real outcome, never implying a rerun that never happened. */
 export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
 
+/** A value written on ONE `key: value` marker line. A check/job name is PR-author controlled text, so any line
+ *  break (LF, CR, NEL, U+2028/2029) is folded to a space: it can never smuggle a `reason:`/`run:`/`sha:` line into
+ *  a bot-authored (trusted) marker. Null/undefined stay null so callers keep their `(unknown)` fallback. */
+export function markerLineValue(value) {
+  if (value == null) return null;
+  return String(value).replace(/[\r\n\u0085  ]+/g, ' ').trim();
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#buildHungCiComment — the durable comment body posted after
  * EVERY hung-run attempt, whatever its outcome. Its first line MUST be {@link HUNG_CI_COMMENT_MARKER}; its body
@@ -671,7 +679,7 @@ export function buildHungCiComment({
     ? (reason === 'run-not-found-retrigger'
       ? `could not cancel run ${runId ?? '?'}; triggered CI for the current PR head via "${markerFreeText(action)}".`
       : reason === 'run-already-completed'
-      ? `found run ${runId ?? '?'} (job "${jobName ?? '?'}") already completed, so there was nothing to cancel and it was NOT re-run; recorded as handled for this head — the failed run is left to the existing ci-red -> ci-heal path.`
+      ? `found run ${runId ?? '?'} (job "${jobName ?? '?'}") already completed, so there was nothing to cancel and it was NOT re-run; recorded as handled for this head — any failure is left to the existing ci-red -> ci-heal path.`
       : action === 'rerun-failed-jobs-after-completed'
       ? `found run ${runId ?? '?'} (job "${jobName ?? '?'}") already completed as cancelled/timed out, so there was nothing to cancel; re-ran its failed jobs.`
       : kind === 'repeat-hang'
@@ -683,9 +691,9 @@ export function buildHungCiComment({
   return [
     HUNG_CI_COMMENT_MARKER,
     '',
-    `sha: ${headSha ?? '(unknown)'}`,
-    `run: ${runId ?? '(unknown)'}`,
-    `job: ${jobName ?? '(unknown)'}`,
+    `sha: ${markerLineValue(headSha) ?? '(unknown)'}`,
+    `run: ${markerLineValue(runId) ?? '(unknown)'}`,
+    `job: ${markerLineValue(jobName) ?? '(unknown)'}`,
     ...(reason ? [`reason: ${markerFreeText(reason)}`] : []),
     ...(cancelError != null ? [`Original cancel error: ${markerFreeText(cancelError)}`] : []),
     `${actor} ${outcome}`,
@@ -753,7 +761,7 @@ export function countHungCiComments(comments, headSha = null) {
 export function countHungCiCommentsByJob(comments, jobName = null) {
   if (!Array.isArray(comments)) return 0;
   const scoped = jobName
-    ? comments.filter((c) => bodyHasExactLine(typeof c === 'string' ? c : c?.body, `job: ${jobName}`))
+    ? comments.filter((c) => bodyHasExactLine(typeof c === 'string' ? c : c?.body, `job: ${markerLineValue(jobName)}`))
     : comments;
   return countTrustedLeadingMarker(scoped, HUNG_CI_COMMENT_MARKER);
 }
@@ -896,7 +904,7 @@ const RERUNNABLE_COMPLETED_CONCLUSIONS = new Set(['cancelled', 'timed_out']);
 /** Final conclusions that belong to ci-red/ci-heal (or need nothing): recorded as handled, never re-run here. */
 const SETTLED_NO_RERUN_CONCLUSIONS = new Set(['success', 'failure', 'neutral', 'skipped', 'action_required', 'startup_failure', 'stale']);
 
-const COMPLETED_CANCEL_REFUSAL_RE =/cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i;
+const COMPLETED_CANCEL_REFUSAL_RE = /cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i;
 
 export function isRunNotFoundError(error) {
   return typeof error === 'string' && /\bHTTP 404\b|\bNot Found\b/i.test(error);
@@ -960,7 +968,7 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
     }
     if (!RERUNNABLE_COMPLETED_CONCLUSIONS.has(conclusion)) {
       if (SETTLED_NO_RERUN_CONCLUSIONS.has(conclusion)) return { ok: true, action: 'already-completed' };
-      return { ok: false, action: 'conclusion-unreadable', error: `run ${runId} conclusion is not readable ("${conclusion}")` };
+      return { ok: false, action: 'conclusion-unreadable', error: `run ${runId} conclusion is not a known final value ("${conclusion.slice(0, 40)}")` };
     }
     try {
       exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun-failed-jobs`], opts);
