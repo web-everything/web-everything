@@ -464,8 +464,9 @@ export function resolveInfraFallbackToCi({ env = process.env, tool } = {}) {
  * head's required `test` check must be green (and every other required check). Anything unreadable, partial, for another
  * head, or not a plain infrastructure failure returns null, so today's infra ladder stands. A real red is never masked.
  */
-async function infraCiGreenFallback({ io, record, marker }) {
+async function infraCiGreenFallback({ io, record, marker, lane }) {
   try {
+    if (!lane?.head || lower(lane.head) !== lower(record.sha) || lane.dirty) return null; // the lane must still be the pushed head, clean
     const setting = typeof io.infraFallbackToCi === 'function' ? io.infraFallbackToCi() : null;
     if (setting?.enabled !== true || record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure') return null;
     if (!record.earlyPush?.ok || lower(record.earlyPush.sha) !== lower(record.sha)) return null;
@@ -474,7 +475,11 @@ async function infraCiGreenFallback({ io, record, marker }) {
     const required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }))?.checks ?? [];
     if (!required.includes('test')) return null;
     const checks = await io.readPreviousChecks({ repo: record.repo, headSha: record.sha });
-    if (headCiVerdict(checks, required) !== 'green' || headCiVerdict(checks, ['test']) !== 'green') return null;
+    if (headCiVerdict(checks, required) !== 'green') return null;
+    // SKIPPED / NEUTRAL count as passed to the push gate; a fallback for a failed local verify needs a real pass.
+    const strict = name => (Array.isArray(checks) ? checks : []).filter(r => (r?.name || r?.context) === name).every(r =>
+      (r.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'SUCCESS' : String(r.state).toUpperCase() === 'SUCCESS'));
+    if (!required.every(name => (checks ?? []).some(r => (r?.name || r?.context) === name) && strict(name))) return null;
     return `required CI green on pushed head ${String(record.sha).slice(0, 8)}; verify.infraFallbackToCi=on (${setting.source ?? 'standard'})`;
   } catch { return null; }
 }
@@ -626,9 +631,9 @@ export async function runAwaitVerifyPass({
         }
         rows.push(row); continue;
       }
-      if (record?.kind === 'fix' && (d.resume === 'infra' || record.infraRetry?.exhausted
+      if (record?.kind === 'fix' && d.resume !== 'void' && !record.pendingResume && (d.resume === 'infra' || record.infraRetry?.exhausted
         || (record.infraRetry?.attempts ?? 0) >= (recovery.value.infraRetry?.maxAttempts ?? Infinity))) {
-        const fallback = await infraCiGreenFallback({ io, record, marker });
+        const fallback = await infraCiGreenFallback({ io, record, marker, lane });
         if (fallback) {
           d = { action: 'push', reason: `infra-ci-green-fallback: ${fallback}` };
           Object.assign(row, { action: d.action, reason: d.reason });

@@ -1631,12 +1631,21 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
     ['another required check is red', { required: ['test', 'lint'], checks: [['test', 'SUCCESS'], ['lint', 'FAILURE']] }],
     ['the CI read fails', { checks: () => { throw new Error('gh down'); } }],
     ['the setting is off', { fallback: false }],
+    ['the test check was skipped', { checks: [['test', 'SKIPPED']] }],
   ])('keeps the infra ladder when %s', async (_name, opts) => {
     const h = ciHarness(opts);
     const { rows } = await tick(h);
     expect(h.calls.resume).toHaveLength(0);
     expect(h.calls.push).toHaveLength(0);
     expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+  });
+  it('keeps the void/refusal when the lane moved or is dirty', async () => {
+    for (const over of [{ head: OTHER }, { dirty: true }]) {
+      const h = ciHarness(); h.state.lane = lane(over);
+      const { rows } = await tick(h);
+      expect(h.calls.push).toHaveLength(0);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
   });
   it('never masks a real red verdict: red goes to the fixer, not to CI', async () => {
     const h = ciHarness({ mark: marker('red') });
