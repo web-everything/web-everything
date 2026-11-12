@@ -7,7 +7,7 @@ import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, AWAIT_LOAD_DEFER_MAX_MS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
+  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, AWAIT_LOAD_DEFER_MAX_MS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo, resolveDeliveredStaleMs, resolveDeliveredStale,
 } from '../await-verify-pass.mjs';
 import { classifyAwaitVerify } from '../await-verify.mjs';
 
@@ -114,6 +114,116 @@ function harness({ records = [rec()], session = { sessionId: rec().sessionId, na
   };
   return { io, store, calls, state };
 }
+
+describe('delivered previous-head CI repair recovery', () => {
+  const repairHarness = (options) => {
+    const h = harness(options);
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    return h;
+  };
+  const pending = (over = {}) => rec({
+    previousCi: { failuresHandedOff: true, ready: { ciFailures: [{ name: 'test', conclusion: 'failure' }] } },
+    pendingResume: { kind: 'previous-ci', delivered: true, deliveredAt: new Date(T0).toISOString() },
+    ...over,
+  });
+  const wait = { action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' };
+  const tick = (h, nowMs = T0 + 60_000, extra = {}) => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, ...extra });
+
+  it.each([0, AWAIT_VERIFY_LIMITS.deliveredStaleMs + 1])('retires a delivered repair whose session is gone, age %s', async age => {
+    const record = pending();
+    const h = repairHarness({ records: [record], session: null });
+    const clear = h.io.clearRecord;
+    const cleared = [];
+    h.io.clearRecord = (key, expected) => { cleared.push([key, expected]); return clear(key); };
+    const { rows } = await tick(h, T0 + age);
+    expect(cleared).toEqual([[record.sessionId, record]]);
+    expect(h.store.size).toBe(0);
+    expect(rows[0]).toMatchObject({ action: 'resume', reason: 'delivered-repair-abandoned',
+      result: expect.stringContaining('delivered previous-head CI repair abandoned (session gone); record retired so a fresh fixer is admitted; fix.awaitDeliveredStaleMs=') });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.calls.push).toEqual([]);
+  });
+
+  it('keeps waiting for a busy session regardless of delivery age', async () => {
+    const h = repairHarness({ records: [pending()], session: { sessionId: rec().sessionId, status: 'working' } });
+    expect((await tick(h, T0 + 10 * AWAIT_VERIFY_LIMITS.deliveredStaleMs)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+  });
+
+  it('keeps an idle session waiting while the delivery is young, even if the request is old', async () => {
+    const h = repairHarness({ records: [pending({ requestedAt: new Date(T0 - TTL).toISOString() })] });
+    expect((await tick(h)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+  });
+
+  it('retires an idle stale repair using requestedAt for legacy records without deliveredAt', async () => {
+    const h = repairHarness({ records: [pending({ pendingResume: { kind: 'previous-ci', delivered: true } })] });
+    const { rows } = await tick(h, T0 + AWAIT_VERIFY_LIMITS.deliveredStaleMs + 1);
+    expect(rows[0]).toMatchObject({ action: 'resume', reason: 'delivered-repair-abandoned',
+      result: expect.stringContaining('abandoned (session idle past stale window); record retired so a fresh fixer is admitted; fix.awaitDeliveredStaleMs=') });
+    expect(h.store.size).toBe(0);
+  });
+
+  it('retires through compare-and-delete and keeps the wait when the record changed', async () => {
+    const h = harness({ records: [pending()], session: null });
+    const seen = [];
+    h.io.clearStoredRecordIf = (key, expected) => { seen.push([key, expected]); return { cleared: false }; };
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    expect((await tick(h)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(seen).toHaveLength(1);
+    expect(h.store.size).toBe(1);
+  });
+
+  it('keeps the old wait row when retiring the record fails', async () => {
+    const h = repairHarness({ records: [pending()], session: null });
+    h.io.clearRecord = () => ({ cleared: false });
+    expect((await tick(h)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+    const normal = harness({ session: null });
+    normal.state.marker = marker('green');
+    expect((await tick(normal)).rows[0].result).toBe('session-gone; not pushed');
+    expect(normal.store.size).toBe(0);
+  });
+
+  it('retains a delivered record when session evidence is incomplete', async () => {
+    const h = repairHarness({ records: [pending()] });
+    h.io.listSessions = () => ({ incomplete: [{ session: null, reason: 'listing failed' }] });
+    const { rows } = await tick(h);
+    expect(rows[0]).toMatchObject(wait);
+    expect(rows[0].result).toContain('session listing incomplete');
+    expect(h.store.size).toBe(1);
+  });
+
+  it('retains an idle record with an invalid delivery timestamp', async () => {
+    const h = repairHarness({ records: [pending({ pendingResume: { kind: 'previous-ci', delivered: true, deliveredAt: 'invalid' } })] });
+    expect((await tick(h, T0 + TTL)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+  });
+
+  it.each([undefined, '', '0', '-1', '1.5', 'no', 'Infinity', '9007199254740992'])('invalid stale setting %s uses the default', value => {
+    expect(resolveDeliveredStaleMs({ WE_AWAIT_VERIFY_DELIVERED_STALE_MS: value })).toBe(30 * 60_000);
+  });
+  it('resolves the stale window standard → platform → tool → env with its source', () => {
+    expect(resolveDeliveredStale({}, {})).toEqual({ ms: 30 * 60_000, source: 'standard' });
+    expect(resolveDeliveredStale({}, { platform: { awaitDeliveredStaleMs: 5 } })).toEqual({ ms: 5, source: 'platform' });
+    expect(resolveDeliveredStale({}, { platform: { awaitDeliveredStaleMs: 5 }, tool: { awaitDeliveredStaleMs: 6 } })).toEqual({ ms: 6, source: 'tool' });
+    expect(resolveDeliveredStale({ WE_AWAIT_VERIFY_DELIVERED_STALE_MS: '7' }, { tool: { awaitDeliveredStaleMs: 6 } })).toEqual({ ms: 7, source: 'env' });
+    expect(resolveDeliveredStale({}, { tool: { awaitDeliveredStaleMs: -1 } })).toEqual({ ms: 30 * 60_000, source: 'standard' });
+  });
+  it('parses a positive integer stale window override', () => {
+    expect(resolveDeliveredStaleMs({ WE_AWAIT_VERIFY_DELIVERED_STALE_MS: '12345' })).toBe(12345);
+  });
+
+  it('stamps deliveredAt when a previous-CI resume is delivered', async () => {
+    const h = repairHarness({ records: [pending({ pendingResume: { kind: 'previous-ci' } })] });
+    await tick(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect([...h.store.values()][0].pendingResume).toMatchObject({
+      kind: 'previous-ci', delivered: true, deliveredAt: new Date(T0 + 60_000).toISOString(),
+    });
+    expect(h.store.size).toBe(1);
+  });
+});
 
 describe('runAwaitVerifyPass', () => {
   it('green → pushes the exact sha to the recorded ref, then resumes the SAME session and clears the record', async () => {

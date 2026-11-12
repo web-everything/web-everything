@@ -22,12 +22,15 @@
  *
  * The gate is never weakened: nothing is pushed unless {@link classifyAwaitVerdict} answers `push`, and the push
  * names the verdict's own sha. Pure core + injectable IO, like we:scripts/conveyor/load-flake-reverify.mjs.
+ * Settings: fix.awaitDeliveredStaleMs via policy-cascade (standard 30 min → platform → tool → env WE_AWAIT_VERIFY_DELIVERED_STALE_MS); invalid layers fall through.
  */
 import { execFileSync } from 'node:child_process';
 import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, realpathSync } from 'node:fs';
 import { tmpdir, loadavg, cpus } from 'node:os';
 import { legacyLoadQuiet, reverifyConfig } from './load-flake-reverify.mjs';
 import { join, resolve, dirname, sep } from 'node:path';
+import { resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearStoredAwaitVerifyIf,
@@ -57,7 +60,26 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** Policy limits. `maxReds` counts the record's own `attempt` (the fixer bumps it on each re-mark). */
 /** Longest one load deferral may wait for a quiet host before the red follows the normal ladder (2h). */
 export const AWAIT_LOAD_DEFER_MAX_MS = 2 * 60 * 60_000;
-export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000 });
+export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000, deliveredStaleMs: 30 * 60_000 });
+/** Delivered-stale window through policy-cascade (standard → platform → tool `fix.awaitDeliveredStaleMs` → env). Returns ms and source layer. */
+export function resolveDeliveredStale(env = process.env, { platform, tool, defaultMs = AWAIT_VERIFY_LIMITS.deliveredStaleMs } = {}) {
+  const raw = env?.WE_AWAIT_VERIFY_DELIVERED_STALE_MS;
+  const envMs = /^\d+$/.test(String(raw ?? '')) ? Number(raw) : undefined;
+  const r = resolveCascade({
+    standard: { awaitDeliveredStaleMs: defaultMs }, platform, tool,
+    envValues: { awaitDeliveredStaleMs: envMs },
+    valid: { awaitDeliveredStaleMs: v => Number.isSafeInteger(v) && v > 0 },
+  });
+  return { ms: r.value.awaitDeliveredStaleMs, source: r.sources.awaitDeliveredStaleMs ?? 'standard' };
+}
+export function resolveDeliveredStaleMs(env = process.env, opts = {}) { return resolveDeliveredStale(env, opts).ms; }
+/** IO only: read the platform/tool layers (missing or unreadable ones fall back). */
+function readDeliveredStale(env = process.env, defaultMs) {
+  let tool, platform;
+  try { tool = readSettings()?.fix; } catch { /* absent tool layer */ }
+  try { platform = platformPreference('fix', { env }); } catch { /* absent platform layer */ }
+  return resolveDeliveredStale(env, { platform, tool, defaultMs });
+}
 /** Repo keys with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
 export const AWAIT_LOAD_FLAKE_REPO_KEYS = Object.freeze(['we']);
 const repoKeyOrNull = (slug) => { try { return repoKeyForSlug(slug) ?? null; } catch { return null; } };
@@ -451,12 +473,29 @@ export async function runAwaitVerifyPass({
   // fix.pushBeforeGate (we:scripts/lib/fix-push-policy.mjs): an injected policy wins; else the IO's own; else OFF (today's flow).
   const policy = pushPolicy ?? (typeof io.pushPolicy === 'function' ? io.pushPolicy() : null);
   const recovery = retryPolicy ?? io.retryPolicy?.() ?? loadVerifyRecoverySettings();
+  const deliveredStale = readDeliveredStale(process.env, limits.deliveredStaleMs ?? AWAIT_VERIFY_LIMITS.deliveredStaleMs);
+  const deliveredStaleMs = deliveredStale.ms;
   for (const { key, record: stored } of io.listRecords()) {
     let record = stored;
     const row = { key, pr: record?.pr ?? null, repo: record?.repo ?? null, sha: record?.sha ?? null };
     try {
       if (previousCiFailurePending(record) && record.pendingResume?.delivered) {
-        rows.push({ ...row, action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' });
+        Object.assign(row, { action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' });
+        const session = lookupAwaitSession(record, io.listSessions());
+        const deliveredAt = Date.parse(record.pendingResume.deliveredAt ?? record.requestedAt);
+        const stale = Number.isFinite(deliveredAt) && nowMs - deliveredAt > deliveredStaleMs;
+        if (!session || (!isSessionBusy(session) && stale)) {
+          // A fresh fixer reads live CI; retire the inventory even though clearOrNote would retain it.
+          // Compare-and-delete when the IO offers it: a concurrent re-mark must never lose its newer record.
+          const retired = typeof io.clearStoredRecordIf === 'function' ? io.clearStoredRecordIf(key, record) : io.clearRecord(key, record);
+          if ((await retired)?.cleared !== false && (typeof io.clearStoredRecordIf !== 'function' || (await retired)?.cleared === true)) {
+            const why = session ? 'session idle past stale window' : 'session gone';
+            rows.push({ ...row, action: 'resume', reason: 'delivered-repair-abandoned',
+              result: `delivered previous-head CI repair abandoned (${why}); record retired so a fresh fixer is admitted; fix.awaitDeliveredStaleMs=${deliveredStaleMs} (${deliveredStale.source})` });
+            continue;
+          }
+        }
+        rows.push(row);
         continue;
       }
       if (previousCiFailurePending(record) && (record.resumeFailures ?? 0) >= limits.maxResumeFailures) {
@@ -698,7 +737,7 @@ export async function runAwaitVerifyPass({
         if (previousCiFailurePending(record)) {
           // Retain the inventory until the fixer re-marks and the follow-up push succeeds.
           // A delivered message must not wake the session again on every daemon tick.
-          if (persist({ ...record, pendingResume: { ...record.pendingResume, delivered: true } })) {
+          if (persist({ ...record, pendingResume: { ...record.pendingResume, delivered: true, deliveredAt: new Date(nowMs).toISOString() } })) {
             row.result = `resumed:${record.pendingResume.kind}; previous-head CI failures retained`;
           }
           rows.push(row); continue;
