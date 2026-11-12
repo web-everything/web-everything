@@ -939,6 +939,28 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
+  it('treats a 409 "run that is completed" cancel refusal as done: re-runs only the failed/cancelled jobs, no cancel-failed', () => {
+    const calls = [];
+    const exec = vi.fn((file, args) => {
+      calls.push(args);
+      if (args[args.length - 1].endsWith('/cancel')) throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)');
+      return '';
+    });
+    const sleepSync = vi.fn();
+    const result = cancelAndRerunHungRun(43093913029, { repo: 'web-everything/web-everything', exec, sleepSync });
+    expect(result).toEqual({ ok: true, action: 'rerun-failed-jobs-after-completed' });
+    expect(calls[1]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/43093913029/rerun-failed-jobs']);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(sleepSync).not.toHaveBeenCalled();
+  });
+
+  it('does not treat any other 409 cancel refusal as completed', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Conflict (HTTP 409)'); });
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result.action).toBe('cancel-failed');
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
   it('reports a failed rerun distinctly from a failed cancel', () => {
     let n = 0;
     const exec = vi.fn(() => { n += 1; if (n === 2) throw new Error('gh: rerun rejected'); return ''; });
@@ -1352,6 +1374,17 @@ describe('ci-red-recovery-watch — cancelHungRun', () => {
     const exec = vi.fn(() => { const e = new Error('Command failed: gh run cancel 1'); e.stderr = 'HttpError: Resource not accessible by integration'; throw e; });
     const result = cancelHungRun(1, { exec });
     expect(result).toEqual({ ok: false, action: 'cancel-failed', error: 'HttpError: Resource not accessible by integration' });
+  });
+
+  it('treats a 409 "run that is completed" cancel refusal as done (ok, no rerun, loop stops)', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)'); });
+    expect(cancelHungRun(43093913029, { exec })).toEqual({ ok: true, action: 'already-completed' });
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat any other 409 as completed', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Conflict (HTTP 409)'); });
+    expect(cancelHungRun(1, { exec }).action).toBe('cancel-failed');
   });
 });
 

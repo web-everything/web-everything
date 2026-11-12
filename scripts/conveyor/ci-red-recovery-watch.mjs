@@ -887,6 +887,8 @@ export function describeExecError(e) {
   return raw.length > 500 ? `${raw.slice(0, 500)}…` : raw;
 }
 
+const COMPLETED_CANCEL_REFUSAL_RE = /cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i;
+
 export function isRunNotFoundError(error) {
   return typeof error === 'string' && /\bHTTP 404\b|\bNot Found\b/i.test(error);
 }
@@ -907,7 +909,11 @@ export function cancelHungRun(runId, { repo = null, exec = execFileSyncThrottled
   try {
     exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
-    return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
+    const error = describeExecError(e);
+    // A run that already finished needs no cancel: GitHub's 409 "run that is completed" means done. No rerun here
+    // (the cap holds); the existing ci-heal / needs-you path takes the PR once.
+    if (COMPLETED_CANCEL_REFUSAL_RE.test(error)) return { ok: true, action: 'already-completed' };
+    return { ok: false, action: 'cancel-failed', error };
   }
   return { ok: true, action: 'cancelled-no-rerun' };
 }
@@ -928,7 +934,18 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
   try {
     exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
-    return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
+    const error = describeExecError(e);
+    // The run finished before the cancel landed: GitHub refuses with a 409 "run that is completed". That is no
+    // refusal (same rule as ci-queue-watch's refusalAftermath), so re-run just its failed/cancelled jobs.
+    if (!COMPLETED_CANCEL_REFUSAL_RE.test(error)) {
+      return { ok: false, action: 'cancel-failed', error };
+    }
+    try {
+      exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun-failed-jobs`], opts);
+    } catch (e2) {
+      return { ok: false, action: 'rerun-failed', error: describeExecError(e2) };
+    }
+    return { ok: true, action: 'rerun-failed-jobs-after-completed' };
   }
   sleepSync(waitMs);
   try {
