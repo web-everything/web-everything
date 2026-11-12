@@ -322,7 +322,7 @@ export async function planOverlayStacks({
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
  *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null,
  *   prForcePushes?:((pr:number)=>(Promise<Array<{before:string,after?:string|null}>|null>))|null, stackMode?:'tops'|'independent',
- *   stackModeSource?:string}} o
+ *   stackModeSource?:string, auditedTip?:((ref:string, sha:string)=>boolean)|null}} o
  * @returns {Promise<{ok:false, reason:'main-unresolved'}|{ok:true, mainSha:string, finalSha:string,
  *   applied:Array<{ref:string,pr:number|null,sha:string}>,
  *   decisions:Array<{ref:string,pr:number|null,action:'remove'|'drop'|'skip'|'apply',reason:string,sha:string|null}>,
@@ -331,7 +331,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(),
+  noPin = new Set(), auditedTip = null,
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -539,11 +539,28 @@ export async function planRebuild({
     }
 
     // 2. resolve the overlay ref's remote-tracking tip.
-    const ovSha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+    let ovSha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
     if (!ovSha) {
       if (raw?.pinned === true) return refusePinned(ref, pr, null, 'ref-gone', 'flag');
       decisions.push({ ref, pr, action: 'remove', reason: 'ref-gone', sha: null });
       continue;
+    }
+    // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence.
+    const adoptedTip = adoptedTips.get(ref);
+    let unauditedFrom = null;
+    if (typeof auditedTip === 'function' && adoptedTip && adoptedTip !== ovSha
+      && !establishedRefs.has(ref) && git(['merge-base', '--is-ancestor', ovSha, mainSha]).status !== 0
+      && !auditedTip(ref, ovSha)) {
+      const newTip = ovSha;
+      unauditedFrom = newTip;
+      ovSha = adoptedTip;
+      alerts.push({
+        kind: 'overlay-unaudited-tip',
+        detail: {
+          ref, pr, adopted: adoptedTip, newTip,
+          message: `overlay ${ref} keeps its audited adopted head ${adoptedTip.slice(0, 10)}: new tip ${newTip.slice(0, 10)} has no fix-ready + audit record (unaudited-tip)`,
+        },
+      });
     }
     const inMain = (sha) => {
       if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) return true;
@@ -694,7 +711,7 @@ export async function planRebuild({
     }
     cur = newSha;
     const edge = resolution?.edgeSha ? { edgeSha: resolution.edgeSha } : {};
-    applied.push({ ref, pr, sha: ovSha, ...(resolution?.ok ? { resolvedVia: resolution.via, ...edge } : {}) });
+    applied.push({ ref, pr, sha: ovSha, ...(unauditedFrom ? { pinnedFrom: unauditedFrom } : {}), ...(resolution?.ok ? { resolvedVia: resolution.via, ...edge } : {}) });
     decisions.push({ ref, pr, action: 'apply', reason: resolution?.ok ? `applied-${resolution.via}` : 'applied', sha: ovSha });
     if (resolution?.ok) alerts.push({ kind: 'overlay-conflict-resolved', detail: { ref, pr, via: resolution.via, ...edge } });
   }
@@ -759,7 +776,7 @@ export async function planRebuild({
   if (lostBases.length > 0) {
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip,
     });
   }
 
@@ -859,7 +876,7 @@ export async function planRebuild({
       for (const refs of retryPinGroups()) {
         const alt = await planRebuild({
           git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-          keepIndependent, noPin: new Set(refs),
+          keepIndependent, noPin: new Set(refs), auditedTip,
         });
         if (!alt.ok || alt.establishedLost.length > 0) continue;
         const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
