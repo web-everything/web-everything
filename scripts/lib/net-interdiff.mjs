@@ -102,6 +102,12 @@ function run(exec, args, extra = {}) {
 function runDiff(exec, args, extra = {}) {
   const out = exec('git', args, { encoding: 'latin1', stdio: ['ignore', 'pipe', 'ignore'], timeout: TIMEOUT_MS, ...extra });
   if (typeof out !== 'string') throw new Error('exec-returned-non-string');
+  // latin1 never yields U+FFFD (every char is <= U+00FF), so one here means the injected exec decoded the bytes as UTF-8
+  // anyway, which is the lossy read this function exists to avoid. Refuse it: the caller keeps the raw range.
+  if (out.includes('�')) throw new Error('diff-decoded-lossily');
+  // A wrapper that returns the cut-off stdout instead of throwing on overflow would give two equal prefixes. One char is
+  // one byte here, so a length at the limit is treated as truncated (fail closed).
+  if (extra.maxBuffer > 0 && out.length >= extra.maxBuffer) throw new Error('diff-truncated');
   return out;
 }
 
@@ -171,7 +177,9 @@ export function netInterdiff({ exec: rawExec, priorHead, head, base, rawFiles, b
     // Bound the work (about five git calls per path): over the path cap, or past the total time budget (see `exec`
     // above), the caller keeps the raw range.
     if (entries.length > MAX_FILES) return null;
-    for (const [path] of entries) if (typeof path !== 'string' || !path || path.startsWith('-')) return null;
+    // U+FFFD in a path means the caller decoded a non-UTF-8 name lossily: `a\xE9` and `a\xE8` both read `a�`, and could
+    // match a different real file. The name cannot be trusted, so the caller keeps the raw range.
+    for (const [path] of entries) if (typeof path !== 'string' || !path || path.startsWith('-') || path.includes('�')) return null;
     // Collected as entries and built with Object.fromEntries: `files[path] = …` would turn a path named `__proto__`
     // into a prototype assignment and silently lose it. fromEntries defines it as an own property.
     const kept = [];

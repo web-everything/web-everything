@@ -432,6 +432,36 @@ describe('netInterdiff keeps every real PR change and drops only an identical on
     expect(out.dropped).toEqual(['same.txt']);
   });
 
+  it('fails closed (null) when the injected exec decodes diff output as UTF-8 despite the requested encoding', () => {
+    start('forced-utf8');
+    writeFileSync(join(dir, 'f.txt'), Buffer.from([0x80, 0x0a]));
+    const prior = commit('pr1 sets 0x80');
+    writeFileSync(join(dir, 'f.txt'), Buffer.from([0x81, 0x0a]));
+    const head = commit('pr2 sets 0x81');
+    const forcedUtf8 = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    expect(netInterdiff({ exec: forcedUtf8, priorHead: prior, head, base: 'main', rawFiles: { 'f.txt': null } })).toBeNull();
+  });
+
+  it('fails closed (null) for a path containing U+FFFD (a lossily decoded name can alias a different file)', () => {
+    start('fffd-path');
+    write('x.txt', lines(5));
+    const prior = commit('pr1');
+    write('x.txt', setLine(lines(5), 2, 'PR2'));
+    const head = commit('pr2');
+    expect(net(prior, head, { 'x.txt': null, 'a�': null })).toBeNull();
+  });
+
+  it('fails closed (null) when a diff read comes back cut off at the buffer limit instead of throwing', () => {
+    start('truncated');
+    write('t.txt', lines(5));
+    const prior = commit('pr1');
+    write('t.txt', setLine(lines(5), 2, 'PR2'));
+    const head = commit('pr2');
+    // A spawnSync-style wrapper: returns exactly maxBuffer bytes of stdout (the same prefix at both heads) rather than throwing.
+    const cutOff = (cmd, args, opts) => (args.includes('diff') ? 'a'.repeat(opts.maxBuffer) : exec(cmd, args, opts));
+    expect(netInterdiff({ exec: cutOff, priorHead: prior, head, base: 'main', rawFiles: { 't.txt': null } })).toBeNull();
+  });
+
   it('preserves the raw line arrays of kept files (same reference)', () => {
     start('arrays');
     write('p.txt', setLine(lines(20), 4, 'PR'));
