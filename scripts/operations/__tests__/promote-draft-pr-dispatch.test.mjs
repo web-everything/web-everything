@@ -543,3 +543,24 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
   expect(touched).toEqual([2, 3, 1]);
   expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
 });
+
+it('past deadline with a cursor skips reconcile, uses deferred=[cursor], and keeps the cursor for next pass', () => {
+  const reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
+  const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
+  const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+    now: () => 11, deadlineAt: 10, cursor: 42, reconcile,
+    provider: { ready }, readHeadCheckState, readPrLabels,
+  });
+  expect(result).toMatchObject({ handled: 0, deferred: [42], nextCursor: 42 });
+  for (const fn of [reconcile, ready, readHeadCheckState, readPrLabels]) expect(fn).not.toHaveBeenCalled();
+});
+
+it('past deadline without a cursor skips reconcile and flags deadlineSkipped', () => {
+  const reconcile = vi.fn(() => ({ dispatch: [43, 42].map(prNumber => ({ kind: 'promote-draft', prNumber })), refusals: [] }));
+  const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
+  const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+    now: () => 11, deadlineAt: 10, reconcile, provider: { ready }, readHeadCheckState, readPrLabels,
+  });
+  expect(result).toMatchObject({ handled: 0, deferred: [], nextCursor: null, deadlineSkipped: true });
+  for (const fn of [reconcile, ready, readHeadCheckState, readPrLabels]) expect(fn).not.toHaveBeenCalled();
+});

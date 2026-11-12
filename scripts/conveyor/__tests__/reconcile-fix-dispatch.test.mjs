@@ -2241,3 +2241,29 @@ describe('card-at-ref scope: one unsafe piece rejects its whole authored entry',
     expect(unit.scope).toEqual(['we:a.mjs', 'we:b.mjs']);
   });
 });
+
+describe('runReconcileFixDispatch — PR deadline and cursor', () => {
+  it('yields between dispatches, resumes deferred PRs first, and wraps without starving earlier PRs', () => {
+    let time = 10;
+    const touched = [];
+    const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+      reconcile: () => ({ dispatch: [1764, 1765, 1766].map(prNumber => ({ kind: 'fix', prNumber,
+        headRefName: `fix-branch-${prNumber}` })), refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null,
+      dispatch: entry => { touched.push(entry.pr); time += 1; return { pr: entry.pr }; },
+    };
+    const first = runReconcileFixDispatch(options);
+    expect(touched).toEqual([1764]);
+    expect(first).toMatchObject({ handled: 1, deferred: [1765, 1766], nextCursor: 1765 });
+    touched.length = 0;
+    const second = runReconcileFixDispatch({ ...options, cursor: first.nextCursor, deadlineAt: time });
+    expect(touched).toEqual([1765]);
+    expect(second).toMatchObject({ handled: 1, deferred: [1766, 1764], nextCursor: 1766 });
+    touched.length = 0;
+    const third = runReconcileFixDispatch({ ...options, cursor: second.nextCursor, deadlineAt: 100 });
+    expect(touched).toEqual([1766, 1764, 1765]);
+    expect(third).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+  });
+});

@@ -1271,3 +1271,38 @@ it('preserves oldest-owed order with a deadline and resumes at the exact PR curs
     expect(third).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('past deadline with a cursor skips every blocking prelude, keeps deferred=[cursor], and retries flushes next pass', async () => {
+  let time = 11;
+  const order = [];
+  const pollAttempts = vi.fn(() => { order.push('poll'); return []; });
+  const flushOwed = vi.fn(() => { order.push('owed'); return {}; });
+  const flushTimeouts = vi.fn(async () => { order.push('timeouts'); return []; });
+  const reconcile = vi.fn(() => { order.push('reconcile'); return { dispatch: [], refusals: [] }; });
+  const dispatch = vi.fn();
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => time,
+    deadlineAt: 10, cursor: 42, pollAttempts, flushOwed, flushTimeouts, reconcile, dispatch,
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), pickFreeLanes: () => [],
+  };
+  const first = await runReconcileCiHealDispatch(options);
+  expect(first).toMatchObject({ handled: 0, deferred: [42], nextCursor: 42 });
+  for (const fn of [pollAttempts, flushOwed, flushTimeouts, reconcile, dispatch]) expect(fn).not.toHaveBeenCalled();
+  time = 0;
+  const second = await runReconcileCiHealDispatch({ ...options, cursor: first.nextCursor });
+  expect(order).toEqual(['poll', 'owed', 'timeouts', 'reconcile']);
+  for (const fn of [pollAttempts, flushOwed, flushTimeouts, reconcile]) expect(fn).toHaveBeenCalledTimes(1);
+  expect(second).toMatchObject({ handled: 0, deferred: [], nextCursor: null });
+});
+
+it('past deadline without a cursor skips every blocking prelude (including reconcile), flags deadlineSkipped and starts from the top next pass', async () => {
+  const pollAttempts = vi.fn(() => []), flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []);
+  const reconcile = vi.fn(() => ({ dispatch: [42, 43].map(prNumber => ({ kind: 'ci-heal', prNumber })), refusals: [] }));
+  const dispatch = vi.fn();
+  const result = await runReconcileCiHealDispatch({ root: '/repo', checkStaleness: FRESH,
+    now: () => 11, deadlineAt: 10, pollAttempts, flushOwed, flushTimeouts, reconcile, dispatch,
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), pickFreeLanes: () => [],
+    resolveWorkUnit: () => ({ itemNum: null, scope: [] }), timeoutHold: () => null,
+  });
+  expect(result).toMatchObject({ handled: 0, deferred: [], nextCursor: null, deadlineSkipped: true });
+  for (const fn of [reconcile, pollAttempts, flushOwed, flushTimeouts, dispatch]) expect(fn).not.toHaveBeenCalled();
+});

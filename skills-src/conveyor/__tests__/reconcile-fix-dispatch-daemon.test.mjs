@@ -2547,17 +2547,17 @@ describe('fix pass budgets', () => {
     missingRunTick: noopMissingRunTick, notesTick: noopNotesTick,
     awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
     passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: {
-      stuckFixersMs: 1000, ciHealMs: 1000, promoteDraftMs: 1000,
+      fixMs: 1000, stuckFixersMs: 1000, ciHealMs: 1000, promoteDraftMs: 1000,
     } } }), budgetRotation: {}, ...extra });
 
-  it.each(['ci-heal', 'promote-draft'])('carries %s PR cursor across passes, clears it on completion and logs PR counts', async phase => {
+  it.each(['fix', 'ci-heal', 'promote-draft'])('carries %s PR cursor across passes, clears it on completion and logs PR counts', async phase => {
     const cursors = {}, calls = [];
     const tick = ({ repo, cursor, deadlineAt, now }) => {
       calls.push({ repo, cursor, deadlineAt, clock: now() });
       return { ...empty(), handled: 1, deferred: calls.length === 1 ? [42, 43] : [], nextCursor: calls.length === 1 ? 42 : null };
     };
     const opts = fixture({ repos: ['a'], now: () => 0, prCursors: cursors,
-      [phase === 'ci-heal' ? 'ciHealTick' : 'promoteDraftTick']: tick });
+      [{ fix: 'fixTick', 'ci-heal': 'ciHealTick', 'promote-draft': 'promoteDraftTick' }[phase]]: tick });
     const first = await runTickAllRepos(opts);
     expect(first.budgets[phase]).toMatchObject({ hit: true, skipped: [42, 43] });
     expect(formatPassPhaseTiming(first)).toContain(`pass-timing phase=${phase} ms=0 budgetMs=1000 budgetHit=true prs=1 deferred=2`);
@@ -2568,6 +2568,39 @@ describe('fix pass budgets', () => {
       { repo: 'a', cursor: 42, deadlineAt: 1000, clock: 0 },
       { repo: 'a', cursor: undefined, deadlineAt: 1000, clock: 0 },
     ]);
+  });
+
+  it('wires the notes deadline, clock and saved PR cursor through to the notes reader', async () => {
+    const now = () => 0;
+    const notesTick = vi.fn(() => ({ notes: [], prsByNumber: new Map() }));
+    await runTickAllRepos(fixture({ repos: ['a'], now, notesTick, notesDryRun: true,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { notesMs: 1000 } } }),
+      prCursors: { notes: { a: 42 } },
+    }));
+    expect(notesTick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'a', deadlineAt: 1000, cursor: 42, now }));
+  });
+
+  it('stops notes inside a repo when discovery spends the phase budget and resumes deferred notes next pass', async () => {
+    let time = 0;
+    const cursors = {};
+    const notesTick = vi.fn(() => {
+      if (notesTick.mock.calls.length === 1) time += 1001;
+      return { notes: [42, 43].map(prNumber => ({ kind: 'awaiting-permission', prNumber,
+        sessionId: `session-${prNumber}`, text: 'Needs permission' })), prsByNumber: new Map() };
+    });
+    const opts = fixture({ repos: ['a'], now: () => time, prCursors: cursors, notesTick, notesDryRun: true,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { notesMs: 1000 } } }),
+    });
+    const first = await runTickAllRepos(opts);
+    expect(first.noteComments).toEqual([]);
+    expect(first.phasePrCounts.notes).toEqual({ handled: 0, deferred: 2 });
+    expect(first.budgets.notes).toMatchObject({ hit: true, skipped: [42, 43] });
+    expect(cursors.notes.a).toBe(42);
+    const second = await runTickAllRepos(opts);
+    expect(notesTick.mock.calls[1][0]).toMatchObject({ repo: 'a', deadlineAt: 2001, cursor: 42 });
+    expect(second.noteComments.map(row => row.prNumber)).toEqual([42, 43]);
+    expect(second.phasePrCounts.notes).toEqual({ handled: 2, deferred: 0 });
+    expect(cursors.notes.a).toBeUndefined();
   });
 
   it.each([['fixMs', 'FIX'], ['notesMs', 'NOTES'], ['orphanGuardMs', 'ORPHAN_GUARD']])('resolves %s defaults, overrides and bounds', (key, envKey) => {
@@ -2681,5 +2714,49 @@ describe('fix pass budgets', () => {
       budgets: { 'ci-heal': { budgetMs: 1000, hit: true } },
     })).toEqual(['pass-timing phase=fix ms=20 budgetMs=none budgetHit=false prs=0 deferred=0',
       'pass-timing phase=ci-heal ms=1001 budgetMs=1000 budgetHit=true prs=0 deferred=0']);
+  });
+});
+
+describe('runReconcileNotesAllRepos — cooperative deadline', () => {
+  const safety = { value: { alertAtRoundCap: false }, sources: { alertAtRoundCap: 'test' } };
+  const note = prNumber => ({ kind: 'awaiting-permission', prNumber, sessionId: `session-${prNumber}`, text: 'Needs permission' });
+
+  it('does not post deferred notes and re-derives them next pass, resuming at the PR cursor', () => {
+    let time = 10;
+    const posted = [];
+    const tick = vi.fn(() => ({ notes: [42, 43, 44].map(note), prsByNumber: new Map() }));
+    const postComment = vi.fn(({ pr }) => { posted.push(pr); time += 1; return { ok: true }; });
+    const options = { repos: ['repo-a'], tick, postComment, safety, dryRun: false,
+      now: () => time, deadlineAt: 10, stuckAfterGrant: () => null, publish: vi.fn(), parkToHuman: vi.fn(),
+    };
+    const first = runReconcileNotesAllRepos(options);
+    expect(posted).toEqual([42]);
+    expect(first).toMatchObject({ handled: 1, deferred: [43, 44], nextCursor: 43 });
+    expect(first.comments.map(row => row.prNumber)).toEqual([42]);
+    // The next pass discovers current notes again; the earlier episode is now resolved.
+    tick.mockImplementation(() => ({ notes: [43, 44].map(note), prsByNumber: new Map() }));
+    posted.length = 0;
+    const second = runReconcileNotesAllRepos({ ...options, cursor: first.nextCursor, deadlineAt: 100 });
+    expect(tick).toHaveBeenCalledTimes(2);
+    expect(posted).toEqual([43, 44]);
+    expect(second).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+  });
+
+  it('checks the deadline before reading the next repo and re-derives that repo on the next pass', () => {
+    let time = 10;
+    const posted = [];
+    const tick = vi.fn(({ repo }) => ({ notes: repo === 'repo-a'
+      ? (posted.includes(42) ? [] : [note(42)]) : [note(43)], prsByNumber: new Map() }));
+    const options = { repos: ['repo-a', 'repo-b'], tick, safety, dryRun: false,
+      now: () => time, deadlineAt: 10, stuckAfterGrant: () => null, publish: vi.fn(), parkToHuman: vi.fn(),
+      postComment: ({ pr }) => { posted.push(pr); time += 1; return { ok: true }; },
+    };
+    runReconcileNotesAllRepos(options);
+    expect(tick.mock.calls.map(([options]) => options.repo)).toEqual(['repo-a']);
+    expect(posted).toEqual([42]);
+    tick.mockClear();
+    runReconcileNotesAllRepos({ ...options, deadlineAt: 100 });
+    expect(tick.mock.calls.map(([options]) => options.repo)).toEqual(['repo-a', 'repo-b']);
+    expect(posted).toEqual([42, 43]);
   });
 });
