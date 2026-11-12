@@ -426,26 +426,65 @@ export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '
  * wins, ordered by id. Absent = no hold. An unreadable read, or a full page with no decision, holds.
  * `combined` is the per-context latest summary; `statuses` the full newest-first list, read only when the context
  * exists. */
-export function evaluateRedTeamPublicationHold({ pr, combined, statuses, isTrusted = isTrustedMarkerAuthor } = {}) {
+export function evaluateRedTeamPublicationHold({ pr, combined, statuses, historyComplete, isTrusted = isTrustedMarkerAuthor } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!context) return failure('red-team publication hold PR number missing or invalid');
   const latest = combined?.statuses;
   if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
     return failure('red-team publication hold unreadable or incomplete; operator must inspect commit statuses');
   if (!latest.some(status => status?.context === context)) return { ok: true, reason: 'no red-team publication hold on head' };
-  if (!Array.isArray(statuses) || statuses.length > 100 || statuses.some(status => !Number.isSafeInteger(status?.id)))
+  // `historyComplete` comes from the paged reader; without it `statuses` is one 100-item page, complete only when short.
+  const paged = typeof historyComplete === 'boolean';
+  if (!Array.isArray(statuses) || (!paged && statuses.length > 100) || statuses.some(status => !Number.isSafeInteger(status?.id)))
     return failure('red-team publication hold history unreadable; operator must inspect commit statuses');
+  const complete = paged ? historyComplete : statuses.length < 100;
   const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
   // The summary says this PR's context exists, so the history must show it; an empty or contradictory history
   // (e.g. a failure in the summary but none in the list) is unreadable evidence, never a clear.
-  if (!ordered.length) return failure('red-team publication hold history lacks the summarized hold; operator must inspect commit statuses');
   for (const status of ordered) {
     if (status.state !== 'success')
       return failure(`red-team round not confirmed published (GitHub-visible hold, ${message(status.state)}); retry check publication before enqueue`);
     if (isTrusted({ user: { login: String(status.creator?.login ?? '') } })) return { ok: true, reason: 'red-team publication hold cleared on head' };
   }
-  if (statuses.length === 100) return failure('red-team publication hold history incomplete at 100-status bound; operator must inspect commit statuses');
+  if (!complete) return failure(`red-team publication hold history incomplete at the ${paged ? `${STATUS_PAGE_CAP}-page` : '100-status'} bound; operator must inspect commit statuses`);
+  if (!ordered.length) return failure('red-team publication hold history lacks the summarized hold; operator must inspect commit statuses');
   return { ok: true, reason: 'no trusted red-team publication hold on head' };
+}
+
+/** Page bound for the two commit-status reads (100 items a page). Past it a read is incomplete: the gate holds with an
+ * operator-visible reason and the clearer keeps its retry marker. */
+export const STATUS_PAGE_CAP = 10;
+const statusPage = (repo, headSha, path, page) =>
+  `repos/${repo}/commits/${headSha}/${path}?per_page=100${page > 1 ? `&page=${page}` : ''}`;
+
+/** The combined status (one latest status per context), paged until `total_count` contexts are read. Contexts past the
+ * cap leave `statuses` shorter than `total_count`, which every consumer reads as incomplete (fail closed). */
+function readCombinedStatus({ repo, headSha, gh }) {
+  const first = JSON.parse(gh(['api', statusPage(repo, headSha, 'status', 1)], ioOptions));
+  if (!Array.isArray(first?.statuses) || !Number.isSafeInteger(first.total_count)) return first;
+  const statuses = [...first.statuses];
+  for (let page = 2; page <= STATUS_PAGE_CAP && statuses.length < first.total_count; page++) {
+    const next = JSON.parse(gh(['api', statusPage(repo, headSha, 'status', page)], ioOptions))?.statuses;
+    if (!Array.isArray(next)) throw Error('combined status page unreadable');
+    if (!next.length) break;
+    statuses.push(...next);
+  }
+  return { ...first, statuses };
+}
+
+/** The newest-first status history, paged until `decisive` matches a status on `context` (every newer status is then
+ * already read) or the list ends. Unrelated contexts can fill any number of pages ahead of this PR's context.
+ * `complete` is false only when the cap stopped the read first. */
+function readStatusHistory({ repo, headSha, gh, context, decisive }) {
+  const statuses = [];
+  for (let page = 1; page <= STATUS_PAGE_CAP; page++) {
+    const batch = JSON.parse(gh(['api', statusPage(repo, headSha, 'statuses', page)], ioOptions));
+    if (!Array.isArray(batch) || batch.length > 100 || batch.some(status => !Number.isSafeInteger(status?.id)))
+      throw Error('statuses unreadable');
+    statuses.push(...batch);
+    if (batch.length < 100 || batch.some(status => status.context === context && decisive(status))) return { statuses, complete: true };
+  }
+  return { statuses, complete: false };
 }
 
 /** Description prefix of the publication hold {@link publishRedTeamCheckFromLive} sets. */
@@ -468,17 +507,17 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, is
     // The combined summary (one latest status per context) settles absence first, the same way the gate reader does:
     // unrelated contexts can fill the 100-status history page, and absence must never read as an incomplete history
     // (that kept the retry marker forever and re-published checks until the check-run bound refused the head).
-    const combined = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/status?per_page=100`], ioOptions));
+    const combined = readCombinedStatus({ repo, headSha, gh });
     const latest = combined?.statuses;
     if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
       throw Error('combined status unreadable or incomplete');
     if (!latest.some(status => status?.context === context)) return { ok: true, cleared: false, reason: 'no publication hold on head' };
-    const statuses = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions));
-    if (!Array.isArray(statuses) || statuses.some(status => !Number.isSafeInteger(status?.id)))
-      throw Error('statuses unreadable');
+    // Paged: the context's entries can sit behind any number of newer unrelated statuses.
+    const { statuses, complete } = readStatusHistory({ repo, headSha, gh, context,
+      decisive: status => status.state === 'success' && trusted(status) });
     const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
     const settled = ordered.findIndex(status => status.state === 'success' && trusted(status));
-    if (settled < 0 && statuses.length >= 100) throw Error('statuses incomplete at 100-status bound');
+    if (settled < 0 && !complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound`);
     holds = (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
   if (!holds.length) return { ok: true, cleared: false, reason: 'no publication hold on head' };
@@ -494,10 +533,14 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
   try {
-    const combined = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/status?per_page=100`], ioOptions));
+    const combined = readCombinedStatus({ repo, headSha, gh });
     const present = Array.isArray(combined?.statuses) && combined.statuses.some(status => status?.context === context);
-    const statuses = present ? JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions)) : undefined;
-    return evaluateRedTeamPublicationHold({ pr, combined, statuses, ...(isTrusted ? { isTrusted } : {}) });
+    const trusted = isTrusted ?? isTrustedMarkerAuthor;
+    // Decisive for the gate: the newest hold, or the newest trusted success (the evaluator stops at either).
+    const history = present ? readStatusHistory({ repo, headSha, gh, context,
+      decisive: status => status.state !== 'success' || trusted({ user: { login: String(status.creator?.login ?? '') } }) }) : undefined;
+    return evaluateRedTeamPublicationHold({ pr, combined, statuses: history?.statuses, historyComplete: history?.complete,
+      ...(isTrusted ? { isTrusted } : {}) });
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
 }
 

@@ -594,6 +594,55 @@ describe('red-team check run contract', () => {
         expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: false });
         expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
       });
+      // Self-review variant: the context exists but its entries sit behind 100+ newer unrelated statuses; the history is
+      // paged until the newest trusted success, so the helper's own hold is still found and cleared.
+      it.each([
+        ['behind one full page', 100],
+        ['behind three full pages', 250],
+      ])('clearLivePublicationHold: the context %s of unrelated statuses is still read', (_name, newer) => {
+        const ctx = 'red-team/publication #7';
+        const history = [
+          ...Array.from({ length: newer }, (_, i) => ({ id: 10_000 - i, state: 'success', context: 'ci/build' })),
+          { id: 50, state: 'failure', context: ctx, description: 'held: live red-team check not clear: x', creator: { login: 'web-everything' } },
+          { id: 40, state: 'success', context: ctx, creator: { login: 'web-everything' } },
+          ...Array.from({ length: 120 }, (_, i) => ({ id: 38 - i, state: 'success', context: 'old' })),
+        ];
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: [{ context: 'ci/build', state: 'success' }, { context: ctx, state: 'failure' }] });
+          const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+          return JSON.stringify(history.slice((page - 1) * 100, page * 100));
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: true });
+        // It stops at the page holding the trusted success, never reading the older pages.
+        const pages = gh.mock.calls.filter(([args]) => /\/statuses\?/.test(args[1])).length;
+        expect(pages).toBe(Math.floor((newer + 1) / 100) + 1);
+      });
+      it('clearLivePublicationHold: a context still undecided at the page cap fails closed (marker kept, nothing posted)', () => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication #7', state: 'failure' }] });
+          const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+          return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: 100_000 - page * 100 - i, state: 'success', context: 'ci/build' })));
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: false, reason: expect.stringMatching(/10-page bound/) });
+        expect(gh.mock.calls.filter(([args]) => /\/statuses\?/.test(args[1]))).toHaveLength(api.STATUS_PAGE_CAP);
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
+      });
+      it('clearLivePublicationHold: more than 100 contexts are paged, so an absent context still settles', () => {
+        const contexts = Array.from({ length: 150 }, (_, i) => ({ context: `ci/${i}`, state: 'success' }));
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) {
+            const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+            return JSON.stringify({ total_count: 150, statuses: contexts.slice((page - 1) * 100, page * 100) });
+          }
+          return '[]';
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: false });
+        expect(gh.mock.calls.map(([args]) => args[1]).filter(p => /\/status\?/.test(p))).toEqual([
+          `repos/o/r/commits/${HEAD}/status?per_page=100`, `repos/o/r/commits/${HEAD}/status?per_page=100&page=2`]);
+      });
       it.each([
         ['an incomplete combined summary', { total_count: 101, statuses: [{ context: 'ci/build', state: 'success' }] }],
         ['a malformed combined summary', { statuses: 'x' }],
@@ -1190,6 +1239,34 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
     const gh3 = args => (/\/status\?/.test(args[1]) ? JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication', state: 'failure' }] })
       : JSON.stringify([]));
     expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh: gh3 })).toMatchObject({ ok: true });
+  });
+  it.each([
+    ['a hold', 'failure', 'web-everything[bot]', false],
+    ['a trusted clear', 'success', 'web-everything[bot]', true],
+  ])('pages the history past 100 unrelated statuses to find %s', async (_name, state, login, ok) => {
+    const { readRedTeamPublicationHoldFact, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
+    const context = redTeamPublicationContext(7);
+    const history = [...Array.from({ length: 130 }, (_, i) => ({ id: 1000 - i, context: 'ci/build', state: 'success' })),
+      { id: 5, context, state, creator: { login } }];
+    const gh = args => {
+      if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: [{ context: 'ci/build', state: 'success' }, { context, state }] });
+      const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+      return JSON.stringify(history.slice((page - 1) * 100, page * 100));
+    };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh })).toMatchObject({ ok });
+  });
+  it('a history still undecided at the page cap holds the gate', async () => {
+    const { readRedTeamPublicationHoldFact, redTeamPublicationContext, STATUS_PAGE_CAP } = await import('../red-team-check-run.mjs');
+    const context = redTeamPublicationContext(7);
+    let reads = 0;
+    const gh = args => {
+      if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context, state: 'failure' }] });
+      reads++;
+      return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: 100_000 - reads * 100 - i, context: 'ci/build', state: 'success' })));
+    };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/10-page bound/) });
+    expect(reads).toBe(STATUS_PAGE_CAP);
   });
 });
 
