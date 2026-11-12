@@ -125,7 +125,12 @@ const KNOWN_MACHINE_SHAPE_RES = [
 ];
 // Operator-written notes that decide nothing about the review (R907). Trusted marker authors ONLY (`isKnownMachineBody`
 // gates this list on `isTrustedMarkerAuthor`); any other author's copy stays a possible hold.
-const TRUSTED_AUTHOR_NOTE_RES = [/^\s*🛠 operator action — refresh\b/, /^\s*Manual R247 pass — daemon:/];
+// Whole-body anchored (a trailing objection must not ride a known prefix) and refused when the free text voices a hold.
+const TRUSTED_AUTHOR_NOTE_RES = [
+  /^🛠 operator action — refresh\n\nOperator @[\w-]+ via \w+:\n> [^\n]+\n\nUndo: [^\n]+\n\n<!-- operator-action: \{"version":1,"op":"refresh"[^\n]*\} -->\s*$/,
+  /^Manual R247 pass — daemon: [^\n]+$/,
+];
+const TRUSTED_NOTE_HOLD_WORD_RE = /\b(?:hold|held|do not|don'?t|must not|never merge|block(?:ed|s|ing)?|changes? requested|reject(?:ed)?|stop|wait|unsafe)\b/i;
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
 const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\./;
 const ADVISORY_CHANGES_RE = /\*\*Advisory outcome:\*\*\s*`?changes`?/i;
@@ -293,7 +298,8 @@ export function isKnownMachineBody(body, comment = undefined) {
     }
   }
   if (MECHANICAL_PARK_RE.test(text)) return true;
-  if (isTrustedMarkerAuthor(comment) && TRUSTED_AUTHOR_NOTE_RES.some((re) => re.test(text))) return true;
+  if (isTrustedMarkerAuthor(comment) && !TRUSTED_NOTE_HOLD_WORD_RE.test(text)
+    && TRUSTED_AUTHOR_NOTE_RES.some((re) => re.test(text.trim()))) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
     || isDrainEnqueueClearance(text, comment)

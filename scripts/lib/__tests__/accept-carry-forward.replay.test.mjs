@@ -907,7 +907,7 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
   // R907 06:33 ET: the live #6381/#6595 operator comments (refresh note, manual R247 pass) are machine-marked notes that
   // decide nothing about the review, but ONLY from a trusted marker author; any other author's copy still holds.
   describe('operator refresh / manual R247 shapes (R907)', () => {
-    const REFRESH = '🛠 operator action — refresh\n\nOperator @chalbert via chat: refresh so CI re-runs\n\nUndo: restore the previous head\n\n<!-- operator-action: refresh -->';
+    const REFRESH = '🛠 operator action — refresh\n\nOperator @chalbert via chat:\n> R895: smoke failed on runner apt DNS — refresh so CI re-runs\n\nUndo: restore the previous head only through a reviewed repair\n\n<!-- operator-action: {"version":1,"op":"refresh","pr":6381,"actor":"chalbert","details":{"undo":"x"}} -->';
     const MANUAL = 'Manual R247 pass — daemon: red-team; reason: EMERGENCY (labelled): refresh moved head; old-head review run left review-unfinished';
     const OP = { login: 'chalbert' };
     for (const [name, body] of Object.entries({ refresh: REFRESH, 'manual R247 pass': MANUAL })) {
@@ -923,6 +923,12 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
         expect(isKnownMachineBody(body, { author: null })).toBe(false);
       });
     }
+    it('a trailing objection on a known prefix, even from a trusted author, still holds (audit)', () => {
+      for (const b of [`${REFRESH}\nHold this PR; do not merge.`, `${MANUAL} Also hold this PR, do not merge.`,
+        '🛠 operator action — refresh\nHold this PR; do not merge.', 'Manual R247 pass — daemon: review\nreject the change']) {
+        expect(isKnownMachineBody(b, { author: OP })).toBe(false);
+      }
+    });
   });
 });
 
