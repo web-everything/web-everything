@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { planReadyRestore, sweepReadyRestore } from '../ready-label-restore.mjs';
+import { planReadyRestore, sweepReadyRestore, reacceptedAfterReadyRemoval } from '../ready-label-restore.mjs';
 import { sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
 
 const live = (extra = {}) => ({
@@ -11,7 +11,7 @@ const live = (extra = {}) => ({
 const fixture = (extra = {}) => {
   const provider = { readPrState: vi.fn(() => live()), setLabels: vi.fn() };
   const readPr = vi.fn(() => live());
-  return { repo: 'o/r', prs: [live()], provider, readPr, log: vi.fn(), ...extra };
+  return { repo: 'o/r', prs: [live()], provider, readPr, readEvents: vi.fn(() => []), log: vi.fn(), ...extra };
 };
 
 describe('planReadyRestore', () => {
@@ -108,7 +108,7 @@ describe('review-hold wiring', () => {
   });
   it('composes the injected restore with the shared listing and dryRun', () => {
     const f = fixture();
-    const readyRestore = vi.fn(opts => sweepReadyRestore({ ...opts, readPr: f.readPr }));
+    const readyRestore = vi.fn(opts => sweepReadyRestore({ ...opts, readPr: f.readPr, readEvents: f.readEvents }));
     const rows = run({ provider: f.provider, readyRestore, dryRun: true });
     expect(readyRestore).toHaveBeenCalledTimes(1);
     expect(readyRestore).toHaveBeenCalledWith(expect.objectContaining({
@@ -134,5 +134,35 @@ describe('capped rollup evidence', () => {
     const rollup = Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun', name: i ? `c${i}` : 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }));
     const pr = { state: 'OPEN', isDraft: false, headRefOid: 'a', labels: [{ name: 'review:accepted' }, { name: 'red-team:clear' }], statusCheckRollup: rollup };
     expect(planReadyRestore(pr).restore).toBe(false);
+  });
+});
+
+describe('re-acceptance after a ready-to-merge removal', () => {
+  const ev = (event, label, createdAt) => ({ event, label, createdAt });
+  const T = (m) => `2026-11-12T10:0${m}:00Z`;
+  it('removal after accept gives no restore', () => {
+    const f = fixture({ readEvents: () => [ev('labeled', 'review:accepted', T(1)), ev('unlabeled', 'ready-to-merge', T(2))] });
+    expect(sweepReadyRestore(f)[0].readyRestore).toBe('skip');
+    expect(f.provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('accept after removal gives restore', () => {
+    const f = fixture({ readEvents: () => [ev('labeled', 'review:accepted', T(1)), ev('unlabeled', 'ready-to-merge', T(2)), ev('labeled', 'review:accepted', T(3))] });
+    expect(sweepReadyRestore(f)[0].readyRestore).toBe('restored');
+  });
+  it('a tie is not provably later: no restore', () => {
+    expect(reacceptedAfterReadyRemoval([ev('unlabeled', 'ready-to-merge', T(2)), ev('labeled', 'review:accepted', T(2))]).ok).toBe(false);
+  });
+  it('no removal found applies the plain rule', () => {
+    expect(reacceptedAfterReadyRemoval([ev('labeled', 'review:accepted', T(1))]).ok).toBe(true);
+  });
+  it.each([['throws', () => { throw new Error('boom'); }], ['not an array', () => null], ['bad time', () => [ev('unlabeled', 'ready-to-merge', 'x')]]])(
+    'unreadable timeline (%s) gives no restore', (_n, readEvents) => {
+      const f = fixture({ readEvents });
+      expect(sweepReadyRestore(f)[0].readyRestore).toBe('skip');
+      expect(f.provider.setLabels).not.toHaveBeenCalled();
+    });
+  it('dry-run also honours the guard', () => {
+    const f = fixture({ dryRun: true, readEvents: () => [ev('labeled', 'review:accepted', T(1)), ev('unlabeled', 'ready-to-merge', T(2))] });
+    expect(sweepReadyRestore(f)[0].readyRestore).toBe('skip');
   });
 });

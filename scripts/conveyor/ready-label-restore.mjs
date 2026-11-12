@@ -4,6 +4,8 @@ import { isRequiredCheckGreen } from '../merge-ai-prs.mjs';
 import { requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { defaultReadLabelEvents } from './human-surface-repark.mjs';
+import { execRead } from '../lib/proc-read.mjs';
 import { createMqLiveReader } from '../lib/drain-queue-safety.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
@@ -50,21 +52,41 @@ function defaultReadPr(repo, number, provider) {
   return { ...pr, statusCheckRollup: checks.statusCheckRollup };
 }
 
+/** Pure: oldest-first label events. A `ready-to-merge` removal with no strictly later `review:accepted` add means the
+ *  strip was deliberate (or the acceptance predates it): do not restore. No removal at all: the plain rule applies. */
+export function reacceptedAfterReadyRemoval(events) {
+  if (!Array.isArray(events)) return { ok: false, reason: 'label events unreadable' };
+  const at = (e) => Date.parse(e?.createdAt);
+  if (events.some(e => !e || !Number.isFinite(at(e)) || typeof e.label !== 'string')) return { ok: false, reason: 'label events incomplete' };
+  const removals = events.filter(e => e.event === 'unlabeled' && e.label === READY).map(at);
+  if (!removals.length) return { ok: true };
+  const removedAt = Math.max(...removals);
+  const accepted = events.filter(e => e.event === 'labeled' && e.label === REVIEW_LABELS.accepted).map(at);
+  const acceptedAt = accepted.length ? Math.max(...accepted) : -Infinity;
+  return acceptedAt > removedAt ? { ok: true }
+    : { ok: false, reason: 'ready-to-merge was removed and re-acceptance is not provably later' };
+}
+
+const defaultReadEvents = (repo, number) => defaultReadLabelEvents(number, { repo, exec: createMqLiveReader(execRead) });
+
 const clean = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
 /** One live plan per listed candidate, then a fresh head/hold guard at the write boundary.
  * Read/write errors retain the absent label; the next daemon sweep retries the PR.
  */
-export function sweepReadyRestore({ repo, prs = [], readPr, provider = createGhProvider(), dryRun = false, log = () => {} } = {}) {
+export function sweepReadyRestore({ repo, prs = [], readPr, readEvents = defaultReadEvents, provider = createGhProvider(), dryRun = false, log = () => {} } = {}) {
   const results = [];
   for (const pr of prs) {
     if (!candidate(pr)) continue;
     let row;
+    let reaccept;
     try {
       const live = readPr ? readPr(repo, pr.number) : defaultReadPr(repo, pr.number, provider);
       const plan = planReadyRestore(live);
       if (!plan.restore) {
         row = { num: pr.number, readyRestore: 'skip', detail: plan.reason };
+      } else if (!(reaccept = reacceptedAfterReadyRemoval(readEvents(repo, pr.number))).ok) {
+        row = { num: pr.number, readyRestore: 'skip', detail: reaccept.reason };
       } else if (dryRun) {
         row = { num: pr.number, readyRestore: 'would-restore', detail: 'accepted, red-team clear, required check green' };
       } else {
