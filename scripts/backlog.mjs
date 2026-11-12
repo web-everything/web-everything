@@ -65,7 +65,7 @@ import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
 import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildPrioritySettings, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
-import { acquireBuildQueueLock, buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
+import { DEFAULT_BUILD_QUEUE_CACHE_MAX_AGE_MS, acquireBuildQueueLock, buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
 import { readQueueFile, resolveQueuePath, resolveQueueSource, normNum, bornAsIndexFromItems, resolveBornAsRefs } from './conveyor/queue-store.mjs';
 import { DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
 import { readSettings, SETTINGS_DIR } from './lib/settings-files.mjs';
@@ -1158,8 +1158,8 @@ function buildQueue() {
       // set it too: key on the merged value itself, not only on the one file's mtime.
       JSON.stringify(readSettings().buildQueuePriority ?? null)]);
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
-  const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
-  const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
+  const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? DEFAULT_BUILD_QUEUE_CACHE_MAX_AGE_MS);
+  const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : DEFAULT_BUILD_QUEUE_CACHE_MAX_AGE_MS;
   let releaseLock;
   if (key !== null) {
     const stdout = readBuildQueueCache({ file, key, now: at, maxAgeMs });

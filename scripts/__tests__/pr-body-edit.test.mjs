@@ -190,11 +190,17 @@ describe('repair() — GraphQL userContentEdits recovery', () => {
     expect(editCall(execFile)).toBeTruthy();
   });
 
-  it('refuses successfully read but empty history without writing a stamp-lost marker', () => {
+  // R907 (rulings.md 2026-11-12 07:17 ET): an EMPTY but successfully read history means the live body is the
+  // creation body, so 'no stamp' is proven and the marker only makes the PR non-independent (stricter).
+  // Intended behaviour since the #6664 ruling: a complete, successfully read history with zero stamps records the
+  // stamp-lost marker (no author id invented) instead of refusing. Unreadable/incomplete history still refuses above.
+  it('records a stamp-lost marker, never an invented id, for a successfully read empty history', () => {
     const execFile = stubExec(() => response([]));
-    expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
+    expect(repair(ghView(unstamped), pr, repo, execFile)).toBe(0);
     expectGraphqlOnly(execFile);
-    expect(editCall(execFile)).toBeUndefined();
+    const call = editCall(execFile);
+    expect(call[2].input).toBe(`${unstamped}\n\n<!-- author-stamp-lost: unrecoverable -->\n`);
+    expect(call[2].input).not.toContain('authored-by-actor');
   });
 
   it('a PR already marked stamp-lost short-circuits without any history request', () => {

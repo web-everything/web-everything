@@ -607,7 +607,7 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
     && Array.isArray(laneRelevantChangeSince) && laneRelevantChangeSince.length === 0;
   const matches = exactShaMatch || coveredByUnchangedRelevantSet;
   const carriedForwardNote = coveredByUnchangedRelevantSet
-    ? ` (recorded for ${String(rec.sha).slice(0, 8)}; carried forward to ${String(headSha).slice(0, 8)} — no lane-relevant file changed since)`
+    ? ` (verify-marker carried from ${String(rec.sha).slice(0, 8)}; carried forward to ${String(headSha).slice(0, 8)} — no lane-relevant file changed since)`
     : '';
 
   if (matches && rec.status === 'green') {

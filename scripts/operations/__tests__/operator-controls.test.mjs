@@ -14,9 +14,10 @@ const contexts = {
   rearm: { state: 'OPEN', labels: ['review:changes'], head: 'h', comments: [] },
   refresh: { state: 'OPEN', head: 'h', headRef: 'lane/a', main: 'm', containsMain: false, crossRepo: false, comments: [] },
   'grant-rounds': { state: 'OPEN', head: 'h', comments: [] },
+  'ci-heal-reset': { head: 'a'.repeat(40), awaitVerify: [{ key: 'k', record: { repo: 'web-everything/web-everything', pr: 7, sha: 'a'.repeat(40), resumeFailures: 3, kind: 'fix', previousCi: { ready: { ciFailures: ['test'] } } } }], comments: [] },
   'clear-claim': { claims: [{ owner: 'old', meta: { repo: 'we', pr: 7, kind: 'fix', scope: ['a.js'] }, live: false }], comments: [] },
 };
-const args = name => name === 'retry-prepare' ? { ...input, pr: 0, item: '7' } : input;
+const args = name => name === 'retry-prepare' ? { ...input, pr: 0, item: '7' } : name === 'ci-heal-reset' ? { ...input, head: 'a'.repeat(40) } : input;
 const plan = name => planOperatorControl(name, { ...contexts[name], now: '2026-10-13' }, args(name));
 describe('operator controls', () => {
   it('round trips escaped durable attribution', () => {

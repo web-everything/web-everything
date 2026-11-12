@@ -1183,6 +1183,20 @@ export function defaultReadRecoveryCredential({ repo, exec = execFileSyncThrottl
   } catch { return { token: null, env }; }
 }
 
+/** One bounded head read; incomplete evidence keeps the cap and human/ci-heal fallback. */
+export function defaultReadHeadRuns({ repo, headSha, exec = execFileSyncThrottled } = {}) {
+  try {
+    const runs = JSON.parse(exec('gh', ['api',
+      `repos/${repoSlug(repo)}/actions/runs?head_sha=${headSha}&per_page=100`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }));
+    if (!Number.isSafeInteger(runs.total_count) || runs.total_count < 0 || runs.total_count >= 100
+      || !Array.isArray(runs.workflow_runs) || runs.workflow_runs.length !== runs.total_count) return null;
+    return runs.workflow_runs;
+  } catch { return null; }
+}
+
 /** Two bounded reads per admitted push candidate, with no pagination or guessed
  * empty result. A full page may be truncated: hand off to human/ci-heal instead.
  */
@@ -1380,9 +1394,10 @@ export function restackStackedPr(d, {
  * shape and injectability exactly — every reader/writer is injectable so the whole sweep is exercisable with no
  * network and no credential.
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
- *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
+ *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function, readHeadRuns?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
- *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps only ruleset-only candidates across SHAs.
+ *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps plain-absent ruleset candidates across SHAs;
+ *   startup-failure admission counts only current-head attempts.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepMissingRunRecovery({
@@ -1394,7 +1409,7 @@ export function sweepMissingRunRecovery({
   readAttributedRequiredChecks = readRequiredContexts === defaultReadRequiredContexts
     ? defaultReadAttributedRequiredChecks : readRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
-  readRecoveryEvidence = defaultReadRecoveryEvidence,
+  readRecoveryEvidence = defaultReadRecoveryEvidence, readHeadRuns = defaultReadHeadRuns,
   readRecoveryPr = defaultReadRecoveryPr, readRecoveryCredential = defaultReadRecoveryCredential,
   checkClaim = pushRefusal,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
@@ -1463,7 +1478,6 @@ export function sweepMissingRunRecovery({
     const comments = readComments(c.prNumber, { repo });
     return {
       ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch }),
-      recoveryAttemptsForPr: countMissingRunComments(comments, null, { defaultBranch }),
       // Bound checks discovered only by the ruleset expansion across pushes. Classic/declared candidates
       // retain their existing per-SHA budget, including all-absent heads and restacks.
       triggerAttemptsForPr: classicCandidateNumbers.has(c.prNumber)
@@ -1477,8 +1491,17 @@ export function sweepMissingRunRecovery({
   const candidateByPr = new Map(candidates.map(c => [c.prNumber, c]));
   plan.dispatch = plan.dispatch.filter(d => {
     if (classicCandidateNumbers.has(d.prNumber)) return true;
+    // Startup failures get the current head's budget, already bounded by the planner.
+    // Keep the cross-head cap for the original plain-absent ruleset candidates.
+    if (!legacyCandidateNumbers.has(d.prNumber)) return true;
     const attempts = attemptsByPr.get(d.prNumber) ?? 0;
     if (attempts < maxRetriesPerPr) return true;
+    // Open-PR listings omit workflow runs. Check only otherwise capped heads for
+    // startup failures; the planner has already enforced the per-SHA cap.
+    try {
+      const runs = readHeadRuns({ repo: repoSlug(repo), headSha: d.headSha });
+      if (Array.isArray(runs) && runs.some(isStartupFailure)) return true;
+    } catch { /* Unknown evidence keeps the refusal and its operator fallback. */ }
     plan.refusals.push({ ...d, kind: 'missing-run-pr-cap-exhausted', attempts,
       why: `PR #${d.prNumber} already had ${attempts} missing-run trigger attempt(s) across all head SHAs (cap ${maxRetriesPerPr}) — needs human/ci-heal inspection` });
     return false;
@@ -1505,7 +1528,7 @@ export function sweepMissingRunRecovery({
             }),
             claimed: held === null ? false : true,
             token: credential?.token, env: credential?.env,
-            attemptsForSha: c?.triggerAttemptsForSha, attemptsForPr: c?.recoveryAttemptsForPr,
+            attemptsForSha: c?.triggerAttemptsForSha, attemptsForPr: c?.triggerAttemptsForSha,
             maxRetriesPerSha, maxRetriesPerPr,
           });
         } catch {

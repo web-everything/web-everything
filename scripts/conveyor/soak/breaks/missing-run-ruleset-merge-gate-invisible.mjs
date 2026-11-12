@@ -66,6 +66,8 @@ export default {
         readRequiredContexts: () => CLASSIC_CONTEXTS,
         readAttributedRequiredChecks: () => [...CLASSIC_CONTEXTS, 'never-emitted'],
         readHeadCommittedAt: () => '2026-10-12T21:21:24Z', readComments: () => comments,
+        // Hermetic: an unreadable head keeps the cross-head cap (no live GitHub read).
+        readHeadRuns: () => null,
         trigger: () => { attempts++; return { ok: true, action: 'pull-request-push' }; },
         postComment: (_, facts) => comments.push({ viewerDidAuthor: true, body: buildMissingRunComment(facts) }),
         clearLabel: () => true,

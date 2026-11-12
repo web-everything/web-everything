@@ -68,7 +68,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS, findLastGreenAncestor, decideSinceLastGreen } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
-import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { isCardOnlyDiff, isCardPath, isDocsPath } from '../ci-card-only.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
 import { buildReverseImportGraph, selectRelatedTests } from './related-test-selection.mjs';
@@ -659,12 +659,17 @@ export function laneRelevantChangeSince({ recordSha, headSha, base = 'origin/mai
     // `headSha` that is not (or is no longer) this checkout's actual current HEAD (e.g. an explicit `--sha=`).
     const mergeBase = String(runGit(['merge-base', base, sha])).trim() || null;
     if (!mergeBase) return null;
-    return lines(runGit(['diff', '--name-only', mergeBase, sha, '--']));
+    return lines(runGit(['diff', '--name-only', '--no-renames', mergeBase, sha, '--']));
   };
   try {
     // The trailing `--` separates the two revisions from a pathspec (there is none) so a validly-hex-shaped but
     // still-unexpected value can never be read as a path or a further option either.
-    const changedSinceRecord = lines(runGit(['diff', '--name-only', recordSha, headSha, '--']));
+    // A backlog card / .md doc after the marker carries no code to verify: drop those paths from the net diff
+    // (--no-renames so a code file renamed to a .md name still lists its old path). A marker for a commit that is
+    // NOT an ancestor of headSha is refused (`--is-ancestor` exits 1 -> runGit throws -> null).
+    runGit(['merge-base', '--is-ancestor', recordSha, headSha]);
+    const changedSinceRecord = lines(runGit(['diff', '--name-only', '--no-renames', recordSha, headSha, '--']))
+      .filter((f) => !isCarriedDocPath(f));
     if (changedSinceRecord.length === 0) return [];
     // The UNION of "relevant at record time" and "relevant at headSha" — see the header doc above for why
     // `headSha` alone misses a lane-side revert of its own already-verified work.
@@ -924,4 +929,9 @@ export function formatVerifyPhases(phases) {
   ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`),
   ...(phases.settingsSource ? [`settingsSource=${JSON.stringify(phases.settingsSource)}`] : []),
   ...Object.entries(phases.admissionPhases ?? {}).map(([name, phase]) => `${name}Wait=${phase.waitedMs}(${phase.lane})`)].join(' ');
+}
+
+/** A path whose change carries no code: a `.md` under backlog/ (card) or docs/ ONLY — never a root `README.md`. */
+function isCarriedDocPath(f) {
+  return (isCardPath(f) || isDocsPath(f)) && /^(?:backlog|docs)\/.+\.md$/.test(f);
 }

@@ -17,15 +17,15 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fingerprintOf, parseStackMarkers, renderStackMarker, stackHoldHeading } from '../../conveyor/review-stack-base.mjs';
 
 import {
-  readLatestFixRange,
+  readLatestFixRange, BODY_FILE_REFUSALS,
   PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks as createSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
@@ -37,7 +37,10 @@ import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.m
 import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH } from '../../lib/policy-cascade.mjs';
 import { evaluateRedTeamCheckFact, readRedTeamGateSource } from '../../lib/red-team-check-run.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
-import { createMemoryRunStore } from '../run-store.mjs';
+import { createFileRunStore, createMemoryRunStore, sharedRunsDir } from '../run-store.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
+import { op } from '../registry.mjs';
+import { effect as effectStep } from '../step-kinds.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
 import { VERDICTS, appendVerdict, buildLedgerEvent, buildVerdictRecord, readVerdictLedger, parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
 import { deriveReferrals, ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
@@ -449,6 +452,253 @@ describe('the label sink', () => {
     pr: 7, repo: 'o/n', to: 'accepted', actor: 'operator', bodyFile: 'o-n-7-verdict.md', reviewedHead: 'a'.repeat(40),
     addLabel: 'review:accepted', removeLabels: ['review:pending'],
   };
+
+  beforeEach(async () => {
+    await createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root })[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body: '# verdict' }, CTX);
+  });
+
+  it.each([
+    '--body-file=gone.md is unreadable (ENOENT: no such file)',
+    '--body-file=gone.md is empty — pass the verdict write-up',
+    '--body-file must live under the repo root or a temp dir (got gone.md)',
+  ])('recognises and permits recovery only for the body-file refusal: %s', async text => {
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root, runNode: () => { throw new Error(text); } });
+    expect(isPreWriteRefusal(text)).toBe(true);
+    expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error: `review-set-label.mjs failed and its outcome is UNKNOWN: ${text}` })).toBe(true);
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+  });
+
+  it.each(['UNKNOWN: connection reset', '--body-file=gone.md is unreadable after write',
+    'some file is unreadable (ENOENT)', 'invalid --repo',
+    // A post-write gh line that only CONTAINS a body-file refusal phrase is not proof (patterns are anchored).
+    'review-set-label.mjs failed and its outcome is UNKNOWN: HTTP 422: --body-file=x.md is unreadable (ENOENT)',
+    'review-set-label.mjs failed and its outcome is UNKNOWN: gh: --body-file=x.md is empty — pass the verdict write-up',
+    'review-set-label.mjs reported an error and its outcome is UNKNOWN: comment failed: --body-file must live under the repo root or a temp dir (got /x)',
+  ])('does not recover unrelated pending errors: %s', error => {
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root });
+    expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error })).toBe(false);
+  });
+
+  it('restages a recycled lane body from the same run applied write-up before spawning', async () => {
+    rmSync(reviewSidecarDir(root), { recursive: true });
+    const runStore = createMemoryRunStore();
+    // The reader is intentionally keyed by run id; a sibling run is never a fallback.
+    const read = vi.fn(id => id === CTX.runId ? { id, effects: [{ type: REVIEW_EFFECTS.WRITE_UP,
+      status: 'applied', payload: { bodyFile: payload.bodyFile, body: '# recovered verdict' } }] } : null);
+    const runNode = vi.fn(argv => {
+      expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice(12), 'utf8')).toBe('# recovered verdict');
+      return '{"ok":true}';
+    });
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root, runStore: { ...runStore, read }, runNode });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(read).toHaveBeenCalledWith(CTX.runId);
+    expect(runNode).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['missing', 'wrong-run', 'unapplied', 'wrong-file', 'empty', 'non-string', 'unreadable'])('refuses missing bodies with %s evidence before spawning', async mode => {
+    rmSync(reviewSidecarDir(root), { recursive: true });
+    const run = { id: mode === 'wrong-run' ? 'other-run' : CTX.runId, effects: [{
+      type: REVIEW_EFFECTS.WRITE_UP, status: mode === 'unapplied' ? 'pending' : 'applied',
+      payload: { bodyFile: mode === 'wrong-file' ? 'other.md' : payload.bodyFile,
+        body: mode === 'empty' ? '  ' : mode === 'non-string' ? 42 : '# verdict' },
+    }] };
+    const runNode = vi.fn();
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root, runNode, runStore: { read: () => {
+      if (mode === 'unreadable') throw new Error('corrupt record');
+      return mode === 'missing' ? null : run;
+    } } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(runNode).not.toHaveBeenCalled();
+  });
+
+  // #6661 send-back — recovery must read the SAME store the executor and `run.mjs --resume` write: the one
+  // `resolveRunsDir()` names, where `OPERATION_RUNS_DIR` wins over the shared folder. Driven through the CLI
+  // entry (`runOperationCli --resume`) and the real executor, not the sink helper alone.
+  describe('recovery through the CLI resume, against the OPERATION_RUNS_DIR store', () => {
+    const saved = {};
+    let runsDir;
+    let sharedDir;
+    beforeEach(() => {
+      for (const k of ['OPERATION_RUNS_DIR', 'WE_SHARED_RUNS_DIR']) saved[k] = process.env[k];
+      runsDir = mkdtempSync(join(tmpdir(), 'review-pr-io-runs-'));
+      sharedDir = mkdtempSync(join(tmpdir(), 'review-pr-io-shared-'));
+      process.env.OPERATION_RUNS_DIR = runsDir;
+      process.env.WE_SHARED_RUNS_DIR = sharedDir;
+    });
+    afterEach(() => {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      rmSync(runsDir, { recursive: true, force: true });
+      rmSync(sharedDir, { recursive: true, force: true });
+    });
+
+    /** The `stageVerdict` → `record` shape of review-pr, reduced to the two effects under test. */
+    const stagedRecord = () => {
+      const declaration = op('review-body-restore', {
+        input: {},
+        stageVerdict: effectStep({ reads: [], effects: () => [
+          { type: REVIEW_EFFECTS.WRITE_UP, payload: { pr: 7, repo: 'o/n', bodyFile: payload.bodyFile, body: '# staged verdict' }, idempotent: true },
+        ] }),
+        record: effectStep({ reads: [], effects: () => [{ type: REVIEW_EFFECTS.LABEL, payload, idempotent: false }] }),
+      });
+      const registry = createRegistry();
+      registry.register(declaration);
+      return { declaration, registry };
+    };
+
+    it('restores a deleted body from the staged run and writes it before the pending label replays', async () => {
+      expect(sharedRunsDir()).not.toBe(runsDir);
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      const { declaration, registry } = stagedRecord();
+      const store = createFileRunStore();
+      const id = 'run-restore-cli';
+      const gate = async () => ({ allowed: true, headSha: payload.reviewedHead });
+      // Round 1: the write-up stages; the label attempt dies the way the pre-fix build recorded it — pending, UNKNOWN.
+      const historical = `review-set-label.mjs failed and its outcome is UNKNOWN: --body-file=${payload.bodyFile} is unreadable (ENOENT: no such file or directory)`;
+      const first = createReviewPrSinks({ root, publishGate: gate });
+      const halted = await runOperationCli({
+        declaration, registry, store, judge: async () => ({}), argv: [], newRunId: () => id,
+        sinks: { ...first, [REVIEW_EFFECTS.LABEL]: async () => { throw new Error(historical); } },
+      });
+      expect(halted.stopped).toBe('effect-halted');
+      const stuck = store.read(id).effects.find(e => e.type === REVIEW_EFFECTS.LABEL);
+      expect(stuck).toMatchObject({ status: 'pending', error: historical });
+      // The lane is recycled: the staged body file is gone; only the run record remembers it.
+      const bodyPath = reviewBodyPath({ root, runId: id, bodyFile: payload.bodyFile });
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      expect(existsSync(bodyPath)).toBe(false);
+      // Round 2: `--resume` with the DEFAULT recovery store. The spawn sees the restored body on disk.
+      const events = [];
+      const write = store.write;
+      const tracked = { ...store, write: record => {
+        events.push(`write:${record.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)?.status}`);
+        return write(record);
+      } };
+      const runNode = vi.fn(argv => {
+        const file = argv.find(a => a.startsWith('--body-file=')).slice('--body-file='.length);
+        events.push(`spawn:${readFileSync(file, 'utf8')}`);
+        return '{"ok":true,"pr":7,"to":"accepted"}';
+      });
+      const resumed = await runOperationCli({
+        declaration, registry, store: tracked, judge: async () => ({}), argv: [`--resume=${id}`], newRunId: () => 'unused',
+        sinks: createSinks({ root, publishGate: gate, readPublishHead: ({ expectedHead }) => expectedHead, runNode }),
+      });
+      expect(resumed.code).toBe(0);
+      expect(runNode).toHaveBeenCalledTimes(1);
+      expect(readFileSync(bodyPath, 'utf8')).toBe('# staged verdict');
+      // Proven-not-applied → `failed` is persisted first, then the attempt is marked, then the body is posted.
+      expect(events.slice(0, 3)).toEqual(['write:failed', 'write:pending', 'spawn:# staged verdict']);
+      expect(store.read(id).effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status).toBe('applied');
+      // Nothing was ever written to the shared folder this env overrides.
+      expect(createFileRunStore(sharedDir).list()).toEqual([]);
+    });
+
+    it('recovers from the store the executor was handed, not a store the sink chose on its own', async () => {
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      const { declaration, registry } = stagedRecord();
+      // A non-default store: nothing about this run exists under OPERATION_RUNS_DIR or the shared folder.
+      const store = createMemoryRunStore();
+      const id = 'run-restore-own-store';
+      const gate = async () => ({ allowed: true, headSha: payload.reviewedHead });
+      const historical = `review-set-label.mjs failed and its outcome is UNKNOWN: --body-file=${payload.bodyFile} is unreadable (ENOENT: no such file or directory)`;
+      await runOperationCli({
+        declaration, registry, store, judge: async () => ({}), argv: [], newRunId: () => id,
+        sinks: { ...createReviewPrSinks({ root, publishGate: gate }), [REVIEW_EFFECTS.LABEL]: async () => { throw new Error(historical); } },
+      });
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      const runNode = vi.fn(argv => {
+        expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice('--body-file='.length), 'utf8')).toBe('# staged verdict');
+        return '{"ok":true}';
+      });
+      const resumed = await runOperationCli({
+        declaration, registry, store, judge: async () => ({}), argv: [`--resume=${id}`], newRunId: () => 'unused',
+        sinks: createReviewPrSinks({ root, publishGate: gate, runNode }),
+      });
+      expect(resumed.code).toBe(0);
+      expect(runNode).toHaveBeenCalledTimes(1);
+      expect(createFileRunStore().list()).toEqual([]);
+    });
+
+    // #6661 send-back item 1 — the DEFAULT recovery store, with no executor handle (`ctx.readRun` absent). The
+    // executor tests above recover through `ctx.readRun`, so they would stay green if the default regressed to
+    // `sharedRunsDir`; this one fails then, because the staged run lives only under OPERATION_RUNS_DIR.
+    it('without an executor handle, the default store is the OPERATION_RUNS_DIR one, not the shared folder', async () => {
+      expect(sharedRunsDir()).not.toBe(runsDir);
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      const { declaration, registry } = stagedRecord();
+      const id = 'run-restore-default-store';
+      const gate = async () => ({ allowed: true, headSha: payload.reviewedHead });
+      const historical = `review-set-label.mjs failed and its outcome is UNKNOWN: --body-file=${payload.bodyFile} is unreadable (ENOENT: no such file or directory)`;
+      await runOperationCli({
+        declaration, registry, store: createFileRunStore(), judge: async () => ({}), argv: [], newRunId: () => id,
+        sinks: { ...createReviewPrSinks({ root, publishGate: gate }), [REVIEW_EFFECTS.LABEL]: async () => { throw new Error(historical); } },
+      });
+      expect(createFileRunStore(runsDir).read(id)?.id).toBe(id);
+      expect(createFileRunStore(sharedDir).list()).toEqual([]);
+      const bodyPath = reviewBodyPath({ root, runId: id, bodyFile: payload.bodyFile });
+      rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+      expect(existsSync(bodyPath)).toBe(false);
+      const runNode = vi.fn(argv => {
+        expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice('--body-file='.length), 'utf8')).toBe('# staged verdict');
+        return '{"ok":true}';
+      });
+      // No `runStore` override and no `ctx.readRun`: only the sink's own default can find the run.
+      const sinks = createReviewPrSinks({ root, publishGate: gate, runNode });
+      await sinks[REVIEW_EFFECTS.LABEL](payload, { key: 'record:0', runId: id, type: REVIEW_EFFECTS.LABEL });
+      expect(runNode).toHaveBeenCalledTimes(1);
+      expect(readFileSync(bodyPath, 'utf8')).toBe('# staged verdict');
+    });
+
+    // Every body-file refusal accepted as replay proof gets a REAL-CLI case here: the CLI must refuse with no gh
+    // call and no file written, or a replay could double-post. The coverage test below fails if a new pattern is
+    // added to BODY_FILE_REFUSALS without a case.
+    const BODY_FILE_CASES = [
+      ['unreadable', () => join(root, 'gone.md')],
+      ['empty', () => { const p = join(root, 'empty.md'); writeFileSync(p, ''); return p; }],
+      ['whitespace-only', () => { const p = join(root, 'blank.md'); writeFileSync(p, '  \n\t\n'); return p; }],
+      // Outside every allowed root (cwd, tmpdir, /tmp): the location check runs before the file is read.
+      ['outside-root', () => '/nonexistent-review-pr-io-6661/verdict.md'],
+    ];
+    const runRealCli = (bodyFile) => {
+      const bin = mkdtempSync(join(tmpdir(), 'review-pr-io-gh-'));
+      const log = join(bin, 'gh.log');
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$@" >> "${log}"\nexit 1\n`, { mode: 0o755 });
+      const before = readdirSync(root).sort();
+      let cli;
+      let ghCalls = '';
+      try {
+        cli = spawnSync(process.execPath, [resolve('scripts/review-set-label.mjs'), '7', '--repo=o/n',
+          '--to=accepted', '--actor=operator', `--body-file=${bodyFile}`], {
+          encoding: 'utf8', cwd: root, timeout: 60_000, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, VITEST: 'true' },
+        });
+      } finally {
+        ghCalls = existsSync(log) ? readFileSync(log, 'utf8') : '';
+        rmSync(bin, { recursive: true, force: true });
+      }
+      return { cli, ghCalls, before, after: readdirSync(root).sort() };
+    };
+
+    it.each(BODY_FILE_CASES)('the real review-set-label CLI refuses a %s body before any write, in a form recovery recognises', (_name, makeBodyFile) => {
+      const { cli, ghCalls, before, after } = runRealCli(makeBodyFile());
+      const diagnostics = `status=${cli.status} stdout=${cli.stdout} stderr=${cli.stderr}`;
+      expect(cli.status, diagnostics).toBe(2);
+      const error = JSON.parse(cli.stdout.trim().split('\n').pop()).error;
+      expect(ghCalls).toBe('');
+      expect(after).toEqual(before);
+      expect(isPreWriteRefusal(error)).toBe(true);
+      const sinks = createReviewPrSinks({ root });
+      expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error: `review-set-label.mjs failed and its outcome is UNKNOWN: ${error}` })).toBe(true);
+    });
+
+    it('every body-file refusal that licenses a replay has a real-CLI no-write case', () => {
+      const covered = new Set();
+      for (const [, makeBodyFile] of BODY_FILE_CASES) {
+        const { cli } = runRealCli(makeBodyFile());
+        const error = JSON.parse(cli.stdout.trim().split('\n').pop()).error;
+        BODY_FILE_REFUSALS.forEach((pattern, i) => { if (pattern.test(error)) covered.add(i); });
+      }
+      expect([...covered].sort()).toEqual(BODY_FILE_REFUSALS.map((_, i) => i));
+    });
+  });
 
   it('shells the SINGLE HOME with the target, the actor and the staged body file', async () => {
     const seen = [];
@@ -3708,10 +3958,12 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     const runNode = vi.fn(() => '{"ok":true}');
     const sleep = vi.fn(async ms => { time += ms; });
     const sinks = createReviewPrSinks({
+      root,
       env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
       runNode, sleep, now: () => time, out: () => {}, readPublishHead: () => head,
       publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks }),
     });
+    await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: 'v.md', body: '# verdict' }, { runId: 'r' });
     const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
     return { publish, runNode };
   };

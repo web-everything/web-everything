@@ -96,3 +96,20 @@ describe('client argv compatibility with the unchanged Forge allowlist', () => {
     expect(stage).not.toHaveBeenCalled();
   });
 });
+
+describe('equivalent test spellings route to Forge; everything else stays refused', () => {
+  const ok = argv => allowedCommand(remote.normalizeRemoteArgv(argv));
+  it('accepts bare vitest run/related', () => {
+    expect(ok(['vitest', 'run', 'scripts/a.test.mjs'])).toBe(true);
+    expect(ok(['vitest', 'related', '--run', 'scripts/a.mjs'])).toBe(true);
+  });
+  it('accepts node scripts/check-standards.mjs with only allowed flags', () => {
+    expect(ok(['node', 'scripts/check-standards.mjs', '--local', '--files=a.mjs'])).toBe(true);
+  });
+  it('still refuses non-test commands', () => {
+    for (const argv of [['claude', '-p', 'x'], ['codex', 'exec', 'x'], ['gh', 'pr', 'list'],
+      ['node', '-e', 'x'], ['node', 'scripts/check-standards.mjs', '--scope=x'],
+      ['node', 'scripts/check-standards.mjs', '--help'], ['node', 'scripts/other.mjs', '--local'],
+      ['vitest', 'run', 'a.test.mjs', '--config', 'evil.ts']]) expect(ok(argv)).toBe(false);
+  });
+});

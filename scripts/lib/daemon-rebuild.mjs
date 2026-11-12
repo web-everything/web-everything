@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/lib/daemon-rebuild.mjs
+ * Public rebuild entry is a plain re-export; ownership and request retries are coordinated by self-sync.
  * @description Module C (card 4044/xgomze7, "the heart") of the daemon-clone rebuild
  *   (docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clauses 2-5) — REBUILDS a daemon clone
  *   fresh from `origin/main` plus its registered overlay list (`daemon-overlays.mjs`, Module B) every tick,
@@ -108,6 +109,8 @@
 // The code lives in `./daemon-rebuild/` (move-only split, one file per concern; `./daemon-rebuild/index.mjs` is
 // the re-export surface). This file stays the compatibility entry point and the CLI, so no caller changes.
 export * from './daemon-rebuild/index.mjs';
+// Register-only overlay writers signal the rebuilder through this existing public facade; no lock is taken.
+export { writeRebuildRequest } from './daemon-clone-lock.mjs';
 
 import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';

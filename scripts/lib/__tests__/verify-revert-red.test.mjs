@@ -362,19 +362,28 @@ describe('parts', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  // The ceiling rides INSIDE the admitted command (the shim), so it starts when the heavy pool grants the slot — never
-  // on the wrapper process, whose lifetime also covers the queue wait.
-  const ceilingOf = (args) => JSON.parse(args.at(-1)).ms;
+  // R830 — plain `npx vitest run <files>`: no `node -e` shim, so the Forge client accepts the argv shape.
+  const timedOutErr = () => Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT', status: null, stdout: ' RUN v1\n', stderr: '' });
 
-  it('the reverted run carries its ceiling inside the admitted command, never as a timeout on the wrapper', () => {
+  it('the run is a plain npx vitest argv (no node -e shim) and the ceiling is the wrapper run ceiling, counted from slot grant', () => {
     const seen = [];
-    const run = (_f, args, opts) => {
-      seen.push({ wrapperTimeout: opts.timeout, ceiling: ceilingOf(args) });
-      throw Object.assign(new Error('exit 124'), { status: 124, stdout: ' RUN v1\n', stderr: 'revert-red-timeout: run exceeded 1234ms and was killed\n' });
-    };
+    const run = (f, args, opts) => { seen.push({ f, args, timeout: opts.timeout }); throw timedOutErr(); };
+    const wrapperKilled = () => Object.assign(new Error('x'), { status: 124, stdout: '', stderr: 'heavy-command admission: run exceeded 1234ms and was stopped.\n' });
     expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run, timeoutMs: 1234 })).toMatchObject({ ran: false, green: false, timedOut: true });
-    expect(seen).toEqual([{ wrapperTimeout: undefined, ceiling: 1234 }]);
-    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, opts) => { expect(opts.timeout).toBeUndefined(); return 'Test Files  1 passed (1)\n'; } })).toMatchObject({ ran: true, timedOut: false });
+    const all = [seen[0].f, ...seen[0].args];
+    expect(all).not.toContain('-e');
+    expect(all.slice(all.indexOf('--') + 1).join(' ')).toMatch(/^npx vitest run \.\/a\.test\.mjs/);
+    // The ceiling rides on the wrapper (starts at slot grant), NOT as an exec timeout around the queue wait.
+    expect(seen[0].timeout).toBeUndefined();
+    expect(seen[0].args).toContain('--run-ceiling-ms=1234');
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw wrapperKilled(); }, timeoutMs: 1234 })).toMatchObject({ ran: false, timedOut: true });
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw Object.assign(new Error('x'), { status: 124, stdout: '', stderr: 'other' }); }, timeoutMs: 1234 }).timedOut).toBe(false);
+    // The remote path's own timeout line counts; the phrase buried mid-line in other output does not.
+    const remote = Object.assign(new Error('x'), { status: 124, stdout: 'Test Files  1 failed (1)\n', stderr: 'heavy-admission: remote failed (remote-timeout) - remote termination unconfirmed; refusing local rerun (exit 124).\n' });
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw remote; }, timeoutMs: 1234 })).toMatchObject({ ran: false, timedOut: true });
+    const spoof2 = Object.assign(new Error('x'), { status: 124, stdout: 'Tests  1 passed (1)\n', stderr: ' log: run exceeded 7ms and was stopped\n' });
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw spoof2; }, timeoutMs: 1234 }).timedOut).toBe(false);
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, opts) => { expect(opts.timeout).toBeUndefined(); expect(_a.join(' ')).not.toContain('run-ceiling'); return 'Test Files  1 passed (1)\n'; } })).toMatchObject({ ran: true, timedOut: false });
   });
 
   it('the shim bounds only the command it wraps: it kills the whole process group when the ceiling passes', () => {
@@ -413,7 +422,7 @@ describe('parts', () => {
 
   it('a timed-out run is its own reason, not a generic unrun (baseline and reverted run)', async () => {
     await withFix(async (ctx) => {
-      const timedOut = () => { throw Object.assign(new Error('exit 124'), { status: 124, stdout: '', stderr: 'revert-red-timeout: run exceeded 1ms and was killed\n' }); };
+      const timedOut = () => { throw timedOutErr(); };
       const baseline = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'enforce', probe: createRevertProbe({ run: timedOut, timeoutMs: 1 }) });
       expect(baseline).toMatchObject({ status: 'unproven', reason: 'baseline-timeout', blocking: true });
       let calls = 0;
@@ -426,9 +435,9 @@ describe('parts', () => {
 
   it('the revert probe bounds BOTH of its runs with a 10-minute ceiling by default', () => {
     const seen = [];
-    const probe = createRevertProbe({ read: () => 'fixed', write: () => {}, run: (_f, args) => { seen.push(ceilingOf(args)); return 'Test Files  1 passed (1)\n'; } });
+    const probe = createRevertProbe({ read: () => 'fixed', write: () => {}, run: (_f, a, o) => { seen.push(a.find((x) => x.startsWith('--run-ceiling-ms='))); return 'Test Files  1 passed (1)\n'; } });
     probe({ cwd: '.', targets: [{ target: 'a.mjs', fixed: 'fixed', revert: 'old' }], suite: ['./a.test.mjs'] });
-    expect(seen).toEqual([600000, 600000]);
+    expect(seen).toEqual(['--run-ceiling-ms=600000', '--run-ceiling-ms=600000']);
   });
 
   it('the single-file mutation probe also refuses to write over an edit made during its baseline run', () => {
