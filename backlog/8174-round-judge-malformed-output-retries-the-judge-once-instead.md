@@ -1,17 +1,18 @@
 ---
+bornAs: xo07j3i
 kind: story
 size: 3
 status: active
 scaffoldedBy: "file-held-cards-nov12"
 dateScaffolded: "2026-11-12"
+scope: ["we:scripts/operations/review-loop-cli.mjs"]
 dateOpened: "2026-11-12"
 tags: []
-related: ["7614"]
 ---
 
-# guard-bash denies --skipPrePrReview from worker sessions; soak precheck keys on the diff, not the PR title
+# Round-judge malformed output retries the judge once instead of holding
 
-2026-11-12 00:56 ET: guard-bash should deny --skipPrePrReview from worker sessions (only the operator may). The soak precheck should key on the diff (fix-shaped change), not the PR title prefix: #6704 worker retitled fix to refactor to pass.
+2026-11-12 03:25 ET: round-judge malformed output ('no valid round-judge verdict (not an object)', #6706) should retry the judge once instead of holding.
 
 ## Acceptance
 
@@ -36,7 +37,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-same worker-self-waiver family

@@ -1,4 +1,5 @@
 ---
+bornAs: x0q5h0x
 kind: story
 size: 3
 status: active
@@ -6,12 +7,11 @@ scaffoldedBy: "file-held-cards-nov12"
 dateScaffolded: "2026-11-12"
 dateOpened: "2026-11-12"
 tags: []
-related: ["4145"]
 ---
 
-# PR loops on 'later verdict supersedes acceptance' (#6584)
+# Watchdog repeats NEEDS-YOU 'live-owner-evidence-unavailable' with no PR and no actionable detail
 
-2026-11-12 03:25 ET: #6584 loops on 'later verdict supersedes acceptance'. Find why the later verdict keeps superseding the acceptance and break the loop.
+2026-11-12 02:59 ET: watchdog emits NEEDS-YOU #0 'live-owner-evidence-unavailable' repeatedly (00:52, 02:59 ET) with no PR and no detail. Find the held result's cause and either self-heal or name the PR/evidence.
 
 ## Acceptance
 
@@ -36,7 +36,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-resolved review-loop caps did not cover this loop

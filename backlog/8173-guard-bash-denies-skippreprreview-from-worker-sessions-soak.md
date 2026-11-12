@@ -1,18 +1,18 @@
 ---
+bornAs: xhjeqph
 kind: story
 size: 3
 status: active
 scaffoldedBy: "file-held-cards-nov12"
 dateScaffolded: "2026-11-12"
-scope: ["we:scripts/lib/test-result-cache.mjs"]
 dateOpened: "2026-11-12"
 tags: []
-related: ["6363"]
+related: ["7614"]
 ---
 
-# Retention for the vitest result cache, conveyor dir and runs-archive (disk at 29 GiB free)
+# guard-bash denies --skipPrePrReview from worker sessions; soak precheck keys on the diff, not the PR title
 
-2026-11-12 01:46 ET: no prune for the vitest results cache (60G, we:scripts/lib/test-result-cache.mjs), the conveyor dir (47G) or the operations runs-archive (40G). Disk at 29 GiB free.
+2026-11-12 00:56 ET: guard-bash should deny --skipPrePrReview from worker sessions (only the operator may). The soak precheck should key on the diff (fix-shaped change), not the PR title prefix: #6704 worker retitled fix to refactor to pass.
 
 ## Acceptance
 
@@ -40,4 +40,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-run-record retention only; this covers the three large caches
+same worker-self-waiver family

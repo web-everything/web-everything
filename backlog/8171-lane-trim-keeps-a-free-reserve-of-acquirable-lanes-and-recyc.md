@@ -1,17 +1,19 @@
 ---
+bornAs: xczg1se
 kind: story
 size: 3
 status: active
 scaffoldedBy: "file-held-cards-nov12"
 dateScaffolded: "2026-11-12"
-scope: ["we:scripts/hooks/sync-guard-clone.mjs"]
+scope: ["we:scripts/lane-pool.mjs"]
 dateOpened: "2026-11-12"
 tags: []
+related: ["4014"]
 ---
 
-# A dirty guard clone denies every Bash call, including the repair script
+# Lane trim keeps a free reserve of acquirable lanes and recycles stale pinned lanes
 
-2026-11-11 23:14 ET: guard clone dirty -> every Bash call denied (Pinned guard: cannot load dedicated clone guard), including the repair script itself. Fix: allow we:scripts/hooks/sync-guard-clone.mjs through the guard, or auto-sync, so a dirty guard clone cannot lock out all sessions.
+2026-11-12 01:46 ET: trim removed all 21 idle lanes; acquire re-provisioned 15 within 45 min (disk churn). Trim must keep a free reserve. Pinned lanes (41) with stale unpushed/uncommitted work >24h should be bundled and recycled like #6693 does for stashes.
 
 ## Acceptance
 
@@ -36,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+extends the cap/prune work with a reserve and pinned-lane recycling

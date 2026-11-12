@@ -1,17 +1,19 @@
 ---
+bornAs: xpx9q84
 kind: story
 size: 3
 status: active
 scaffoldedBy: "file-held-cards-nov12"
 dateScaffolded: "2026-11-12"
-scope: ["we:scripts/conveyor/orphan-fix-round.mjs"]
+scope: ["we:scripts/lib/test-result-cache.mjs"]
 dateOpened: "2026-11-12"
 tags: []
+related: ["6363"]
 ---
 
-# Fix-daemon orphan-guard re-dispatches a fixer on already-fixed work (head: unknown)
+# Retention for the vitest result cache, conveyor dir and runs-archive (disk at 29 GiB free)
 
-2026-11-12 07:31 ET: fix-daemon orphan-guard and the 'ruling not addressed' comment fire with head: unknown and do not check whether the new head already satisfies the send-back (#6647, 10:59Z comment), so a fixer is re-dispatched on already-fixed work.
+2026-11-12 01:46 ET: no prune for the vitest results cache (60G, we:scripts/lib/test-result-cache.mjs), the conveyor dir (47G) or the operations runs-archive (40G). Disk at 29 GiB free.
 
 ## Acceptance
 
@@ -36,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+run-record retention only; this covers the three large caches

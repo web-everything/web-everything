@@ -1,17 +1,18 @@
 ---
+bornAs: xe6q1pq
 kind: story
 size: 3
 status: active
 scaffoldedBy: "file-held-cards-nov12"
 dateScaffolded: "2026-11-12"
-scope: ["we:scripts/operations/review-loop-cli.mjs"]
 dateOpened: "2026-11-12"
 tags: []
+related: ["4145"]
 ---
 
-# Round-judge malformed output retries the judge once instead of holding
+# PR loops on 'later verdict supersedes acceptance' (#6584)
 
-2026-11-12 03:25 ET: round-judge malformed output ('no valid round-judge verdict (not an object)', #6706) should retry the judge once instead of holding.
+2026-11-12 03:25 ET: #6584 loops on 'later verdict supersedes acceptance'. Find why the later verdict keeps superseding the acceptance and break the loop.
 
 ## Acceptance
 
@@ -36,3 +37,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+resolved review-loop caps did not cover this loop

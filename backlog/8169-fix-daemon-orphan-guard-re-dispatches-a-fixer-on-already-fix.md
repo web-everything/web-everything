@@ -1,16 +1,18 @@
 ---
+bornAs: x2l1poz
 kind: story
 size: 3
 status: active
 scaffoldedBy: "file-held-cards-nov12"
 dateScaffolded: "2026-11-12"
+scope: ["we:scripts/conveyor/orphan-fix-round.mjs"]
 dateOpened: "2026-11-12"
 tags: []
 ---
 
-# Watchdog repeats NEEDS-YOU 'live-owner-evidence-unavailable' with no PR and no actionable detail
+# Fix-daemon orphan-guard re-dispatches a fixer on already-fixed work (head: unknown)
 
-2026-11-12 02:59 ET: watchdog emits NEEDS-YOU #0 'live-owner-evidence-unavailable' repeatedly (00:52, 02:59 ET) with no PR and no detail. Find the held result's cause and either self-heal or name the PR/evidence.
+2026-11-12 07:31 ET: fix-daemon orphan-guard and the 'ruling not addressed' comment fire with head: unknown and do not check whether the new head already satisfies the send-back (#6647, 10:59Z comment), so a fixer is re-dispatched on already-fixed work.
 
 ## Acceptance
 
