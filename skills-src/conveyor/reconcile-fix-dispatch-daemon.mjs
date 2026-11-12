@@ -101,7 +101,7 @@ const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..
 import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
-import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 /** Per-owner App auth: this daemon fixes PRs in every org (live 2026-10-04: plateau-app calls failed with the
@@ -906,6 +906,9 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
 
 // R812: settings can narrow these bounds; only code can enlarge the outer limit.
 const FIX_PASS_LIMITS = {
+  fixMs: { defaultMs: 300000, maxMs: 1800000, env: 'WE_FIX_BUDGET_FIX_MS', phase: 'fix' },
+  notesMs: { defaultMs: 300000, maxMs: 1800000, env: 'WE_FIX_BUDGET_NOTES_MS', phase: 'notes' },
+  orphanGuardMs: { defaultMs: 300000, maxMs: 1800000, env: 'WE_FIX_BUDGET_ORPHAN_GUARD_MS', phase: 'orphan-guard' },
   stuckFixersMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_STUCK_FIXERS_MS', phase: 'stuck-fixers' },
   ciHealMs: { defaultMs: 180000, maxMs: 900000, env: 'WE_FIX_BUDGET_CI_HEAL_MS', phase: 'ci-heal' },
   promoteDraftMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_PROMOTE_DRAFT_MS', phase: 'promote-draft' },
@@ -944,6 +947,7 @@ export function resolveFixPassBudgets({ env = process.env,
 
 // One cursor per bounded repo phase; callers can inject isolated daemon state.
 const fixPassRotation = {};
+const fixPassPrCursors = {};
 
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
@@ -1019,6 +1023,7 @@ export async function runTickAllRepos({
   now = Date.now,
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
+  prCursors = fixPassPrCursors,
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
@@ -1046,13 +1051,31 @@ export async function runTickAllRepos({
     }
     delete budgetRotation[phase];
   }
-  const phaseMs = {};
+  const phaseMs = {}, phaseStarts = {}, phasePrCounts = {};
+  // Wrap both sync and async ticks without changing the synchronous fan-outs.
+  const boundedPrTick = (phase, tick) => options => {
+    const cursors = prCursors[phase] ??= {};
+    const record = result => {
+      const counts = phasePrCounts[phase] ??= { handled: 0, deferred: 0 };
+      counts.handled += result?.handled ?? 0;
+      counts.deferred += result?.deferred?.length ?? 0;
+      if (result?.nextCursor != null) {
+        cursors[options.repo] = result.nextCursor;
+        budgets[phase].hit = true;
+        budgets[phase].skipped.push(...(result.deferred ?? []));
+      } else delete cursors[options.repo];
+      return result;
+    };
+    const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
+      cursor: cursors[options.repo], now });
+    return result && typeof result.then === 'function' ? result.then(record) : record(result);
+  };
   const finishPhase = (name, start) => {
     phaseMs[name] = now() - start;
     if (budgets[name] && phaseMs[name] > budgets[name].budgetMs) budgets[name].hit = true;
   };
-  const timed = (name, fn) => { const t = now(); try { return fn(); } finally { finishPhase(name, t); } };
-  const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { finishPhase(name, t); } };
+  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return fn(); } finally { finishPhase(name, t); } };
+  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await fn(); } finally { finishPhase(name, t); } };
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick, shared by both dispatching halves below. Real IO
   // (`planClaudeAuthDispatchGate`'s own `claude agents --json --all` read + health read + cheap probe) runs
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule
@@ -1204,11 +1227,19 @@ export async function runTickAllRepos({
   // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
   const orphanGuard = await timedAsync('orphan-guard', async () => {
     if (stuckFixerTick || !realTick || !orphanGuardTick) return { rows: [] };
-    try { return await orphanGuardTick({ env: process.env, nowMs: now() }) ?? { rows: [] }; }
+    try { return await orphanGuardTick({ env: process.env, nowMs: now(),
+      repos: (function* () {
+        for (const repo of budgetRepos('orphan-guard', repos)) {
+          const key = repoKeyForSlug(repo);
+          if (!key) throw new Error(`orphan-guard: unknown repo ${repo}`);
+          yield { key, slug: CONSTELLATION_REPOS[key].slug };
+        }
+      })(),
+    }) ?? { rows: [] }; }
     catch (e) { return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] }; }
   });
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
+    : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', stepRepos.get('fix')), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   planCache?.markTouched(fix);
@@ -1238,7 +1269,7 @@ export async function runTickAllRepos({
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }),
+    : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick ? {} : { queueAdmission, dispatchThrottle }),
       ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
   ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
   planCache?.markTouched(ciHeal);
@@ -1259,13 +1290,13 @@ export async function runTickAllRepos({
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
-  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
+  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: boundedPrTick('promote-draft', sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch)) }));
   promoteDraft.budgetSkipped = budgets['promote-draft'].skipped;
   planCache?.markTouched(promoteDraft);
   // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
   // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
   const notes = timed('notes', () => runReconcileNotesAllRepos({
-    repos, ...(planCache ? { reconcile: planCache.reconcile } : {}),
+    repos: budgetRepos('notes', repos), ...(planCache ? { reconcile: planCache.reconcile } : {}),
     ...(notesTick ? { tick: notesTick } : planCache ? { tick: (o) => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
   }));
   // #3383 follow-up — tag confirmed freshly-dispatched fix/ci-heal sessions, `fix`+`ci-heal`
@@ -1325,7 +1356,7 @@ export async function runTickAllRepos({
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
-    budgets, passBudgetSettings: passBudgets,
+    phasePrCounts, budgets, passBudgetSettings: passBudgets,
     skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
 }
@@ -1524,7 +1555,7 @@ export function formatPassTiming(result) {
 /** Keep the historical total line intact; emit each phase exactly once alongside it. */
 export function formatPassPhaseTiming(result) {
   return Object.entries(result?.phaseMs ?? {}).filter(([, ms]) => Number.isFinite(ms))
-    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false}`);
+    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false} prs=${result?.phasePrCounts?.[name]?.handled ?? 0} deferred=${result?.phasePrCounts?.[name]?.deferred ?? 0}`);
 }
 
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +

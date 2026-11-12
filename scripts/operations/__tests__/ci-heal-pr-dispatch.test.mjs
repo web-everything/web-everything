@@ -1239,3 +1239,29 @@ it('checks the current Argon Pro identity for CI-heal quota holds', () => {
   expect(readHolds).toHaveBeenCalledWith('gemini-4-argon-high', { now: 123 });
   expect(readHolds).not.toHaveBeenCalledWith('gemini-3.1-pro', expect.anything());
 });
+
+it('yields CI-heal between complete PR effects and resumes at the cursor with wraparound', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-'));
+  let time = 10, inEffect = false;
+  const touched = [];
+  const now = vi.fn(() => { expect(inEffect).toBe(false); return time; });
+  const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
+    reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a' })), refusals: [] }),
+    dispatch: async p => { inEffect = true; time = 11; touched.push(p.pr); await Promise.resolve(); return { pr: p.pr }; },
+    pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+    flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+    salvage: async () => null, currentBuild: () => null,
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => { expect(inEffect).toBe(true); inEffect = false; } },
+  };
+  try {
+    const first = await runReconcileCiHealDispatch(options);
+    expect(first).toMatchObject({ handled: 1, deferred: [2, 3], nextCursor: 2 });
+    expect(touched).toEqual([1]);
+    expect(now).toHaveBeenCalledTimes(2);
+    touched.length = 0;
+    const second = await runReconcileCiHealDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
+    expect(touched).toEqual([2, 3, 1]);
+    expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

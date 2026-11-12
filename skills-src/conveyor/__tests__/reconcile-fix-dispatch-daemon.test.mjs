@@ -44,6 +44,7 @@ import * as supersedeWatch from '../../../scripts/conveyor/supersede-watch.mjs';
 import * as heavyAdmission from '../../../scripts/readiness/heavy-admission.mjs';
 import * as resourceGate from '../../../scripts/lib/resource-gate.mjs';
 import * as unsupportedRepo from '../../../scripts/conveyor/unsupported-repo.mjs';
+import * as rulingStandDown from '../../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 
 describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
   it.each([
@@ -472,7 +473,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft'].includes(step)
+              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
     expect(readPrs).toHaveBeenCalledTimes(1);
@@ -488,7 +490,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     // R242 audit round 3: preserve durable flush ordering and fresh-evidence writes.
     for (const step of ['ci-heal', 'notes']) {
       expect(opts[steps[step]]).toHaveBeenCalledTimes(1);
-      expect(opts[steps[step]]).toHaveBeenCalledWith({ repo: 'repo-a' });
+      expect(opts[steps[step]]).toHaveBeenCalledWith(step === 'ci-heal'
+        ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
       expect(result.skippedSteps).not.toContain(step);
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
@@ -644,7 +647,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft'].includes(step)
+              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
     expect(result.skippedSteps ?? []).toEqual([]);
     expect(skipLines(log)).toEqual([]);
@@ -750,7 +754,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft'].includes(step)
+              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
   });
 
@@ -822,7 +827,9 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       // R242 audit round 3 reverses earlier sharing expectations: these owners
       // must always run their historical paths for flush ordering and fresh writes.
       if (['ci-heal', 'notes'].includes(step)) {
-        expect(options).toEqual({ repo: options.repo });
+        expect(options).toEqual(step === 'ci-heal'
+          ? { repo: options.repo, deadlineAt: expect.any(Number), cursor: undefined, now: expect.any(Function) }
+          : { repo: options.repo });
         seen.push([step, options.repo]);
         return fallback();
       }
@@ -874,7 +881,7 @@ describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal disp
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' }); // ci-heal still ran for repo-a despite fix's own failure there
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // ci-heal still ran for repo-a despite fix's own failure there
     expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false }); // fix still ran for repo-b despite ci-heal's own failure there
     expect(out.refusals).toEqual(expect.arrayContaining([
       { repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'fix broke' },
@@ -1302,7 +1309,7 @@ describe('runTickAllRepos — now runs THREE halves: fix, ci-heal, and hung-ci-r
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
     expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' });
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'hung-ci broke' }]));
   });
 });
@@ -1438,7 +1445,7 @@ describe('runTickAllRepos — now runs FOUR halves: fix, ci-heal, hung-ci-recove
       missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
     expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' });
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'rebase broke' }]));
   });
 });
@@ -1552,7 +1559,7 @@ describe('runTickAllRepos — now runs SIX halves, missing-run-recovery included
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
     expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' });
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'trigger broke' }]));
   });
 });
@@ -2130,6 +2137,44 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     };
   };
 
+  it.each(['keys', 'slugs'])('bounds orphan-guard between repos and resumes the skipped repo next pass (%s)', async form => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = 0;
+    const visited = [];
+    const repos = ['we', 'frontierui'].map(key => form === 'slugs' ? CONSTELLATION_REPOS[key].slug : key);
+    const options = { ...f.options, repos, now: () => time, budgetRotation: {},
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: async ({ repos }) => {
+        for (const repo of repos) { visited.push(repo.key); time += 1001; }
+        return { rows: [] };
+      } };
+    const first = await realRunTickAllRepos(options);
+    expect(visited).toEqual(['we']);
+    expect(first.stuckFixers.rows).toEqual([]);
+    expect(first.budgets['orphan-guard']).toMatchObject({ hit: true, skipped: [repos[1]] });
+    visited.length = 0;
+    const second = await realRunTickAllRepos(options);
+    expect(visited).toEqual(['frontierui']);
+    expect(second.stuckFixers.rows).toEqual([]);
+    expect(second.budgets['orphan-guard']).toMatchObject({ hit: true, skipped: [repos[0]] });
+    expect(time).toBe(2002);
+  });
+
+  it('reports an unknown orphan-guard repo without yielding an invalid repo to the guard', async () => {
+    const f = productionFixture();
+    const visited = [];
+    const result = await realRunTickAllRepos({ ...f.options, repos: ['fui'], budgetRotation: {},
+      orphanGuardTick: async ({ repos }) => {
+        for (const repo of repos) visited.push(repo);
+        return { rows: [] };
+      } });
+    expect(visited).toEqual([]);
+    expect(result.stuckFixers.orphanRounds.rows).toEqual([
+      { decision: 'error', reason: 'orphan-guard: unknown repo fui' },
+    ]);
+  });
+
   it('runs the orphan-round guard before fix so a capped orphan is not re-dispatched first', async () => {
     const f = productionFixture();
     const order = [];
@@ -2242,7 +2287,13 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const spy = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf());
     let t = 0;
-    await runTickAllRepos({ ...base, repos: ['repo-a'], now: () => (t += 400_000), ...phases([]) });
+    const ticks = phases([]);
+    // Expire the cache between complete phase ticks; clock probes themselves consume no budget.
+    for (const name of ['fixTick', 'ciHealTick', 'promoteDraftTick', 'notesTick']) {
+      const tick = ticks[name];
+      ticks[name] = options => { const result = tick(options); t += 1_000_000; return result; };
+    }
+    await runTickAllRepos({ ...base, repos: ['repo-a'], now: () => t, ...ticks });
     expect(spy.mock.calls.length).toBeGreaterThan(1);
   });
 
@@ -2380,6 +2431,33 @@ describe('fix pass budgets', () => {
       stuckFixersMs: 1000, ciHealMs: 1000, promoteDraftMs: 1000,
     } } }), budgetRotation: {}, ...extra });
 
+  it.each(['ci-heal', 'promote-draft'])('carries %s PR cursor across passes, clears it on completion and logs PR counts', async phase => {
+    const cursors = {}, calls = [];
+    const tick = ({ repo, cursor, deadlineAt, now }) => {
+      calls.push({ repo, cursor, deadlineAt, clock: now() });
+      return { ...empty(), handled: 1, deferred: calls.length === 1 ? [42, 43] : [], nextCursor: calls.length === 1 ? 42 : null };
+    };
+    const opts = fixture({ repos: ['a'], now: () => 0, prCursors: cursors,
+      [phase === 'ci-heal' ? 'ciHealTick' : 'promoteDraftTick']: tick });
+    const first = await runTickAllRepos(opts);
+    expect(first.budgets[phase]).toMatchObject({ hit: true, skipped: [42, 43] });
+    expect(formatPassPhaseTiming(first)).toContain(`pass-timing phase=${phase} ms=0 budgetMs=1000 budgetHit=true prs=1 deferred=2`);
+    await runTickAllRepos(opts);
+    await runTickAllRepos(opts);
+    expect(calls).toEqual([
+      { repo: 'a', cursor: undefined, deadlineAt: 1000, clock: 0 },
+      { repo: 'a', cursor: 42, deadlineAt: 1000, clock: 0 },
+      { repo: 'a', cursor: undefined, deadlineAt: 1000, clock: 0 },
+    ]);
+  });
+
+  it.each([['fixMs', 'FIX'], ['notesMs', 'NOTES'], ['orphanGuardMs', 'ORPHAN_GUARD']])('resolves %s defaults, overrides and bounds', (key, envKey) => {
+    expect(resolveFixPassBudgets({ env: {}, file: {} })[key]).toEqual({ value: 300000, source: 'standard' });
+    expect(resolveFixPassBudgets({ env: { [`WE_FIX_BUDGET_${envKey}_MS`]: '4567' }, file: {} })[key]).toEqual({ value: 4567, source: 'env' });
+    expect(resolveFixPassBudgets({ env: { [`WE_FIX_BUDGET_${envKey}_MS`]: '99999999' }, file: {} })[key].value).toBe(1800000);
+    expect(resolveFixPassBudgets({ env: { [`WE_FIX_BUDGET_${envKey}_MS`]: 'bad' }, file: {} })[key].value).toBe(300000);
+  });
+
   it('runs fix before stuck-fixers, CI-heal and promote-draft', async () => {
     const order = [];
     await runTickAllRepos(fixture({ repos: ['a'], now: () => 0,
@@ -2411,6 +2489,23 @@ describe('fix pass budgets', () => {
     expect(order).toEqual(['fix:a', 'fix:b', 'fix:c', `${phase}:c`]);
   });
 
+  it.each(['fix', 'notes'])('bounds %s between repos and resumes the skipped repo', async phase => {
+    let time = 0;
+    const visited = [];
+    const opts = fixture({ now: () => time,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { fixMs: 1000, notesMs: 1000 } } }),
+      [phase === 'fix' ? 'fixTick' : 'notesTick']: ({ repo }) => {
+        visited.push(repo); time += 1001; return { ...empty(), notes: [], prsByNumber: new Map() };
+      },
+    });
+    const first = await runTickAllRepos(opts);
+    expect(visited).toEqual(['a']);
+    expect(first.budgets[phase]).toMatchObject({ hit: true, skipped: ['b', 'c'] });
+    visited.length = 0;
+    await runTickAllRepos(opts);
+    expect(visited).toEqual(['b']);
+  });
+
   it('over-budget stuck-fixers preserves the pass and logs budgetHit=true', async () => {
     let time = 0;
     const result = await runTickAllRepos(fixture({ now: () => time,
@@ -2420,7 +2515,7 @@ describe('fix pass budgets', () => {
     expect(result.ciHeal.repos).toHaveLength(3);
     const lines = [];
     buildCliDaemonEffects({ owner: 't', log: { error: line => lines.push(line) } }).onTick(result);
-    expect(lines).toContain('reconcile-fix-dispatch-daemon: pass-timing phase=stuck-fixers ms=1001 budgetMs=1000 budgetHit=true');
+    expect(lines).toContain('reconcile-fix-dispatch-daemon: pass-timing phase=stuck-fixers ms=1001 budgetMs=1000 budgetHit=true prs=0 deferred=0');
     expect(lines.filter(line => line.includes('fix-pass-budget'))).toHaveLength(1);
   });
 
@@ -2431,6 +2526,9 @@ describe('fix pass budgets', () => {
       stuckFixersMs: { value: 600000, source: 'tool' },
       ciHealMs: { value: 2000, source: 'env' },
       promoteDraftMs: { value: 600000, source: 'env' },
+      fixMs: { value: 300000, source: 'standard' },
+      notesMs: { value: 300000, source: 'standard' },
+      orphanGuardMs: { value: 300000, source: 'standard' },
     });
     expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { ciHealMs: 1 } } }).ciHealMs.value).toBe(1000);
     expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { ciHealMs: 9999999 } } }).ciHealMs.value).toBe(900000);
@@ -2462,7 +2560,7 @@ describe('fix pass budgets', () => {
   it('formats one finite phase line including budgets and unbudgeted phases', () => {
     expect(formatPassPhaseTiming({ phaseMs: { fix: 20, 'ci-heal': 1001, bad: NaN },
       budgets: { 'ci-heal': { budgetMs: 1000, hit: true } },
-    })).toEqual(['pass-timing phase=fix ms=20 budgetMs=none budgetHit=false',
-      'pass-timing phase=ci-heal ms=1001 budgetMs=1000 budgetHit=true']);
+    })).toEqual(['pass-timing phase=fix ms=20 budgetMs=none budgetHit=false prs=0 deferred=0',
+      'pass-timing phase=ci-heal ms=1001 budgetMs=1000 budgetHit=true prs=0 deferred=0']);
   });
 });

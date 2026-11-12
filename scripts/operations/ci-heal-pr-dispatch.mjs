@@ -428,8 +428,10 @@ export async function runReconcileCiHealDispatch({
   fixConfig = fixLoopConfig(),
   currentBuild = () => currentCheckoutBuild(root),
   postParkComment = postFixLoopParkComment,
-  now = Date.now(),
+  now = Date.now,
+  deadlineAt, cursor,
 } = {}) {
+  const clock = typeof now === 'function' ? now : () => now;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
@@ -445,7 +447,7 @@ export async function runReconcileCiHealDispatch({
   if (reconciled?.deferred === true) {
     const readDeferred = String(reconciled.message ?? reconciled.reason ?? 'deferred').split('\n')[0];
     console.error(`ci-heal-pr-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
-    return { dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
+    return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
   }
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
@@ -462,9 +464,14 @@ export async function runReconcileCiHealDispatch({
       timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message });
     }
   }
-  const ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
+  let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
+  if (deadlineAt != null || cursor != null) {
+    ciHealEntries.sort((a, b) => a.prNumber - b.prNumber);
+    const start = ciHealEntries.findIndex(entry => entry.prNumber >= cursor);
+    if (start > 0) ciHealEntries = [...ciHealEntries.slice(start), ...ciHealEntries.slice(0, start)];
+  }
   if (!ciHealEntries.length && timeoutResults.length) return {
-    dispatched: timeoutResults.filter((r) => r.status === 'requested'),
+    handled: 0, deferred: [], nextCursor: null, dispatched: timeoutResults.filter((r) => r.status === 'requested'),
     refusals: timeoutResults.filter((r) => r.status !== 'requested'), timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush,
   };
@@ -480,7 +487,7 @@ export async function runReconcileCiHealDispatch({
       why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
     }));
     recordUnsupported({ repo: repoKey, rows: [...otherRows, ...refusals], path: unsupportedPath });
-    return { dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
+    return { handled: ciHealEntries.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
   }
   // `ci-heal` IS supported here — clear any stale `ci-heal` unsupported rows, preserving `fix`/`review` rows.
   recordUnsupported({ repo: repoKey, rows: otherRows, path: unsupportedPath });
@@ -492,7 +499,15 @@ export async function runReconcileCiHealDispatch({
   const refusals = [];
   let build = null;
   try { build = await (fixLoop.currentBuild ?? currentBuild)(); } catch { /* Build lookup is best effort. */ }
+  let handled = 0;
+  let deferred = [];
   for (const entry of ciHealEntries) {
+    const entryNow = clock();
+    if (deadlineAt != null && entryNow > deadlineAt) {
+      deferred = ciHealEntries.slice(handled).map(row => row.prNumber);
+      break;
+    }
+    handled += 1;
     if (fixLoop.killed()) {
       refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
       continue;
@@ -522,7 +537,7 @@ export async function runReconcileCiHealDispatch({
     let loopRows = [];
     try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
 
-    const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now, config: fixConfig };
+    const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now: entryNow, config: fixConfig };
     const raw = fixLoopState(identity);
     const infraRows = [], sessionRows = fixLoopSessionRows(identity);
     for (const session of new Set(raw.sessions)) {
@@ -629,7 +644,7 @@ export async function runReconcileCiHealDispatch({
     }
   }
 
-  return { dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
+  return { handled, deferred, nextCursor: deferred[0] ?? null, dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
     refusals: [...refusals, ...timeoutResults.filter((r) => r.status !== 'requested')], timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
 }
