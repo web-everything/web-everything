@@ -1350,6 +1350,31 @@ export function isBehindButClean(v) {
     && v.hasManifest === false && v.testGreen === true && (v.certifyLabel === true || v.aiGenerated === true);
 }
 
+/**
+ * Authoritative head-tree probe: true ONLY when git proves the head tree has no `.lane-manifest.json` path at all.
+ * `v.hasManifest === false` is not enough (malformed/item-less manifests parse to null), so any read problem or any
+ * listed path fails closed (false => the existing rebase/strip path runs). `git` is injected (args => stdout).
+ */
+export function headTreeLacksManifestFile({ headRef, headSha, prNumber, git }) {
+  try {
+    const read = readLegacyLocalManifestAt({ headRef, headSha, prNumber, git });
+    if (read.unreadable || !read.definitive || read.manifest != null) return false;
+    return String(git(['ls-tree', '--end-of-options', headSha, '--', '.lane-manifest.json']) ?? '').trim() === '';
+  } catch { return false; }
+}
+
+/** Return the rebase operation unless the queue can preserve this proven manifest-free head. */
+export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFree, rebase = rebaseDropManifest }) {
+  if (setting === 'conflict-only' && mergeStrategy.queueOwnsFreshness(v.repo) === true
+    && isBehindButClean(v) && manifestFree() === true) {
+    v.decision = 'merge';
+    v.reason = 'behind main but clean; merge queue tests PR + main - enqueued on its existing head';
+    v.rebaseDrop = 'skipped-behind-clean';
+    return null;
+  }
+  return rebase;
+}
+
 /** Pure: injected settings layers keep IO outside the resolver; invalid values retain the legacy rebase path. */
 export function resolveRebaseBeforeEnqueue(env = {}, { platform, tool } = {}) {
   const checked = value => value === undefined || ['conflict-only', 'always'].includes(value) ? value : 'invalid';
@@ -5906,10 +5931,14 @@ async function runCli() {
         }
         continue;
       }
-      if (rebaseBeforeEnqueue.value === 'conflict-only' && mergeStrategy.queueOwnsFreshness(v.repo) && isBehindButClean(v)) {
-        v.decision = 'merge';
-        v.reason = 'behind main but clean; merge queue tests PR + main - enqueued on its existing head';
-        v.rebaseDrop = 'skipped-behind-clean';
+      const behindCleanDir = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
+      const rebase = routeRebaseBeforeEnqueue(v, { setting: rebaseBeforeEnqueue.value, mergeStrategy,
+        manifestFree: () => !!behindCleanDir && headTreeLacksManifestFile({
+          headRef: v.headRef, headSha: v.listedHeadSha || v.headSha, prNumber: v.num,
+          git: (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: behindCleanDir }),
+        }),
+      });
+      if (!rebase) {
         if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} ${v.reason}\n`);
         continue;
       }
@@ -5944,7 +5973,7 @@ async function runCli() {
         if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} would rebase-drop manifest (state ${v.state}/${v.mergeable})${cloneDir ? ` via ${cloneDir}` : ''} then merge\n`);
         continue;
       }
-      let r = rebaseDropManifest({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
+      let r = rebase({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
       // #2371 — a REAL (non-manifest) conflict is the manifest resolver's own skip boundary; retry it with the
       // wider content resolver, which ONLY auto-resolves if every conflicting hunk is non-overlapping. Its own
       // skip (a genuine overlapping/unsafe hunk) is left exactly as before — surfaced for `/finish`.

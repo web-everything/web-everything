@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -53,6 +53,52 @@ describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
 
   it('fails closed with missing verdict fields', () => {
     for (const v of [undefined, null, {}]) expect(isBehindButClean(v)).toBe(false);
+  });
+});
+
+describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
+  const clean = { repo: 'fixture/repo', decision: 'skip', reason: 'merge state BEHIND', state: 'BEHIND',
+    mergeable: 'MERGEABLE', hasManifest: false, certifyLabel: true, testGreen: true, headSha: 'reviewed-head' };
+  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, patch = {} } = {}) => {
+    const verdict = { ...clean, ...patch };
+    const before = { ...verdict };
+    const rebaseDropManifest = vi.fn(() => ({ action: 'skip', reason: 'fixture rebase probe' }));
+    const mergeStrategy = { queueOwnsFreshness: vi.fn(() => ownsFreshness) };
+    const operation = routeRebaseBeforeEnqueue(verdict, {
+      setting, mergeStrategy, manifestFree: () => manifestFree, rebase: rebaseDropManifest,
+    });
+    const args = { laneRef: 'lane/fixture', base: 'origin/main' };
+    const result = operation?.(args);
+    return { verdict, before, operation, rebaseDropManifest, mergeStrategy, args, result };
+  };
+
+  it('conflict-only retains a clean BEHIND verdict for the queue without calling rebaseDropManifest', () => {
+    const { verdict, operation, rebaseDropManifest, mergeStrategy } = route();
+    expect(verdict).toEqual({ ...clean, decision: 'merge', rebaseDrop: 'skipped-behind-clean',
+      reason: 'behind main but clean; merge queue tests PR + main - enqueued on its existing head' });
+    expect(operation).toBe(null);
+    expect(rebaseDropManifest).not.toHaveBeenCalled();
+    expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledOnce();
+    expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledWith(clean.repo);
+  });
+
+  it.each([
+    ['always still calls rebaseDropManifest for a queue-owned clean BEHIND PR', { setting: 'always' }],
+    ['direct-merge repo still calls rebaseDropManifest under conflict-only', { ownsFreshness: false }],
+    ['unknown freshness ownership still calls rebaseDropManifest', { ownsFreshness: null }],
+    ['CONFLICTING still calls rebaseDropManifest', { patch: { mergeable: 'CONFLICTING' } }],
+    ['DIRTY still calls rebaseDropManifest', { patch: { state: 'DIRTY' } }],
+    ['manifest PR still calls rebaseDropManifest', { patch: { hasManifest: true } }],
+    ['unproven manifest-free head still calls rebaseDropManifest', { manifestFree: false }],
+    ['missing manifest evidence still calls rebaseDropManifest', { patch: { hasManifest: undefined } }],
+  ])('%s', (_name, options) => {
+    const { verdict, before, operation, rebaseDropManifest, args, result } = route(options);
+    expect(verdict).toEqual(before);
+    expect(verdict.decision).toBe('skip');
+    expect(operation).toBe(rebaseDropManifest);
+    expect(rebaseDropManifest).toHaveBeenCalledOnce();
+    expect(rebaseDropManifest).toHaveBeenCalledWith(args);
+    expect(result).toEqual({ action: 'skip', reason: 'fixture rebase probe' });
   });
 });
 
@@ -396,4 +442,28 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
   const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
+});
+
+describe('headTreeLacksManifestFile — authoritative manifest-path probe', () => {
+  const sha = 'a'.repeat(40);
+  const mk = (lsTree, show) => (args) => {
+    if (args[0] === 'cat-file') return '';
+    if (args[0] === 'ls-tree') { if (lsTree instanceof Error) throw lsTree; return lsTree; }
+    if (args[0] === 'show') { if (show instanceof Error) throw show; return show; }
+    return '';
+  };
+  const call = (git) => headTreeLacksManifestFile({ headRef: 'lane/x', headSha: sha, prNumber: 1, git });
+  it('true only when the head tree lists no manifest path', () => { expect(call(mk('', ''))).toBe(true); });
+  it('false for a malformed manifest file (parses to null but the path exists)', () => {
+    expect(call(mk('100644 blob abc\t.lane-manifest.json', '{not json'))).toBe(false);
+  });
+  it('false for a manifest without item', () => {
+    expect(call(mk('100644 blob abc\t.lane-manifest.json', '{}'))).toBe(false);
+  });
+  it('false (fail closed) when git cannot read the head', () => {
+    expect(call(mk(new Error('boom'), ''))).toBe(false);
+  });
+  it('false without a full head sha', () => {
+    expect(headTreeLacksManifestFile({ headRef: 'lane/x', headSha: 'abc', prNumber: 1, git: mk('', '') })).toBe(false);
+  });
 });
