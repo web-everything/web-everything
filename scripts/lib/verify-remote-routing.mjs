@@ -60,10 +60,18 @@ function wrappedVitestCommand(command) {
   const args = words.slice(3);
   // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
   // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
-  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
+  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'") && !arg.startsWith("--outputFile.json='/")))) return null;
   // R335 widened the runner allowlist for the soak guard only (json report, --config); verify keeps those local.
-  if (args.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(unquote(arg)))) return null;
-  if (!allowedCommand(['npx', 'vitest', words[2], ...args.map(unquote)])) return null;
+  // The always-run guard (`run` + json reporter + ONE absolute outputFile, no config) is the one exception: the
+  // nested wrapper strips the path before Forge and writes the returned report back locally (fail-closed there).
+  const unquoted = args.map(unquote);
+  const reportArgs = unquoted.filter(arg => arg.startsWith('--outputFile'));
+  const guard = !related && reportArgs.length === 1 && /^--outputFile\.json=\/[^\0]+$/.test(reportArgs[0])
+    && !reportArgs[0].split('/').includes('..') && unquoted.includes('--reporter=json') && !unquoted.includes('--config');
+  if (!guard && unquoted.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(arg))) return null;
+  const checked = guard ? unquoted.map(arg => arg.startsWith('--outputFile') ? '--outputFile.json=guard-report.json' : arg) : unquoted;
+  if (!allowedCommand(['npx', 'vitest', words[2], ...checked])) return null;
+  if (guard) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest run ${args.join(' ')}`;
   // `vitest related` has no package script: the nested heavy-admission wrapper maps `npx vitest related` itself
   // (remote first, then its own local fallback), and Forge's allowlist already requires `--run` for it.
   if (related) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest related ${args.join(' ')}`;

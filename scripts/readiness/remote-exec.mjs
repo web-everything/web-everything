@@ -93,6 +93,37 @@ function canonicalTestArgv(argv) {
 }
 
 /** Strip leading ./ from Vitest file arguments without changing execution policy. */
+// The always-run guard asks for vitest's json report at an absolute LOCAL path. Forge only accepts a work-relative
+// path and never sends files back, so the client strips the path, lets the json reporter print to stdout, and
+// writes the (path-remapped) report locally itself.
+export function splitGuardReport(argv) {
+  if (!Array.isArray(argv) || argv[0] !== 'npx' || argv[1] !== 'vitest' || argv[2] !== 'run'
+    || !argv.includes('--reporter=json') || argv.includes('--config')) return { argv };
+  const reports = argv.filter(arg => typeof arg === 'string' && arg.startsWith('--outputFile'));
+  if (reports.length !== 1 || !reports[0].startsWith('--outputFile.json=')) return { argv };
+  const outputFile = reports[0].slice('--outputFile.json='.length);
+  if (!isAbsolute(outputFile) || outputFile.includes('\0') || outputFile.split('/').includes('..')) return { argv };
+  return { argv: argv.filter(arg => arg !== reports[0]), outputFile };
+}
+// Fail closed: null unless the last JSON blob in stdout is a vitest report with a testResults array.
+export function parseGuardReport(stdout, files, cwd) {
+  try {
+    const text = Buffer.isBuffer(stdout) ? stdout.toString('utf8') : String(stdout ?? '');
+    const starts = [...text.matchAll(/\{\s*"numTotalTestSuites"/g)];
+    if (!starts.length) return null;
+    const tail = text.slice(starts.at(-1).index);
+    let report;
+    try { report = JSON.parse(tail); } catch { report = JSON.parse(tail.slice(0, tail.lastIndexOf('}') + 1)); }
+    if (!report || !Array.isArray(report.testResults)) return null;
+    for (const entry of report.testResults) {
+      const name = String(entry?.name ?? '');
+      const file = files.find(f => name === f || name.endsWith('/' + f));
+      if (file) entry.name = join(cwd, file);
+    }
+    return JSON.stringify(report);
+  } catch { return null; }
+}
+
 export function normalizeRemoteArgv(argv) {
   argv = canonicalTestArgv(argv);
   if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
@@ -1153,8 +1184,13 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   };
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
-  argv = normalizeRemoteArgv(argv);
+  const guardSplit = splitGuardReport(argv);
+  const guardOutputFile = guardSplit.outputFile;
+  argv = normalizeRemoteArgv(guardSplit.argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed',safeFallbackDetail('command-not-allowed',argv));
+  const guardChunks = [];
+  let guardBytes = 0;
+  const collectGuard = (chunk, stream) => { if (stream === 'stdout' && (guardBytes += chunk.length) <= 16 * 1024 * 1024) guardChunks.push(Buffer.from(chunk)); };
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
   const bundleTransport=resolveTransport(transport)==='git-bundle';
@@ -1190,7 +1226,8 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
     ...(command === 'run' ? {signal: cancel.signal} : {}),
-    ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
+    ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {}),
+    ...(command === 'run' && guardOutputFile ? {onOutput:collectGuard} : {})});
   let run;
   let staging;
   let finished = false;
@@ -1428,6 +1465,20 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         // Only a matching protected receipt proves it is safe to rerun locally.
         if (incompleteStandards) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'};
       }
+      if (guardOutputFile) {
+        // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
+        // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
+        const files = argv.slice(3).filter(arg => !arg.startsWith('-'));
+        const reportText = guardBytes <= 16 * 1024 * 1024 ? parseGuardReport(Buffer.concat(guardChunks), files, cwd) : null;
+        let written = false;
+        if (reportText !== null) {
+          try {
+            const existing = await fs.lstat(guardOutputFile).catch(() => null);
+            if (!existing?.isSymbolicLink()) { await fs.writeFile(guardOutputFile, reportText, { mode: 0o600 }); written = true; }
+          } catch { /* unwritable report stays missing */ }
+        }
+        if (!written && result.code === 0) return {mode:'cancelled',terminated:true,code:1,reason:'guard-report-unavailable'};
+      }
       if(reply.timings) {
         timings.splice(timings.findLastIndex(t=>t.stage==='forge-run'),1);
         const index=timings.findLastIndex(t=>t.stage==='finish-receipt');
@@ -1468,7 +1519,7 @@ export function verifyReceipt(text, expected, code) {
 /** Explicit remote CLI request; the shared decision contract owns safe local admission. */
 export async function main(options = {}) {
   const remoteArgv = normalizeRemoteArgv(options.argv);
-  if (!isAllowedCommand(remoteArgv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
+  if (!isAllowedCommand(normalizeRemoteArgv(splitGuardReport(options.argv).argv))) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
   const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
   const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});
