@@ -250,10 +250,9 @@ describe('the shadow pass', () => {
     const { gh } = fakeGh({ prs: [pr] });
     const hold = [[{ user: { login: AUTOMATION_LOGINS[0] }, created_at: new Date(NOW - 2 * 3600_000).toISOString(), body: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back\n\n<!-- review-referral-hold: a1b5166bcd74 -->' }]];
     const wrapped = (bin, args, o) => (/\/comments\?/.test(String(args.at(-1))) ? JSON.stringify(hold) : gh(bin, args, o));
-    const calls = [];
-    const judge = (o) => { calls.push(o.trigger); return { verdict: 'escalate', reasons: ['no-evidence'], evidence: { trigger: o.trigger, head: o.head.slice(0, 12) } }; };
-    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)), judge, dir: auditDir(), log: () => {} });
-    expect(calls).toEqual(['referral-hold']);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)), dir: auditDir(), log: () => {} });
+    // the REAL judge ran (a verdict, not null) on empty evidence, so it fails closed to the operator with its own reason
+    expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'send-back' });
     expect(JSON.stringify(out)).not.toMatch(/not an object/);
   });
   it('one unreadable PR row makes the whole pass plan nothing', async () => {
