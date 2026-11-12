@@ -47,6 +47,7 @@ export function parseArgs(argv) {
   if (opts.state !== undefined && !['open', 'closed', 'merged'].includes(opts.state)) throw new Error('invalid --state');
   if (opts.kind === 'ci-run' && !opts.branch && !opts.sha) throw new Error('ci-run needs --branch or --sha');
   if (opts.kind === 'adoption' && (!opts.clone || !opts.sha)) throw new Error('adoption needs --clone and --sha');
+  if (opts.kind === 'adoption' && !/^[0-9a-f]{40}$/i.test(opts.sha)) throw new Error('adoption needs a full 40-hex --sha (abbreviated refused)');
   // Only registered daemon clones can satisfy an adoption gate; a pool lane or any other checkout never counts.
   if (opts.clone !== undefined && !DAEMON_CLONE_SEED.includes(opts.clone)) throw new Error('--clone must be a registered daemon clone');
   if (opts.kind === 'pr' && (!opts.pr || (!opts.state && !opts.labelsPresent.length && !opts.labelsAbsent.length))) throw new Error('pr needs --pr and a state or label predicate');
@@ -91,6 +92,9 @@ function defaultExec(file, args, { timeout }) {
     const real = assertCloneRoot(dir);
     // The named directory must itself be the repository root, never a parent repository git discovered.
     if (execFileSync(file, ['-C', dir, 'rev-parse', '--show-toplevel'], { ...options, env }).trim() !== real) throw new Error('not a repository root');
+    // The sha must name a commit object itself, never a branch/tag that happens to look like one.
+    const sha = args[4];
+    execFileSync(file, ['-C', dir, 'rev-parse', '--verify', `${sha}^{commit}`], { ...options, env });
     // Both git calls share one budget: the second gets only what the first left.
     const left = Math.floor(options.timeout - (performance.now() - started));
     if (left < 1) throw new Error('await command deadline reached');

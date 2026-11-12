@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseArgs, awaitCondition, main, cloneDir, assertCloneRoot } from '../await.mjs';
 
-const SHA = 'abc123def456';
+const SHA = 'abc123def456abc123def456abc123def456abcd';
 const CLONE = 'wev-fix-daemon';
 const RUN = {
   databaseId: 123, status: 'completed', conclusion: 'success',
@@ -295,6 +295,10 @@ describe('main', () => {
 });
 
 describe('adoption hardening', () => {
+  it('refuses an abbreviated --sha for adoption', () => {
+    expect(() => parseArgs(['--kind', 'adoption', '--clone', CLONE, '--sha', 'abc123def456'])).toThrow(/40-hex/);
+  });
+
   const ws = '/w';
   it('accepts a clone whose realpath equals its registry root', () => {
     const realpath = p => ({ '/w': '/real/w', '/w/wev-fix-daemon': '/real/w/wev-fix-daemon' })[p];
