@@ -63,6 +63,10 @@ describe('credentialContentFinding whitespace-exemption boundaries', () => {
     ['backticked spaced credential glued before in markdown', 'notes.md', ':', 'x`aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY` tail'],
     ['backticked spaced credential glued after in markdown', 'notes.md', ':', 'head `aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY`y'],
     ['backticked spaced credential with word text around it in markdown', 'notes.md', ':', 'use`aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY`here ok'],
+    // Each span kind is matched in its own pass: an apostrophe span must not consume a backtick's opening.
+    ['apostrophe span before a backtick span that holds the credential', 'notes.md', ':', "see 'a `b' aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY` here"],
+    // A double-backtick span closes on a double-backtick run, so a literal backtick inside does not split it.
+    ['double-backtick span with a literal backtick inside the credential', 'notes.md', ':', '``aB3dE5fG7h J9kL2`mN4pQ6 rS8tU0vW2xY``'],
   ])('flags: %s', (_name, path, sep, value) => {
     expect(scan(`signing_key${sep} ${value}\n`, path)).toBe(flagged);
   });

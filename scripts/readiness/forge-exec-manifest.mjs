@@ -322,11 +322,14 @@ function assignmentFinding(text,blockOnly=false,path='') {
     // (`<secret> # prod`, `<secret> (rotated)`, a backticked secret in prose) is a secret with a tail, not prose.
     // Quoted/backticked spans also keep the scan when their content is opaque after removing whitespace;
     // word boundaries apply to the apostrophe only (they stop prose contractions from forming spans); a backtick
-    // span is valid Markdown glued to word characters (x`secret`y), so it takes no boundary.
+    // span is valid Markdown glued to word characters (x`secret`y), so it takes no boundary. The two span kinds are
+    // matched in separate passes so one kind cannot consume the other's delimiter (`'a `b' <secret>` `), and a backtick
+    // span closes on a run of the same length (``a`b``), so a literal backtick inside cannot split it into short halves.
     // Boundaries pinned in forge-scan-code-expression.test.mjs (whitespace-exemption boundaries).
     const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
       &&!(leaf.endsWith('.md')?/["]/:/["'`]/).test(trimmed)&&!trimmed.split(/\s+/).some(opaqueToken)
-      &&![...trimmed.matchAll(/(?<!\w)'(.+?)'(?!\w)|`(.+?)`/g)].some(([, apostrophe,tick])=>opaqueToken((apostrophe??tick).replace(/\s/g,'')));
+      &&![...[...trimmed.matchAll(/(?<!\w)'(.+?)'(?!\w)/g)].map(m=>m[1]),...[...trimmed.matchAll(/(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g)].map(m=>m[2])]
+        .some(span=>opaqueToken(span.replace(/\s/g,'')));
     if(blockOnly)continue;
     if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value)))return `high-entropy-${findingField(field)}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
