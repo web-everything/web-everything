@@ -19,7 +19,7 @@ import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs'
 import * as redTeamGate from '../red-team-gate.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { buildOperatorActionComment } from '../../operations/operator-controls.mjs';
+import { buildOperatorActionComment, CONTROL_OPS } from '../../operations/operator-controls.mjs';
 import {
   buildClearedFromMarker, buildReviewedDiffMarker, parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
 } from '../review-escalation.mjs';
@@ -987,6 +987,30 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
         const body = REFRESH.replace(/<!-- operator-action: .* -->/, `<!-- operator-action: ${payload} -->`);
         expect(isKnownMachineBody(body, { author: OP })).toBe(false);
       }
+    });
+    // Only the REFRESH note is exempt (PR #6713 review): every other trusted-author control note (unpark, rearm, grant-rounds, ...)
+    // still counts as a later comment and holds, as it did before this exemption existed.
+    it('a trusted-author control note whose op is not "refresh" is NOT a known machine shape (holds)', () => {
+      const others = CONTROL_OPS.filter(op => op !== 'refresh');
+      expect(others.length).toBeGreaterThan(0);
+      for (const op of others) {
+        expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ op })), { author: OP })).toBe(false);
+      }
+      for (const op of [undefined, null, 5, '', 'Refresh', ' refresh', ['refresh'], { op: 'refresh' }]) {
+        expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ op })), { author: OP })).toBe(false);
+      }
+      const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-10-09T14:00:00Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->` },
+        { author: OP, createdAt: '2026-10-09T15:00:00Z', body: buildOperatorActionComment(refreshRecord({ op: 'grant-rounds' })) }];
+      expect(latestAcceptRecord(comments, []).laterVerdict).toBe(true);
+    });
+    // ACCEPTED RESIDUAL (#6714): the single-line manual R247 pass is recognised by its header alone, so inline revocation
+    // wording inside its free-text reason is NOT inspected for a trusted author. Pinned so a regex edit or #6714 flips it visibly.
+    it('accepted residual (#6714): inline hold wording in a manual R247 pass reason from a trusted author is recognised', () => {
+      const inline = 'Manual R247 pass — daemon: review; reason: EMERGENCY (labelled): approval revoked; further review required, do not merge';
+      expect(isKnownMachineBody(inline, { author: OP })).toBe(true);
+      expect(isKnownMachineBody(inline, { author: { login: 'someone-else' } })).toBe(false);
+      expect(isKnownMachineBody(inline, undefined)).toBe(false);
+      expect(isKnownMachineBody(`${inline}\nApproval revoked, do not merge.`, { author: OP })).toBe(false);
     });
     // ACCEPTED RESIDUAL (operator ruling R907, 06:45 ET and 09:59 ET; carded #6714): recognition is marker-anchored, so a
     // trusted author's free text between the producer header and a valid trailing marker is NOT inspected. This pins that

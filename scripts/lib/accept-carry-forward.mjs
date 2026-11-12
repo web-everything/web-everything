@@ -128,7 +128,7 @@ const KNOWN_MACHINE_SHAPE_RES = [
 // MARKER-ANCHORED recognition (R907 09:59 ET, PR #6713 review): the note is recognised by its producer's machine marker, never by
 // its free-text reason (a vocabulary allow-list regressed the live #6381/#6595 notes; a hold-word blacklist is never exhaustive).
 // So the reason has NO length or word limit. The prose-reason residual is accepted and carded as #6714.
-//   - refresh note  = trusted author + a body that ENDS in the `<!-- operator-action: {json} -->` marker (a JSON object, any keys)
+//   - refresh note  = trusted author + a body opened by the `🛠 operator action — refresh` header that ENDS in the `<!-- operator-action: {json} -->` marker (a JSON object with `op: "refresh"`, any other keys)
 //   - manual R247   = trusted author + the single-line `Manual R247 pass — daemon: <name>;` header (producer:
 //     scripts/operations/manual-daemon-pass-io.mjs)
 // A body with anything after the marker, a second line on a manual pass, a missing/malformed marker, or an untrusted author holds.
@@ -141,12 +141,14 @@ const MANUAL_PASS_HEADER_RE = new RegExp(`^Manual R247 pass — daemon: [\\w-]+;
 function isTrustedAuthorNote(text) {
   const t = text.trim();
   if (MANUAL_PASS_HEADER_RE.test(t)) return true;
-  if (!t.startsWith(OPERATOR_ACTION_HEADER)) return false; // the producer's header opens the body; text before the marker alone is not a note
+  // The producer's header line opens the body and names the REFRESH op; text before the marker alone is not a note.
+  if (t.split(new RegExp(`[${NL}]`))[0] !== `${OPERATOR_ACTION_HEADER}refresh`) return false;
   const marker = OPERATOR_ACTION_MARKER_RE.exec(t);
   if (!marker) return false;
   try {
     const r = JSON.parse(marker[1]);
-    return r !== null && typeof r === 'object' && !Array.isArray(r);
+    // Only `op: 'refresh'` is exempt: every other control note (unpark, rearm, grant-rounds, ...) still counts as a later comment.
+    return r !== null && typeof r === 'object' && !Array.isArray(r) && r.op === 'refresh';
   } catch { return false; }
 }
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
