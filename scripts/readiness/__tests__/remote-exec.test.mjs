@@ -2358,18 +2358,20 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
-  it('ships a tracked clean changed credential source with a public base', async () => {
-    const name = 'credentials.md', content = 'public\nclean edit\n';
+  it('ships a tracked credential source that only adds harmless code beside an existing public password literal', async () => {
+    const name = 'credentials.mjs';
+    const base = ['export const password', ' = "', 'example', '";\n'].join('');
+    const content = `${base}export const count = 1;\n`;
     writeFileSync(join(cwd, name), content);
     const paths = ['package-lock.json', name].map(value => Buffer.from(value));
     const stage = indexRecord(name, content);
-    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, 'public')});
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, base)}, {code:0, stdout:Buffer.from(base)});
     const manifest = await build({cwd, exec:inventory});
     expect(manifest.entries).toContainEqual({path:Buffer.from(name), sha256:sha(content), executable:false, tracked:true});
     expect(manifest.excluded).toEqual([]);
     const exec = acceptingTransport(paths, stage, inventory);
     expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0});
-    expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./credentials.md\0./package-lock.json\0'));
+    expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./credentials.mjs\0./package-lock.json\0'));
     expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
   });
 
@@ -2389,7 +2391,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(callsOf(inventory).some(call => gitArgs(call)[0] === 'cat-file')).toBe(false);
   });
 
-  it('ships a clean changed source whose unchanged public secret is outside the context window', async () => {
+  it('refuses a changed source whose unchanged public private-key header is outside the former context window', async () => {
     const name = 'credentials.md';
     const base = [secretLine(), 'one', 'two', 'three', 'four', 'old'].join('\n');
     const content = base.replace('old', 'clean edit');
@@ -2397,13 +2399,33 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const paths = ['package-lock.json', name].map(value => Buffer.from(value));
     const stage = indexRecord(name, content);
     const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, base)}, {code:0, stdout:Buffer.from(base)});
-    const manifest = await build({cwd, exec:inventory});
-    expect(manifest.entries).toContainEqual({path:Buffer.from(name), sha256:sha(content), executable:false, tracked:true});
-    expect(manifest.excluded).toEqual([]);
+    const detail = `${name}: pem-header`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
     const exec = acceptingTransport(paths, stage, inventory);
-    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0});
-    expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./credentials.md\0./package-lock.json\0'));
-    expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it.each(['reordered existing lines', 'continuation more than three lines below password'])
+  ('refuses a high-entropy password in %s without transmission', async kind => {
+    const name = 'credentials.md';
+    const value = `  ${Array.from({length:32}, (_, i) => String.fromCharCode(65+i)).join('')}`;
+    const base = kind === 'reordered existing lines'
+      ? ['public:', value, 'password:', 'next: example'].join('\n')
+      : ['password:', '  one', '  two', '  three', '  four', 'next: example'].join('\n');
+    const content = kind === 'reordered existing lines'
+      ? ['public:', 'password:', value, 'next: example'].join('\n')
+      : base.replace('next: example', `${value}\nnext: example`);
+    writeFileSync(join(cwd, name), content);
+    const paths = [Buffer.from(name)], stage = indexRecord(name, content);
+    const inventory = gitInventory(paths, stage, {code:0, stdout:treeRecord(name, base)}, {code:0, stdout:Buffer.from(base)});
+    const detail = `${name}: high-entropy-password`;
+    await expect(build({cwd, exec:inventory})).rejects.toMatchObject({code:'excluded-source-file', detail});
+    const exec = acceptingTransport(paths, stage, inventory);
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file', detail});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
   it('refuses an untracked credential-named source even when its content is clean and public', async () => {
@@ -2422,6 +2444,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     ['AWS key', () => ['AK', 'IA', '0123456789ABCDEF'].join(''), 'aws-access-key'],
     ['token assignment', () => `token = '${Array.from({length:32}, (_, i) => String.fromCharCode(65+i)).join('')}'`, 'high-entropy-token'],
     ['PEM header', secretLine, 'pem-header'],
+    ['exported password literal', () => ['export const password', ' = "', 'private-live-', 'password', '";'].join(''), 'credential-literal-assignment'],
     ['unsupported encoding', () => Buffer.from([0xff]), 'unsupported-text-encoding'],
   ])('refuses a tracked credential source with %s in added lines and carries its finding', async (_label, added, finding) => {
     const name = 'credentials.md', content = Buffer.concat([Buffer.from('public\n'), Buffer.from(added())]);

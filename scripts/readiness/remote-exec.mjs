@@ -595,7 +595,6 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     // Match warm export: pattern-spelling public files stay excluded without
     // aborting unrelated work. The public worktree identity check above still
     // refuses private edits; manifestEntry remains a fail-closed leaf guard.
-    let vetted=false;
     if(changedVet!==undefined) {
       // Unchanged lines are public (origin/main); only lines this branch adds or edits are new exposure.
       let base='';
@@ -610,9 +609,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== indexBlobs.get(path.toString('base64'))) throw excludedSource(path,'worktree-differs-from-index');
       const finding=changedLinesFinding(path,content,base);
       if(finding)throw excludedSource(path,finding);
-      vetted=true;
     } else if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
-    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')),vetted)};
+    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
   });
   for (const leaf of leaves) {
     if (leaf?.entry) entries.push(leaf.entry);
