@@ -846,10 +846,20 @@ export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgen
  * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number, readFingerprints?:Function, readClaims?:Function}} [o]
  */
 export function createReconcilePlanCache({ reconcile = (input) => runReconcilePass(input), now = Date.now,
-  maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims } = {}) {
+  maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims,
+  log = (line) => process.stderr.write(`${line}\n`) } = {}) {
   const entries = new Map();
   const touched = new Map();
-  const probe = (repo) => ({ prs: readFingerprints(repo), claims: readClaims() });
+  // One line per prelude read: how long it took and when it started. Join startedAt..+ms against the gh-throttle call
+  // log (waitedMs per call) to tell a gh-slot wait from GitHub API time. Logging never fails or slows the read.
+  const timedRead = (kind, repo, fn, extra = '') => {
+    const startedAt = now();
+    try { return fn(); } finally {
+      try { log(`reconcile-fix-dispatch-daemon: prelude-read kind=${kind} repo=${repo} ms=${now() - startedAt}${extra} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
+    }
+  };
+  const probe = (repo) => ({ prs: timedRead('fingerprints', repo, () => readFingerprints(repo)),
+    claims: timedRead('claims', repo, () => readClaims()) });
   const filterRows = (plan, stale) => {
     for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) {
       plan[key] = plan[key].filter(row => stale !== 'all' && !stale.has(row?.prNumber ?? row?.pr));
@@ -892,8 +902,12 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       const allowStandDownAutoProceed = input.allowStandDownAutoProceed === true;
       const cacheable = Object.entries(input).every(([key, value]) => value === undefined
         || ['repo', 'readPrs', 'allowStandDownAutoProceed'].includes(key));
+      const readStart = now();
       const hit = cacheable ? read(repo, allowStandDownAutoProceed) : null;
-      if (hit) return hit.plan;
+      if (hit) {
+        try { log(`reconcile-fix-dispatch-daemon: prelude-read kind=plan repo=${repo} ms=${now() - readStart} cache=hit startedAt=${new Date(readStart).toISOString()}`); } catch { /* best-effort */ }
+        return hit.plan;
+      }
       // Do not let notes reuse the preceding plan if an override or a failed recompute replaces it.
       entries.delete(repo);
       let baseline = null;
@@ -906,10 +920,13 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       // attribution repo it would otherwise get by identity is passed explicitly. Later stages capture the hydrated
       // rows for notes.
       const { readPrs: _discovery, ...fresh } = input;
+      const planStart = now();
+      const readOpenPrs = tap(planFreshReadPrs(defaultReadPrs));
       const plan = filterRows(reconcile({ ...fresh,
-        readPrs: tap(planFreshReadPrs(defaultReadPrs)),
+        readPrs: (...args) => timedRead('open-pr-read', repo, () => readOpenPrs(...args)),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
+      try { log(`reconcile-fix-dispatch-daemon: prelude-read kind=plan repo=${repo} ms=${now() - planStart} cache=miss startedAt=${new Date(planStart).toISOString()}`); } catch { /* best-effort */ }
       try { if (baseline && cacheable) entries.set(repo, { at: now(), baseline, allowStandDownAutoProceed,
         plan: structuredClone(plan), captured: structuredClone(captured) }); }
       catch { entries.delete(repo); }
