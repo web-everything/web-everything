@@ -87,6 +87,7 @@ describe('related + unproven selections (bundle transport)', () => {
     expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', 'dir/*'], readFile: read })).toBe(true);
     expect(selectionUnproven({ argv: ['npx', 'vitest', 'run'], readFile: read })).toBe(true);
     expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], readFile: read })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'related', 'pure.test.mjs'], readFile: read })).toBe(true);
     expect(selectionUnproven({ argv: ['node', 'x.mjs'], readFile: read })).toBe(false);
   });
 });

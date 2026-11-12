@@ -76,6 +76,7 @@ export function selectionUnproven({ argv, cwd = process.cwd(), readFile, helpers
   const files = testFilterArgs(argv);
   const isVitest = (argv?.[0] === 'npx' ? argv[1] : argv?.[0]) === 'vitest' || (argv?.[0] === 'npm' && /^test:/.test(argv[2] ?? ''));
   if (!isVitest) return false;
+  if (argv.includes('related')) return true; // the filters are sources, not the tests they select
   if (!files.length) return true;
   const read = readFile ?? containedRead(cwd);
   return files.some((f) => { try { return sourceNeedsGit(read(f), { helpers }); } catch (e) { return e?.code !== 'ENOENT' || /[*?[\]{}]/.test(f); } });
