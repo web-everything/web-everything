@@ -241,7 +241,8 @@ describe('applyRedTeamGate', () => {
     const logs = [];
     const { io, calls } = fakeIo({ comments: [comment([F()])], readHead: () => heads.shift() ?? OTHER, log: (l) => logs.push(l) });
     const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
-    expect(r).toMatchObject({ status: 'applied', head: HEAD, headMovedAfterWrite: OTHER });
+    expect(r).toMatchObject({ status: 'send-back-wrong-head', head: HEAD, headMovedAfterWrite: OTHER });
+    expect(gateExitCode(r)).toBe(1);
     expect(calls.find((c) => c[0] === 'comment')[1].body).toContain(HEAD.slice(0, 12));
     expect(logs.join('\n')).toMatch(/moved to 2{40} during the send-back write/);
   });

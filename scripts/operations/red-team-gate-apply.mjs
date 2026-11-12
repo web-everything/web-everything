@@ -203,7 +203,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
           let after = null;
           try { after = String(io.readHead({ repo, pr }) ?? '').toLowerCase(); } catch { after = null; }
           if (after !== head) {
-            wrongHead = after ?? 'unreadable';
+            wrongHead = after || 'unreadable';
             io.log?.(`red-team gate: head of #${pr} moved to ${wrongHead} during the send-back write; findings were judged on ${head}`);
           }
           try { await io.appendSendBackEvent({ repo, pr, head }); } catch (e) { io.log(`red-team gate: send-back of #${pr} applied but the ledger event missed: ${e.message}`); }
@@ -231,14 +231,14 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
       if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
     }
-    return { status: 'applied', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, ...(wrongHead ? { headMovedAfterWrite: wrongHead } : {}) };
+    return { status: wrongHead ? 'send-back-wrong-head' : 'applied', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, ...(wrongHead ? { headMovedAfterWrite: wrongHead, error: `review:changes may sit on a newer head than ${head}` } : {}) };
   } catch (e) {
     return { status: 'error', reason: String(e?.message ?? e).slice(0, 500) };
   }
 }
 
 /** Statuses the CLI reports with a nonzero exit: every failure, including a record that could not be posted. */
-export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed']);
+export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'send-back-wrong-head', 'card-failed', 'card-record-failed']);
 
 /** The CLI exit code for a gate result: 1 on any failure status, else 0. PURE. */
 export const gateExitCode = (r) => (GATE_FAILURE_STATUSES.includes(r?.status) ? 1 : 0);
