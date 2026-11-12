@@ -2577,6 +2577,25 @@ describe('fix pass budgets', () => {
     expect(notesTick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'a', deadlineAt: 1000, cursor: 42, now }));
   });
 
+  it('rotates the notes repo order so a later repo still gets its note within 2 passes when repo A discovery always spends the budget', async () => {
+    let time = 0;
+    const rotation = {};
+    const notesTick = vi.fn(({ repo }) => {
+      if (repo === 'a') time += 1001; // A's discovery alone exhausts the notes budget every pass
+      return { notes: [{ kind: 'awaiting-permission', prNumber: repo === 'a' ? 1 : 2,
+        sessionId: `session-${repo}`, text: 'Needs permission' }], prsByNumber: new Map() };
+    });
+    const opts = fixture({ repos: ['a', 'b'], now: () => time, notesTick, notesDryRun: true, budgetRotation: rotation,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { notesMs: 1000 } } }),
+    });
+    const seen = new Set();
+    for (let pass = 0; pass < 2; pass += 1) {
+      const result = await runTickAllRepos(opts);
+      for (const row of result.noteComments) seen.add(row.repo);
+    }
+    expect([...seen].sort()).toEqual(['a', 'b']);
+  });
+
   it('stops notes inside a repo when discovery spends the phase budget and resumes deferred notes next pass', async () => {
     let time = 0;
     const cursors = {};
