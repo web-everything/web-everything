@@ -77,7 +77,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync, openSync, closeSync, unlinkSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync, openSync, closeSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
@@ -3133,8 +3133,9 @@ function releaseSalvageStash(dir) {
     const todo = shas.filter(sha => !recorded.has(sha));
     if (todo.length) {
       mkdirSync(backupDir, { recursive: true });
-      const file = `stash-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}-${todo[0].slice(0, 8)}.bundle`;
       const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      // The nonce keeps racing releases from replacing each other's verified bundle.
+      const file = `stash-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}-${todo[0].slice(0, 8)}-${nonce}.bundle`;
       const names = todo.map((_, i) => `refs/release-stash/${nonce}/${i}`);
       try {
         for (const [i, sha] of todo.entries()) {
@@ -3145,14 +3146,11 @@ function releaseSalvageStash(dir) {
         for (const name of names) releaseEvidenceGit(['update-ref', '--no-deref', '-d', name], dir);
       }
       if (!releaseVerifyStashBundle(dir, join(backupDir, file), todo)) return [...recorded.keys()];
-      // The index is append-only evidence: keep every existing line (including bundles of stash entries since
-      // dropped) and replace the file by rename so a crash never leaves a truncated record.
-      const existing = existsSync(recordFile) ? readFileSync(recordFile, 'utf8').split('\n').filter(Boolean) : [];
-      const tmpRecord = `${recordFile}.${nonce}.tmp`;
-      try {
-        writeFileSync(tmpRecord, `${[...existing, ...todo.map(sha => `${sha} ${file}`)].join('\n')}\n`);
-        renameSync(tmpRecord, recordFile);
-      } finally { rmSync(tmpRecord, { force: true }); }
+      // The index is append-only evidence: earlier lines (including bundles of stash entries since dropped) are never
+      // rewritten. One O_APPEND write adds the new lines, so a crash cannot truncate the record and a racing release
+      // cannot overwrite another's lines. A missing final newline (torn earlier write) is closed first.
+      const torn = existsSync(recordFile) && !readFileSync(recordFile, 'utf8').endsWith('\n') && statSync(recordFile).size > 0;
+      appendFileSync(recordFile, `${torn ? '\n' : ''}${todo.map(sha => `${sha} ${file}`).join('\n')}\n`);
       for (const sha of todo) recorded.set(sha, file);
       log(`  ${basename(dir)}: salvaged ${todo.length} stash entr${todo.length === 1 ? 'y' : 'ies'} to ${join(backupDir, file)}`);
     }

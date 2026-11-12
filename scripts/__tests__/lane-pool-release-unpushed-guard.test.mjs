@@ -423,6 +423,17 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     // The record is replaced by rename, so no temp file is left behind.
     expect(readdirSync(join(base, 'backups', 'lane-1-preserve')).filter(name => name.endsWith('.tmp'))).toEqual([]);
   });
+  it('with recovery on, closes a torn final index line instead of merging the new line into it', () => {
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    mkdirSync(dir, { recursive: true });
+    const torn = `${'a'.repeat(40)} old-stash.bund`;
+    writeFileSync(join(dir, 'stash-bundles.txt'), torn);
+    const sha = stashText('fresh stashed edit\n');
+    released(release([], '', '', RECOVERY_ON));
+    const lines = readFileSync(join(dir, 'stash-bundles.txt'), 'utf8').split('\n');
+    expect(lines[0]).toBe(torn);
+    expect(lines[1].startsWith(`${sha} stash-`)).toBe(true);
+  });
   // Fail closed: a stash that cannot be bundled and verified stays unproven, the lane keeps refusing, nothing is
   // recorded, and the temporary refs are removed even on the failure path.
   it.each([
