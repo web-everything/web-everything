@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
+import { verifyFinishBody, verificationInfrastructureFailure } from '../../lib/lane-verify.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
@@ -1595,5 +1596,83 @@ describe('timeout-only load recovery', () => {
       expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: now, ttlMs: shortTtl })).toMatchObject({ awaiting: true });
     }
     expect(h.store.get(rec().sessionId).loadRetry.since).toBe(new Date(T0).toISOString());
+  });
+});
+
+// verify.infraFallbackToCi: an infrastructure-only local verify failure (no test verdict), retries spent, is settled by
+// the exact pushed head's green required `test` CI check. Anything else keeps today's infra ladder.
+describe('infra verify failure falls back to green CI on the pushed head', () => {
+  const run = (row) => ({ name: row[0], status: 'COMPLETED', conclusion: row[1] });
+  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live', pushResult } = {}) => {
+    const h = harness({ pushResult, records: [rec({ retries: 2, earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
+    h.state.marker = mark ?? marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'SIGKILL after 1800000ms' } });
+    h.io.readPreviousHead = async () => head;
+    h.io.readPreviousRequired = async () => ({ checks: required, source });
+    h.io.readPreviousChecks = async () => (typeof checks === 'function' ? checks() : checks.map(run));
+    h.io.infraFallbackToCi = () => ({ enabled: fallback, source: 'standard' });
+    return h;
+  };
+  const tick = (h) => runAwaitVerifyPass({ io: h.io, nowMs: T0, ttlMs: TTL, retryPolicy: { value: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 } }, sources: {} } });
+
+  it('ends the round on the green required test check for the exact pushed head, without a second push (live #6693: push-refused)', async () => {
+    const h = ciHarness({ pushResult: { ok: false, reason: 'refusing to push lane/item-68b: the fix claim on web-everything/web-everything PR #4115 is not held by this session' } });
+    const { rows } = await tick(h);
+    expect(rows[0].action).not.toMatch(/^infra-/);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('before/after evidence comment');
+    expect(h.calls.rerequest).toHaveLength(0);
+  });
+  it.each([
+    ['the PR head is another sha', { head: OTHER }],
+    ['the test check failed', { checks: [['test', 'FAILURE']] }],
+    ['the test check is still running', { checks: [['test', '']] }],
+    ['test is not in the required set', { required: ['lint'], checks: [['lint', 'SUCCESS']] }],
+    ['another required check is red', { required: ['test', 'lint'], checks: [['test', 'SUCCESS'], ['lint', 'FAILURE']] }],
+    ['the CI read fails', { checks: () => { throw new Error('gh down'); } }],
+    ['the setting is off', { fallback: false }],
+    ['the infra reason is verify-unsettled, not a kill', { mark: marker('infrastructure-failure', { infrastructure: { reason: 'verify-unsettled', detail: 'x' } }) }],
+    ['the required set is a cache/fallback read', { source: 'fallback' }],
+    ['the test check was skipped', { checks: [['test', 'SKIPPED']] }],
+  ])('keeps the infra ladder when %s', async (_name, opts) => {
+    const h = ciHarness(opts);
+    const { rows } = await tick(h);
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+  });
+  it('keeps the void/refusal when the lane moved or is dirty', async () => {
+    for (const over of [{ head: OTHER }, { dirty: true }]) {
+      const h = ciHarness(); h.state.lane = lane(over);
+      const { rows } = await tick(h);
+      expect(h.calls.push).toHaveLength(0);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
+  });
+  it('keeps the ladder when the lane or verdict changes during the CI reads', async () => {
+    for (const change of [h => { h.state.lane = lane({ dirty: true }); }, h => { h.state.marker = marker('red'); }]) {
+      const h = ciHarness();
+      h.io.readPreviousChecks = async () => { change(h); return [run(['test', 'SUCCESS'])]; };
+      await tick(h);
+      expect(h.calls.push).toHaveLength(0);
+    }
+  });
+  it('accepts the marker the real verifyFinishBody writes for a killed run, though it drops the failing tests', async () => {
+    const infrastructure = verificationInfrastructureFailure({ timedOutPhase: 'vitest', ceilingMs: 1800000 });
+    const real = verifyFinishBody({ startedAt: new Date(T0).toISOString() }, { finishedAt: new Date(T0).toISOString(), exitCode: null, sha: SHA, treeHash: TREE, infrastructure, failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } });
+    expect(real).toMatchObject({ status: 'infrastructure-failure', infrastructure: { reason: 'verify-timeout' } });
+    expect(real.failureDetails).toBeUndefined();
+    const h = ciHarness({ mark: real });
+    const { rows } = await tick(h);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+  });
+  it('never masks a real red verdict: red goes to the fixer, not to CI', async () => {
+    const h = ciHarness({ mark: marker('red') });
+    const { rows } = await tick(h);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    expect(h.calls.resume[0].prompt).toContain('Verify is RED');
   });
 });
