@@ -1597,3 +1597,52 @@ describe('timeout-only load recovery', () => {
     expect(h.store.get(rec().sessionId).loadRetry.since).toBe(new Date(T0).toISOString());
   });
 });
+
+// verify.infraFallbackToCi: an infrastructure-only local verify failure (no test verdict), retries spent, is settled by
+// the exact pushed head's green required `test` CI check. Anything else keeps today's infra ladder.
+describe('infra verify failure falls back to green CI on the pushed head', () => {
+  const run = (row) => ({ name: row[0], status: 'COMPLETED', conclusion: row[1] });
+  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark } = {}) => {
+    const h = harness({ records: [rec({ retries: 2, earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
+    h.state.marker = mark ?? marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'SIGKILL after 1800000ms' } });
+    h.io.readPreviousHead = async () => head;
+    h.io.readPreviousRequired = async () => ({ checks: required });
+    h.io.readPreviousChecks = async () => (typeof checks === 'function' ? checks() : checks.map(run));
+    h.io.infraFallbackToCi = () => ({ enabled: fallback, source: 'standard' });
+    return h;
+  };
+  const tick = (h) => runAwaitVerifyPass({ io: h.io, nowMs: T0, ttlMs: TTL, retryPolicy: { value: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 } }, sources: {} } });
+
+  it('ends the round on the green required test check for the exact pushed head', async () => {
+    const h = ciHarness();
+    const { rows } = await tick(h);
+    expect(rows[0].action).not.toMatch(/^infra-/);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('before/after evidence comment');
+    expect(h.calls.rerequest).toHaveLength(0);
+  });
+  it.each([
+    ['the PR head is another sha', { head: OTHER }],
+    ['the test check failed', { checks: [['test', 'FAILURE']] }],
+    ['the test check is still running', { checks: [['test', '']] }],
+    ['test is not in the required set', { required: ['lint'], checks: [['lint', 'SUCCESS']] }],
+    ['another required check is red', { required: ['test', 'lint'], checks: [['test', 'SUCCESS'], ['lint', 'FAILURE']] }],
+    ['the CI read fails', { checks: () => { throw new Error('gh down'); } }],
+    ['the setting is off', { fallback: false }],
+  ])('keeps the infra ladder when %s', async (_name, opts) => {
+    const h = ciHarness(opts);
+    const { rows } = await tick(h);
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+  });
+  it('never masks a real red verdict: red goes to the fixer, not to CI', async () => {
+    const h = ciHarness({ mark: marker('red') });
+    const { rows } = await tick(h);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    expect(h.calls.resume[0].prompt).toContain('Verify is RED');
+  });
+});
