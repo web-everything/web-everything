@@ -2197,6 +2197,28 @@ describe('#6606 carried check recovered after a transient verification failure',
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
 
+  // Self-review variant of the same class: while every check write fails, each uncapped retry used to add one more
+  // publication-hold status, until the clearer's status page cap made settlement impossible. The helper's own hold,
+  // already set, still binds: retries post no further hold, and the head stays held.
+  it('retries while check writes keep failing post one publication hold, not one per retry', () => {
+    const w = world({ failReadAt: 0, failCheckPosts: { has: () => true } });
+    try {
+      for (let attempt = 0; attempt < 30; attempt++)
+        expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, remoteHold: true });
+      expect(w.statuses.filter(status => status.context === `red-team/publication #${pr}`)).toHaveLength(1);
+      expect(w.holdFact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    // A round writer's hold on top is not the helper's own: the helper still posts its hold over it (fail closed).
+    const v = world({ failReadAt: 0, failCheckPosts: { has: () => true } });
+    try {
+      v.statuses.unshift({ id: 99, state: 'failure', context: `red-team/publication #${pr}`, description: 'held: finished round publication in progress',
+        creator: { login: 'web-everything' } });
+      v.publish({ pr, headSha: head });
+      expect(v.statuses[0]).toMatchObject({ state: 'failure', description: expect.stringMatching(/^held: live red-team check not clear:/) });
+    } finally { rmSync(v.dir, { recursive: true, force: true }); }
+  });
+
   it('an older confirmed attempt never removes the marker a newer attempt owns', () => {
     const w = world();
     try {

@@ -383,17 +383,24 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         // confirmed, even if this process dies right after the post. A failed record never stops the hold itself.
         let intent = '';
         try { beforeHold?.(); } catch (error) { intent = `; hold intent not recorded (${message(error)})`; }
-        const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
-        return { ...failure(`${failures}; ${hold.ok ? 'red-team publication hold posted' : hold.reason}${intent}`), remoteHold: true };
+        // The recovery pass retries without a cap, so while check writes keep failing each attempt would add one more
+        // hold status; past the status page cap the clearer could then never settle. When this PR's context already
+        // reads as this helper's own hold, that hold still binds: post nothing. Any other state, or a failed read,
+        // posts (fail closed).
+        const held = liveHoldAlreadySet({ repo, pr, headSha, gh });
+        const hold = held ? { ok: true } : postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
+        const holdNote = held ? 'red-team publication hold already set' : hold.ok ? 'red-team publication hold posted' : hold.reason;
+        return { ...failure(`${failures}; ${holdNote}${intent}`), remoteHold: true };
       }
     }
     return failure(reason);
   }
   return confirmed();
 
-  // Confirmed. `onConfirmed` runs here, still under the writers' lock (#6606 red team on a67e77345): a hold any helper
-  // attempt posted is then necessarily older than this confirmed success, and no later attempt can post one between
-  // the confirmation and the caller's clear. Its outcome never turns the confirmed success into a failure check.
+  // Confirmed. `onConfirmed` runs here, still under the writers' lock (#6606 red team on a67e77345): no later attempt
+  // can post a hold between the confirmation and the caller's clear. (A reused success can be older than a hold an
+  // earlier attempt set; that hold is the helper's own, so the clear still removes it.) Its outcome never turns the
+  // confirmed success into a failure check.
   function confirmed() {
     if (!onConfirmed) return { ok: true };
     let settled;
@@ -505,6 +512,20 @@ function readStatusHistory({ repo, headSha, gh, context, decisive }) {
 
 /** Description prefix of the publication hold {@link publishRedTeamCheckFromLive} sets. */
 const LIVE_HOLD_DESCRIPTION_PREFIX = 'held: live red-team check not clear:';
+
+/** True only when the combined status reads this PR's context as a non-success whose description is the live helper's
+ * hold. Then a further helper hold adds nothing (the gate already holds, and the clearer removes it once a success is
+ * confirmed). A round writer's hold is not enough: if it cleared its own, the head must still be held. Any read failure
+ * is false, so the caller posts. */
+function liveHoldAlreadySet({ repo, pr, headSha, gh }) {
+  try {
+    const context = redTeamPublicationContext(pr);
+    const latest = readCombinedStatus({ repo, headSha, gh })?.statuses;
+    const status = Array.isArray(latest) ? latest.find(entry => entry?.context === context) : null;
+    return Boolean(status) && status.state !== 'success' && typeof status.description === 'string'
+      && status.description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX);
+  } catch { return false; }
+}
 
 /** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears
  * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,
