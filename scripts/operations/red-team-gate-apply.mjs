@@ -40,11 +40,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, classOnlyCards, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  GATE_OUTCOMES, gateRoundGrants, liveResultGateState, classOnlyCards, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
-import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
+import { resolveRoundCap, effectiveRoundCap } from '../lib/round-cap.mjs';
 import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { EVENT_TYPES, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
 import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
@@ -106,7 +106,7 @@ export function buildSendBackArgv({ repo, pr, bodyPath }) {
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
-export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP, classCards = null }) {
+export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = resolveRoundCap(process.env), classCards = null }) {
   const lines = [redTeamGateMarker(pr, head, outcome, result, grantIds, classCards),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
@@ -135,7 +135,7 @@ export async function applyRedTeamGate(input = {}, io = createRedTeamGateIo()) {
   return result;
 }
 
-async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_ROUND_CAP } = {}, io = createRedTeamGateIo()) {
+async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRoundCap(process.env) } = {}, io = createRedTeamGateIo()) {
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
@@ -162,7 +162,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses. The anchor counts
     // this head like `readRound` does when the thread shows its review before the grant (thread order, not clocks).
     const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo, standingRuling) : [];
-    const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at, g) => {
+    const effectiveCap = effectiveRoundCap({ env: { WE_REVIEW_ROUND_CAP: String(cap) }, grants, roundAt: (at, g) => {
       const reviewed = Number.isInteger(headReviewIndex) && Number.isInteger(g?.index) && headReviewIndex < g.index;
       try { return io.readRoundAsOf?.({ repo, pr, at, head: reviewed ? head : null }) ?? null; } catch { return null; }
     } });

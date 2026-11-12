@@ -25,7 +25,7 @@ describe('card 8062: one shared round-cap resolver', () => {
     const prev = process.env.WE_REVIEW_ROUND_CAP;
     process.env.WE_REVIEW_ROUND_CAP = '8';
     try {
-      const body = buildGateComment({ pr: 1, head: 'abc', outcome: GATE_OUTCOMES.ROUND_CAP, plan: { sendBack: [{ index: 1 }] }, round: 8 });
+      const body = buildGateComment({ pr: 1, head: 'abc', outcome: GATE_OUTCOMES.ROUND_CAP, plan: { sendBack: [{ index: 1 }], card: [], advisory: [] }, round: 8 });
       expect(body).toContain('round cap (8)');
     } finally { if (prev === undefined) delete process.env.WE_REVIEW_ROUND_CAP; else process.env.WE_REVIEW_ROUND_CAP = prev; }
   });

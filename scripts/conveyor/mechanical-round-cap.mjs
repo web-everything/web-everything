@@ -36,6 +36,7 @@ import { execFileSync } from 'node:child_process';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { REVIEWED_SHA_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, REVIEW_PR_CHANNEL, normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
+import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export const MECHANICAL_ROUNDS_SETTING = 'mechanicalRoundsCountTowardCap';
@@ -466,17 +467,11 @@ export function hasPendingMechanicalRound(pr) {
   return roundAt > (verdicts.length ? Math.max(...verdicts) : -Infinity);
 }
 
-// Keep in sync with reconcile-core.mjs#resolveRoundCap; importing it here would create a cycle.
-function resolveRoundCap(env = process.env) {
-  const value = env.WE_REVIEW_ROUND_CAP;
-  return typeof value === 'string' && /^\d+$/.test(value.trim())
-    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : 5;
-}
 
 /** IO: attach `mechanicalRound` facts to each PR whose latest round was mechanical. Never throws. */
 export function enrichPrsWithMechanicalRound(prs, {
   defaultBranch = 'main', readFacts = readMechanicalRoundFacts, readRoundCommits: readCommits = readRoundCommits,
-  roundCap = resolveRoundCap(),
+  roundCap = resolveRoundCap(process.env),
 } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
     let enriched = pr;
