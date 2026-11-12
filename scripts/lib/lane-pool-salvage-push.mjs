@@ -57,7 +57,9 @@ export async function salvagePushLane({ lane, laneDir, io, now = () => new Date(
  *  there reads no repository config. Exported for its test. */
 export const NO_REPO_CWD = parse(resolve('/')).root;
 
-export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync, accountHome }) {
+export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync, accountHome, gitTimeoutMs = 120_000 }) {
+  // `gitTimeoutMs` bounds EVERY git call this io makes (config reads, ls-remote, fetch, push). Release/salvage keep the
+  // generous default; acquire passes a short one so a slow origin cannot stall a daemon tick (it fails closed instead).
   const baseEnv = { ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' };
   const env = laneGitHardeningEnv(baseEnv);
   // The canonical-origin listing run in the VALIDATED primary only: the operator's own credential helper / askpass
@@ -73,7 +75,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       '-c', 'remote.origin.pushurl=', '-c', 'push.gpgSign=false', '-c', 'gpg.ssh.defaultKeyCommand=', command, ...args];
   };
   // `bounded` runs the command under git-bounded.mjs so a timeout kills the whole process group (index-pack, ssh).
-  const git = (dir, args, timeout = 120_000, bounded = false, callEnv = env) => {
+  const git = (dir, args, timeout = gitTimeoutMs, bounded = false, callEnv = env) => {
     const cmd = bounded ? boundedGitCommand(args, timeout) : { file: 'git', args };
     return runGit(cmd.file, cmd.args, {
       cwd: dir, env: callEnv, encoding: 'utf8', timeout: bounded ? timeout + BOUNDED_GIT_GRACE_MS : timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
@@ -84,7 +86,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
   // `callEnv`: the env the checked transport itself runs under, so the check reads the same global config git applies
   // (the primary listing reads it from the account home, not a caller-set HOME — PR #6319 self-review).
   const checkTransportConfig = (dir, { primary = false, callEnv = env } = {}) => {
-    const git = (d, args) => gitRun(d, args, 120_000, false, callEnv);
+    const git = (d, args) => gitRun(d, args, gitTimeoutMs, false, callEnv);
     // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
     // every effective rewrite (including includes and global config) before transport.
     // NUL-delimited names keep newlines in a subsection from hiding a rewrite key.
@@ -167,7 +169,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     if (command === 'fetch' && repo.alternatesReferencePath) {
       try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.alternatesReferencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
     }
-    return git(dir, transportArgs, 120_000, true);
+    return git(dir, transportArgs, gitTimeoutMs, true);
   };
   // A fetch writes THROUGH a symbolic ref (PR #6319, R639): a lane-made refs/remotes/origin/main -> refs/heads/work/keep
   // would reset the lane's unpushed branch to the pushed tip. Only the ordinary origin/HEAD alias of a plain origin/*
@@ -244,7 +246,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       const refs = owned();
       if (refs.length) {
         runGit('git', ['update-ref', '--stdin'], {
-          cwd: dir, env, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
+          cwd: dir, env, encoding: 'utf8', timeout: gitTimeoutMs, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
           stdio: ['pipe', 'pipe', 'pipe'], input: refs.map(ref => `option no-deref\ndelete ${ref}\n`).join(''),
         });
       }
@@ -267,7 +269,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     const dir = primaryDir || repo.referencePath;
     const callEnv = primaryDir ? primaryEnv : env;
     checkTransportConfig(dir, { primary: !!primaryDir, callEnv });
-    return git(primaryDir ? NO_REPO_CWD : dir, args, 120_000, true, callEnv);
+    return git(primaryDir ? NO_REPO_CWD : dir, args, gitTimeoutMs, true, callEnv);
   };
   return {
     fetchHeads,

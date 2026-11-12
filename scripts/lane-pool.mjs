@@ -3182,17 +3182,47 @@ function releaseUnprovenCommits(dir, salvage, proof, { allowFetch = true } = {})
 // Acquire and salvage use the release evidence, including ALL branches, HEAD and stash reflog tips.
 // Acquire may use the release proof's safe object-only fetch when origin advanced beyond the lane's objects.
 // Salvage defaults to read-only evidence so --dry-run never fetches or writes temporary refs.
+// Acquire runs inside daemon ticks (the rebuild smoke acquires a real lane) that are bounded at 90s, so its network
+// evidence calls get a short per-call bound; a timeout reads as unproven and fails closed instead of stalling the tick.
+const ACQUIRE_EVIDENCE_GIT_TIMEOUT_MS = 20_000;
 function unpushedLaneWork(repo, dir, { allowFetch = false } = {}) {
   const redirect = releaseGitDirRedirect(dir);
   if (redirect) return { commits: null, why: redirect };
-  const io = repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
+  const io = repo.originUrl
+    ? realSalvageIo({ repo, preflightLaneDir: dir, ...(allowFetch ? { gitTimeoutMs: ACQUIRE_EVIDENCE_GIT_TIMEOUT_MS } : {}) })
+    : null;
   return releaseUnprovenCommits(dir, null, { io }, { allowFetch });
+}
+
+/** Network-free fast path for acquire: the local commits (HEAD, every branch, every stash entry) that no origin
+ *  tracking ref contains. '' = every tip is already on a tracking ref, so there is nothing to prove and acquire skips
+ *  the ls-remote + object fetch entirely (the common case: a lane that is only behind origin). null = unreadable or
+ *  unsafe evidence (a symbolic tracking ref other than origin/HEAD could alias the ops namespace), and the caller
+ *  falls through to the full canonical-origin proof, which fails closed on its own. Tracking refs are the same
+ *  evidence the #2924 fresh-fetch re-verify already trusts; acquire's pre-reset call runs right after that
+ *  `fetch --prune`, so deleted or force-moved origin branches no longer count here. A stash entry is never
+ *  reachable from a tracking ref, so stashed work always takes the full path. */
+function localOnlyLaneWork(dir) {
+  const local = releaseLocalWorkTips(dir);
+  if (!local) return null;
+  const tracking = releaseEvidenceGit(['for-each-ref', '--format=%(refname)%00%(symref)', 'refs/remotes/origin/'], dir,
+    { timeout: LOCAL_GIT_TIMEOUT_MS });
+  if (tracking === null) return null;
+  for (const line of tracking ? tracking.split('\n') : []) {
+    const [name, target] = line.split('\0');
+    if (target && name !== 'refs/remotes/origin/HEAD') return null;
+  }
+  return releaseEvidenceGit(['rev-list', '--ignore-missing', ...local.tips, '--not',
+    '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*'], dir,
+  { timeout: LOCAL_GIT_TIMEOUT_MS });
 }
 
 /** Acquire's view of unpushed work: the strict preservation evidence minus commits that are patch-equivalent to
  *  origin/<branch> (squash-merged work is safe to drop, the same relaxation `list --acquirable` applies). Unreadable
  *  evidence (commits === null) and any genuinely unmatched commit, stash included, still block. */
 function acquireBlockingWork(repo, dir) {
+  // Nothing local-only (no commit outside the origin tracking refs): skip the ls-remote + object fetch entirely.
+  if (!releaseGitDirRedirect(dir) && localOnlyLaneWork(dir) === '') return { commits: '' };
   const work = unpushedLaneWork(repo, dir, { allowFetch: true });
   if (!work.commits) return work;
   const local = releaseLocalWorkTips(dir);
@@ -3233,6 +3263,9 @@ async function salvageUnpushed(repo, { lanes = existingLanes(repo), dryRun = fal
   for (const n of lanes) {
     const dir = laneDir(repo, n);
     if (liveLease(dir, Date.now(), ttlMsFromFlags())) continue;
+    // Network-free skip: a lane whose every tip is already on an origin tracking ref has nothing to park, so it costs
+    // no liveness probe, claim, ls-remote or fetch. This only ever skips an action, so a stale tracking ref cannot lose work.
+    if (!releaseGitDirRedirect(dir) && localOnlyLaneWork(dir) === '') continue;
     let claim = null;
     try {
       const assertLiveness = () => {

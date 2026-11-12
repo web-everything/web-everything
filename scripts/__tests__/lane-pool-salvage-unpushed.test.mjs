@@ -255,13 +255,54 @@ describe('lane-pool salvage-unpushed', () => {
     expect(JSON.parse(result.stdout).lane).toBe(2);
   });
 
-  it('acquires an unfetched free lane after canonical origin/main advances using object-only verification', () => {
+  // The daemon-soak regression (PR #6647 send-back): acquire runs inside 90s-bounded daemon ticks, so a lane that is
+  // merely BEHIND origin must be recognised from local tracking refs alone, with no ls-remote and no object fetch.
+  it.each(['unreadable origin head listing', 'advanced origin'])('acquire of a lane with no local-only commits needs no canonical-origin proof (%s)', scenario => {
+    let advanced = null;
+    if (scenario === 'advanced origin') {
+      const publisher = join(root, 'publisher');
+      git(['clone', origin, publisher]);
+      advanced = commit(publisher, 'advanced main');
+      git(['fetch', publisher, 'main:main'], origin);
+      expect(() => git(['cat-file', '-e', advanced], lane)).toThrow();
+    }
+    const result = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--json'], { TEST_BAD_HEADS: '1' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).lane).toBe(1);
+    if (advanced) expect(git(['rev-parse', 'HEAD'], lane)).toBe(advanced);
+    const log = events();
+    expect(log.some(e => e.args.includes('ls-remote') && e.args.at(-1) === 'refs/heads/*')).toBe(false);
+    expect(log.some(e => e.args.some(arg => arg.includes(':refs/release-verify/')))).toBe(false);
+  });
+
+  it('acquire evidence calls are bounded by a short per-call timeout while release keeps its default', async () => {
+    const { realSalvageIo } = await import('../lib/lane-pool-salvage-push.mjs');
+    const probe = gitTimeoutMs => {
+      const seen = [];
+      const runGit = (file, args, options) => { seen.push({ listing: args.includes('ls-remote'), timeout: options.timeout }); return ''; };
+      const repo = { branch: 'main', originUrl: origin, referencePath: primary, primaryPath: primary };
+      realSalvageIo({ repo, backupRoot: join(root, 'backups'), runGit, ...(gitTimeoutMs ? { gitTimeoutMs } : {}) }).remoteHeads();
+      return seen;
+    };
+    const bounded = probe(5_000);
+    expect(bounded.some(call => call.listing)).toBe(true);
+    // The listing runs under git-bounded.mjs, whose grace period sits on top of the bound; nothing may exceed it.
+    expect(Math.max(...bounded.map(call => call.timeout))).toBeLessThan(5_000 + 30_000);
+    expect(Math.max(...probe().map(call => call.timeout))).toBeGreaterThanOrEqual(120_000);
+  });
+
+  it('acquires an unfetched free lane whose only commit is published behind an unfetched origin head using object-only verification', () => {
+    // The lane's commit is on origin only as an ancestor of a head whose objects the lane lacks, so the tracking refs
+    // cannot prove it and the full canonical-origin proof (with its object-only fetch) still runs.
     const publisher = join(root, 'publisher');
     git(['clone', origin, publisher]);
+    const published = commit(lane, 'published through a descendant');
+    git(['fetch', lane, 'main'], publisher);
+    git(['checkout', '-B', 'main', 'FETCH_HEAD'], publisher);
     const advanced = commit(publisher, 'advanced main');
     git(['fetch', publisher, 'main:main'], origin);
-    // The publisher is independent of the primary whose objects the lane borrows.
     expect(() => git(['cat-file', '-e', advanced], lane)).toThrow();
+    expect(git(['merge-base', '--is-ancestor', published, advanced], publisher)).toBe('');
     const result = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--json']);
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout).lane).toBe(1);
@@ -378,6 +419,14 @@ describe('lane-pool salvage-unpushed', () => {
     expect(result.status, result.stderr).toBe(0); expect(JSON.parse(result.stdout).lane).toBe(1);
     const released = run('release', ['--lane=1', '--session=smoke']);
     expect(released.status, released.stderr).toBe(0);
+  });
+
+  it('salvage-unpushed skips lanes with no local-only commits without a liveness probe, listing or fetch', () => {
+    // Unknown liveness evidence would refuse a lane holding work; a lane with none is skipped before any such probe.
+    const result = run('salvage-unpushed', [], { TEST_AGENTS: 'unknown', TEST_CWDS: 'unknown', TEST_BAD_HEADS: '1' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toMatch(/FAILED/);
+    expect(events().some(e => e.args.includes('ls-remote') || e.args.includes('push') || (e.args.includes('fetch') && e.args.includes('origin')))).toBe(false);
   });
 
   it('dry-run changes no refs, stash, lease or working copy and never pushes or fetches', () => {
