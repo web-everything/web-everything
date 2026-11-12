@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:docs/agent/backlog-workflow.md", "we:backlog/4465-builder-routes-a-build-agent-s-not-buildable-already-done-re.md", "we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs", "we:scripts/__tests__/agent-text-authoring-contract.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-07"
-preparedAgainstSha: "87af65ada62a84ff7366c9f67e4b65b9abb599b9"
+preparedDate: "2026-11-11"
+preparedAgainstSha: "bb7d033add105b73d52891a7b41ec06aeb6bcd1d"
 tags: []
 ---
 
@@ -31,6 +31,8 @@ Premise checked at checkout `ef097d284ddcfeb70dc92f158750fc1a1dc90663` (research
 - **Research at `ebd25fbfd10e36691a82b3274caacf4790fccc4f` (no stamp):** the old three-file scope and manual-only documentation proof omit executable coverage of the main deliverable. Corrected scope adds planned we:scripts/__tests__/agent-text-authoring-contract.test.mjs for both documentation surfaces. Keep size **3**: approximately 35 lines in we:docs/agent/backlog-workflow.md, 20 in we:backlog/4465-builder-routes-a-build-agent-s-not-buildable-already-done-re.md, 45 in we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs and 80 in the new documentation test (about 180 changed lines across four files).
 - **Current evidence:** we:scripts/check-standards-rules.mjs:505-517 requires `kind` and rejects unknown kinds; we:scripts/check-standards.mjs:869 calls that validator. we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs:9-46 covers the vocabulary and a valid investigation, but has no missing/invalid-kind cases. we:docs/agent/backlog-workflow.md:43 has the removed-actor lens and we:docs/agent/backlog-workflow.md:353-380 already requires adversarial fixtures for model consumers; neither supplies this specific four-obligation authoring lens. Reuse that existing guidance rather than imply no model-input guidance exists.
 - **Runtime premise refreshed:** we:scripts/operations/build-dispatch-hold-route-land.mjs:332-418 still verifies ancestry, non-backlog changes and delivery evidence, with prepare citations also checking tests added by the cited commit or modified tests whose added lines name the card. The previous “added tests only” description was too narrow. Refusals return `failed` at we:scripts/operations/build-dispatch-hold-route-land.mjs:440; the finding branch remains `other` at we:scripts/conveyor/build-dispatch-hold-router.mjs:237-239. we:backlog/4465-builder-routes-a-build-agent-s-not-buildable-already-done-re.md:6 is resolved; we:backlog/4522-observe-a-hold-route-landing-s-own-terminal-outcome-instead.md:5 remains open. No lifecycle or dependency change is needed.
+
+- **Re-prepared 2026-11-11 against `bb7d033ad`:** premises re-verified unchanged. `BACKLOG_KINDS` and the required-`kind` loop still sit at we:scripts/check-standards-rules.mjs:365 and :505-516; the lens anchor and we:scripts/__tests__/agent-text-authoring-contract.test.mjs still do not exist; #4465 is still resolved and #4522 still open; the only commit touching scoped surfaces since the prior stamp is an unrelated leash-pin snapshot. Design, MVP, Test plan, Proof plan and Acceptance [A1]–[A4] stand as written.
 
 ## Design
 

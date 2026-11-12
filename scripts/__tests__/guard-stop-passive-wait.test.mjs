@@ -1,3 +1,5 @@
+import { pinnedFixture } from '../hooks/__tests__/pinned-fixture.mjs';
+import { pinnedHookScript, pinnedStopHookScript } from '../lib/pinned-hook-command.mjs';
 import { afterAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -230,13 +232,28 @@ describe('guard-stop-passive-wait — real CLI boundary and bounded transcript I
   });
   it('wires both events to the same guard and retains the existing Bash guard', () => {
     const settings = JSON.parse(readFileSync(join(here, '../../.claude/settings.json'), 'utf8'));
+    const f = pinnedFixture();
+    try {
+      for (const hook_event_name of ['Stop', 'SubagentStop']) {
+        const hook = settings.hooks[hook_event_name].flatMap(entry => entry.hooks)
+          .find(hook => hook.command.includes('scripts/guard-stop-passive-wait.mjs'));
+        const output = f.command(f.lane, hook.command, { ...envelope, hook_event_name });
+        expect(output.status, output.stderr).toBe(2);
+        expect(JSON.parse(output.stdout)).toMatchObject({ decision: 'block',
+          hookSpecificOutput: { hookEventName: hook_event_name } });
+      }
+    } finally { f.cleanup(); }
     for (const event of ['Stop', 'SubagentStop']) {
       expect(settings.hooks[event].flatMap((entry) => entry.hooks)).toContainEqual({
-        type: 'command', command: 'node scripts/guard-stop-passive-wait.mjs',
+        type: 'command', command: expect.stringMatching(/run-pinned-guard\.mjs.* --stop-hook scripts\/guard-stop-passive-wait\.mjs'$/),
       });
+      const commands = settings.hooks[event].flatMap((entry) => entry.hooks.map((hook) => hook.command));
+      expect(commands.map(pinnedStopHookScript)).toContain('scripts/guard-stop-passive-wait.mjs');
+      // A Stop wrapper must never be the deny form: its exit 2 would block stopping on every retry.
+      expect(commands.map(pinnedHookScript).filter(Boolean)).toEqual([]);
     }
     expect(settings.hooks.PreToolUse.find((entry) => entry.matcher === 'Bash').hooks).toContainEqual({
-      type: 'command', command: 'node scripts/guard-bash.mjs',
+      type: 'command', command: expect.stringMatching(/run-pinned-guard\.mjs.* scripts\/guard-bash\.mjs; code=/),
     });
   });
 });

@@ -167,12 +167,13 @@
  * (guard-bash.test.mjs), and the whole table is differentially fuzzed against `origin/main` across the
  * three cwd/lease contexts.
  */
+import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync, realpathSync, appendFileSync, mkdirSync } from 'node:fs';
 import { DECLARED_HOMES } from './operations/declared-homes.mjs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readdirSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, join, sep } from 'node:path';
 import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedLaneSlug, requiredAssertionSlug } from './lib/lane-lease.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
@@ -5367,16 +5368,17 @@ if (IS_CLI) {
     // cross-check/fallback for the rare call where the env is unset. Used to tell my own lease from a peer's.
     const mySessionId = process.env.CLAUDE_CODE_SESSION_ID || ev.session_id || null;
     hookSessionId = mySessionId;
-    // #2302 — the Bash cwd decides primary-vs-lane. Derive the constellation primary roots from THIS script's
-    // location (<workspace>/<repo>/scripts/guard-bash.mjs) and realpath both sides so a symlinked workspace
+    // #2302 — the Bash cwd decides primary-vs-lane. Derive the constellation primary roots from the
+    // operated checkout (or this script when unpinned) and realpath both sides so a symlinked workspace
     // still matches. Fail-OPEN (leave primaryCwd=false) on any error — a guard bug must never wedge the agent.
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
     const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
     effectiveCwd = cwd;
-    const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-    const workspace = dirname(weRoot);
+    const weRoot = hookRoot(import.meta.url);
+    const laneIndex = process.env.WE_HOOK_ROOT ? weRoot.indexOf(`${sep}.lanes${sep}`) : -1;
+    const workspace = laneIndex >= 0 ? weRoot.slice(0, laneIndex) : dirname(weRoot);
     const primaries = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'].map((r) => rp(join(workspace, r)));
     primaryCwd = isPrimaryCwd(cwd, primaries);
     // #xpt9fvd — the daemon-clone registry (seed ∪ every clone the overlay state dir has recorded), computed
@@ -5450,7 +5452,7 @@ if (IS_CLI) {
     if (!r && fullSuiteEscapeUsed(cmd)) {
       process.stderr.write(`guard-bash: ESCAPE — ${FULL_SUITE_ESCAPE_ENV}=1 allowed a bare full-suite unit run (xpnhz4o; logged): ${cmd.trim().slice(0, 300)}\n`);
       const logPath = process.env.WE_FULL_SUITE_ESCAPE_LOG
-        || join(resolve(dirname(fileURLToPath(import.meta.url)), '..'), '.conveyor', 'full-suite-escape.log');
+        || join(hookRoot(import.meta.url), '.conveyor', 'full-suite-escape.log');
       mkdirSync(dirname(logPath), { recursive: true });
       appendFileSync(logPath, JSON.stringify({
         at: new Date().toISOString(), session: process.env.CLAUDE_CODE_SESSION_ID || null,

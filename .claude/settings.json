@@ -70,7 +70,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/guard-prep.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-prep.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       },
@@ -79,27 +79,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/guard-lane.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-lane.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "node scripts/lint-locus-prefix.mjs --pre"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/lint-locus-prefix.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "node scripts/lint-invisible-characters.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/lint-invisible-characters.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "node scripts/check-memory.mjs --pre"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/check-memory.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "node scripts/backlog-guard.mjs --pre"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/backlog-guard.mjs --pre; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           },
           {
             "type": "command",
-            "command": "node scripts/guard-backward-edge.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-backward-edge.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       },
@@ -108,7 +108,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/guard-bash.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-bash.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       },
@@ -117,7 +117,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/guard-monitor-subagent.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-monitor-subagent.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'"
           }
         ]
       }
@@ -127,7 +127,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/guard-stop-passive-wait.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs; stop guard skipped\" >&2; exit 1; }; exec node \"$launcher\" --stop-hook scripts/guard-stop-passive-wait.mjs'"
           }
         ]
       }
@@ -137,11 +137,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/guard-stop-passive-wait.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs; stop guard skipped\" >&2; exit 1; }; exec node \"$launcher\" --stop-hook scripts/guard-stop-passive-wait.mjs'"
           },
           {
             "type": "command",
-            "command": "node scripts/guard-stop-background-running.mjs"
+            "command": "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs; stop guard skipped\" >&2; exit 1; }; exec node \"$launcher\" --stop-hook scripts/guard-stop-background-running.mjs'"
           }
         ]
       }
