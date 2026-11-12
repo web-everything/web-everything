@@ -1,7 +1,8 @@
 import { redTeamForHead } from './red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
-import { readSealedStatus } from './red-team-sealed-status.mjs';
+import { readFileSync } from 'node:fs';
+import { readSealedStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
 import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 
 /** Re-read the live head right before the write: a head that moved after the writer's own check must not be labelled. */
@@ -18,7 +19,8 @@ export function headGuardedProvider(provider, head) {
 /** Repair derived labels for trusted results on already-reviewed, unchanged heads. */
 export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
   env = process.env, log = () => {}, provider = null, sync = syncRedTeamStatusLabels,
-  readSeal = readSealedStatus, sealStored = publishStoredRedTeamResult } = {}) {
+  readSeal = readSealedStatus, sealStored = publishStoredRedTeamResult,
+  isLegacyRan = key => { try { return JSON.parse(readFileSync(sealedStatusPath(key, key.env), 'utf8'))?.result === 'ran'; } catch { return false; } } } = {}) {
   let updated = rawPrs;
   const applied = [], errors = [];
   const labelName = label => typeof label === 'string' ? label : label?.name;
@@ -37,6 +39,9 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
     try {
       if (!redTeamForHead(row.comments, pr, head)) continue;
       if (readSeal({ repo, pr, head, env })?.unsealed === true) {
+        // Only the legacy bare `ran` status: the publisher recovers it from the exact-head seat row and checks that row is
+        // self-consistent. A non-legacy result's findings are trusted as stored, so it never seals here (the sweep owns it).
+        if (!isLegacyRan({ repo, pr, head, env })) continue;
         const sealed = sealStored({ status: { repo, pr, head }, sealOnly: true,
           listComments: () => row.comments,
           postComment: () => { throw Error('seal-only never posts'); } });

@@ -25,6 +25,7 @@ function fixture() {
     sync: vi.fn(() => ({ add: 'red-team:clear', remove: ['red-team:pending'] })),
     readSeal: vi.fn(() => null),
     sealStored: vi.fn(() => ({ status: 'sealed' })),
+    isLegacyRan: vi.fn(() => true),
     log: vi.fn(),
   };
 }
@@ -83,6 +84,35 @@ describe('syncResultOnHeadLabels', () => {
     expect(result.errors).toEqual([{ pr, head, error: expect.any(Error) }]);
     expect(input.log).toHaveBeenCalledTimes(1);
     expect(input.sync).not.toHaveBeenCalled();
+  });
+
+  it('never seals a non-legacy unsealed status here (its findings are trusted as stored)', () => {
+    const input = fixture();
+    input.readSeal.mockReturnValue({ unsealed: true });
+    input.isLegacyRan.mockReturnValue(false);
+    const result = syncResultOnHeadLabels(input);
+    expect(input.sealStored).not.toHaveBeenCalled();
+    expect(input.sync).not.toHaveBeenCalled();
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
+  });
+
+  it('with the REAL publisher, a legacy status whose seat row holds a confirmed break the comment omits stays pending', async () => {
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { publishStoredRedTeamResult } = await import('../red-team-withheld-publish.mjs');
+    const statusDir = mkdtempSync(join(tmpdir(), 'rt-seal-'));
+    const status = { repo, pr, head, status: 'finished', result: 'ran' };
+    writeFileSync(join(statusDir, `${encodeURIComponent(repo)}-${pr}-${head}.json`), JSON.stringify(status));
+    const row = { rev: head, findings: [{ confirmedByRecheck: true, category: 'correctness', summary: 'Break', file: 'a.mjs', line: 1 }],
+      foldedVerdict: 'changes', confirmedMissCount: 1, provider: 'codex', model: 'x', callId: 'c', recheckStatus: 'done' };
+    const input = fixture();
+    input.readSeal.mockReturnValue({ unsealed: true });
+    input.sealStored = args => publishStoredRedTeamResult({ ...args, statusDir, readSeatRow: () => row, publishNeedsYou: () => {} });
+    const result = syncResultOnHeadLabels(input);
+    expect(input.sync).not.toHaveBeenCalled();
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
+    expect(result.errors).toHaveLength(1);
   });
 
   it('keeps a sealed same-head result with confirmed breaks blocked', () => {
