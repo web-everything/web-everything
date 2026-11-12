@@ -155,8 +155,8 @@ describe('setting-driven red-team queue floor', () => {
     expect(log).toHaveBeenCalledTimes(expected > 0 ? 1 : 0);
   });
 
-  it('loads defaults 2/10 from the real shipped settings file with no environment overrides', () => {
-    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ ...floor, reviewStartsPerTick: 3 });
+  it('loads defaults 4/10 from the real shipped settings file with no environment overrides', () => {
+    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 4 });
     expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(4);
   });
 
@@ -891,5 +891,24 @@ describe('raiseReviewStartsPerTick guards', () => {
     expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 101 })).toBe(2);
     expect(raiseReviewStartsPerTick(0, { floor: f, cpuIdlePct: 50 })).toBe(0);
     expect(raiseReviewStartsPerTick(Infinity, { floor: f, cpuIdlePct: 50 })).toBe(Infinity);
+  });
+});
+
+describe('R878 red-team queue admits up to 4 only within the host ceiling', () => {
+  const floor4 = { minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 4 };
+  it('idle host with ceiling 4 raises remainingStarts to 4', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 4 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 50 });
+    expect(capacity.remainingStarts).toBe(4);
+  });
+  it('host ceiling of 2 (R853 not admitting more) holds the queue at 2', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 2 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 50 });
+    expect(capacity.remainingStarts).toBe(2);
+  });
+  it('busy CPU never raises above the existing allowance', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 4 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 5 });
+    expect(capacity.remainingStarts).toBe(2);
   });
 });

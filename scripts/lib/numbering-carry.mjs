@@ -12,6 +12,8 @@
  *   Live case #5608: drain numbering also rewrote ids in docs/agent/platform-decisions.md, voiding human clearance.
  */
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
+import { proveMixedMechanicalChain, submoduleStrictExec } from './carry-chain.mjs';
+import { isAutomationAuthored } from './marker-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { execFileSync } from 'node:child_process';
@@ -407,6 +409,7 @@ const staleReason = /^(?:is STALE|could NOT be re-verified this pass) —/;
 export function isNumberingTolerableLaterBody(body, comment = undefined) {
   if (isKnownMachineBody(body, comment)) return true;
   if (typeof body !== 'string') return false;
+  if (isAutomationAuthored({ ...comment, viewerDidAuthor: false }) && /^🔧 conveyor fix — re-armed for re-review\n\nThe previously accepted PR was re-pushed and its acceptance is being re-armed for review by [A-Za-z0-9 ._-]{1,100}; the PR is re-armed `review:pending` \(an independent re-review is owed\)\.\n\nThe fix agent did NOT clear the review — a human `\/review` \(or the drain AI-review convergence pass\) re-verdicts\.$/.test(body)) return true;
   // A withdrawal is not itself a hold: whatever caused it still stands on the thread and is judged on its own.
   if (isWithdrawnNotice(body)) return true;
   const park = stalePark.exec(body);
@@ -492,8 +495,7 @@ export function buildNumberingRestampBody({ fromSha, toSha, human, actor, headDi
   return [
     '📌 review — acceptance re-stamped after a rebase (no new review)', '',
     `Recorded by ${writer} via numbering-carry. The head moved from \`${fromSha.slice(0, 12)}\` to \`${toSha.slice(0, 12)}\` `
-      + `only by the drain's own card-numbering commit(s): ${proofReason}. Each commit was verified mechanically `
-      + '(backlog card renames to their assigned numbers, the bornAs stamp, and id-to-number rewrites; nothing else). '
+      + `only by a mechanically proven move: ${proofReason}. `
       + `The acceptance recorded on \`${fromSha.slice(0, 12)}\``
       + (human ? ` — the human clearance by ${name} —` : '')
       + ' is carried unchanged; any other change still needs a fresh review.', '',
@@ -660,8 +662,17 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   let proof = numberingOff ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
   if (!proof.ok && netSetting.value) {
     // An alternative proof cannot settle a head the first proof could not read: either retryable miss stays retryable.
-    const net = proveIdenticalNetPatch({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+    // Strict exec: a tracked ignore=all must not hide a submodule pointer change from the patch comparison.
+    const net = proveIdenticalNetPatch({ exec: submoduleStrictExec(exec), cwd, fromSha: plan.from, toSha: plan.to });
     proof = net.ok ? net : { ...net, retryable: Boolean(proof.retryable || net.retryable), reason: `${proof.reason}; net patch: ${net.reason}` };
+  }
+  if (!proof.ok && !plan.human) {
+    const chain = proveMixedMechanicalChain({ exec, cwd, fromSha: plan.from, toSha: plan.to,
+      numberingEnabled: numberingSetting.value, netPatchEnabled: netSetting.value });
+    proof = chain.ok ? chain : { ...chain, retryable: Boolean(proof.retryable || chain.retryable),
+      reason: `${proof.reason}; chain: ${chain.reason}` };
+  } else if (!proof.ok && plan.human) {
+    proof = { ...proof, reason: `${proof.reason}; human clearance cannot be carried across a mechanical chain; request a fresh human review` };
   }
   if (!proof.ok) {
     if (!proof.retryable && !numberingOff) settledRestamps.add(key);

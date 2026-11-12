@@ -5,8 +5,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/__tests__/review-extra-seats.test.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/lib/review-core.mjs", "we:scripts/lib/__tests__/review-core.test.mjs", "we:scripts/lib/review-policy.mjs", "we:scripts/__tests__/review-core-cli.test.mjs", "we:scripts/lib/__tests__/review-policy.conformance.test.mjs", "we:scripts/lib/review-policy.contract.json", "we:scripts/operations/__tests__/review-pr.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-09"
-preparedAgainstSha: "c9809e203b93d3f7d742bf01fc57c80cbed8e268"
+preparedDate: "2026-11-10"
+preparedAgainstSha: "99fa39f0e6920efd8f8d14762f207d671f8d95c6"
 tags: []
 ---
 
@@ -37,6 +37,8 @@ we:backlog/4314-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md's
 - 2026-11-07 prepare: premise holds on current main (no `spec-consistency` lens exists; the #4487 hits in `git log` are an unrelated PR number and a prevention card). Scope widened from 4 to 6 files: we:scripts/lib/review-policy.mjs (`VALID_CARE_LENSES` literal), we:scripts/__tests__/review-core-cli.test.mjs (pinned lens count) and we:scripts/lib/__tests__/review-policy.conformance.test.mjs are changed by adding a panel lens. Citations in the body re-checked against current line numbers.
 
 - 2026-11-09 re-prepare (prepare-stale): scope file we:scripts/lib/jury-core.mjs changed on main since the 2026-11-07 stamp, but only in the operator-ruling parser region (~:3840-4013, unrelated to the lens enums). Premise re-checked: no `spec-consistency` lens exists, design unchanged. Citations refreshed (line shifts of +1 only; `earnedLenses` pin now at we:scripts/__tests__/review-core-cli.test.mjs:339).
+
+- 2026-11-10 re-prepare (prepare-stale): none of the scope files changed on main since the 2026-11-09 stamp (`git log c9809e20..HEAD` over all scope paths is empty); no `spec-consistency` lens exists; citations re-checked and still hold (`CLAIM_ACCURACY` at we:scripts/lib/jury-core.mjs:1438, `ADVISORY_LENSES` :1735, `PANEL_LENSES` :1775, `LENS_EXPECTATIONS` we:scripts/lib/review-core.mjs:1952, `LENS_HUNT_BRIEF` :1971, `ROUTED_ADVISORY_LENSES` we:scripts/operations/review-dispatch.mjs:195). Design unchanged; stamp refreshed.
 
 ## Design
 
