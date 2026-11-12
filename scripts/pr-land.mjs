@@ -115,7 +115,7 @@ import { computeNetDiffSignals, recordParkVerdict } from './merge-ai-prs.mjs';
 import {
   scoreEscalation, parseDeviationDisclosure, producerReviewLabel, shouldApplyReviewLabel, REVIEW_LABEL_META, REVIEW_LABELS,
   reconcileEscalationReasonBlock, reconcileRoster, ROSTER_TIMING,
-  isReviewHoldLabel, READY_TO_MERGE_LABEL, readyMergeConflictsWithHold, hasUnclearedReviewLabel,
+  isReviewHoldLabel, READY_TO_MERGE_LABEL, readyMergeConflictsWithHold, hasUnclearedReviewLabel, parseReviewedSha,
 } from './lib/review-escalation.mjs'; // #2307 — deterministic review-escalation label AT PR-OPEN; #2635 — roster bind+reconcile; #2832 — hold/ready self-consistency
 import { resolveJuryPlan } from './lib/review-core.mjs'; // #2635 — recompute the jury roster from the REAL diff at PR-open
 import { POLICY_CARE_JURY } from './lib/review-policy.mjs'; // #2635 — the care→jury contract's roster-timing mode (knob #4)
@@ -513,10 +513,23 @@ export function prCreateBodyGuard(body) {
  * @param {{labelApplied?: boolean}} [opts] - did THIS run's `--add-label ready-to-merge` succeed?
  * @returns {{held:boolean, strip:boolean}}
  */
-export function decideHoldReadyStrip(verdictLabel, currentLabels, { labelApplied = false } = {}) {
-  const held = (!!verdictLabel && isReviewHoldLabel(verdictLabel)) || hasUnclearedReviewLabel(currentLabels);
+export function decideHoldReadyStrip(verdictLabel, currentLabels, { labelApplied = false, acceptedAtHead = false } = {}) {
+  // A PR already accepted for THIS exact head (see `isAcceptedAtHead`) has had that head judged: a fresh score must not re-hold it.
+  const held = (!acceptedAtHead && !!verdictLabel && isReviewHoldLabel(verdictLabel)) || hasUnclearedReviewLabel(currentLabels);
   const strip = held && (readyMergeConflictsWithHold([...(currentLabels || []), verdictLabel]) || labelApplied);
   return { held, strip };
+}
+
+/**
+ * True iff the PR is already accepted for THIS exact head: it carries `review:accepted` AND the shared
+ * `parseReviewedSha` marker reader (same one review-set-label uses) finds a reviewed-sha equal to `headSha`.
+ * Anything else (no marker, other sha, no accepted label) is false, so a new unreviewed head keeps its hold.
+ * An observed uncleared hold label (review:human/pending/changes) is still handled by hasUnclearedReviewLabel.
+ */
+export function isAcceptedAtHead(labels, comments, headSha) {
+  const names = (labels || []).map((l) => (typeof l === 'string' ? l : l && l.name));
+  if (!names.includes(REVIEW_LABELS.accepted) || !headSha) return false;
+  return parseReviewedSha(comments) === String(headSha).toLowerCase();
 }
 
 /**
@@ -1223,7 +1236,12 @@ async function runCli() {
     const humanRequired = rubric.humanRequired || roster.humanAlignmentRequired;
     const finalLabel = humanRequired ? REVIEW_LABELS.human : rubric.label;
     const reasons = [...rubric.reasons, ...roster.reasons];
-    const verdict = { label: finalLabel, apply: shouldApplyReviewLabel(finalLabel, currentLabels), reasons, humanRequired, roster };
+    let acceptedAtHead = false;
+    try { acceptedAtHead = isAcceptedAtHead(currentLabels, forge.viewPr(prNum, 'comments').comments || [], refSha); } catch { /* read miss: keep today's hold */ }
+    const carried = acceptedAtHead && !!finalLabel && isReviewHoldLabel(finalLabel) && !humanRequired;
+    const verdict = carried
+      ? { label: null, apply: false, reasons: [], humanRequired, roster, acceptedAtHead: true }
+      : { label: finalLabel, apply: shouldApplyReviewLabel(finalLabel, currentLabels), reasons, humanRequired, roster };
 
     if (verdict.label && verdict.apply) {
       const meta = REVIEW_LABEL_META[verdict.label];
@@ -1274,7 +1292,7 @@ async function runCli() {
     // PR is deliberately held for review — the #4 signal, distinct from `labelApplied:false` apply-failure) and
     // `strip` (the PR observably carries `ready-to-merge` while held, so remove it — gated on what the PR actually
     // holds, NOT on whether THIS run's applyLabel add succeeded, #5).
-    const holdDecision = decideHoldReadyStrip(verdict.label, currentLabels, { labelApplied });
+    const holdDecision = decideHoldReadyStrip(verdict.label, currentLabels, { labelApplied, acceptedAtHead: !!verdict.acceptedAtHead });
     if (holdDecision.held) held = true;
     if (holdDecision.strip) {
       try { forge.removeLabel(prNum, READY_TO_MERGE_LABEL); labelApplied = false; }
