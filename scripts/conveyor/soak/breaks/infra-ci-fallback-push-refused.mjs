@@ -13,12 +13,12 @@ export default {
   id: 'infra-ci-fallback-push-refused',
   title: 'an infra verify failure with green required CI hands the round back without a second push (live #6693 push-refused)',
   card: 'PR for lane/await-verify-ci-green-fallback (R895+R903)',
-  fixedBy: { sha: 'be0a2bc8b665d3470c0624f1eaf68f90fd2adcf4', where: 'lane/await-verify-ci-green-fallback', paths: [PASS] },
+  fixedBy: { sha: '33ee0ead26032a28739b1a690e1a25a67e7b87b5', where: 'lane/await-verify-ci-green-fallback', paths: [PASS] },
   fixPresent(root) { return readFileSync(join(root, PASS), 'utf8').includes('skipPush: true'); },
   async run({ log } = {}) {
     const violations = [];
     const record = { v: 1, sessionId: 'fix-6693', who: 'fix-6693', repo: CONSTELLATION_REPOS.we.slug, pr: 6693, kind: 'fix',
-      sha: SHA, lane: '/lanes/lane-9', ref: 'lane/x', attempt: 1, retries: 2, requestedAt: new Date(NOW - 3_600_000).toISOString(),
+      sha: SHA, lane: '/lanes/lane-9', ref: 'lane/x', attempt: 1, retries: 2, infraRetry: { attempts: 3 }, requestedAt: new Date(NOW - 3_600_000).toISOString(),
       earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, done: true } };
     const store = new Map([[record.sessionId, record]]);
     const prompts = [];

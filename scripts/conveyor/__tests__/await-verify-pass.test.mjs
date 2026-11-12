@@ -8,7 +8,7 @@ import { verifyFinishBody, verificationInfrastructureFailure } from '../../lib/l
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, AWAIT_LOAD_DEFER_MAX_MS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo, resolveDeliveredStaleMs, resolveDeliveredStale,
+  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, AWAIT_LOAD_DEFER_MAX_MS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo, resolveDeliveredStaleMs, resolveDeliveredStale, resolveInfraFallbackToCi,
 } from '../await-verify-pass.mjs';
 import { classifyAwaitVerify } from '../await-verify.mjs';
 
@@ -1603,8 +1603,9 @@ describe('timeout-only load recovery', () => {
 // the exact pushed head's green required `test` CI check. Anything else keeps today's infra ladder.
 describe('infra verify failure falls back to green CI on the pushed head', () => {
   const run = (row) => ({ name: row[0], status: 'COMPLETED', conclusion: row[1] });
-  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live', pushResult, infraRetry } = {}) => {
-    const h = harness({ pushResult, records: [rec({ retries: 2, ...(infraRetry ? { infraRetry } : {}), earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
+  // Default: the infra retries are spent (attempts 3 = maxAttempts 3), the only state in which the fallback may run.
+  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live', pushResult, infraRetry = { attempts: 3 }, recOver = {}, earlyPushSha = SHA } = {}) => {
+    const h = harness({ pushResult, records: [rec({ retries: 2, ...(infraRetry ? { infraRetry } : {}), earlyPush: { ok: true, sha: earlyPushSha, upToDate: true, attempts: 1, at: new Date(T0).toISOString() }, ...recOver })] });
     h.state.marker = mark ?? marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'SIGKILL after 1800000ms' } });
     h.io.readPreviousHead = async () => head;
     h.io.readPreviousRequired = async () => ({ checks: required, source });
@@ -1662,11 +1663,21 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
       expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
     }
   });
-  // Acceptance "retries spent": the fallback gate is `d.resume === 'infra' || exhausted || attempts >= max`, so a FIRST infra kill
-  // on a pushed head with green required CI is handed back without spending the remaining infraRetry attempts (ruled residual:
-  // CI on the exact head is the stronger evidence). Both sides of the boundary are pinned so a change to either is deliberate.
+  // Acceptance "retries spent": the fallback runs only once the infra ladder is spent (exhausted, or attempts >= maxAttempts).
+  // Before that, green CI does NOT short-circuit the ladder: the retry stays scheduled.
   it.each([
     ['no infra retry has run yet (attempts 0 < max 3)', undefined],
+    ['one retry has run (attempts 1 < max 3)', { attempts: 1, scheduled: true, nextAttemptAt: new Date(T0 + 60_000).toISOString() }],
+    ['two retries have run (attempts 2 < max 3)', { attempts: 2 }],
+  ])('keeps the ladder, even with green CI, when %s', async (_name, infraRetry) => {
+    const h = ciHarness({ infraRetry: infraRetry ?? false });
+    const { rows } = await tick(h);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    expect(rows[0].action).toMatch(/^(infra-retry|infra-retry-scheduled|wait)$/);
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.push).toHaveLength(0);
+  });
+  it.each([
     ['retries are spent (attempts 3 = max 3)', { attempts: 3 }],
     ['the ladder is marked exhausted', { attempts: 1, exhausted: true }],
   ])('hands back on green CI when %s', async (_name, infraRetry) => {
@@ -1677,12 +1688,64 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
     expect(h.calls.rerequest).toHaveLength(0);
   });
   it('keeps the ladder at either side of the retries boundary when CI is not green', async () => {
-    for (const infraRetry of [undefined, { attempts: 3 }]) {
+    for (const infraRetry of [false, { attempts: 3 }]) {
       const h = ciHarness({ infraRetry, checks: [['test', 'FAILURE']] });
       const { rows } = await tick(h);
       expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
       expect(rows[0].action).toMatch(/^infra-/);
     }
+  });
+  // Both accepted kill reasons hand back (dropping either from the allowlist must redden one case).
+  it.each(['verify-timeout', 'verify-signal'])('hands back on green required CI after a spent %s failure', async (reason) => {
+    const h = ciHarness({ mark: marker('infrastructure-failure', { infrastructure: { reason, detail: 'killed' } }) });
+    const { rows } = await tick(h);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it.each([
+    ['the record is not a fix round', { recOver: { kind: 'build' } }],
+    ['the early push was another sha', { earlyPushSha: OTHER }],
+  ])('keeps the ladder when %s', async (_name, opts) => {
+    const h = ciHarness(opts);
+    const { rows } = await tick(h);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+  });
+  it('rejects the fallback when the PR head changes during the CI reads', async () => {
+    const h = ciHarness();
+    let head = SHA;
+    h.io.readPreviousHead = async () => head;
+    h.io.readPreviousChecks = async () => { head = OTHER; return [run(['test', 'SUCCESS'])]; };
+    const { rows } = await tick(h);
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+  });
+  it('keeps the ladder when the second PR head read fails or is empty', async () => {
+    for (const second of [async () => { throw new Error('gh down'); }, async () => '']) {
+      const h = ciHarness();
+      let n = 0;
+      h.io.readPreviousHead = async () => (n++ === 0 ? SHA : second());
+      const { rows } = await tick(h);
+      expect(h.calls.resume).toHaveLength(0);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
+  });
+  // The real resolver (the harness above injects the boolean): standard on, environment over tool, tool over standard.
+  it.each([
+    ['nothing configured → standard on', {}, undefined, { enabled: true, source: 'standard' }],
+    ['tool off', {}, { infraFallbackToCi: false }, { enabled: false, source: 'tool' }],
+    ['tool on', {}, { infraFallbackToCi: true }, { enabled: true, source: 'tool' }],
+    ['tool value not a boolean → standard on', {}, { infraFallbackToCi: 'no' }, { enabled: true, source: 'standard' }],
+    ['env 0 beats tool on', { WE_VERIFY_INFRA_FALLBACK_TO_CI: '0' }, { infraFallbackToCi: true }, { enabled: false, source: 'environment' }],
+    ['env false', { WE_VERIFY_INFRA_FALLBACK_TO_CI: 'false' }, undefined, { enabled: false, source: 'environment' }],
+    ['env OFF (case, spaces)', { WE_VERIFY_INFRA_FALLBACK_TO_CI: ' OFF ' }, undefined, { enabled: false, source: 'environment' }],
+    ['env 1 beats tool off', { WE_VERIFY_INFRA_FALLBACK_TO_CI: '1' }, { infraFallbackToCi: false }, { enabled: true, source: 'environment' }],
+    ['env true', { WE_VERIFY_INFRA_FALLBACK_TO_CI: 'true' }, undefined, { enabled: true, source: 'environment' }],
+    ['unrecognised env falls through to tool', { WE_VERIFY_INFRA_FALLBACK_TO_CI: 'maybe' }, { infraFallbackToCi: false }, { enabled: false, source: 'tool' }],
+  ])('resolveInfraFallbackToCi: %s', (_name, env, tool, expected) => {
+    expect(resolveInfraFallbackToCi({ env, tool })).toEqual(expected);
   });
   it('accepts the marker the real verifyFinishBody writes for a killed run, though it drops the failing tests', async () => {
     const infrastructure = verificationInfrastructureFailure({ timedOutPhase: 'vitest', ceilingMs: 1800000 });

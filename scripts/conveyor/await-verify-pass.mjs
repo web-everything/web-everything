@@ -486,7 +486,8 @@ async function infraCiGreenFallback({ io, record, marker, lane }) {
     const strict = name => (Array.isArray(checks) ? checks : []).filter(r => (r?.name || r?.context) === name).every(r =>
       (r.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'SUCCESS' : String(r.state).toUpperCase() === 'SUCCESS'));
     if (!required.every(name => (checks ?? []).some(r => (r?.name || r?.context) === name) && strict(name))) return null;
-    // The reads above are async: the lane and verdict must still be what was decided on.
+    // The reads above are async: the PR head, lane and verdict must still be what was decided on.
+    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
     const nowLane = io.laneState(record.lane);
     if (!nowLane?.head || lower(nowLane.head) !== lower(record.sha) || nowLane.dirty) return null;
     if (io.readMarker(record.lane)?.status !== 'infrastructure-failure') return null;
@@ -641,7 +642,8 @@ export async function runAwaitVerifyPass({
         }
         rows.push(row); continue;
       }
-      if (record?.kind === 'fix' && d.resume !== 'void' && !record.pendingResume && (d.resume === 'infra' || record.infraRetry?.exhausted
+      // "Retries spent" means the infra ladder is spent (exhausted, or attempts >= maxAttempts); a first kill keeps the ladder.
+      if (record?.kind === 'fix' && d.resume !== 'void' && !record.pendingResume && (record.infraRetry?.exhausted
         || (record.infraRetry?.attempts ?? 0) >= (recovery.value.infraRetry?.maxAttempts ?? Infinity))) {
         const fallback = await infraCiGreenFallback({ io, record, marker, lane });
         if (fallback) {
