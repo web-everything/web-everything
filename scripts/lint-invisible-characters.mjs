@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /** #2866 PreToolUse(Edit|Write): inspect the proposed content before it reaches disk. */
+import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync } from 'node:fs';
-import { dirname, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { relative, resolve } from 'node:path';
 import { scanInvisibleCharacters } from './check-standards-rules.mjs';
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const root = hookRoot(import.meta.url);
 try {
   const event = JSON.parse(readFileSync(0, 'utf8'));
   const input = event.tool_input ?? {};
