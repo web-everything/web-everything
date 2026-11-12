@@ -1631,6 +1631,7 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
     ['another required check is red', { required: ['test', 'lint'], checks: [['test', 'SUCCESS'], ['lint', 'FAILURE']] }],
     ['the CI read fails', { checks: () => { throw new Error('gh down'); } }],
     ['the setting is off', { fallback: false }],
+    ['the infra marker also carries a failing test', { mark: marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'x' }, failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } }) }],
     ['the required set is a cache/fallback read', { source: 'fallback' }],
     ['the test check was skipped', { checks: [['test', 'SKIPPED']] }],
   ])('keeps the infra ladder when %s', async (_name, opts) => {

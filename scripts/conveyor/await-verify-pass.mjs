@@ -469,6 +469,8 @@ async function infraCiGreenFallback({ io, record, marker, lane }) {
     if (!lane?.head || lower(lane.head) !== lower(record.sha) || lane.dirty) return null; // the lane must still be the pushed head, clean
     const setting = typeof io.infraFallbackToCi === 'function' ? io.infraFallbackToCi() : null;
     if (setting?.enabled !== true || record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure') return null;
+    // Infrastructure status next to an observed failing test is a real red in disguise: never masked.
+    if (marker.failureDetails?.tests?.length || marker.retriedFailures?.length || marker.failures?.length) return null;
     if (!record.earlyPush?.ok || lower(record.earlyPush.sha) !== lower(record.sha)) return null;
     if (typeof io.readPreviousHead !== 'function' || typeof io.readPreviousRequired !== 'function' || typeof io.readPreviousChecks !== 'function') return null;
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
