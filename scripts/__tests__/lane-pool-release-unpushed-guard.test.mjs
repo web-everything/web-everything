@@ -588,6 +588,23 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(git(['rev-parse', 'refs/stash^1'], laneDir)).toBe(sha);
     refused(release([], '', '', RECOVERY_ON), sha);
   });
+  // The same rule must cover older reflog entries, not only refs/stash: the newest stash here sits on a pushed commit, so
+  // only stash@{1}^1 still points at the unpushed one.
+  it('with recovery on, refuses an unpushed commit reachable only as the base of an older stash entry', () => {
+    git(['checkout', '--quiet', '-b', 'work/older'], laneDir);
+    writeFileSync(join(laneDir, 'real.txt'), 'real work\n');
+    git(['add', 'real.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'real'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir);
+    stashText('older stashed edit\n');
+    git(['checkout', '--quiet', '--detach', 'origin/main'], laneDir);
+    stashText('newer stashed edit\n');
+    git(['branch', '-D', 'work/older'], laneDir);
+    expect(git(['for-each-ref', '--contains', sha, '--format=%(refname)', 'refs/heads', 'refs/remotes'], laneDir)).toBe('');
+    expect(git(['rev-parse', 'refs/stash^1'], laneDir)).not.toBe(sha);
+    expect(git(['rev-parse', 'stash@{1}^1'], laneDir)).toBe(sha);
+    refused(release([], '', '', RECOVERY_ON), sha);
+  });
   it('with recovery on, still refuses a genuine unpushed commit when a stash is also present', () => {
     writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
     git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
