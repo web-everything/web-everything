@@ -2353,7 +2353,15 @@ export function decideContradictoryVerdictHeal({
     if (!acceptedSha) return { heal: false, reason: 'accept-sha-unknown' };
     const accepted = acceptedSha.toLowerCase();
     const head = headSha.toLowerCase();
-    if (accepted.startsWith(head) || head.startsWith(accepted)) return { heal: false, reason: 'accept-current' };
+    if (accepted.startsWith(head) || head.startsWith(accepted)) {
+      // The accept for this exact head is the verdict; a pending on the same head is stale.
+      return {
+        heal: true, reason: 'stale-pending',
+        decision: { allowed: true, addLabel: null, removeLabels: [REVIEW_LABELS.pending], keepsHuman: false,
+          reason: `stale review:pending dropped; review:accepted covers the current head ${headSha.slice(0, 7)}` },
+        comment: buildStalePendingHealComment({ headSha }),
+      };
+    }
     return {
       heal: true, reason: 'stale-accept',
       decision: { allowed: true, addLabel: null, removeLabels: [REVIEW_LABELS.accepted], keepsHuman: false,
@@ -3359,6 +3367,15 @@ function decideReviewGateCore({
   // (x30jq9n): landing unreviewed code on a clock is never the right failure mode; a stuck park is handled by
   // the operator, not by the drain.
   return { action: 'park', reason: 'escalated — awaiting an independent review (review:pending)', applyLabel: REVIEW_LABELS.pending, humanRequired: false };
+}
+
+/** Durable evidence for removing a pending that sits beside an accept of the current head. Pure. */
+export function buildStalePendingHealComment({ headSha }) {
+  return [
+    '**`review:pending` removed — stale hold beside a current acceptance.**',
+    '',
+    `The recorded acceptance covers the live head \`${headSha}\`, so \`review:pending\` no longer guards anything.`,
+  ].join('\n');
 }
 
 /** Durable evidence for removing an older-head accept beside pending. Pure. */
