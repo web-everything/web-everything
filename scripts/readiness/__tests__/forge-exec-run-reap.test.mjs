@@ -108,11 +108,12 @@ describe('production uidBusy scanner', () => {
   });
   it('killRun kills the verified owner tree and the slot UID, but not a reused owner pid', async () => {
     const st = {'/proc/50/stat': '50 (node) S 1 0', '/proc/51/stat': '51 (python3) S 50 0', '/proc/52/stat': '52 (x) S 99 0',
-      '/proc/50/status': procStatus([0, 0, 0, 0]), '/proc/51/status': procStatus([0, 0, 0, 0]), '/proc/52/status': procStatus([0, 0, 0, 0])};
-    const proc = {...procFixture({entries: ['50', '51', '52'], readStatus: path => st[path]}), readFile: async p => Buffer.from(st[p])};
+      '/proc/50/status': procStatus([0, 0, 0, 0]), '/proc/51/status': procStatus([0, 0, 0, 0]), '/proc/52/status': procStatus([0, 0, 0, 0]),
+      '/proc/53/stat': '53 (w) S 1 0', '/proc/53/status': procStatus([workerUid, workerUid, workerUid, workerUid])};
+    const proc = {...procFixture({entries: ['50', '51', '52', '53'], readStatus: path => st[path]}), readFile: async p => Buffer.from(st[p])};
     const killed = [];
     await killRun({uid: workerUid, ownerPid: 50, ownerStart: '9'}, proc, pid => killed.push(pid), async () => '9');
-    expect(killed.sort()).toEqual([50, 51]);
+    expect(killed.sort()).toEqual([50, 51, 53]);
     const none = [];
     await killRun({uid: workerUid, ownerPid: 50, ownerStart: '9'}, proc, pid => none.push(pid), async () => '10');
     expect(none).toEqual([]);

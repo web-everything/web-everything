@@ -1013,7 +1013,10 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       };
       if(!await decide())continue;
       let killed=0;
-      if(await pastMax()) {
+      // The wedged owner holds the slot flock, so the kill cannot wait for the lock; re-read the reservation
+      // right before it and kill only if it is still the same run and nonce (a new run would differ).
+      const stillSame=async()=>{const now=await readRecord(join(lockPath,'reservation.json'));return now?.run===reservation.run&&now?.nonce===reservation.nonce;};
+      if(await pastMax()&&await stillSame()) {
         const record=entries.length?await readRecord(entries[0].file):null;
         killed=await reapProbe.killRun({uid:(await identity('forge-exec-'+slotNumber)).uid,ownerPid:record?.owner?.pid,ownerStart:record?.owner?.start}).catch(()=>0);
       }
