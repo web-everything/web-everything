@@ -152,6 +152,8 @@ describe('missing-run PR-event recovery', () => {
     const failed = fixture({ message: msg, reserveDispatch, failDispatch: true });
     expect(failed.result).toMatchObject({ ok: false, error: expect.stringContaining('failed during dispatch') });
     expect(taken.size).toBe(1);
+    // One reservation key whatever the repo slug's case.
+    expect([...taken][0]).toBe(`${repo.toLowerCase()}@${sha}`);
     const again = fixture({ message: msg, reserveDispatch });
     expect(again.result.ok).toBe(false);
     expect(again.calls.some(c => c.args.includes('-X'))).toBe(false);

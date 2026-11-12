@@ -153,8 +153,9 @@ export function pushMissingRunCommit(d, options = {}) {
       if (live.state !== 'open' || live.head?.sha !== d.headSha || live.head?.ref !== d.headRefName) return defer('PR head or state changed');
       // The listing above only sees runs GitHub has already indexed. The reservation is what makes it ONE dispatch
       // per head: taken after the last re-check and before the POST, never released (see reserveMissingRunDispatch).
-      if (!reserveDispatch(`${repo}@${d.headSha}`)) {
-        return { ok: false, action, error: 'ci.yml dispatch already reserved for this head; needs ci-heal, not another trigger' };
+      // GitHub slugs are case-insensitive: one key for `Org/Repo` and `org/repo`.
+      if (!reserveDispatch(`${repo.toLowerCase()}@${d.headSha}`)) {
+        return { ok: false, action, error: 'ci.yml dispatch already reserved for this head (taken by an earlier attempt, which may not have completed); needs ci-heal, not another trigger' };
       }
       exec('gh', ['api', '-X', 'POST', `repos/${repo}/actions/workflows/ci.yml/dispatches`, '-f', `ref=${d.headRefName}`], { ...opts, env: ghEnv });
       return { ok: true, action, dispatched: true };
