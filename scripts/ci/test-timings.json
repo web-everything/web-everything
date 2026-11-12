@@ -1711,6 +1711,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-single-owner-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-daemon-pass-slow-phases-delay-fix.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
@@ -1728,6 +1729,7 @@
   "scripts/conveyor/soak/breaks/answered-stand-down-never-redispatched.soak.test.mjs": 99.38,
   "scripts/conveyor/soak/breaks/argon-feature-dispatch.soak.test.mjs": 2.31,
   "scripts/conveyor/soak/breaks/auto-rebase-operator-withdrawal.soak.test.mjs": 0.62,
+  "scripts/conveyor/soak/breaks/await-verify-delivered-previous-ci-never-retired.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/await-verify-lane-config-executes.soak.test.mjs": 1.33,
   "scripts/conveyor/soak/breaks/await-verify-real-lane-tree-hash.soak.test.mjs": 1.35,
   "scripts/conveyor/soak/breaks/bad-overlay-falls-back.soak.test.mjs": 225.35,
@@ -1779,8 +1781,10 @@
   "scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.soak.test.mjs": 1.29,
   "scripts/conveyor/soak/breaks/incomplete-check-evidence-drops-pr-from-planning.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/infra-cancelled-ci-refused-forever.soak.test.mjs": 0.76,
+  "scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/lane-acquire-under-load.soak.test.mjs": 61.27,
   "scripts/conveyor/soak/breaks/lane-git-inherited-location.soak.test.mjs": 0.28,
+  "scripts/conveyor/soak/breaks/lane-local-guard-loaded-as-hook.soak.test.mjs": 0.33,
   "scripts/conveyor/soak/breaks/large-queue-slow-already-done.soak.test.mjs": 5.97,
   "scripts/conveyor/soak/breaks/large-reap-backlog-starves-dispatch.soak.test.mjs": 59.84,
   "scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs": 0.32,

@@ -151,7 +151,8 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       expect.soft(out.admitted).toEqual([]);
       expect.soft(out.excluded).toEqual([{ key: 'sid-1', reason: 'resume-exhausted' }]);
       expect.soft(out.rows).toEqual([{
-        key: 'sid-1', pr: 1, who: 'fix-1', action: 'resume', reason: 'resume-exhausted-excluded',
+        key: 'sid-1',
+        pr: 1, who: 'fix-1', action: 'resume', reason: 'resume-exhausted-excluded',
         result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)',
       }]);
       expect.soft(formatAwaitVerifyLines(out).some(line => line.includes('operator recovery required'))).toBe(true);
