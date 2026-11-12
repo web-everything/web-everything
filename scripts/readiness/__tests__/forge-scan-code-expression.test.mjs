@@ -67,8 +67,26 @@ describe('credentialContentFinding whitespace-exemption boundaries', () => {
     ['apostrophe span before a backtick span that holds the credential', 'notes.md', ':', "see 'a `b' aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY` here"],
     // A double-backtick span closes on a double-backtick run, so a literal backtick inside does not split it.
     ['double-backtick span with a literal backtick inside the credential', 'notes.md', ':', '``aB3dE5fG7h J9kL2`mN4pQ6 rS8tU0vW2xY``'],
+    // U+2028/U+2029 are YAML line breaks that `.` does not match: they must not end a span early.
+    ['backticked credential with a U+2028 inside the span', 'notes.md', ':', `\`aB3dE5fG7h J9kL2mN4pQ6${String.fromCharCode(0x2028)}rS8tU0vW2xY\``],
+    ['apostrophe credential with a U+2029 inside the span', 'notes.md', ':', `'aB3dE5fG7h J9kL2mN4pQ6${String.fromCharCode(0x2029)}rS8tU0vW2xY'`],
+    // A credential split across spans, each piece under the 20-character floor, is tested as a whole.
+    ['credential split across two backtick spans', 'notes.md', ':', '`aB3dE5fG7h J9kL2` `mN4pQ6 rS8tU0vW2xY`'],
+    ['credential split across two apostrophe spans', 'notes.md', ':', "'aB3dE5fG7h J9kL2' 'mN4pQ6 rS8tU0vW2xY'"],
   ])('flags: %s', (_name, path, sep, value) => {
     expect(scan(`signing_key${sep} ${value}\n`, path)).toBe(flagged);
+  });
+
+  // The span passes are lazy: unclosed apostrophes made them quadratic. A value past the bound skips the span
+  // exemption (fail closed, full scan) instead of running them.
+  it('bounds the span passes on a long line of unclosed apostrophes', () => {
+    const started = Date.now();
+    scan(`signing_key: ${" 'a".repeat(40000)}\n`, 'notes.md');
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it('keeps the full scan for an over-long value past the span bound', () => {
+    const filler = Array.from({ length: 400 }, (_, i) => `w${i.toString(36)}x`).join(' ');
+    expect(scan(`signing_key: ${filler} 'aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY'\n`, 'notes.md')).toBe(flagged);
   });
 
   it.each([

@@ -198,6 +198,7 @@ const opaqueCode=(token,words=token)=>opaqueLiteral(token)||/^(?=(?:[a-f]*\d){3}
   ||(token.length>=20&&entropy(token)>=3.5&&!wordLike(words.replace(/[+/=$]+/g,' ')));
 const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|case|in|of|instanceof|if|while|for|switch|catch|with|else|do|new|async|function|class|import|super|this|default|let|const|var|extends|as|satisfies|static|get|set)(?![\w$])/g;
 const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
+const maxExpressionValue=1024;
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
 export function credentialBufferFinding(content) {
   for(const encoding of ['latin1','utf8','utf16le']) {
@@ -326,10 +327,17 @@ function assignmentFinding(text,blockOnly=false,path='') {
     // matched in separate passes so one kind cannot consume the other's delimiter (`'a `b' <secret>` `), and a backtick
     // span closes on a run of the same length (``a`b``), so a literal backtick inside cannot split it into short halves.
     // Boundaries pinned in forge-scan-code-expression.test.mjs (whitespace-exemption boundaries).
-    const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
+    // Span content uses [^] (not `.`) so U+2028/U+2029 inside a span cannot end it. The span passes are lazy and
+    // quadratic on unclosed quotes, so a value over maxExpressionValue keeps the full scan (fail closed). The
+    // concatenation of all span contents is also tested, so a credential split across spans (`a` `b`) cannot hide in
+    // pieces under the length floor. A stray backtick that pairs away the real opener leaves a bare spaced value,
+    // which the exemption already accepts by design.
+    const spans=trimmed.length>maxExpressionValue?null:[
+      ...[...trimmed.matchAll(/(?<!\w)'([^]+?)'(?!\w)/g)].map(m=>m[1]),
+      ...[...trimmed.matchAll(/(?<!`)(`+)(?!`)([^]+?)(?<!`)\1(?!`)/g)].map(m=>m[2])].map(span=>span.replace(/\s/g,''));
+    const expression=spans!==null&&/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
       &&!(leaf.endsWith('.md')?/["]/:/["'`]/).test(trimmed)&&!trimmed.split(/\s+/).some(opaqueToken)
-      &&![...[...trimmed.matchAll(/(?<!\w)'(.+?)'(?!\w)/g)].map(m=>m[1]),...[...trimmed.matchAll(/(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g)].map(m=>m[2])]
-        .some(span=>opaqueToken(span.replace(/\s/g,'')));
+      &&![...spans,spans.join('')].some(opaqueToken);
     if(blockOnly)continue;
     if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value)))return `high-entropy-${findingField(field)}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
