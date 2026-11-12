@@ -568,7 +568,7 @@ export function writeInfraStore(store, path = resolveInfraStorePath()) {
  * Set `requireLock` to refuse an unlocked fallback write when preserving concurrent updates is required.
  */
 const lockWaitCell = new Int32Array(new SharedArrayBuffer(4));
-export function withInfraLock(path, fn,{ staleMs = 15_000, timeoutMs = 5_000, requireLock = false } = {}) {
+export function withInfraLock(path, fn, { staleMs = 15_000, timeoutMs = 5_000, requireLock = false } = {}) {
   const lockPath = `${path}.lock`;
   mkdirSync(dirname(path), { recursive: true });
   const start = Date.now();
