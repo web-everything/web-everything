@@ -34,7 +34,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
-import { isTrustedMarkerAuthor, OPERATOR_LOGINS } from './marker-authorship.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
@@ -125,44 +125,24 @@ const KNOWN_MACHINE_SHAPE_RES = [
 ];
 // Operator-written notes that decide nothing about the review (R907). Trusted marker authors ONLY (`isKnownMachineBody`
 // gates this list on `isTrustedMarkerAuthor`); any other author's copy stays a possible hold.
-// Whole-body anchored (a trailing objection must not ride a known prefix). The free-text reason is matched against a CLOSED set
-// of whole mechanical CLAUSES (PR #6713 review): neither a hold-word blacklist ("approval revoked", "withdrawn", "needs work",
-// curly-apostrophe "don’t" all slipped past it) nor a bag of allowed words ("review failed on the new head; run review again")
-// can be exhaustive, so a reason is only ever 1-3 of these exact clauses, optionally led by an `R<n>:` round tag. Anything else
-// — including any character outside printable ASCII / an em dash — leaves the note a possible hold. Leaving a clause off fails safe.
-const MECHANICAL_NOTE_CLAUSES = ['refresh moved head', 'old-head review run left review-unfinished', 'smoke failed on runner apt DNS',
-  'refresh so CI re-runs', 'CI runner outage', 'CI timed out', 'CI flaked', 'head moved onto main'];
-const MECHANICAL_REASON_RE = new RegExp(`^(?:R\\d{1,5}: )?(?:${MECHANICAL_NOTE_CLAUSES.join('|')})(?:(?:; | — )(?:${MECHANICAL_NOTE_CLAUSES.join('|')})){0,2}$`);
-const isMechanicalNoteText = (s) => typeof s === 'string' && s.length <= 300 && MECHANICAL_REASON_RE.test(s);
-// `MANUAL_DAEMONS` in scripts/operations/manual-daemon-pass.mjs (a closed enum; not imported — that module pulls the operation registry).
-const MANUAL_PASS_DAEMONS = new Set(['review', 'red-team', 'fix', 'verify']);
-// The refresh note's fixed producer strings and fields (scripts/operations/operator-controls.mjs `planOperatorControl` / `buildOperatorActionComment`).
-const REFRESH_UNDO = 'restore the previous head only through a reviewed content-preserving git repair';
-const REFRESH_CHANNELS = new Set(['chat', 'cli', 'terminal', 'slack']);
-const REFRESH_NOTE_RE = /^🛠 operator action — refresh\n\nOperator @([\w-]+) via (\w+):\n> ([^\n]+)\n\nUndo: ([^\n]+)\n\n<!-- operator-action: (\{[^\n]*\}) -->\s*$/;
-const MANUAL_PASS_NOTE_RE = /^Manual R247 pass — daemon: ([\w-]+); reason: EMERGENCY \(labelled\): ([^\n]+?)(?:; checkout sha: [0-9a-f]{7,64}\.)?$/; // the producer's own `; checkout sha: <sha>.` trailer
+// MARKER-ANCHORED recognition (R907 09:59 ET, PR #6713 review): the note is recognised by its producer's machine marker, never by
+// its free-text reason (a vocabulary allow-list regressed the live #6381/#6595 notes; a hold-word blacklist is never exhaustive).
+// So the reason has NO length or word limit. The prose-reason residual is accepted and carded as #6714.
+//   - refresh note  = trusted author + a body that ENDS in the `<!-- operator-action: {json} -->` marker (a JSON object, any keys)
+//   - manual R247   = trusted author + the single-line `Manual R247 pass — daemon: <name>;` header (producer:
+//     scripts/operations/manual-daemon-pass-io.mjs)
+// A body with anything after the marker, a second line on a manual pass, a missing/malformed marker, or an untrusted author holds.
+const OPERATOR_ACTION_MARKER_RE = /<!-- operator-action: (\{[^\n]*\}) -->\s*$/;
+const MANUAL_PASS_HEADER_RE = /^Manual R247 pass — daemon: [\w-]+;[^\n]*$/;
 function isTrustedAuthorNote(text) {
   const t = text.trim();
-  const manual = MANUAL_PASS_NOTE_RE.exec(t);
-  if (manual) return MANUAL_PASS_DAEMONS.has(manual[1]) && isMechanicalNoteText(manual[2]);
-  const refresh = REFRESH_NOTE_RE.exec(t);
-  if (!refresh) return false;
-  const [, handle, channel, quote, undo, json] = refresh;
-  if (!isMechanicalNoteText(quote) || undo !== REFRESH_UNDO || !REFRESH_CHANNELS.has(channel)
-    || !OPERATOR_LOGINS.some((l) => l.toLowerCase() === handle.toLowerCase())) return false;
-  // The machine-readable record is free-form too: exactly the producer's keys, each pinned, and it must agree with the prose.
-  let r;
-  try { r = JSON.parse(json); } catch { return false; }
-  const plain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-  const only = (o, keys) => Object.keys(o).every((k) => keys.includes(k));
-  const str = (v, re) => typeof v === 'string' && v.length <= 300 && re.test(v);
-  if (!plain(r) || !only(r, ['version', 'op', 'repo', 'pr', 'actor', 'channel', 'reason', 'at', 'key', 'details'])) return false;
-  if (r.version !== 1 || r.op !== 'refresh' || !str(r.repo, /^[\w.-]+\/[\w.-]+$/) || !Number.isInteger(r.pr)) return false;
-  if (String(r.actor).toLowerCase() !== handle.toLowerCase() || r.channel !== channel || r.reason !== quote) return false;
-  if (!str(r.at, /^\d{4}-\d\d-\d\dT[\d:.]+Z$/) || !str(r.key, /^[\w.:/@+-]+$/) || !plain(r.details)) return false;
-  const d = r.details;
-  return only(d, ['undo', 'previousHead', 'headRef', 'main']) && d.undo === REFRESH_UNDO
-    && str(d.previousHead, /^[0-9a-f]{40}$/) && str(d.main, /^[0-9a-f]{40}$/) && str(d.headRef, /^[\w./-]+$/);
+  if (MANUAL_PASS_HEADER_RE.test(t)) return true;
+  const marker = OPERATOR_ACTION_MARKER_RE.exec(t);
+  if (!marker) return false;
+  try {
+    const r = JSON.parse(marker[1]);
+    return r !== null && typeof r === 'object' && !Array.isArray(r);
+  } catch { return false; }
 }
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
 const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\./;
