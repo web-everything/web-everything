@@ -321,11 +321,12 @@ function assignmentFinding(text,blockOnly=false,path='') {
     // in source a backtick opens a template literal). A value that carries any single opaque token
     // (`<secret> # prod`, `<secret> (rotated)`, a backticked secret in prose) is a secret with a tail, not prose.
     // Quoted/backticked spans also keep the scan when their content is opaque after removing whitespace;
-    // word boundaries around the quotes prevent prose apostrophes from forming spans.
+    // word boundaries apply to the apostrophe only (they stop prose contractions from forming spans); a backtick
+    // span is valid Markdown glued to word characters (x`secret`y), so it takes no boundary.
     // Boundaries pinned in forge-scan-code-expression.test.mjs (whitespace-exemption boundaries).
     const expression=/\.(?:mjs|cjs|js|mts|ts|md)$/.test(leaf)&&!trimmed.includes('${{')&&/\s/.test(trimmed)
       &&!(leaf.endsWith('.md')?/["]/:/["'`]/).test(trimmed)&&!trimmed.split(/\s+/).some(opaqueToken)
-      &&![...trimmed.matchAll(/(?<![\w])(['`])(.+?)\1(?![\w])/g)].some(([, ,span])=>opaqueToken(span.replace(/\s/g,'')));
+      &&![...trimmed.matchAll(/(?<!\w)'(.+?)'(?!\w)|`(.+?)`/g)].some(([, apostrophe,tick])=>opaqueToken((apostrophe??tick).replace(/\s/g,'')));
     if(blockOnly)continue;
     if(credentialNamed&&!expression&&value.length>=20&&entropy(value)>=3.5&&!(testSource&&codeExpression(value)))return `high-entropy-${findingField(field)}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {

@@ -57,6 +57,12 @@ describe('credentialContentFinding whitespace-exemption boundaries', () => {
     ['single-quoted spaced credential in markdown', 'notes.md', ':', "'aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY'"],
     ['backticked spaced credential in markdown', 'notes.md', ':', '`aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY`'],
     ['spaced credential embedded in markdown prose', 'notes.md', ':', "use 'aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY' here"],
+    // Markdown code spans need no word boundary: only the apostrophe does (prose contractions). A span glued to
+    // word characters is still a valid code span, so it must not escape the opaque-token check.
+    ['backticked spaced credential glued on both sides in markdown', 'notes.md', ':', 'x`aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY`y'],
+    ['backticked spaced credential glued before in markdown', 'notes.md', ':', 'x`aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY` tail'],
+    ['backticked spaced credential glued after in markdown', 'notes.md', ':', 'head `aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY`y'],
+    ['backticked spaced credential with word text around it in markdown', 'notes.md', ':', 'use`aB3dE5fG7h J9kL2mN4pQ6 rS8tU0vW2xY`here ok'],
   ])('flags: %s', (_name, path, sep, value) => {
     expect(scan(`signing_key${sep} ${value}\n`, path)).toBe(flagged);
   });
@@ -68,6 +74,7 @@ describe('credentialContentFinding whitespace-exemption boundaries', () => {
     // The original Forge fallback line; it comes from a markdown file, where backticks are code spans.
     ['markdown prose with code spans (the original fallback line)', 'notes.md', 'key=value` config surface (`codex exec --help`, or grep the installed binary)'],
     ['markdown prose with code spans', 'notes.md', 'key: see `codex exec --help` or grep the installed binary for it'],
+    ['markdown prose with glued short code spans', 'notes.md', 'key: use the`codex exec`flag or the`grep -r`tool here'],
   ])('allows: %s', (_name, path, line) => {
     expect(scan(`${line}\n`, path)).toBeNull();
   });
