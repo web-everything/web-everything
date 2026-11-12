@@ -15,6 +15,7 @@ import { refreshOntoMain } from '../conveyor/ci-red-recovery-watch.mjs';
 import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueSettings } from '../lib/merge-queue-hook.mjs';
 import { createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { listStoredAwaitVerify, writeStoredAwaitVerify } from '../conveyor/await-verify.mjs';
 import { planOperatorControl, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
 export const CONTROL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -25,6 +26,7 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
   readComments = (repo, pr) => readCompletePrComments(pr, { repo }),
   readHolds = () => listBuildDispatchHolds({ lockRoot: join(coord, 'build-dispatch-holds') }),
   listClaims = () => listFixDispatchClaims(join(coord, 'fix-dispatch-claims')),
+  listAwaitVerify = listStoredAwaitVerify,
   readClaim = args => readFixDispatchClaim({ ...args, lockRoot: join(coord, 'fix-dispatch-claims') }),
   readAgents = () => JSON.parse(execFileSync('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000 })),
   readCheck = (repo, head) => {
@@ -63,6 +65,7 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
       return { claims, comments, now: at };
     }
     const p = readPr(input.repo, input.pr);
+    if (name === 'ci-heal-reset') return { ...p, awaitVerify: listAwaitVerify().filter(({ record }) => record.repo === input.repo && record.pr === input.pr), now: at };
     if (name === 'refresh' && p.state === 'OPEN' && !p.crossRepo) {
       const checkout = input.checkout || root;
       // Read the repository's live main, not a potentially stale local tracking ref.
@@ -90,6 +93,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
   readText = path => readFileSync(path, 'utf8'), pathExists = existsSync,
   makeDir = mkdirSync, writeText = writeFileSync, rename = renameSync, chmod = chmodSync, append = appendFileSync,
   releaseHold = releaseBuildDispatchHold, clearFailure = clearBuildFailure, releaseClaim = releaseFixDispatchClaim,
+  writeAwaitVerify = writeStoredAwaitVerify,
   releasePrepare = releaseOwnPrepareHolds, refresh = refreshOntoMain, rememberRefresh = recordRefreshed,
   refreshStatePath = refreshedStatePath,
   extensionSink = createExtendRoundsSinks({ readThread: (repo, pr) => readContext('grant-rounds', { repo, pr }), regate: runRedTeamGateForPr })['github.round-extension'],
@@ -138,6 +142,14 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
       // The daemon helper owns prepare-unstamped. A pending stamp hold uses the same release primitive.
       await releasePrepare({ nums: [Number(i.item)], holds, release: ({ num }) => releaseHold({ repo: 'we', num: Number(num), lockRoot: join(coord, 'build-dispatch-holds') }) });
       for (const h of holds.filter(h => h.reason === 'prepare-stamp-pending')) await releaseHold({ repo: 'we', num: Number(h.num), lockRoot: join(coord, 'build-dispatch-holds') });
+    } else if (name === 'ci-heal-reset') {
+      const latest = await readContext(name, i);
+      planOperatorControl(name, latest, i); // Check the live head again immediately before writing.
+      if (controlFingerprint(name, latest, i) !== p.fingerprint) throw new Error('await-verify state changed before mutation');
+      for (const { record } of p.resets) {
+        const result = await writeAwaitVerify({ ...record, resumeFailures: 0, operatorResets: (record.operatorResets ?? 0) + 1 });
+        if (result?.ok !== true) throw new Error(`await-verify write failed: ${result?.reason ?? 'unconfirmed'}`);
+      }
     } else if (name === 'rearm') child('scripts/conveyor/rearm-review.mjs', [String(i.pr), ...attribution]);
     else if (name === 'refresh') {
       const before = await readContext(name, i);
@@ -154,6 +166,15 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     }
   });
   const prove = verify ?? ((p, after) => {
+    if (p.op === 'ci-heal-reset') {
+      if (after.head !== p.record.details.head || !Array.isArray(after.awaitVerify)) return false;
+      const expected = { ...after, awaitVerify: after.awaitVerify.map(row => {
+        const old = p.resets.find(r => r.key === row.key);
+        return old ? { ...row, record: { ...row.record, resumeFailures: old.record.resumeFailures, operatorResets: old.record.operatorResets } } : row;
+      }) };
+      return p.resets.every(old => after.awaitVerify.some(row => row.key === old.key && row.record.resumeFailures === 0 && row.record.operatorResets === (old.record.operatorResets ?? 0) + 1))
+        && controlFingerprint(p.op, expected, p.input) === p.fingerprint;
+    }
     if (p.op === 'refresh') return after.state === 'OPEN' && after.containsMain;
     if (p.op === 'grant-rounds') return true; // wrapped extension sink proves the trusted count and exact body
     if (p.op === 'clear-claim') return !after.claims.some(c => p.claims.some(old => old.meta.repo === c.meta.repo && old.meta.pr === c.meta.pr && old.meta.kind === c.meta.kind));
@@ -166,6 +187,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     if (p.input.preview || p.action === 'noop') return { action: 'noop', why: 'preview or nothing to do' };
     const before = await readContext(p.op, p.input), existing = await getRecords(p, before);
     if (p.records.every(r => existing.some(old => old.key === r.key))) return { action: 'noop', why: 'operator action key already recorded' };
+    if (p.op === 'ci-heal-reset') planOperatorControl(p.op, before, p.input);
     if (controlFingerprint(p.op, before, p.input) !== p.fingerprint) throw new Error('state changed since operator plan; re-run');
     const validated = planOperatorControl(p.op, { ...before, now: p.record.at }, p.input);
     if (validated.body !== p.body || JSON.stringify(validated.records) !== JSON.stringify(p.records) || validated.action !== 'apply') throw new Error('operator plan no longer valid');

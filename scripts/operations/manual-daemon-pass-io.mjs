@@ -35,11 +35,35 @@ export function readManualDaemonStatus({ exec = execFileSync, env = process.env 
   return assessDaemonStatus(snapshot);
 }
 
-export async function dispatchManualPass(input, { env, load = () => import('./review-job.mjs') } = {}) {
-  const { dispatchReviewByMode, dispatchReviewJob } = await load();
+export async function dispatchManualPass(input, { env, load = () => import('./review-job.mjs'), readHead } = {}) {
+  const { dispatchReviewByMode, dispatchReviewJob, createReviewJobIo } = await load();
   // The daemon leaves root to the shared dispatcher's module checkout default.
   const options = { pr: input.pr, repo: input.repo, env };
-  return input.daemon === 'red-team' ? dispatchReviewJob({ ...options, redTeamOnly: true }) : dispatchReviewByMode(options);
+  // A red-team restart names the mode the job's queued admission will re-plan; anything else would be refused there.
+  if (input.redTeamMode !== undefined && !['fresh', 'resume'].includes(input.redTeamMode)) {
+    throw new Error('manual-daemon-pass: invalid redTeamMode; operator must inspect before retrying');
+  }
+  if (input.expectedHead !== undefined) {
+    if (typeof input.expectedHead !== 'string' || !/^[a-f0-9]{40}$/i.test(input.expectedHead)) {
+      throw new Error('manual-daemon-pass: invalid expectedHead; operator must inspect before retrying');
+    }
+    let head;
+    try {
+      const read = readHead ?? createReviewJobIo({ env }).liveHead;
+      head = await read({ repo: input.repo, pr: input.pr });
+    } catch {
+      throw new Error('manual-daemon-pass: PR head unreadable; operator must inspect before retrying');
+    }
+    if (typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) {
+      throw new Error('manual-daemon-pass: PR head unreadable; operator must inspect before retrying');
+    }
+    if (head.toLowerCase() !== input.expectedHead.toLowerCase()) {
+      throw new Error('manual-daemon-pass: PR head changed; operator must inspect before retrying');
+    }
+  }
+  return input.daemon === 'red-team' ? dispatchReviewJob({ ...options, redTeamOnly: true,
+    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }),
+    ...(input.redTeamMode === undefined ? {} : { redTeamMode: input.redTeamMode }) }) : dispatchReviewByMode(options);
 }
 
 export function createManualDaemonPassSinks({

@@ -266,6 +266,24 @@ export function readCardRulingFileMode({ env = process.env, tool, log = line => 
   return { value, source };
 }
 
+/** R903/R905: off|on, standard off. Same cardRuling block as cardRulingFileMode; env WE_CARD_RULING_ALLOW_NON_REGRESSION. */
+export function readCardAllowNonRegression({ env = process.env, tool, log = line => console.error(line) } = {}) {
+  const valid = v => v === 'off' || v === 'on';
+  const { prefs, errors } = readPlatformPreferences({ env });
+  if (errors?.length) throw new Error(`unreadable platform settings: ${errors.join('; ')}`);
+  for (const block of [prefs?.cardRuling, tool]) {
+    if (block !== undefined && block !== null && typeof block === 'object' && !Array.isArray(block)
+      && Object.hasOwn(block, 'allowNonRegression') && !valid(block.allowNonRegression))
+      throw new Error('invalid cardRuling.allowNonRegression: use off or on');
+  }
+  const r = cascadePolicy('cardRuling', tool, { standard: { allowNonRegression: 'off' }, env, log,
+    envValues: { allowNonRegression: env.WE_CARD_RULING_ALLOW_NON_REGRESSION }, valid: { allowNonRegression: valid } });
+  if (r.invalid.length) throw new Error('invalid cardRuling.allowNonRegression (WE_CARD_RULING_ALLOW_NON_REGRESSION)');
+  const value = r.value.allowNonRegression, source = r.sources.allowNonRegression;
+  log(`cardRuling.allowNonRegression=${value} (${source})`);
+  return { value, source };
+}
+
 /** Read-only dedupe first; new cards always use the existing isolated single-card landing path. */
 // Dedupe is forced ON for ruling cards whatever the repo-wide default says: this path must never file a duplicate.
 // A failed PR lookup (readPrHostedCards swallows it as []) must also refuse, never read as "no card exists".
@@ -397,7 +415,7 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
       ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
         evidence: readJudgeEvidence(evidenceFile, readFile),
         disagreements: referralDisagreements(thread.comments, open, { repo, pr, finding }) } : {}),
-      cardFileMode: readCardRulingFileMode({ env, tool, log }),
+      cardFileMode: readCardRulingFileMode({ env, tool, log }), cardAllowNonRegression: readCardAllowNonRegression({ env, tool, log }),
       findingClassPolicy: readFindingClassPolicy({ env, log }),
       card: resolveCardRef(card, { root, readable, pr, prHead: lazyPrHead(() => openPrHead({ repo, pr, head: thread.headRefOid })) }),
       followUpEnabled: env.WE_REFERRAL_RULING_FOLLOW_UP !== '0',

@@ -259,7 +259,8 @@ describe('runTickAllRepos wiring', () => {
       hungCiTick: empty, mainRedRebaseTick: empty, missingRunTick: empty, promoteDraftTick: empty,
       notesTick: () => ({ notes: [], refusals: [] }), notesDryRun: true,
     });
-    expect(order.slice(0, 3)).toEqual(['await', 'reclaim', 'fix']);
+    // R362: fix decides first; the slow, budgeted reclaim follows it.
+    expect(order.slice(0, 3)).toEqual(['await', 'fix', 'reclaim']);
     expect(order).toContain('ci-heal');
     expect(result.stuckFixers.rows[0].result).toBe('reclaimed');
   });

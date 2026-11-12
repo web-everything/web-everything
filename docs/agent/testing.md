@@ -1293,6 +1293,111 @@ exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` w
 
 ### Passive-wait hook regression probes
 
+Security hooks (`PreToolUse`, `Stop`, `SubagentStop`) bootstrap the launcher and guards only
+from `$HOME/workspace/.guard-main`, never an env-selected clone or the primary or lane copies.
+Tests redirect that fixed location through a temporary `HOME`. The launcher derives its clone
+from its own realpath and refuses locations other than `<clone>/scripts/hooks/run-pinned-guard.mjs`.
+The launcher requires a real regular file within the clone's `scripts/` tree (symlinks cannot
+escape), sets `WE_HOOK_ROOT` to the real cwd checkout toplevel, and preserves stdin, argv,
+cwd and guard exit codes. From a cwd outside Git (a dispatched worker's scratch directory),
+`WE_HOOK_ROOT` is the primary checkout beside the clone (`webeverything` or `web-everything`);
+with neither present the launcher denies. For `PreToolUse`, missing clone, launcher, script or
+Git evidence fails closed with stderr and exit 2, and the settings wrapper maps any nonzero
+launcher result to exit 2. `Stop` and `SubagentStop` use a separate wrapper
+(`exec node "$launcher" --stop-hook …`): exit 2 there means "keep going", so a launcher
+failure that would recur on every retry exits 1 (non-blocking, stderr shown), and the guard's
+own exit code passes through unchanged. `scripts/lib/pinned-hook-command.mjs` recognizes the
+two forms separately, and dispatch carries only the deny form as a `PreToolUse` guard.
+The hook never fetches. Sync freshness uses only `<clone>/.git/FETCH_HEAD` mtime;
+missing, unreadable, non-file, invalid or future-dated evidence denies execution. A last sync
+older than 24 hours fails closed with exit 2, the exact recovery command
+`node <clone>/scripts/hooks/sync-guard-clone.mjs`, and the launchd template path
+`<clone>/scripts/hooks/com.we.guard-main-sync.plist.template`. An old HEAD commit in a
+quiet repository does not make a recently synchronized clone stale. The pristine check
+requires every `git ls-files -v` tag to be `H`, clean
+`status --porcelain --untracked-files=all --ignored` (so a file hidden by `.gitignore` or
+`info/exclude`, such as a planted `node_modules` package, also denies) and
+`diff-index --quiet HEAD --`, and HEAD equal to origin/main. Test fixtures therefore link
+`node_modules` beside the clone, never inside it. Git checks disable
+`core.fsmonitor` and `core.untrackedCache`. Refresh with `node scripts/hooks/sync-guard-clone.mjs`
+from a repo with the intended origin, or pass `--origin=<url>` from any directory.
+
+The sync script creates a single-branch main clone and records its canonical path in local
+Git config (`we.guardClone`). Subsequent runs validate that ownership, origin, main branch,
+and main-only fetch refspec before fetch/reset/clean. Every successful run updates
+`FETCH_HEAD` mtime, including initial creation and unchanged origin/main. Initial creation
+resets HEAD to the fetched origin/main too; the deterministic clone/fetch race regression
+advances a temporary local origin after clone completes and verifies convergence before success.
+An existing unowned checkout is refused:
+move it aside and rerun sync to create the disposable clone. Never point this at a working
+checkout; all tracked edits and untracked/ignored files in the owned clone are discarded.
+Use an absolute origin URL/path so the scheduler and interactive invocations agree.
+
+Hooks matching one event run in parallel (six share the `Edit|Write` matcher), so launchers
+never exclude each other. Each launcher holds a shared lease, a
+`<clone>.guard-readers/<pid>-<nonce>` file holding its start time, until its guard exits.
+Only sync takes the exclusive sibling `<clone>.guard-lock`, a file holding
+`<pid> <start-ms> <nonce>` and published with one hard link, so it exists only once complete.
+Sync fetches into the private ref `refs/we-guard/incoming` (empty `--refmap`, no FETCH_HEAD
+write) before taking the lock, so the lock covers only `update-ref`, `reset` and `clean`. A
+launcher that finds a live sync waits up to 20 seconds, then denies with "retry the hook".
+Sync takes its lock before it lists leases, and a launcher re-checks the lock after publishing
+its lease, so sync cannot reset a clone a guard is running from. After taking the lock, sync
+waits up to 20 seconds for live leases to drain, then refuses with "retry sync" without
+resetting or cleaning; a live sync lock is refused before any fetch. Ownership is judged by
+process liveness, never by a timer: a pid that is gone, or that now names a process with a
+different `ps -o lstart` start time (pid reuse), is an exited owner. Unknown evidence counts as
+live. Launchers ignore an exited owner's lock (and an ownerless old-protocol lock directory) but
+wait for, then deny behind, an old-protocol directory whose `owner` record is live, judged exactly
+as reclaim judges it; an `owner` that is not a readable file denies. That record is
+`<pid> <hex nonce>`, never read as a start time: its pid is a reuse only when that process started
+after the `owner` file was written. The next
+sync reclaims an abandoned lock and prunes exited leases, and the pristine and freshness checks still guard a
+clone a crashed sync left half-reset. Reclaim is serialised behind `<clone>.guard-lock.reclaim`
+and removes only an existing record judged dead: a lock observed absent is never reclaimed
+(a peer may publish at any moment after that read). An old-protocol directory (the empty mkdir
+lock, or an earlier revision's directory holding an `owner` record) is reclaimed only when that
+record is absent or dead, by unlinking `owner` and then `rmdir`, which cannot remove a lock file
+published meanwhile; a directory with other entries is refused and named. An abandoned reclaim marker
+(a sync killed inside that few-millisecond step) makes sync refuse and name the marker to
+remove. Sync sweeps staging and aside debris left by exited syncs, and ignores entries in
+`.guard-readers` that are not `<pid>-<hex>` leases. A launcher killed outright orphans its
+guard, which can then run while a sync resets the clone. `WE_GUARD_LOCK_WAIT_MS` may only
+shorten either wait (tests use it); it can never lengthen it. Both waits print their effective
+bound ("waiting up to <ms>ms"), so the cap is tested without waiting it out, and a test keeps
+the launcher's and sync's copies of the lock helpers identical. The soak break
+`lane-local-guard-loaded-as-hook` inspects every security event: `PreToolUse`, `Stop` and
+`SubagentStop`.
+The launcher canonicalizes the clone and guard entry path, passes the guard realpath as
+Node's `argv[1]`, and runs in place without a temporary copy. This keeps CLI entry checks
+working through symlinked HOME/TMPDIR paths (including macOS `/var` → `/private/var`).
+After the child exits, a changed or unreadable entry realpath fails closed with exit 2;
+repair the clone with `scripts/hooks/sync-guard-clone.mjs` before retrying.
+The named concurrent-sync regression pauses before a delayed import, removes that dependency
+in origin/main, verifies sync refuses while the guard's lease is live, and verifies refresh
+succeeds after the original import finishes and the lease is released. The named
+concurrent-hook regression starts every `Edit|Write` hook at once and requires each to report
+ready while all leases are held, then exit 0. Keep test coordination event-driven (stdout and
+stderr lines), without sleep/poll loops.
+
+For macOS scheduling, initialize the clone first, then copy
+`scripts/hooks/com.we.guard-main-sync.plist.template` to
+`~/Library/LaunchAgents/com.we.guard-main-sync.plist`. Replace every placeholder with an
+XML-escaped absolute value: node executable, canonical guard clone, origin URL, executable
+search PATH (including Git), and an existing log directory. launchd does not expand shell
+variables or tildes. Install with
+`launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.we.guard-main-sync.plist"`;
+remove with `launchctl bootout gui/$(id -u)/com.we.guard-main-sync`.
+It runs every 900 seconds; inspect the configured stderr log after installation.
+
+Use temporary independent guard clones and primary/linked-worktree fixtures under the task's
+`TMPDIR`; replace primary and lane guards/launchers to prove neither runs. Settings-wiring
+probes execute every configured command through `sh -c` with a temporary `HOME`, including
+a hostile `WE_GUARD_CLONE` that must never select a launcher. Cover assume-unchanged and
+skip-worktree edits, failed index/diff reads, stale or invalid FETCH_HEAD, and old HEAD
+with a fresh sync (no warning). Cover unchanged sync timestamp refreshes.
+Sync probes use local temporary origins only, including wrong-origin and unowned-target refusals.
+
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
 `agent_transcript_path`, falling back to `transcript_path` only when absent; an unreadable or malformed
 selected file fails open. Keep Monitor cases event-specific: any Monitor call plus passive-wait
@@ -3427,6 +3532,12 @@ the client and removes each cross-check (d) guard independently, including the w
 check; the same bad inventory must escape only in the mutant. Production files are
 never rewritten by these probes, and a missing mutation target fails the test.
 
+For named Node filesystem imports, fault injection in an in-memory mutation suite must
+load its unchanged control through the same native loader as its mutants. Vitest's
+transformed named imports can retain earlier bindings despite `syncBuiltinESMExports()`.
+`pr-stall-live-safety.test.mjs` pairs each passing control contract with a failing mutant
+assertion, including evidence appended after planning and refusal to persist intent.
+
 Keep direct bound-exec missing-cwd cases and the delta builder's default-cwd case.
 Row 13 configures a side-effecting fsmonitor hook: require its sentinel to stay absent
 and pin `-c core.fsmonitor=false` on every manifest Git command after binding.
@@ -3898,10 +4009,15 @@ clearing as a false-positive proof of detector completeness.
 ## Shard split-retry evidence
 
 `verify-shard-run` retries incomplete inventory once in at most two halves to surface
-failures. The retry never yields PASS: the first TIMEOUT, NOT-RUN, or FAIL half
+failures. The first TIMEOUT, NOT-RUN, or FAIL half
 keeps its status (TIMEOUT/NOT-RUN exit 124). Otherwise, observed failure evidence
-makes the shard FAIL (exit 1). Every other retry
-outcome is UNSETTLED (exit 75), including all halves passing. Retry output and
+makes the shard FAIL (exit 1). The shard settles PASS (exit 0) only when every half
+passes with exit 0, no signal, and complete inventory; the halves together cover
+exactly the shard's files; and every assertion in every reported retry file is
+`passed`, with no observed failure, infrastructure exit, or load deferral.
+Missing assertions and pending/skipped/todo assertions keep it UNSETTLED,
+as do missing or oversized half reports, load deferral, or an unresolved exit 75.
+Every other retry outcome is UNSETTLED (exit 75). Retry output and
 failure details remain visible, and each shard contributes one final result.
 Admission forwards child exit codes, so exit 75 cannot prove the command never ran;
 nonzero exits other than 75 are failure evidence even without inventory, and
@@ -4088,3 +4204,87 @@ The judge facts reader observes the shared run store; hermetic facts fixtures mu
 cascade; judge facts IO tests cover durable per-run alert claims and ruled-finding suppression.
 Alert claims never expire automatically: uncertain publication requires operator inspection
 of `referral-judge-alert-claims` in the shared runs directory, rather than a liveness probe.
+
+
+## Shared clone owner election and deferred-mutation retries
+
+`daemon-clone-single-owner.test.mjs` pins live-key election using stable string ordering,
+reader-clock heartbeat ages with a 30-second future-skew bound, and monotonic persisted epochs.
+Election and rebuild execution share a coordination mutex, independent of the reader/writer
+locks. A live local process retains that fence through a paused event loop; a provably dead
+process permits reclamation. Unknown lock liveness or corrupt/exhausted epochs defer rebuilds;
+the operator must inspect and repair coordination evidence before rebuilding resumes.
+`daemon-rebuild-request-failures.test.mjs` distinguishes explicit rebuild failures from neutral
+job/lock outcomes, including persisted request retention. `daemon-self-sync-mutation-due.test.mjs`
+requires failed/refused mutations to remain pending and retry on the next tick; only a completed
+mutation enters handled-ID state. Run these and the affected lock/self-sync regressions through
+`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <scoped files>`.
+
+## Live-owner watch import ordering
+
+`createLiveOwnerWatchIo` loads dispatch and overlay module roots sequentially. These roots share
+circular dependencies: starting them together with `Promise.all` deadlocks vite-node evaluation
+before adapter construction. Keep the portable IO cases in `pr-live-owner-watch.test.mjs` at the
+default timeout; injected dispatchers and lock identity probes keep their exercised IO local.
+
+Stalled living owners escalate to a rate-limited NEEDS-YOU event; activity age never proves death
+or permits claim takeover. The portable IO regressions exercise production evidence, planning,
+and admission for fix/build/review owners, retaining the live/unknown admission hold and checking
+that fresh owners and unknown evidence cannot trigger takeover. The feed-tail regression uses
+more than 2 MiB and spies on the actual read to pin offset, requested length, returned bytes, and
+exclusion of the partial leading record.
+
+Live-owner review recovery must use `runReconcilePass` admission with the complete comment
+thread before the manual single-PR launcher. Re-arm comments, rather than the displayed round
+label, carry the durable attempt budget. The manual launcher drops `expectedHead` on the review
+path, so the watch IO hands it a loader that pins `expectedHead` and the resolved dispatch mode
+on `dispatchReviewByMode`; the red-team path forwards it to `dispatchReviewJob` already. Session
+mode has no job-side head pin, so review recovery refuses in that mode. The
+`job refuses a head changed after the manual precheck` cases drive the real manual launcher and
+job dispatcher with a job-side head that moved after the precheck, and assert no launch. Unknown
+build-claim metadata blocks ownership classification; lease expiry alone never proves that its
+owner is gone.
+
+The decision log and smell state stay inside the 2 MiB read cap: the log is read as a byte tail
+that must reach back past the one-hour dedup window (else it fails closed), and smell-state keys
+older than the longest notify window are pruned on write. The hook-gap log is unpruned and written
+by other sessions, so the self-audit tail-reads its newest records (byte and record caps) and says
+so in its summary, rather than holding every pass once the log outgrows the read cap. The health
+probe forwards only the tick budget to the bounded child, less a fixed start-up margin, and skips a
+tick too short to leave one. That keeps the budget checks inside the kill timeout. It does not
+bound the work after an intent record: with acting enabled, an action admitted near the end of
+the budget can still be killed between `intent` and `did`, leaving a one-hour dedup hold with no
+`action-failed` notice. This is a disclosed residual while acting is off by default; reserving
+execute time before the intent write is owed before acting is enabled. Mode, `actEnabled` and
+thresholds resolve in the child's own cascade, so health defaults never override a
+settings-file or platform opt-in. The opt-in regression drives the real probe and child launch
+and reads back the env the child received.
+
+Live-owner watch ships report-only (R876): `actEnabled` defaults false regardless of mode.
+The policy cascade logs its value and source; an explicit settings boolean true or
+`WE_LIVE_OWNER_WATCH_ACT=1` opts in, and invalid policy closes acting. The pass keeps
+would-do records and emits head-bound `no-live-owner` feed events (60-minute dedup),
+system smells, and the self-audit line. The IO execution choke point refuses all mutations
+before constructing action adapters, including red-team claim abandonment. Acting fixtures
+must opt in explicitly; disabled-path tests cover each action kind even in mode on.
+## Pinned-hook checkout roots
+
+Pinned guard code must resolve operated-checkout paths through `scripts/lib/hook-root.mjs`,
+independently of its source location. The launcher sets `WE_HOOK_ROOT` to the real Git toplevel
+of its cwd; an unresolvable root denies. Keep direct-execution checks and resource imports tied
+to `import.meta.url`. Direct calls retain the script-parent root.
+`scripts/hooks/__tests__/hook-root.test.mjs` probes primary/lane protection, seeded daemon
+paths and lint scope through the real launcher using isolated primary/worktree fixtures under
+`TMPDIR`. The launcher tests execute the configured settings wrapper from linked worktrees
+and clone lanes with replaced lane launchers and guards, proving dedicated-clone execution,
+lane-root propagation and fail-closed denial when clone evidence is missing or incomplete.
+Private scripts revisions and the sync/publication mutex protect delayed imports during
+scheduled reset/clean; their lifetime is the owning guard invocation.
+
+The launcher requires an empty porcelain status (including untracked files), HEAD equal to
+`refs/remotes/origin/main`, and, when `WE_GUARD_ORIGIN` is set, an exact origin URL match.
+All Git calls and the child guard receive an environment with every `GIT_*` variable removed;
+other environment variables survive. Sync removes working-tree write bits after publication
+and restores owner write access before refresh. Permissions discourage edits; launcher checks
+remain mandatory. Launcher/sync tests cover dirty tracked and untracked files, divergent or
+missing main refs, origin mismatches, hostile Git overrides and read-only refresh/late imports.

@@ -8,7 +8,7 @@
 # - /srv/forge-receipts ops:ops 0700, /srv/forge-cache root:ops 0770,
 #   /srv/forge-base ops:ops 0700 and its anonymous public bare repo.git;
 # - /usr/local/libexec root:root 0755 and bundled root:root 0755 wrappers
-#   forge-exec-run.mjs, forge-warm-base.mjs and forge-exec-limits.mjs;
+#   forge-exec-run.mjs, forge-warm-base.mjs, forge-exec-limits.mjs and forge-cache-prune.mjs;
 # - /etc/forge-exec/limits.json root:root 0644 (created only if absent),
 #   persistent parent/slot systemd slices with live resource ceilings;
 # - /etc/sudoers.d/forge-exec root:root 0440 with these exact forms:
@@ -17,6 +17,8 @@
 #   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *
 # - root-owned forge-warm-base systemd service/timer (service runs as ops,
 #   timer every 30s) and /etc/cron.daily/forge-exec-prune root:root 0755;
+# - forge-cache-prune.service/timer: root oneshot cache retention, 2min after
+#   boot then every 15min, idle IO/low CPU priority; cron retains exec/receipt pruning;
 # - R497 egress: slot users forge-exec-1..N get no outbound network except loopback and
 #   TCP 443 to registry.npmjs.org (cold npm ci runs as the slot user). Rules come from
 #   /usr/local/libexec/forge-egress.sh (nft table inet forge_exec_egress), refreshed every
@@ -182,7 +184,7 @@ try:
         # installed imports resolve to node builtins, including on Node 22.1.
         import re, json
         source_dir = os.path.dirname(sys.argv[1])
-        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs"}
+        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs"}
         def bundle(filename, nested=False):
             if filename not in allowed:
                 raise RuntimeError("unexpected wrapper dependency")
@@ -214,7 +216,7 @@ try:
             if nested:
                 return "(await (async () => {\n" + code + "\nreturn {" + ",".join(dict.fromkeys(names)) + "};\n})())"
             return "#!/usr/bin/env node\n" + code
-        for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs"]:
+        for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs"]:
             name = ".forge-exec-run-" + secrets.token_hex(16)
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=dest)
             try:
@@ -296,6 +298,43 @@ WantedBy=timers.target
 TIMER
 systemctl daemon-reload
 systemctl enable --now forge-warm-base.timer
+# Required cache settings (explicit service environment, logged with provenance):
+# FORGE_CACHE_MAX_AGE_HOURS=12 (clamped 6..24), FORGE_CACHE_MAX_BYTES=214748364800,
+# FORGE_CACHE_HIGH_WATER_PCT=80 (0..100; reclaim to five percentage points below).
+# Minimum age is always at least one hour. Edit the Environment= values below
+# (or override in a service drop-in), then daemon-reload. Missing/invalid settings
+# refuse all pruning; restore valid values before retrying. Incomplete evidence refuses
+# deletion: inspect/repair reservations and records before retrying the service.
+# The pruner uses the existing /usr/bin/flock utility to hold all numbered and
+# legacy reservation writer leases through evidence reads and anchored deletion.
+cat > /etc/systemd/system/forge-cache-prune.service <<'CACHE_SERVICE'
+[Unit]
+Description=Prune expired Forge dependency cache profiles
+After=local-fs.target
+[Service]
+Type=oneshot
+User=root
+Environment=FORGE_CACHE_MAX_AGE_HOURS=12
+Environment=FORGE_CACHE_MAX_BYTES=214748364800
+Environment=FORGE_CACHE_HIGH_WATER_PCT=80
+ExecStart=/usr/bin/env node /usr/local/libexec/forge-cache-prune.mjs --apply
+Nice=19
+IOSchedulingClass=idle
+CACHE_SERVICE
+cat > /etc/systemd/system/forge-cache-prune.timer <<'CACHE_TIMER'
+[Unit]
+Description=Check Forge cache retention every 15 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=false
+Unit=forge-cache-prune.service
+[Install]
+WantedBy=timers.target
+CACHE_TIMER
+systemctl daemon-reload
+systemctl enable --now forge-cache-prune.timer
 # R497: no egress for slot users. Root-owned script, installed via temp + atomic rename.
 if ! command -v nft >/dev/null 2>&1; then
   apt-get install -y nftables
@@ -348,17 +387,17 @@ systemctl enable --now forge-exec-egress.timer
 cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
 #!/bin/bash
 set -euo pipefail
-# Active reservations protect their slot and identifiable run/cache evidence.
+# Active reservations protect their slot and identifiable run evidence.
 # Unrelated expired state is pruned when reservation evidence identifies what
-# to protect; incomplete evidence preserves expired receipts/caches. Reclaim only after
+# to protect; incomplete evidence preserves expired receipts. Reclaim only after
 # excluding reservation writers and launches, then proving its UID has no live
 # processes. Historical reservations require operator cleanup after stopping the UID.
 python3 - <<'PRUNE_PY'
 import os, re, stat, shutil, time, json, pwd, sys, fcntl
 root, receipts = '/srv/forge-exec', '/srv/forge-receipts'
 now = time.time()
-active, runs, caches = set(), set(), set()
-unknown_receipts = unknown_caches = False
+active, runs = set(), set()
+unknown_receipts = False
 def metadata(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -406,7 +445,7 @@ for name in sorted(names):
     path = os.path.join(receipts, name)
     try: st = os.lstat(path)
     except FileNotFoundError:
-        if name in blocked: unknown_receipts = unknown_caches = True
+        if name in blocked: unknown_receipts = True
         continue
     if not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe reservation')
     try: record = metadata(os.path.join(path, 'reservation.json'))
@@ -424,18 +463,9 @@ for name in sorted(names):
     active.add(name)
     run = record.get('run')
     if not isinstance(run, str) or not re.fullmatch(r'(r-|warm-)[a-f0-9]{32}', run):
-        unknown_receipts = unknown_caches = True
+        unknown_receipts = True
         continue
     runs.add(run)
-    identified_cache = False
-    for phase in ('prepared', 'running', 'receipt'):
-        try:
-            lock = metadata(os.path.join(receipts, run + '.' + phase)).get('lock')
-            if isinstance(lock, str) and re.fullmatch(r'[a-f0-9]{64}', lock):
-                caches.add(lock)
-                identified_cache = True
-        except (OSError, ValueError): pass
-    if not identified_cache: unknown_caches = True
 
 def prune(parent, age, pattern, files=False, protected=()):
     st = os.lstat(parent)
@@ -457,9 +487,6 @@ for slot in os.listdir(root):
 if unknown_receipts:
     print('forge-exec-prune: incomplete reservation evidence; preserving expired receipts until operator repair or confirmed UID shutdown', file=sys.stderr)
 else: prune(receipts, 86400, r'.*', files=True)
-if unknown_caches:
-    print('forge-exec-prune: incomplete reservation evidence; preserving expired cache entries until operator repair or confirmed UID shutdown', file=sys.stderr)
-else: prune('/srv/forge-cache', 1209600, r'.*', protected=caches)
 PRUNE_PY
 PRUNE
 chown root:root /etc/cron.daily/forge-exec-prune

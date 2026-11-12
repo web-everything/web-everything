@@ -119,7 +119,7 @@ import { tmpdir } from 'node:os';
 import { applyHumanClearanceCarry, latestHumanClearance } from '../human-clearance-carry.mjs';
 import { liveCarryFingerprints } from '../carry-equivalence.mjs';
 import { buildClearedFromMarker, buildReviewedContributionMarker, normalizeDiffFingerprint } from '../review-escalation.mjs';
-import { restampAfterNumbering } from '../numbering-carry.mjs';
+import { restampAfterNumbering, _resetNumberingRestampMemo } from '../numbering-carry.mjs';
 it('uses Git-generated diffs and stable patch ids to distinguish moved edits from safe offset rebases', () => {
   const dir = mkdtempSync(join(tmpdir(), 'net-patch-read-only-'));
   const gitDiff = (before, after) => {
@@ -197,6 +197,9 @@ it.each([
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 function offsetRebaseFixture({ defaultRefuse = false, tier = 'net-patch' } = {}) {
+  // The restamp memo is module-level and keyed repo#pr@head. Fixture commits are deterministic within one clock
+  // second, so two fixtures can mint the SAME head sha and the second would hit the first's settled memo (null result).
+  _resetNumberingRestampMemo();
   const dir = mkdtempSync(join(tmpdir(), 'net-patch-'));
   const git = (...args) => execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8' }).trim();
   const content = Array.from({ length: 30 }, (_, i) => `line ${i}\n`).join('');
