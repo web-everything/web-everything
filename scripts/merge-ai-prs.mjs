@@ -2062,6 +2062,7 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
   const manifestByPr = new Map();
   const commitsByPr = new Map();
   const degradedByPr = new Map();
+  const malformedRepos = new Set();   // card 8036 — repos holding a PR whose manifest was unreadable JSON
   let listingTruncated = false;
   let listingFailed = false;
   const readsMap = reads instanceof Map ? reads : new Map();
@@ -2078,6 +2079,7 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
       const commits = Array.isArray(r.commits) ? r.commits : [];
       manifestByPr.set(key, manifest);
       commitsByPr.set(key, commits);
+      if (r.malformed) malformedRepos.add(repo);
       degradedByPr.set(key, !!r.degraded);   // #xc7p3q9 Fix 2 — a swallowed-error read → fail closed in the couple gate
       if (manifest && manifest.item != null) openItems.add(asItemId(manifest.item));
     }
@@ -2088,7 +2090,7 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
   // cap (the oldest held blockers may be missing), and no per-PR read degraded (B1). Incomplete → the couple gate
   // reads a carrier's ABSENCE as UNKNOWN and fails closed, instead of as "landed" → orphan-land.
   const contextComplete = !!reconcileRan && !listingFailed && !listingTruncated && !anyDegraded;
-  return { prsByRepo, openItems, manifestByPr, commitsByPr, degradedByPr, truncated: listingTruncated, contextComplete };
+  return { prsByRepo, openItems, manifestByPr, commitsByPr, degradedByPr, malformedRepos, truncated: listingTruncated, contextComplete };
 }
 
 /**
@@ -2524,7 +2526,7 @@ export function planDrainPass({ verdicts = null, listings = null, openPrContext 
   // `landedThisPass` by construction and can never change an answer: the tests would pass (they hand-seed the set)
   // while production behaviour stayed byte-identical. The live derivation belongs in the CASCADE, against refs
   // that ACTUALLY merged — see `deriveCoupleIncomplete`. The disjointness/reachability test pins this.
-  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, strictAbsentHashDependencies, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug, readyOrder });
+  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, malformedRepos: ctx.malformedRepos, strictAbsentHashDependencies, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug, readyOrder });
   return { prsByRepo, verdicts: vs, carrierHealth, plan };
 }
 
@@ -2616,7 +2618,7 @@ export function isConfirmSweepSettled({ merged = 0, pendingRebased = 0, consider
  * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, strictAbsentHashDependencies?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapSkips?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
  * @returns {{ready:Array, deferred:Array<{num,item,waitOn:Array<number|string>}>, staleLandedOpenItems:Array<number|string>}}  ready is ordered (item asc, then PR#); staleLandedOpenItems = items proven landed yet still named by an open PR (#999/xq985wu F2 stale-PR diagnostic).
  */
-export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, strictAbsentHashDependencies = false, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
+export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, malformedRepos = null, strictAbsentHashDependencies = false, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
   // Every candidate still in play keeps its item "open" — a red/skip blocker must still defer its dependents,
   // so the open set is ALL candidate items, not just the mergeable ones. (A merged item is removed by the
@@ -2715,7 +2717,10 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     // #xc7p3q9 (R1) — PLAN-WIDE fail-closed backstop: in an INCOMPLETE context a manifest-less verdict from a
     // NON-WE repo MIGHT be a coupled impl whose carrier we could not read → it must never enter `ready`, whether or
     // not a join stamped `coupleDefer`. Catches the un-joined orphan the per-carrier gate structurally misses.
-    const blindImplDefer = contextComplete !== true && c.hasManifest !== true && !isWeRepo(c.repo);
+    // card 8036 — a malformed manifest elsewhere hides a possible carrier's couple link: manifest-less non-WE PRs in
+    // OTHER repos than the malformed one keep the old deferral this pass; same-repo PRs proceed (the malformed PR itself is held).
+    const otherRepoOfMalformed = malformedRepos instanceof Set && malformedRepos.size > 0 && ![...malformedRepos].every((r) => r === c.repo);
+    const blindImplDefer = (contextComplete !== true || otherRepoOfMalformed) && c.hasManifest !== true && !isWeRepo(c.repo);
     const blindWait = blindImplDefer ? ['incomplete-context'] : (c.readMalformed === true ? ['malformed-manifest'] : []);
     // #xc7p3q9 (R2) — a verdict may NEVER waitOn its OWN item (a self-referential wait is structurally
     // unsatisfiable — the livelock). Strip any edge naming this verdict's own item.
@@ -6771,7 +6776,7 @@ async function runCli() {
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
     const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
-    const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
+    const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, malformedRepos: openPrContext.malformedRepos, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
     logDrainOrder(p);
     return p;
   };

@@ -452,6 +452,18 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     expect(plan.deferred.map((d) => d.num)).toEqual([61]);                   // A fails closed alone
   });
 
+  it('card 8036 — a malformed manifest in one repo keeps the old deferral for manifest-less PRs in OTHER repos only', () => {
+    const A = ghPr(61, 'lane/a-fui', {}); const C = ghPr(70, 'lane/c-fui', {}); const D = ghPr(81, 'lane/d-other', {});
+    const OTHER = 'frontier-ui/other';
+    const reads = new Map([[`${FUI}::61`, { manifest: null, commits: [], degraded: false, malformed: true }], [`${FUI}::70`, { manifest: null, commits: [], degraded: false }], [`${OTHER}::81`, { manifest: null, commits: [], degraded: false }]]);
+    const ctx = reduceOpenPrContext({ listings: [{ repo: FUI, prs: [A, C] }, { repo: OTHER, prs: [D] }], reads, reconcileRan: true });
+    expect(ctx.contextComplete).toBe(true);
+    const mk = (num, repo, readMalformed) => ({ num, repo, headRef: `lane/${num}`, hasManifest: false, item: null, blockedBy: [], stackParents: [], decision: 'merge', ...(readMalformed ? { readMalformed: true } : {}) });
+    const plan = planLabelDrain([mk(61, FUI, true), mk(70, FUI), mk(81, OTHER)], { contextComplete: ctx.contextComplete, malformedRepos: ctx.malformedRepos, isWeRepo: isLocalRepo });
+    expect(plan.ready.map((c) => c.num)).toEqual([70]);                       // same repo proceeds
+    expect(plan.deferred.map((d) => d.num).sort()).toEqual([61, 81]);         // malformed PR + other-repo impl half held
+  });
+
   it('card 8036 — buildDrainVerdicts stamps readMalformed from the per-PR read', () => {
     const A = ghPr(61, 'lane/a-fui', { labels: ['ready-to-merge'] });
     const vs = buildDrainVerdicts({ prsByRepo: new Map([[FUI, [A]]]), repos: [FUI], readOf: () => ({ manifest: null, commits: [], malformed: true }), isLocalRepo });
