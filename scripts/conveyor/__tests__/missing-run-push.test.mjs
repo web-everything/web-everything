@@ -115,6 +115,10 @@ describe('missing-run PR-event recovery', () => {
     const pending = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', status: 'queued' }] });
     expect(pending.result.ok).toBe(false);
     expect(pending.calls.some(c => c.args.includes('-X'))).toBe(false);
+    // Incomplete run evidence or a claim taken meanwhile fails closed.
+    const claimed = fixture({ message: msg, checkClaim: vi.fn().mockReturnValueOnce(null).mockReturnValue({ message: 'held' }) });
+    expect(claimed.result.deferred).toBe(true);
+    expect(claimed.calls.some(c => c.args.includes('-X'))).toBe(false);
   });
   it('reports a stacked or fork PR as a counted failure (not a free deferral) and never pushes', () => {
     const stacked = fixture({ live: { ...pr, base: { ref: 'lane/other' } } });
