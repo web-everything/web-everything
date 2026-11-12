@@ -99,7 +99,20 @@ export function pushMissingRunCommit(d, options = {}) {
     git('fetch', '--no-tags', remote, ref);
     if (git('rev-parse', 'FETCH_HEAD') !== d.headSha) return defer('branch moved before recovery');
     const message = git('show', '-s', '--format=%B', d.headSha);
-    if (message.split('\n').some(line => line.startsWith(RECOVERY_COMMIT_MARKER))) return { ok: false, action, error: 'recovery commit still has no PR checks; needs ci-heal, not another empty commit' };
+    if (message.split('\n').some(line => line.startsWith(RECOVERY_COMMIT_MARKER))) {
+      // Live 2026-11-11 (#6684/#6633): the marked empty commit produced no pull_request run either. A second empty
+      // commit cannot help, but a workflow_dispatch of ci.yml on the branch reports `test`/`smoke` on this head
+      // (the manual fix). ONE dispatch per head: any existing ci.yml run on the head (queued, running, done) blocks it.
+      stage = 'dispatch';
+      const ghEnv = { ...gitEnv, GH_TOKEN: token };
+      const existing = JSON.parse(String(exec('gh', ['api', `repos/${repo}/actions/runs?head_sha=${d.headSha}&per_page=100`], { ...opts, env: ghEnv })));
+      if (!Number.isSafeInteger(existing.total_count) || existing.total_count >= 100) return defer('head runs unreadable or too many; needs ci-heal inspection');
+      if ((existing.workflow_runs ?? []).some(run => String(run?.path ?? '').includes('ci.yml'))) {
+        return { ok: false, action, error: 'recovery commit still has no PR checks and CI was already dispatched for this head; needs ci-heal, not another trigger' };
+      }
+      exec('gh', ['api', '-X', 'POST', `repos/${repo}/actions/workflows/ci.yml/dispatches`, '-f', `ref=${d.headRefName}`], { ...opts, env: ghEnv });
+      return { ok: true, action, dispatched: true };
+    }
     const tree = git('rev-parse', `${d.headSha}^{tree}`);
     stage = 'commit-tree';
     const newHeadSha = git('-c', 'user.name=Web Everything', '-c', 'user.email=conveyor@users.noreply.github.com',
