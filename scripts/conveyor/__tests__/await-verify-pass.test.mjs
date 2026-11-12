@@ -1602,11 +1602,11 @@ describe('timeout-only load recovery', () => {
 // the exact pushed head's green required `test` CI check. Anything else keeps today's infra ladder.
 describe('infra verify failure falls back to green CI on the pushed head', () => {
   const run = (row) => ({ name: row[0], status: 'COMPLETED', conclusion: row[1] });
-  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark } = {}) => {
+  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live' } = {}) => {
     const h = harness({ records: [rec({ retries: 2, earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
     h.state.marker = mark ?? marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'SIGKILL after 1800000ms' } });
     h.io.readPreviousHead = async () => head;
-    h.io.readPreviousRequired = async () => ({ checks: required });
+    h.io.readPreviousRequired = async () => ({ checks: required, source });
     h.io.readPreviousChecks = async () => (typeof checks === 'function' ? checks() : checks.map(run));
     h.io.infraFallbackToCi = () => ({ enabled: fallback, source: 'standard' });
     return h;
@@ -1631,6 +1631,7 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
     ['another required check is red', { required: ['test', 'lint'], checks: [['test', 'SUCCESS'], ['lint', 'FAILURE']] }],
     ['the CI read fails', { checks: () => { throw new Error('gh down'); } }],
     ['the setting is off', { fallback: false }],
+    ['the required set is a cache/fallback read', { source: 'fallback' }],
     ['the test check was skipped', { checks: [['test', 'SKIPPED']] }],
   ])('keeps the infra ladder when %s', async (_name, opts) => {
     const h = ciHarness(opts);
@@ -1645,6 +1646,14 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
       const { rows } = await tick(h);
       expect(h.calls.push).toHaveLength(0);
       expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
+  });
+  it('keeps the ladder when the lane or verdict changes during the CI reads', async () => {
+    for (const change of [h => { h.state.lane = lane({ dirty: true }); }, h => { h.state.marker = marker('red'); }]) {
+      const h = ciHarness();
+      h.io.readPreviousChecks = async () => { change(h); return [run(['test', 'SUCCESS'])]; };
+      await tick(h);
+      expect(h.calls.push).toHaveLength(0);
     }
   });
   it('never masks a real red verdict: red goes to the fixer, not to CI', async () => {

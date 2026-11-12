@@ -472,7 +472,9 @@ async function infraCiGreenFallback({ io, record, marker, lane }) {
     if (!record.earlyPush?.ok || lower(record.earlyPush.sha) !== lower(record.sha)) return null;
     if (typeof io.readPreviousHead !== 'function' || typeof io.readPreviousRequired !== 'function' || typeof io.readPreviousChecks !== 'function') return null;
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
-    const required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }))?.checks ?? [];
+    const requiredRead = await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 });
+    if (requiredRead?.source !== 'live') return null; // cache / fallback / declared sets are not proof of what is required now
+    const required = requiredRead.checks ?? [];
     if (!required.includes('test')) return null;
     const checks = await io.readPreviousChecks({ repo: record.repo, headSha: record.sha });
     if (headCiVerdict(checks, required) !== 'green') return null;
@@ -480,6 +482,10 @@ async function infraCiGreenFallback({ io, record, marker, lane }) {
     const strict = name => (Array.isArray(checks) ? checks : []).filter(r => (r?.name || r?.context) === name).every(r =>
       (r.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'SUCCESS' : String(r.state).toUpperCase() === 'SUCCESS'));
     if (!required.every(name => (checks ?? []).some(r => (r?.name || r?.context) === name) && strict(name))) return null;
+    // The reads above are async: the lane and verdict must still be what was decided on.
+    const nowLane = io.laneState(record.lane);
+    if (!nowLane?.head || lower(nowLane.head) !== lower(record.sha) || nowLane.dirty) return null;
+    if (io.readMarker(record.lane)?.status !== 'infrastructure-failure') return null;
     return `required CI green on pushed head ${String(record.sha).slice(0, 8)}; verify.infraFallbackToCi=on (${setting.source ?? 'standard'})`;
   } catch { return null; }
 }
