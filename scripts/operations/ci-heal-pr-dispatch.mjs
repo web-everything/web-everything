@@ -465,9 +465,8 @@ export async function runReconcileCiHealDispatch({
     }
   }
   let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
-  if (deadlineAt != null || cursor != null) {
-    ciHealEntries.sort((a, b) => a.prNumber - b.prNumber);
-    const start = ciHealEntries.findIndex(entry => entry.prNumber >= cursor);
+  if (cursor != null) {
+    const start = ciHealEntries.findIndex(entry => entry.prNumber === cursor);
     if (start > 0) ciHealEntries = [...ciHealEntries.slice(start), ...ciHealEntries.slice(0, start)];
   }
   if (!ciHealEntries.length && timeoutResults.length) return {

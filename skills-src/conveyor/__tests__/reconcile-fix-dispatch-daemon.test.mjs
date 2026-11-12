@@ -2247,6 +2247,53 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
   });
 
+  it.each(['keys', 'slugs'])('defers fix for a repo with a caught orphan listing error, allowing completed repos (%s)', async form => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    const repos = ['we', 'frontierui'].map(key => form === 'slugs' ? CONSTELLATION_REPOS[key].slug : key);
+    const result = await realRunTickAllRepos({ ...f.options, repos, budgetRotation: {},
+      orphanGuardTick: options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
+        listBounced: slug => {
+          if (slug === CONSTELLATION_REPOS.we.slug) throw new Error('listing unavailable');
+          return [];
+        } }),
+    });
+    expect(result.stuckFixers.orphanRounds.rows).toContainEqual({ repo: CONSTELLATION_REPOS.we.slug,
+      decision: 'error', reason: 'listing failed: listing unavailable' });
+    expect(vi.mocked(fixDispatch.runReconcileFixDispatch).mock.calls.map(([options]) => options.repo)).toEqual([repos[1]]);
+    expect(result.refusals).toContainEqual({ repo: repos[0], prNumber: null,
+      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+  });
+
+  it.each([
+    { decision: 'error', result: 'error: comment read failed' },
+    { decision: 'escalate', result: 'error: escalation failed' },
+    { decision: 'escalate', result: 'not-done: unavailable' },
+    { decision: 'escalate', result: 'escalated (marker comment failed: unavailable)' },
+    { decision: 'unknown', result: 'escalated' },
+    { decision: 'escalate' },
+  ])('defers fix on an error or unknown orphan row despite iterator completion: %j', async row => {
+    const f = productionFixture();
+    const result = await realRunTickAllRepos({ ...f.options,
+      orphanGuardTick: async ({ repos }) => {
+        for (const repo of repos) expect(repo.key).toBe('we');
+        const success = { repo: CONSTELLATION_REPOS.we.slug, decision: 'escalate', result: 'escalated' };
+        return { rows: [success, { repo: CONSTELLATION_REPOS.we.slug, ...row }, success] };
+      } });
+    expect(fixDispatch.runReconcileFixDispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual({ repo: 'we', prNumber: null,
+      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+  });
+
+  it.each([undefined, {}, { rows: [null] }, { rows: [{ decision: 'error' }] }])(
+    'defers fix when orphan completion evidence is unreadable or cannot be attributed: %j', async evidence => {
+      const f = productionFixture();
+      const result = await realRunTickAllRepos({ ...f.options,
+        orphanGuardTick: async ({ repos }) => { for (const repo of repos) expect(repo.key).toBe('we'); return evidence; } });
+      expect(fixDispatch.runReconcileFixDispatch).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ repo: 'we', kind: 'orphan-guard-deferred' }));
+    });
+
   it('runs the orphan-round guard before fix so a capped orphan is not re-dispatched first', async () => {
     const f = productionFixture();
     const order = [];

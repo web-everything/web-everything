@@ -1229,17 +1229,32 @@ export async function runTickAllRepos({
   const orphanGuardCompleted = new Set();
   const orphanGuard = await timedAsync('orphan-guard', async () => {
     if (!requireOrphanGuard) return { rows: [] };
-    try { return await orphanGuardTick({ env: process.env, nowMs: now(),
+    try {
+      const result = await orphanGuardTick({ env: process.env, nowMs: now(),
       repos: (function* () {
         for (const repo of budgetRepos('orphan-guard', repos)) {
           const key = repoKeyForSlug(repo);
           if (!key) throw new Error(`orphan-guard: unknown repo ${repo}`);
           yield { key, slug: CONSTELLATION_REPOS[key].slug };
-          // Resuming the iterator proves the guard finished this repo before requesting another.
+          // Iterator progress proves only that the repo was visited; returned rows may still report failure.
           orphanGuardCompleted.add(repo);
         }
       })(),
-    }) ?? { rows: [] }; }
+      });
+      if (!Array.isArray(result?.rows)) orphanGuardCompleted.clear();
+      else for (const row of result.rows) {
+        const key = row?.repo && repoKeyForSlug(row.repo);
+        if (!key) { orphanGuardCompleted.clear(); break; }
+        const success = { rearm: 're-armed', redispatch: 're-dispatched', escalate: 'escalated' };
+        if (!Object.hasOwn(success, row.decision)
+          || (row.result !== success[row.decision] && row.result !== 'report-only (WE_ORPHAN_FIX_GUARD=0)')) {
+          for (const repo of orphanGuardCompleted) {
+            if (repoKeyForSlug(repo) === key) orphanGuardCompleted.delete(repo);
+          }
+        }
+      }
+      return result ?? { rows: [] };
+    }
     catch (e) {
       orphanGuardCompleted.clear();
       return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] };
