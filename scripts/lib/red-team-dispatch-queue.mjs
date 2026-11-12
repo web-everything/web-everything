@@ -8,7 +8,7 @@ import { isRealHead } from './red-team-skip-outcome.mjs';
 const transactions = new WeakMap();
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // still probed every tick, but it must not occupy one of the capacity-bound admissions.
-const NON_RUNNABLE_REASONS = new Set(['review-unfinished']);
+const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
 // At most this many probes ride along per repo per tick; attempts rotation (maxAttempts) moves a probe that stays
 // blocked to the tail, so every blocked entry is re-checked in turn.
 const MAX_PROBES = 2;
@@ -18,8 +18,8 @@ const note = (log, message) => {
   catch { /* Diagnostics must not interrupt recovery. */ }
 };
 
-export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
-export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 6;
+export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 6;
 
 /** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
 export function loadRedTeamQueueFloor({ env = process.env,
@@ -166,15 +166,17 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (!entry) continue;
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
-        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip' } : undefined);
-        if (entry.blocked && (dispatched.some(matches) || !NON_RUNNABLE_REASONS.has(failure?.reason))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
+        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true } : undefined);
+        // A planner skip (e.g. later verdict supersedes acceptance) starts nothing, so it must not keep a capacity slot.
+        const nonRunnable = f => !!f && f.reason !== 'no review capacity left' && (f.skipped === true || NON_RUNNABLE_REASONS.has(f.reason));
+        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
-          if (NON_RUNNABLE_REASONS.has(failure.reason)) {
+          if (nonRunnable(failure)) {
             // The slot is released (see admit); the normal attempts rotation still bounds how long it stays in front.
-            entry.blocked = failure.reason;
+            entry.blocked = failure.skipped ? 'planner-skip' : failure.reason;
           }
           entry.attempts++;
           if (entry.attempts >= limit) {
