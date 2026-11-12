@@ -486,7 +486,9 @@ export async function runAwaitVerifyPass({
         const stale = Number.isFinite(deliveredAt) && nowMs - deliveredAt > deliveredStaleMs;
         if (!session || (!isSessionBusy(session) && stale)) {
           // A fresh fixer reads live CI; retire the inventory even though clearOrNote would retain it.
-          if (io.clearRecord(key, record)?.cleared !== false) {
+          // Compare-and-delete when the IO offers it: a concurrent re-mark must never lose its newer record.
+          const retired = typeof io.clearStoredRecordIf === 'function' ? io.clearStoredRecordIf(key, record) : io.clearRecord(key, record);
+          if ((await retired)?.cleared !== false && (typeof io.clearStoredRecordIf !== 'function' || (await retired)?.cleared === true)) {
             const why = session ? 'session idle past stale window' : 'session gone';
             rows.push({ ...row, action: 'resume', reason: 'delivered-repair-abandoned',
               result: `delivered previous-head CI repair abandoned (${why}); record retired so a fresh fixer is admitted; fix.awaitDeliveredStaleMs=${deliveredStaleMs} (${deliveredStale.source})` });

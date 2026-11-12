@@ -164,6 +164,16 @@ describe('delivered previous-head CI repair recovery', () => {
     expect(h.store.size).toBe(0);
   });
 
+  it('retires through compare-and-delete and keeps the wait when the record changed', async () => {
+    const h = harness({ records: [pending()], session: null });
+    const seen = [];
+    h.io.clearStoredRecordIf = (key, expected) => { seen.push([key, expected]); return { cleared: false }; };
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    expect((await tick(h)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(seen).toHaveLength(1);
+    expect(h.store.size).toBe(1);
+  });
+
   it('keeps the old wait row when retiring the record fails', async () => {
     const h = repairHarness({ records: [pending()], session: null });
     h.io.clearRecord = () => ({ cleared: false });
