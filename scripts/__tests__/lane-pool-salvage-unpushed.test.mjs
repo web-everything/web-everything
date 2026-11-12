@@ -275,6 +275,19 @@ describe('lane-pool salvage-unpushed', () => {
     expect(log.some(e => e.args.some(arg => arg.includes(':refs/release-verify/')))).toBe(false);
   });
 
+  it('a non-standard fetch mapping gives the fast path no proofs, so a stale tracking ref cannot hide local-only work', () => {
+    // origin/gone lingers after its origin branch was deleted; a restricted mapping would never prune it.
+    git(['checkout', '-b', 'leftover'], lane);
+    const sha = commit(lane, 'only on a stale tracking ref');
+    git(['update-ref', 'refs/remotes/origin/gone', sha], lane);
+    git(['checkout', 'main'], lane);
+    git(['config', '--replace-all', 'remote.origin.fetch', '+refs/heads/main:refs/remotes/origin/main'], lane);
+    const result = run('acquire', ['--lane=1', '--no-reap'], { TEST_BAD_HEADS: '1' });
+    expect(result.status).not.toBe(0);
+    expect(git(['rev-parse', 'leftover'], lane)).toBe(sha);
+    expect(events().some(e => e.cwd === lane && e.args.includes('checkout') && e.args.includes('-B'))).toBe(false);
+  });
+
   it('acquire evidence calls are bounded by a short per-call timeout while release keeps its default', async () => {
     const { realSalvageIo } = await import('../lib/lane-pool-salvage-push.mjs');
     const probe = gitTimeoutMs => {
@@ -296,8 +309,11 @@ describe('lane-pool salvage-unpushed', () => {
     // cannot prove it and the full canonical-origin proof (with its object-only fetch) still runs.
     const publisher = join(root, 'publisher');
     git(['clone', origin, publisher]);
+    // On a side branch with HEAD left on main, so the lane stays ahead=0 and acquirable by the pre-claim scan.
+    git(['checkout', '-b', 'side'], lane);
     const published = commit(lane, 'published through a descendant');
-    git(['fetch', lane, 'main'], publisher);
+    git(['checkout', 'main'], lane);
+    git(['fetch', lane, 'side'], publisher);
     git(['checkout', '-B', 'main', 'FETCH_HEAD'], publisher);
     const advanced = commit(publisher, 'advanced main');
     git(['fetch', publisher, 'main:main'], origin);

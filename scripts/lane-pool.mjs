@@ -3196,25 +3196,19 @@ function unpushedLaneWork(repo, dir, { allowFetch = false } = {}) {
 
 /** Network-free fast path for acquire: the local commits (HEAD, every branch, every stash entry) that no origin
  *  tracking ref contains. '' = every tip is already on a tracking ref, so there is nothing to prove and acquire skips
- *  the ls-remote + object fetch entirely (the common case: a lane that is only behind origin). null = unreadable or
- *  unsafe evidence (a symbolic tracking ref other than origin/HEAD could alias the ops namespace), and the caller
- *  falls through to the full canonical-origin proof, which fails closed on its own. Tracking refs are the same
- *  evidence the #2924 fresh-fetch re-verify already trusts; acquire's pre-reset call runs right after that
- *  `fetch --prune`, so deleted or force-moved origin branches no longer count here. A stash entry is never
- *  reachable from a tracking ref, so stashed work always takes the full path. */
+ *  the ls-remote + object fetch entirely (the common case: a lane that is only behind origin). null = unreadable
+ *  evidence; the caller falls through to the full canonical-origin proof, which fails closed on its own. The proofs
+ *  are exactly `localRemoteShas`' (the #2924 fresh-fetch re-verify's): only under the standard fetch mapping, only
+ *  direct non-ops tracking refs, never a symbolic one. Any other mapping yields no proofs, so every tip counts as
+ *  local-only and takes the full path. Acquire's pre-reset call runs right after `fetch --prune`, so deleted or
+ *  force-moved origin branches no longer count here. A stash entry is never reachable from a tracking ref, so
+ *  stashed work always takes the full path. */
 function localOnlyLaneWork(dir) {
   const local = releaseLocalWorkTips(dir);
   if (!local) return null;
-  const tracking = releaseEvidenceGit(['for-each-ref', '--format=%(refname)%00%(symref)', 'refs/remotes/origin/'], dir,
-    { timeout: LOCAL_GIT_TIMEOUT_MS });
-  if (tracking === null) return null;
-  for (const line of tracking ? tracking.split('\n') : []) {
-    const [name, target] = line.split('\0');
-    if (target && name !== 'refs/remotes/origin/HEAD') return null;
-  }
-  return releaseEvidenceGit(['rev-list', '--ignore-missing', ...local.tips, '--not',
-    '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*'], dir,
-  { timeout: LOCAL_GIT_TIMEOUT_MS });
+  const input = [...local.tips, ...[...localRemoteShas(dir)].map(sha => `^${sha}`)].map(line => `${line}\n`).join('');
+  return releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir,
+    { stdio: ['pipe', 'pipe', 'pipe'], input, timeout: LOCAL_GIT_TIMEOUT_MS });
 }
 
 /** Acquire's view of unpushed work: the strict preservation evidence minus commits that are patch-equivalent to
