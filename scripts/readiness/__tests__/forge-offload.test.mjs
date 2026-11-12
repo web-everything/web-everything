@@ -599,6 +599,47 @@ describe('runner base materialization refuses before install',()=>{
       expect(requests[0].baseSha).toBe(f.base.sha);
     }else if(!['retry succeeds','next base'].includes(mode))expect(requests[0].baseSha).toBeUndefined();
   },30_000);
+  it.each(['copy failure','protected rejection'])('preserves credential warnings across a delta-to-full retry after %s',async fault=>{
+    // R857: manifest advisories apply to credential-named, verified public files.
+    await fs.writeFile(join(repo,'credential-note.md'),'key: abcdefghij0123456789XYZ');
+    git(['add','credential-note.md']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+    const f=await setup(),onWarning=vi.fn();
+    let copies=0;
+    const requests=[];
+    const transport=async call=>{
+      if(call.file==='git')return exec(call);
+      if(call.file==='rsync') {
+        copies++;
+        if(copies===1&&fault==='copy failure')return {code:1,stdout:''};
+        const destination=call.args.at(-1).split(':').slice(1).join(':').replace('/srv/forge-exec',join(f.server,'runs'));
+        for(const name of call.input.toString().split('\0').filter(Boolean)) {
+          const rel=name.slice(2);
+          await fs.mkdir(join(destination,rel,'..'),{recursive:true});
+          await fs.copyFile(join(call.cwd,rel),join(destination,rel));
+        }
+        if(copies===1&&fault==='protected rejection')await fs.writeFile(join(f.dir,'tree/mode.txt'),'tampered');
+        return {code:0,stdout:''};
+      }
+      const action=call.args.at(-1).split(' ').at(-1);
+      if(action==='true')return {code:0,stdout:''};
+      const request=JSON.parse(call.input);
+      if(action==='run') {
+        requests.push(request);
+        try {const value=await f.runner.run(request);return {code:value.code,stdout:''};}
+        catch {return {code:1,stdout:''};}
+      }
+      return {code:0,stdout:JSON.stringify(await f.runner[action](request))};
+    };
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,onWarning,log:vi.fn()});
+    expect(result).toMatchObject({mode:'remote',code:0});
+    expect(copies).toBe(2);
+    expect(requests.at(-1).baseSha).toBeUndefined();
+    if(fault==='protected rejection')expect(requests[0].baseSha).toBe(f.base.sha);
+    expect(onWarning.mock.calls).toEqual([
+      ['credential-warn','credential-note.md: high-entropy-key'],
+      ['credential-warn','credential-note.md: high-entropy-key'],
+    ]);
+  },30_000);
   it('refuses an ignored test created while the SSH base-manifest response is in flight',async()=>{
     const f=await setup(),ignoredListings=[];
     await fs.writeFile(join(repo,'.git/info/exclude'),'late.test.mjs\n');
@@ -976,12 +1017,19 @@ describe('warm-base tick',()=>{
     return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs,runs:join(root,'slots'),receipts:join(root,'receipts')}};
   }
   it('warmTick excludes flagged public files with secret-like content and matches full/delta inventories',async()=>{
+    const token='ghp_'+'A1b2C3d4E5f6G7h8I9j0K';
     const refused={
-      'token-patterns.mjs':'const sample = "ghp_abcdefghijklmnopqrstuvwxyz0123";',
-      'credentials.yaml':'password: q8Zr2LmX9vT4pW7kJ1nB5cY3',
-      'token-utf16.txt':Buffer.from('password: q8Zr2LmX9vT4pW7kJ1nB5cY3','utf16le'),
+      'token-patterns.mjs':`const sample = "${token}";`,
+      'credentials.yaml':`password: ${token}`,
+      'token-utf16.txt':Buffer.from('public contents','utf16le'),
+      'token-invalid.json':'{',
+      'token-array.json':'[]',
+      'token-nul.txt':'public\0',
+      'token-invalid-utf8.txt':Buffer.from([255]),
     };
     for(const [path,bytes] of Object.entries(refused))await fs.writeFile(join(repo,path),bytes);
+    const generic='password: q8Zr2LmX9vT4pW7kJ1nB5cY3';
+    await fs.writeFile(join(repo,'credentials-generic.yaml'),generic);
     await fs.writeFile(join(repo,'token-clean.mjs'),'export const ok = 1;');
     git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
     const f=await tickFixture();
@@ -996,7 +1044,9 @@ describe('warm-base tick',()=>{
       expect(excluded).toContain(path);expect(paths).not.toContain(path);
       await expect(fs.lstat(join(published,'tree',path))).rejects.toMatchObject({code:'ENOENT'});
     }
-    expect(paths).toEqual(expect.arrayContaining(['mode.txt','token-clean.mjs']));
+    expect(paths).toEqual(expect.arrayContaining(['mode.txt','token-clean.mjs','credentials-generic.yaml']));
+    expect(excluded).not.toContain('credentials-generic.yaml');
+    expect(await fs.readFile(join(published,'tree','credentials-generic.yaml'),'utf8')).toBe(generic);
     expect(await fs.readFile(join(published,'tree','token-clean.mjs'),'utf8')).toBe('export const ok = 1;');
     expect(f.install).toHaveBeenCalledOnce();
   });

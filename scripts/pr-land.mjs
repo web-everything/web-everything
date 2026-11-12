@@ -130,6 +130,7 @@ import { join } from 'node:path';
 import { pushRefusal, callerIdentity, repoKeyForCheckout } from './conveyor/fix-procedure.mjs'; // fix procedure — refuse a push to a branch another fixer holds the fix claim on
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
+import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
@@ -261,7 +262,8 @@ export function withDelegationStamp(body, marker = DELEGATION_MARKER_LINE) {
 export function composePrBody(body, manifest = LANE_MANIFEST, marker = AUTHOR_MARKER, delegationMarker = DELEGATION_MARKER_LINE) {
   return withDelegationStamp(withAuthorStamp(manifest ? embedManifestInBody(body, manifest) : body, marker), delegationMarker);
 }
-const CREATE_BODY = composePrBody(BODY);
+let CREATE_BODY = composePrBody(BODY);
+let DEFERRED_TO_CI = null; // R893 — set by the finish-guard when verify was infra-failed and CI carries the proof
 // Post-land id-collision self-heal (#2071, generalized to EVERY land route). After a clean merge, heal any
 // NEW-item backlog id collision the land created against `main` (two files claiming one NNN) — the exact
 // heal the parallel integrator runs at Phase 4b, now shared so `/pr`, `/drain` (which reuses this) AND a
@@ -974,7 +976,12 @@ async function runCli() {
       gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     });
-    if (!gate.ok) {
+    const deferredOpen = gate.ok ? { ok: false } : deferredToCiDecision({ gate, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
+    if (deferredOpen.ok) {
+      DEFERRED_TO_CI = deferredOpen;
+      CREATE_BODY = appendDeferredDisclosure(CREATE_BODY, deferredOpen.disclosure);
+      if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · ${deferredOpen.disclosure} - opening only; ready-to-merge needs a green CI test check on ${refSha.slice(0, 8)}\n`);
+    } else if (!gate.ok) {
       emit({ repo: REPO, merged: false, reason: gate.reason, ref: REF, sha: refSha, verifyStatus: gate.status, detail: `refusing to land ${REF} — ${gate.detail} (${BASE} left untouched; this is #2833's stall guard)` }, 3);
     }
   }
@@ -1109,7 +1116,8 @@ async function runCli() {
     try {
       const liveBody = forge.viewPr(prNum, 'body').body || '';
       const updated = composePrBody(liveBody);
-      if (updated !== liveBody) forge.editBody(prNum, updated);
+      // R893: a rerun records the deferral on an existing PR too (idempotent), in the same single body edit.
+      syncDeferredBody({ forge, prNum, liveBody, composed: updated, deferred: DEFERRED_TO_CI });
     } catch { /* best-effort — drain ref fallback covers a miss */ }
   }
   if (prNum == null) return ghFailed('could not determine the PR number after create');
@@ -1382,7 +1390,12 @@ async function runCli() {
   }
 
   // Required checks are GREEN — NOW apply the producer-certified label (#2199: never before this point).
-  if (PLAN.labelWhenGreen) applyLabel();
+  // R893 — a deferred-to-ci PR is labelled only on a green CI `test` check-run for this exact sha (no new bypass).
+  if (PLAN.labelWhenGreen) {
+    const deferredRefusal = deferredLabelRefusal({ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI });
+    if (deferredRefusal) emit({ repo: REPO, merged: false, ...deferredRefusal }, 3);
+    applyLabel();
+  }
 
   // #2307 — and the deterministic review-escalation label (review:human / review:pending), alongside
   // ready-to-merge — a green producer PR IS ready; the review label is the *landing gate*, which the drain
