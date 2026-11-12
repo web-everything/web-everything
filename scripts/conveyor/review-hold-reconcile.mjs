@@ -178,7 +178,7 @@ export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {})
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
   acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, readFiles = null, readReviews = null, now = Date.now, log = (line) => writeLineSync(2, line),
+  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, readFiles = null, readReviews = null, assertReferrals = assertMandatoryReferralsCleared, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -340,9 +340,8 @@ export function sweepReviewHoldLabels({
       // Fail closed: an unreadable file list keeps the pending.
       const readChangedFiles = () => {
         try {
-          if (readFiles) return readFiles(pr.number, { repo: repoOf() });
-          const out = exec('gh', ['pr', 'view', String(pr.number), '--repo', repoOf(), '--json', 'files', '--jq', '[.files[].path]'], { encoding: 'utf8' });
-          const files = JSON.parse(String(out));
+          // The provider reader keeps BOTH rename paths (destination and previous_filename).
+          const files = readFiles ? readFiles(pr.number, { repo: repoOf() }) : provider.readPrFiles?.(repoOf(), pr.number);
           return Array.isArray(files) ? files : null;
         } catch { return null; }
       };
@@ -379,7 +378,8 @@ export function sweepReviewHoldLabels({
           const fresh = { ...provider.readPrState(repoOf(), pr.number), comments: readComments(pr.number, { repo: repoOf() }) };
           if (fresh.state !== 'OPEN' || fresh.headRefOid !== state.headRefOid
             || evalHeal(fresh).reason !== 'stale-pending') heal = { heal: false, reason: 'recheck-changed' };
-        } catch { heal = { heal: false, reason: 'recheck-failed' }; }
+          else assertReferrals(fresh, { repo: repoOf(), pr: pr.number });
+        } catch (e) { heal = { heal: false, reason: /referral|ruling/i.test(String(e?.message)) ? 'referral-hold' : 'recheck-failed' }; }
       }
       if (heal.heal) {
         // Account for this pass's own successful cleanup; GitHub rejects removing an absent label.
@@ -397,7 +397,8 @@ export function sweepReviewHoldLabels({
           } catch (e) {
             entry.error = String((e && e.message) || e).split('\n')[0];
           }
-          if (toRemove.length) {
+          // A pending removed without its durable explanation is worse than a pending kept one more tick.
+          if (toRemove.length && !(heal.reason === 'stale-pending' && !entry.commentPosted)) {
             try {
               provider.setLabels(repoOf(), pr.number, { remove: toRemove });
             } catch (e) {

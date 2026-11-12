@@ -575,11 +575,39 @@ describe('#5045 same-head accept with a standing changes-requested review', () =
   });
 });
 
+describe('#5045 same-head accept guards (R907)', () => {
+  const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
+  const mk = (extra) => {
+    const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` }] }) });
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readReviews: () => [], ...extra });
+    return { p, r: results.find((r) => r.num === 5045 && (r.healed || r.flagged)) };
+  };
+  it('reads files through the provider (both rename paths) and keeps pending for an engine-tier original', () => {
+    const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` }] }) });
+    p.readPrFiles = () => ['docs/renamed.mjs', 'scripts/merge-ai-prs.mjs'];
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readReviews: () => [], assertReferrals: () => ({}) });
+    expect(results.find((r) => r.num === 5045 && r.flagged).flagReason).toBe('accept-current');
+    expect(p.calls.set).toEqual([]);
+  });
+  it('keeps pending when the mandatory-referral check throws', () => {
+    const { p, r } = mk({ readFiles: () => ['docs/a.md'], assertReferrals: () => { throw new Error('mandatory referral blocking'); } });
+    expect(r.flagReason).toBe('referral-hold');
+    expect(p.calls.set).toEqual([]);
+  });
+  it('does not remove pending when the explanatory comment fails to post', () => {
+    const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` }] }) });
+    p.postComment = () => { throw new Error('comment boom'); };
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readReviews: () => [], readFiles: () => ['docs/a.md'], assertReferrals: () => ({}) });
+    expect(results.find((r) => r.num === 5045).error).toContain('comment boom');
+    expect(p.calls.set).toEqual([]);
+  });
+});
+
 describe('#5045 pending with a stale accept', () => {
   const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
   for (const current of [false, true]) it(current ? 'removes stale pending beside same-head acceptance' : 'posts evidence and removes only stale accepted', () => {
     const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${current ? head : '9db3d19825465e7da28c4e179833e2c799bb94e4'} -->` }] }) });
-    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readFiles: () => ['docs/a.md'], readReviews: () => [] });
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readFiles: () => ['docs/a.md'], readReviews: () => [], assertReferrals: () => ({}) });
     const r = results.find((r) => r.num === 5045 && (r.healed || r.flagged));
     if (current) {
       expect(r.healed).toEqual(['review:pending']);
