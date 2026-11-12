@@ -2356,11 +2356,9 @@ export function decideContradictoryVerdictHeal({
     if (accepted.startsWith(head) || head.startsWith(accepted)) {
       // A later deliberate verdict/hold after the accept, or an unreadable file list, keeps the pending.
       if (laterVerdict || !Array.isArray(changedFiles)) return { heal: false, reason: 'accept-current' };
-      // An engine-tier park (#2412) puts review:pending beside a fresh accept until `redteam:accepted` lands;
-      // removing it then would bypass that validator.
-      if (changedFiles.some((f) => isEngineTierPath(f)) && !hasReviewLabel(currentLabels, REVIEW_LABELS.redteamAccepted)) {
-        return { heal: false, reason: 'accept-current' };
-      }
+      // An engine-tier park (#2412) puts review:pending beside a fresh accept until the validator signs off;
+      // the heal never fires for engine-tier files (no label-only sign-off is trusted here).
+      if (changedFiles.some((f) => isEngineTierPath(f))) return { heal: false, reason: 'accept-current' };
       // The accept for this exact head is the verdict; a pending on the same head is stale.
       return {
         heal: true, reason: 'stale-pending',

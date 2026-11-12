@@ -67,6 +67,7 @@ import {
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { latestAcceptRecord, resolveAcceptCarryForward } from '../lib/accept-carry-forward.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { createMqLiveReader } from '../lib/drain-queue-safety.mjs';
@@ -358,7 +359,7 @@ export function sweepReviewHoldLabels({
       // The heal's own comment is not a verdict; every park/hold marker AFTER the accept is one.
       const FILES_API_CAP = 3000;
       const evalHeal = (st0) => {
-        const st = { ...st0, comments: (st0.comments ?? []).filter((c) => !String(c?.body ?? '').includes(STALE_PENDING_HEAL_MARKER)) };
+        const st = { ...st0, comments: (st0.comments ?? []).filter((c) => !(isTrustedMarkerAuthor(c) && String(c?.body ?? '').startsWith(STALE_PENDING_HEAL_MARKER))) };
         let rec = latestAcceptRecord(st.comments);
         const acc = (rec?.sha ?? '').toLowerCase();
         const hd = st.headRefOid.toLowerCase();

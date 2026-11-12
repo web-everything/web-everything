@@ -620,6 +620,11 @@ describe('#5045 park markers and file-list cap (R907)', () => {
     expect(r.flagged).toBeDefined();
     expect(p.calls.set).toEqual([]);
   });
+  it('keeps pending when an untrusted comment quotes the heal marker after the accept', () => {
+    const { p, r } = run([accept, { author: { login: 'someone-else' }, body: '<!-- stale-pending-heal -->\nI object' }], ['docs/a.md']);
+    expect(r.flagged).toBeDefined();
+    expect(p.calls.set).toEqual([]);
+  });
   it('keeps pending when the file list is at the API cap', () => {
     const { p, r } = run([accept], Array.from({ length: 3000 }, (_, i) => `docs/f${i}.md`));
     expect(r.flagReason).toBe('accept-current');

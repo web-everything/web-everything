@@ -3064,7 +3064,7 @@ describe('pending beside accepted', () => {
     const base = { ...facts, acceptedSha: facts.headSha };
     expect(decideContradictoryVerdictHeal(base)).toEqual({ heal: false, reason: 'accept-current' });
     expect(decideContradictoryVerdictHeal({ ...base, changedFiles: ['scripts/merge-ai-prs.mjs'] }).heal).toBe(false);
-    expect(decideContradictoryVerdictHeal({ ...base, currentLabels: [...facts.currentLabels, 'redteam:accepted'], changedFiles: ['scripts/merge-ai-prs.mjs'] }).heal).toBe(true);
+    expect(decideContradictoryVerdictHeal({ ...base, currentLabels: [...facts.currentLabels, 'redteam:accepted'], changedFiles: ['scripts/merge-ai-prs.mjs'] }).heal).toBe(false);
     expect(decideContradictoryVerdictHeal({ ...base, currentLabels: [...facts.currentLabels, 'redteam:accepted'] }).heal).toBe(false);
     expect(decideContradictoryVerdictHeal({ ...base, changedFiles: ['docs/a.md'], laterVerdict: true }).heal).toBe(false);
   });
