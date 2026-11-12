@@ -97,8 +97,11 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
     }
     // stand-down-answer.mjs quotes the operator's reason, so its scope-baseline is never alone on a line.
     // Read it from the verified answer record (trusted poster + exact rebuild checked by parseOperatorAnswer).
-    const answer = parseOperatorAnswer(raw);
-    const inAnswer = answer?.reason.match(/(?:^|\s)scope-baseline:\s*([0-9a-f]{40})(?![0-9a-f])/);
+    // Operator-authored only, naming a stand-down present in this thread, with the marker ending the reason
+    // (so quoted/negated prose such as "do not use scope-baseline: <sha>; rejected" cannot grant a reset).
+    const answer = c.operator ? parseOperatorAnswer(raw) : null;
+    const named = answer && (comments ?? []).some(x => x?.id && String(x.id) === answer.standDownId);
+    const inAnswer = named && answer.reason.match(/(?:^|\s)scope-baseline:\s*([0-9a-f]{40})\s*$/);
     if (inAnswer) baseline = inAnswer[1];
     if (/^🔓 conveyor fix-end/.test(c.body)) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;
