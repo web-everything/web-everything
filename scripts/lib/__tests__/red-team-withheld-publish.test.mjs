@@ -307,6 +307,15 @@ describe('stored red-team publication', () => {
     publishStoredRedTeamResult(io);
     expect(parseRedTeamComment(io.postComment.mock.calls[0][0].body).findings[0].confirmed).toBe(true);
   });
+  it('a gh slot-throttle on the comments read or the post never spends a publish attempt', () => {
+    const throttled = () => { throw Error('gh read failed (exit): gh-throttle: throttled \u2014 no gh slot within 8s (class=background); retry next tick'); };
+    for (const extra of [{ listComments: throttled }, { postComment: vi.fn(throttled) }]) {
+      const io = harness(stored('error'), extra);
+      for (let i = 0; i < 4; i++) expect(publishStoredRedTeamResult(io)).toEqual({ status: 'retry' });
+      expect(io.status.publishAttempts).toBeUndefined();
+      expect(io.publishNeedsYou).not.toHaveBeenCalled();
+    }
+  });
   it('error retries once, then escalates exactly once and never posts a third time', () => {
     const io = harness(stored('error'), { postComment: vi.fn(() => { throw Error('gh failed'); }) });
     expect(publishStoredRedTeamResult(io)).toMatchObject({ status: 'retry' });
