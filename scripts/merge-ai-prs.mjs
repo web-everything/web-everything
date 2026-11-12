@@ -4873,7 +4873,7 @@ async function runCli() {
           return license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
         } catch { return false; }
       } });
-    const guard = mqSameHeadGuard({ refresh, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+    const guard = mqSameHeadGuard({ refresh, dryRun: DRY_RUN, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
     const shown = { line: guard.reason ?? guard.line };
@@ -4882,7 +4882,7 @@ async function runCli() {
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
       sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
-        allowAlreadyQueued: false, refresh, log: line => process.stderr.write(`${line}\n`) }) });
+        allowAlreadyQueued: false, refresh, dryRun: DRY_RUN, log: line => process.stderr.write(`${line}\n`) }) });
     if (result?.enqueued === true) {
       try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
     }

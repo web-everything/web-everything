@@ -1,4 +1,5 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
+import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -108,11 +109,10 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Retain the operator-visible hold; a live operator re-enqueue can still reach bookkeeping below.
   let mergeConflictRemovals = 0;
   let failedChecksRemovals = 0;
-  let reenqueuedAfterFailure = false;
+  let reenqueuedAfterFailure = 0;
   for (const event of timeline.nodes) {
-    // The one retry is spent as soon as the PR is queued again after its failed removal, even if that
-    // retry later leaves the queue by a manual removal.
-    if (event?.__typename === 'AddedToMergeQueueEvent' && failedChecksRemovals > 0) reenqueuedAfterFailure = true;
+    // Each retry is spent when queued after a failed removal, including manual withdrawal.
+    if (event?.__typename === 'AddedToMergeQueueEvent' && failedChecksRemovals > 0) reenqueuedAfterFailure++;
     if (event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent') continue;
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
     const reason = mqRemovalReason(event);
@@ -134,23 +134,27 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
       else return hold(reason || 'unknown removal reason');
     }
   }
-  if (failedChecksRemovals > 1)
+  if (failedChecksRemovals > 2)
     return hold(`failed_checks (${failedChecksRemovals} removals on this head); operator must inspect history and enqueue manually`);
-  if (failedChecksRemovals === 1 && reenqueuedAfterFailure)
-    return hold('failed_checks (the single infrastructure retry was already spent); operator must inspect history and enqueue manually');
+  if (failedChecksRemovals > 0 && reenqueuedAfterFailure >= 2)
+    return hold('failed_checks (the two infrastructure retries were already spent); operator must inspect history and enqueue manually');
   // Every failing test is in the active red-main quarantine: a known flake, not a head failure.
   const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
-  if (failedChecksRemovals === 1 && !quarantineRetry && !(retryEvidence?.mainGreen === true
-    && ['infra', 'main-red'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
-    return hold('failed_checks');
+  if (failedChecksRemovals > 0 && !quarantineRetry && !(retryEvidence?.mainGreen === true
+    && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
+    // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
+    // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
+    return hold(reenqueuedAfterFailure > 0
+      ? 'failed_checks (re-queued after the failed removal without retry evidence); operator must inspect history and enqueue manually'
+      : 'failed_checks');
   if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
     return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
   if (mergeConflictRemovals > 0 && mergeState !== 'CLEAN')
     return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
   const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
-  return { hold: false, line: failedChecksRemovals === 1
+  return { hold: false, line: failedChecksRemovals > 0
     ? hold((quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
-      : `failed_checks infra retry 1/1 (main green, PR CLEAN, ${retryEvidence.infra})`) + retryDetails).line
+      : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
     : null };
 }
@@ -419,23 +423,25 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
   } catch { return null; }
 }
 
-/** At most ten failed jobs, with metadata, logs and main pages sharing a 20-call budget.
+/** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.
  * Incomplete evidence leaves the historical hold in place for operator inspection.
  */
-function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retryPolicy, now = Date.now() }) {
+function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, now = Date.now() }) {
   try {
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
       && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
-    if (timeline.error || timeline.hasPreviousPage !== false || removals.length !== 1
-      || mqRemovalReason(removals[0]) !== 'failed_checks') return null;
-    const removal = removals[0];
+    if (timeline.error || timeline.hasPreviousPage !== false || removals.length < 1 || removals.length > 2
+      || removals.some(event => mqRemovalReason(event) !== 'failed_checks')) return null;
+    if (timeline.nodes.filter(event => event?.__typename === 'AddedToMergeQueueEvent'
+      && timeline.nodes.indexOf(event) > timeline.nodes.indexOf(removals[0])).length >= 2) return null;
+    const removal = removals.at(-1);
     const oid = mqOid(removal.beforeCommit?.oid);
     const timestamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
     const removedAt = timestamp(removal.createdAt);
     if (!oid || !Number.isFinite(removedAt)) return null;
     // Reserve two calls for deciding main CI even when job evidence exhausts its allowance.
-    let budget = 20;
+    let budget = 30;
     const readPages = (endpoint, key) => {
       const items = [], ids = new Set();
       let total;
@@ -459,7 +465,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
       }
       throw new Error('truncated retry evidence; operator must inspect full history');
     };
-    const checks = readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs');
+    const attempts = inspectMqReruns({ checks: readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs'), repo, commit: oid, removedAt });
+    const checks = attempts.checks;
     const infraConclusions = new Set(['cancelled', 'timed_out', 'startup_failure']);
     const passing = new Set(['success', 'neutral', 'skipped']);
     if (checks.some(check => check.status !== 'completed'
@@ -482,11 +489,33 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
     const summaryInfra = check => infraConclusions.has(check.conclusion)
       || [check.output?.title, check.output?.summary].some(value => typeof value === 'string' && runnerLoss.test(value))
         && ![check.output?.title, check.output?.summary, check.output?.text].some(value => typeof value === 'string' && testFailure.test(value));
+    // Infra proof without logs: every failed job was cancelled/never ran, or the only real failure is the
+    // merge-gate's own red-main-freeze HOLD (caused by main, not by this PR). A real failing job never qualifies.
+    const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
+    // The merge-gate's reason is only in its job log: read it once (budgeted) and require the freeze to be the SOLE hold.
+    const gates = failed.filter(check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure');
+    let freezeProven = false;
+    if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
+      try {
+        const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
+        if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
+          budget--;
+          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}/logs`], {
+            encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
+            .slice(-MQ_INFRA_SCAN_BYTES);
+          const holds = log.split('\n').filter(line => /^\S+\s+hold\s{2,}\S+/.test(line));
+          freezeProven = holds.length === 1 && /^\S+\s+hold\s{2,}red-main-freeze\s+main is RED \(freeze:/.test(holds[0]);
+        }
+      } catch { /* unreadable gate log: the hold stays */ }
+    }
+    const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;
     const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
     const logVerdicts = new Map();
     const derived = new Set();
-    if (failed.length > MQ_INFRA_MAX_JOBS) {
+    if (noLogInfra) {
+      // No log reads: the job conclusions themselves are the evidence.
+    } else if (failed.length > MQ_INFRA_MAX_JOBS) {
       logReason = `failed-job count exceeds ${MQ_INFRA_MAX_JOBS}-job limit; operator must inspect failed jobs and enqueue manually`;
     } else {
       for (const check of failed) {
@@ -550,9 +579,15 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
     const intrinsic = failed.filter(check => !derived.has(check.id));
     const derivedNames = failed.filter(check => derived.has(check.id)).map(check => check.name
       .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' '));
-    if (!intrinsic.length)
+    if (!intrinsic.length && !noLogInfra)
       logReason = 'only derived aggregate failures; operator must inspect failed jobs and enqueue manually';
-    const infra = !logReason && intrinsic.every(check => (!hasAggregateCandidates && summaryInfra(check)) || logVerdicts.get(check.id) === true);
+    let infra = !logReason && (noLogInfra || intrinsic.every(check => (!hasAggregateCandidates && summaryInfra(check)) || logVerdicts.get(check.id) === true));
+    const rerun = requestMqReruns({ attempts, repo, exec, scope: rerunScope,
+      eligible: !infra && !logReason && !hasAggregateCandidates, dryRun,
+      spend: () => { if (budget <= 2) throw new Error('retry evidence budget exhausted'); budget--; } });
+    if (rerun.reason) logReason = rerun.reason;
+    if (attempts.reason) infra = false;
+    else if (!logReason && attempts.confirmed) infra = true;
     // These queries need only their first page, regardless of the workflow's history size.
     const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
     const readRunPage = (endpoint, limit, allowEmpty = false) => {
@@ -591,15 +626,18 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, quarantine, retry
     const ignored = new Set([...infraConclusions].filter(c => c !== 'timed_out').concat('stale', 'action_required'));
     const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
     const stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
+    const mergeState = readMqMergeState({ repo, pr, head, exec });
+    if (attempts.confirmed && mergeState !== 'CLEAN')
+      logReason = `PR is not CLEAN (${typeof mergeState === 'string' && /^[A-Z_]{1,32}$/.test(mergeState) ? mergeState : 'unknown'})`;
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: infra ? 'infra' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
-      mergeState: readMqMergeState({ repo, pr, head, exec }) };
+      mergeState };
   } catch { return null; }
 }
 
@@ -617,12 +655,13 @@ function mqRetryDeclineReason(evidence, holdLine) {
   return 'retry conditions not met';
 }
 
-export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, now = Date.now(),
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, dryRun = false, now = Date.now(),
   // Hermetic under test: the live ops/quarantine branch is only consulted when a test injects a reader.
   quarantine = { readList: process.env.VITEST || process.env.WE_UNDER_TEST ? null : () => readQuarantine() } } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
   // at enqueuePr's mutation boundary, even if another reader still reports the PR as queued.
+  const rerunScope = exec;
   exec = createMqLiveReader(exec);
   const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
@@ -633,7 +672,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
         retryEvidence: (retryEvidence = timelineHasFailedChecks(timeline, currentHead)
-          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, quarantine, now,
+          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (!decision.hold && decision.line) log(decision.line);
