@@ -21,7 +21,7 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
-import { publishRedTeamPolicyClearCheck, publishRedTeamCheckFromLive, clearLivePublicationHold, readRedTeamGateSource } from './red-team-check-run.mjs';
+import { createPolicyClearPublisher, publishRedTeamCheckFromLive, clearLivePublicationHold, readRedTeamGateSource } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -736,8 +736,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   // still attempted (as round writers publish in every mode), so a head settled during a rollback is not stranded
   // once the source switches back, but a failure does not block the settlement. Test runs need explicit IO for this
   // channel, as recordRedTeamStatus does.
-  const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : args => publishRedTeamPolicyClearCheck({
-    ...args, appId: env.WE_APP_ID, gh: (ghArgs, options) => runGhSync(ghArgs, { ...options, env }) }));
+  // The App id comes from the shared resolver (env, else the WE_APP_ID repository variable: the daemon never sets
+  // the env), and the writes run as that App, never this daemon's reviewer role (#6535 operator send-back).
+  const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : createPolicyClearPublisher({ env }));
   const publishPolicyClearCheck = (pr, head) => {
     if (!publisher) return;
     let posted;

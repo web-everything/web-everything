@@ -547,12 +547,14 @@ export function recordRedTeamStatus(input, options = {}) {
         const head = input.loopPayload?.findings?.read?.netBasis?.rev;
         // A publisher alone must not opt terminal evidence reads into real GitHub IO.
         const gh = options.gh ?? (underTest ? () => { throw Error('test publication evidence requires injected gh'); }
-          : (args, opts) => runGhSync(args, { ...opts, env: options.env ?? process.env }));
+          // A writer's own `opts.env` (the WE App identity, redTeamWriterEnv) wins over the drain's env (#6535).
+          : (args, opts) => runGhSync(args, { env: options.env ?? process.env, ...opts }));
         // Test runs need explicit IO for this channel too: a check publisher alone does not opt into status writes.
         const statusChannel = typeof options.postPublicationHold === 'function' || typeof options.gh === 'function' || !underTest;
         const postHold = ({ held, reason }) => {
           try {
-            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh });
+            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh,
+              env: options.env ?? process.env });
             if (result?.ok === true) return result;
             // `definite` is computed by the poster from the untruncated error; an injected poster may only say it in its reason.
             const why = String(result?.reason ?? '');
@@ -591,7 +593,8 @@ export function recordRedTeamStatus(input, options = {}) {
         const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: input.status, hold, sendBack });
         const post = payload => {
           try {
-            const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, pr: input.pr, headSha: head, payload, gh });
+            const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, pr: input.pr, headSha: head, payload, gh,
+              env: options.env ?? process.env });
             return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
           } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
         };

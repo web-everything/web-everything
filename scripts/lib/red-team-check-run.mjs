@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { withFileLock } from './atomic-json-file.mjs';
 import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { LEGACY_ROLE, ROLE_ENV } from './github-app-identity.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isPublishableRedTeamResult, readRedTeamDisposition, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
@@ -60,8 +61,68 @@ export function withRedTeamCheckLock({ repo, pr, headSha, env = process.env,
   }
 }
 
+/** The one fail-closed reason for a missing, invalid or unreadable WE App id (every reader and the writer). */
+export const WE_APP_ID_UNSET = 'WE_APP_ID unset or invalid; configure the WE App repository variable';
+
+/**
+ * The identity every red-team check-run and publication-hold WRITE uses (#6535 operator send-back, 2026-11-12):
+ * today's App, the one whose id is the repository variable WE_APP_ID and which readers already trust. A role App
+ * (the reviewer, merger or worker) holds only checks:read and statuses:read, and its runs would not be the trusted
+ * author anyway. The child env pins `WE_GITHUB_APP_ROLE=legacy`; the gh shim then uses today's App ONLY, never a
+ * role App, and fails closed (no personal fallback for a daemon) when its token is unavailable. Whatever role the
+ * calling process plays (`WE_GITHUB_APP_ROLE=reviewer` in the review daemon) is overridden for this call only.
+ */
+export const RED_TEAM_WRITER_ROLE = LEGACY_ROLE;
+// An inherited token (the caller's role App, applied as GH_TOKEN with its hash) would be used by the shim's
+// fallback or by a bare gh: it is dropped, so only the shim's today's-App token can authenticate the write.
+const INHERITED_AUTH = ['GH_TOKEN', 'GITHUB_TOKEN', 'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_AUTH_SOURCE', 'WE_GH_AUTH_INSTALLATION'];
+export const redTeamWriterEnv = (env = process.env) => {
+  const out = { ...env, [ROLE_ENV]: RED_TEAM_WRITER_ROLE };
+  for (const key of INHERITED_AUTH) delete out[key];
+  return out;
+};
+
+const weAppIdCache = new Map();
+/** Test seam: forget the per-process cache. */
+export function resetWeAppIdCacheForTest() { weAppIdCache.clear(); }
+
+/**
+ * The WE App id readers trust and the writer must author as (#6535 operator send-back). `env.WE_APP_ID` first (CI
+ * sets it from `vars.WE_APP_ID`); else the repository variable itself, read once per process and repo through today's
+ * App (`gh api repos/<repo>/actions/variables/WE_APP_ID --jq .value`; role Apps hold no Variables permission). A
+ * daemon never sets WE_APP_ID, so without this every reader and the policy-clear writer failed closed forever.
+ * Only a valid id is cached; an unreadable or invalid variable returns `ok:false` with {@link WE_APP_ID_UNSET} (and
+ * no appId), so a caller passing `appId` on keeps the existing fail-closed reason, and the next call retries.
+ * @returns {{ok:true, appId:string, source:'env'|'repository-variable'} | {ok:false, reason:string, detail?:string}}
+ */
+export function resolveWeAppId({ env = process.env, gh = runGhSync, repo } = {}) {
+  if (validApp(env?.WE_APP_ID)) return { ok: true, appId: String(env.WE_APP_ID), source: 'env' };
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) return { ...failure(WE_APP_ID_UNSET), detail: 'repository missing or invalid' };
+  const key = repo.toLowerCase();
+  if (weAppIdCache.has(key)) return weAppIdCache.get(key);
+  let value;
+  try {
+    value = String(gh(['api', `repos/${repo}/actions/variables/WE_APP_ID`, '--jq', '.value'],
+      { ...ioOptions, env: redTeamWriterEnv(env) }) ?? '').trim();
+  } catch (error) { return { ...failure(WE_APP_ID_UNSET), detail: `repository variable unreadable: ${message(error)}` }; }
+  if (!validApp(value)) return { ...failure(WE_APP_ID_UNSET), detail: 'repository variable missing or invalid' };
+  const resolved = { ok: true, appId: value, source: 'repository-variable' };
+  weAppIdCache.set(key, resolved);
+  return resolved;
+}
+
+/** The daemon's policy-clear writer: resolve the trusted App id, then publish as that App (never the caller's role). */
+export function createPolicyClearPublisher({ env = process.env, run = runGhSync, publish = publishRedTeamPolicyClearCheck } = {}) {
+  const gh = (ghArgs, options = {}) => run(ghArgs, { env, ...options });
+  return args => {
+    const app = resolveWeAppId({ env, gh, repo: args?.repo });
+    if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
+    return publish({ ...args, appId: app.appId, env, gh });
+  };
+}
+
 export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId } = {}) {
-  if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
+  if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha)) return failure('red-team head missing or invalid');
   if (!Array.isArray(checkRuns)) return failure('red-team check runs unreadable');
   const identity = prIdentity(repo, pr);
@@ -106,17 +167,18 @@ export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBa
       summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000) } };
 }
 
-/** Publication is best effort; callers must persist local status before calling. */
+/** Publication is best effort; callers must persist local status before calling. Posts as the WE App
+ * ({@link redTeamWriterEnv}); a caller's `gh` must let `options.env` win over its own env. */
 export function postRedTeamCheckRun(options = {}) {
   return withRedTeamCheckLock(options, () => postRedTeamCheckRunUnlocked(options));
 }
 
-function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSync } = {}) {
+function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSync, env = process.env } = {}) {
   try {
     if (!validHead(headSha) || payload?.head_sha !== headSha || !prIdentity(repo, pr)
       || payload.external_id !== prIdentity(repo, pr)) throw Error('invalid red-team check identity or external_id');
     gh(['api', `repos/${repo}/check-runs`, '--method', 'POST', '--input', '-'],
-      { ...ioOptions, input: JSON.stringify(payload) });
+      { ...ioOptions, input: JSON.stringify(payload), env: redTeamWriterEnv(env) });
     return { ok: true };
   } catch (error) { return failure(`red-team check publication failed: ${message(error)}`); }
 }
@@ -163,18 +225,18 @@ export function publishRedTeamPolicyClearCheck(options = {}) {
   return withRedTeamCheckLock(options, () => publishRedTeamPolicyClearCheckUnlocked(options));
 }
 
-function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
+function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env } = {}) {
   const before = readPolicyClearView({ repo, pr, headSha, appId, gh });
   if (before.ok !== true) return failure(`policy-clear check not posted: ${before.reason}`);
   if (before.current === before.desired) return before.desired === 'success'
     ? { ok: true, reason: 'red-team check already clear on head' }
     : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
-  if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, state: before.desired });
-  const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh,
+  if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
+  const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
   if (posted.ok !== true) return posted;
   const after = readPolicyClearView({ repo, pr, headSha, appId, gh });
-  if (after.ok !== true) return supersede({ repo, pr, headSha, gh, state: 'in_progress',
+  if (after.ok !== true) return supersede({ repo, pr, headSha, gh, env, state: 'in_progress',
     detail: `re-read after publication failed (${after.reason})` });
   if (after.desired === 'success' && after.current === 'success') return posted;
   // No round run requires anything else, but its success is not the newest run (a lagging read, or another
@@ -182,15 +244,15 @@ function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh =
   // re-reads and posts the success again only if it is still not newest.
   if (after.desired === 'success') return failure(`policy-clear unverified: newest run shows ${after.current}, not its success; retry`);
   if (after.current === after.desired) return { ...failure(POLICY_CLEAR_YIELDED), detail: 'a newer round run is authoritative' };
-  return supersede({ repo, pr, headSha, gh, state: after.desired });
+  return supersede({ repo, pr, headSha, gh, env, state: after.desired });
 }
 
 const runState = run => run.status !== 'completed' ? 'in_progress' : run.conclusion === 'success' ? 'success' : 'failure';
 const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
 
 /** Post a policy-clear run that mirrors the round's state, so the round (never this writer's success) is newest. */
-function supersede({ repo, pr, headSha, gh, state, detail }) {
-  const yielded = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, payload: redTeamCheckRunPayload({ repo, pr, headSha,
+function supersede({ repo, pr, headSha, gh, env, state, detail }) {
+  const yielded = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env, payload: redTeamCheckRunPayload({ repo, pr, headSha,
     status: state === 'failure' ? 'finished' : 'in_progress', hold: `${POLICY_CLEAR_YIELDED}${detail ? `: ${detail}` : ''}`,
     sendBack: state === 'failure', policyClear: true }) });
   return { ...failure(POLICY_CLEAR_YIELDED),
@@ -201,7 +263,7 @@ function supersede({ repo, pr, headSha, gh, state, detail }) {
  * Whole-head refusals (unreadable, truncated, another PR only, unordered ids, bad identity) are kept from the gate's
  * own evaluator. */
 function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
-  if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
+  if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   let data;
   try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions)); }
@@ -341,14 +403,14 @@ export const redTeamPublicationContext = pr => /^[1-9]\d*$/.test(String(pr ?? ''
   ? `${RED_TEAM_PUBLICATION_CONTEXT} #${Number(pr)}` : null;
 
 /** Deliberately NOT under the check lock: this is the last-resort hold for when check writes (or the lock) fail. */
-export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '', gh = runGhSync } = {}) {
+export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '', gh = runGhSync, env = process.env } = {}) {
   try {
     const context = redTeamPublicationContext(pr);
     if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context) throw Error('invalid red-team publication hold identity (repo, PR number and head required)');
     const description = String(held ? `held: ${reason || 'red-team round not confirmed published'}` : 'red-team publication confirmed')
       .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 140);
     gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
-      { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context, description }) });
+      { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context, description }), env: redTeamWriterEnv(env) });
     return { ok: true };
   } catch (error) {
     // A definite rejection (HTTP 4xx) created or changed no status. Read it from the FULL error text, before the
@@ -433,7 +495,7 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
 
 /** One bounded read; incomplete evidence needs operator inspection rather than a guessed pass. */
 function readRedTeamCheckRuns({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
-  if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
+  if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   try {
     const data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions));
