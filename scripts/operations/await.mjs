@@ -3,6 +3,7 @@
  * No run records are persisted; a timeout returns a command the operator can resume.
  */
 import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -82,6 +83,13 @@ function defaultExec(file, args, { timeout }) {
   if (file === 'git') {
     // Never inherit repository overrides (GIT_DIR, GIT_WORK_TREE, ...): the probe must read only the named clone.
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+    env.GIT_NO_REPLACE_OBJECTS = '1'; // replacement refs must not falsify ancestry
+    env.GIT_NO_LAZY_FETCH = '1';
+    const dir = args[1];
+    // The named directory must itself be the repository root, never a parent repository git discovered.
+    if (args[0] === '-C' && execFileSync(file, ['-C', dir, 'rev-parse', '--show-toplevel'], { ...options, env }).trim() !== realpathSync(dir)) {
+      throw new Error('not a repository root');
+    }
     return execFileSync(file, args, { ...options, env });
   }
   throw new Error('unsupported executable');
@@ -89,10 +97,8 @@ function defaultExec(file, args, { timeout }) {
 
 /** A daemon clone is named by its registry entry (`wev-fix-daemon`, `.lanes/we-drain-daemon/code`), relative to the workspace root. */
 export function cloneDir(name) {
-  const root = join(homedir(), 'workspace');
-  const dedicated = join(root, '.daemon-clones', name);
-  // Deterministic by registry shape: pool-style entries live under .lanes, the rest under .daemon-clones.
-  return name.startsWith('.lanes/') ? join(root, name) : dedicated;
+  // Same resolution as the registry's own `daemonCloneRoots`: seed name joined directly under the workspace root.
+  return join(homedir(), 'workspace', name);
 }
 
 function resumeCommand(opts) {
