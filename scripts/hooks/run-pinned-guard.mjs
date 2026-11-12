@@ -158,8 +158,6 @@ try {
   // Freshness is not repository evidence. Pin Git's metadata path so it cannot
   // discover a parent checkout when this clone is damaged or incomplete.
   git('--git-dir', join(clone, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}');
-  const entries = git('-C', clone, 'ls-files', '-v', '-z').split('\0');
-  if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
   // --ignored: a file hidden by .gitignore or info/exclude (e.g. a planted node_modules
   // package shadowing a bare import) is not part of the pinned revision either.
   // A reader can race the index refresh after a sync (index.lock held by a sibling launcher,
@@ -167,6 +165,9 @@ try {
   // across every attempt and still denies.
   for (let attempt = 1; ; attempt++) {
     try {
+      // All evidence is re-read on every attempt: a pass needs every check clean on the same attempt.
+      const entries = git('-C', clone, 'ls-files', '-v', '-z').split('\0');
+      if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
       const hidden = entries.slice(0, -1).filter(entry => !entry.startsWith('H '));
       const dirty = git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored');
       if (hidden.length || dirty) {

@@ -558,6 +558,33 @@ process.exit(result.status ?? 2);
     if (check === 'ls-files') expect(audit.slice(-3)).toEqual(['ls-files', '-v', '-z']);
     else expect(audit.slice(-4)).toEqual(['diff-index', '--quiet', 'HEAD', '--']);
   });
+  describe('retry re-reads all evidence on every attempt', () => {
+    const wrap = (f, body) => {
+      const realGit = spawnSync('which', ['git'], {encoding:'utf8'}).stdout.trim();
+      const bin = join(f.temp, 'bin'); mkdirSync(bin);
+      const count = join(f.temp, 'count');
+      writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const {appendFileSync, readFileSync} = require('node:fs');
+const {spawnSync} = require('node:child_process');
+const args = process.argv.slice(2);
+const seen = name => { appendFileSync(${JSON.stringify(count)}, name+'\\n'); return readFileSync(${JSON.stringify(count)}, 'utf8').split('\\n').filter(x => x === name).length; };
+${body}
+const result = spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'});
+process.exit(result.status ?? 2);
+`, {mode:0o755});
+      f.env.PATH = bin + ':' + f.env.PATH;
+    };
+    it('passes only after a transient dirty status clears and everything is clean together', () => {
+      const f = fixture();
+      wrap(f, "if (args.includes('status') && seen('status') === 1) { console.log(' M scripts/guard-bash.mjs'); process.exit(0); }");
+      expect(f.launch()).toMatchObject({status: 0});
+    });
+    it('denies when a hidden-flag entry appears on a later attempt after an earlier dirty status', () => {
+      const f = fixture();
+      wrap(f, "if (args.includes('status') && seen('status') === 1) { console.log(' M scripts/guard-bash.mjs'); process.exit(0); }\nif (args.includes('ls-files') && seen('ls-files') >= 2) { process.stdout.write('S scripts/guard-bash.mjs\\0'); process.exit(0); }");
+      expect(f.launch()).toMatchObject({status: 2, stdout: '', stderr: expect.stringContaining('not pristine')});
+    });
+  });
   it('derives the clone from its own realpath despite a hostile clone override', () => {
     const f = fixture(); f.env.WE_GUARD_CLONE = f.lane;
     expect(f.launch().status).toBe(0);
