@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.we.guard-main-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_PATH__</string>
+    <string>__GUARD_CLONE_PATH__/scripts/hooks/sync-guard-clone.mjs</string>
+    <string>--origin=__ORIGIN_URL__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>WE_GUARD_CLONE</key><string>__GUARD_CLONE_PATH__</string>
+    <key>PATH</key><string>__EXECUTABLE_PATH__</string>
+  </dict>
+  <key>WorkingDirectory</key><string>__GUARD_CLONE_PATH__</string>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__LOG_DIRECTORY__/guard-main-sync.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIRECTORY__/guard-main-sync.err</string>
+</dict>
+</plist>

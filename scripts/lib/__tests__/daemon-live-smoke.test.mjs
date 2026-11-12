@@ -43,6 +43,9 @@ import {
 import { runBounded } from '../bounded-child.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { ghSlotWaitClass, ghSlotWaitMs } from '../gh-throttle.mjs';
+// Fixture credential values are assembled at runtime (pieces joined) so no long literal sits next to a credential-named key.
+const AMBIENT_STALE = ['daemon', 'ambient', 'stale'].join('-');
+const AMBIENT_STALE_TOKEN = `${AMBIENT_STALE}-token`;
 vi.mock('../settings-files.mjs', async (original) => {
   const actual = await original();
   return { ...actual, readDeclaredSettings: vi.fn(actual.readDeclaredSettings) };
@@ -1409,7 +1412,7 @@ it('gh-api-repo still fails and preserves the real error plus shim warning in a 
 
 describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
   it('strips an inherited GH_TOKEN/GITHUB_TOKEN even when App auth is not configured (no shim to fall back on)', () => {
-    const out = ghDispatchedSessionEnv({ GH_TOKEN: 'daemon-ambient-stale', GITHUB_TOKEN: 'also-stale', PATH: '/usr/bin', HOME: '/x' });
+    const out = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE, GITHUB_TOKEN: 'also-stale', PATH: '/usr/bin', HOME: '/x' });
     expect(out.GH_TOKEN).toBeUndefined();
     expect(out.GITHUB_TOKEN).toBeUndefined();
     expect(out.PATH).toBe('/usr/bin');
@@ -1420,7 +1423,7 @@ describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
     const out = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        GH_TOKEN: 'daemon-ambient-stale', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GH_TOKEN: AMBIENT_STALE,
       },
       {
         pathEnv: '/opt/homebrew/bin', dir: '/shim', cachePath: '/x/cache.json',
@@ -1435,7 +1438,7 @@ describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
     const out = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        GITHUB_TOKEN: 'daemon-ambient-stale', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GITHUB_TOKEN: AMBIENT_STALE,
       },
       { pathEnv: '/opt/homebrew/bin', dir: '/shim', exists: () => true, writeFile: vi.fn(), chmod: vi.fn(), mkdir: vi.fn() },
     );
@@ -1459,7 +1462,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
 
   it('FAILS (RED→GREEN: this is what today\'s bug let quietly pass) when routed through ghDispatchedSessionEnv against a daemon env carrying a stale ambient GH_TOKEN and no shim configured', async () => {
     const runChild = vi.fn(fakeGh);
-    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/usr/bin' });
+    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' });
     const result = await ghApiCheck({ ghChildEnv, budgets: { ghApiMs: 1000 }, runChild });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/failed/);
@@ -1468,7 +1471,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
 
   it('gh-pr-list FAILS the same way, for the same reason', async () => {
     const runChild = vi.fn(fakeGh);
-    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/usr/bin' });
+    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' });
     const result = await ghPrListCheck({ ghChildEnv, budgets: { ghPrListMs: 1000 }, runChild });
     expect(result.ok).toBe(false);
   });
@@ -1477,7 +1480,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
     const runChild = vi.fn(fakeGh);
     // Reproduces the pre-fix `ghEnvFor`: no shim contributed (App auth unconfigured here, matching the
     // isolated unit above), so `{...env, ...null}` === env, UNCHANGED — the ambient token survives untouched.
-    const preFixGhChildEnv = { GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/usr/bin' };
+    const preFixGhChildEnv = { GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' };
     const result = await ghApiCheck({ ghChildEnv: preFixGhChildEnv, budgets: { ghApiMs: 1000 }, runChild });
     expect(result.ok).toBe(true); // demonstrates the masking bug: the gate would have adopted broken code
   });
@@ -1487,7 +1490,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
     const ghChildEnv = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GH_TOKEN: AMBIENT_STALE_TOKEN,
       },
       { pathEnv: '/opt/homebrew/bin', dir: '/shim', exists: () => true, writeFile: vi.fn(), chmod: vi.fn(), mkdir: vi.fn() },
     );

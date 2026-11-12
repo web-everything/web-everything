@@ -83,6 +83,7 @@
  * Protocol: reads the PreToolUse event JSON on stdin, denies via exit code 2 + a stderr message (mirrors
  * scripts/backlog-guard.mjs). Fail-OPEN on any internal error — a guard bug must never wedge the agent.
  */
+import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -237,9 +238,8 @@ if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fi
       const ev = JSON.parse(readFileSync(0, 'utf8') || '{}');
       const file = ev?.tool_input?.file_path;
       if (file) {
-        // Roots derived from this script's own location so the hook is portable:
-        //   <workspace>/<repo>/scripts/guard-lane.mjs  →  <workspace> is the shared parent of every checkout.
-        const weRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+        // The launcher supplies the operated checkout; unpinned calls retain the script-location root.
+        const weRoot = hookRoot(import.meta.url);
         const real = resolveReal(file);
         // #2997 — collect the target lane's LIVE lease + this caller's durable session id (the impure half),
         // then hand both to the pure decision. Keyed on `CLAUDE_CODE_SESSION_ID` FIRST, the SAME source

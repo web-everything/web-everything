@@ -3,9 +3,14 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { credentialContentFinding } from '../forge-exec-manifest.mjs';
+import { credentialContentFinding, credentialContentWarning } from '../forge-exec-manifest.mjs';
 
-const scan = (text, path = 'scripts/lib/example.mjs') => credentialContentFinding(Buffer.from(path), Buffer.from(text));
+// A high-entropy value is advisory evidence (a warning); token formats and unbounded blocks still block.
+// The code-expression exemptions sit on the warning path, so read the block verdict first, then the warning.
+const scan = (text, path = 'scripts/lib/example.mjs') => {
+  const content = Buffer.from(text);
+  return credentialContentFinding(Buffer.from(path), content) ?? credentialContentWarning(Buffer.from(path), content);
+};
 const literal = 'abcdefghij0123456789XYZ';
 
 // Forge fell back to the loaded Mac when ordinary source lines such as `keys: [index], at: r.at, action });`
@@ -195,5 +200,6 @@ describe('forge scan test files pass their own scan', () => {
   it.each(['forge-exec-manifest.test.mjs', 'forge-scan-code-expression.test.mjs'])('%s has no credential finding', name => {
     const content = readFileSync(join(dir, name));
     expect(credentialContentFinding(Buffer.from(`scripts/readiness/__tests__/${name}`), content)).toBeNull();
+    expect(credentialContentWarning(Buffer.from(`scripts/readiness/__tests__/${name}`), content)).toBeNull();
   });
 });

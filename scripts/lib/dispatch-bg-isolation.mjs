@@ -51,6 +51,7 @@
 import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { pinnedHookScript } from './pinned-hook-command.mjs';
 
 /** The settings PATCH that disables Claude Code's own background-session isolation guard. Frozen — every
  *  caller merges this same literal value, never a hand-rolled equivalent. */
@@ -112,12 +113,12 @@ export function resolveGuardRepoRoot({ fileUrl = import.meta.url, exists = (p) =
 }
 
 /**
- * xl5reby — the repo's PreToolUse guard hooks, rewritten so every script path is ABSOLUTE (`node scripts/x.mjs`
- * resolves against the session cwd, and a dispatched worker's cwd is a scratch dir with no `scripts/`). PURE.
+ * xl5reby — the repo's PreToolUse guard hooks. Legacy direct script paths become absolute because a worker
+ * starts in a scratch directory with no `scripts/`. Pinned launcher commands retain their own path resolution. PURE.
  * Only PreToolUse is carried: those are the deny guards. SessionStart/Stop/PostToolUse hooks do bookkeeping with
- * side effects meant for interactive sessions and stay out. A command that is not a plain `node scripts/...` is
- * skipped rather than guessed at. The guards locate the primaries and the lane from their OWN location and the
- * event payload, never from the process cwd, so an absolute path is all they need.
+ * side effects meant for interactive sessions and stay out. Pinned launcher commands are carried unchanged;
+ * their script argument resolves inside the pinned clone. Other unrecognized commands are skipped. Legacy guards
+ * locate the primaries and the lane from their OWN location and the event payload, never from the process cwd.
  * @param {{preToolUse?: Array, repoRoot: string}} o
  * @returns {Array<{matcher?: string, hooks: Array<{type: string, command: string}>}>}
  */
@@ -127,6 +128,10 @@ export function dispatchGuardHooks({ preToolUse, repoRoot }) {
   for (const g of groups) {
     const hooks = [];
     for (const h of g?.hooks ?? []) {
+      if (h?.type === 'command' && pinnedHookScript(h.command)) {
+        hooks.push({ ...h });
+        continue;
+      }
       const m = h?.type === 'command' && typeof h.command === 'string' ? /^node (scripts\/\S+)(.*)$/.exec(h.command) : null;
       if (m) hooks.push({ type: 'command', command: `node "${join(repoRoot, m[1])}"${m[2]}` });
     }
@@ -138,7 +143,7 @@ export function dispatchGuardHooks({ preToolUse, repoRoot }) {
 /**
  * xl5reby — THE SAFETY GAP: a dispatched worker starts in `.operations/dispatch/<id>`, which has no repo
  * `.claude/settings.json`, so the repo's PreToolUse guards (guard-bash, guard-lane, ...) never ran for it.
- * This merges them (absolute paths) into the worker's OWN `<cwd>/.claude/settings.local.json`. Why this file
+ * This merges them (pinned commands or legacy absolute paths) into the worker's OWN `<cwd>/.claude/settings.local.json`. Why this file
  * and not `--settings` or user-level hooks: the local settings file is read fresh from the start directory on
  * every task (the `--settings` JSON is skipped when the CLI hands out a pre-warmed spare session, see the
  * header), and it is scoped to this one worker, so nothing leaks to the operator's other sessions. ADDITIVE and

@@ -1,4 +1,4 @@
-import { assertJudgeReason, assertCardFiling, cardFilingBinding, buildRulingCardInput, cardFilingVerdict, rulingCardSteps, judgeRulingInput, landedRulingCard } from './record-referral-ruling.mjs';
+import { withNonRegressionEvidence, assertJudgeReason, assertCardFiling, cardFilingBinding, buildRulingCardInput, cardFilingVerdict, rulingCardSteps, judgeRulingInput, landedRulingCard } from './record-referral-ruling.mjs';
 import { classAction, allClasses } from '../lib/finding-class-policy.mjs';
 import { breakClass } from '../lib/red-team-gate.mjs';
 /**
@@ -230,6 +230,7 @@ function selectRedTeamRulingFindings(read, input) {
 
 /** THE VERDICT. Validate, select, and describe the writes. PURE. */
 export function planRedTeamRuling(read, input) {
+  input = withNonRegressionEvidence(read, input).input;
   validateRedTeamRulingInput(read, input);
   const { pr, ruling, actor, channel, reason } = input;
   const { head, comments, scope, state, atCap, selected } = selectRedTeamRulingFindings(read, input);
@@ -266,7 +267,7 @@ export function planRedTeamCard(read, input) {
   validateRedTeamRulingInput(read, input);
   const { selected, state } = selectRedTeamRulingFindings(read, input);
   const policy = read.setting?.findingClasses ?? {};
-  if (selected.some(f => f.securityReachableToday === true || !(classAction(f, policy) === 'defer-card'
+  if (!withNonRegressionEvidence(read, input).evidence && selected.some(f => f.securityReachableToday === true || !(classAction(f, policy) === 'defer-card'
     || (breakClass(f) === 'degraded' && read.setting?.degraded === 'card'
       && allClasses(f).length > 0 && !allClasses(f).some(c => classAction({ ...f, findingClass: c, alsoClasses: [] }, policy) === 'fix-now')))))
     throw new Error('fileCard refuses a fix-now or security break; only coverage-class findings can be carded');
@@ -292,6 +293,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
       reason: 'string',
       card: { type: 'string', required: false },
       fileCard: { type: 'boolean', required: false },
+      notWorseThanMain: { type: 'string', required: false },
       cause: { type: 'string', enum: [...FALSE_FINDING_CAUSES], required: false },
       preview: { type: 'boolean', required: false, default: false },
     },
@@ -307,7 +309,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
       return selected.map(f => ({ ...f, runId: state.resultId, key: String(f.index) }));
     }),
     plan: compute({
-      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
+      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.notWorseThanMain', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
       fn: (view) => {
         const plan = cardFilingVerdict(view) ?? planRedTeamRuling(view.findings.reread ?? view.findings.read, (landedRulingCard(view.findings)?.input ?? view.input));
         if (landedRulingCard(view.findings)?.judgeEvidence) plan.judgeEvidence = landedRulingCard(view.findings)?.judgeEvidence;
