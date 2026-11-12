@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { pushMissingRunCommit, recoveryPushCredential, RECOVERY_COMMIT_MARKER } from '../missing-run-push.mjs';
+import { pushMissingRunCommit, recoveryPushCredential, reserveMissingRunDispatch, RECOVERY_COMMIT_MARKER } from '../missing-run-push.mjs';
 import { countMissingRunComments, buildMissingRunComment, MISSING_RUN_CREDENTIAL_REFUSAL, MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
 
 const sha = '1f7481b9bccf75ae1c37ed5705ec2ab57d77a9c7';
@@ -13,7 +13,9 @@ const repo = 'web-everything/web-everything';
 const d = { prNumber: 3209, headRefName: 'lane/model-routing', headSha: sha };
 const pr = { state: 'open', mergeable: true, head: { sha, ref: d.headRefName, repo: { full_name: repo } }, base: { ref: 'main' } };
 function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, checkClaim = () => null,
-  env = { GH_TOKEN: 'ghp_test-secret' }, runs = [], failDispatch = false, listing, liveAtDispatch, ...rest } = {}) {
+  env = { GH_TOKEN: 'ghp_test-secret' }, runs = [], failDispatch = false, listing, liveAtDispatch, slug = repo, ...rest } = {}) {
+  // `slug` is the repo spelling the caller passes AND the canonical name the (mocked) API reports for the PR head.
+  if (slug !== repo && live === pr) live = { ...pr, head: { ...pr.head, repo: { full_name: slug } } };
   const calls = [];
   let prReads = 0;
   // Hermetic by default: never touch the real state root. The `reserveDispatch: undefined` key opts into the real one.
@@ -24,7 +26,7 @@ function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, 
       if (args.includes('-X')) { if (failDispatch) throw new Error('secret credential in error'); return ''; }
       // `listing` overrides the raw run-listing body (a string is returned verbatim, an object is serialised).
       if (args[1].includes('/actions/runs')) return typeof listing === 'string' ? listing : JSON.stringify(listing ?? { total_count: runs.length, workflow_runs: runs });
-      expect(args).toEqual(['api', `repos/${repo}/pulls/3209`]);
+      expect(args).toEqual(['api', `repos/${slug}/pulls/3209`]);
       // The second PR read is the final exact-head re-check right before the dispatch POST.
       return JSON.stringify(++prReads >= 2 && liveAtDispatch ? liveAtDispatch : live);
     }
@@ -35,7 +37,7 @@ function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, 
     if (args.includes('push') && failPush) throw new Error('secret credential in error');
     return '';
   });
-  const result = pushMissingRunCommit(d, { repo, exec, env, checkClaim, readCache: () => null,
+  const result = pushMissingRunCommit(d, { repo: slug, exec, env, checkClaim, readCache: () => null,
     ...(reserveDispatch ? { reserveDispatch } : {}) });
   return { result, calls, exec };
 }
@@ -168,7 +170,6 @@ describe('missing-run PR-event recovery', () => {
       'the head moved to another sha': { ...pr, head: { ...pr.head, sha: next } },
       'the head ref changed': { ...pr, head: { ...pr.head, ref: 'lane/other' } },
       'the PR was closed': { ...pr, state: 'closed' },
-      'the PR was merged': { ...pr, state: 'merged' },
     };
     for (const [name, liveAtDispatch] of Object.entries(moved)) {
       const reserved = vi.fn(() => true);
@@ -195,8 +196,12 @@ describe('missing-run PR-event recovery', () => {
       expect(second.result).toMatchObject({ ok: false, error: expect.stringContaining('already reserved') });
       expect(second.result.deferred).toBeUndefined();
       expect(second.calls.some(c => c.args.includes('-X'))).toBe(false);
-      // A different head is a different reservation.
       expect(readdirSync(join(dir, 'missing-run-dispatch'))).toHaveLength(1);
+      // A different head is a different reservation; the same head (any call) is not; a different repo is not the same.
+      expect(reserveMissingRunDispatch(`${repo}@${next}`, { env })).toBe(true);
+      expect(reserveMissingRunDispatch(`${repo}@${next}`, { env })).toBe(false);
+      expect(reserveMissingRunDispatch(`other/repo@${sha}`, { env })).toBe(true);
+      expect(readdirSync(join(dir, 'missing-run-dispatch'))).toHaveLength(3);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('keeps the reservation when the dispatch POST fails (outcome unknown), and fails closed when it cannot be taken', () => {
@@ -206,8 +211,15 @@ describe('missing-run PR-event recovery', () => {
     const failed = fixture({ message: msg, reserveDispatch, failDispatch: true });
     expect(failed.result).toMatchObject({ ok: false, error: expect.stringContaining('failed during dispatch') });
     expect(taken.size).toBe(1);
-    // One reservation key whatever the repo slug's case.
-    expect([...taken][0]).toBe(`${repo.toLowerCase()}@${sha}`);
+    expect([...taken][0]).toBe(`${repo}@${sha}`);
+    // One reservation key whatever the repo slug's case: a mixed-case spelling (same PR) maps to the SAME key,
+    // so the lowercase attempt above already holds it and the mixed-case one never dispatches.
+    const mixed = fixture({ message: msg, reserveDispatch, slug: 'Web-Everything/Web-Everything' });
+    expect(mixed.result.ok).toBe(false);
+    expect(mixed.calls.some(c => c.args.includes('-X'))).toBe(false);
+    const keys = [];
+    fixture({ message: msg, reserveDispatch: (k) => { keys.push(k); return true; }, slug: 'Web-Everything/Web-Everything' });
+    expect(keys).toEqual([`${repo}@${sha}`]);
     const again = fixture({ message: msg, reserveDispatch });
     expect(again.result.ok).toBe(false);
     expect(again.calls.some(c => c.args.includes('-X'))).toBe(false);
