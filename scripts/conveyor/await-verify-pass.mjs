@@ -53,6 +53,7 @@ import { fixPushGate } from '../lib/review-timing.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { readReviewHead, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { headCiVerdict } from './fix-push-ci.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -450,6 +451,34 @@ async function previousCiPushGate({ io, record, nowMs, policy, persist }) {
   return decision;
 }
 
+/** verify.infraFallbackToCi: standard ON; WE_VERIFY_INFRA_FALLBACK_TO_CI=0|false|off, else the tool layer's `verify.infraFallbackToCi`. */
+export function resolveInfraFallbackToCi({ env = process.env, tool } = {}) {
+  const raw = String(env?.WE_VERIFY_INFRA_FALLBACK_TO_CI ?? '').trim().toLowerCase();
+  if (['0', 'false', 'off'].includes(raw)) return { enabled: false, source: 'environment' };
+  if (['1', 'true', 'on'].includes(raw)) return { enabled: true, source: 'environment' };
+  if (typeof tool?.infraFallbackToCi === 'boolean') return { enabled: tool.infraFallbackToCi, source: 'tool' };
+  return { enabled: true, source: 'standard' };
+}
+/**
+ * An infrastructure-only local verify failure (no test verdict) whose retries are spent is settled by CI: the exact pushed
+ * head's required `test` check must be green (and every other required check). Anything unreadable, partial, for another
+ * head, or not a plain infrastructure failure returns null, so today's infra ladder stands. A real red is never masked.
+ */
+async function infraCiGreenFallback({ io, record, marker }) {
+  try {
+    const setting = typeof io.infraFallbackToCi === 'function' ? io.infraFallbackToCi() : null;
+    if (setting?.enabled !== true || record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure') return null;
+    if (!record.earlyPush?.ok || lower(record.earlyPush.sha) !== lower(record.sha)) return null;
+    if (typeof io.readPreviousHead !== 'function' || typeof io.readPreviousRequired !== 'function' || typeof io.readPreviousChecks !== 'function') return null;
+    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
+    const required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }))?.checks ?? [];
+    if (!required.includes('test')) return null;
+    const checks = await io.readPreviousChecks({ repo: record.repo, headSha: record.sha });
+    if (headCiVerdict(checks, required) !== 'green' || headCiVerdict(checks, ['test']) !== 'green') return null;
+    return `required CI green on pushed head ${String(record.sha).slice(0, 8)}; verify.infraFallbackToCi=on (${setting.source ?? 'standard'})`;
+  } catch { return null; }
+}
+
 /**
  * Apply the policy to every stored record once. Every effect is an injected port, so the whole pass replays
  * offline (see the test's fix-4115 replay).
@@ -596,6 +625,14 @@ export async function runAwaitVerifyPass({
           row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
         }
         rows.push(row); continue;
+      }
+      if (record?.kind === 'fix' && (d.resume === 'infra' || record.infraRetry?.exhausted
+        || (record.infraRetry?.attempts ?? 0) >= (recovery.value.infraRetry?.maxAttempts ?? Infinity))) {
+        const fallback = await infraCiGreenFallback({ io, record, marker });
+        if (fallback) {
+          d = { action: 'push', reason: `infra-ci-green-fallback: ${fallback}` };
+          Object.assign(row, { action: d.action, reason: d.reason });
+        }
       }
       if (record?.kind === 'fix' && (d.resume === 'infra'
         || (record.infraRetry?.scheduled && d.action === 'wait')
@@ -997,6 +1034,7 @@ export async function defaultAwaitVerifyIo({
     readPreviousChecks: readReviewChecks,
     readPreviousRequired: getRequiredStatusChecks,
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
+    infraFallbackToCi: () => { let tool; try { tool = readSettings()?.verify; } catch { /* absent tool layer */ } return resolveInfraFallbackToCi({ env, tool }); },
     loadHigh: () => {
       try { return !legacyLoadQuiet(loadavg(), cpus().length, reverifyConfig(env)); }
       catch { return false; }
