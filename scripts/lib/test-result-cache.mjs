@@ -15,7 +15,8 @@
  * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override those limits. Active runs and runs
  * younger than 6 hours are protected. A different run that is alive but idle over 6 hours is NOT yet protected
  * (owner-PID liveness is a follow-up card).
- * Key contexts prune at most hourly, only for enabled cache runs.
+ * Key contexts prune at most hourly, only for enabled cache runs (so createKeyContext is no longer read-only
+ * in that case: it may delete old trace run dirs and write .prune-stamp).
  */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';

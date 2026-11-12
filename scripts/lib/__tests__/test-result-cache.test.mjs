@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path';
 import { cacheEnabled, createKeyContext, keyFor, listUnitTestFiles, parseVitestGlobs, classifyTier } from '../test-result-cache.mjs';
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync, symlinkSync, utimesSync } from 'node:fs';
 import * as testResultCache from '../test-result-cache.mjs';
+import { execFileSync } from 'node:child_process';
 
 const roots = [];
 afterEach(() => { while (roots.length) rmSync(roots.pop(), { recursive: true, force: true }); });
@@ -351,5 +352,12 @@ describe('test-result cache retention', () => {
     const later = makeRun(dir, MIDDLE, 10 * DAY, 8, now);
     keyOf(root, { env });
     expect(existsSync(later)).toBe(true);
+  });
+  it('the prune CLI removes old runs in the configured store and prints the result as JSON', () => {
+    const dir = makeCache();
+    const old = makeRun(dir, OLD, 10 * DAY, 8, Date.now());
+    const out = execFileSync(process.execPath, [join(process.cwd(), 'scripts', 'lib', 'test-result-cache.mjs'), 'prune'], { env: { ...process.env, WE_TEST_CACHE_DIR: dir }, encoding: 'utf8' });
+    expect(existsSync(old)).toBe(false);
+    expect(JSON.parse(out).removed).toBe(1);
   });
 });
