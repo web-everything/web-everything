@@ -212,9 +212,6 @@ export function sweepAdvisoryLabels({
       // A carried result holds on the seal of the head it came from, and only the live head is published above: seal
       // those source heads too (seal only, nothing posted for a superseded head), or the carried head holds forever.
       if (!dryRun) {
-        // One thread read per PR per pass, shared by every source head (a held source is re-compared each pass).
-        let sourceThread;
-        const readSourceThread = () => (sourceThread ??= provider.readComments(resolvedRepo, pr.number));
         for (const from of redTeamCarrySources({ comments, pr: pr.number, head: live.headRefOid })) {
           try {
             // Pick by the READER's own view of the raw status file (never the run-evidence summary, which can omit a status
@@ -224,7 +221,9 @@ export function sweepAdvisoryLabels({
             const seal = readSeal({ repo: resolvedRepo, pr: pr.number, head: from });
             if (seal?.unsealed !== true && seal?.legacyHold !== true) continue;
             const sealed = publishStored({ status: { repo: resolvedRepo, pr: pr.number, head: from }, sealOnly: true,
-              listComments: readSourceThread,
+              // The thread this pass already read in full (re-read after a post): no extra GitHub call per held source,
+              // and the sources are compared on the same snapshot the planner reads.
+              listComments: () => comments,
               postComment: () => { throw Error('a seal-only pass never posts'); } });
             if (sealed.status !== 'skipped') (publication.sourceSeals ??= []).push(`${from.slice(0, 9)}:${sealed.status}`);
           } catch (e) {

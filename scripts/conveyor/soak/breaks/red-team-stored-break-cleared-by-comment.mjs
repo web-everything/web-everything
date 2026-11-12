@@ -96,6 +96,17 @@ export default {
           'carry source: after both comments were corrected the sweep never revisited the source, so its legacy hold stayed');
         check(readRedTeamDisposition({ comments: thread, pr: PR, head: NEXT, repo: REPO }).held.length === 0,
           'carry source: the carried head stayed held on matching clean evidence');
+        // The same hold corrected by DELETING the source's stale comment (only the carry left): it must lift too.
+        writeFileSync(statusFile, JSON.stringify({ repo: REPO, pr: PR, head: HEAD, status: 'finished', result: 'ran' }));
+        thread = [trusted(`${redTeamMarker(PR, HEAD)}\n${breakBody}`, '2026-11-10T12:00:00Z'), carried(breakBody, '2026-11-10T12:05:00Z')];
+        sweep();
+        check(JSON.parse(readFileSync(statusFile, 'utf8')).legacyHoldPublished === true, 'carry source (delete): precondition hold not recorded');
+        thread = [carried('### Post-accept red team — no break found', '2026-11-10T12:10:00Z')];
+        sweep();
+        check(JSON.parse(readFileSync(statusFile, 'utf8')).legacyHoldPublished !== true,
+          'carry source (delete): with the stale comment deleted, the seal-only pass never lifted the legacy hold');
+        check(readRedTeamDisposition({ comments: thread, pr: PR, head: NEXT, repo: REPO }).held.length === 0,
+          'carry source (delete): the carried head stayed held on matching clean evidence');
       }
     } catch (error) {
       violations.push(`scenario failed: ${error.stack ?? error}`);

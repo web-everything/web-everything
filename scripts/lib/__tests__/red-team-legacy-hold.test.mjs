@@ -329,6 +329,34 @@ describe('the sealed status reader fails closed', () => {
     expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held).toEqual([]);
     expect(labels).not.toContain('red-team:blocked');
   });
+  it('a flagged carry source with NO comment of its own (the stale one deleted) lifts its hold on a seal-only pass', () => {
+    const live = 'b'.repeat(40);
+    store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);
+    writeStatusFile({ ...legacyStatus(), sealedBreaks: [], legacyHoldPublished: true });
+    // Only B's carry stays in the thread: A's own stale comment was deleted, not edited.
+    const thread = [{ ...carriedClear(live), createdAt: '2026-11-10T12:10:00Z' }];
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held.length).toBeGreaterThan(0);
+    expect(publishStoredRedTeamResult({ status: readStatusFile(), sealOnly: true, listComments: () => thread,
+      postComment: () => { throw Error('never'); }, publishNeedsYou: () => { throw Error('never'); } })).toEqual({ status: 'sealed' });
+    expect(readStatusFile().legacyHoldPublished).toBeUndefined();
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held).toEqual([]);
+  });
+  it('a carry source flagged while its row was unreadable lifts once the row reads, but keeps a recovered break', () => {
+    const live = 'b'.repeat(40);
+    store([]);
+    writeStatusFile(legacyStatus());
+    const thread = [{ ...carriedClear(live), createdAt: '2026-11-10T12:10:00Z' }];
+    const pass = () => publishStoredRedTeamResult({ status: readStatusFile(), sealOnly: true, listComments: () => thread,
+      postComment: () => { throw Error('never'); }, publishNeedsYou: () => {} });
+    expect(pass()).toEqual({ status: 'held' });
+    expect(readStatusFile().legacyHoldPublished).toBe(true);
+    store([seatRow()]);
+    expect(pass()).toEqual({ status: 'sealed' });
+    expect(readStatusFile()).toMatchObject({ sealedBreaks: [expect.any(String)] });
+    expect(readStatusFile().legacyHoldPublished).toBeUndefined();
+    // The flag is gone, yet the recovered confirmed break still holds the carried "no break found" head.
+    expect(readRedTeamDisposition({ comments: thread, pr: 42, head: live, repo, env: process.env }).held.length).toBeGreaterThan(0);
+  });
   it('a stored row with no confirmed break seals an EMPTY list, which lifts the unsealed hold for an agreeing comment', () => {
     store([seatRow({ foldedVerdict: 'accept', confirmedMissCount: 0, findings: [] })]);
     writeStatusFile(legacyStatus());

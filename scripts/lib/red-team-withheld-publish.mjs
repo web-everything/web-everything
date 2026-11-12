@@ -161,6 +161,14 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
     seal(result?.findings);
     // `sealOnly` (a superseded head a carried result came from): record the seal, never post or escalate for it.
     if (sealOnly) {
+      // Reached only with the row recovered and no posted comment in conflict (e.g. the stale one was deleted): nothing
+      // is left for the legacy flag to hold on, and no post will ever lift it for a superseded head, so lift it here.
+      // The carried head still holds on this seal (redTeamHoldDecision compares it with the carried comment).
+      if (legacy && status.legacyHoldPublished) {
+        const { legacyHoldPublished: _lifted, ...rest } = status;
+        status = rest;
+        sealDirty = true;
+      }
       if (sealDirty) writeStatus(status);
       return { status: 'sealed' };
     }
