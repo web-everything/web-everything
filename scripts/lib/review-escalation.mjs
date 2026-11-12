@@ -3377,8 +3377,11 @@ function decideReviewGateCore({
 }
 
 /** Durable evidence for removing a pending that sits beside an accept of the current head. Pure. */
+/** Marks the heal's own comment so the pre-removal recheck can ignore it. */
+export const STALE_PENDING_HEAL_MARKER = '<!-- stale-pending-heal -->';
 export function buildStalePendingHealComment({ headSha }) {
   return [
+    STALE_PENDING_HEAL_MARKER,
     '**`review:pending` removed — stale hold beside a current acceptance.**',
     '',
     `The recorded acceptance covers the live head \`${headSha}\`, so \`review:pending\` no longer guards anything.`,

@@ -72,7 +72,7 @@ import { runGhSync } from '../lib/gh-throttle.mjs';
 import { createMqLiveReader } from '../lib/drain-queue-safety.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import {
-  REVIEW_LABELS, hasReviewLabel, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
+  REVIEW_LABELS, hasReviewLabel, STALE_PENDING_HEAL_MARKER, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
   parseLatestHumanClearedSha,
 } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
@@ -342,7 +342,8 @@ export function sweepReviewHoldLabels({
         try {
           // The provider reader keeps BOTH rename paths (destination and previous_filename).
           const files = readFiles ? readFiles(pr.number, { repo: repoOf() }) : provider.readPrFiles?.(repoOf(), pr.number);
-          return Array.isArray(files) ? files : null;
+          // At or above the API cap the list may be truncated: unconfirmed completeness keeps the pending.
+          return Array.isArray(files) && files.length < FILES_API_CAP ? files : null;
         } catch { return null; }
       };
       // Formal reviews: unreadable (null) marks the record `reviewsUnreadable`, which keeps the pending.
@@ -354,7 +355,10 @@ export function sweepReviewHoldLabels({
           return Array.isArray(pages) ? pages.flat() : null;
         } catch { return null; }
       };
-      const evalHeal = (st) => {
+      // The heal's own comment is not a verdict; every park/hold marker AFTER the accept is one.
+      const FILES_API_CAP = 3000;
+      const evalHeal = (st0) => {
+        const st = { ...st0, comments: (st0.comments ?? []).filter((c) => !String(c?.body ?? '').includes(STALE_PENDING_HEAL_MARKER)) };
         let rec = latestAcceptRecord(st.comments);
         const acc = (rec?.sha ?? '').toLowerCase();
         const hd = st.headRefOid.toLowerCase();
@@ -368,7 +372,8 @@ export function sweepReviewHoldLabels({
           headSha: st.headRefOid,
           fetchOk: true,
           changedFiles: sameHeadAccept ? readChangedFiles() : null,
-          laterVerdict: !!(rec?.laterVerdict || rec?.laterBodyDerivedHold || rec?.reviewsUnreadable),
+          laterVerdict: !!(rec?.laterVerdict || rec?.laterBodyDerivedHold || rec?.reviewsUnreadable
+            || (rec && st.comments.slice(rec.index + 1).some((c) => /<!--\s*drain-park-reason\s*-->/i.test(String(c?.body ?? ''))))),
         });
       };
       let heal = evalHeal(state);

@@ -35,10 +35,11 @@ function sweepFixture(opts) {
 function provider({ readPrState, failRead = false } = {}) {
   const calls = { set: [], currentRepo: 0, readPrState: [], postComment: [] };
   const states = new Map();
+  const posted = new Map();
   const p = {
     calls,
     fixturePrs: [],
-    readComments: (number) => states.get(number)?.comments ?? [],
+    readComments: (number) => [...(states.get(number)?.comments ?? []), ...(posted.get(number) ?? [])],
     setLabels: (repo, number, spec) => { calls.set.push({ repo, number, spec }); },
     currentRepo: () => { calls.currentRepo += 1; return 'o/n'; },
     readPrState: (repo, number) => {
@@ -49,7 +50,10 @@ function provider({ readPrState, failRead = false } = {}) {
       states.set(number, state);
       return state;
     },
-    postComment: (repo, number, body) => { calls.postComment.push({ repo, number, body }); },
+    postComment: (repo, number, body) => {
+      calls.postComment.push({ repo, number, body });
+      posted.set(number, [...(posted.get(number) ?? []), { author: { login: 'web-everything' }, body }]);
+    },
   };
   return p;
 }
@@ -600,6 +604,32 @@ describe('#5045 same-head accept guards (R907)', () => {
     const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readReviews: () => [], readFiles: () => ['docs/a.md'], assertReferrals: () => ({}) });
     expect(results.find((r) => r.num === 5045).error).toContain('comment boom');
     expect(p.calls.set).toEqual([]);
+  });
+});
+
+describe('#5045 park markers and file-list cap (R907)', () => {
+  const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
+  const run = (comments, files) => {
+    const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments }) });
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readReviews: () => [], readFiles: () => files, assertReferrals: () => ({}) });
+    return { p, r: results.find((r) => r.num === 5045 && (r.healed || r.flagged)) };
+  };
+  const accept = { author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` };
+  it('keeps pending when a park marker follows the accept', () => {
+    const { p, r } = run([accept, { author: { login: 'web-everything' }, body: '<!-- drain-park-reason -->\ntest-gaming suspected' }], ['docs/a.md']);
+    expect(r.flagged).toBeDefined();
+    expect(p.calls.set).toEqual([]);
+  });
+  it('keeps pending when the file list is at the API cap', () => {
+    const { p, r } = run([accept], Array.from({ length: 3000 }, (_, i) => `docs/f${i}.md`));
+    expect(r.flagReason).toBe('accept-current');
+    expect(p.calls.set).toEqual([]);
+  });
+  it('removes pending end to end with the heal comment persisted in the thread', () => {
+    const { p, r } = run([accept], ['docs/a.md']);
+    expect(r.healed).toEqual(['review:pending']);
+    expect(r.removalAborted).toBeUndefined();
+    expect(p.calls.set[0].spec).toEqual({ remove: ['review:pending'] });
   });
 });
 
