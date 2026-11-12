@@ -394,7 +394,7 @@ describe('isGateSelfPath — the POLICY tier of the trust chain (#2285 v1, #2448
     expect(isGateSelfPath('packages/plateau-loop/src/merge-ai-prs.mjs')).toBe(false); // engine stays agent-reviewable
   });
   it('does NOT flag other blast-radius code — those stay agent-reviewable', () => {
-    for (const p of ['scripts/pr-land.mjs', 'scripts/lane-pool.mjs', 'skills-src/drain/SKILL.md',
+    for (const p of ['scripts/merge-ai-prs.mjs', 'scripts/lane-pool.mjs', 'skills-src/drain/SKILL.md',
                      'agent-memory-src/index-meta.md',
                      'src/_data/blocks.json', 'scripts/lib/rebase-drop-manifest.mjs']) {
       expect(isGateSelfPath(p)).toBe(false);
@@ -409,7 +409,7 @@ describe('scoreEscalation', () => {
     expect(r.reasons).toEqual([]);
   });
   it('a blast-radius file escalates', () => {
-    const r = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'] });
+    const r = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'] });
     expect(r.escalate).toBe(true);
     expect(r.reasons.join(' ')).toMatch(/blast-radius/);
   });
@@ -457,7 +457,7 @@ describe('scoreEscalation', () => {
     expect(lander.escalate).toBe(true);
     expect(lander.humanRequired).toBe(false);
     // other blast-radius → escalates but agent-reviewable (NOT humanRequired)
-    const other = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/pr-land.mjs'] });
+    const other = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/merge-ai-prs.mjs'] });
     expect(other.escalate).toBe(true);
     expect(other.humanRequired).toBe(false);
     // a plain leaf → neither
@@ -490,9 +490,9 @@ describe('#3317 — the escalation basis is cumulative (merge-base…head) for e
     });
     it('#3317 — the union is MONOTONE: an own-delta-only file still scores, so the fix can never LOSE a signal', () => {
       // A child that reverts an ancestor's edit has a file in the own delta with no net cumulative change.
-      const r = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'], humanBasisFiles: ['backlog/leaf.md'] });
-      expect(r.signals.blastRadius).toEqual(['scripts/pr-land.mjs']);
-      expect(r.basisFiles).toEqual(['backlog/leaf.md', 'scripts/pr-land.mjs']);
+      const r = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'], humanBasisFiles: ['backlog/leaf.md'] });
+      expect(r.signals.blastRadius).toEqual(['scripts/merge-ai-prs.mjs']);
+      expect(r.basisFiles).toEqual(['backlog/leaf.md', 'scripts/merge-ai-prs.mjs']);
     });
   });
 
@@ -615,8 +615,8 @@ describe('#2890 — diffHunks (base-vs-head diff CONTENT) is accepted and thread
   });
   it('producerReviewLabel is unaffected by diffHunks riding along on the score object it receives', () => {
     const hunks = '@@ -1,2 +1,2 @@\n-old\n+new\n';
-    const withHunks = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'], diffHunks: hunks });
-    const withoutHunks = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'] });
+    const withHunks = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'], diffHunks: hunks });
+    const withoutHunks = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'] });
     expect(producerReviewLabel(withHunks)).toBe(producerReviewLabel(withoutHunks));
   });
 });
@@ -744,11 +744,11 @@ describe('#2890-review-fix finding 4 — the hunks travel with the file list com
     expect(r.signals.blastRadius).toContain('scripts/reverted-again.mjs');
   });
   it('falls back to changedFiles in the NON-stacked case, where the two bases are identical', () => {
-    const r = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'], diffHunks: 'diff\n' });
-    expect(r.diffHunksBasisFiles).toEqual(['scripts/pr-land.mjs']);
+    const r = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'], diffHunks: 'diff\n' });
+    expect(r.diffHunksBasisFiles).toEqual(['scripts/merge-ai-prs.mjs']);
   });
   it('is null whenever the hunks are null — a real file list can never be paired with an absent content signal', () => {
-    const r = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'], humanBasisFiles: ['scripts/pr-land.mjs'] });
+    const r = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'], humanBasisFiles: ['scripts/merge-ai-prs.mjs'] });
     expect(r.diffHunks).toBeNull();
     expect(r.diffHunksBasisFiles).toBeNull();
   });
@@ -1991,7 +1991,7 @@ describe('scoreEscalation carries the advisory careLevel (#2567 — additive)', 
     expect(scoreEscalation({ changedFiles: ['backlog/x.md'], diffLines: 20 }).careLevel).toBe(CARE_LEVELS.NONE);
   });
   it('a blast-radius PR → elevated', () => {
-    expect(scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'] }).careLevel).toBe(CARE_LEVELS.ELEVATED);
+    expect(scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'] }).careLevel).toBe(CARE_LEVELS.ELEVATED);
   });
   it('a declarative-leash (humanRequired) PR → high', () => {
     expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/lib/gate-config.mjs'] }).careLevel).toBe(CARE_LEVELS.HIGH);
@@ -2002,7 +2002,7 @@ describe('scoreEscalation carries the advisory careLevel (#2567 — additive)', 
     expect(r.careLevel).toBe(CARE_LEVELS.ELEVATED);
   });
   it('is ADDITIVE — the existing escalate/humanRequired/reasons/signals fields are unchanged', () => {
-    const r = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'] });
+    const r = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'] });
     expect(r.escalate).toBe(true);
     expect(r.humanRequired).toBe(false);
     expect(Array.isArray(r.reasons)).toBe(true);
@@ -2111,7 +2111,7 @@ describe('the #2771/#2785 tier table — real repo paths, pinned route', () => {
     ['a statute doc (a NEW rule, no codify shape proven)', ['docs/agent/platform-decisions.md'], true, REVIEW_LABELS.human],
     ['the ENGINE tier — the lander (unchanged, #2445)', ['scripts/merge-ai-prs.mjs'], false, REVIEW_LABELS.pending],
     ['the check:standards rules impl (engine tier)', ['scripts/check-standards-rules.mjs'], false, REVIEW_LABELS.pending],
-    ['an ordinary blast-radius script', ['scripts/pr-land.mjs'], false, REVIEW_LABELS.pending],
+    ['an ordinary blast-radius script', ['scripts/merge-ai-prs.mjs'], false, REVIEW_LABELS.pending],
     ['an ordinary LEAF file — no review owed at all', ['demos/spa.html'], false, null],
     ['a backlog item (ordinary leaf)', ['backlog/2785-implement-the-narrowed-review-human-rubric.md'], false, null],
   ];
@@ -2148,7 +2148,7 @@ describe('the #2771/#2785 tier table — real repo paths, pinned route', () => {
     // deriveReviewDisposition THROWS on an unrecognized reason, and the drain hands it `reasons` verbatim. So
     // every decorated string the rubric can emit must round-trip, and land on the clearance the ruling intends.
     const humanRows = [['scripts/lib/gate-config.mjs'], ['docs/agent/platform-decisions.md']];
-    const agentRows = [['scripts/lib/review-escalation.mjs'], ['scripts/merge-ai-prs.mjs'], ['scripts/pr-land.mjs']];
+    const agentRows = [['scripts/lib/review-escalation.mjs'], ['scripts/merge-ai-prs.mjs'], ['scripts/merge-ai-prs.mjs']];
     for (const changedFiles of [...humanRows, ...agentRows]) {
       const { reasons } = scoreEscalation({ humanSurfaces: 'broad', changedFiles, diffLines: 900, dismissedFindings: 2, crossRepo: true });
       expect(reasons.length).toBeGreaterThan(0);
@@ -3053,12 +3053,18 @@ describe('pending beside accepted', () => {
     expect(decideContradictoryVerdictHeal({ ...facts, acceptedSha: null })).toEqual({ heal: false, reason: 'accept-sha-unknown' });
   });
   it('drops a stale pending when the accept covers the current head', () => {
-    const r = decideContradictoryVerdictHeal({ ...facts, acceptedSha: facts.headSha });
+    const r = decideContradictoryVerdictHeal({ ...facts, acceptedSha: facts.headSha, changedFiles: ['docs/a.md'] });
     expect(r.heal).toBe(true);
     expect(r.reason).toBe('stale-pending');
     expect(r.decision).toMatchObject({ allowed: true, addLabel: null, removeLabels: ['review:pending'], keepsHuman: false });
     expect(r.comment).toContain('review:pending');
     expect(r.comment).toContain(facts.headSha);
+  });
+  it('keeps pending for engine-tier or unknown files without redteam:accepted', () => {
+    const base = { ...facts, acceptedSha: facts.headSha };
+    expect(decideContradictoryVerdictHeal(base)).toEqual({ heal: false, reason: 'accept-current' });
+    expect(decideContradictoryVerdictHeal({ ...base, changedFiles: ['scripts/merge-ai-prs.mjs'] }).heal).toBe(false);
+    expect(decideContradictoryVerdictHeal({ ...base, currentLabels: [...facts.currentLabels, 'redteam:accepted'], changedFiles: ['scripts/merge-ai-prs.mjs'] }).heal).toBe(true);
   });
   it('never heals a current accept when the read failed', () => {
     expect(decideContradictoryVerdictHeal({ ...facts, acceptedSha: facts.headSha, fetchOk: false })).toEqual({ heal: false, reason: 'fetch-unavailable' });

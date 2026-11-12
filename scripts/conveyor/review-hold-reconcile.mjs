@@ -178,7 +178,7 @@ export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {})
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
   acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
+  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, readFiles = null, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -337,12 +337,25 @@ export function sweepReviewHoldLabels({
       }
     }
     if (plan.flagged?.length) {
+      // Fail closed: an unreadable file list is treated as engine-tier by the decision.
+      const readChangedFiles = () => {
+        try {
+          if (readFiles) return readFiles(pr.number, { repo: repoOf() });
+          const out = exec('gh', ['pr', 'view', String(pr.number), '--repo', repoOf(), '--json', 'files', '--jq', '[.files[].path]'], { encoding: 'utf8' });
+          const files = JSON.parse(String(out));
+          return Array.isArray(files) ? files : null;
+        } catch { return null; }
+      };
+      const acc = (latestAcceptRecord(state.comments)?.sha ?? '').toLowerCase();
+      const hd = state.headRefOid.toLowerCase();
+      const sameHeadAccept = hasReviewLabel(state.labels, 'review:pending') && hasReviewLabel(state.labels, 'review:accepted') && !!acc && (acc.startsWith(hd) || hd.startsWith(acc));
       const heal = decideContradictoryVerdictHeal({
         currentLabels: state.labels,
         humanClearedSha: parseLatestHumanClearedSha(state.comments),
         acceptedSha: latestAcceptRecord(state.comments)?.sha ?? null,
         headSha: state.headRefOid,
         fetchOk: true,
+        changedFiles: sameHeadAccept ? readChangedFiles() : null,
       });
       if (heal.heal) {
         // Account for this pass's own successful cleanup; GitHub rejects removing an absent label.

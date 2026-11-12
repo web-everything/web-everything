@@ -2344,7 +2344,7 @@ export function findContradictoryReviewVerdicts(labels) {
  * @returns {{heal: boolean, reason: string, decision?: object, comment?: string}}
  */
 export function decideContradictoryVerdictHeal({
-  currentLabels = [], humanClearedSha = null, acceptedSha = null, headSha = null, fetchOk = false,
+  currentLabels = [], humanClearedSha = null, acceptedSha = null, headSha = null, fetchOk = false, changedFiles = null,
 } = {}) {
   const contradiction = findContradictoryReviewVerdicts(currentLabels);
   if (!contradiction.length) return { heal: false, reason: 'no-contradiction' };
@@ -2354,6 +2354,12 @@ export function decideContradictoryVerdictHeal({
     const accepted = acceptedSha.toLowerCase();
     const head = headSha.toLowerCase();
     if (accepted.startsWith(head) || head.startsWith(accepted)) {
+      // An engine-tier park (#2412) puts review:pending beside a fresh accept until `redteam:accepted` lands;
+      // removing it then would bypass that validator. Unknown files fail closed like engine-tier.
+      const engineTier = !Array.isArray(changedFiles) || changedFiles.some((f) => isEngineTierPath(f));
+      if (engineTier && !hasReviewLabel(currentLabels, REVIEW_LABELS.redteamAccepted)) {
+        return { heal: false, reason: 'accept-current' };
+      }
       // The accept for this exact head is the verdict; a pending on the same head is stale.
       return {
         heal: true, reason: 'stale-pending',
