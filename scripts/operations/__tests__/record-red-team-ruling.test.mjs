@@ -2418,3 +2418,16 @@ describe('R671 v1 acting judge red-team blocks', () => {
     expect(planRedTeamRuling(judgeRead({ judgeActorPolicy: context.judgeActorPolicy }), judgeInput())).toMatchObject({ actor: 'judge:r10', ruling: 'block' });
   });
 });
+
+describe('anyState keeps the pending round-extension guard (planner)', () => {
+  it.each(['card', 'not-real', 'block'])('%s: refuses while a round extension awaits the gate, under anyState=true', ruling => {
+    const grant = { author: OP, createdAt: '2026-10-20T23:50:00Z', body: buildRoundExtensionComment({
+      repo, pr: PR, by: 1, actor: OP.login, channel: 'chat', reason: 'one more round', at: '2026-10-20T23:50:00Z',
+    }) };
+    const args = ruling === 'not-real' ? { ruling, card: undefined, cause: 'other' } : { ruling, ...(ruling === 'block' ? { card: undefined } : {}) };
+    const snapshot = { scope: { value: { anyState: true } }, comments: thread([grant]) };
+    expect(() => planRedTeamRuling(read(snapshot), input(args))).toThrow(/pending round extension/);
+    expect(() => rulableBreaks({ comments: snapshot.comments, labels: [], pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS,
+      scope: { anyState: true }, ruling, repo })).toThrow(/pending round extension/);
+  });
+});

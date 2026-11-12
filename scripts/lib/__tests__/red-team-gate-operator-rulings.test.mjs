@@ -397,3 +397,15 @@ describe('latest operator action deduplication', () => {
     expect(operatorRulingsOnLiveResult([], P, H).resultId).toBeNull();
   });
 });
+
+describe('anyState keeps the pending round-extension guard (shared reader)', () => {
+  it.each([false, true])('an operator card posted while a human grant is unconsumed releases nothing (anyState=%s)', anyState => {
+    const repo = 'o/r';
+    const at = '2026-10-21T18:00:00Z';
+    const grant = human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert', channel: 'chat', reason: 'one more round', at }), at);
+    const comments = [...live, grant, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')];
+    expect(liveResultGateState(comments, P, H, repo)).toMatchObject({ reopened: true });
+    const d = readRedTeamDisposition({ comments, repo, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+    expect(held(d)).toEqual([1]);
+  });
+});
