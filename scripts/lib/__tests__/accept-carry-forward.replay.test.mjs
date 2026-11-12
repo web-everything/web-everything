@@ -968,6 +968,19 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
       expect(isKnownMachineBody('Manual R247 pass: reason: EMERGENCY (labelled): refresh moved head', { author: OP })).toBe(false);
       expect(isKnownMachineBody(`${MANUAL}\nHold this PR; do not merge.`, { author: OP })).toBe(false);
     });
+    // Self-review (PR #6713): every line terminator counts, and the refresh marker must sit in a body the producer's header opens.
+    it('a second line behind \\r, U+0085, U+2028, U+2029, VT or FF holds on a manual pass and after the refresh marker', () => {
+      for (const sep of ['\r', '\r\n', '\u0085', ' ', ' ', '\v', '\f']) {
+        expect(isKnownMachineBody(`${MANUAL}${sep}Hold this PR, do not merge.`, { author: OP })).toBe(false);
+        expect(isKnownMachineBody(`${REFRESH}${sep}Hold this PR, do not merge.`, { author: OP })).toBe(false);
+      }
+    });
+    it('a hold sentence before a bare marker, or a quoted marker line, is not a refresh note', () => {
+      const marker = REFRESH.slice(REFRESH.indexOf('<!-- operator-action:'));
+      for (const b of [`Approval revoked, do not merge.\n\n${marker}`, `> ${marker}`, `${REFRESH.split('\n')[0]}`.replace('🛠 operator action — ', '') + `\n${marker}`]) {
+        expect(isKnownMachineBody(b, { author: OP })).toBe(false);
+      }
+    });
     it('a trailing objection on a known prefix, even from a trusted author, still holds (audit)', () => {
       for (const b of [`${REFRESH}\nHold this PR; do not merge.`,
         '🛠 operator action — refresh\nHold this PR; do not merge.', 'Manual R247 pass — daemon: review\nreject the change']) {

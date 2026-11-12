@@ -132,11 +132,16 @@ const KNOWN_MACHINE_SHAPE_RES = [
 //   - manual R247   = trusted author + the single-line `Manual R247 pass — daemon: <name>;` header (producer:
 //     scripts/operations/manual-daemon-pass-io.mjs)
 // A body with anything after the marker, a second line on a manual pass, a missing/malformed marker, or an untrusted author holds.
-const OPERATOR_ACTION_MARKER_RE = /<!-- operator-action: (\{[^\n]*\}) -->\s*$/;
-const MANUAL_PASS_HEADER_RE = /^Manual R247 pass — daemon: [\w-]+;[^\n]*$/;
+// Every line terminator Markdown / the producers treat as a line break (`\r`, U+0085, U+2028/9, VT, FF as well as `\n`): a second
+// "line" smuggled behind any of them must not ride the header or the marker.
+const NL = '\\r\\n\\u0085\\u2028\\u2029\\v\\f';
+const OPERATOR_ACTION_HEADER = '🛠 operator action — ';
+const OPERATOR_ACTION_MARKER_RE = new RegExp(`\\n<!-- operator-action: (\\{[^${NL}]*\\}) -->\\s*$`); // on its OWN line, last in the body
+const MANUAL_PASS_HEADER_RE = new RegExp(`^Manual R247 pass — daemon: [\\w-]+;[^${NL}]*$`);
 function isTrustedAuthorNote(text) {
   const t = text.trim();
   if (MANUAL_PASS_HEADER_RE.test(t)) return true;
+  if (!t.startsWith(OPERATOR_ACTION_HEADER)) return false; // the producer's header opens the body; text before the marker alone is not a note
   const marker = OPERATOR_ACTION_MARKER_RE.exec(t);
   if (!marker) return false;
   try {
