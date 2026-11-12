@@ -450,17 +450,13 @@ export async function runReconcileCiHealDispatch({
   // the target repo; see `runReconcileFixDispatch`'s identical note for why this runs for every repo.
   assertMainNotStale(root, checkStaleness);
   // #4352 — retry any budget-refused CI-heal/escalation comment owed on this repo (see the docblock above).
-  if (pastDeadline()) return deadlineResult();
   const healObservations = pollAttempts({ repo: repoKey });
   // The durable flushes are skipped only once per overrun: a flush skipped last pass runs now regardless of the
   // clock, so a slow poll can never starve owed-write publication or timeout follow-ups (they are idempotent).
-  if (pastDeadline()) return deadlineResult();
   owedFlush = flushOwed(repoKey);
-  if (pastDeadline()) return deadlineResult();
   timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
   flushSkippedRepos.delete(repoKey);
   flushForced = false;
-  if (pastDeadline()) return deadlineResult();
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
   // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.
@@ -522,7 +518,7 @@ export async function runReconcileCiHealDispatch({
   let deferred = [];
   for (const entry of ciHealEntries) {
     const entryNow = clock();
-    if (deadlineAt != null && entryNow > deadlineAt) {
+    if (handled > 0 && deadlineAt != null && entryNow > deadlineAt) {
       deferred = ciHealEntries.slice(handled).map(row => row.prNumber);
       break;
     }

@@ -2317,3 +2317,24 @@ describe('runReconcileFixDispatch — PR deadline and cursor', () => {
     expect(third).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
   });
 });
+
+describe('runReconcileFixDispatch — progress guarantee', () => {
+  it('a reconcile that always overruns the budget still dispatches one PR every pass (no starvation)', () => {
+    let time = 0;
+    const touched = [];
+    const options = { root: '/repo', checkStaleness: FRESH, now: () => time,
+      reconcile: () => { time += 1000; return { dispatch: [1764, 1765].map(prNumber => ({ kind: 'fix', prNumber,
+        headRefName: `fix-branch-${prNumber}` })), refusals: [] }; },
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null,
+      dispatch: entry => { touched.push(entry.pr); return { pr: entry.pr }; } };
+    let cursor;
+    for (let pass = 0; pass < 2; pass += 1) {
+      const result = runReconcileFixDispatch({ ...options, deadlineAt: time + 100, cursor });
+      expect(result.handled).toBeGreaterThanOrEqual(1);
+      cursor = result.nextCursor ?? undefined;
+    }
+    expect(touched).toEqual([1764, 1765]);
+  });
+});

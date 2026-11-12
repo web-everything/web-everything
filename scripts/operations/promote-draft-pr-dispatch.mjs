@@ -315,7 +315,6 @@ export function runReconcilePromoteDraftDispatch({
   const ghProvider = provider ?? createDraftPromoteProvider({
     cwd: root, repo: repoKey === 'we' ? undefined : repoSlug,
   });
-  if (deadlineAt != null && now() > deadlineAt) return deadlineResult();
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   let entries = (reconciled.dispatch ?? []).filter((entry) => entry.kind === 'promote-draft');
   if (deadlineAt != null || cursor != null) {
@@ -339,7 +338,7 @@ export function runReconcilePromoteDraftDispatch({
   let stackPolicy;
   for (const entry of entries) {
     // Yield only before an entry: its reads and writes must finish together.
-    if (deadlineAt != null && now() > deadlineAt) {
+    if (handled > 0 && deadlineAt != null && now() > deadlineAt) {
       deferred = entries.slice(handled).map(row => row.prNumber);
       break;
     }

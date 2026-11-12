@@ -2130,7 +2130,7 @@ export function runReconcileFixDispatch({
   let handled = 0;
   let deferred = [];
   for (const entry of planned) {
-    if (deadlineAt != null && clock() > deadlineAt) {
+    if (handled > 0 && deadlineAt != null && clock() > deadlineAt) {
       deferred = planned.slice(handled).map(row => row.pr);
       break;
     }
