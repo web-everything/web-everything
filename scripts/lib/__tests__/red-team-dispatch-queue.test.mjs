@@ -335,7 +335,7 @@ describe('card-only red-team queue bypass', () => {
     const sync = vi.spyOn(f.queue, 'sync');
     const run = vi.fn(() => ({ rows: [], dispatched: [], notStarted: [] }));
 
-    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     expect(readNetFiles.mock.calls).toEqual([[{ repo, number, headRefOid: head(number) }]]);
     expect(sync.mock.calls).toEqual([[repo, []]]);
@@ -350,6 +350,46 @@ describe('card-only red-team queue bypass', () => {
       && line.includes('bypasses red-team queue'))).toBe(true);
   });
 
+  it.each([
+    ['skip policy false => card-only PR queues/held normally', () => false],
+    ['policy reader throws => queues normally', () => { throw new Error('policy unavailable'); }],
+  ])('%s', async (_name, reader) => {
+    const f = fixture();
+    const options = inputs([125, 126], { capacity: capacity(1) });
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/125-card.md'] }));
+    const readSkipCardOnly = vi.fn(reader);
+    const sync = vi.spyOn(f.queue, 'sync');
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly, run, log: f.log });
+
+    expect(readSkipCardOnly).toHaveBeenCalledOnce();
+    expect(sync.mock.calls).toEqual([[repo, candidates([125, 126])]]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[0]]);
+    expect(run.mock.calls[0][0].rawPrs).toEqual([options.rawPrs[0]]);
+    expect(numbers(f.open().entries())).toEqual([126]);
+    expect(f.logs).toContain(`${prefix}hold ${repo}#126: capacity; waiting for a later tick`);
+    expect(f.logs.some(line => line.includes('bypasses red-team queue'))).toBe(false);
+  });
+
+  it('policy reader not called when no card-only candidate', async () => {
+    const f = fixture();
+    const options = inputs([127]);
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['scripts/code.mjs'] }));
+    const readSkipCardOnly = vi.fn(() => { throw new Error('policy must not be read'); });
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly, run });
+
+    expect(readNetFiles).toHaveBeenCalledOnce();
+    expect(readSkipCardOnly).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual(options.plan.refusals);
+    expect(run.mock.calls[0][0].rawPrs).toEqual(options.rawPrs);
+    expect(f.open().entries()).toEqual([]);
+  });
+
   it('card-only PR with unreadable capacity is queued and held instead of bypassed or forwarded to run', async () => {
     const f = fixture();
     const options = inputs([122], { capacity: undefined });
@@ -357,7 +397,7 @@ describe('card-only red-team queue bypass', () => {
     const sync = vi.spyOn(f.queue, 'sync');
     const run = vi.fn(started);
 
-    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     expect(readNetFiles.mock.calls).toEqual([[{ repo, number: 122, headRefOid: head(122) }]]);
     expect(sync.mock.calls).toEqual([[repo, candidates([122])]]);
@@ -378,7 +418,7 @@ describe('card-only red-team queue bypass', () => {
     }));
     const run = vi.fn(started);
 
-    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     expect(readNetFiles.mock.calls).toEqual([123, 124].map(number => [{ repo, number, headRefOid: head(number) }]));
     expect(run).toHaveBeenCalledOnce();
@@ -392,7 +432,7 @@ describe('card-only red-team queue bypass', () => {
     const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/102-card.md', 'scripts/code.mjs'] }));
     const run = vi.fn(started);
 
-    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     expect(readNetFiles.mock.calls).toEqual([102, 103].map(number => [{ repo, number, headRefOid: head(number) }]));
     expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[0]]);
@@ -415,7 +455,7 @@ describe('card-only red-team queue bypass', () => {
     const readNetFiles = vi.fn(reader);
     const run = vi.fn(started);
 
-    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     expect(readNetFiles.mock.calls).toEqual([first, first + 1].map(number => [{ repo, number, headRefOid: head(number) }]));
     expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[0]]);
@@ -438,7 +478,7 @@ describe('card-only red-team queue bypass', () => {
       notStarted: [],
     }));
 
-    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     expect(sync.mock.calls).toEqual([[repo, candidates([117])]]);
     expect(numbers(admit.mock.results[0].value)).toEqual([117]);
@@ -452,7 +492,7 @@ describe('card-only red-team queue bypass', () => {
     const f = fixture();
     const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/118-card.md'] }));
     const run = vi.fn(() => ({ rows: [], dispatched: [], notStarted: [] }));
-    const tick = options => runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    const tick = options => runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     await tick(inputs([118]));
     await tick(inputs([118]));
@@ -476,9 +516,9 @@ describe('card-only red-team queue bypass', () => {
     const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/1000-card.md'] }));
     const run = () => ({ rows: [], dispatched: [], notStarted: [] });
 
-    await runWithRedTeamQueue({ queue: f.queue, ...inputs(prs), readNetFiles, run });
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs(prs), readNetFiles, readSkipCardOnly: () => true, run });
     expect(readNetFiles).toHaveBeenCalledTimes(257);
-    await runWithRedTeamQueue({ queue: f.queue, ...inputs(prs), readNetFiles, run });
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs(prs), readNetFiles, readSkipCardOnly: () => true, run });
     expect(readNetFiles.mock.calls.length).toBeGreaterThan(257);
     expect(readNetFiles.mock.calls.length).toBeLessThanOrEqual(514);
     expect(f.queue.entries()).toEqual([]);
@@ -494,7 +534,7 @@ describe('card-only red-team queue bypass', () => {
     const sync = vi.spyOn(f.queue, 'sync');
     const run = vi.fn(() => ({ rows: [], dispatched: [], notStarted: [] }));
 
-    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
 
     expect(sync.mock.calls).toEqual([[repo, []]]);
     const persisted = JSON.parse(f.files.get(f.file));

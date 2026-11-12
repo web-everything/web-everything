@@ -7,6 +7,7 @@ import { isRealHead } from './red-team-skip-outcome.mjs';
 import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { isUnderTest } from './under-test.mjs';
+import { readRedTeamProbes } from './red-team-gate.mjs';
 
 const transactions = new WeakMap();
 const cardOnlyHeads = new Map();
@@ -264,7 +265,7 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  floor, readCpuIdlePct, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const candidates = [], cardOnlyCandidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
@@ -289,9 +290,12 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
   }
   const capacity = normalizeCapacity(rawCapacity);
   // Unreadable capacity admits nothing (fail closed), so a card-only PR queues like any other then.
+  // The bypass also needs the live card-only skip policy on (the one the red-team pass itself follows).
+  let skipCardOnly = false;
+  if (cardOnlyCandidates.length) { try { skipCardOnly = readSkipCardOnly() === true; } catch { /* fail closed */ } }
   const bypassed = new Set();
   for (const entry of cardOnlyCandidates) {
-    if (readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
+    if (skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
     else candidates.push(entry);
   }
   if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
