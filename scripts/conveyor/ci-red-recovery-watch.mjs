@@ -652,7 +652,7 @@ export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
  *  a bot-authored (trusted) marker. Null/undefined stay null so callers keep their `(unknown)` fallback. */
 export function markerLineValue(value) {
   if (value == null) return null;
-  return String(value).replace(/[\r\n\u0085  ]+/g, ' ').trim();
+  return String(value).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ').trim();
 }
 
 /**
