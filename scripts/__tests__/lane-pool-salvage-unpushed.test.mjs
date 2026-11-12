@@ -37,6 +37,10 @@ const args = process.argv.slice(2);
 appendFileSync(process.env.TEST_GIT_LOG, JSON.stringify({ args, cwd: process.cwd() }) + '\\n');
 if (process.env.TEST_BAD_HEADS && args.includes('ls-remote') && args.at(-1) === 'refs/heads/*') { process.stdout.write('incomplete'); process.exit(0); }
 if (process.env.TEST_FAIL_PUSH && args.includes('push')) process.exit(1);
+// Unreadable preservation evidence: only the release/acquire tip-presence read fails. The history probe pins
+// GIT_SHALLOW_FILE=/dev/null, so it still passes and acquire reaches the evidence check instead of quarantining.
+if (process.env.TEST_UNREADABLE_TIPS && process.env.GIT_SHALLOW_FILE !== '/dev/null' && args.includes('cat-file')
+    && args.some(a => a.startsWith('--batch-check'))) process.exit(1);
 if (process.env.TEST_COLLISION_ORIGIN && args.includes('push')) {
   const ref = args.at(-1).split(':').at(-1);
   const competing = spawnSync(${JSON.stringify(realGit)}, ['--git-dir', process.env.TEST_COLLISION_ORIGIN,
@@ -210,8 +214,15 @@ describe('lane-pool salvage-unpushed', () => {
     const sha = commit(lane, 'unpublished main');
     git(['checkout', '-b', 'clean-head', 'origin/main'], lane);
     const head = git(['rev-parse', 'HEAD'], lane);
-    const result = run('acquire', ['--lane=1', '--no-reap'], evidence === 'unreadable' ? { TEST_BAD_HEADS: '1' } : {});
+    writeFileSync(join(root, 'git-log'), '');
+    const result = run('acquire', ['--lane=1', '--no-reap'], evidence === 'unreadable' ? { TEST_UNREADABLE_TIPS: '1' } : {});
     expect(result.status).not.toBe(0);
+    // The unreadable case must really hit the unreadable-evidence path: the tip-presence read was attempted in the lane
+    // and failed, and acquire refused before its fetch (the unpushed case only refuses after one).
+    const laneFetched = events().some(e => e.cwd === lane && e.args.includes('fetch'));
+    const tipRead = events().some(e => e.cwd === lane && e.args.some(a => a.startsWith('--batch-check')));
+    expect(tipRead).toBe(true);
+    if (evidence === 'unreadable') expect(laneFetched).toBe(false);
     expect(result.stderr).toMatch(/unpushed work or unreadable preservation evidence.*salvage-unpushed or inspect it manually/);
     expect(git(['rev-parse', 'main'], lane)).toBe(sha);
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(head);
