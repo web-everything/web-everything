@@ -21,7 +21,7 @@ const candidate = pr => {
 /** Pure: unknown or incomplete admission evidence leaves the label absent. */
 export function planReadyRestore(pr, { requiredCheck = 'test' } = {}) {
   const refuse = reason => ({ restore: false, reason });
-  if (!pr || (pr.state !== undefined && pr.state !== 'OPEN')) return refuse('PR is not open');
+  if (!pr || pr.state !== 'OPEN') return refuse('PR is not open');
   if (pr.isDraft !== false) return refuse('PR is draft or draft state is unknown');
   if (!Array.isArray(pr.labels) || names(pr).some(label => typeof label !== 'string' || !label)) return refuse('labels are unreadable');
   if (!pr.headRefOid || typeof pr.headRefOid !== 'string') return refuse('head is unreadable');
@@ -68,12 +68,12 @@ export function sweepReadyRestore({ repo, prs = [], readPr, provider = createGhP
       } else if (dryRun) {
         row = { num: pr.number, readyRestore: 'would-restore', detail: 'accepted, red-team clear, required check green' };
       } else {
-        const current = provider.readPrState(repo, pr.number);
+        // Fresh live read (labels, state, draft AND the check rollup) at the write boundary: same-head reruns can change CI.
+        const current = readPr ? readPr(repo, pr.number) : defaultReadPr(repo, pr.number, provider);
         if (!current?.headRefOid || current.headRefOid !== live.headRefOid) {
           row = { num: pr.number, readyRestore: 'skip', detail: 'head moved or unreadable; retry next sweep' };
         } else {
-          // The check belongs to the unchanged head; labels/draft/state must still admit it.
-          const finalPlan = planReadyRestore({ ...current, statusCheckRollup: live.statusCheckRollup });
+          const finalPlan = planReadyRestore(current);
           if (!finalPlan.restore) row = { num: pr.number, readyRestore: 'skip', detail: finalPlan.reason };
           else {
             provider.setLabels(repo, pr.number, { add: READY });

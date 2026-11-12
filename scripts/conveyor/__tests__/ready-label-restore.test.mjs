@@ -37,8 +37,11 @@ describe('planReadyRestore', () => {
   ])('refuses %s', (_name, extra) => {
     expect(planReadyRestore(live(extra))).toEqual({ restore: false, reason: expect.any(String) });
   });
-  it('allows absent state and uses the configured required check', () => {
-    expect(planReadyRestore(live({ state: undefined, statusCheckRollup: [{ name: 'build', conclusion: 'SUCCESS' }] }),
+  it('refuses an absent state (fails closed)', () => {
+    expect(planReadyRestore(live({ state: undefined })).restore).toBe(false);
+  });
+  it('uses the configured required check', () => {
+    expect(planReadyRestore(live({ statusCheckRollup: [{ name: 'build', conclusion: 'SUCCESS' }] }),
       { requiredCheck: 'build' })).toEqual({ restore: true });
   });
 });
@@ -47,10 +50,8 @@ describe('sweepReadyRestore', () => {
   it('reads a candidate live and adds through the provider after checking the head', () => {
     const f = fixture();
     expect(sweepReadyRestore(f)).toEqual([{ num: 7, readyRestore: 'restored', detail: expect.any(String) }]);
-    expect(f.readPr).toHaveBeenCalledTimes(1);
+    expect(f.readPr).toHaveBeenCalledTimes(2);
     expect(f.readPr).toHaveBeenCalledWith('o/r', 7);
-    expect(f.provider.readPrState).toHaveBeenCalledTimes(1);
-    expect(f.provider.readPrState).toHaveBeenCalledWith('o/r', 7);
     expect(f.provider.setLabels).toHaveBeenCalledTimes(1);
     expect(f.provider.setLabels).toHaveBeenCalledWith('o/r', 7, { add: 'ready-to-merge' });
   });
@@ -67,13 +68,19 @@ describe('sweepReadyRestore', () => {
   });
   it.each(['b'.repeat(40), undefined])('refuses a moved or unreadable final head (%s)', (headRefOid) => {
     const f = fixture();
-    f.provider.readPrState.mockReturnValue(live({ headRefOid }));
+    f.readPr.mockReturnValueOnce(live()).mockReturnValueOnce(live({ headRefOid }));
+    expect(sweepReadyRestore(f)[0].readyRestore).toBe('skip');
+    expect(f.provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('refuses a required check that went red at the final read (same head)', () => {
+    const f = fixture();
+    f.readPr.mockReturnValueOnce(live()).mockReturnValueOnce(live({ statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] }));
     expect(sweepReadyRestore(f)[0].readyRestore).toBe('skip');
     expect(f.provider.setLabels).not.toHaveBeenCalled();
   });
   it('refuses a hold added at the final read', () => {
     const f = fixture();
-    f.provider.readPrState.mockReturnValue(live({ labels: [...live().labels, 'review:human'] }));
+    f.readPr.mockReturnValueOnce(live()).mockReturnValueOnce(live({ labels: [...live().labels, 'review:human'] }));
     expect(sweepReadyRestore(f)[0].readyRestore).toBe('skip');
     expect(f.provider.setLabels).not.toHaveBeenCalled();
   });
@@ -86,7 +93,7 @@ describe('sweepReadyRestore', () => {
     const f = fixture({ prs: [live(), live({ number: 8 })] });
     const fail = () => { throw new Error('unavailable'); };
     if (phase === 'read') f.readPr.mockImplementationOnce(fail);
-    if (phase === 'head') f.provider.readPrState.mockImplementationOnce(fail);
+    if (phase === 'head') f.readPr.mockReturnValueOnce(live()).mockImplementationOnce(fail);
     if (phase === 'write') f.provider.setLabels.mockImplementationOnce(fail);
     expect(sweepReadyRestore(f).map(r => r.readyRestore)).toEqual(['skip', 'restored']);
   });
