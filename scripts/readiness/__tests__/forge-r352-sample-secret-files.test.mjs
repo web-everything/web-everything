@@ -10,8 +10,8 @@ const root=join(dirname(fileURLToPath(import.meta.url)),'..','..','..');
 const cards=readdirSync(join(root,'backlog')).filter(f=>/^(?:2806|3866|3912|4382)-/.test(f)).map(f=>`backlog/${f}`);
 const files=[
   'scripts/lib/secret-scrub.mjs','scripts/lib/github-app-token.mjs',
-  'scripts/conveyor/soak/breaks/smoke-expired-gh-token.mjs',
-  'scripts/__tests__/rust-scan-secret-scrub-parity.test.mjs',
+  'scripts/conveyor/soak/breaks/smoke-expired-gh-token.mjs','scripts/rust-scan/src/secret_scrub.rs',
+  'scripts/__tests__/secret-scrub.test.mjs','scripts/__tests__/rust-scan-secret-scrub-parity.test.mjs',
   'scripts/__tests__/publish-secret-gate.test.mjs',
   // Found by the same scan once the listed files were clean: heuristic hits on field names.
   'scripts/conveyor/credential-inventory.mjs','scripts/conveyor/health-smells/__tests__/credential-inventory-stale.test.mjs',
@@ -25,8 +25,13 @@ describe('R352 sample files retain strict credential rejection with generic advi
     expect(credentialContentFinding(Buffer.from(path),content)).toBeNull();
     expect(()=>manifestEntry(Buffer.from(path),content,false,true)).not.toThrow();
   });
-  it.each([['scripts/rust-scan/src/secret_scrub.rs','github-token'],['scripts/__tests__/secret-scrub.test.mjs','google-api-key']])('blocks the existing token fixture in %s',(name,finding)=>{
-    const path=Buffer.from(name),content=readFileSync(join(root,name));
+  // The repo fixtures now assemble their token literals at run time (so they scan clean); the
+  // strict-rejection guarantee is pinned with the same shapes built here, assembled the same way.
+  it.each([
+    ['scripts/rust-scan/src/secret_scrub.rs','github-token',`let t = "${'github_pat'}_11ABCDEFG0123456789012345678901234567890123456789012345";\n`],
+    ['scripts/__tests__/secret-scrub.test.mjs','google-api-key',`const k = '${'AIza'+'S'}yNOTREALsynthetic0000000000000000000';\n`],
+  ])('blocks a token sample of the format %s used to carry',(name,finding,text)=>{
+    const path=Buffer.from(name),content=Buffer.from(text);
     expect(credentialContentFinding(path,content)).toBe(finding);
     expect(()=>manifestEntry(path,content,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
   });
