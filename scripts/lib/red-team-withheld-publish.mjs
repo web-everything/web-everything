@@ -8,6 +8,7 @@ import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-
 import { redTeamMarker, parseRedTeamComment, sealedBreakKeys, postedBreakKeys, redTeamBreaksAgree, redTeamHoldDecision } from './red-team-gate.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
+import { isGhThrottled } from './gh-deferred.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 
 export function needsPublish(status) {
@@ -30,6 +31,10 @@ export function renderMinimalRedTeamComment({ pr, rev, findings, omitLocation = 
     return `${i + 1}. [${tag}] (${category(f.category)}, impact?)${where} — [summary withheld: failed the secret scrub]`;
   })].join('\n');
 }
+
+/** A gh slot-throttle is host load, not a publish failure: it retries next tick and never spends the two-attempt budget (#6706). */
+export const THROTTLE_RETRY_LIMIT = 24;
+const isThrottle = e => String(e?.message ?? e).includes('gh-throttle: throttled') || isGhThrottled(e);
 
 /** Synchronous IO shell, like the sweep. Persist retry/escalation state atomically, with a two-attempt bound. */
 export function publishStoredRedTeamResult({ status, listComments, postComment, sealOnly = false,
@@ -115,6 +120,15 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
       }
       return status.publishAttempts >= 2 ? escalate() : { status: 'retry' };
     };
+    // A gh slot-throttle is host load, not a publish failure: it keeps its own bounded budget (never the two-attempt one),
+    // so persistent throttling still escalates to the operator after THROTTLE_RETRY_LIMIT ticks (#6706).
+    const throttledAttempt = () => {
+      const spent = (status.throttleRetries ?? 0) + 1;
+      if (spent >= THROTTLE_RETRY_LIMIT) return failedAttempt();
+      status = { ...status, throttleRetries: spent };
+      writeStatus(status);
+      return { status: 'retry' };
+    };
     const provider = (!listComments || !postComment) ? createGhProvider() : null;
     let conflict = false;
     try {
@@ -151,7 +165,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
           return { status: 'skipped' };
         }
       }
-    } catch { return sealOnly ? { status: 'retry' } : failedAttempt(); }
+    } catch (e) { return sealOnly ? { status: 'retry' } : isThrottle(e) ? throttledAttempt() : failedAttempt(); }
     // Outside the try: a failing alert write must not be counted as a publish attempt.
     if (conflict) return holdLegacy();
     if (legacy) {
@@ -196,7 +210,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
       if (sealDirty) { writeStatus(status); sealDirty = false; }
       if (postComment) postComment({ repo, pr, body });
       else provider.postComment(repo, pr, body);
-    } catch { return failedAttempt(); }
+    } catch (e) { return isThrottle(e) ? throttledAttempt() : failedAttempt(); }
     const { legacyHoldPublished: _posted, ...kept } = status;
     writeStatus({ ...kept, publishedAt: now(), result: { ...result, comment: 'posted' } });
     return { status: 'posted' };

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
-import { needsPublish, publishStoredRedTeamResult, renderMinimalRedTeamComment } from '../red-team-withheld-publish.mjs';
+import { needsPublish, THROTTLE_RETRY_LIMIT, publishStoredRedTeamResult, renderMinimalRedTeamComment } from '../red-team-withheld-publish.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamMarker } from '../red-team-gate.mjs';
 
@@ -306,6 +306,20 @@ describe('stored red-team publication', () => {
     const io = harness();
     publishStoredRedTeamResult(io);
     expect(parseRedTeamComment(io.postComment.mock.calls[0][0].body).findings[0].confirmed).toBe(true);
+  });
+  it('a gh slot-throttle on the comments read or the post never spends a publish attempt', () => {
+    const throttled = () => { throw Error('gh read failed (exit): gh-throttle: throttled \u2014 no gh slot within 8s (class=background); retry next tick'); };
+    for (const extra of [{ listComments: throttled }, { postComment: vi.fn(throttled) }]) {
+      const io = harness(stored('error'), extra);
+      for (let i = 0; i < 4; i++) expect(publishStoredRedTeamResult(io)).toEqual({ status: 'retry' });
+      expect(io.status.publishAttempts).toBeUndefined();
+      expect(io.publishNeedsYou).not.toHaveBeenCalled();
+      // ...but persistent throttling is bounded: it still escalates once, via the ordinary failed path.
+      let last;
+      for (let i = 0; i < THROTTLE_RETRY_LIMIT + 1; i++) last = publishStoredRedTeamResult(io);
+      expect(last).toMatchObject({ status: 'failed' });
+      expect(io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    }
   });
   it('error retries once, then escalates exactly once and never posts a third time', () => {
     const io = harness(stored('error'), { postComment: vi.fn(() => { throw Error('gh failed'); }) });
