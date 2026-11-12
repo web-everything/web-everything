@@ -35,3 +35,8 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Follow-ups added 2026-11-12 (R895+R903 residuals :478 and :745)
+
+- Re-read the PR head after the CI reads in we:scripts/conveyor/await-verify-pass.mjs `infraCiGreenFallback`, as the review CI gate does, so a head that moves during the reads gets no green hand-back for the old sha.
+- Claim-owner liveness: the `skipPush` hand-back skips the push port's claim/branch/open-PR guards, and the fix claim owner Mac:82182 is a dead pid that is still refreshed as a live owner. Check owner liveness before trusting or refreshing a claim, and keep the claim guards on the hand-back path.
