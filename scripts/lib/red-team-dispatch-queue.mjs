@@ -18,8 +18,8 @@ const note = (log, message) => {
   catch { /* Diagnostics must not interrupt recovery. */ }
 };
 
-export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
-export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 6;
+export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 6;
 
 /** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
 export function loadRedTeamQueueFloor({ env = process.env,

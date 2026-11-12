@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
-import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
+import { localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
 import { verificationInfrastructureFailure, verifyFinishBody } from '../lane-verify.mjs';
 import { runShards } from '../verify-shard-run.mjs';
 import { createFailureCollector } from '../verify-failures.mjs';
@@ -161,9 +161,17 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
 
 // R495 — `vitest related` stays on the Mac by design (the remote wrapper maps only `vitest run`); name why.
 it('names the local-only reason for a vitest related phase and keeps raw-command for the rest', () => {
-  expect(localPhaseReason("npx vitest related 'scripts/a.mjs' --run --passWithNoTests && npm run check:standards"))
-    .toBe('vitest-related-local-only');
+  // Only a related phase the wrapper could not take (here a disallowed env key) is reported as local-only.
   expect(localPhaseReason('NODE_ENV=x npx vitest related a.mjs --run')).toBe('vitest-related-local-only');
   expect(localPhaseReason('npx vitest run a.test.mjs')).toBe('raw-command');
   expect(localPhaseReason('echo hi')).toBe('raw-command');
+});
+
+describe('localPhaseShape', () => {
+  it('names tool, subcommand and flag names only, never values, paths or env', () => {
+    const guard = "npx vitest run 'scripts/a/__tests__/x.test.mjs' --reporter=default --reporter=json --outputFile.json='/tmp/secret dir/report.json' --testTimeout=30000";
+    expect(localPhaseShape(guard)).toBe('npx vitest run --reporter --outputFile --testTimeout');
+    expect(localPhaseShape(`VERIFY_SCAN_FILES='["a.mjs"]' node scripts/x.mjs --flag=v && echo hi`)).toBe('node --flag && echo hi');
+    expect(localPhaseShape(guard)).not.toMatch(/secret|x\.test|30000/);
+  });
 });
