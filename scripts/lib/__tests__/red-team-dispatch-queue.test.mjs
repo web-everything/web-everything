@@ -433,19 +433,23 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
-  it('planner skip rows (not in notStarted) count as attempts so a non-dispatchable head rotates', async () => {
+  it('planner skip rows (not in notStarted) count as attempts, rotate, and no longer starve the next PR', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'stale re-dispatch already spent';
+    const dispatchedPrs = [];
     const run = options => {
-      const pr = options.plan.refusals[0].prNumber;
-      return pr === 1
-        ? { rows: [{ prNumber: 1, action: 'skip', why: reason }], dispatched: [], notStarted: [] }
-        : started(options);
+      const rest = options.plan.refusals.filter(row => row.prNumber !== 1);
+      const res = started({ plan: { refusals: rest } });
+      dispatchedPrs.push(...res.dispatched.map(d => d.prNumber));
+      const skipped = options.plan.refusals.some(row => row.prNumber === 1);
+      return { rows: [...(skipped ? [{ prNumber: 1, action: 'skip', why: reason }] : []), ...res.rows],
+        dispatched: res.dispatched, notStarted: [] };
     };
     for (let tick = 0; tick < 2; tick++) {
       await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
     }
-    expect(numbers(f.queue.entries())).toEqual([2, 1]);
+    expect(dispatchedPrs).toEqual([2]); // PR2 really dispatched on tick 2 despite capacity 1
+    expect(numbers(f.queue.entries())).toEqual([1]);
     expect(f.logs.some(line => line.includes('requeue') && line.includes(reason))).toBe(true);
   });
 
@@ -734,6 +738,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(f.logs.some(line => line.includes('probe example/project#1'))).toBe(true);
       expect(f.logs.some(line => line.includes('admit example/project#2: capacity 1'))).toBe(true);
       expect(f.logs.some(line => line.includes('hold example/project#3: capacity 1'))).toBe(true);
+    });
+    it('a planner-skipped head (superseded acceptance) frees its slot for the next runnable PR', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'later verdict or hold supersedes acceptance' }], dispatched: [], notStarted: [] });
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2]);
     });
     it('keeps FIFO order and the capacity bound among runnable PRs', async () => {
       const f = fixture();
