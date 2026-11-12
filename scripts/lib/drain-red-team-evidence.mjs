@@ -72,6 +72,12 @@ const unfinishedSince = run => {
 };
 const hasOpenEffect = run => run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
 const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
+// An unfinished run whose read head is a readable sha other than the live head reviews a superseded head: it cannot
+// hold the live head. Unreadable or absent head (cleanRev null) stays unfinished (fail closed). Only the gate decision.
+const supersededUnfinished = (run, head) => {
+  const rev = cleanRev(run?.findings?.read?.netBasis?.rev), live = cleanRev(head);
+  return rev !== null && live !== null && rev !== live;
+};
 // R622: an unfinished run a comment may settle is one that has NOT decided anything yet: no verdict, or only the
 // "needs a human" hold awaiting its confirm, and no label effect still pending or in flight. A run that already
 // recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
@@ -246,7 +252,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           for (const slot of Object.values(slots)) {
             if (slot.newer(hit, slot.newest)) slot.newest = hit;
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
-            if (unfinishedReview(run)) {
+            if (unfinishedReview(run) && !supersededUnfinished(run, head)) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
               const since = unfinishedSince(run);
