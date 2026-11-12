@@ -326,6 +326,28 @@ describe('forge leaked-state reaper', () => {
     expect(killedUids).toEqual([]);
     expect(await exists(stuck.lock)).toBe(true);
   });
+  it('killUid refuses uid 0, 999 and non-integers without killing', async () => {
+    const proc = procFixture({readStatus: () => procStatus([0, 0, 0, 0])});
+    const killed = [];
+    for (const bad of [0, 999, 1.5, NaN, '20001']) await expect(killUid(bad, proc, pid => killed.push(pid))).rejects.toThrow(/refuses/);
+    expect(killed).toEqual([]);
+  });
+  it('killRun never kills owner pid 1', async () => {
+    const st = {'/proc/1/stat': '1 (init) S 0 0'};
+    const proc = {readdir: async () => ['1'], readFile: async p => Buffer.from(st[p] ?? procStatus([0, 0, 0, 0]))};
+    const killed = [];
+    await killRun({uid: workerUid, ownerPid: 1, ownerStart: '9'}, proc, pid => killed.push(pid), async () => '9');
+    expect(killed).toEqual([]);
+  });
+  it('a failing past-max kill skips the slot: lock kept, nothing reaped', async () => {
+    const stuck = await leak(1, 24, {owner, ageMs: 3 * 3600e3});
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => false;
+    probe.killRun = async () => { throw new Error('kill failed'); };
+    await makeRunner().telemetry();
+    expect(await exists(stuck.lock)).toBe(true);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(false);
+  });
   it('keeps a live run inside its max runtime and kills nothing', async () => {
     const live = await leak(1, 21, {owner, ageMs: 60e3});
     const killedUids = [];

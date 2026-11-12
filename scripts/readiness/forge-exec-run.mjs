@@ -1013,11 +1013,12 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         return age>=REAP_GRACE_MS;
       };
       if(!await decide())continue;
-      let killed=0;
+      let killed=0,viaMax=false;
       // The wedged owner holds the slot flock, so the kill cannot wait for the lock; re-read the reservation
       // right before it and kill only if it is still the same run and nonce (a new run would differ).
       const stillSame=async()=>{const now=await readRecord(join(lockPath,'reservation.json'));return now?.run===reservation.run&&now?.nonce===reservation.nonce;};
       if(await pastMax()) {
+        viaMax=true;
         try {
           const record=entries.length?await readRecord(entries[0].file):null;
           const slotUid=(await identity('forge-exec-'+slotNumber)).uid;
@@ -1032,7 +1033,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         if(!await decide())return;
         await tombstone(lockPath);
         if(reservation?.run){await dropRecords(reservation.run);taken.add(reservation.run);}
-        await reapLog(`${lock} run=${reservation?.run??'none'} reason=${killed?'past-max-runtime killed='+killed:'owner-gone'}`);
+        await reapLog(`${lock} run=${reservation?.run??'none'} reason=${viaMax?'past-max-runtime killed='+killed:'owner-gone'}`);
       }).catch(error=>process.stderr.write('forge-exec-run: reap skipped '+lock+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'));
     }
     // Records whose own reservation is gone can no longer own a run.
