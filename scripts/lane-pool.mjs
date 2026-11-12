@@ -2309,8 +2309,8 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
         throw new Error(`lane-${chosen} is no longer provably safe to reset: origin fetch failed (${msgOf(e).trim()})`, { cause: e });
       }
     };
-    // Inspect canonical preservation evidence before the ordinary fetch fills missing objects or moves tracking
-    // refs. This only primes object-only verification; the fresh pre-reset guard still decides whether to reset.
+    // Local-only (no network) readability check of the preservation evidence before the ordinary fetch moves tracking
+    // refs; the fresh post-fetch pre-reset guard (`beforeReset`) still decides whether to reset.
     beforeFetch();
     let fetchedSpecs = fetchForReset(dietConfig);
     const repairUnhealthyClone = () => {
@@ -2382,7 +2382,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     if (held) throw Object.assign(new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`), { laneHoldRefusal: true });
     // Acquire's all-branches/HEAD/stash unpushed-work guard runs here, AFTER the #2924 fresh-fetch re-verify and
     // the hold rule, so those older refusals keep their own wording and fetch evidence; THROWS like them.
-    beforeReset();
+    beforeReset(() => localRemoteShas(dir, fetchedSpecs));
     acquireResetSnapshots.set(chosen, before);
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
     beforeDestructiveStep();
@@ -2764,7 +2764,7 @@ async function cmdAcquire(repo) {
           }
           provisionClaimedLane(repo, pick, false, {
             beforeFetch: () => assertReadableLaneEvidence(repo, pick),
-            beforeReset: () => assertNoUnpushedLaneWork(repo, pick),
+            beforeReset: getShas => assertNoUnpushedLaneWork(repo, pick, getShas),
           }); // auto-pick never targets a reserved lane
           chosen = pick;
           break;
@@ -2909,7 +2909,7 @@ async function cmdAcquire(repo) {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       provisionClaimedLane(repo, chosen, targetWasReserved, {
         beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
-        beforeReset: () => assertNoUnpushedLaneWork(repo, chosen),
+        beforeReset: getShas => assertNoUnpushedLaneWork(repo, chosen, getShas),
       });
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
@@ -3189,39 +3189,58 @@ function unpushedLaneWork(repo, dir, { allowFetch = false } = {}) {
   return releaseUnprovenCommits(dir, null, { io }, { allowFetch });
 }
 
-/** Acquire's view of unpushed work: the strict preservation evidence minus commits that are patch-equivalent to
- *  origin/<branch> (squash-merged work is safe to drop, the same relaxation `list --acquirable` applies). Unreadable
- *  evidence (commits === null) and any genuinely unmatched commit, stash included, still block. */
-function acquireBlockingWork(repo, dir) {
-  const work = unpushedLaneWork(repo, dir, { allowFetch: true });
-  if (!work.commits) return work;
+/** Acquire's view of unpushed work, NETWORK-FREE (R903: acquire runs inside daemon ticks, where a hung `ls-remote` or
+ *  verification fetch blew the 90s tick bound). Every branch, HEAD and stash tip must be reachable from `remoteShas`
+ *  — the fresh post-fetch tracking tips (`localRemoteShas`, sound only immediately after acquire's own fetch, which
+ *  just refreshed and pruned them) — or be patch-equivalent to origin/<branch> (squash-merged work is safe to drop,
+ *  the same relaxation `list --acquirable` applies). Unreadable evidence (commits === null), an empty/unverifiable
+ *  proof set and any genuinely unmatched commit, stash included, still block. */
+function acquireBlockingWork(repo, dir, remoteShas) {
+  const redirect = releaseGitDirRedirect(dir);
+  if (redirect) return { commits: null, why: redirect };
   const local = releaseLocalWorkTips(dir);
-  if (!local) return work;
+  if (!local) return { commits: null };
+  const input = [...local.tips, ...[...(remoteShas ?? [])].map(sha => `^${sha}`)].map(line => `${line}\n`).join('');
+  const unproven = releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin'], dir, { stdio: ['pipe', 'pipe', 'pipe'], input });
+  if (unproven === null) return { commits: null };
+  if (unproven === '') return { commits: '' };
   const real = new Set();
   for (const tip of local.tips) {
     const out = releaseEvidenceGit(['rev-list', '--right-only', '--cherry-pick', `origin/${repo.branch}...${tip}`], dir);
-    if (out === null) return work;
+    if (out === null) return { commits: unproven };
     for (const sha of out.split('\n')) if (sha) real.add(sha);
   }
-  const left = work.commits.split('\n').filter(sha => sha && real.has(sha));
-  return { ...work, commits: left.join('\n') };
+  return { commits: unproven.split('\n').filter(sha => sha && real.has(sha)).join('\n') };
 }
 
-/** Acquire's pre-fetch step: primes object-only verification and fails closed when the preservation evidence is
- *  UNREADABLE. Unpushed work found here is deliberately NOT refused yet: the #2924 fresh-fetch re-verify, the hold
- *  rule and `assertNoUnpushedLaneWork` (pre-reset) all re-read it on post-fetch refs and own the refusal wording. */
+/** Acquire's pre-fetch step: local-only (no network) and fails closed when the preservation evidence is UNREADABLE.
+ *  Unpushed work is deliberately NOT refused yet: the #2924 fresh-fetch re-verify, the hold rule and
+ *  `assertNoUnpushedLaneWork` (pre-reset) all re-read it on post-fetch refs and own the refusal wording. */
 function assertReadableLaneEvidence(repo, chosen) {
   if (flags.force) return;
-  const work = acquireBlockingWork(repo, laneDir(repo, chosen));
-  if (work.commits === null) throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually (or --force to discard)`);
+  const dir = laneDir(repo, chosen);
+  if (releaseGitDirRedirect(dir) || !releaseLocalWorkTips(dir)) throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually (or --force to discard)`);
 }
 
-/** Acquire's pre-reset refusal: all-branches/HEAD/stash tips must be provably on origin (or patch-equivalent).
- *  `--force` is the documented operator override, exactly as for the #2924 containment re-verify. */
-function assertNoUnpushedLaneWork(repo, chosen) {
+/** Acquire's pre-reset refusal: all-branches/HEAD/stash tips must be provably on origin (or patch-equivalent), judged
+ *  on the fresh post-fetch tracking refs (`getRemoteShas`) with no network call. `--force` is the documented operator
+ *  override, exactly as for the #2924 containment re-verify. */
+function assertNoUnpushedLaneWork(repo, chosen, getRemoteShas) {
   if (flags.force) return;
-  const work = acquireBlockingWork(repo, laneDir(repo, chosen));
+  const work = acquireBlockingWork(repo, laneDir(repo, chosen), getRemoteShas());
   if (work.commits !== '') throw new Error(`lane-${chosen} is no longer provably safe to reset: it holds unpushed work or unreadable preservation evidence — run salvage-unpushed or inspect it manually (or --force to discard)`);
+}
+
+/** Network-free skip test for the salvage pass: true when every branch, HEAD and stash tip is already reachable from
+ *  some local tracking ref (origin/HEAD and origin/ops/* excluded). Stale tracking refs can only HIDE work from this
+ *  best-effort park — a skipped lane is left untouched, never reset — so the live `ls-remote` + verification fetch
+ *  below only runs for a lane that holds a commit no tracking ref covers. Unreadable evidence is never "covered". */
+function laneTipsCoveredByTracking(dir) {
+  const local = releaseLocalWorkTips(dir);
+  if (!local) return false;
+  const out = releaseEvidenceGit(['rev-list', '--ignore-missing', '--max-count=1', '--stdin', '--not', '--exclude=origin/HEAD',
+    '--exclude=origin/ops/*', '--remotes=origin/*'], dir, { stdio: ['pipe', 'pipe', 'pipe'], input: local.tips.map(sha => `${sha}\n`).join('') });
+  return out === '';
 }
 
 /** Park abandoned commits on the canonical remote before recycling a free lane. An exclusive lease spans
@@ -3249,6 +3268,9 @@ async function salvageUnpushed(repo, { lanes = existingLanes(repo), dryRun = fal
         claim = acquired;
         journalLaneEvent(dir, { action: 'salvage-claim', reason: 'exclusive hold for unpushed-work salvage' });
       }
+      // Network-free skip: nothing local-only per the tracking refs means nothing to park (and no reset), so a lane
+      // without abandoned work never costs an `ls-remote`.
+      if (laneTipsCoveredByTracking(dir)) continue;
       const work = unpushedLaneWork(repo, dir);
       if (work.commits === null) throw new Error(`incomplete preservation evidence: ${work.why || 'unreadable local refs/objects'}; inspect lane manually`);
       if (work.commits === '') continue;

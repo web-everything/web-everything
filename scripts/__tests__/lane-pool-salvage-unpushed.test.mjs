@@ -255,7 +255,24 @@ describe('lane-pool salvage-unpushed', () => {
     expect(JSON.parse(result.stdout).lane).toBe(2);
   });
 
-  it('acquires an unfetched free lane after canonical origin/main advances using object-only verification', () => {
+  it('gc skips a lane with no local-only commits without any origin listing, fetch or lease claim (R903 tick bound)', () => {
+    const result = run('gc', [], { LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '0' });
+    expect(result.status, result.stderr).toBe(0);
+    const log = events().filter(e => e.args.includes('ls-remote')
+      || e.args.some(arg => String(arg).includes(':refs/release-verify/')));
+    expect(log).toEqual([]);
+    expect(refs()).toBe('');
+  });
+
+  it('acquire never lists or verification-fetches the canonical origin (R903 tick bound)', () => {
+    const result = run('acquire', ['--no-reap', '--no-free-list', '--no-cache', '--json']);
+    expect(result.status, result.stderr).toBe(0);
+    const log = events();
+    expect(log.some(e => e.args.includes('ls-remote'))).toBe(false);
+    expect(log.some(e => e.args.some(arg => String(arg).includes(':refs/release-verify/')))).toBe(false);
+  });
+
+  it('acquires an unfetched free lane after canonical origin/main advances without object-only verification', () => {
     const publisher = join(root, 'publisher');
     git(['clone', origin, publisher]);
     const advanced = commit(publisher, 'advanced main');
@@ -267,10 +284,9 @@ describe('lane-pool salvage-unpushed', () => {
     expect(JSON.parse(result.stdout).lane).toBe(1);
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(advanced);
     const log = events();
-    const verification = log.findIndex(e => e.cwd === lane && e.args.includes('fetch')
-      && e.args.some(arg => arg.includes(':refs/release-verify/')));
-    const reset = log.findIndex(e => e.cwd === lane && e.args.includes('checkout') && e.args.includes('-B'));
-    expect(verification).toBeGreaterThanOrEqual(0); expect(reset).toBeGreaterThan(verification);
+    // The ordinary fetch fills the objects and refreshes the tracking refs the pre-reset check reads: no `ls-remote`.
+    expect(log.some(e => e.args.includes('ls-remote') || e.args.some(arg => String(arg).includes(':refs/release-verify/')))).toBe(false);
+    expect(log.some(e => e.cwd === lane && e.args.includes('checkout') && e.args.includes('-B'))).toBe(true);
     expect(git(['for-each-ref', '--format=%(refname)', 'refs/release-verify/'], lane)).toBe('');
   });
 
