@@ -32,7 +32,7 @@ const job = (id, conclusion = 'failure') => ({
 // No summary hints or quarantine coverage can mask the log-based classification.
 function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
   runs = [{ ...run(103, null, '2026-11-01T13:50:00Z'), status: 'in_progress' }, run(102)],
-  events = [removal()] } = {}) {
+  events = [removal()], mergeState = 'CLEAN' } = {}) {
   const log = vi.fn(), logReads = [];
   const exec = vi.fn((command, args, opts) => {
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
@@ -47,7 +47,7 @@ function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
       } } } } });
     }
     if (args.includes('mergeStateStatus,headRefOid')) {
-      return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
+      return JSON.stringify({ headRefOid: head, mergeStateStatus: mergeState });
     }
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
     if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`)) {
@@ -82,7 +82,7 @@ function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
 // The reader is private: the public retry line exposes its infra classification.
 function expectInfraRetry(decision) {
   expect(decision.hold).toBe(false);
-  expect(decision.line).toContain('failed_checks infra retry 1/1 (main green, PR CLEAN, infra)');
+  expect(decision.line).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN, infra)');
   expect(decision.line).toContain('main run 102');
 }
 
@@ -104,6 +104,27 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     settings.drain = {};
   });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
+
+  it.each([
+    ['green main and CLEAN PR', 'success', 'CLEAN', false],
+    ['red main and CLEAN PR', 'failure', 'CLEAN', true],
+    ['green main and BLOCKED PR', 'success', 'BLOCKED', true],
+    ['green main and BEHIND PR', 'success', 'BEHIND', true],
+    ['green main and unknown PR state', 'success', null, true],
+  ])('rerun-confirmed admission requires green main and a CLEAN PR: %s', (_name, conclusion, mergeState, hold) => {
+    const original = { ...job(21), id: 1021, head_sha: mergeCommit,
+      started_at: '2026-11-01T13:30:00Z', completed_at: '2026-11-01T13:40:00Z' };
+    const successor = { ...job(41, 'success'), id: 1041, name: original.name, head_sha: mergeCommit,
+      started_at: '2026-11-01T13:46:00Z', completed_at: '2026-11-01T13:49:00Z' };
+    const f = fixture({ checks: [successor, original], logs: new Map([[21, testLog]]),
+      runs: [run(102, conclusion)], mergeState });
+    const decision = f.guard();
+    expect(decision.hold).toBe(hold);
+    if (!hold) expect(decision.line).toMatch(/rerun-green.*rerun-confirmed flake/);
+    else if (conclusion !== 'success') expect(decision.reason).toMatch(/main CI is not green/);
+    else expect(decision.reason).toMatch(/PR is not CLEAN/);
+    expect(f.exec.mock.calls.filter(([, args]) => args.includes('POST'))).toEqual([]);
+  });
 
   it('accepts failure-conclusion test shards only when every failed job log matches the standard allowlist', () => {
     const f = fixture({ checks: [job(21), job(22)], logs: new Map([[21, infraLog], [22, infraLog]]) });
@@ -134,13 +155,15 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expectVisibleDecision(decision, /main CI is not green.*102.*failure/);
   });
 
-  it('keeps the single retry bound after a second same-head failed_checks removal', () => {
+  it('keeps the two-retry bound after a third same-head failed_checks removal', () => {
     const f = fixture({ events: [removal(), {
       __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:46:00Z',
+    }, removal('2026-11-01T13:50:00Z'), {
+      __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:51:00Z',
     }, removal('2026-11-01T13:55:00Z')] });
     const decision = f.guard();
     expect(decision.hold).toBe(true);
-    expect(decision.line).toMatch(/2 removals on this head.*operator must inspect history and enqueue manually/);
+    expect(decision.line).toMatch(/3 removals on this head.*operator must inspect history and enqueue manually/);
     expect(f.logReads).toHaveLength(0);
   });
 
@@ -238,7 +261,7 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
   it('returns the accept reason and deciding main run for catch-up outcome visibility', () => {
     const decision = fixture().guard();
     expectInfraRetry(decision);
-    expectVisibleDecision(decision, /infra retry 1\/1/);
+    expectVisibleDecision(decision, /infra retry 1\/2/);
   });
 
   it('returns the decline reason and deciding main run on the guard result consumed by merge-ai-prs', () => {

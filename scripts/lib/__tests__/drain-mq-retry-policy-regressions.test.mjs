@@ -22,7 +22,7 @@ function probe({ count = 1, text = signature, clean = 'CLEAN', main = 'success',
     const response = pullRequest => JSON.stringify({ data: { repository: { pullRequest } } });
     if (args.some(arg => arg.includes('isInMergeQueue'))) return response({ isInMergeQueue: false, headRefOid: head });
     if (args.some(arg => arg.includes('timelineItems'))) return response({ timelineItems: {
-      nodes: spent ? [removal, { __typename: 'AddedToMergeQueueEvent' }] : [removal],
+      nodes: spent ? [removal, { __typename: 'AddedToMergeQueueEvent' }, removal, { __typename: 'AddedToMergeQueueEvent' }] : [removal],
       pageInfo: { hasPreviousPage: false },
     } });
     if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ headRefOid: head, mergeStateStatus: clean });
@@ -91,7 +91,7 @@ describe('MQ log authorization guard regressions', () => {
       `repos/${repo}/actions/jobs/9021/logs`, `repos/${repo}/actions/jobs/9022/logs`,
     ]);
     expect(decision.hold).toBe(false);
-    expect(decision.reason).toContain('infra retry 1/1');
+    expect(decision.reason).toContain('infra retry 1/2');
     expect(decision.mainRunId).toBe(102);
   });
 
@@ -146,7 +146,7 @@ describe('MQ log authorization guard regressions', () => {
     expect(decision.reason).toMatch(/main CI is not green.*102.*failure/);
   });
 
-  it('a spent single retry cannot be authorized again by matching infra logs', () => {
+  it('two spent retries cannot be authorized again by matching infra logs', () => {
     const { decision } = probe({ spent: true });
     expect(decision.hold).toBe(true);
     expect(decision.reason).toContain('already spent');
