@@ -7,11 +7,12 @@
  *   isConfirmSweepSettled, coupleImplOpen, liveOpenHeadRefs) and #3004 (deriveCoupleIncomplete — a half-landed
  *   couple no longer clears a dependent's edge) — all exported from `scripts/merge-ai-prs.mjs`.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { classifyPr, planLabelDrain, joinImplToCouples, decideBatchesIdleExit, resolveRepos, OPEN_PR_LIST_LIMIT, carrierDeferDecision, buildCarrierHealth, deferralsAllHeldCouple, planDrainPass, resolveContextRepos, reduceOpenPrContext, collectOpenPrContext, isContentsNotFound, readRemoteManifestViaApi, isPassIdle, isConfirmSweepSettled, coupleImplOpen, liveOpenHeadRefs, deriveCoupleIncomplete, reviewCoverageGaps, buildDrainVerdicts } from '../merge-ai-prs.mjs';
+import * as drainMod from '../merge-ai-prs.mjs';   // card 8036 R2 helpers, read off the namespace so a missing export reddens only its own tests
 import { REVIEW_LABELS } from '../lib/review-escalation.mjs';
 import { buildManifest, asItemId } from '../readiness/lane-manifest.mjs';
 
@@ -447,9 +448,10 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     const ctx = reduceOpenPrContext({ listings: [{ repo: FUI, prs: [A, B] }], reads, reconcileRan: true });
     expect(ctx.contextComplete).toBe(true);                                  // B's absence-of-manifest is still provable
     const mk = (num, readMalformed) => ({ num, repo: FUI, headRef: `lane/${num}-fui`, hasManifest: false, item: null, blockedBy: [], stackParents: [], decision: 'merge', ...(readMalformed ? { readMalformed: true } : {}) });
-    const plan = planLabelDrain([mk(61, true), mk(62, false)], { contextComplete: ctx.contextComplete, isWeRepo: isLocalRepo });
-    expect(plan.ready.map((c) => c.num)).toEqual([62]);                      // B unchanged
+    const plan = planLabelDrain([mk(61, true), mk(62, false)], { contextComplete: ctx.contextComplete, malformedRepos: ctx.malformedRepos, isWeRepo: isLocalRepo });
+    expect(plan.ready.map((c) => c.num)).toEqual([62]);                      // B unchanged (same repo — see card xvnrvsv)
     expect(plan.deferred.map((d) => d.num)).toEqual([61]);                   // A fails closed alone
+    expect(plan.deferred[0].waitOn).toEqual(['malformed-manifest']);         // the promised, operator-readable reason
   });
 
   it('card 8036 — a malformed manifest in one repo keeps the old deferral for manifest-less PRs in OTHER repos only', () => {
@@ -460,14 +462,96 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     expect(ctx.contextComplete).toBe(true);
     const mk = (num, repo, readMalformed) => ({ num, repo, headRef: `lane/${num}`, hasManifest: false, item: null, blockedBy: [], stackParents: [], decision: 'merge', ...(readMalformed ? { readMalformed: true } : {}) });
     const plan = planLabelDrain([mk(61, FUI, true), mk(70, FUI), mk(81, OTHER)], { contextComplete: ctx.contextComplete, malformedRepos: ctx.malformedRepos, isWeRepo: isLocalRepo });
-    expect(plan.ready.map((c) => c.num)).toEqual([70]);                       // same repo proceeds
+    // Same repo proceeds. This is a KNOWN residual, not the target: a same-repo impl half of a malformed CARRIER
+    // is not held yet — card xvnrvsv (see the it.todo below). Do not read this assertion as the intended end state.
+    expect(plan.ready.map((c) => c.num)).toEqual([70]);
     expect(plan.deferred.map((d) => d.num).sort()).toEqual([61, 81]);         // malformed PR + other-repo impl half held
+    const waits = new Map(plan.deferred.map((d) => [d.num, d.waitOn]));
+    expect(waits.get(61)).toEqual(['malformed-manifest']);
+    expect(waits.get(81)).toEqual(['incomplete-context']);
   });
 
-  it('card 8036 — buildDrainVerdicts stamps readMalformed from the per-PR read', () => {
+  it.todo('card xvnrvsv — a manifest-less impl half in the SAME repo as a malformed-manifest carrier is held');
+
+  it('card 8036 R2 — two malformed PRs in different repos each keep their own malformed-manifest reason (waits are additive)', () => {
+    const OTHER = 'frontier-ui/other';
+    const reads = new Map([[`${FUI}::61`, { manifest: null, commits: [], degraded: false, malformed: true }], [`${OTHER}::63`, { manifest: null, commits: [], degraded: false, malformed: true }]]);
+    const ctx = reduceOpenPrContext({ listings: [{ repo: FUI, prs: [ghPr(61, 'lane/a-fui')] }, { repo: OTHER, prs: [ghPr(63, 'lane/e-other')] }], reads, reconcileRan: true });
+    const mk = (num, repo) => ({ num, repo, headRef: `lane/${num}`, hasManifest: false, item: null, blockedBy: [], stackParents: [], decision: 'merge', readMalformed: true });
+    const plan = planLabelDrain([mk(61, FUI), mk(63, OTHER)], { contextComplete: ctx.contextComplete, malformedRepos: ctx.malformedRepos, isWeRepo: isLocalRepo });
+    expect(plan.ready).toEqual([]);
+    for (const d of plan.deferred) expect(d.waitOn).toEqual(expect.arrayContaining(['malformed-manifest', 'incomplete-context']));
+  });
+
+  it('card 8036 R2 — a strict absent-HASH dependency stays held while ANY manifest is malformed (absence is unproven)', () => {
+    // `--only` fast drain: the blocker item may be the one the malformed PR carries, so its absence proves nothing.
+    const dep = { num: 90, repo: null, headRef: 'lane/dep-we', hasManifest: true, item: 'xdep001', blockedBy: ['xblk001'], stackParents: [], decision: 'merge' };
+    const held = planLabelDrain([dep], { contextComplete: true, malformedRepos: new Set([FUI]), strictAbsentHashDependencies: true, isWeRepo: isLocalRepo });
+    expect(held.ready).toEqual([]);
+    expect(held.deferred[0].waitOn).toContain('xblk001');
+    const clean = planLabelDrain([dep], { contextComplete: true, malformedRepos: new Set(), strictAbsentHashDependencies: true, isWeRepo: isLocalRepo });
+    expect(clean.ready.map((c) => c.num)).toEqual([90]);                      // a clean complete context still proves absence
+  });
+
+  it('card 8036 R2 — planDrainPass (real producers end to end) holds the malformed PR, other-repo impl halves and strict hash dependents', () => {
+    const OTHER = 'frontier-ui/other';
+    const A = ghPr(61, 'lane/a-fui', { labels: ['ready-to-merge'] });          // malformed head-tree manifest
+    const B = ghPr(81, 'lane/b-other', { labels: ['ready-to-merge'] });        // manifest-less, other repo
+    const D = ghPr(90, 'lane/dep-we', { labels: ['ready-to-merge'] });         // WE PR, hash-blocked on an absent item
+    const dManifest = { item: 'xdep001', repos: [{ repo: 'we', ref: 'lane/dep-we' }], blockedBy: ['xblk001'], stackParents: [] };
+    const reads = new Map([
+      [`${FUI}::61`, drainMod.shapeOpenPrRead({ manifestRes: { manifest: null, degraded: false, malformed: true }, commitsRes: { commits: [claude, claude], degraded: false } })],
+      [`${OTHER}::81`, drainMod.shapeOpenPrRead({ manifestRes: { manifest: null, degraded: false }, commitsRes: { commits: [claude, claude], degraded: false } })],
+      ['cwd::90', drainMod.shapeOpenPrRead({ manifestRes: { manifest: dManifest, degraded: false }, commitsRes: { commits: [claude, claude], degraded: false } })],
+    ]);
+    const listings = [{ repo: null, prs: [D] }, { repo: FUI, prs: [A] }, { repo: OTHER, prs: [B] }];
+    const openPrContext = reduceOpenPrContext({ listings, reads, reconcileRan: true });
+    expect(openPrContext.contextComplete).toBe(true);
+    const { plan } = planDrainPass({ listings, openPrContext, repos: [null, FUI, OTHER], readOf: (repo, num) => reads.get(`${repo || 'cwd'}::${num}`), requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug, strictAbsentHashDependencies: true });
+    expect(plan.ready).toEqual([]);
+    const waits = new Map(plan.deferred.map((d) => [d.num, d.waitOn]));
+    expect(waits.get(61)).toContain('malformed-manifest');
+    expect(waits.get(81)).toEqual(['incomplete-context']);                    // needs malformedRepos handed to the planner
+    expect(waits.get(90)).toContain('xblk001');                               // needs the shared absence predicate
+  });
+
+  it('card 8036 R2 — shapeOpenPrRead carries `malformed` only when the manifest read set it', () => {
+    const commitsRes = { commits: [claude], degraded: false };
+    expect(drainMod.shapeOpenPrRead({ manifestRes: { manifest: null, degraded: false, malformed: true }, commitsRes }))
+      .toEqual({ manifest: null, commits: [claude], degraded: false, transient: false, malformed: true });
+    expect(drainMod.shapeOpenPrRead({ manifestRes: { manifest: null, degraded: false }, commitsRes }))
+      .toEqual({ manifest: null, commits: [claude], degraded: false, transient: false });
+    // the context listing may skip the commits read: no `commits` key at all, degraded/transient still carried
+    expect(drainMod.shapeOpenPrRead({ manifestRes: { manifest: null, degraded: true, transient: true, malformed: true }, includeCommits: false }))
+      .toEqual({ manifest: null, degraded: true, transient: true, malformed: true });
+  });
+
+  it('card 8036 R2 — contextProofFields hands the planner contextComplete AND malformedRepos from one place', () => {
+    const malformedRepos = new Set([FUI]);
+    expect(drainMod.contextProofFields({ contextComplete: true, malformedRepos })).toEqual({ contextComplete: true, malformedRepos });
+    expect(drainMod.contextProofFields({})).toEqual({ contextComplete: false, malformedRepos: new Set() });
+    expect(drainMod.contextProofFields(null)).toEqual({ contextComplete: false, malformedRepos: new Set() });
+  });
+
+  it('card 8036 R2 — every production planLabelDrain call uses contextProofFields; both fetchOne sites use shapeOpenPrRead', () => {
+    // runCli's `replan` and its two `fetchOne` readers are not reachable from a unit test, so pin their wiring here.
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    const calls = src.split('\n').filter((l) => /\bplanLabelDrain\(/.test(l) && !/^\s*(\*|\/\/)/.test(l) && !/export function planLabelDrain\(/.test(l));
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const l of calls) expect(l).toContain('...contextProofFields(');
+    expect(src.match(/return shapeOpenPrRead\(/g)?.length).toBe(2);
+    expect(src).not.toMatch(/return \{[^\n]*manifest: manifestRes\.manifest/);
+  });
+
+  it('card 8036 — buildDrainVerdicts stamps readMalformed from the per-PR read and logs which PR and repo', () => {
     const A = ghPr(61, 'lane/a-fui', { labels: ['ready-to-merge'] });
-    const vs = buildDrainVerdicts({ prsByRepo: new Map([[FUI, [A]]]), repos: [FUI], readOf: () => ({ manifest: null, commits: [], malformed: true }), isLocalRepo });
-    expect(vs[0].readMalformed).toBe(true);
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const vs = buildDrainVerdicts({ prsByRepo: new Map([[FUI, [A]]]), repos: [FUI], readOf: () => ({ manifest: null, commits: [], malformed: true }), isLocalRepo });
+      expect(vs[0].readMalformed).toBe(true);
+      const lines = spy.mock.calls.map((c) => String(c[0]));
+      expect(lines.some((l) => l.includes('#61') && l.includes(FUI) && l.includes('malformed'))).toBe(true);
+    } finally { spy.mockRestore(); }
   });
 
   it('R1 — the PLAN-WIDE invariant: an UN-joined manifest-less non-WE verdict in an INCOMPLETE context DEFERS', () => {
