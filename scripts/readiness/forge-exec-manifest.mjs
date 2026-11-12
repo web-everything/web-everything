@@ -235,7 +235,7 @@ export function changedLinesFinding(path,content,base) {
   for(const line of text.split(split)) {
     const n=have.get(line)??0;
     if(n>0){have.set(line,n-1);continue;}
-    if(/(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)\w*["'\]]?\s*[:=]\s*(?:["'`]|[A-Za-z0-9+/_-]{12,})/i.test(line))return 'credential-literal-assignment';
+    if(/(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)\w*["'\]]?\s*[:=]\s*(?:["'`]|[A-Za-z0-9+/_-]{12,}|$)/i.test(line))return 'credential-literal-assignment';
   }
   return null;
 }

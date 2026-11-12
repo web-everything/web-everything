@@ -35,6 +35,11 @@ describe('changedLinesFinding', () => {
     expect(finding(content, base)).toBe('high-entropy-password');
   });
 
+  it('refuses an added multiline password assignment', () => {
+    const added = ['export const password =', '\n  "', 'private-live-', 'password', '";'].join('');
+    expect(finding(`public\n${added}\n`, 'public\n')).toBe('credential-literal-assignment');
+  });
+
   it('refuses an added exported password literal', () => {
     const added = ['export const password', ' = "', 'private-live-', 'password', '";'].join('');
     expect(finding(`public\n${added}\n`, 'public\n')).toBe('credential-literal-assignment');
