@@ -904,6 +904,26 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
     expect(isKnownMachineBody(undefined)).toBe(true);
     expect(isKnownMachineBody('  \n ')).toBe(true);
   });
+  // R907 06:33 ET: the live #6381/#6595 operator comments (refresh note, manual R247 pass) are machine-marked notes that
+  // decide nothing about the review, but ONLY from a trusted marker author; any other author's copy still holds.
+  describe('operator refresh / manual R247 shapes (R907)', () => {
+    const REFRESH = '🛠 operator action — refresh\n\nOperator @chalbert via chat: refresh so CI re-runs\n\nUndo: restore the previous head\n\n<!-- operator-action: refresh -->';
+    const MANUAL = 'Manual R247 pass — daemon: red-team; reason: EMERGENCY (labelled): refresh moved head; old-head review run left review-unfinished';
+    const OP = { login: 'chalbert' };
+    for (const [name, body] of Object.entries({ refresh: REFRESH, 'manual R247 pass': MANUAL })) {
+      it(`${name} from a trusted author is a known machine shape and does not supersede the accept`, () => {
+        expect(isKnownMachineBody(body, { author: OP })).toBe(true);
+        const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-10-09T14:00:00Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->` },
+          { author: OP, createdAt: '2026-10-09T15:00:00Z', body }];
+        expect(latestAcceptRecord(comments, []).laterVerdict).toBe(false);
+      });
+      it(`${name} from an untrusted author, or with no author, still holds (fail closed)`, () => {
+        expect(isKnownMachineBody(body, { author: { login: 'someone-else' } })).toBe(false);
+        expect(isKnownMachineBody(body)).toBe(false);
+        expect(isKnownMachineBody(body, { author: null })).toBe(false);
+      });
+    }
+  });
 });
 
 // PR #4631 round 3 (F1/F3, test-coverage): the drain's anti-test-gaming carry used to be inline in `runCli`, so no test
