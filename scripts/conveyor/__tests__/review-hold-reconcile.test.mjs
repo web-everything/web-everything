@@ -564,11 +564,22 @@ describe('#5045 pending with a same-head accept, files unreadable', () => {
   });
 });
 
+describe('#5045 same-head accept with a standing changes-requested review', () => {
+  it('keeps the pending', () => {
+    const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
+    const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` }] }) });
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readFiles: () => ['docs/a.md'],
+      readReviews: () => [{ state: 'CHANGES_REQUESTED', submitted_at: '2999-01-01T00:00:00Z', user: { login: 'someone' } }] });
+    expect(results.find((r) => r.num === 5045 && r.flagged).flagReason).toBe('accept-current');
+    expect(p.calls.set).toEqual([]);
+  });
+});
+
 describe('#5045 pending with a stale accept', () => {
   const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
   for (const current of [false, true]) it(current ? 'removes stale pending beside same-head acceptance' : 'posts evidence and removes only stale accepted', () => {
     const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${current ? head : '9db3d19825465e7da28c4e179833e2c799bb94e4'} -->` }] }) });
-    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readFiles: () => ['docs/a.md'] });
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n', readFiles: () => ['docs/a.md'], readReviews: () => [] });
     const r = results.find((r) => r.num === 5045 && (r.healed || r.flagged));
     if (current) {
       expect(r.healed).toEqual(['review:pending']);

@@ -178,7 +178,7 @@ export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {})
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
   acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, readFiles = null, now = Date.now, log = (line) => writeLineSync(2, line),
+  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, readFiles = null, readReviews = null, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -346,12 +346,22 @@ export function sweepReviewHoldLabels({
           return Array.isArray(files) ? files : null;
         } catch { return null; }
       };
+      // Formal reviews: unreadable (null) marks the record `reviewsUnreadable`, which keeps the pending.
+      const readFormalReviews = () => {
+        try {
+          if (readReviews) return readReviews(pr.number, { repo: repoOf() });
+          const out = exec('gh', ['api', `repos/${repoOf()}/pulls/${pr.number}/reviews`, '--paginate', '--slurp'], { encoding: 'utf8' });
+          const pages = JSON.parse(String(out));
+          return Array.isArray(pages) ? pages.flat() : null;
+        } catch { return null; }
+      };
       const evalHeal = (st) => {
-        const rec = latestAcceptRecord(st.comments);
+        let rec = latestAcceptRecord(st.comments);
         const acc = (rec?.sha ?? '').toLowerCase();
         const hd = st.headRefOid.toLowerCase();
         const sameHeadAccept = hasReviewLabel(st.labels, 'review:pending') && hasReviewLabel(st.labels, 'review:accepted') && !!acc
           && (acc.startsWith(hd) || hd.startsWith(acc));
+        if (sameHeadAccept) rec = latestAcceptRecord(st.comments, readFormalReviews());
         return decideContradictoryVerdictHeal({
           currentLabels: st.labels,
           humanClearedSha: parseLatestHumanClearedSha(st.comments),
